@@ -286,7 +286,6 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 
         encoded_callback = urllib.parse.quote(callback_url, safe="")
         target_url = f"{frontend_url.rstrip('/')}/automations/api-key-callback?callback_url={encoded_callback}&app_type=default"
-        print("\n" + "─" * 60)
         webbrowser.open(target_url)
         print("🌐 Opening browser...")
         print("If browser doesn't open automatically, open this link:")

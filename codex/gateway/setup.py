@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Claude Code - Environment Setup Script
+Codex CLI - Environment Setup Script
 """
 
 import os
@@ -171,65 +171,6 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
     else:
         return False, f"Unsupported OS: {system}"
 
-
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """
-    Remove an environment variable export line from the user's shell rc file.
-    """
-    rc_file = get_shell_rc_file()
-    if rc_file is None:
-        return False
-    try:
-        rc_file.touch(exist_ok=True)
-        with open(rc_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        new_lines = []
-        removed = False
-        export_prefix = f"export {var_name}="
-        for line in lines:
-            if line.strip().startswith(export_prefix):
-                removed = True
-                continue
-            new_lines.append(line)
-        if removed:
-            with open(rc_file, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-        return True
-    except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
-
-
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """
-    Remove a user environment variable on Windows by deleting it from HKCU\\Environment.
-    """
-    try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        # If it doesn't exist, treat as success
-        return True
-    except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
-
-
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """
-    Remove an environment variable permanently across OS platforms.
-    """
-    system = platform.system().lower()
-    if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
-    elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
-    else:
-        return False, f"Unsupported OS: {system}"
-
-
 def verify_api_key(api_key: str) -> bool:
     """
     Verify the API key by making a request to the /models endpoint.
@@ -285,46 +226,6 @@ def verify_api_key(api_key: str) -> bool:
     except Exception as e:
         print(f"❌ API key verification failed: {e}")
         return False
-
-
-def setup_claude_key_helper() -> None:
-    """
-    Create ~/.claude/anthropic_key.sh that echoes UNBOUND_API_KEY and
-    update ~/.claude/settings.json with apiKeyHelper pointing to that script.
-    """
-    claude_dir = Path.home() / ".claude"
-    settings_path = claude_dir / "settings.json"
-    key_helper_path = claude_dir / "anthropic_key.sh"
-
-    try:
-        claude_dir.mkdir(parents=True, exist_ok=True)
-
-        # Write anthropic_key.sh
-        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
-        try:
-            current_mode = key_helper_path.stat().st_mode
-            os.chmod(key_helper_path, current_mode | 0o111)
-        except Exception:
-            pass
-
-        # Read existing settings.json if present
-        settings: Dict[str, any] = {}
-        if settings_path.exists():
-            try:
-                settings = json.loads(settings_path.read_text(encoding="utf-8")) or {}
-            except Exception:
-                settings = {}
-
-        # Remove hooks if present before adding apiKeyHelper
-        if "hooks" in settings:
-            del settings["hooks"]
-
-        # Update apiKeyHelper
-        settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
-
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-    except Exception as e:
-        print(f"⚠️  Failed to configure Claude Code key helper: {e}")
 
 
 def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -409,18 +310,8 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 def main():
     """Main setup function."""
     print("=" * 60)
-    print("Claude Code - Environment Setup")
+    print("Codex CLI - Environment Setup")
     print("=" * 60)
-    
-    # Flush previously set environment variables at start
-    for var_name in [
-        "ANTHROPIC_BASE_URL",
-        "UNBOUND_API_KEY"
-    ]:
-        try:
-            remove_env_var(var_name)
-        except Exception:
-            pass
     
     # Prompt user to initiate callback flow and print the response
     parser = argparse.ArgumentParser(add_help=False)
@@ -454,15 +345,12 @@ def main():
     
     print("API Key Verified ✅")
     
-    success, message = set_env_var("UNBOUND_API_KEY", api_key)
+    success, message = set_env_var("OPENAI_API_KEY", api_key)
     if not success:
-        print(f"❌ Failed to configure UNBOUND_API_KEY: {message}")
+        print(f"❌ Failed to configure OPENAI_API_KEY: {message}")
         return
     
-    success, message = set_env_var("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
-    
-    # Configure Claude Code helper files
-    setup_claude_key_helper()
+    success, message = set_env_var("OPENAI_BASE_URL", "https://api.getunbound.ai/v1")
     
     # Final instructions
     print("\n" + "=" * 60)
