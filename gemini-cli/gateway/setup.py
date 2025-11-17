@@ -17,6 +17,7 @@ import threading
 import http.server
 import socketserver
 import socket
+import webbrowser
 
 
 def get_shell_rc_file() -> Path:
@@ -275,9 +276,11 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         encoded_callback = urllib.parse.quote(callback_url, safe="")
         target_url = f"{frontend_url.rstrip('/')}/automations/api-key-callback?callback_url={encoded_callback}&app_type=default"
         print("\n" + "─" * 60)
-        print("🔗 Click the following URL (or paste in your browser):")
+        webbrowser.open(target_url)
+        print("🌐 Opening browser...")
+        print("If browser doesn't open automatically, open this link:")
         print(target_url)
-        print("Waiting for the website to return to the terminal...")
+        print("Waiting for authentication...")
 
         try:
             done_evt.wait()
