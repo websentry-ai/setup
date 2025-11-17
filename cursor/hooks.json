@@ -1,0 +1,12 @@
+{
+    "version": 1,
+    "hooks": {
+      "afterShellExecution": [{ "command": "./hooks/unbound.py" }],
+      "afterMCPExecution": [{ "command": "./hooks/unbound.py" }],
+      "afterFileEdit": [{ "command": "./hooks/unbound.py" }],
+      "beforeReadFile": [{ "command": "./hooks/unbound.py" }],
+      "beforeSubmitPrompt": [{ "command": "./hooks/unbound.py" }],
+      "afterAgentResponse": [{ "command": "./hooks/unbound.py" }],
+      "stop": [{ "command": "./hooks/unbound.py" }]
+    }
+}
