@@ -433,7 +433,8 @@ def main():
         print("\n❌ Missing required argument: --domain (e.g., --domain gateway.getunbound.ai)")
         return
 
-    cb_response = run_one_shot_callback_server(normalize_url(args.domain))
+    auth_url = normalize_url(args.domain)
+    cb_response = run_one_shot_callback_server(auth_url)
     if cb_response is None:
         print("\n❌ Failed to receive callback response. Exiting.")
         return
