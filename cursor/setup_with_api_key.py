@@ -8,6 +8,8 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Tuple
+import certifi
+import ssl
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
@@ -96,7 +98,10 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
 
 def download_file(url: str, dest_path: Path) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
+        # Create SSL context with certifi certificates
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
+        with urllib.request.urlopen(url, timeout=30, context=ssl_context) as response:
             if response.status == 200:
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 dest_path.write_bytes(response.read())

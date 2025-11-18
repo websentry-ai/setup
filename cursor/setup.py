@@ -14,6 +14,8 @@ import threading
 import http.server
 import socketserver
 import socket
+import certifi
+import ssl
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
@@ -173,10 +175,12 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         print(f"❌ Failed to run callback server: {e}")
         return None
 
-
 def download_file(url: str, dest_path: Path) -> bool:
     try:
-        with urllib.request.urlopen(url, timeout=30) as response:
+        # Create SSL context with certifi certificates
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        
+        with urllib.request.urlopen(url, timeout=30, context=ssl_context) as response:
             if response.status == 200:
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 dest_path.write_bytes(response.read())
@@ -185,7 +189,6 @@ def download_file(url: str, dest_path: Path) -> bool:
     except Exception as e:
         print(f"❌ Failed to download {url}: {e}")
         return False
-
 
 def setup_hooks():
     hooks_dir = Path.home() / ".cursor" / "hooks"
