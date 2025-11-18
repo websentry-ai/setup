@@ -14,8 +14,14 @@ import threading
 import http.server
 import socketserver
 import socket
-import certifi
 import ssl
+
+try:
+    import certifi
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--user", "certifi"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import certifi
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"

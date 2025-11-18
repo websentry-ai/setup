@@ -8,8 +8,14 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Tuple
-import certifi
 import ssl
+
+try:
+    import certifi
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--user", "certifi"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    import certifi
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
