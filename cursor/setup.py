@@ -27,6 +27,16 @@ HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/mai
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 
 
+def install_macos_certificates():
+    """Run Python certificate installation command on macOS."""
+    if platform.system().lower() != "darwin":
+        return
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cert_path = f"/Applications/Python {py_version}/Install Certificates.command"
+    if os.path.exists(cert_path):
+        subprocess.run([cert_path], capture_output=True)
+
+
 def normalize_url(domain: str) -> str:
     """Normalize domain to proper URL format."""
     domain = domain.strip()
@@ -293,6 +303,8 @@ def restart_cursor() -> bool:
 
 
 def main():
+    install_macos_certificates()
+    
     print("=" * 60)
     print("Unbound Cursor Hooks - Setup")
     print("=" * 60)

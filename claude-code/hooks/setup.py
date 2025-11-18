@@ -28,6 +28,16 @@ except ImportError:
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 
 
+def install_macos_certificates():
+    """Run Python certificate installation command on macOS."""
+    if platform.system().lower() != "darwin":
+        return
+    py_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    cert_path = f"/Applications/Python {py_version}/Install Certificates.command"
+    if os.path.exists(cert_path):
+        subprocess.run([cert_path], capture_output=True)
+
+
 def normalize_url(domain: str) -> str:
     domain = domain.strip()
     
@@ -390,6 +400,8 @@ def configure_claude_settings() -> bool:
 
 
 def main():
+    install_macos_certificates()
+    
     print("=" * 60)
     print("Claude Code Setup for Unbound Gateway")
     print("=" * 60)
