@@ -15,6 +15,24 @@ from datetime import datetime
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path(__file__).parent / "agent-audit.log"
+ERROR_LOG = Path(__file__).parent / "error.log"
+
+
+def log_error(message):
+    """Log error with timestamp to error.log, keeping only last 25 errors."""
+    timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
+    error_entry = f"{timestamp}: {message}\n"
+    
+    with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+        f.write(error_entry)
+    
+    # Keep only last 25 errors
+    if ERROR_LOG.exists():
+        with open(ERROR_LOG, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        if len(lines) > 25:
+            with open(ERROR_LOG, 'w', encoding='utf-8') as f:
+                f.writelines(lines[-25:])
 
 
 def load_existing_logs():
@@ -136,6 +154,7 @@ def build_llm_exchange(events, api_key=None):
 def send_to_api(exchange, api_key):
     """Send exchange data to Unbound API."""
     if not api_key:
+        log_error("No API key present in send_to_api function")
         return False
     
     try:
@@ -149,8 +168,12 @@ def send_to_api(exchange, api_key):
         request = urllib.request.Request(url, data=data, headers=headers, method='POST')
         
         with urllib.request.urlopen(request, timeout=10) as response:
-            return response.status == 200
-    except Exception:
+            if response.status != 200:
+                log_error(f"API response status is not 200: {response.status}")
+                return False
+            return True
+    except Exception as e:
+        log_error(f"Exception in send_to_api: {str(e)}")
         return False
 
 
@@ -330,6 +353,7 @@ def main():
         
     except Exception as e:
         # Log errors but still output {} to not break Cursor
+        log_error(f"Exception in main: {str(e)}")
         print("{}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         print("{}")

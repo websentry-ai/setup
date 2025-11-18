@@ -12,6 +12,28 @@ from typing import Dict, List, Tuple, Optional
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
+ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
+
+
+def log_error(message: str):
+    """Log error with timestamp to error.log, keeping only last 25 errors."""
+    timestamp = datetime.utcnow().isoformat() + 'Z'
+    error_entry = f"{timestamp}: {message}\n"
+    
+    try:
+        ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write(error_entry)
+        
+        # Keep only last 25 errors
+        if ERROR_LOG.exists():
+            with open(ERROR_LOG, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            if len(lines) > 25:
+                with open(ERROR_LOG, 'w', encoding='utf-8') as f:
+                    f.writelines(lines[-25:])
+    except Exception:
+        pass
 
 
 def load_existing_logs() -> List[Dict]:
@@ -201,6 +223,7 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
 
 def send_to_api(exchange: Dict, api_key: str) -> bool:
     if not api_key:
+        log_error("No API key present in send_to_api function")
         return False
     
     try:
@@ -214,9 +237,13 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
         request = urllib.request.Request(url, data=data, headers=headers, method='POST')
         
         with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status == 200
+            if response.status != 200:
+                log_error(f"API response status is not 200: {response.status}")
+                return False
+            return True
             
-    except Exception:
+    except Exception as e:
+        log_error(f"Exception in send_to_api: {str(e)}")
         return False
 
 
@@ -322,6 +349,7 @@ def main():
         
     except Exception as e:
         # Still return empty JSON object to Claude Code to indicate completion
+        log_error(f"Exception in main: {str(e)}")
         print("{}", flush=True)
 
 
