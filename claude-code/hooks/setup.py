@@ -5,7 +5,6 @@ import os
 import sys
 import platform
 import subprocess
-import urllib.request
 import urllib.parse
 import webbrowser
 from pathlib import Path
@@ -15,14 +14,6 @@ import http.server
 import socketserver
 import socket
 import json
-import ssl
-
-try:
-    import certifi
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--user", "certifi"],
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    import certifi
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
@@ -250,16 +241,14 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 
 def download_file(url: str, dest_path: Path) -> bool:
     try:
-        # Create SSL context with certifi certificates
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-        
-        with urllib.request.urlopen(url, timeout=30, context=ssl_context) as response:
-            if response.status == 200:
-                dest_path.parent.mkdir(parents=True, exist_ok=True)
-                dest_path.write_bytes(response.read())
-                return True
-        return False
-    except Exception as e:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", str(dest_path), url],
+            capture_output=True,
+            timeout=30
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"❌ Failed to download {url}: {e}")
         return False
 
