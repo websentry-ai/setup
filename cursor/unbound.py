@@ -7,7 +7,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import json
 import os
-import urllib.request
+import subprocess
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
@@ -159,19 +159,20 @@ def send_to_api(exchange, api_key):
     
     try:
         url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/cursor"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        data = json.dumps(exchange)
         
-        data = json.dumps(exchange).encode('utf-8')
-        request = urllib.request.Request(url, data=data, headers=headers, method='POST')
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST", "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json", "-d", data, url],
+            capture_output=True,
+            timeout=10
+        )
         
-        with urllib.request.urlopen(request, timeout=10) as response:
-            if response.status != 200:
-                log_error(f"API response status is not 200: {response.status}")
-                return False
-            return True
+        if result.returncode != 0:
+            error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
+            log_error(f"API request failed: {error_msg}")
+            return False
+        return True
     except Exception as e:
         log_error(f"Exception in send_to_api: {str(e)}")
         return False
