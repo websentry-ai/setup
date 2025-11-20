@@ -3,11 +3,10 @@
 import sys
 import json
 import os
-import urllib.request
+import subprocess
 from pathlib import Path
-from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
@@ -222,26 +221,27 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
 
 
 def send_to_api(exchange: Dict, api_key: str) -> bool:
+    """Send exchange data to Unbound API."""
     if not api_key:
         log_error("No API key present in send_to_api function")
         return False
     
     try:
         url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/claude"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
+        data = json.dumps(exchange)
         
-        data = json.dumps(exchange).encode('utf-8')
-        request = urllib.request.Request(url, data=data, headers=headers, method='POST')
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST", "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json", "-d", data, url],
+            capture_output=True,
+            timeout=10
+        )
         
-        with urllib.request.urlopen(request, timeout=30) as response:
-            if response.status != 200:
-                log_error(f"API response status is not 200: {response.status}")
-                return False
-            return True
-            
+        if result.returncode != 0:
+            error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
+            log_error(f"API request failed: {error_msg}")
+            return False
+        return True
     except Exception as e:
         log_error(f"Exception in send_to_api: {str(e)}")
         return False
