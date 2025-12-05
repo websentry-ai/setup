@@ -86,6 +86,7 @@ def build_llm_exchange(events, api_key=None):
     user_prompt = None
     assistant_response = None
     conversation_id = None
+    model = None
     
     for log_entry in events:
         event = log_entry.get('event', {})
@@ -93,6 +94,9 @@ def build_llm_exchange(events, api_key=None):
         
         if not conversation_id:
             conversation_id = event.get('conversation_id')
+        
+        if not model:
+            model = event.get('model')
         
         if hook_event_name == 'beforeSubmitPrompt':
             user_prompt = event.get('prompt')
@@ -142,9 +146,12 @@ def build_llm_exchange(events, api_key=None):
     if not messages:
         return None
     
+    if not model or model == 'default':
+        model = 'auto'
+
     exchange = {
         'conversation_id': conversation_id,
-        'model': 'auto',
+        'model': model,
         'messages': messages
     }
     
