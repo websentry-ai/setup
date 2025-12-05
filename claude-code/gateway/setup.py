@@ -20,15 +20,24 @@ import socket
 import webbrowser
 
 
+DEBUG = False
+
+
+def debug_print(message: str) -> None:
+    """Print message only if DEBUG mode is enabled."""
+    if DEBUG:
+        print(f"[DEBUG] {message}")
+
+
 def normalize_url(domain: str) -> str:
     """Normalize domain to proper URL format."""
     domain = domain.strip()
-    
+
     if domain.startswith("http://") or domain.startswith("https://"):
         url = domain
     else:
         url = f"https://{domain}"
-    
+
     return url.rstrip('/')
 
 def get_shell_rc_file() -> Path:
@@ -222,9 +231,13 @@ def remove_env_var(var_name: str) -> Tuple[bool, str]:
     system = platform.system().lower()
     if system == "windows":
         success = remove_env_var_on_windows(var_name)
+        if success:
+            debug_print(f"Removed {var_name} from Windows registry")
         return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     elif system in ["darwin", "linux"]:
         success = remove_env_var_on_unix(var_name)
+        if success:
+            debug_print(f"Removed {var_name} from shell rc file")
         return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     else:
         return False, f"Unsupported OS: {system}"
@@ -406,12 +419,81 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
+def remove_claude_key_helper() -> None:
+    """Remove the apiKeyHelper script and setting from Claude config."""
+    claude_dir = Path.home() / ".claude"
+    key_helper_path = claude_dir / "anthropic_key.sh"
+    settings_path = claude_dir / "settings.json"
+
+    # Remove the key helper script
+    if key_helper_path.exists():
+        try:
+            key_helper_path.unlink()
+            debug_print(f"Removed {key_helper_path}")
+            print(f"✅ Removed {key_helper_path}")
+        except Exception as e:
+            print(f"❌ Failed to remove {key_helper_path}: {e}")
+
+    # Remove apiKeyHelper from settings.json
+    if settings_path.exists():
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            if "apiKeyHelper" in settings:
+                del settings["apiKeyHelper"]
+                with open(settings_path, "w", encoding="utf-8") as f:
+                    json.dump(settings, f, indent=2)
+                debug_print("Removed apiKeyHelper from settings.json")
+                print("✅ Removed apiKeyHelper from settings.json")
+        except Exception as e:
+            print(f"❌ Failed to update settings.json: {e}")
+
+
+def clear_setup() -> None:
+    """Undo all changes made by the setup script."""
+    print("=" * 60)
+    print("Claude Code - Clearing Setup")
+    print("=" * 60)
+
+    # Remove environment variables
+    env_vars = ["UNBOUND_API_KEY", "ANTHROPIC_BASE_URL"]
+    for var in env_vars:
+        success, _ = remove_env_var(var)
+        if success:
+            print(f"✅ Removed {var}")
+        else:
+            print(f"❌ Failed to remove {var}")
+
+    # Remove Claude key helper files
+    remove_claude_key_helper()
+
+    print("\n" + "=" * 60)
+    print("Clear Complete!")
+    print("=" * 60)
+
+
 def main():
     """Main setup function."""
+    global DEBUG
+
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
+    parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
+    parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
+    args, _ = parser.parse_known_args()
+
+    if args.debug:
+        DEBUG = True
+        debug_print("Debug mode enabled")
+
+    if args.clear:
+        clear_setup()
+        return
+
     print("=" * 60)
     print("Claude Code - Environment Setup")
     print("=" * 60)
-    
+
     # Flush previously set environment variables at start
     for var_name in [
         "ANTHROPIC_BASE_URL",
@@ -421,12 +503,6 @@ def main():
             remove_env_var(var_name)
         except Exception:
             pass
-    
-    # Prompt user to initiate callback flow and print the response
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
-    # tolerate unknown args so this script can be called from other tooling
-    args, _ = parser.parse_known_args()
 
     if not args.domain:
         print("\n❌ Missing required argument: --domain (e.g., --domain gateway.getunbound.ai)")
@@ -448,21 +524,29 @@ def main():
         print("\n❌ No api_key found in callback. Exiting.")
         return
 
+    debug_print("Verifying API key...")
     if not verify_api_key(api_key):
         print("❌ API key verification failed. Exiting.")
         return
-    
+
     print("API Key Verified ✅")
-    
+    debug_print("API key verification successful")
+
+    debug_print("Setting UNBOUND_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to configure UNBOUND_API_KEY: {message}")
         return
-    
+    debug_print("UNBOUND_API_KEY set successfully")
+
+    debug_print("Setting ANTHROPIC_BASE_URL environment variable...")
     success, message = set_env_var("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
-    
+    debug_print("ANTHROPIC_BASE_URL set successfully")
+
     # Configure Claude Code helper files
+    debug_print("Setting up Claude key helper...")
     setup_claude_key_helper()
+    debug_print("Claude key helper configured")
     
     # Final instructions
     print("\n" + "=" * 60)

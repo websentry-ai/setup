@@ -18,6 +18,14 @@ import json
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 
+DEBUG = False
+
+
+def debug_print(message: str) -> None:
+    """Print message only if DEBUG mode is enabled."""
+    if DEBUG:
+        print(f"[DEBUG] {message}")
+
 
 def install_macos_certificates():
     """Run Python certificate installation command on macOS."""
@@ -168,9 +176,13 @@ def remove_env_var(var_name: str) -> Tuple[bool, str]:
     system = platform.system().lower()
     if system == "windows":
         success = remove_env_var_on_windows(var_name)
+        if success:
+            debug_print(f"Removed {var_name} from Windows registry")
         return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     elif system in ["darwin", "linux"]:
         success = remove_env_var_on_unix(var_name)
+        if success:
+            debug_print(f"Removed {var_name} from shell rc file")
         return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     else:
         return False, f"Unsupported OS: {system}"
@@ -242,11 +254,14 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 def download_file(url: str, dest_path: Path) -> bool:
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
             ["curl", "-fsSL", "-o", str(dest_path), url],
             capture_output=True,
             timeout=30
         )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"❌ Failed to download {url}: {e}")
@@ -388,19 +403,113 @@ def configure_claude_settings() -> bool:
         return False
 
 
+def remove_hooks_from_settings() -> None:
+    """Remove the unbound hooks from settings.json."""
+    settings_path = Path.home() / ".claude" / "settings.json"
+    hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
+
+    if not settings_path.exists():
+        return
+
+    try:
+        with open(settings_path, 'r', encoding='utf-8') as f:
+            settings = json.load(f)
+
+        if "hooks" not in settings:
+            return
+
+        modified = False
+        for event in list(settings["hooks"].keys()):
+            event_config = settings["hooks"][event]
+            new_config = []
+            for item in event_config:
+                if isinstance(item, dict):
+                    hooks = item.get("hooks", [])
+                    new_hooks = [h for h in hooks if h.get("command") != hook_command]
+                    if new_hooks:
+                        item["hooks"] = new_hooks
+                        new_config.append(item)
+                    elif hooks != new_hooks:
+                        modified = True
+                        debug_print(f"Removed unbound hook from {event}")
+                else:
+                    new_config.append(item)
+            if new_config:
+                settings["hooks"][event] = new_config
+            else:
+                del settings["hooks"][event]
+                modified = True
+
+        if not settings["hooks"]:
+            del settings["hooks"]
+            modified = True
+
+        if modified:
+            with open(settings_path, 'w', encoding='utf-8') as f:
+                json.dump(settings, f, indent=2)
+            print("✅ Removed hooks from settings.json")
+    except Exception as e:
+        print(f"❌ Failed to update settings.json: {e}")
+
+
+def clear_setup() -> None:
+    """Undo all changes made by the setup script."""
+    print("=" * 60)
+    print("Claude Code Hooks - Clearing Setup")
+    print("=" * 60)
+
+    # Remove environment variable
+    success, _ = remove_env_var("UNBOUND_CLAUDE_API_KEY")
+    if success:
+        print("✅ Removed UNBOUND_CLAUDE_API_KEY")
+    else:
+        print("❌ Failed to remove UNBOUND_CLAUDE_API_KEY")
+
+    # Remove the unbound.py script
+    script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+            debug_print(f"Removed {script_path}")
+            print(f"✅ Removed {script_path}")
+        except Exception as e:
+            print(f"❌ Failed to remove {script_path}: {e}")
+
+    # Remove hooks from settings.json
+    remove_hooks_from_settings()
+
+    print("\n" + "=" * 60)
+    print("Clear Complete!")
+    print("=" * 60)
+
+
 def main():
+    global DEBUG
+
+    # Parse arguments
+    clear_mode = "--clear" in sys.argv
+    debug_mode = "--debug" in sys.argv
+
+    if debug_mode:
+        DEBUG = True
+        debug_print("Debug mode enabled")
+
+    if clear_mode:
+        clear_setup()
+        return
+
     install_macos_certificates()
-    
+
     print("=" * 60)
     print("Claude Code Setup for Unbound Gateway")
     print("=" * 60)
-    
+
     domain = None
     for i, arg in enumerate(sys.argv):
         if arg == "--domain" and i + 1 < len(sys.argv):
             domain = sys.argv[i + 1]
             break
-    
+
     if not domain:
         print("❌ Missing required argument: --domain")
         print("Usage: python3 setup.py --domain gateway.getunbound.ai")
@@ -422,27 +531,35 @@ def main():
     if not api_key:
         print("❌ No API key received. Exiting.")
         return
-    
+
+    debug_print("API key received from callback")
+
+    debug_print("Setting UNBOUND_CLAUDE_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
-    
+    debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
+
     # Remove ANTHROPIC_BASE_URL if it exists
+    debug_print("Removing ANTHROPIC_BASE_URL if it exists...")
     try:
         remove_env_var("ANTHROPIC_BASE_URL")
     except Exception:
         pass
-    
+
+    debug_print("Setting up hooks...")
     if not setup_hooks():
         print("❌ Failed to setup hooks")
         return
-    
-    import json
+    debug_print("Hooks downloaded successfully")
+
+    debug_print("Configuring Claude settings...")
     if not configure_claude_settings():
         print("❌ Failed to configure Claude settings")
         return
-    
+    debug_print("Claude settings configured successfully")
+
     print("✅ API key verified and added")
     print("✅ Setup complete")
     print("=" * 60)

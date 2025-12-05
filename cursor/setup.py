@@ -17,6 +17,14 @@ import socket
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 
+DEBUG = False
+
+
+def debug_print(message: str) -> None:
+    """Print message only if DEBUG mode is enabled."""
+    if DEBUG:
+        print(f"[DEBUG] {message}")
+
 
 def install_macos_certificates():
     """Run Python certificate installation command on macOS."""
@@ -106,16 +114,73 @@ def set_env_var_unix(var_name: str, value: str) -> bool:
 
 def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
     system = platform.system().lower()
-    
+
     if system == "windows":
         success = set_env_var_windows(var_name, value)
+        if success:
+            debug_print(f"Environment variable {var_name} set on Windows")
         return (True, "Set for new terminals") if success else (False, "Failed")
     elif system in ["darwin", "linux"]:
         success = set_env_var_unix(var_name, value)
         if success:
+            debug_print(f"Environment variable {var_name} added to shell rc file")
             shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
             return True, f"Run 'source ~/.{shell_name}rc' or restart terminal"
         return False, "Failed"
+    else:
+        return False, f"Unsupported OS: {system}"
+
+
+def remove_env_var_on_unix(var_name: str) -> bool:
+    """Remove an environment variable export line from the user's shell rc file."""
+    rc_file = get_shell_rc_file()
+    if rc_file is None:
+        return False
+    try:
+        if not rc_file.exists():
+            return True
+        with open(rc_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines = []
+        removed = False
+        export_prefix = f"export {var_name}="
+        for line in lines:
+            if line.strip().startswith(export_prefix):
+                removed = True
+                debug_print(f"Removing {var_name} from {rc_file}")
+                continue
+            new_lines.append(line)
+        if removed:
+            with open(rc_file, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+        return True
+    except Exception as e:
+        print(f"❌ Failed to modify {rc_file}: {e}")
+        return False
+
+
+def remove_env_var_on_windows(var_name: str) -> bool:
+    """Remove a user environment variable on Windows."""
+    try:
+        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
+        debug_print(f"Removed {var_name} from Windows registry")
+        return True
+    except subprocess.CalledProcessError:
+        return True
+    except FileNotFoundError:
+        print("❌ 'reg' command not found. Please remove the variable manually.")
+        return False
+
+
+def remove_env_var(var_name: str) -> Tuple[bool, str]:
+    """Remove an environment variable permanently across OS platforms."""
+    system = platform.system().lower()
+    if system == "windows":
+        success = remove_env_var_on_windows(var_name)
+        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+    elif system in ["darwin", "linux"]:
+        success = remove_env_var_on_unix(var_name)
+        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     else:
         return False, f"Unsupported OS: {system}"
 
@@ -185,11 +250,14 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 def download_file(url: str, dest_path: Path) -> bool:
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
             ["curl", "-fsSL", "-o", str(dest_path), url],
             capture_output=True,
             timeout=30
         )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"❌ Failed to download {url}: {e}")
@@ -291,19 +359,71 @@ def restart_cursor() -> bool:
         return False
 
 
+def clear_setup() -> None:
+    """Undo all changes made by the setup script."""
+    print("=" * 60)
+    print("Unbound Cursor Hooks - Clearing Setup")
+    print("=" * 60)
+
+    # Remove environment variable
+    success, _ = remove_env_var("UNBOUND_CURSOR_API_KEY")
+    if success:
+        print("✅ Removed UNBOUND_CURSOR_API_KEY")
+    else:
+        print("❌ Failed to remove UNBOUND_CURSOR_API_KEY")
+
+    # Remove the hooks.json file
+    hooks_json = Path.home() / ".cursor" / "hooks.json"
+    if hooks_json.exists():
+        try:
+            hooks_json.unlink()
+            debug_print(f"Removed {hooks_json}")
+            print(f"✅ Removed {hooks_json}")
+        except Exception as e:
+            print(f"❌ Failed to remove {hooks_json}: {e}")
+
+    # Remove the unbound.py script
+    script_path = Path.home() / ".cursor" / "hooks" / "unbound.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+            debug_print(f"Removed {script_path}")
+            print(f"✅ Removed {script_path}")
+        except Exception as e:
+            print(f"❌ Failed to remove {script_path}: {e}")
+
+    print("\n" + "=" * 60)
+    print("Clear Complete!")
+    print("=" * 60)
+
+
 def main():
+    global DEBUG
+
+    # Parse arguments
+    clear_mode = "--clear" in sys.argv
+    debug_mode = "--debug" in sys.argv
+
+    if debug_mode:
+        DEBUG = True
+        debug_print("Debug mode enabled")
+
+    if clear_mode:
+        clear_setup()
+        return
+
     install_macos_certificates()
-    
+
     print("=" * 60)
     print("Unbound Cursor Hooks - Setup")
     print("=" * 60)
-    
+
     domain = None
     for i, arg in enumerate(sys.argv):
         if arg == "--domain" and i + 1 < len(sys.argv):
             domain = sys.argv[i + 1]
             break
-    
+
     if not domain:
         print("\n❌ Missing required argument: --domain")
         print("Usage: python3 setup.py --domain gateway.getunbound.ai")
@@ -325,19 +445,24 @@ def main():
     if not api_key:
         print("\n❌ No API key received. Exiting.")
         return
-    
+
     print("✅ API key received")
-    
+    debug_print("API key received from callback")
+
+    debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
-    
+
     print(f"✅ Environment variable set")
-    
+    debug_print("UNBOUND_CURSOR_API_KEY set successfully")
+
+    debug_print("Setting up hooks...")
     if not setup_hooks():
         print("\n❌ Failed to setup hooks")
         return
+    debug_print("Hooks setup complete")
     
     print("\n" + "=" * 60)
     print("Setup Complete!")
