@@ -263,6 +263,11 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
             if not api_key:
                 print("❌ No api_key in response")
                 return None
+            user_email = data.get("email")
+            first_name = data.get("first_name")
+            last_name = data.get("last_name")
+            print(f"User email: {user_email}")
+            print(f"Name: {first_name} {last_name}")
             return api_key
         except json.JSONDecodeError:
             print("❌ Invalid JSON response from server")
