@@ -21,6 +21,38 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
+def get_enterprise_hooks_dir() -> Path:
+    """Get the enterprise-managed hooks directory based on OS."""
+    system = platform.system().lower()
+
+    if system == "darwin":
+        return Path("/Library/Application Support/Cursor")
+    elif system == "linux":
+        return Path("/etc/cursor")
+    elif system == "windows":
+        return Path("C:/ProgramData/Cursor")
+    else:
+        raise OSError(f"Unsupported operating system: {system}")
+
+
+def check_admin_privileges() -> bool:
+    """Check if the script is running with admin/root privileges."""
+    system = platform.system().lower()
+
+    try:
+        if system in ["darwin", "linux"]:
+            # Check if running as root (UID 0)
+            return os.geteuid() == 0
+        elif system == "windows":
+            # Check if running as admin
+            import ctypes
+            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+        return False
+    except Exception as e:
+        debug_print(f"Failed to check privileges: {e}")
+        return False
+
+
 def get_mac_serial_number() -> str:
     """Get the Mac serial number using system_profiler."""
     try:
@@ -142,9 +174,14 @@ def download_file(url: str, dest_path: Path) -> bool:
 
 
 def setup_hooks():
-    hooks_dir = Path.home() / ".cursor" / "hooks"
-    hooks_json = Path.home() / ".cursor" / "hooks.json"
+    enterprise_dir = get_enterprise_hooks_dir()
+    hooks_dir = enterprise_dir / "hooks"
+    hooks_json = enterprise_dir / "hooks.json"
     script_path = hooks_dir / "unbound.py"
+
+    debug_print(f"Enterprise hooks directory: {enterprise_dir}")
+    debug_print(f"Hooks JSON path: {hooks_json}")
+    debug_print(f"Script path: {script_path}")
 
     print("\n📥 Downloading hooks configuration...")
     if not download_file(HOOKS_URL, hooks_json):
@@ -297,6 +334,12 @@ def main():
     # Check platform
     if platform.system().lower() != "darwin":
         print("❌ This script only supports macOS")
+        return
+
+    # Check admin privileges
+    if not check_admin_privileges():
+        print("❌ This script requires administrator/root privileges")
+        print("   Please run with: sudo python3 setup.py ...")
         return
 
     # Parse arguments
