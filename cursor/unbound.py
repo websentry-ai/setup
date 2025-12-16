@@ -14,8 +14,22 @@ from datetime import datetime
 
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
-AUDIT_LOG = Path(__file__).parent / "agent-audit.log"
-ERROR_LOG = Path(__file__).parent / "error.log"
+
+# Use user's home directory for logs
+LOG_DIR = Path.home() / ".cursor" / "hooks"
+AUDIT_LOG = LOG_DIR / "agent-audit.log"
+ERROR_LOG = LOG_DIR / "error.log"
+
+# Ensure log directory exists
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Fallback to temp directory if home directory is not writable
+    import tempfile
+    LOG_DIR = Path(tempfile.gettempdir()) / "cursor-hooks"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIT_LOG = LOG_DIR / "agent-audit.log"
+    ERROR_LOG = LOG_DIR / "error.log"
 
 
 def log_error(message):
