@@ -212,6 +212,46 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> bool:
         return False
 
 
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
+    """Remove environment variable from a user's shell rc files."""
+    try:
+        rc_files = [
+            home_dir / ".zprofile",
+            home_dir / ".bash_profile"
+        ]
+
+        success = False
+        export_prefix = f"export {var_name}="
+
+        for rc_file in rc_files:
+            if not rc_file.exists():
+                continue
+
+            try:
+                with open(rc_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+
+                new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
+
+                if len(new_lines) < len(lines):
+                    with open(rc_file, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+
+                    # Set correct ownership
+                    user_info = pwd.getpwnam(username)
+                    os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
+
+                    debug_print(f"Removed {var_name} from {rc_file}")
+                    success = True
+            except Exception as e:
+                debug_print(f"Failed to update {rc_file}: {e}")
+
+        return success
+    except Exception as e:
+        debug_print(f"Error removing env var for {username}: {e}")
+        return False
+
+
 def set_env_var_unix(var_name: str, value: str) -> bool:
     # On macOS when running as root, use system-wide approach
     if platform.system().lower() == "darwin" and os.geteuid() == 0:
@@ -367,6 +407,74 @@ def restart_cursor() -> bool:
         return False
 
 
+def clear_setup():
+    """Remove hooks and environment variables set by the setup script."""
+    print("=" * 60)
+    print("Unbound Cursor Hooks - Clearing Setup")
+    print("=" * 60)
+
+    # Check admin privileges
+    if not check_admin_privileges():
+        print("❌ This script requires administrator/root privileges")
+        print("   Please run with: sudo python3 setup.py --clear")
+        return
+
+    # Remove enterprise hooks files (NOT the entire Cursor directory)
+    print("\n🗑️  Removing enterprise hooks...")
+    enterprise_dir = get_enterprise_hooks_dir()
+    hooks_json = enterprise_dir / "hooks.json"
+    hooks_dir = enterprise_dir / "hooks"
+
+    # Remove hooks.json
+    if hooks_json.exists():
+        try:
+            hooks_json.unlink()
+            print(f"✅ Removed {hooks_json}")
+        except Exception as e:
+            print(f"❌ Failed to remove {hooks_json}: {e}")
+    else:
+        print(f"   {hooks_json} does not exist")
+
+    # Remove hooks directory
+    if hooks_dir.exists():
+        try:
+            import shutil
+            shutil.rmtree(hooks_dir)
+            print(f"✅ Removed {hooks_dir}")
+        except Exception as e:
+            print(f"❌ Failed to remove {hooks_dir}: {e}")
+    else:
+        print(f"   {hooks_dir} does not exist")
+
+    # Remove environment variable from all users
+    print("\n🗑️  Removing environment variables...")
+    user_homes = get_all_user_homes()
+
+    if not user_homes:
+        print("   No user home directories found")
+    else:
+        removed_count = 0
+        for username, home_dir in user_homes:
+            if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
+                removed_count += 1
+
+        if removed_count > 0:
+            print(f"✅ Removed environment variable from {removed_count} user(s)")
+        else:
+            print("   No environment variables found to remove")
+
+    print("\n" + "=" * 60)
+    print("Clear Complete!")
+    print("=" * 60)
+
+    # Restart Cursor
+    restart_cursor()
+
+    print("=" * 60)
+    print("\nNote: Restart your terminal or log out/in for env var changes to take effect")
+    print("=" * 60)
+
+
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, serial_number: str) -> str:
     """Fetch API key from MDM endpoint."""
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?app_name={app_name}&serial_number={serial_number}&app_type=cursor"
@@ -424,10 +532,18 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
 def main():
     global DEBUG
 
+    # Check for --clear flag first
+    clear_mode = "--clear" in sys.argv
+
     debug_mode = "--debug" in sys.argv
     if debug_mode:
         DEBUG = True
         debug_print("Debug mode enabled")
+
+    # If clear mode, run cleanup and exit
+    if clear_mode:
+        clear_setup()
+        return
 
     print("=" * 60)
     print("Unbound Cursor Hooks - MDM Setup")
@@ -468,7 +584,8 @@ def main():
 
     if not base_url or not app_name or not auth_api_key:
         print("\n❌ Missing required arguments")
-        print("Usage: python setup.py --url <base_url> --app_name <app_name> --api_key <api_key> [--debug]")
+        print("Usage: sudo python3 setup.py --url <base_url> --app_name <app_name> --api_key <api_key> [--debug]")
+        print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
     # Get serial number
