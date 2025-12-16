@@ -6,8 +6,9 @@ import platform
 import subprocess
 import json
 import time
+import pwd
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, List
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
@@ -128,7 +129,95 @@ def set_env_var_windows(var_name: str, value: str) -> bool:
         return False
 
 
+def get_all_user_homes() -> List[Tuple[str, Path]]:
+    """Get all real user home directories on the system (excluding system accounts)."""
+    user_homes = []
+
+    try:
+        # Iterate through all users in the password database
+        for user in pwd.getpwall():
+            uid = user.pw_uid
+            username = user.pw_name
+            home_dir = Path(user.pw_dir)
+
+            # Filter out system accounts (UID < 500 on macOS)
+            # Real users typically have UID >= 501 on macOS
+            if uid >= 500 and home_dir.exists() and home_dir.is_dir():
+                # Additional checks to ensure it's a real user home
+                if str(home_dir).startswith('/Users/') and username not in ['Shared', 'Guest']:
+                    user_homes.append((username, home_dir))
+                    debug_print(f"Found user: {username} -> {home_dir}")
+
+        return user_homes
+    except Exception as e:
+        debug_print(f"Error enumerating users: {e}")
+        return []
+
+
+def set_env_var_system_wide_macos(var_name: str, value: str) -> bool:
+    """Set environment variable for all users on macOS by updating each user's shell rc file."""
+    try:
+        user_homes = get_all_user_homes()
+
+        if not user_homes:
+            print("⚠️  No user home directories found")
+            return False
+
+        success_count = 0
+        export_line = f'export {var_name}="{value}"'
+
+        # Set environment variable for each user
+        for username, home_dir in user_homes:
+            debug_print(f"Setting env var for user: {username}")
+
+            # Get user's UID and GID for proper file ownership
+            try:
+                user_info = pwd.getpwnam(username)
+                uid = user_info.pw_uid
+                gid = user_info.pw_gid
+            except KeyError:
+                debug_print(f"Could not get UID/GID for {username}")
+                continue
+
+            # Try both zsh and bash profiles
+            rc_files = [
+                home_dir / ".zprofile",
+                home_dir / ".bash_profile"
+            ]
+
+            user_success = False
+            for rc_file in rc_files:
+                try:
+                    # Append to the rc file
+                    if append_to_file(rc_file, export_line, var_name):
+                        # Set correct ownership (important when running as root)
+                        os.chown(rc_file, uid, gid)
+                        debug_print(f"Updated {rc_file} for {username}")
+                        user_success = True
+                except Exception as e:
+                    debug_print(f"Failed to update {rc_file}: {e}")
+
+            if user_success:
+                success_count += 1
+
+        if success_count > 0:
+            print(f"   Set for {success_count} user(s)")
+            return True
+        else:
+            print("⚠️  Failed to set environment variable for any users")
+            return False
+
+    except Exception as e:
+        print(f"❌ Failed to set system-wide environment variable: {e}")
+        return False
+
+
 def set_env_var_unix(var_name: str, value: str) -> bool:
+    # On macOS when running as root, use system-wide approach
+    if platform.system().lower() == "darwin" and os.geteuid() == 0:
+        return set_env_var_system_wide_macos(var_name, value)
+
+    # For other cases, use the per-user approach
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False
@@ -148,9 +237,14 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
     elif system in ["darwin", "linux"]:
         success = set_env_var_unix(var_name, value)
         if success:
-            debug_print(f"Environment variable {var_name} added to shell rc file")
-            shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
-            return True, f"Run 'source ~/.{shell_name}rc' or restart terminal"
+            # Check if we're running as root on macOS (system-wide setup)
+            if system == "darwin" and os.geteuid() == 0:
+                debug_print(f"Environment variable {var_name} set system-wide")
+                return True, "Set system-wide for all users"
+            else:
+                debug_print(f"Environment variable {var_name} added to shell rc file")
+                shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
+                return True, f"Run 'source ~/.{shell_name}rc' or restart terminal"
         return False, "Failed"
     else:
         return False, f"Unsupported OS: {system}"
@@ -391,7 +485,7 @@ def main():
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
-    print("✅ Environment variable set")
+    print(f"✅ Environment variable set ({message})")
 
     # Setup hooks
     debug_print("Setting up hooks...")
