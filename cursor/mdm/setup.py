@@ -294,6 +294,14 @@ def setup_hooks():
     except Exception as e:
         print(f"⚠️  Could not make script executable: {e}")
 
+    # Set proper permissions for hooks directory (allow users to write logs)
+    try:
+        os.chmod(hooks_dir, 0o775)  # rwxrwxr-x - group can write
+        debug_print(f"Set hooks directory permissions to 775")
+        print("✅ Set hooks directory permissions")
+    except Exception as e:
+        print(f"⚠️  Could not set directory permissions: {e}")
+
     return True
 
 
