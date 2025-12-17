@@ -133,10 +133,11 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
     messages = []
     assistant_tool_uses = []
     all_assistant_responses = []
-    
+
     user_prompt = None
     user_prompt_timestamp = None
     session_id = None
+    permission_mode = None
     
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -157,10 +158,13 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
         hook_event_name = event.get('hook_event_name')
-        
+
         if not session_id:
             session_id = event.get('session_id')
-        
+
+        if not permission_mode:
+            permission_mode = event.get('permission_mode')
+
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
             if prompt:
@@ -211,10 +215,14 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
     if not messages:
         return None
     
+    if not permission_mode:
+        permission_mode = 'default'
+
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': 'auto',
-        'messages': messages
+        'messages': messages,
+        'permission_mode': permission_mode
     }
     
     return exchange
