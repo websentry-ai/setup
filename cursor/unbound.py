@@ -366,9 +366,8 @@ def main():
         # Process stop event
         if hook_event_name == 'stop' and generation_id:
             process_stop_event(generation_id, api_key)
-        
-        # Cleanup old logs to manage file size
-        cleanup_old_logs()
+            # Only cleanup after processing stop event to avoid race conditions
+            cleanup_old_logs()
         
         # Output required by Cursor hooks
         print("{}")
