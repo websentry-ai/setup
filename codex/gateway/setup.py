@@ -255,7 +255,8 @@ def verify_api_key(api_key: str) -> bool:
         url = "https://api.getunbound.ai/v1/models"
         headers = {
             "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "Unbound CLI"
         }
         
         request = urllib.request.Request(url, headers=headers)
