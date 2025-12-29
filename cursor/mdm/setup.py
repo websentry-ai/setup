@@ -13,7 +13,7 @@ from typing import Tuple, List
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 
-DEBUG = False
+DEBUG = True
 
 
 def debug_print(message: str) -> None:
@@ -91,6 +91,18 @@ def get_shell_rc_file() -> Path:
         raise OSError(f"Unsupported operating system: {system}")
 
 
+def check_env_var_exists(rc_file: Path, var_name: str, value: str) -> bool:
+    if not rc_file.exists():
+        return False
+    try:
+        with open(rc_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        export_line = f'export {var_name}="{value}"'
+        return any(l.rstrip() == export_line for l in lines)
+    except Exception:
+        return False
+
+
 def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
     try:
         file_path.touch(exist_ok=True)
@@ -154,16 +166,18 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
         return []
 
 
-def set_env_var_system_wide_macos(var_name: str, value: str) -> bool:
-    """Set environment variable for all users on macOS by updating each user's shell rc file."""
+def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool]:
+    """Set environment variable for all users on macOS by updating each user's shell rc file.
+    Returns: (success, changed)"""
     try:
         user_homes = get_all_user_homes()
 
         if not user_homes:
             print("⚠️  No user home directories found")
-            return False
+            return False, False
 
         success_count = 0
+        changed_count = 0
         export_line = f'export {var_name}="{value}"'
 
         # Set environment variable for each user
@@ -186,30 +200,35 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> bool:
             ]
 
             user_success = False
+            user_changed = False
             for rc_file in rc_files:
                 try:
-                    # Append to the rc file
+                    exists_already = check_env_var_exists(rc_file, var_name, value)
                     if append_to_file(rc_file, export_line, var_name):
                         # Set correct ownership (important when running as root)
                         os.chown(rc_file, uid, gid)
                         debug_print(f"Updated {rc_file} for {username}")
                         user_success = True
+                        if not exists_already:
+                            user_changed = True
                 except Exception as e:
                     debug_print(f"Failed to update {rc_file}: {e}")
 
             if user_success:
                 success_count += 1
+            if user_changed:
+                changed_count += 1
 
         if success_count > 0:
             print(f"   Set for {success_count} user(s)")
-            return True
+            return True, changed_count > 0
         else:
             print("⚠️  Failed to set environment variable for any users")
-            return False
+            return False, False
 
     except Exception as e:
         print(f"❌ Failed to set system-wide environment variable: {e}")
-        return False
+        return False, False
 
 
 def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
@@ -252,42 +271,57 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
         return False
 
 
-def set_env_var_unix(var_name: str, value: str) -> bool:
-    # On macOS when running as root, use system-wide approach
+def set_env_var_unix(var_name: str, value: str) -> Tuple[bool, bool]:
     if platform.system().lower() == "darwin" and os.geteuid() == 0:
         return set_env_var_system_wide_macos(var_name, value)
 
     # For other cases, use the per-user approach
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return False, False
 
+    exists_already = check_env_var_exists(rc_file, var_name, value)
     export_line = f'export {var_name}="{value}"'
-    return append_to_file(rc_file, export_line, var_name)
+    success = append_to_file(rc_file, export_line, var_name)
+    return success, success and not exists_already
 
 
-def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
+def set_env_var(var_name: str, value: str) -> Tuple[bool, bool, str]:
     system = platform.system().lower()
 
     if system == "windows":
         success = set_env_var_windows(var_name, value)
         if success:
             debug_print(f"Environment variable {var_name} set on Windows")
-        return (True, "Set for new terminals") if success else (False, "Failed")
+        msg = "Set for new terminals" if success else "Failed"
+        return (success, True, msg)
     elif system in ["darwin", "linux"]:
-        success = set_env_var_unix(var_name, value)
+        success, changed = set_env_var_unix(var_name, value)
         if success:
             # Check if we're running as root on macOS (system-wide setup)
             if system == "darwin" and os.geteuid() == 0:
                 debug_print(f"Environment variable {var_name} set system-wide")
-                return True, "Set system-wide for all users"
+                return True, changed, "Set system-wide for all users"
             else:
                 debug_print(f"Environment variable {var_name} added to shell rc file")
                 shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
-                return True, f"Run 'source ~/.{shell_name}rc' or restart terminal"
-        return False, "Failed"
+                return True, changed, f"Run 'source ~/.{shell_name}rc' or restart terminal"
+        return False, False, "Failed"
     else:
-        return False, f"Unsupported OS: {system}"
+        return False, False, f"Unsupported OS: {system}"
+
+
+def compare_hooks_json(hooks_json_path: Path, new_content: str) -> bool:
+    if not hooks_json_path.exists():
+        return True
+    try:
+        with open(hooks_json_path, 'r', encoding='utf-8') as f:
+            existing_content = f.read()
+        existing = json.loads(existing_content)
+        new = json.loads(new_content)
+        return existing != new
+    except Exception:
+        return True
 
 
 def download_file(url: str, dest_path: Path) -> bool:
@@ -307,24 +341,36 @@ def download_file(url: str, dest_path: Path) -> bool:
         return False
 
 
-def setup_hooks():
+def setup_hooks() -> Tuple[bool, bool]:
     enterprise_dir = get_enterprise_hooks_dir()
     hooks_dir = enterprise_dir / "hooks"
     hooks_json = enterprise_dir / "hooks.json"
     script_path = hooks_dir / "unbound.py"
+    temp_hooks_json = enterprise_dir / "hooks.json.tmp"
 
     debug_print(f"Enterprise hooks directory: {enterprise_dir}")
     debug_print(f"Hooks JSON path: {hooks_json}")
     debug_print(f"Script path: {script_path}")
 
     print("\n📥 Downloading hooks configuration...")
-    if not download_file(HOOKS_URL, hooks_json):
-        return False
+    if not download_file(HOOKS_URL, temp_hooks_json):
+        return False, False
+
+    hooks_changed = False
+    try:
+        with open(temp_hooks_json, 'r', encoding='utf-8') as f:
+            new_hooks_content = f.read()
+        hooks_changed = compare_hooks_json(hooks_json, new_hooks_content)
+        hooks_json.parent.mkdir(parents=True, exist_ok=True)
+        temp_hooks_json.replace(hooks_json)
+    except Exception as e:
+        debug_print(f"Failed to handle hooks.json: {e}")
+        return False, False
     print("✅ hooks.json downloaded")
 
     print("📥 Downloading unbound.py script...")
     if not download_file(SCRIPT_URL, script_path):
-        return False
+        return False, hooks_changed
     print("✅ unbound.py downloaded")
 
     try:
@@ -336,13 +382,13 @@ def setup_hooks():
 
     # Set proper permissions for hooks directory (allow users to write logs)
     try:
-        os.chmod(hooks_dir, 0o775)  # rwxrwxr-x - group can write
+        os.chmod(hooks_dir, 0o775)
         debug_print(f"Set hooks directory permissions to 775")
         print("✅ Set hooks directory permissions")
     except Exception as e:
         print(f"⚠️  Could not set directory permissions: {e}")
 
-    return True
+    return True, hooks_changed
 
 
 def restart_cursor() -> bool:
@@ -606,7 +652,7 @@ def main():
 
     # Set environment variable
     debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
-    success, message = set_env_var("UNBOUND_CURSOR_API_KEY", cursor_api_key)
+    success, env_changed, message = set_env_var("UNBOUND_CURSOR_API_KEY", cursor_api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
@@ -614,7 +660,8 @@ def main():
 
     # Setup hooks
     debug_print("Setting up hooks...")
-    if not setup_hooks():
+    hooks_success, hooks_changed = setup_hooks()
+    if not hooks_success:
         print("\n❌ Failed to setup hooks")
         return
     debug_print("Hooks setup complete")
@@ -623,7 +670,11 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    restart_cursor()
+    if env_changed or hooks_changed:
+        debug_print(f"Restart needed: env_changed={env_changed}, hooks_changed={hooks_changed}")
+        restart_cursor()
+    else:
+        debug_print("No changes detected, skipping restart")
 
     print("=" * 60)
     print("\n")
