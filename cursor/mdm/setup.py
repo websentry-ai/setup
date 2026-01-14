@@ -523,7 +523,10 @@ def clear_setup():
 
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, serial_number: str) -> str:
     """Fetch API key from MDM endpoint."""
-    url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?app_name={app_name}&serial_number={serial_number}&app_type=cursor"
+    params = f"serial_number={serial_number}&app_type=cursor"
+    if app_name:
+        params = f"app_name={app_name}&{params}"
+    url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
 
     debug_print(f"Fetching API key from: {url}")
 
@@ -628,9 +631,9 @@ def main():
         else:
             i += 1
 
-    if not base_url or not app_name or not auth_api_key:
+    if not base_url or not auth_api_key:
         print("\n❌ Missing required arguments")
-        print("Usage: sudo python3 setup.py --url <base_url> --app_name <app_name> --api_key <api_key> [--debug]")
+        print("Usage: sudo python3 setup.py --url <base_url> --api_key <api_key> [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
