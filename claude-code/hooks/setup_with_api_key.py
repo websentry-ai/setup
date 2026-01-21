@@ -11,6 +11,14 @@ import subprocess
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 
+DEBUG = False
+
+
+def debug_print(message: str) -> None:
+    """Print message only if DEBUG mode is enabled."""
+    if DEBUG:
+        print(f"[DEBUG] {message}")
+
 
 def install_macos_certificates():
     """Run Python certificate installation command on macOS."""
@@ -67,6 +75,7 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
 
 
 def set_env_var_windows(var_name: str, value: str) -> bool:
+    debug_print(f"Writing to user environment registry (Windows)")
     try:
         import subprocess
         subprocess.run(["setx", var_name, value], check=True, capture_output=True)
@@ -80,7 +89,8 @@ def set_env_var_unix(var_name: str, value: str) -> bool:
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False
-    
+
+    debug_print(f"Writing to shell file: {rc_file}")
     export_line = f'export {var_name}="{value}"'
     return append_to_file(rc_file, export_line, var_name)
 
@@ -163,11 +173,14 @@ def remove_env_var(var_name: str) -> Tuple[bool, str]:
 def download_file(url: str, dest_path: Path) -> bool:
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
             ["curl", "-fsSL", "-o", str(dest_path), url],
             capture_output=True,
             timeout=30
         )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"❌ Failed to download {url}: {e}")
@@ -177,21 +190,18 @@ def download_file(url: str, dest_path: Path) -> bool:
 def setup_hooks():
     hooks_dir = Path.home() / ".claude" / "hooks"
     script_path = hooks_dir / "unbound.py"
-    
-    # print("\n📥 Downloading unbound.py script...")
-    
+
+    debug_print("Setting up hooks...")
     if not download_file(SCRIPT_URL, script_path):
         return False
-    # print("✅ unbound.py downloaded")
-    
+    debug_print("Hooks downloaded successfully")
+
     try:
         current_mode = script_path.stat().st_mode
         os.chmod(script_path, current_mode | 0o111)
-        # print("✅ Made unbound.py executable")
     except Exception as e:
-        # print(f"⚠️  Could not make script executable: {e}")
         pass
-    
+
     return True
 
 
@@ -297,8 +307,8 @@ def configure_claude_settings() -> bool:
         
         with open(settings_path, 'w', encoding='utf-8') as f:
             json.dump(settings, f, indent=2)
-        
-        # print("✅ Claude settings configured successfully")
+
+        debug_print("Claude settings configured successfully")
         return True
         
     except json.JSONDecodeError as e:
@@ -311,10 +321,17 @@ def configure_claude_settings() -> bool:
 
 
 def main():
+    global DEBUG
+
     install_macos_certificates()
-    
+
+    # Parse --debug flag
+    if "--debug" in sys.argv:
+        DEBUG = True
+        debug_print("Debug mode enabled")
+
     print("Claude code setup")
-    
+
     api_key = None
     for i, arg in enumerate(sys.argv):
         if arg == "--api-key" and i + 1 < len(sys.argv):
@@ -325,23 +342,27 @@ def main():
         print("❌ Missing required argument: --api-key")
         print("Usage: python3 setup_with_api_key.py --api-key YOUR_API_KEY")
         return
-    
+
+
+    debug_print("Setting UNBOUND_CLAUDE_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
-    
+    debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
+
     # Remove ANTHROPIC_BASE_URL if it exists
+    debug_print("Removing ANTHROPIC_BASE_URL if it exists...")
     try:
         remove_env_var("ANTHROPIC_BASE_URL")
     except Exception:
         pass
-    
+
     if not setup_hooks():
         print("❌ Failed to setup hooks")
         return
-    
-    import json
+
+    debug_print("Configuring Claude settings...")
     if not configure_claude_settings():
         print("❌ Failed to configure Claude settings")
         return

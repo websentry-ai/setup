@@ -93,6 +93,7 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
 
 
 def set_env_var_windows(var_name: str, value: str) -> bool:
+    debug_print(f"Writing to user environment registry (Windows)")
     try:
         subprocess.run(["setx", var_name, value], check=True, capture_output=True)
         return True
@@ -105,7 +106,8 @@ def set_env_var_unix(var_name: str, value: str) -> bool:
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False
-    
+
+    debug_print(f"Writing to shell file: {rc_file}")
     export_line = f'export {var_name}="{value}"'
     return append_to_file(rc_file, export_line, var_name)
 

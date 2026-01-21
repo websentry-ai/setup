@@ -103,14 +103,15 @@ def append_to_file(file_path: Path, line: str) -> bool:
 def set_env_var_on_windows(var_name: str, value: str) -> bool:
     """
     Set environment variable permanently on Windows using setx.
-    
+
     Args:
         var_name: Name of the environment variable
         value: Value to set
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
+    debug_print(f"Writing to user environment registry (Windows)")
     try:
         subprocess.run(["setx", var_name, value], check=True, capture_output=True)
         return True
@@ -127,18 +128,19 @@ def set_env_var_on_windows(var_name: str, value: str) -> bool:
 def set_env_var_on_unix(var_name: str, value: str) -> bool:
     """
     Set environment variable permanently on Unix-like systems (macOS, Linux).
-    
+
     Args:
         var_name: Name of the environment variable
         value: Value to set
-    
+
     Returns:
         bool: True if successful, False otherwise
     """
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False
-    
+
+    debug_print(f"Writing to shell file: {rc_file}")
     export_line = f'export {var_name}="{value}"'
     
     was_added = append_to_file(rc_file, export_line)

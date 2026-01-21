@@ -218,6 +218,7 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
     try:
         if system == "darwin":
             rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+            debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
             user_success = False
             user_changed = False
             export_line = f'export {var_name}="{value}"'
@@ -244,6 +245,7 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
         elif system == "linux":
             rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+            debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
             user_success = False
             user_changed = False
             export_line = f'export {var_name}="{value}"'
@@ -269,6 +271,7 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
             return user_success, user_changed
 
         elif system == "windows":
+            debug_print(f"Writing to system registry (Windows)")
             try:
                 subprocess.run(
                     ["setx", var_name, value, "/M"],
