@@ -7,7 +7,7 @@ import subprocess
 import json
 import pwd
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 DEBUG = True
 
@@ -27,7 +27,7 @@ def check_admin_privileges() -> bool:
         return False
 
 
-def get_device_identifier() -> str:
+def get_device_identifier() -> Optional[str]:
     system = platform.system().lower()
     try:
         if system == "darwin":
@@ -318,7 +318,7 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         return False, False
 
 
-def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> str:
+def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
     params = f"serial_number={device_id}&app_type=default"
     if app_name:
         params = f"app_name={app_name}&{params}"
