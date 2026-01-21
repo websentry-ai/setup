@@ -198,6 +198,7 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
                 home_dir / ".zprofile",
                 home_dir / ".bash_profile"
             ]
+            debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
 
             user_success = False
             user_changed = False

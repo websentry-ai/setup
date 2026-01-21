@@ -11,6 +11,14 @@ from typing import Tuple
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 
+DEBUG = False
+
+
+def debug_print(message: str) -> None:
+    """Print message only if DEBUG mode is enabled."""
+    if DEBUG:
+        print(f"[DEBUG] {message}")
+
 
 def install_macos_certificates():
     """Run Python certificate installation command on macOS."""
@@ -69,6 +77,7 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
 
 
 def set_env_var_windows(var_name: str, value: str) -> bool:
+    debug_print(f"Writing to user environment registry (Windows)")
     try:
         import subprocess
         subprocess.run(["setx", var_name, value], check=True, capture_output=True)
@@ -83,6 +92,7 @@ def set_env_var_unix(var_name: str, value: str) -> bool:
     if rc_file is None:
         return False
 
+    debug_print(f"Writing to shell file: {rc_file}")
     export_line = f'export {var_name}="{value}"'
     return append_to_file(rc_file, export_line, var_name)
 
@@ -106,11 +116,14 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
 def download_file(url: str, dest_path: Path) -> bool:
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
         result = subprocess.run(
             ["curl", "-fsSL", "-o", str(dest_path), url],
             capture_output=True,
             timeout=30
         )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"❌ Failed to download {url}: {e}")
@@ -122,6 +135,7 @@ def setup_hooks():
     hooks_json = Path.home() / ".cursor" / "hooks.json"
     script_path = hooks_dir / "unbound.py"
 
+    debug_print("Setting up hooks...")
     print("\n📥 Downloading hooks configuration...")
     if not download_file(HOOKS_URL, hooks_json):
         return False
@@ -139,6 +153,7 @@ def setup_hooks():
     except Exception as e:
         print(f"⚠️ Could not make script executable: {e}")
 
+    debug_print("Hooks setup complete")
     return True
 
 
@@ -190,8 +205,15 @@ def restart_cursor() -> bool:
 
 
 def main():
+    global DEBUG
+
     install_macos_certificates()
-    
+
+    # Parse --debug flag
+    if "--debug" in sys.argv:
+        DEBUG = True
+        debug_print("Debug mode enabled")
+
     print("=" * 60)
     print("Unbound Cursor Hooks - Setup with API Key")
     print("=" * 60)
@@ -213,10 +235,12 @@ def main():
 
     print("\n✅ API key provided")
 
+    debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
+    debug_print("UNBOUND_CURSOR_API_KEY set successfully")
 
     print(f"✅ Environment variable set ({message})")
 
