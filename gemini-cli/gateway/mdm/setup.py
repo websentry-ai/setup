@@ -98,24 +98,20 @@ def get_device_identifier() -> str:
                 )
                 if result.returncode == 0:
                     lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-                    if len(lines) > 1:
+                    if len(lines) >= 2:
                         return lines[1]
             except Exception:
-                debug_print("WMI query failed, trying registry")
+                debug_print("wmic failed, trying registry")
 
             try:
                 result = subprocess.run(
-                    ["reg", "query", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
+                    ["reg", "query", "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "/v", "ProcessorNameString"],
                     capture_output=True,
                     text=True,
                     timeout=10
                 )
                 if result.returncode == 0:
-                    for line in result.stdout.split('\n'):
-                        if 'MachineGuid' in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                return parts[-1]
+                    return result.stdout.strip()
             except Exception:
                 pass
 
@@ -322,57 +318,6 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         return False, False
 
 
-def setup_claude_key_helper_for_user(username: str, home_dir: Path) -> bool:
-    system = platform.system().lower()
-    try:
-        claude_dir = home_dir / ".claude"
-        settings_path = claude_dir / "settings.json"
-        key_helper_path = claude_dir / "anthropic_key.sh"
-
-        claude_dir.mkdir(parents=True, exist_ok=True)
-
-        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
-
-        if system in ["darwin", "linux"]:
-            try:
-                current_mode = key_helper_path.stat().st_mode
-                os.chmod(key_helper_path, current_mode | 0o111)
-            except Exception as e:
-                debug_print(f"Failed to make script executable: {e}")
-
-        settings = {}
-        if settings_path.exists():
-            try:
-                settings = json.loads(settings_path.read_text(encoding="utf-8")) or {}
-            except Exception:
-                settings = {}
-
-        if "hooks" in settings:
-            del settings["hooks"]
-
-        settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-
-        if system in ["darwin", "linux"]:
-            try:
-                user_info = pwd.getpwnam(username)
-                os.chown(key_helper_path, user_info.pw_uid, user_info.pw_gid)
-                os.chown(settings_path, user_info.pw_uid, user_info.pw_gid)
-                os.chown(claude_dir, user_info.pw_uid, user_info.pw_gid)
-                os.chmod(key_helper_path, 0o755)
-                os.chmod(settings_path, 0o644)
-                os.chmod(claude_dir, 0o755)
-            except Exception as e:
-                debug_print(f"Failed to set ownership/permissions for {username}: {e}")
-
-        debug_print(f"Configured Claude key helper for {username}")
-        return True
-
-    except Exception as e:
-        debug_print(f"Failed to setup Claude key helper for {username}: {e}")
-        return False
-
-
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> str:
     params = f"serial_number={device_id}&app_type=default"
     if app_name:
@@ -515,47 +460,9 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
         return False
 
 
-def remove_claude_key_helper_from_user(username: str, home_dir: Path) -> bool:
-    try:
-        claude_dir = home_dir / ".claude"
-        key_helper_path = claude_dir / "anthropic_key.sh"
-        settings_path = claude_dir / "settings.json"
-
-        if key_helper_path.exists():
-            try:
-                key_helper_path.unlink()
-                debug_print(f"Removed {key_helper_path}")
-            except Exception as e:
-                debug_print(f"Failed to remove {key_helper_path}: {e}")
-
-        if settings_path.exists():
-            try:
-                with open(settings_path, 'r', encoding='utf-8') as f:
-                    settings = json.load(f)
-                changed = False
-                if "apiKeyHelper" in settings:
-                    del settings["apiKeyHelper"]
-                    changed = True
-                if "hooks" in settings:
-                    del settings["hooks"]
-                    changed = True
-
-                if changed:
-                    with open(settings_path, 'w', encoding='utf-8') as f:
-                        json.dump(settings, f, indent=2)
-                    debug_print("Cleaned settings.json")
-            except Exception as e:
-                debug_print(f"Failed to update settings.json: {e}")
-
-        return True
-    except Exception as e:
-        debug_print(f"Error removing Claude config for {username}: {e}")
-        return False
-
-
 def clear_setup():
     print("=" * 60)
-    print("Claude Code - Clearing MDM Setup")
+    print("Gemini CLI - Clearing MDM Setup")
     print("=" * 60)
 
     if not check_admin_privileges():
@@ -571,25 +478,14 @@ def clear_setup():
     else:
         removed_count = 0
         for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY"):
+            if remove_env_var_from_user(username, home_dir, "GEMINI_API_KEY"):
                 removed_count += 1
-            remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+            remove_env_var_from_user(username, home_dir, "GOOGLE_GEMINI_BASE_URL")
 
         if removed_count > 0:
             print(f"✅ Removed environment variables from {removed_count} user(s)")
         else:
             print("   No environment variables found to remove")
-
-    print("\n🗑️  Removing Claude configuration...")
-    config_removed = 0
-    for username, home_dir in user_homes:
-        if remove_claude_key_helper_from_user(username, home_dir):
-            config_removed += 1
-
-    if config_removed > 0:
-        print(f"✅ Removed Claude configuration from {config_removed} user(s)")
-    else:
-        print("   No Claude configuration found to remove")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -611,7 +507,7 @@ def main():
         return
 
     print("=" * 60)
-    print("Claude Code - MDM Setup")
+    print("Gemini CLI - MDM Setup")
     print("=" * 60)
 
     if not check_admin_privileges():
@@ -660,49 +556,34 @@ def main():
     print("✅ Device identifier retrieved")
 
     print("\n🔑 Fetching API key from MDM...")
-    claude_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
-    if not claude_api_key:
+    gemini_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
+    if not gemini_api_key:
         return
     print("✅ API key received")
 
     print("\n📝 Setting environment variables system-wide...")
-    success, env_changed = set_env_var_system_wide("UNBOUND_API_KEY", claude_api_key)
+    success, env_changed = set_env_var_system_wide("GEMINI_API_KEY", gemini_api_key)
     if not success:
-        print(f"❌ Failed to set UNBOUND_API_KEY")
+        print(f"❌ Failed to set GEMINI_API_KEY")
         return
-    debug_print("UNBOUND_API_KEY set successfully")
+    debug_print("GEMINI_API_KEY set successfully")
 
-    success, url_changed = set_env_var_system_wide("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
+    success, url_changed = set_env_var_system_wide("GOOGLE_GEMINI_BASE_URL", "https://api.getunbound.ai/v1")
     if not success:
-        print(f"❌ Failed to set ANTHROPIC_BASE_URL")
+        print(f"❌ Failed to set GOOGLE_GEMINI_BASE_URL")
         return
-    debug_print("ANTHROPIC_BASE_URL set successfully")
-
-    print("\n🔧 Configuring Claude for all users...")
-    user_homes = get_all_user_homes()
-    config_count = 0
-
-    for username, home_dir in user_homes:
-        if setup_claude_key_helper_for_user(username, home_dir):
-            config_count += 1
-
-    if config_count > 0:
-        print(f"✅ Configured Claude for {config_count} user(s)")
-    else:
-        print("⚠️  Failed to configure Claude for any users")
+    debug_print("GOOGLE_GEMINI_BASE_URL set successfully")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
-    print("=" * 60)
-    print("\n")
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  Setup cancelled.")
+        print("\n\n⚠️  Setup cancelled by user.")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\n❌ An error occurred: {e}")
         exit(1)
