@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Tuple, List, Optional
 
 DEBUG = True
+SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 
 
 def debug_print(message: str) -> None:
@@ -132,7 +133,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
 
     try:
         if system == "darwin":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -143,7 +144,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -201,7 +202,7 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
 
         return True
     except Exception as e:
-        print(f"❌ Failed to modify {file_path}: {e}")
+        print(f"Failed to modify {file_path}: {e}")
         return False
 
 
@@ -299,7 +300,7 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         user_homes = get_all_user_homes()
 
         if not user_homes:
-            print("⚠️  No user home directories found")
+            print("No user home directories found")
             return False, False
 
         success_count = 0
@@ -317,16 +318,16 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
             print(f"   Set for {success_count} user(s)")
             return True, changed_count > 0
         else:
-            print("⚠️  Failed to set environment variable for any users")
+            print("Failed to set environment variable for any users")
             return False, False
 
     except Exception as e:
-        print(f"❌ Failed to set system-wide environment variable: {e}")
+        print(f"Failed to set system-wide environment variable: {e}")
         return False, False
 
 
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
-    params = f"serial_number={device_id}&app_type=default"
+    params = f"serial_number={device_id}&app_type=claude-code"
     if app_name:
         params = f"app_name={app_name}&{params}"
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
@@ -343,7 +344,7 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
 
         output_lines = result.stdout.strip().split('\n')
         if len(output_lines) < 2:
-            print("❌ Invalid response from server")
+            print("Invalid response from server")
             return None
 
         http_code = output_lines[-1]
@@ -353,14 +354,14 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         debug_print(f"Response: {response_body}")
 
         if http_code != "200":
-            print(f"❌ API request failed with status {http_code}")
+            print(f"API request failed with status {http_code}")
             return None
 
         try:
             data = json.loads(response_body)
             api_key = data.get("api_key")
             if not api_key:
-                print("❌ No api_key in response")
+                print("No api_key in response")
                 return None
             user_email = data.get("email")
             first_name = data.get("first_name")
@@ -369,15 +370,15 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
             print(f"Name: {first_name} {last_name}")
             return api_key
         except json.JSONDecodeError:
-            print("❌ Invalid JSON response from server")
+            print("Invalid JSON response from server")
             return None
 
     except subprocess.TimeoutExpired:
-        print("❌ Request timed out")
+        print("Request timed out")
         return None
     except Exception as e:
         debug_print(f"Request failed: {e}")
-        print("❌ Failed to fetch API key")
+        print("Failed to fetch API key")
         return None
 
 
@@ -480,79 +481,179 @@ def get_managed_settings_dir() -> Path:
         raise OSError(f"Unsupported operating system: {system}")
 
 
-def setup_managed_settings() -> bool:
+def download_file(url: str, dest_path: Path) -> bool:
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", str(dest_path), url],
+            capture_output=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"Failed to download {url}: {e}")
+        return False
+
+
+def setup_managed_hooks() -> bool:
     """
-    Set up system-wide managed settings for Claude Code.
-    Creates managed-settings.json and anthropic_key.sh in the system location.
+    Set up system-wide managed hooks for Claude Code.
+    Downloads unbound.py and configures managed-settings.json with hooks.
     """
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
         settings_path = managed_dir / "managed-settings.json"
-        key_helper_path = managed_dir / "anthropic_key.sh"
+        hooks_dir = managed_dir / "hooks"
+        script_path = hooks_dir / "unbound.py"
 
-        # Create directory
+        # Create directories
         managed_dir.mkdir(parents=True, exist_ok=True)
+        hooks_dir.mkdir(parents=True, exist_ok=True)
         debug_print(f"Created managed settings directory: {managed_dir}")
 
-        # Create anthropic_key.sh script
-        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
-        debug_print(f"Created key helper script: {key_helper_path}")
+        # Download unbound.py script
+        if not download_file(SCRIPT_URL, script_path):
+            print("Failed to download unbound.py")
+            return False
+        debug_print(f"Downloaded hook script: {script_path}")
 
         # Make script executable on Unix systems
         if system in ["darwin", "linux"]:
-            os.chmod(key_helper_path, 0o755)
+            os.chmod(script_path, 0o755)
             debug_print("Set script as executable")
 
-        # Create managed-settings.json
-        settings = {
-            "apiKeyHelper": str(key_helper_path)
+        # Read existing settings or create new
+        settings = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    settings = json.load(f) or {}
+            except Exception:
+                settings = {}
+
+        # Configure hooks
+        hook_command = str(script_path)
+        hooks_config = {
+            "PostToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "SessionStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "SessionEnd": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ]
         }
+
+        settings["hooks"] = hooks_config
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 
         # Set permissions - readable by all users
         if system in ["darwin", "linux"]:
             os.chmod(managed_dir, 0o755)
+            os.chmod(hooks_dir, 0o755)
             os.chmod(settings_path, 0o644)
-            os.chmod(key_helper_path, 0o755)
+            os.chmod(script_path, 0o755)
 
         return True
 
     except Exception as e:
-        print(f"❌ Failed to setup managed settings: {e}")
+        print(f"Failed to setup managed hooks: {e}")
         debug_print(f"Error details: {e}")
         return False
 
 
-def clear_managed_settings() -> bool:
-    """Remove the apiKeyHelper script and setting from managed Claude config."""
+def clear_managed_hooks() -> bool:
+    """Remove the hooks script and hooks setting from managed Claude config."""
     try:
         managed_dir = get_managed_settings_dir()
         settings_path = managed_dir / "managed-settings.json"
-        key_helper_path = managed_dir / "anthropic_key.sh"
+        hooks_dir = managed_dir / "hooks"
+        script_path = hooks_dir / "unbound.py"
 
         removed_any = False
 
-        # Remove the key helper script
-        if key_helper_path.exists():
+        # Remove the hook script
+        if script_path.exists():
             try:
-                key_helper_path.unlink()
-                debug_print(f"Removed {key_helper_path}")
+                script_path.unlink()
+                debug_print(f"Removed {script_path}")
                 removed_any = True
             except Exception as e:
-                debug_print(f"Failed to remove {key_helper_path}: {e}")
+                debug_print(f"Failed to remove {script_path}: {e}")
 
-        # Remove apiKeyHelper from managed-settings.json (keep the file)
+        # Try to remove hooks directory if empty
+        if hooks_dir.exists():
+            try:
+                if not any(hooks_dir.iterdir()):
+                    hooks_dir.rmdir()
+                    debug_print(f"Removed empty directory {hooks_dir}")
+            except Exception as e:
+                debug_print(f"Could not remove directory {hooks_dir}: {e}")
+
+        # Remove hooks from managed-settings.json (keep the file)
         if settings_path.exists():
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                if "apiKeyHelper" in settings:
-                    del settings["apiKeyHelper"]
+                if "hooks" in settings:
+                    del settings["hooks"]
                     with open(settings_path, "w", encoding="utf-8") as f:
                         json.dump(settings, f, indent=2)
-                    debug_print("Removed apiKeyHelper from managed-settings.json")
+                    debug_print("Removed hooks from managed-settings.json")
                     removed_any = True
             except Exception as e:
                 debug_print(f"Failed to update managed-settings.json: {e}")
@@ -560,21 +661,21 @@ def clear_managed_settings() -> bool:
         return removed_any
 
     except Exception as e:
-        debug_print(f"Error clearing managed settings: {e}")
+        debug_print(f"Error clearing managed hooks: {e}")
         return False
 
 
 def clear_setup():
     print("=" * 60)
-    print("Claude Code - Clearing MDM Setup")
+    print("Claude Code Hooks - Clearing MDM Setup")
     print("=" * 60)
 
     if not check_admin_privileges():
-        print("❌ This script requires administrator/root privileges")
+        print("This script requires administrator/root privileges")
         print("   Please run with: sudo python3 setup.py --clear")
         return
 
-    print("\n🗑️  Removing environment variables...")
+    print("\nRemoving environment variables...")
     user_homes = get_all_user_homes()
 
     if not user_homes:
@@ -582,22 +683,21 @@ def clear_setup():
     else:
         removed_count = 0
         for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY"):
+            if remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY"):
                 removed_count += 1
-            remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
         if removed_count > 0:
-            print(f"✅ Removed environment variables from {removed_count} user(s)")
+            print(f"Removed environment variables from {removed_count} user(s)")
         else:
             print("   No environment variables found to remove")
 
-    # Remove managed settings
-    print("\n🗑️  Removing managed settings...")
-    if clear_managed_settings():
+    # Remove managed hooks
+    print("\nRemoving managed hooks...")
+    if clear_managed_hooks():
         managed_dir = get_managed_settings_dir()
-        print(f"✅ Removed managed settings from {managed_dir}")
+        print(f"Removed managed hooks from {managed_dir}")
     else:
-        print("   No managed settings found to remove")
+        print("   No managed hooks found to remove")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -608,27 +708,23 @@ def main():
     global DEBUG
 
     clear_mode = "--clear" in sys.argv
-    debug_mode = "--debug" in sys.argv
-
-    if debug_mode:
-        DEBUG = True
-        debug_print("Debug mode enabled")
+    DEBUG = True
 
     if clear_mode:
         clear_setup()
         return
 
     print("=" * 60)
-    print("Claude Code - MDM Setup")
+    print("Claude Code Hooks - MDM Setup")
     print("=" * 60)
 
     if not check_admin_privileges():
         system = platform.system().lower()
         if system in ["darwin", "linux"]:
-            print("❌ This script requires administrator/root privileges")
+            print("This script requires administrator/root privileges")
             print("   Please run with: sudo python3 setup.py ...")
         else:
-            print("❌ This script requires administrator privileges")
+            print("This script requires administrator privileges")
             print("   Please run as Administrator")
         return
 
@@ -654,44 +750,38 @@ def main():
             i += 1
 
     if not base_url or not auth_api_key:
-        print("\n❌ Missing required arguments")
+        print("\nMissing required arguments")
         print("Usage: sudo python3 setup.py --url <base_url> --api_key <api_key> [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
-    print("\n🔍 Getting device identifier...")
+    print("\nGetting device identifier...")
     device_id = get_device_identifier()
     if not device_id:
-        print("❌ Failed to get device identifier")
+        print("Failed to get device identifier")
         return
     debug_print(f"Device identifier: {device_id}")
-    print("✅ Device identifier retrieved")
+    print("Device identifier retrieved")
 
-    print("\n🔑 Fetching API key from MDM...")
-    claude_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
-    if not claude_api_key:
+    print("\nFetching API key from MDM...")
+    api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
+    if not api_key:
         return
-    print("✅ API key received")
+    print("API key received")
 
-    print("\n📝 Setting environment variables system-wide...")
-    success, env_changed = set_env_var_system_wide("UNBOUND_API_KEY", claude_api_key)
+    print("\nSetting environment variables system-wide...")
+    success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
-        print(f"❌ Failed to set UNBOUND_API_KEY")
+        print("Failed to set UNBOUND_CLAUDE_API_KEY")
         return
-    debug_print("UNBOUND_API_KEY set successfully")
+    debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
 
-    success, url_changed = set_env_var_system_wide("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
-    if not success:
-        print(f"❌ Failed to set ANTHROPIC_BASE_URL")
-        return
-    debug_print("ANTHROPIC_BASE_URL set successfully")
-
-    print("\n🔧 Configuring Claude managed settings...")
-    if setup_managed_settings():
+    print("\nConfiguring Claude managed hooks...")
+    if setup_managed_hooks():
         managed_dir = get_managed_settings_dir()
-        print(f"✅ Created managed settings in {managed_dir}")
+        print(f"Created managed hooks in {managed_dir}")
     else:
-        print("❌ Failed to configure managed settings")
+        print("Failed to configure managed hooks")
         return
 
     print("\n" + "=" * 60)
@@ -703,7 +793,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  Setup cancelled.")
+        print("\n\nSetup cancelled.")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         exit(1)
