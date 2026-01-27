@@ -230,6 +230,7 @@ def configure_claude_settings() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -241,6 +242,7 @@ def configure_claude_settings() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -252,6 +254,7 @@ def configure_claude_settings() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -264,6 +267,7 @@ def configure_claude_settings() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -275,6 +279,7 @@ def configure_claude_settings() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]

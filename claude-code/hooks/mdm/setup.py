@@ -545,6 +545,7 @@ def setup_managed_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -556,6 +557,7 @@ def setup_managed_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -567,6 +569,7 @@ def setup_managed_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -579,6 +582,7 @@ def setup_managed_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -590,6 +594,7 @@ def setup_managed_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
+                            "async": True,
                             "timeout": 60
                         }
                     ]
