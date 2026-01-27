@@ -325,57 +325,6 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         return False, False
 
 
-def setup_claude_key_helper_for_user(username: str, home_dir: Path) -> bool:
-    system = platform.system().lower()
-    try:
-        claude_dir = home_dir / ".claude"
-        settings_path = claude_dir / "settings.json"
-        key_helper_path = claude_dir / "anthropic_key.sh"
-
-        claude_dir.mkdir(parents=True, exist_ok=True)
-
-        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
-
-        if system in ["darwin", "linux"]:
-            try:
-                current_mode = key_helper_path.stat().st_mode
-                os.chmod(key_helper_path, current_mode | 0o111)
-            except Exception as e:
-                debug_print(f"Failed to make script executable: {e}")
-
-        settings = {}
-        if settings_path.exists():
-            try:
-                settings = json.loads(settings_path.read_text(encoding="utf-8")) or {}
-            except Exception:
-                settings = {}
-
-        if "hooks" in settings:
-            del settings["hooks"]
-
-        settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-
-        if system in ["darwin", "linux"]:
-            try:
-                user_info = pwd.getpwnam(username)
-                os.chown(key_helper_path, user_info.pw_uid, user_info.pw_gid)
-                os.chown(settings_path, user_info.pw_uid, user_info.pw_gid)
-                os.chown(claude_dir, user_info.pw_uid, user_info.pw_gid)
-                os.chmod(key_helper_path, 0o755)
-                os.chmod(settings_path, 0o644)
-                os.chmod(claude_dir, 0o755)
-            except Exception as e:
-                debug_print(f"Failed to set ownership/permissions for {username}: {e}")
-
-        debug_print(f"Configured Claude key helper for {username}")
-        return True
-
-    except Exception as e:
-        debug_print(f"Failed to setup Claude key helper for {username}: {e}")
-        return False
-
-
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
     params = f"serial_number={device_id}&app_type=default"
     if app_name:
@@ -518,41 +467,100 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
         return False
 
 
-def remove_claude_key_helper_from_user(username: str, home_dir: Path) -> bool:
-    try:
-        claude_dir = home_dir / ".claude"
-        key_helper_path = claude_dir / "anthropic_key.sh"
-        settings_path = claude_dir / "settings.json"
+def get_managed_settings_dir() -> Path:
+    """Get the system-wide managed settings directory for Claude Code."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    elif system == "linux":
+        return Path("/etc/claude-code")
+    elif system == "windows":
+        return Path("C:/Program Files/ClaudeCode")
+    else:
+        raise OSError(f"Unsupported operating system: {system}")
 
+
+def setup_managed_settings() -> bool:
+    """
+    Set up system-wide managed settings for Claude Code.
+    Creates managed-settings.json and anthropic_key.sh in the system location.
+    """
+    system = platform.system().lower()
+    try:
+        managed_dir = get_managed_settings_dir()
+        settings_path = managed_dir / "managed-settings.json"
+        key_helper_path = managed_dir / "anthropic_key.sh"
+
+        # Create directory
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Created managed settings directory: {managed_dir}")
+
+        # Create anthropic_key.sh script
+        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
+        debug_print(f"Created key helper script: {key_helper_path}")
+
+        # Make script executable on Unix systems
+        if system in ["darwin", "linux"]:
+            os.chmod(key_helper_path, 0o755)
+            debug_print("Set script as executable")
+
+        # Create managed-settings.json
+        settings = {
+            "apiKeyHelper": str(key_helper_path)
+        }
+        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        debug_print(f"Created managed settings: {settings_path}")
+
+        # Set permissions - readable by all users
+        if system in ["darwin", "linux"]:
+            os.chmod(managed_dir, 0o755)
+            os.chmod(settings_path, 0o644)
+            os.chmod(key_helper_path, 0o755)
+
+        return True
+
+    except Exception as e:
+        print(f"❌ Failed to setup managed settings: {e}")
+        debug_print(f"Error details: {e}")
+        return False
+
+
+def clear_managed_settings() -> bool:
+    """Remove the apiKeyHelper script and setting from managed Claude config."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        settings_path = managed_dir / "managed-settings.json"
+        key_helper_path = managed_dir / "anthropic_key.sh"
+
+        removed_any = False
+
+        # Remove the key helper script
         if key_helper_path.exists():
             try:
                 key_helper_path.unlink()
                 debug_print(f"Removed {key_helper_path}")
+                removed_any = True
             except Exception as e:
                 debug_print(f"Failed to remove {key_helper_path}: {e}")
 
+        # Remove apiKeyHelper from managed-settings.json (keep the file)
         if settings_path.exists():
             try:
-                with open(settings_path, 'r', encoding='utf-8') as f:
+                with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                changed = False
                 if "apiKeyHelper" in settings:
                     del settings["apiKeyHelper"]
-                    changed = True
-                if "hooks" in settings:
-                    del settings["hooks"]
-                    changed = True
-
-                if changed:
-                    with open(settings_path, 'w', encoding='utf-8') as f:
+                    with open(settings_path, "w", encoding="utf-8") as f:
                         json.dump(settings, f, indent=2)
-                    debug_print("Cleaned settings.json")
+                    debug_print("Removed apiKeyHelper from managed-settings.json")
+                    removed_any = True
             except Exception as e:
-                debug_print(f"Failed to update settings.json: {e}")
+                debug_print(f"Failed to update managed-settings.json: {e}")
 
-        return True
+        return removed_any
+
     except Exception as e:
-        debug_print(f"Error removing Claude config for {username}: {e}")
+        debug_print(f"Error clearing managed settings: {e}")
         return False
 
 
@@ -583,16 +591,13 @@ def clear_setup():
         else:
             print("   No environment variables found to remove")
 
-    print("\n🗑️  Removing Claude configuration...")
-    config_removed = 0
-    for username, home_dir in user_homes:
-        if remove_claude_key_helper_from_user(username, home_dir):
-            config_removed += 1
-
-    if config_removed > 0:
-        print(f"✅ Removed Claude configuration from {config_removed} user(s)")
+    # Remove managed settings
+    print("\n🗑️  Removing managed settings...")
+    if clear_managed_settings():
+        managed_dir = get_managed_settings_dir()
+        print(f"✅ Removed managed settings from {managed_dir}")
     else:
-        print("   No Claude configuration found to remove")
+        print("   No managed settings found to remove")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -681,24 +686,17 @@ def main():
         return
     debug_print("ANTHROPIC_BASE_URL set successfully")
 
-    print("\n🔧 Configuring Claude for all users...")
-    user_homes = get_all_user_homes()
-    config_count = 0
-
-    for username, home_dir in user_homes:
-        if setup_claude_key_helper_for_user(username, home_dir):
-            config_count += 1
-
-    if config_count > 0:
-        print(f"✅ Configured Claude for {config_count} user(s)")
+    print("\n🔧 Configuring Claude managed settings...")
+    if setup_managed_settings():
+        managed_dir = get_managed_settings_dir()
+        print(f"✅ Created managed settings in {managed_dir}")
     else:
-        print("⚠️  Failed to configure Claude for any users")
+        print("❌ Failed to configure managed settings")
+        return
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
-    print("=" * 60)
-    print("\n")
 
 
 if __name__ == "__main__":
