@@ -1,30 +1,25 @@
 #!/usr/bin/env python3
 """
-Codex CLI - Environment Setup Script
+Shared utility functions for setup scripts across different AI coding assistants.
+This module provides common functionality for environment variable management,
+URL normalization, and API key verification.
 """
 
 import os
-import sys
 import platform
 import subprocess
+import urllib.request
+import urllib.error
 import urllib.parse
 import json
 from pathlib import Path
-from typing import Optional, Dict
-import argparse
+from typing import Tuple, Optional, Dict
 import threading
 import http.server
 import socketserver
 import socket
 import webbrowser
 
-# Add parent directory to path to import shared utilities
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-from setup_utils import (
-    debug_print, normalize_url, get_shell_rc_file, 
-    set_env_var, remove_env_var, verify_api_key
-)
-import setup_utils
 
 DEBUG = False
 
@@ -46,12 +41,13 @@ def normalize_url(domain: str) -> str:
 
     return url.rstrip('/')
 
-def get_shell_rc_file() -> Path:
+
+def get_shell_rc_file() -> Optional[Path]:
     """
     Determine the appropriate shell configuration file based on the OS and shell.
     
     Returns:
-        Path: Path to the shell configuration file
+        Path: Path to the shell configuration file, or None for Windows
     """
     system = platform.system().lower()
     shell = os.environ.get("SHELL", "").lower()
@@ -78,29 +74,44 @@ def get_shell_rc_file() -> Path:
         raise OSError(f"Unsupported operating system: {system}")
 
 
-def append_to_file(file_path: Path, line: str) -> bool:
+def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None) -> bool:
     """
     Append a line to a file only if it's not already present.
     
     Args:
         file_path: Path to the file to append to
         line: Line to append (without newline)
+        var_name: Optional variable name to remove old exports before adding new one
     
     Returns:
-        bool: True if line was added, False if it already existed
+        bool: True if line was added or already existed, False on error
     """
     try:
         file_path.touch(exist_ok=True)
         
         with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
+            lines = f.readlines()
         
-        if line not in content:
-            with open(file_path, "a", encoding="utf-8") as f:
-                f.write(f"{line}\n")
+        # Remove existing export for this variable if var_name is provided
+        if var_name:
+            export_prefix = f"export {var_name}="
+            lines = [l for l in lines if not l.strip().startswith(export_prefix)]
+        
+        # Check if line already exists
+        if line + "\n" not in lines and line not in [l.rstrip() for l in lines]:
+            lines.append(f"{line}\n")
+            
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
             return True
-        else:
-            return False
+        
+        # If we removed an old export and need to add new one
+        if var_name:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            return True
+            
+        return True
     except Exception as e:
         print(f"❌ Failed to modify {file_path}: {e}")
         return False
@@ -151,25 +162,22 @@ def set_env_var_on_unix(var_name: str, value: str) -> bool:
     
     was_added = append_to_file(rc_file, export_line)
     
-    if was_added:
-        return True
-    else:
-        return True
+    return True if was_added else True
 
 
 def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
     """
     Set an environment variable permanently across all OS platforms.
-
+    
     Args:
         var_name: Name of the environment variable
         value: Value to set
-
+    
     Returns:
         Tuple[bool, str]: (success, message)
     """
     system = platform.system().lower()
-
+    
     if system == "windows":
         success = set_env_var_on_windows(var_name, value)
         if success:
@@ -177,7 +185,7 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
             return True, "Environment variable set for new terminals"
         else:
             return False, "Failed to set environment variable"
-
+    
     elif system in ["darwin", "linux"]:
         success = set_env_var_on_unix(var_name, value)
         if success:
@@ -186,13 +194,21 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
             return True, f"Run 'source ~/.{shell_name}rc' or restart terminal"
         else:
             return False, "Failed to set environment variable"
-
+    
     else:
         return False, f"Unsupported OS: {system}"
 
 
 def remove_env_var_on_unix(var_name: str) -> bool:
-    """Remove an environment variable export line from the user's shell rc file."""
+    """
+    Remove an environment variable export line from the user's shell rc file.
+    
+    Args:
+        var_name: Name of the environment variable to remove
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False
@@ -207,7 +223,6 @@ def remove_env_var_on_unix(var_name: str) -> bool:
         for line in lines:
             if line.strip().startswith(export_prefix):
                 removed = True
-                debug_print(f"Removing {var_name} from {rc_file}")
                 continue
             new_lines.append(line)
         if removed:
@@ -220,12 +235,21 @@ def remove_env_var_on_unix(var_name: str) -> bool:
 
 
 def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove a user environment variable on Windows."""
+    """
+    Remove a user environment variable on Windows by deleting it from HKCU\\Environment.
+    
+    Args:
+        var_name: Name of the environment variable to remove
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        debug_print(f"Removed {var_name} from Windows registry")
+        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], 
+                      check=True, capture_output=True)
         return True
     except subprocess.CalledProcessError:
+        # If it doesn't exist, treat as success
         return True
     except FileNotFoundError:
         print("❌ 'reg' command not found. Please remove the variable manually.")
@@ -233,41 +257,53 @@ def remove_env_var_on_windows(var_name: str) -> bool:
 
 
 def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """Remove an environment variable permanently across OS platforms."""
+    """
+    Remove an environment variable permanently across OS platforms.
+    
+    Args:
+        var_name: Name of the environment variable to remove
+        
+    Returns:
+        Tuple[bool, str]: (success, message)
+    """
     system = platform.system().lower()
     if system == "windows":
         success = remove_env_var_on_windows(var_name)
+        if success:
+            debug_print(f"Removed {var_name} from Windows registry")
         return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     elif system in ["darwin", "linux"]:
         success = remove_env_var_on_unix(var_name)
+        if success:
+            debug_print(f"Removed {var_name} from shell rc file")
         return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
     else:
         return False, f"Unsupported OS: {system}"
 
 
-def verify_api_key(api_key: str) -> bool:
+def verify_api_key(api_key: str, api_url: str = "https://api.getunbound.ai/v1/models") -> bool:
     """
-    Verify the API key by making a request to the /models endpoint.
+    Verify the API key by making a request to the models endpoint.
     
     Args:
         api_key: The API key to verify
+        api_url: The API endpoint URL to verify against (default: Unbound AI)
     
     Returns:
-        True if valid, False otherwise
+        bool: True if valid, False otherwise
     """
     if not api_key or len(api_key) == 0:
         print("❌ API key is empty")
         return False
     
     try:
-        url = "https://api.getunbound.ai/v1/models"
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
             "User-Agent": "Unbound CLI"
         }
         
-        request = urllib.request.Request(url, headers=headers)
+        request = urllib.request.Request(api_url, headers=headers)
         
         with urllib.request.urlopen(request, timeout=10) as response:
             if response.status == 200:
@@ -306,184 +342,94 @@ def verify_api_key(api_key: str) -> bool:
 def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
     """
     Start a local HTTP server that waits for a single callback request and returns its contents.
-    Returns a dict with method, path, query, headers, and body; or None on failure.
+    
+    Args:
+        frontend_url: The URL to open in the browser
+    
+    Returns:
+        Dict with method, path, query, headers, and body; or None on failure
     """
-    result: Dict[str, any] = {"method": None, "path": None, "query": None, "headers": None, "body": None}
-    done_evt = threading.Event()
+    result = {"received": False, "data": None}
+    server_ready = threading.Event()
 
-    class CallbackHandler(http.server.BaseHTTPRequestHandler):
-        def _finish(self, code: int = 200, message: bytes = b"Logged in successfully! You can close this tab and return to the terminal.") -> None:
-            try:
-                self.send_response(code)
-                self.send_header("Content-Type", "text/plain; charset=utf-8")
-                self.send_header("Content-Length", str(len(message)))
-                self.end_headers()
-                self.wfile.write(message)
-            except Exception:
-                pass
-
-        def do_GET(self) -> None:
+    class CallbackHandler(http.server.SimpleHTTPRequestHandler):
+        def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
-            result["method"] = "GET"
-            result["path"] = self.path
-            result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
-            result["headers"] = {k: v for k, v in self.headers.items()}
-            result["body"] = None
-            self._finish()
-            done_evt.set()
-
-        def do_POST(self) -> None:
-            length = int(self.headers.get("Content-Length", "0") or 0)
-            body = self.rfile.read(length) if length > 0 else b""
+            query_params = urllib.parse.parse_qs(parsed.query)
+            
+            result["data"] = {
+                "method": "GET",
+                "path": parsed.path,
+                "query": query_params,
+                "headers": dict(self.headers),
+                "body": None
+            }
+            result["received"] = True
+            
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h1>Success!</h1><p>You can close this window now.</p></body></html>")
+        
+        def do_POST(self):
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length).decode('utf-8') if content_length > 0 else None
+            
             parsed = urllib.parse.urlparse(self.path)
-            result["method"] = "POST"
-            result["path"] = self.path
-            result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
-            result["headers"] = {k: v for k, v in self.headers.items()}
-            result["body"] = body.decode("utf-8", errors="replace") if body else None
-            self._finish()
-            done_evt.set()
+            query_params = urllib.parse.parse_qs(parsed.query)
+            
+            result["data"] = {
+                "method": "POST",
+                "path": parsed.path,
+                "query": query_params,
+                "headers": dict(self.headers),
+                "body": body
+            }
+            result["received"] = True
+            
+            self.send_response(200)
+            self.send_header("Content-type", "text/html")
+            self.end_headers()
+            self.wfile.write(b"<html><body><h1>Success!</h1><p>You can close this window now.</p></body></html>")
+        
+        def log_message(self, format, *args):
+            pass
 
-        def log_message(self, format: str, *args) -> None:
-            return
+    def find_free_port() -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('', 0))
+            s.listen(1)
+            port = s.getsockname()[1]
+        return port
+
+    def run_server(port: int):
+        with socketserver.TCPServer(("", port), CallbackHandler) as httpd:
+            server_ready.set()
+            while not result["received"]:
+                httpd.handle_request()
 
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            host, port = s.getsockname()
-        callback_url = f"http://127.0.0.1:{port}/callback"
-
-        httpd = socketserver.TCPServer(("127.0.0.1", port), CallbackHandler)
-        httpd.allow_reuse_address = True
-
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-
-        encoded_callback = urllib.parse.quote(callback_url, safe="")
-        target_url = f"{frontend_url.rstrip('/')}/automations/api-key-callback?callback_url={encoded_callback}&app_type=default"
-        webbrowser.open(target_url)
-        print("🌐 Opening browser...")
-        print("If browser doesn't open automatically, open this link:")
-        print(target_url)
-        print("Waiting for authentication...")
-
-        try:
-            done_evt.wait()
-        finally:
-            try:
-                httpd.shutdown()
-                httpd.server_close()
-            except Exception:
-                pass
-
-        return result
+        port = find_free_port()
+        callback_url = f"http://localhost:{port}/callback"
+        full_url = f"{frontend_url}?callback_url={urllib.parse.quote(callback_url)}"
+        
+        server_thread = threading.Thread(target=run_server, args=(port,), daemon=True)
+        server_thread.start()
+        
+        server_ready.wait(timeout=2)
+        
+        print(f"Opening browser to: {full_url}")
+        webbrowser.open(full_url)
+        
+        timeout = 300
+        server_thread.join(timeout=timeout)
+        
+        if result["received"]:
+            return result["data"]
+        else:
+            print("❌ Timeout waiting for callback")
+            return None
+            
     except Exception as e:
         print(f"❌ Failed to run callback server: {e}")
         return None
-
-
-def clear_setup() -> None:
-    """Undo all changes made by the setup script."""
-    global DEBUG
-    print("=" * 60)
-    print("Codex CLI - Clearing Setup")
-    print("=" * 60)
-
-    # Remove environment variables
-    env_vars = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
-    for var in env_vars:
-        success, _ = remove_env_var(var)
-        if success:
-            print(f"✅ Removed {var}")
-        else:
-            print(f"❌ Failed to remove {var}")
-
-    print("\n" + "=" * 60)
-    print("Clear Complete!")
-    print("=" * 60)
-
-
-def main():
-    """Main setup function."""
-    global DEBUG
-
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
-    parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
-    parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
-    args, _ = parser.parse_known_args()
-
-    if args.debug:
-        DEBUG = True
-        debug_print("Debug mode enabled")
-
-    if args.clear:
-        clear_setup()
-        return
-
-    print("=" * 60)
-    print("Codex CLI - Environment Setup")
-    print("=" * 60)
-
-    if not args.domain:
-        print("\n❌ Missing required argument: --domain (e.g., --domain gateway.getunbound.ai)")
-        return
-
-    auth_url = normalize_url(args.domain)
-    cb_response = run_one_shot_callback_server(auth_url)
-    if cb_response is None:
-        print("\n❌ Failed to receive callback response. Exiting.")
-        return
-
-    api_key = None
-    try:
-        api_key = (cb_response.get("query") or {}).get("api_key")
-    except Exception:
-        api_key = None
-
-    if not api_key:
-        print("\n❌ No api_key found in callback. Exiting.")
-        return
-
-    debug_print("Verifying API key...")
-    if not verify_api_key(api_key):
-        print("❌ API key verification failed. Exiting.")
-        return
-
-    print("API Key Verified ✅")
-    debug_print("API key verification successful")
-
-    debug_print("Setting OPENAI_API_KEY environment variable...")
-    success, message = set_env_var("OPENAI_API_KEY", api_key)
-    if not success:
-        print(f"❌ Failed to configure OPENAI_API_KEY: {message}")
-        return
-    debug_print("OPENAI_API_KEY set successfully")
-
-    debug_print("Setting OPENAI_BASE_URL environment variable...")
-    success, message = set_env_var("OPENAI_BASE_URL", "https://api.getunbound.ai/v1")
-    debug_print("OPENAI_BASE_URL set successfully")
-    
-    # Final instructions
-    print("\n" + "=" * 60)
-    print("Setup Complete!")
-    print("=" * 60)
-    
-    system = platform.system().lower()
-    if system in ["darwin", "linux"]:
-        try:
-            rc_path = get_shell_rc_file()
-            if rc_path is not None:
-                shell_path = os.environ.get("SHELL", "/bin/bash") or "/bin/bash"
-                subprocess.run([shell_path, "-lc", f"source '{rc_path}'"], check=False, capture_output=True)
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n⚠️  Setup cancelled by user.")
-    except Exception as e:
-        print(f"\n❌ An error occurred: {e}")
-        exit(1)
