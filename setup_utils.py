@@ -397,13 +397,13 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 
     def find_free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('', 0))
+            s.bind(('127.0.0.1', 0))
             s.listen(1)
             port = s.getsockname()[1]
         return port
 
     def run_server(port: int):
-        with socketserver.TCPServer(("", port), CallbackHandler) as httpd:
+        with socketserver.TCPServer(("127.0.0.1", port), CallbackHandler) as httpd:
             server_ready.set()
             while not result["received"]:
                 httpd.handle_request()
