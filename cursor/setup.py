@@ -2,13 +2,21 @@
 
 import os
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from setup_utils import (
+    debug_print, normalize_url, get_shell_rc_file,
+    set_env_var, remove_env_var
+)
+import setup_utils
+
 import platform
 import subprocess
 import urllib.parse
 import time
 import webbrowser
-from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Optional, Dict
 import threading
 import http.server
 import socketserver
@@ -20,12 +28,6 @@ SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/ma
 DEBUG = False
 
 
-def debug_print(message: str) -> None:
-    """Print message only if DEBUG mode is enabled."""
-    if DEBUG:
-        print(f"[DEBUG] {message}")
-
-
 def install_macos_certificates():
     """Run Python certificate installation command on macOS."""
     if platform.system().lower() != "darwin":
@@ -34,157 +36,6 @@ def install_macos_certificates():
     cert_path = f"/Applications/Python {py_version}/Install Certificates.command"
     if os.path.exists(cert_path):
         subprocess.run([cert_path], capture_output=True)
-
-
-def normalize_url(domain: str) -> str:
-    """Normalize domain to proper URL format."""
-    domain = domain.strip()
-    
-    if domain.startswith("http://") or domain.startswith("https://"):
-        url = domain
-    else:
-        url = f"https://{domain}"
-    
-    return url.rstrip('/')
-
-
-def get_shell_rc_file() -> Path:
-    system = platform.system().lower()
-    shell = os.environ.get("SHELL", "").lower()
-    
-    if system == "darwin":
-        return Path.home() / ".zprofile" if "zsh" in shell else Path.home() / ".bash_profile"
-    elif system == "linux":
-        return Path.home() / ".zshrc" if "zsh" in shell else Path.home() / ".bashrc"
-    elif system == "windows":
-        return None
-    else:
-        raise OSError(f"Unsupported operating system: {system}")
-
-
-def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
-    try:
-        file_path.touch(exist_ok=True)
-        
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        
-        # Remove existing export for this variable if var_name is provided
-        if var_name:
-            export_prefix = f"export {var_name}="
-            lines = [l for l in lines if not l.strip().startswith(export_prefix)]
-        
-        # Check if line already exists
-        if line + "\n" not in lines and line not in [l.rstrip() for l in lines]:
-            lines.append(f"{line}\n")
-            
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-            return True
-        
-        # If we removed an old export and need to add new one
-        if var_name:
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-            return True
-            
-        return True
-    except Exception as e:
-        print(f"❌ Failed to modify {file_path}: {e}")
-        return False
-
-
-def set_env_var_windows(var_name: str, value: str) -> bool:
-    debug_print(f"Writing to user environment registry (Windows)")
-    try:
-        subprocess.run(["setx", var_name, value], check=True, capture_output=True)
-        return True
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"❌ Failed to set {var_name} on Windows: {e}")
-        return False
-
-
-def set_env_var_unix(var_name: str, value: str) -> bool:
-    rc_file = get_shell_rc_file()
-    if rc_file is None:
-        return False
-
-    debug_print(f"Writing to shell file: {rc_file}")
-    export_line = f'export {var_name}="{value}"'
-    return append_to_file(rc_file, export_line, var_name)
-
-
-def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
-    system = platform.system().lower()
-
-    if system == "windows":
-        success = set_env_var_windows(var_name, value)
-        if success:
-            debug_print(f"Environment variable {var_name} set on Windows")
-        return (True, "Set for new terminals") if success else (False, "Failed")
-    elif system in ["darwin", "linux"]:
-        success = set_env_var_unix(var_name, value)
-        if success:
-            debug_print(f"Environment variable {var_name} added to shell rc file")
-            shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
-            return True, f"Run 'source ~/.{shell_name}rc' or restart terminal"
-        return False, "Failed"
-    else:
-        return False, f"Unsupported OS: {system}"
-
-
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """Remove an environment variable export line from the user's shell rc file."""
-    rc_file = get_shell_rc_file()
-    if rc_file is None:
-        return False
-    try:
-        if not rc_file.exists():
-            return True
-        with open(rc_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        new_lines = []
-        removed = False
-        export_prefix = f"export {var_name}="
-        for line in lines:
-            if line.strip().startswith(export_prefix):
-                removed = True
-                debug_print(f"Removing {var_name} from {rc_file}")
-                continue
-            new_lines.append(line)
-        if removed:
-            with open(rc_file, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-        return True
-    except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
-
-
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove a user environment variable on Windows."""
-    try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        debug_print(f"Removed {var_name} from Windows registry")
-        return True
-    except subprocess.CalledProcessError:
-        return True
-    except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
-
-
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """Remove an environment variable permanently across OS platforms."""
-    system = platform.system().lower()
-    if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
-    elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
-    else:
-        return False, f"Unsupported OS: {system}"
 
 
 def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -408,6 +259,7 @@ def main():
 
     if debug_mode:
         DEBUG = True
+        setup_utils.DEBUG = True
         debug_print("Debug mode enabled")
 
     if clear_mode:
