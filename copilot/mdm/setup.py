@@ -164,7 +164,7 @@ def get_all_user_homes():
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ("Public", "Default", "Default User", "Administrator"):
+                        if user_dir.is_dir() and user_dir.name not in ("Public", "Default", "Default User", "All Users", "Administrator"):
                             user_homes.append((user_dir.name, user_dir))
                 except Exception as e:
                     debug_print(f"Error scanning Windows users directory: {e}")
@@ -482,6 +482,21 @@ def extract_file_reads(variable_data, content_refs, file_state):
     return tool_uses
 
 
+def _extract_tree_text(node):
+    """Recursively extract text from VS Code tree-structured tool results."""
+    if isinstance(node, str):
+        return node
+    if isinstance(node, dict):
+        text = node.get("text")
+        if isinstance(text, str):
+            return text
+        children = node.get("children", [])
+        return "".join(_extract_tree_text(c) for c in children)
+    if isinstance(node, list):
+        return "".join(_extract_tree_text(c) for c in node)
+    return ""
+
+
 def _resolve_tool_result(call_id, tool_call_results):
     entry = tool_call_results.get(call_id, {})
     parts = entry.get("content", [])
@@ -490,6 +505,10 @@ def _resolve_tool_result(call_id, tool_call_results):
         val = p.get("value")
         if isinstance(val, str) and val:
             texts.append(val)
+        elif isinstance(val, dict):
+            extracted = _extract_tree_text(val.get("node", val))
+            if extracted:
+                texts.append(extracted)
     return "\n".join(texts)
 
 
