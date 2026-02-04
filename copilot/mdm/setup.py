@@ -147,7 +147,6 @@ def get_all_user_homes():
                 if uid >= 500 and home_dir.exists() and home_dir.is_dir():
                     if str(home_dir).startswith("/Users/") and username not in ("Shared", "Guest"):
                         user_homes.append((username, home_dir))
-                        debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
             import pwd
@@ -158,7 +157,6 @@ def get_all_user_homes():
                 if uid >= 1000 and home_dir.exists() and home_dir.is_dir():
                     if str(home_dir).startswith("/home/"):
                         user_homes.append((username, home_dir))
-                        debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "windows":
             users_dir = Path("C:/Users")
@@ -167,10 +165,11 @@ def get_all_user_homes():
                     for user_dir in users_dir.iterdir():
                         if user_dir.is_dir() and user_dir.name not in ("Public", "Default", "Default User", "Administrator"):
                             user_homes.append((user_dir.name, user_dir))
-                            debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
                     debug_print(f"Error scanning Windows users directory: {e}")
 
+        if user_homes:
+            debug_print(f"Found {len(user_homes)} user(s): {', '.join(u for u, _ in user_homes)}")
         return user_homes
     except Exception as e:
         debug_print(f"Error enumerating users: {e}")
@@ -630,22 +629,30 @@ def get_user_workspace_root(home_dir):
     return home_dir / ".config" / "Code" / "User" / "workspaceStorage"
 
 
+_unbound_dir_cache = None
+
 def get_unbound_dir():
     """
     Return the .unbound/ directory inside workspace storage for state files.
     When running as root, uses the first real user's workspace storage.
+    Result is cached after first call.
     """
+    global _unbound_dir_cache
+    if _unbound_dir_cache is not None:
+        return _unbound_dir_cache
     if check_admin_privileges():
         for _username, home_dir in get_all_user_homes():
             root = get_user_workspace_root(home_dir)
             if root.exists():
                 d = root / ".unbound"
                 d.mkdir(exist_ok=True)
+                _unbound_dir_cache = d
                 return d
     # Fallback: current user
     root = get_workspace_storage_root()
     d = root / ".unbound"
     d.mkdir(parents=True, exist_ok=True)
+    _unbound_dir_cache = d
     return d
 
 
@@ -771,18 +778,15 @@ def sync_entries(data, api_key):
     total = len([e for e in entries if e.get("status") != "processed"])
     sent = 0
     failed = 0
-    idx = 0
 
+    debug_print(f"Sending {total} exchanges to gateway")
     for entry in entries:
         if entry.get("status") == "processed":
             continue
-        idx += 1
-        debug_print(f"Sending: {idx}/{total}")
 
         success = send_exchange(entry["exchange"], api_key)
         if not success:
             # Retry once
-            debug_print(f"Retrying {idx}/{total}")
             success = send_exchange(entry["exchange"], api_key)
 
         if success:
