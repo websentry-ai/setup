@@ -239,64 +239,6 @@ def remove_env_var(var_name: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def verify_api_key(api_key: str) -> bool:
-    """
-    Verify the API key by making a request to the /models endpoint.
-    
-    Args:
-        api_key: The API key to verify
-    
-    Returns:
-        True if valid, False otherwise
-    """
-    if not api_key or len(api_key) == 0:
-        print("❌ API key is empty")
-        return False
-    
-    try:
-        url = "https://api.getunbound.ai/v1/models"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "User-Agent": "Unbound CLI"
-        }
-        
-        request = urllib.request.Request(url, headers=headers)
-        
-        with urllib.request.urlopen(request, timeout=10) as response:
-            if response.status == 200:
-                data = json.loads(response.read().decode())
-                
-                # Check if response has data (models)
-                if data and isinstance(data, dict) and "data" in data:
-                    if isinstance(data["data"], list) and len(data["data"]) > 0:
-                        return True
-                # Also check if data is a list directly
-                elif data and isinstance(data, list) and len(data) > 0:
-                    return True
-                # Or if it's an object
-                elif data and isinstance(data, dict):
-                    return True
-                
-                return False
-            else:
-                print(f"❌ API key verification failed: {response.status}")
-                return False
-                
-    except urllib.error.HTTPError as e:
-        print(f"❌ API key verification failed: {e.code} {e.reason}")
-        try:
-            error_data = json.loads(e.read().decode())
-            if "error" in error_data and "message" in error_data["error"]:
-                print(f"   Error: {error_data['error']['message']}")
-        except:
-            pass
-        return False
-    except Exception as e:
-        print(f"❌ API key verification failed: {e}")
-        return False
-
-
 def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
     """
     Start a local HTTP server that waits for a single callback request and returns its contents.
@@ -437,11 +379,6 @@ def main():
 
     if not api_key:
         print("\n❌ No api_key found in callback. Exiting.")
-        return
-
-    debug_print("Verifying API key...")
-    if not verify_api_key(api_key):
-        print("❌ API key verification failed. Exiting.")
         return
 
     print("API Key Verified ✅")
