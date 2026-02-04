@@ -98,7 +98,7 @@ def get_device_identifier():
         elif system == "windows":
             try:
                 result = subprocess.run(
-                    ["wmic", "os", "get", "SerialNumber"],
+                    ["wmic", "bios", "get", "serialnumber"],
                     capture_output=True, text=True, timeout=10,
                 )
                 if result.returncode == 0:
