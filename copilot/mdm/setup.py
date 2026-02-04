@@ -542,7 +542,8 @@ def parse_session_file(filepath):
         if not user_text:
             continue
 
-        model_id = req.get("modelId", "unknown")
+        raw_model = req.get("modelId", "")
+        model_id = raw_model.split("/")[-1] if raw_model else "auto"
         timestamp = req.get("timestamp")
         timings = req.get("result", {}).get("timings", {})
         total_elapsed = timings.get("totalElapsed", 0)
