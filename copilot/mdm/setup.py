@@ -366,6 +366,11 @@ def _epoch_ms_to_utc(epoch_ms):
     return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).isoformat()
 
 
+def _clean(d):
+    """Remove keys with empty string values from a dict."""
+    return {k: v for k, v in d.items() if v}
+
+
 def _read_file_from_disk(path):
     try:
         return Path(path).read_text(encoding="utf-8")
@@ -437,11 +442,11 @@ def extract_file_writes(response_parts):
                     content = re.sub(r'\n?`{3,}\s*$', '', val)
                 break
             if path:
-                writes.append({
+                writes.append(_clean({
                     "type": "afterFileEdit",
                     "file_path": path,
                     "content": content,
-                })
+                }))
         i += 1
     return writes
 
@@ -456,11 +461,11 @@ def extract_file_reads(variable_data, content_refs, file_state):
         if path and path not in seen:
             seen.add(path)
             content = file_state.get(path) if path in file_state else _read_file_from_disk(path)
-            tool_uses.append({
+            tool_uses.append(_clean({
                 "type": "beforeReadFile",
                 "file_path": path,
                 "content": content,
-            })
+            }))
 
     for ref_obj in content_refs:
         ref = ref_obj.get("reference", {})
@@ -468,11 +473,11 @@ def extract_file_reads(variable_data, content_refs, file_state):
         if path and path not in seen:
             seen.add(path)
             content = file_state.get(path) if path in file_state else _read_file_from_disk(path)
-            tool_uses.append({
+            tool_uses.append(_clean({
                 "type": "beforeReadFile",
                 "file_path": path,
                 "content": content,
-            })
+            }))
 
     return tool_uses
 
@@ -507,23 +512,30 @@ def extract_tool_calls(result_metadata):
             result_text = _resolve_tool_result(call_id, tool_call_results)
 
             if name == "run_in_terminal":
-                tool_uses.append({
+                tool_uses.append(_clean({
                     "type": "afterShellExecution",
                     "command": args.get("command", ""),
                     "output": result_text,
-                })
+                }))
             elif name in ("readFile", "read_file"):
-                tool_uses.append({
+                tool_uses.append(_clean({
                     "type": "beforeReadFile",
                     "file_path": args.get("filePath", args.get("file_path", "")),
                     "content": result_text,
-                })
+                }))
             elif name in ("editFile", "edit_file", "insert_edit"):
-                tool_uses.append({
+                tool_uses.append(_clean({
                     "type": "afterFileEdit",
                     "file_path": args.get("filePath", args.get("file_path", "")),
                     "content": result_text,
-                })
+                }))
+            else:
+                tool_uses.append(_clean({
+                    "type": "afterMCPExecution",
+                    "tool_name": name,
+                    "tool_input": args,
+                    "result_json": result_text,
+                }))
 
     return tool_uses
 
