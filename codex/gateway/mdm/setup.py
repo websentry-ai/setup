@@ -91,17 +91,18 @@ def get_device_identifier() -> Optional[str]:
         elif system == "windows":
             try:
                 result = subprocess.run(
-                    ["wmic", "bios", "get", "serialnumber"],
+                    ["powershell", "-Command",
+                     "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True,
                     text=True,
                     timeout=10
                 )
                 if result.returncode == 0:
-                    lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
-                    if len(lines) >= 2:
-                        return lines[1]
+                    serial = result.stdout.strip()
+                    if serial:
+                        return serial
             except Exception:
-                debug_print("wmic failed, trying registry")
+                debug_print("PowerShell BIOS query failed, trying registry")
 
             try:
                 result = subprocess.run(
