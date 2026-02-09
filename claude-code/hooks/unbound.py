@@ -129,6 +129,128 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     return conversation_data
 
 
+def get_latest_user_prompt_for_session(session_id: str, transcript_path: Optional[str] = None) -> Optional[str]:
+    """Get the most recent user prompt for this session."""
+    logs = load_existing_logs()
+    latest_prompt = None
+
+    for log in logs:
+        log_session = log.get('session_id') or log.get('event', {}).get('session_id')
+        if log_session == session_id:
+            event = log.get('event', {})
+            if event.get('hook_event_name') == 'UserPromptSubmit':
+                latest_prompt = event.get('prompt')
+
+    if latest_prompt:
+        return latest_prompt
+
+    # Fallback: parse transcript file
+    if transcript_path and transcript_path != 'undefined' and os.path.exists(transcript_path):
+        data = parse_transcript_file(transcript_path)
+        if data.get('user_messages'):
+            return data['user_messages'][-1].get('content')
+
+    return None
+
+
+def extract_command_for_pretool(event: Dict) -> str:
+    """Extract command from tool_input based on tool type."""
+    tool_input = event.get('tool_input', {})
+    tool_name = event.get('tool_name', '')
+
+    # Bash: command field
+    if tool_name == 'Bash' and 'command' in tool_input:
+        return tool_input['command']
+    # File tools: file_path
+    if tool_name in ['Write', 'Edit', 'Read'] and 'file_path' in tool_input:
+        return tool_input['file_path']
+    # Grep: pattern
+    if tool_name == 'Grep' and 'pattern' in tool_input:
+        return tool_input['pattern']
+    # Glob: pattern
+    if tool_name == 'Glob' and 'pattern' in tool_input:
+        return tool_input['pattern']
+    # WebFetch: url
+    if tool_name == 'WebFetch' and 'url' in tool_input:
+        return tool_input['url']
+    # WebSearch: query
+    if tool_name == 'WebSearch' and 'query' in tool_input:
+        return tool_input['query']
+    # Task: prompt
+    if tool_name == 'Task' and 'prompt' in tool_input:
+        return tool_input['prompt']
+    # Default: tool name
+    return tool_name
+
+
+def send_to_pretool_api(request_body: Dict, api_key: str) -> Dict:
+    """Send request to /v1/hooks/pretool endpoint."""
+    if not api_key:
+        return {}
+
+    try:
+        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
+        data = json.dumps(request_body)
+
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "-d", data, url],
+            capture_output=True,
+            timeout=10
+        )
+
+        if result.returncode == 0 and result.stdout:
+            return json.loads(result.stdout.decode('utf-8'))
+        return {}
+    except Exception as e:
+        log_error(f"PreToolUse API error: {str(e)}")
+        return {}
+
+
+def transform_response_for_claude(api_response: Dict) -> Dict:
+    """Transform API response to Claude Code format."""
+    if not api_response:
+        return {}
+
+    decision = api_response.get('decision', 'allow')
+    reason = api_response.get('reason', '')
+
+    return {
+        'hookSpecificOutput': {
+            'hookEventName': 'PreToolUse',
+            'permissionDecision': decision,
+            'permissionDecisionReason': reason
+        }
+    }
+
+
+def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
+    """Process PreToolUse event - DO NOT LOG."""
+    session_id = event.get('session_id')
+    model = event.get('model') or 'auto'
+    transcript_path = event.get('transcript_path')
+    tool_name = event.get('tool_name', '')
+
+    user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
+    command = extract_command_for_pretool(event)
+
+    request_body = {
+        'conversation_id': session_id,
+        'model': model,
+        'pre_tool_use_data': {
+            'command': command,
+            'tool_name': tool_name,
+            'metadata': event
+        },
+        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+    }
+
+    api_response = send_to_pretool_api(request_body, api_key)
+    return transform_response_for_claude(api_response)
+
+
 def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
@@ -335,7 +457,16 @@ def main():
         except json.JSONDecodeError:
             print("{}", flush=True)
             return
-        
+
+        hook_event_name = event.get('hook_event_name')
+        session_id = event.get('session_id')
+
+        # Handle PreToolUse - return immediately after decision is made
+        if hook_event_name == 'PreToolUse':
+            response = process_pre_tool_use(event, api_key)
+            print(json.dumps(response), flush=True)
+            return
+
         timestamp = datetime.utcnow().isoformat() + 'Z'
         log_entry = {
             'timestamp': timestamp,
@@ -344,9 +475,6 @@ def main():
         }
         
         append_to_audit_log(log_entry)
-        
-        hook_event_name = event.get('hook_event_name')
-        session_id = event.get('session_id')
         
         if hook_event_name == 'Stop' and session_id:
             process_stop_event(event, api_key)

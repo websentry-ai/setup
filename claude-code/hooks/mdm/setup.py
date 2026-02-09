@@ -539,6 +539,18 @@ def setup_managed_hooks() -> bool:
         # Configure hooks
         hook_command = str(script_path)
         hooks_config = {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 10
+                        }
+                    ]
+                }
+            ],
             "PostToolUse": [
                 {
                     "matcher": "*",

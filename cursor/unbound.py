@@ -92,6 +92,89 @@ def group_events_by_generation(logs):
     return grouped
 
 
+def get_latest_user_prompt(generation_id):
+    """Get the most recent user prompt for this generation from logs."""
+    logs = load_existing_logs()
+    latest_prompt = None
+
+    for log in logs:
+        event = log.get('event', {})
+        if (event.get('hook_event_name') == 'beforeSubmitPrompt' and
+            event.get('generation_id') == generation_id):
+            latest_prompt = event.get('prompt')
+
+    return latest_prompt
+
+
+def extract_command_for_pretool(event):
+    """Extract command from tool_input based on tool type."""
+    tool_input = event.get('tool_input', {})
+    tool_name = event.get('tool_name', '')
+
+    # Shell/Bash: command field
+    if tool_name in ['Shell', 'Bash'] and 'command' in tool_input:
+        return tool_input['command']
+    # File operations: file_path
+    if 'file_path' in tool_input:
+        return tool_input['file_path']
+    # MCP tools: stringify the input
+    if tool_name == 'MCP':
+        return str(tool_input)
+    # Default: tool name
+    return tool_name
+
+
+def send_to_pretool_api(request_body, api_key):
+    """Send request to /v1/hooks/pretool endpoint."""
+    if not api_key:
+        return {}
+
+    try:
+        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
+        data = json.dumps(request_body)
+
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "-d", data, url],
+            capture_output=True,
+            timeout=10
+        )
+
+        if result.returncode == 0 and result.stdout:
+            return json.loads(result.stdout.decode('utf-8'))
+        return {}
+    except Exception as e:
+        log_error(f"PreToolUse API error: {str(e)}")
+        return {}
+
+
+def process_pre_tool_use(event, api_key):
+    """Process preToolUse event"""
+    generation_id = event.get('generation_id')
+    conversation_id = event.get('conversation_id')
+    model = event.get('model') or 'auto'
+    tool_name = event.get('tool_name', '')
+
+    user_prompt = get_latest_user_prompt(generation_id)
+    command = extract_command_for_pretool(event)
+
+    request_body = {
+        'conversation_id': conversation_id,
+        'model': model,
+        'tool_name': tool_name,
+        'pre_tool_use_data': {
+            'command': command,
+            'metadata': event
+        },
+        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+    }
+
+    api_response = send_to_pretool_api(request_body, api_key)
+    return api_response if api_response else {}
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
@@ -340,7 +423,18 @@ def main():
         except json.JSONDecodeError:
             print("{}")
             return
-        
+
+        # Get event details
+        hook_event_name = event.get('hook_event_name')
+        generation_id = event.get('generation_id')
+        conversation_id = event.get('conversation_id')
+
+        # Handle preToolUse - return immediately after decision is made
+        if hook_event_name == 'preToolUse':
+            response = process_pre_tool_use(event, api_key)
+            print(json.dumps(response), flush=True)
+            return
+
         # Create log entry with timestamp
         timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
         log_entry = {
@@ -350,11 +444,6 @@ def main():
         
         # Append to audit log
         append_to_audit_log(log_entry)
-        
-        # Get event details
-        hook_event_name = event.get('hook_event_name')
-        generation_id = event.get('generation_id')
-        conversation_id = event.get('conversation_id')
         
         # Handle interrupted requests (new generation in same conversation)
         if hook_event_name == 'beforeSubmitPrompt' and conversation_id and generation_id:
