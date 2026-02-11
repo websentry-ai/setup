@@ -183,7 +183,7 @@ def extract_command_for_pretool(event: Dict) -> str:
     return tool_name
 
 
-def send_to_pretool_api(request_body: Dict, api_key: str) -> Dict:
+def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
     """Send request to /v1/hooks/pretool endpoint."""
     if not api_key:
         return {}
@@ -205,12 +205,12 @@ def send_to_pretool_api(request_body: Dict, api_key: str) -> Dict:
             return json.loads(result.stdout.decode('utf-8'))
         return {}
     except Exception as e:
-        log_error(f"PreToolUse API error: {str(e)}")
+        log_error(f"Hook API error: {str(e)}")
         return {}
 
 
 def transform_response_for_claude(api_response: Dict) -> Dict:
-    """Transform API response to Claude Code format."""
+    """Transform API response to Claude Code format for PreToolUse."""
     if not api_response:
         return {}
 
@@ -224,6 +224,24 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
             'permissionDecisionReason': reason
         }
     }
+
+
+def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
+    """Transform API response to Claude Code format for UserPromptSubmit."""
+    if not api_response:
+        return {}
+
+    decision = api_response.get('decision', 'allow')
+    reason = api_response.get('reason', '')
+
+    # For UserPromptSubmit, 'deny' maps to 'block'
+    if decision == 'deny':
+        return {
+            'decision': 'block',
+            'reason': reason
+        }
+
+    return {}
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
@@ -240,6 +258,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'conversation_id': session_id,
         'unbound_app_label': 'claude-code',
         'model': model,
+        'event_name': 'tool_use',
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
@@ -248,8 +267,26 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
-    api_response = send_to_pretool_api(request_body, api_key)
+    api_response = send_to_hook_api(request_body, api_key)
     return transform_response_for_claude(api_response)
+
+
+def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
+    """Process UserPromptSubmit event for policy checking."""
+    session_id = event.get('session_id')
+    model = event.get('model') or 'auto'
+    prompt = event.get('prompt', '')
+
+    request_body = {
+        'conversation_id': session_id,
+        'unbound_app_label': 'claude-code',
+        'model': model,
+        'event_name': 'user_prompt',
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+    }
+
+    api_response = send_to_hook_api(request_body, api_key)
+    return transform_response_for_claude_prompt(api_response)
 
 
 def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] = None) -> Optional[Dict]:
@@ -467,6 +504,17 @@ def main():
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
             return
+
+        # Handle UserPromptSubmit - check policy before processing
+        if hook_event_name == 'UserPromptSubmit':
+            response = process_user_prompt_submit(event, api_key)
+
+            # If denied (response has decision: block), return and don't log
+            if response.get('decision') == 'block':
+                print(json.dumps(response), flush=True)
+                return
+
+            # If allowed, continue to log the event (output printed at end)
 
         timestamp = datetime.utcnow().isoformat() + 'Z'
         log_entry = {
