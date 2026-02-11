@@ -238,6 +238,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
+        'unbound_app_label': 'claude-code',
         'model': model,
         'pre_tool_use_data': {
             'command': command,

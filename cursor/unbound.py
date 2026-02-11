@@ -162,6 +162,7 @@ def process_pre_tool_use(event, api_key):
 
     request_body = {
         'conversation_id': conversation_id,
+        'unbound_app_label': 'cursor',
         'model': model,
         'tool_name': tool_name,
         'pre_tool_use_data': {
