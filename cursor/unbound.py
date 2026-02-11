@@ -434,6 +434,10 @@ def main():
         if hook_event_name == 'preToolUse':
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
+            
+            # Exit with code 2 to block the action if denied
+            if response.get('decision') == 'deny':
+                sys.exit(2)
             return
 
         # Create log entry with timestamp
