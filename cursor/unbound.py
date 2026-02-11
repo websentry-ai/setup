@@ -124,7 +124,7 @@ def extract_command_for_pretool(event):
     return tool_name
 
 
-def send_to_pretool_api(request_body, api_key):
+def send_to_hook_api(request_body, api_key):
     """Send request to /v1/hooks/pretool endpoint."""
     if not api_key:
         return {}
@@ -146,7 +146,7 @@ def send_to_pretool_api(request_body, api_key):
             return json.loads(result.stdout.decode('utf-8'))
         return {}
     except Exception as e:
-        log_error(f"PreToolUse API error: {str(e)}")
+        log_error(f"Hook API error: {str(e)}")
         return {}
 
 
@@ -164,6 +164,7 @@ def process_pre_tool_use(event, api_key):
         'conversation_id': conversation_id,
         'unbound_app_label': 'cursor',
         'model': model,
+        'event_name': 'tool_use',
         'pre_tool_use_data': {
             'tool_name': tool_name,
             'command': command,
@@ -172,7 +173,25 @@ def process_pre_tool_use(event, api_key):
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
-    api_response = send_to_pretool_api(request_body, api_key)
+    api_response = send_to_hook_api(request_body, api_key)
+    return api_response if api_response else {}
+
+
+def process_user_prompt_submit(event, api_key):
+    """Process beforeSubmitPrompt event for policy checking"""
+    conversation_id = event.get('conversation_id')
+    model = event.get('model') or 'auto'
+    prompt = event.get('prompt', '')
+
+    request_body = {
+        'conversation_id': conversation_id,
+        'unbound_app_label': 'cursor',
+        'model': model,
+        'event_name': 'user_prompt',
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+    }
+
+    api_response = send_to_hook_api(request_body, api_key)
     return api_response if api_response else {}
 
 
@@ -434,11 +453,24 @@ def main():
         if hook_event_name == 'preToolUse':
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
-            
+
             # Exit with code 2 to block the action if denied
             if response.get('decision') == 'deny':
                 sys.exit(2)
             return
+
+        # Handle beforeSubmitPrompt - check policy before processing
+        if hook_event_name == 'beforeSubmitPrompt':
+            response = process_user_prompt_submit(event, api_key)
+
+            # If denied, transform response for Cursor format and exit
+            if response.get('decision') == 'deny':
+                cursor_response = {
+                    'continue': False,
+                    'user_message': response.get('reason', 'Prompt blocked by policy')
+                }
+                print(json.dumps(cursor_response), flush=True)
+                sys.exit(2)
 
         # Create log entry with timestamp
         timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
