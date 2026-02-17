@@ -536,8 +536,8 @@ def setup_managed_hooks() -> bool:
             except Exception:
                 settings = {}
 
-        # Configure hooks
-        hook_command = str(script_path)
+        # Configure hooks - quote the path to handle spaces (e.g. macOS "Application Support")
+        hook_command = f'"{script_path}"'
         hooks_config = {
             "PreToolUse": [
                 {
