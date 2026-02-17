@@ -1,7 +1,7 @@
 # codex-mdm-setup
 
 ```bash
-sudo python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py) --url https://backend.getunbound.ai --api_key YOUR_ADMIN_API_KEY
+sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py)" --url https://backend.getunbound.ai --api_key YOUR_ADMIN_API_KEY
 ```
 
 ### Optional Parameters
@@ -12,5 +12,5 @@ sudo python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/r
 ### Clearing Setup
 
 ```bash
-sudo python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py) --clear
+sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py)" --clear
 ```
