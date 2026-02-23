@@ -385,6 +385,9 @@ def main():
     
     print("API key added")
     print("Setup complete")
+    rc_path = get_shell_rc_file()
+    if rc_path is not None:
+        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 
 if __name__ == "__main__":

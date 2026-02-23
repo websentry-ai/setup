@@ -399,16 +399,9 @@ def main():
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
-    
-    system = platform.system().lower()
-    if system in ["darwin", "linux"]:
-        try:
-            rc_path = get_shell_rc_file()
-            if rc_path is not None:
-                shell_path = os.environ.get("SHELL", "/bin/bash") or "/bin/bash"
-                subprocess.run([shell_path, "-lc", f"source '{rc_path}'"], check=False, capture_output=True)
-        except Exception:
-            pass
+    rc_path = get_shell_rc_file()
+    if rc_path is not None:
+        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 if __name__ == "__main__":
     try:

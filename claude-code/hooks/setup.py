@@ -581,6 +581,9 @@ def main():
     print("✅ API key verified and added")
     print("✅ Setup complete")
     print("=" * 60)
+    rc_path = get_shell_rc_file()
+    if rc_path is not None:
+        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 
 if __name__ == "__main__":

@@ -487,13 +487,13 @@ def main():
         input_data = sys.stdin.read().strip()
         
         if not input_data:
-            print("{}", flush=True)
+            print('{"suppressOutput": true}', flush=True)
             return
-        
+
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print("{}", flush=True)
+            print('{"suppressOutput": true}', flush=True)
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -502,6 +502,7 @@ def main():
         # Handle PreToolUse - return immediately after decision is made
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
+            response["suppressOutput"] = True
             print(json.dumps(response), flush=True)
             return
 
@@ -511,6 +512,7 @@ def main():
 
             # If denied (response has decision: block), return and don't log
             if response.get('decision') == 'block':
+                response["suppressOutput"] = True
                 print(json.dumps(response), flush=True)
                 return
 
@@ -529,13 +531,13 @@ def main():
             process_stop_event(event, api_key)
         
         cleanup_old_logs()
-        
-        print("{}", flush=True)
+
+        print('{"suppressOutput": true}', flush=True)
         
     except Exception as e:
         # Still return empty JSON object to Claude Code to indicate completion
         log_error(f"Exception in main: {str(e)}")
-        print("{}", flush=True)
+        print('{"suppressOutput": true}', flush=True)
 
 
 if __name__ == '__main__':

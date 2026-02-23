@@ -615,7 +615,6 @@ def setup_managed_hooks() -> bool:
         }
 
         settings["hooks"] = hooks_config
-        settings["allowManagedHooksOnly"] = True
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 
@@ -670,9 +669,6 @@ def clear_managed_hooks() -> bool:
                 changed = False
                 if "hooks" in settings:
                     del settings["hooks"]
-                    changed = True
-                if "allowManagedHooksOnly" in settings:
-                    del settings["allowManagedHooksOnly"]
                     changed = True
                 if changed:
                     with open(settings_path, "w", encoding="utf-8") as f:
