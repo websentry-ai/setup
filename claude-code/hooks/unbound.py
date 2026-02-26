@@ -218,18 +218,14 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
-    output = {
+    return {
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': decision,
-            'permissionDecisionReason': reason
+            'permissionDecisionReason': reason,
+            'additionalContext': additional_context
         }
     }
-
-    if additional_context:
-        output['hookSpecificOutput']['additionalContext'] = additional_context
-
-    return output
 
 
 def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
