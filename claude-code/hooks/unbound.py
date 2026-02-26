@@ -12,6 +12,7 @@ from typing import Dict, List, Optional
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
+ALLOWED_PRETOOL_USE_HOOK_NAMES = ['Bash']
 
 
 def log_error(message: str):
@@ -252,6 +253,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     model = event.get('model') or 'auto'
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
+
+    # Only allowed tool names need policy checking; skip API call for all other tools
+    if tool_name not in ALLOWED_PRETOOL_USE_HOOK_NAMES:
+        return {}
 
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
     command = extract_command_for_pretool(event)
