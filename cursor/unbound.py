@@ -20,6 +20,9 @@ LOG_DIR = Path.home() / ".cursor" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 
+# Only allowed tool names need policy checking; skip API call for all other tools
+ALLOWED_PRETOOL_USE_HOOK_NAMES = ['Shell']
+
 # Ensure log directory exists
 try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -156,6 +159,10 @@ def process_pre_tool_use(event, api_key):
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
     tool_name = event.get('tool_name', '')
+
+    # Only allowed tool names need policy checking; skip API call for all other tools
+    if tool_name not in ALLOWED_PRETOOL_USE_HOOK_NAMES:
+        return {}
 
     user_prompt = get_latest_user_prompt(generation_id)
     command = extract_command_for_pretool(event)
