@@ -420,7 +420,7 @@ def main():
     print("=" * 60)
 
     print("\nYou can now use OpenClaw with Unbound tool policies:")
-    print("  openclaw agent --local --message 'hello world'")
+    print("  openclaw agent --local --agent main --message 'hello world'")
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:
