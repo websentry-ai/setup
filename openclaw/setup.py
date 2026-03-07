@@ -263,6 +263,22 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
                 print(f"⚠️  Failed to install {PLUGIN_NAME} via npm: {e}")
                 print(f"   Install manually: npm install -g {PLUGIN_NAME}")
 
+            # Register the plugin load path so OpenClaw can find it
+            try:
+                npm_root = subprocess.run(
+                    ["npm", "root", "-g"],
+                    capture_output=True, text=True
+                )
+                if npm_root.returncode == 0:
+                    plugin_path = os.path.join(npm_root.stdout.strip(), PLUGIN_NAME)
+                    if os.path.isdir(plugin_path):
+                        load_paths = config.setdefault("plugins", {}).setdefault("load", {}).setdefault("paths", [])
+                        if plugin_path not in load_paths:
+                            load_paths.append(plugin_path)
+                            debug_print(f"Added plugin load path: {plugin_path}")
+            except FileNotFoundError:
+                pass
+
             entries = config.setdefault("plugins", {}).setdefault("entries", {})
 
             if PLUGIN_NAME not in entries:
