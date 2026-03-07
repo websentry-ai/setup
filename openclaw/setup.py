@@ -69,6 +69,9 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
             export_prefix = f"export {var_name}="
             lines = [l for l in lines if not l.strip().startswith(export_prefix)]
 
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+
         if line + "\n" not in lines and line not in [l.rstrip() for l in lines]:
             lines.append(f"{line}\n")
             with open(file_path, "w", encoding="utf-8") as f:
