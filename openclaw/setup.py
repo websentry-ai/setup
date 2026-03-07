@@ -17,7 +17,7 @@ import json
 DEBUG = False
 
 ENV_VAR_NAME = "UNBOUND_OPENCLAW_API_KEY"
-PLUGIN_NAME = "unbound-gateway"
+PLUGIN_NAME = "unbound-openclaw-plugin"
 PROVIDER_NAME = "unbound"
 DEFAULT_MODEL = "unbound/claude-sonnet-4-20250514"
 
