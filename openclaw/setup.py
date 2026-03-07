@@ -338,6 +338,23 @@ def clear_setup() -> None:
     print("OpenClaw Unbound Plugin - Clearing Setup")
     print("=" * 60)
 
+    # Uninstall plugin npm package
+    try:
+        result = subprocess.run(
+            ["npm", "list", "-g", PLUGIN_NAME],
+            capture_output=True, text=True
+        )
+        if result.returncode == 0:
+            subprocess.run(
+                ["npm", "uninstall", "-g", PLUGIN_NAME],
+                check=True, capture_output=True
+            )
+            print(f"✅ Uninstalled {PLUGIN_NAME}")
+    except FileNotFoundError:
+        pass
+    except subprocess.CalledProcessError:
+        print(f"⚠️  Failed to uninstall {PLUGIN_NAME}. Run manually: npm uninstall -g {PLUGIN_NAME}")
+
     # Remove environment variable
     success, _ = remove_env_var(ENV_VAR_NAME)
     if success:
