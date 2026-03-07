@@ -276,12 +276,23 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
                 }
             else:
                 providers[PROVIDER_NAME]["baseUrl"] = f"{gateway_url}/v1"
-                print("ℹ️  Updating baseUrl in existing unbound provider")
+                if model:
+                    providers[PROVIDER_NAME]["models"] = [
+                        {
+                            "id": model_id,
+                            "name": model_id,
+                            "contextWindow": 200000,
+                            "maxTokens": 8192,
+                        }
+                    ]
+                    print(f"ℹ️  Updated model to {model_id}")
+                else:
+                    print("ℹ️  Updating baseUrl in existing unbound provider")
 
             model_config = config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})
             default_model = f"unbound/{model_id}"
 
-            if "primary" not in model_config:
+            if "primary" not in model_config or model:
                 model_config["primary"] = default_model
             else:
                 print(f"ℹ️  Keeping existing default model: {model_config['primary']}")
