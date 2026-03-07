@@ -242,13 +242,17 @@ def configure_openclaw(gateway_url: str) -> bool:
         if "entries" not in config["plugins"]:
             config["plugins"]["entries"] = {}
 
-        config["plugins"]["entries"]["unbound-gateway"] = {
-            "enabled": True,
-            "config": {
-                "gatewayUrl": gateway_url,
-                "failOpen": True,
-            },
-        }
+        if "unbound-gateway" not in config["plugins"]["entries"]:
+            config["plugins"]["entries"]["unbound-gateway"] = {
+                "enabled": True,
+                "config": {
+                    "gatewayUrl": gateway_url,
+                    "failOpen": True,
+                },
+            }
+        else:
+            config["plugins"]["entries"]["unbound-gateway"]["config"]["gatewayUrl"] = gateway_url
+            print("ℹ️  Updating gatewayUrl in existing unbound-gateway plugin entry")
 
         # Configure the LLM provider
         if "models" not in config:
@@ -256,19 +260,23 @@ def configure_openclaw(gateway_url: str) -> bool:
         if "providers" not in config["models"]:
             config["models"]["providers"] = {}
 
-        config["models"]["providers"]["unbound"] = {
-            "baseUrl": f"{gateway_url}/v1",
-            "apiKey": "${UNBOUND_API_KEY}",
-            "api": "openai-completions",
-            "models": [
-                {
-                    "id": "claude-sonnet-4-20250514",
-                    "name": "Claude Sonnet 4",
-                    "contextWindow": 200000,
-                    "maxTokens": 8192,
-                }
-            ],
-        }
+        if "unbound" not in config["models"]["providers"]:
+            config["models"]["providers"]["unbound"] = {
+                "baseUrl": f"{gateway_url}/v1",
+                "apiKey": "${UNBOUND_API_KEY}",
+                "api": "openai-completions",
+                "models": [
+                    {
+                        "id": "claude-sonnet-4-20250514",
+                        "name": "Claude Sonnet 4",
+                        "contextWindow": 200000,
+                        "maxTokens": 8192,
+                    }
+                ],
+            }
+        else:
+            config["models"]["providers"]["unbound"]["baseUrl"] = f"{gateway_url}/v1"
+            print("ℹ️  Updating baseUrl in existing unbound provider")
 
         # Set default model to use Unbound provider
         if "agents" not in config:
@@ -390,12 +398,7 @@ def main():
     # Always derive the API gateway URL from the bare domain.
     # Input is always a bare domain (e.g., gateway.getunbound.ai).
     # The API endpoint is at api.<domain>.
-    bare_domain = domain
-    for prefix in ("https://", "http://"):
-        if bare_domain.startswith(prefix):
-            bare_domain = bare_domain[len(prefix):]
-            break
-    bare_domain = bare_domain.rstrip("/")
+    bare_domain = urllib.parse.urlparse(auth_url).netloc
     gateway_url = f"https://api.{bare_domain}"
 
     cb_response = run_callback_server(auth_url)
