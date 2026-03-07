@@ -88,7 +88,7 @@ def set_env_var_unix(var_name: str, value: str) -> bool:
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False
-    export_line = f'export {var_name}="{value}"'
+    export_line = f"export {var_name}='{value}'"
     return append_to_file(rc_file, export_line, var_name)
 
 
@@ -170,9 +170,15 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
 
         def do_GET(self):
             parsed = urllib.parse.urlparse(self.path)
+            query = dict(urllib.parse.parse_qsl(parsed.query))
+
+            if parsed.path != "/callback" or "api_key" not in query:
+                self._finish(code=400, message=b"Unexpected request. Please complete the OAuth flow in your browser.")
+                return
+
             result["method"] = "GET"
             result["path"] = self.path
-            result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
+            result["query"] = query
             result["headers"] = {k: v for k, v in self.headers.items()}
             result["body"] = None
             self._finish()
@@ -384,7 +390,12 @@ def main():
     # Always derive the API gateway URL from the bare domain.
     # Input is always a bare domain (e.g., gateway.getunbound.ai).
     # The API endpoint is at api.<domain>.
-    bare_domain = domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+    bare_domain = domain
+    for prefix in ("https://", "http://"):
+        if bare_domain.startswith(prefix):
+            bare_domain = bare_domain[len(prefix):]
+            break
+    bare_domain = bare_domain.rstrip("/")
     gateway_url = f"https://api.{bare_domain}"
 
     cb_response = run_callback_server(auth_url)
