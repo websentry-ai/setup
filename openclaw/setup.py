@@ -242,6 +242,27 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
             config = {}
 
         if setup_plugin:
+            # Install the plugin npm package if not already installed
+            try:
+                result = subprocess.run(
+                    ["npm", "list", "-g", PLUGIN_NAME],
+                    capture_output=True, text=True
+                )
+                if result.returncode != 0:
+                    print(f"📦 Installing {PLUGIN_NAME}...")
+                    subprocess.run(
+                        ["npm", "install", "-g", PLUGIN_NAME],
+                        check=True, capture_output=True
+                    )
+                    print(f"✅ Installed {PLUGIN_NAME}")
+                else:
+                    debug_print(f"{PLUGIN_NAME} already installed")
+            except FileNotFoundError:
+                print("⚠️  npm not found. Install the plugin manually: npm install -g " + PLUGIN_NAME)
+            except subprocess.CalledProcessError as e:
+                print(f"⚠️  Failed to install {PLUGIN_NAME} via npm: {e}")
+                print(f"   Install manually: npm install -g {PLUGIN_NAME}")
+
             entries = config.setdefault("plugins", {}).setdefault("entries", {})
 
             if PLUGIN_NAME not in entries:
