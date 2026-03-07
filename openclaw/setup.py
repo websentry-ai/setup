@@ -11,7 +11,6 @@ from typing import Tuple, Optional, Dict
 import threading
 import http.server
 import socketserver
-import socket
 import json
 
 
@@ -183,13 +182,10 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
             return
 
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            _, port = s.getsockname()
-        callback_url = f"http://127.0.0.1:{port}/callback"
-
-        httpd = socketserver.TCPServer(("127.0.0.1", port), CallbackHandler)
+        httpd = socketserver.TCPServer(("127.0.0.1", 0), CallbackHandler)
         httpd.allow_reuse_address = True
+        _, port = httpd.server_address
+        callback_url = f"http://127.0.0.1:{port}/callback"
 
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -200,10 +196,10 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
         print("🌐 Opening browser...")
         print("If browser doesn't open automatically, open this link:")
         print(target_url)
-        print("Waiting for authentication...")
+        print("Waiting for authentication (5 minute timeout)...")
 
         try:
-            done_evt.wait()
+            timed_out = not done_evt.wait(timeout=300)
         finally:
             try:
                 httpd.shutdown()
@@ -211,13 +207,17 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
             except Exception:
                 pass
 
+        if timed_out:
+            print("❌ Timed out waiting for authentication (5 minutes). Please try again.")
+            return None
+
         return result
     except Exception as e:
         print(f"❌ Failed to run callback server: {e}")
         return None
 
 
-def configure_openclaw(api_key: str, gateway_url: str) -> bool:
+def configure_openclaw(gateway_url: str) -> bool:
     """Configure OpenClaw with the Unbound plugin and provider."""
     config_dir = Path.home() / ".openclaw"
     config_path = config_dir / "openclaw.json"
@@ -369,7 +369,11 @@ def main():
         return
 
     auth_url = normalize_url(domain)
-    gateway_url = f"https://api.{domain}" if not domain.startswith("http") else domain
+    # Always derive the API gateway URL from the bare domain.
+    # Input is always a bare domain (e.g., gateway.getunbound.ai).
+    # The API endpoint is at api.<domain>.
+    bare_domain = domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+    gateway_url = f"https://api.{bare_domain}"
 
     cb_response = run_callback_server(auth_url)
     if cb_response is None:
@@ -397,7 +401,7 @@ def main():
 
     # Configure OpenClaw
     debug_print("Configuring OpenClaw...")
-    if not configure_openclaw(api_key, gateway_url):
+    if not configure_openclaw(gateway_url):
         print("❌ Failed to configure OpenClaw")
         return
 
