@@ -227,8 +227,8 @@ def run_callback_server(frontend_url: str) -> Optional[str]:
         return None
 
 
-def configure_openclaw(gateway_url: str) -> bool:
-    """Configure OpenClaw with the Unbound plugin and provider."""
+def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provider: bool = True, model: str = None) -> bool:
+    """Configure OpenClaw with the Unbound plugin and/or provider."""
     config_dir = Path.home() / ".openclaw"
     config_path = config_dir / "openclaw.json"
 
@@ -241,49 +241,50 @@ def configure_openclaw(gateway_url: str) -> bool:
         except FileNotFoundError:
             config = {}
 
-        # Configure the plugin
-        entries = config.setdefault("plugins", {}).setdefault("entries", {})
+        if setup_plugin:
+            entries = config.setdefault("plugins", {}).setdefault("entries", {})
 
-        if PLUGIN_NAME not in entries:
-            entries[PLUGIN_NAME] = {
-                "enabled": True,
-                "config": {
-                    "gatewayUrl": gateway_url,
-                    "failOpen": True,
-                },
-            }
-        else:
-            entries[PLUGIN_NAME]["config"]["gatewayUrl"] = gateway_url
-            print("ℹ️  Updating gatewayUrl in existing unbound-gateway plugin entry")
+            if PLUGIN_NAME not in entries:
+                entries[PLUGIN_NAME] = {
+                    "enabled": True,
+                    "config": {
+                        "gatewayUrl": gateway_url,
+                        "failOpen": True,
+                    },
+                }
+            else:
+                entries[PLUGIN_NAME]["config"]["gatewayUrl"] = gateway_url
+                print("ℹ️  Updating gatewayUrl in existing plugin entry")
 
-        # Configure the LLM provider
-        providers = config.setdefault("models", {}).setdefault("providers", {})
+        if setup_provider:
+            providers = config.setdefault("models", {}).setdefault("providers", {})
+            model_id = model or "claude-sonnet-4-20250514"
 
-        if PROVIDER_NAME not in providers:
-            providers[PROVIDER_NAME] = {
-                "baseUrl": f"{gateway_url}/v1",
-                "apiKey": "${UNBOUND_OPENCLAW_API_KEY}",
-                "api": "openai-completions",
-                "models": [
-                    {
-                        "id": "claude-sonnet-4-20250514",
-                        "name": "Claude Sonnet 4",
-                        "contextWindow": 200000,
-                        "maxTokens": 8192,
-                    }
-                ],
-            }
-        else:
-            providers[PROVIDER_NAME]["baseUrl"] = f"{gateway_url}/v1"
-            print("ℹ️  Updating baseUrl in existing unbound provider")
+            if PROVIDER_NAME not in providers:
+                providers[PROVIDER_NAME] = {
+                    "baseUrl": f"{gateway_url}/v1",
+                    "apiKey": "${UNBOUND_OPENCLAW_API_KEY}",
+                    "api": "openai-completions",
+                    "models": [
+                        {
+                            "id": model_id,
+                            "name": model_id,
+                            "contextWindow": 200000,
+                            "maxTokens": 8192,
+                        }
+                    ],
+                }
+            else:
+                providers[PROVIDER_NAME]["baseUrl"] = f"{gateway_url}/v1"
+                print("ℹ️  Updating baseUrl in existing unbound provider")
 
-        # Set default model to use Unbound provider
-        model_config = config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})
+            model_config = config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})
+            default_model = f"unbound/{model_id}"
 
-        if "primary" not in model_config:
-            model_config["primary"] = DEFAULT_MODEL
-        else:
-            print(f"ℹ️  Keeping existing default model: {model_config['primary']}")
+            if "primary" not in model_config:
+                model_config["primary"] = default_model
+            else:
+                print(f"ℹ️  Keeping existing default model: {model_config['primary']}")
 
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -374,14 +375,23 @@ def main():
     print("=" * 60)
 
     domain = None
+    model = None
     for i, arg in enumerate(sys.argv):
         if arg == "--domain" and i + 1 < len(sys.argv):
             domain = sys.argv[i + 1]
-            break
+        elif arg == "--model" and i + 1 < len(sys.argv):
+            model = sys.argv[i + 1]
+
+    setup_plugin = "--plugin" in sys.argv
+    setup_provider = "--provider" in sys.argv
+    # If neither flag is given, set up both
+    if not setup_plugin and not setup_provider:
+        setup_plugin = True
+        setup_provider = True
 
     if not domain:
         print("❌ Missing required argument: --domain")
-        print("Usage: python3 setup.py --domain gateway.getunbound.ai")
+        print("Usage: python3 setup.py --domain gateway.getunbound.ai [--plugin] [--provider] [--model MODEL_ID]")
         return
 
     auth_url = normalize_url(domain)
@@ -405,13 +415,15 @@ def main():
 
     # Configure OpenClaw
     debug_print("Configuring OpenClaw...")
-    if not configure_openclaw(gateway_url):
+    if not configure_openclaw(gateway_url, setup_plugin=setup_plugin, setup_provider=setup_provider, model=model):
         print("❌ Failed to configure OpenClaw")
         return
 
     print("✅ API key verified and added")
-    print("✅ OpenClaw plugin configured")
-    print("✅ Unbound LLM provider configured")
+    if setup_plugin:
+        print("✅ OpenClaw plugin configured")
+    if setup_provider:
+        print("✅ Unbound LLM provider configured")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
