@@ -7,7 +7,7 @@ import subprocess
 import urllib.parse
 import webbrowser
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional
 import threading
 import http.server
 import socketserver
@@ -15,6 +15,11 @@ import json
 
 
 DEBUG = False
+
+ENV_VAR_NAME = "UNBOUND_API_KEY"
+PLUGIN_NAME = "unbound-gateway"
+PROVIDER_NAME = "unbound"
+DEFAULT_MODEL = "unbound/claude-sonnet-4-20250514"
 
 
 def debug_print(message: str) -> None:
@@ -153,8 +158,9 @@ def remove_env_var(var_name: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def run_callback_server(frontend_url: str) -> Optional[Dict]:
-    result = {"method": None, "path": None, "query": None, "headers": None, "body": None}
+def run_callback_server(frontend_url: str) -> Optional[str]:
+    """Run a local HTTP server to receive the OAuth callback. Returns the API key or None."""
+    api_key_holder = [None]
     done_evt = threading.Event()
 
     class CallbackHandler(http.server.BaseHTTPRequestHandler):
@@ -176,11 +182,7 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
                 self._finish(code=400, message=b"Unexpected request. Please complete the OAuth flow in your browser.")
                 return
 
-            result["method"] = "GET"
-            result["path"] = self.path
-            result["query"] = query
-            result["headers"] = {k: v for k, v in self.headers.items()}
-            result["body"] = None
+            api_key_holder[0] = query["api_key"]
             self._finish()
             done_evt.set()
 
@@ -196,7 +198,7 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
         thread.start()
 
         encoded_callback = urllib.parse.quote(callback_url, safe="")
-        target_url = f"{frontend_url.rstrip('/')}/automations/api-key-callback?callback_url={encoded_callback}&app_type=openclaw"
+        target_url = f"{frontend_url}/automations/api-key-callback?callback_url={encoded_callback}&app_type=openclaw"
         webbrowser.open(target_url)
         print("🌐 Opening browser...")
         print("If browser doesn't open automatically, open this link:")
@@ -216,7 +218,7 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
             print("❌ Timed out waiting for authentication (5 minutes). Please try again.")
             return None
 
-        return result
+        return api_key_holder[0]
     except Exception as e:
         print(f"❌ Failed to run callback server: {e}")
         return None
@@ -230,20 +232,17 @@ def configure_openclaw(gateway_url: str) -> bool:
     try:
         config_dir.mkdir(parents=True, exist_ok=True)
 
-        if config_path.exists():
+        try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
-        else:
+        except FileNotFoundError:
             config = {}
 
         # Configure the plugin
-        if "plugins" not in config:
-            config["plugins"] = {}
-        if "entries" not in config["plugins"]:
-            config["plugins"]["entries"] = {}
+        entries = config.setdefault("plugins", {}).setdefault("entries", {})
 
-        if "unbound-gateway" not in config["plugins"]["entries"]:
-            config["plugins"]["entries"]["unbound-gateway"] = {
+        if PLUGIN_NAME not in entries:
+            entries[PLUGIN_NAME] = {
                 "enabled": True,
                 "config": {
                     "gatewayUrl": gateway_url,
@@ -251,17 +250,14 @@ def configure_openclaw(gateway_url: str) -> bool:
                 },
             }
         else:
-            config["plugins"]["entries"]["unbound-gateway"]["config"]["gatewayUrl"] = gateway_url
+            entries[PLUGIN_NAME]["config"]["gatewayUrl"] = gateway_url
             print("ℹ️  Updating gatewayUrl in existing unbound-gateway plugin entry")
 
         # Configure the LLM provider
-        if "models" not in config:
-            config["models"] = {}
-        if "providers" not in config["models"]:
-            config["models"]["providers"] = {}
+        providers = config.setdefault("models", {}).setdefault("providers", {})
 
-        if "unbound" not in config["models"]["providers"]:
-            config["models"]["providers"]["unbound"] = {
+        if PROVIDER_NAME not in providers:
+            providers[PROVIDER_NAME] = {
                 "baseUrl": f"{gateway_url}/v1",
                 "apiKey": "${UNBOUND_API_KEY}",
                 "api": "openai-completions",
@@ -275,21 +271,16 @@ def configure_openclaw(gateway_url: str) -> bool:
                 ],
             }
         else:
-            config["models"]["providers"]["unbound"]["baseUrl"] = f"{gateway_url}/v1"
+            providers[PROVIDER_NAME]["baseUrl"] = f"{gateway_url}/v1"
             print("ℹ️  Updating baseUrl in existing unbound provider")
 
         # Set default model to use Unbound provider
-        if "agents" not in config:
-            config["agents"] = {}
-        if "defaults" not in config["agents"]:
-            config["agents"]["defaults"] = {}
-        if "model" not in config["agents"]["defaults"]:
-            config["agents"]["defaults"]["model"] = {}
+        model_config = config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})
 
-        if "primary" not in config["agents"]["defaults"]["model"]:
-            config["agents"]["defaults"]["model"]["primary"] = "unbound/claude-sonnet-4-20250514"
+        if "primary" not in model_config:
+            model_config["primary"] = DEFAULT_MODEL
         else:
-            print(f"ℹ️  Keeping existing default model: {config['agents']['defaults']['model']['primary']}")
+            print(f"ℹ️  Keeping existing default model: {model_config['primary']}")
 
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -312,11 +303,11 @@ def clear_setup() -> None:
     print("=" * 60)
 
     # Remove environment variable
-    success, _ = remove_env_var("UNBOUND_API_KEY")
+    success, _ = remove_env_var(ENV_VAR_NAME)
     if success:
-        print("✅ Removed UNBOUND_API_KEY")
+        print(f"✅ Removed {ENV_VAR_NAME}")
     else:
-        print("❌ Failed to remove UNBOUND_API_KEY")
+        print(f"❌ Failed to remove {ENV_VAR_NAME}")
 
     # Remove plugin config from openclaw.json
     config_path = Path.home() / ".openclaw" / "openclaw.json"
@@ -328,28 +319,24 @@ def clear_setup() -> None:
             modified = False
 
             # Remove plugin entry
-            if "plugins" in config and "entries" in config["plugins"]:
-                if "unbound-gateway" in config["plugins"]["entries"]:
-                    del config["plugins"]["entries"]["unbound-gateway"]
-                    modified = True
-                    print("✅ Removed unbound-gateway plugin entry")
+            entries = config.get("plugins", {}).get("entries", {})
+            if entries.pop(PLUGIN_NAME, None) is not None:
+                modified = True
+                print("✅ Removed unbound-gateway plugin entry")
 
             # Remove provider
-            if "models" in config and "providers" in config["models"]:
-                if "unbound" in config["models"]["providers"]:
-                    del config["models"]["providers"]["unbound"]
-                    modified = True
-                    print("✅ Removed unbound provider")
+            providers = config.get("models", {}).get("providers", {})
+            if providers.pop(PROVIDER_NAME, None) is not None:
+                modified = True
+                print("✅ Removed unbound provider")
 
             # Remove default model if it points to the unbound provider
-            try:
-                primary = config.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
-                if primary.startswith("unbound/"):
-                    del config["agents"]["defaults"]["model"]["primary"]
-                    modified = True
-                    print(f"✅ Removed default model ({primary})")
-            except (KeyError, TypeError):
-                pass
+            model_config = config.get("agents", {}).get("defaults", {}).get("model", {})
+            primary = model_config.get("primary", "")
+            if primary.startswith("unbound/"):
+                model_config.pop("primary")
+                modified = True
+                print(f"✅ Removed default model ({primary})")
 
             if modified:
                 with open(config_path, "w", encoding="utf-8") as f:
@@ -401,17 +388,7 @@ def main():
     bare_domain = urllib.parse.urlparse(auth_url).netloc
     gateway_url = f"https://api.{bare_domain}"
 
-    cb_response = run_callback_server(auth_url)
-    if cb_response is None:
-        print("❌ Failed to receive callback. Exiting.")
-        return
-
-    api_key = None
-    try:
-        api_key = (cb_response.get("query") or {}).get("api_key")
-    except Exception:
-        pass
-
+    api_key = run_callback_server(auth_url)
     if not api_key:
         print("❌ No API key received. Exiting.")
         return
@@ -419,8 +396,8 @@ def main():
     debug_print("API key received from callback")
 
     # Set environment variable
-    debug_print("Setting UNBOUND_API_KEY environment variable...")
-    success, message = set_env_var("UNBOUND_API_KEY", api_key)
+    debug_print(f"Setting {ENV_VAR_NAME} environment variable...")
+    success, message = set_env_var(ENV_VAR_NAME, api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
