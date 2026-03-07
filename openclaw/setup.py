@@ -385,13 +385,9 @@ def main():
         return
 
     auth_url = normalize_url(domain)
-    # Derive the API gateway URL from the frontend domain.
-    # Input: gateway.getunbound.ai (frontend)
-    # API:   api.getunbound.ai (strip "gateway." prefix, prepend "api.")
-    bare_domain = urllib.parse.urlparse(auth_url).netloc
-    if bare_domain.startswith("gateway."):
-        bare_domain = bare_domain[len("gateway."):]
-    gateway_url = f"https://api.{bare_domain}"
+    # The API gateway is always api.getunbound.ai regardless of the UI domain.
+    # --domain only controls where the browser opens for OAuth.
+    gateway_url = "https://api.getunbound.ai"
 
     api_key = run_callback_server(auth_url)
     if not api_key:
