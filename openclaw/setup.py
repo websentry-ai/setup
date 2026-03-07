@@ -326,7 +326,25 @@ def clear_setup() -> None:
             entries = config.get("plugins", {}).get("entries", {})
             if entries.pop(PLUGIN_NAME, None) is not None:
                 modified = True
-                print("✅ Removed unbound-gateway plugin entry")
+                print("✅ Removed plugin entry")
+
+            # Remove plugin from installs
+            installs = config.get("plugins", {}).get("installs", {})
+            unbound_keywords = (PLUGIN_NAME, "unbound-gateway", "openclaw-unbound")
+            for key in list(installs.keys()):
+                install_path = installs[key].get("installPath", "")
+                if any(kw in key or kw in install_path for kw in unbound_keywords):
+                    installs.pop(key)
+                    modified = True
+                    print(f"✅ Removed plugin install ({key})")
+
+            # Remove plugin from load paths
+            load_paths = config.get("plugins", {}).get("load", {}).get("paths", [])
+            original_len = len(load_paths)
+            load_paths[:] = [p for p in load_paths if PLUGIN_NAME not in p and "openclaw-unbound" not in p]
+            if len(load_paths) < original_len:
+                modified = True
+                print("✅ Removed plugin load path")
 
             # Remove provider
             providers = config.get("models", {}).get("providers", {})
