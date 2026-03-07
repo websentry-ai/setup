@@ -183,7 +183,6 @@ def run_callback_server(frontend_url: str) -> Optional[Dict]:
 
     try:
         httpd = socketserver.TCPServer(("127.0.0.1", 0), CallbackHandler)
-        httpd.allow_reuse_address = True
         _, port = httpd.server_address
         callback_url = f"http://127.0.0.1:{port}/callback"
 
@@ -273,7 +272,10 @@ def configure_openclaw(gateway_url: str) -> bool:
         if "model" not in config["agents"]["defaults"]:
             config["agents"]["defaults"]["model"] = {}
 
-        config["agents"]["defaults"]["model"]["primary"] = "unbound/claude-sonnet-4-20250514"
+        if "primary" not in config["agents"]["defaults"]["model"]:
+            config["agents"]["defaults"]["model"]["primary"] = "unbound/claude-sonnet-4-20250514"
+        else:
+            print(f"ℹ️  Keeping existing default model: {config['agents']['defaults']['model']['primary']}")
 
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -324,6 +326,16 @@ def clear_setup() -> None:
                     del config["models"]["providers"]["unbound"]
                     modified = True
                     print("✅ Removed unbound provider")
+
+            # Remove default model if it points to the unbound provider
+            try:
+                primary = config.get("agents", {}).get("defaults", {}).get("model", {}).get("primary", "")
+                if primary.startswith("unbound/"):
+                    del config["agents"]["defaults"]["model"]["primary"]
+                    modified = True
+                    print(f"✅ Removed default model ({primary})")
+            except (KeyError, TypeError):
+                pass
 
             if modified:
                 with open(config_path, "w", encoding="utf-8") as f:
