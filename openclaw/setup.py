@@ -385,10 +385,12 @@ def main():
         return
 
     auth_url = normalize_url(domain)
-    # Always derive the API gateway URL from the bare domain.
-    # Input is always a bare domain (e.g., gateway.getunbound.ai).
-    # The API endpoint is at api.<domain>.
+    # Derive the API gateway URL from the frontend domain.
+    # Input: gateway.getunbound.ai (frontend)
+    # API:   api.getunbound.ai (strip "gateway." prefix, prepend "api.")
     bare_domain = urllib.parse.urlparse(auth_url).netloc
+    if bare_domain.startswith("gateway."):
+        bare_domain = bare_domain[len("gateway."):]
     gateway_url = f"https://api.{bare_domain}"
 
     api_key = run_callback_server(auth_url)
