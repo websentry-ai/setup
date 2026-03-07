@@ -16,7 +16,7 @@ import json
 
 DEBUG = False
 
-ENV_VAR_NAME = "UNBOUND_API_KEY"
+ENV_VAR_NAME = "UNBOUND_OPENCLAW_API_KEY"
 PLUGIN_NAME = "unbound-gateway"
 PROVIDER_NAME = "unbound"
 DEFAULT_MODEL = "unbound/claude-sonnet-4-20250514"
@@ -259,7 +259,7 @@ def configure_openclaw(gateway_url: str) -> bool:
         if PROVIDER_NAME not in providers:
             providers[PROVIDER_NAME] = {
                 "baseUrl": f"{gateway_url}/v1",
-                "apiKey": "${UNBOUND_API_KEY}",
+                "apiKey": "${UNBOUND_OPENCLAW_API_KEY}",
                 "api": "openai-completions",
                 "models": [
                     {
