@@ -7,6 +7,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from collections import defaultdict
@@ -121,7 +122,7 @@ def extract_command_for_pretool(event):
     if 'file_path' in tool_input:
         return tool_input['file_path']
     # MCP tools: stringify the input
-    if tool_name == 'MCP':
+    if tool_name.startswith('MCP:'):
         return str(tool_input)
     # Default: tool name
     return tool_name
@@ -167,16 +168,27 @@ def process_pre_tool_use(event, api_key):
     user_prompt = get_latest_user_prompt(generation_id)
     command = extract_command_for_pretool(event)
 
+    pre_tool_use_data = {
+        'tool_name': tool_name,
+        'command': command,
+        'metadata': event
+    }
+
+    mcp_prefix_match = re.match(r'^MCP:(.+)$', tool_name)
+    if mcp_prefix_match:
+        pre_tool_use_data['mcp_tool'] = mcp_prefix_match.group(1)
+    elif tool_name.startswith('mcp__'):
+        mcp_match = re.match(r'^mcp__(.+?)__(.+)$', tool_name)
+        if mcp_match:
+            pre_tool_use_data['mcp_server'] = mcp_match.group(1)
+            pre_tool_use_data['mcp_tool'] = mcp_match.group(2)
+
     request_body = {
         'conversation_id': conversation_id,
         'unbound_app_label': 'cursor',
         'model': model,
         'event_name': 'tool_use',
-        'pre_tool_use_data': {
-            'tool_name': tool_name,
-            'command': command,
-            'metadata': event
-        },
+        'pre_tool_use_data': pre_tool_use_data,
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 

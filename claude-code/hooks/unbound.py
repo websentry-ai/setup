@@ -3,6 +3,7 @@
 import sys
 import json
 import os
+import re
 import subprocess
 from pathlib import Path
 from datetime import datetime
@@ -180,6 +181,9 @@ def extract_command_for_pretool(event: Dict) -> str:
     # Task: prompt
     if tool_name == 'Task' and 'prompt' in tool_input:
         return tool_input['prompt']
+    # MCP tools: stringify the input
+    if tool_name.startswith('mcp__'):
+        return str(tool_input)
     # Default: tool name
     return tool_name
 
@@ -261,16 +265,24 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
     command = extract_command_for_pretool(event)
 
+    pre_tool_use_data = {
+        'command': command,
+        'tool_name': tool_name,
+        'metadata': event
+    }
+
+    # Detect MCP tools and extract server/tool
+    mcp_match = re.match(r'^mcp__(.+?)__(.+)$', tool_name)
+    if mcp_match:
+        pre_tool_use_data['mcp_server'] = mcp_match.group(1)
+        pre_tool_use_data['mcp_tool'] = mcp_match.group(2)
+
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'claude-code',
         'model': model,
         'event_name': 'tool_use',
-        'pre_tool_use_data': {
-            'command': command,
-            'tool_name': tool_name,
-            'metadata': event
-        },
+        'pre_tool_use_data': pre_tool_use_data,
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
