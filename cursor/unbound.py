@@ -20,8 +20,6 @@ LOG_DIR = Path.home() / ".cursor" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 
-# Only allowed tool names need policy checking; skip API call for all other tools
-ALLOWED_PRETOOL_USE_HOOK_NAMES = ['Shell']
 
 # Ensure log directory exists
 try:
@@ -109,24 +107,6 @@ def get_latest_user_prompt(generation_id):
     return latest_prompt
 
 
-def extract_command_for_pretool(event):
-    """Extract command from tool_input based on tool type."""
-    tool_input = event.get('tool_input', {})
-    tool_name = event.get('tool_name', '')
-
-    # Shell/Bash: command field
-    if tool_name in ['Shell', 'Bash'] and 'command' in tool_input:
-        return tool_input['command']
-    # File operations: file_path
-    if 'file_path' in tool_input:
-        return tool_input['file_path']
-    # MCP tools: stringify the input
-    if tool_name == 'MCP':
-        return str(tool_input)
-    # Default: tool name
-    return tool_name
-
-
 def send_to_hook_api(request_body, api_key):
     """Send request to /v1/hooks/pretool endpoint."""
     if not api_key:
@@ -153,19 +133,35 @@ def send_to_hook_api(request_body, api_key):
         return {}
 
 
-def process_pre_tool_use(event, api_key):
-    """Process preToolUse event"""
+def format_hook_response(api_response):
+    """Convert API response to Cursor hook output format (permission/user_message/agent_message)."""
+    if not api_response:
+        return {}
+    decision = api_response.get('decision', 'allow')
+    reason = api_response.get('reason', '')
+    additional_context = api_response.get('additionalContext', '')
+    response = {'permission': decision}
+    if reason:
+        response['user_message'] = reason
+    if additional_context:
+        response['agent_message'] = additional_context
+    return response
+
+
+def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
+    """Process beforeShellExecution or beforeMCPExecution event."""
     generation_id = event.get('generation_id')
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
-    tool_name = event.get('tool_name', '')
-
-    # Only allowed tool names need policy checking; skip API call for all other tools
-    if tool_name not in ALLOWED_PRETOOL_USE_HOOK_NAMES:
-        return {}
 
     user_prompt = get_latest_user_prompt(generation_id)
-    command = extract_command_for_pretool(event)
+
+    # Build metadata with the raw event, inject mcp fields if present
+    metadata = dict(event)
+    if mcp_server is not None:
+        metadata['mcp_server'] = mcp_server
+    if mcp_tool is not None:
+        metadata['mcp_tool'] = mcp_tool
 
     request_body = {
         'conversation_id': conversation_id,
@@ -175,13 +171,13 @@ def process_pre_tool_use(event, api_key):
         'pre_tool_use_data': {
             'tool_name': tool_name,
             'command': command,
-            'metadata': event
+            'metadata': metadata
         },
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
     api_response = send_to_hook_api(request_body, api_key)
-    return api_response if api_response else {}
+    return format_hook_response(api_response)
 
 
 def process_user_prompt_submit(event, api_key):
@@ -456,13 +452,23 @@ def main():
         generation_id = event.get('generation_id')
         conversation_id = event.get('conversation_id')
 
-        # Handle preToolUse - return immediately after decision is made
-        if hook_event_name == 'preToolUse':
-            response = process_pre_tool_use(event, api_key)
+        # Handle beforeShellExecution / beforeMCPExecution - check policy before execution
+        if hook_event_name == 'beforeShellExecution':
+            response = process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             print(json.dumps(response), flush=True)
+            if response.get('permission') == 'deny':
+                sys.exit(2)
+            return
 
-            # Exit with code 2 to block the action if denied
-            if response.get('decision') == 'deny':
+        if hook_event_name == 'beforeMCPExecution':
+            mcp_tool_name = event.get('tool_name', '')
+            # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
+            response = process_pre_tool_use_execution(
+                event, api_key, f'MCP:{mcp_tool_name}', str(event.get('tool_input', {})),
+                mcp_server=None, mcp_tool=mcp_tool_name
+            )
+            print(json.dumps(response), flush=True)
+            if response.get('permission') == 'deny':
                 sys.exit(2)
             return
 
