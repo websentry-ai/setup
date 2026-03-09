@@ -1,7 +1,8 @@
 {
     "version": 1,
     "hooks": {
-      "preToolUse": [{ "command": "./hooks/unbound.py" }],
+      "beforeShellExecution": [{ "command": "./hooks/unbound.py" }],
+      "beforeMCPExecution": [{ "command": "./hooks/unbound.py" }],
       "afterShellExecution": [{ "command": "./hooks/unbound.py" }],
       "afterMCPExecution": [{ "command": "./hooks/unbound.py" }],
       "afterFileEdit": [{ "command": "./hooks/unbound.py" }],

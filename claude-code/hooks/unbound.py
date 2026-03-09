@@ -12,7 +12,8 @@ from typing import Dict, List, Optional
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
-ALLOWED_PRETOOL_USE_HOOK_NAMES = ['Bash']
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
+MCP_TOOL_PREFIX = 'mcp__'
 
 
 def log_error(message: str):
@@ -156,12 +157,15 @@ def get_latest_user_prompt_for_session(session_id: str, transcript_path: Optiona
 
 def extract_command_for_pretool(event: Dict) -> str:
     """Extract command from tool_input based on tool type."""
-    tool_input = event.get('tool_input', {})
+    tool_input = event.get('tool_input') or {}
     tool_name = event.get('tool_name', '')
 
     # Bash: command field
     if tool_name == 'Bash' and 'command' in tool_input:
         return tool_input['command']
+    # MCP tools: stringify the input
+    if tool_name.startswith(MCP_TOOL_PREFIX):
+        return json.dumps(tool_input)
     # File tools: file_path
     if tool_name in ['Write', 'Edit', 'Read'] and 'file_path' in tool_input:
         return tool_input['file_path']
@@ -254,12 +258,22 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
 
-    # Only allowed tool names need policy checking; skip API call for all other tools
-    if tool_name not in ALLOWED_PRETOOL_USE_HOOK_NAMES:
+    # Only Bash and MCP tools need policy checking; skip API call for all other tools
+    is_mcp = tool_name.startswith(MCP_TOOL_PREFIX)
+    if not is_mcp and tool_name not in ALLOWED_NON_MCP_HOOK_NAMES:
         return {}
 
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
     command = extract_command_for_pretool(event)
+
+    # Build metadata with the raw event
+    metadata = dict(event)
+
+    if is_mcp:
+        # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
+        parts = tool_name[len(MCP_TOOL_PREFIX):].split('__', 1)
+        metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
+        metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
     request_body = {
         'conversation_id': session_id,
@@ -269,7 +283,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
-            'metadata': event
+            'metadata': metadata
         },
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
