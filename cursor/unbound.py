@@ -466,7 +466,7 @@ def main():
             mcp_tool_name = event.get('tool_name', '')
             # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
             response = process_pre_tool_use_execution(
-                event, api_key, f'MCP:{mcp_tool_name}', str(event.get('tool_input', {})),
+                event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input', {})),
                 mcp_server=None, mcp_tool=mcp_tool_name
             )
             print(json.dumps(response), flush=True)

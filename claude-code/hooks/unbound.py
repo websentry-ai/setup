@@ -165,7 +165,7 @@ def extract_command_for_pretool(event: Dict) -> str:
         return tool_input['command']
     # MCP tools: stringify the input
     if tool_name.startswith(MCP_TOOL_PREFIX):
-        return str(tool_input)
+        return json.dumps(tool_input)
     # File tools: file_path
     if tool_name in ['Write', 'Edit', 'Read'] and 'file_path' in tool_input:
         return tool_input['file_path']
