@@ -157,7 +157,7 @@ def get_latest_user_prompt_for_session(session_id: str, transcript_path: Optiona
 
 def extract_command_for_pretool(event: Dict) -> str:
     """Extract command from tool_input based on tool type."""
-    tool_input = event.get('tool_input', {})
+    tool_input = event.get('tool_input') or {}
     tool_name = event.get('tool_name', '')
 
     # Bash: command field

@@ -78,6 +78,13 @@ def append_to_audit_log(event_data):
         f.write(json.dumps(event_data) + '\n')
 
 
+def handle_deny_and_exit(event):
+    """Log a denied decision and terminate with Cursor's block exit code."""
+    timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
+    append_to_audit_log({'timestamp': timestamp, 'event': event, 'policy_decision': 'deny'})
+    sys.exit(2)
+
+
 def group_events_by_generation(logs):
     """Group events by conversation_id and generation_id."""
     grouped = defaultdict(lambda: defaultdict(list))
@@ -457,23 +464,19 @@ def main():
             response = process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
-                timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
-                append_to_audit_log({'timestamp': timestamp, 'event': event, 'policy_decision': 'deny'})
-                sys.exit(2)
+                handle_deny_and_exit(event)
             return
 
         if hook_event_name == 'beforeMCPExecution':
             mcp_tool_name = event.get('tool_name', '')
             # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
             response = process_pre_tool_use_execution(
-                event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input', {})),
+                event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input') or {}),
                 mcp_server=None, mcp_tool=mcp_tool_name
             )
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
-                timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
-                append_to_audit_log({'timestamp': timestamp, 'event': event, 'policy_decision': 'deny'})
-                sys.exit(2)
+                handle_deny_and_exit(event)
             return
 
         # Handle beforeSubmitPrompt - check policy before processing
