@@ -12,7 +12,7 @@ from typing import Dict, List, Optional
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
-ALLOWED_PRETOOL_USE_HOOK_NAMES = ['Bash']
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
 MCP_TOOL_PREFIX = 'mcp__'
 
 
@@ -260,7 +260,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     # Only Bash and MCP tools need policy checking; skip API call for all other tools
     is_mcp = tool_name.startswith(MCP_TOOL_PREFIX)
-    if not is_mcp and tool_name not in ALLOWED_PRETOOL_USE_HOOK_NAMES:
+    if not is_mcp and tool_name not in ALLOWED_NON_MCP_HOOK_NAMES:
         return {}
 
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)

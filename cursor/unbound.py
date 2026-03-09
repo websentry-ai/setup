@@ -78,10 +78,8 @@ def append_to_audit_log(event_data):
         f.write(json.dumps(event_data) + '\n')
 
 
-def handle_deny_and_exit(event):
-    """Log a denied decision and terminate with Cursor's block exit code."""
-    timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
-    append_to_audit_log({'timestamp': timestamp, 'event': event, 'policy_decision': 'deny'})
+def handle_deny_and_exit():
+    """Terminate with Cursor's block exit code."""
     sys.exit(2)
 
 
@@ -145,9 +143,11 @@ def format_hook_response(api_response):
     if not api_response:
         return {}
     decision = api_response.get('decision', 'allow')
+    # Normalise gateway values to Cursor's two-state permission field
+    permission = 'deny' if decision in ('deny', 'block') else 'allow'
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
-    response = {'permission': decision}
+    response = {'permission': permission}
     if reason:
         response['user_message'] = reason
     if additional_context:
@@ -464,7 +464,7 @@ def main():
             response = process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
-                handle_deny_and_exit(event)
+                handle_deny_and_exit()
             return
 
         if hook_event_name == 'beforeMCPExecution':
@@ -476,7 +476,7 @@ def main():
             )
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
-                handle_deny_and_exit(event)
+                handle_deny_and_exit()
             return
 
         # Handle beforeSubmitPrompt - check policy before processing
