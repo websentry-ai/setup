@@ -457,6 +457,8 @@ def main():
             response = process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
+                timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
+                append_to_audit_log({'timestamp': timestamp, 'event': event, 'policy_decision': 'deny'})
                 sys.exit(2)
             return
 
@@ -469,6 +471,8 @@ def main():
             )
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
+                timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
+                append_to_audit_log({'timestamp': timestamp, 'event': event, 'policy_decision': 'deny'})
                 sys.exit(2)
             return
 

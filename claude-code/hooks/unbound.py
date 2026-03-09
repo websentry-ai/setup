@@ -273,7 +273,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
         parts = tool_name[len(MCP_TOOL_PREFIX):].split('__', 1)
         metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
-        metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else parts[0]
+        metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
     request_body = {
         'conversation_id': session_id,
