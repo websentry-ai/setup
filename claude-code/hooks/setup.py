@@ -550,7 +550,11 @@ def main():
         pass
     
     if not api_key:
-        print("❌ No API key received. Exiting.")
+        error_msg = (cb_response.get("query") or {}).get("error") if cb_response else None
+        if error_msg:
+            print(f"❌ Setup failed: {error_msg}")
+        else:
+            print("❌ No API key received. Exiting.")
         return
 
     debug_print("API key received from callback")
