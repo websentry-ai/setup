@@ -2,6 +2,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import platform
 import subprocess
@@ -212,7 +213,11 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
             result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
             result["headers"] = {k: v for k, v in self.headers.items()}
             result["body"] = None
-            self._finish()
+            query = result["query"]
+            if "error" in query:
+                self._finish(code=400, message=f"Setup failed: {query['error'][:200]}\nPlease try again or contact support.".encode())
+            else:
+                self._finish()
             done_evt.set()
 
         def log_message(self, format: str, *args) -> None:
@@ -546,7 +551,12 @@ def main():
         pass
     
     if not api_key:
-        print("❌ No API key received. Exiting.")
+        error_msg = (cb_response.get("query") or {}).get("error")
+        if error_msg:
+            safe_error = re.sub(r'[\x00-\x1f\x7f]', '', error_msg)[:200]
+            print(f"❌ Setup failed: {safe_error}")
+        else:
+            print("❌ No API key received. Exiting.")
         return
 
     debug_print("API key received from callback")
