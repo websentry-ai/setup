@@ -212,7 +212,11 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
             result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
             result["headers"] = {k: v for k, v in self.headers.items()}
             result["body"] = None
-            self._finish()
+            query = result["query"]
+            if "error" in query:
+                self._finish(code=400, message=f"Setup failed: {query['error']}\nPlease try again or contact support.".encode())
+            else:
+                self._finish()
             done_evt.set()
 
         def log_message(self, format: str, *args) -> None:
