@@ -4,92 +4,71 @@ import socket
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
+import time
 
 
 class TestCallbackHandler(unittest.TestCase):
-    """Tests for the CallbackHandler inside run_callback_server."""
+    """Tests for the CallbackHandler inside run_callback_server.
 
-    def _run_server_and_request(self, query_string):
-        """Start the callback server, send a GET request, return (http_code, body, result_dict)."""
+    These tests exercise the real run_callback_server function by mocking
+    webbrowser.open to intercept the URL, then sending an HTTP request
+    to the actual server it spins up.
+    """
+
+    def _run_server_with_query(self, query_string):
+        """Call run_callback_server, intercept its URL, hit it with query_string.
+
+        Returns (http_status, response_body, result_dict).
+        """
         from setup import run_callback_server
-        import http.server
-        import socketserver
-        import urllib.parse
 
-        result = {"method": None, "path": None, "query": None, "headers": None, "body": None}
-        done_evt = threading.Event()
+        captured_url = {}
+        http_response = {}
 
-        class CallbackHandler(http.server.BaseHTTPRequestHandler):
-            def _finish(self, code=200, message=b"Logged in successfully! You can close this tab."):
-                try:
-                    self.send_response(code)
-                    self.send_header("Content-Type", "text/plain; charset=utf-8")
-                    self.send_header("Content-Length", str(len(message)))
-                    self.end_headers()
-                    self.wfile.write(message)
-                except Exception:
-                    pass
+        def fake_browser_open(url):
+            """Instead of opening a browser, parse the callback_url and hit it."""
+            parsed = urllib.parse.urlparse(url)
+            qs = dict(urllib.parse.parse_qsl(parsed.query))
+            callback_url = qs.get("callback_url", "")
+            target = f"{callback_url}?{query_string}"
+            captured_url["target"] = target
 
-            def do_GET(self):
-                parsed = urllib.parse.urlparse(self.path)
-                result["method"] = "GET"
-                result["path"] = self.path
-                result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
-                result["headers"] = {k: v for k, v in self.headers.items()}
-                result["body"] = None
-                query = result["query"]
-                if "error" in query:
-                    self._finish(code=400, message=f"Setup failed: {query['error'][:200]}\nPlease try again or contact support.".encode())
-                else:
-                    self._finish()
-                done_evt.set()
+            # Small delay to let the server finish binding
+            time.sleep(0.05)
 
-            def log_message(self, format, *args):
-                return
+            try:
+                resp = urllib.request.urlopen(target)
+                http_response["code"] = resp.getcode()
+                http_response["body"] = resp.read().decode()
+            except urllib.error.HTTPError as e:
+                http_response["code"] = e.code
+                http_response["body"] = e.read().decode()
 
-        # Bind to a random port
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
+        with patch("webbrowser.open", side_effect=fake_browser_open):
+            result = run_callback_server("https://example.com")
 
-        httpd = socketserver.TCPServer(("127.0.0.1", port), CallbackHandler)
-        httpd.allow_reuse_address = True
-        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-        thread.start()
-
-        url = f"http://127.0.0.1:{port}/callback?{query_string}"
-        try:
-            resp = urllib.request.urlopen(url)
-            code = resp.getcode()
-            body = resp.read().decode()
-        except urllib.error.HTTPError as e:
-            code = e.code
-            body = e.read().decode()
-        finally:
-            httpd.shutdown()
-            httpd.server_close()
-
-        return code, body, result
+        return http_response.get("code"), http_response.get("body", ""), result
 
     def test_success_returns_200(self):
         """CallbackHandler returns 200 on success (no error param)."""
-        code, body, _ = self._run_server_and_request("api_key=abc123")
+        code, body, result = self._run_server_with_query("api_key=abc123")
         self.assertEqual(code, 200)
         self.assertIn("Logged in successfully", body)
+        self.assertEqual(result["query"]["api_key"], "abc123")
 
     def test_error_returns_400(self):
         """CallbackHandler returns 400 with error message when error param present."""
-        code, body, _ = self._run_server_and_request("error=something+went+wrong")
+        code, body, result = self._run_server_with_query("error=something+went+wrong")
         self.assertEqual(code, 400)
         self.assertIn("Setup failed: something went wrong", body)
 
     def test_error_truncated_to_200_chars(self):
         """Error message in HTTP response is truncated to 200 characters."""
         long_error = "x" * 300
-        code, body, _ = self._run_server_and_request(f"error={long_error}")
+        code, body, _ = self._run_server_with_query(f"error={long_error}")
         self.assertEqual(code, 400)
         self.assertIn("x" * 200, body)
-        # After truncation + newline + suffix, the 201st 'x' should not appear
         self.assertNotIn("x" * 201, body)
 
 
@@ -142,6 +121,17 @@ class TestMainErrorHandling(unittest.TestCase):
         output = self._run_main_with_callback({"error": long_error})
         self.assertIn("A" * 200, output)
         self.assertNotIn("A" * 201, output)
+
+    def test_cb_response_error_without_guard(self):
+        """Error path works when cb_response is non-None with no api_key.
+
+        Validates that removing the redundant 'if cb_response else None'
+        guard does not break error extraction -- cb_response is guaranteed
+        non-None at that point because line 543-545 returns early if None.
+        """
+        output = self._run_main_with_callback({"error": "access denied"})
+        self.assertIn("Setup failed: access denied", output)
+        self.assertNotIn("No API key received", output)
 
 
 if __name__ == "__main__":
