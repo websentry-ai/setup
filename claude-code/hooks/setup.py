@@ -532,32 +532,39 @@ def main():
             domain = sys.argv[i + 1]
             break
 
-    if not domain:
-        print("❌ Missing required argument: --domain")
-        print("Usage: python3 setup.py --domain gateway.getunbound.ai")
-        return
-    
-    auth_url = normalize_url(domain)
-    
-    cb_response = run_callback_server(auth_url)
-    if cb_response is None:
-        print("❌ Failed to receive callback. Exiting.")
-        return
-    
-    api_key = None
-    try:
-        api_key = (cb_response.get("query") or {}).get("api_key")
-    except Exception:
-        pass
-    
+    api_key_arg = None
+    for i, arg in enumerate(sys.argv):
+        if arg == "--api-key" and i + 1 < len(sys.argv):
+            api_key_arg = sys.argv[i + 1]
+            break
+
+    api_key = api_key_arg
     if not api_key:
-        error_msg = (cb_response.get("query") or {}).get("error")
-        if error_msg:
-            safe_error = re.sub(r'[\x00-\x1f\x7f]', '', error_msg)[:200]
-            print(f"❌ Setup failed: {safe_error}")
-        else:
-            print("❌ No API key received. Exiting.")
-        return
+        if not domain:
+            print("❌ Missing required argument: --domain or --api-key")
+            print("Usage: python3 setup.py --domain gateway.getunbound.ai")
+            return
+
+        auth_url = normalize_url(domain)
+
+        cb_response = run_callback_server(auth_url)
+        if cb_response is None:
+            print("❌ Failed to receive callback. Exiting.")
+            return
+
+        try:
+            api_key = (cb_response.get("query") or {}).get("api_key")
+        except Exception:
+            pass
+
+        if not api_key:
+            error_msg = (cb_response.get("query") or {}).get("error")
+            if error_msg:
+                safe_error = re.sub(r'[\x00-\x1f\x7f]', '', error_msg)[:200]
+                print(f"❌ Setup failed: {safe_error}")
+            else:
+                print("❌ No API key received. Exiting.")
+            return
 
     debug_print("API key received from callback")
 
