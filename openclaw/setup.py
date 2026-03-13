@@ -459,11 +459,14 @@ def main():
 
     domain = None
     model = None
+    api_key_arg = None
     for i, arg in enumerate(sys.argv):
         if arg == "--domain" and i + 1 < len(sys.argv):
             domain = sys.argv[i + 1]
         elif arg == "--model" and i + 1 < len(sys.argv):
             model = sys.argv[i + 1]
+        elif arg == "--api-key" and i + 1 < len(sys.argv):
+            api_key_arg = sys.argv[i + 1]
 
     setup_plugin = "--plugin" in sys.argv
     setup_provider = "--provider" in sys.argv
@@ -472,20 +475,21 @@ def main():
         setup_plugin = True
         setup_provider = True
 
-    if not domain:
-        print("❌ Missing required argument: --domain")
-        print("Usage: python3 setup.py --domain gateway.getunbound.ai [--plugin] [--provider] [--model MODEL_ID]")
-        return
-
-    auth_url = normalize_url(domain)
-    # The API gateway is always api.getunbound.ai regardless of the UI domain.
-    # --domain only controls where the browser opens for OAuth.
     gateway_url = "https://api.getunbound.ai"
 
-    api_key = run_callback_server(auth_url)
+    api_key = api_key_arg
     if not api_key:
-        print("❌ No API key received. Exiting.")
-        return
+        if not domain:
+            print("❌ Missing required argument: --domain or --api-key")
+            print("Usage: python3 setup.py --domain gateway.getunbound.ai [--api-key KEY] [--plugin] [--provider] [--model MODEL_ID]")
+            return
+
+        auth_url = normalize_url(domain)
+
+        api_key = run_callback_server(auth_url)
+        if not api_key:
+            print("❌ No API key received. Exiting.")
+            return
 
     debug_print("API key received from callback")
 

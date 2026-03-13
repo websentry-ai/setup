@@ -425,6 +425,7 @@ def main():
     parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
     parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
     parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
+    parser.add_argument("--api-key", dest="api_key", help="API key (skip browser auth)")
     args, _ = parser.parse_known_args()
 
     if args.debug:
@@ -449,25 +450,26 @@ def main():
         except Exception:
             pass
 
-    if not args.domain:
-        print("\n❌ Missing required argument: --domain (e.g., --domain gateway.getunbound.ai)")
-        return
-
-    auth_url = normalize_url(args.domain)
-    cb_response = run_one_shot_callback_server(auth_url)
-    if cb_response is None:
-        print("\n❌ Failed to receive callback response. Exiting.")
-        return
-
-    api_key = None
-    try:
-        api_key = (cb_response.get("query") or {}).get("api_key")
-    except Exception:
-        api_key = None
-
+    api_key = args.api_key
     if not api_key:
-        print("\n❌ No api_key found in callback. Exiting.")
-        return
+        if not args.domain:
+            print("\n❌ Missing required argument: --domain or --api-key")
+            return
+
+        auth_url = normalize_url(args.domain)
+        cb_response = run_one_shot_callback_server(auth_url)
+        if cb_response is None:
+            print("\n❌ Failed to receive callback response. Exiting.")
+            return
+
+        try:
+            api_key = (cb_response.get("query") or {}).get("api_key")
+        except Exception:
+            api_key = None
+
+        if not api_key:
+            print("\n❌ No api_key found in callback. Exiting.")
+            return
 
     print("API Key Verified ✅")
     debug_print("API key verification successful")
