@@ -12,6 +12,8 @@ from typing import Tuple, List
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
+LAUNCHAGENT_LABEL = "ai.getunbound.cursor.env"
+LAUNCHAGENT_PATH = Path("/Library/LaunchAgents") / f"{LAUNCHAGENT_LABEL}.plist"
 
 DEBUG = True
 
@@ -130,6 +132,76 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
     except Exception as e:
         print(f"❌ Failed to modify {file_path}: {e}")
         return False
+
+
+def set_launchd_env_var(var_name: str, value: str) -> bool:
+    """Set env var for GUI apps on macOS via launchctl + persistent LaunchAgent plist."""
+    try:
+        # 1. Set immediately for current session
+        result = subprocess.run(
+            ["launchctl", "setenv", var_name, value],
+            capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            debug_print(f"launchctl setenv {var_name} succeeded")
+        else:
+            debug_print(f"launchctl setenv failed: {result.stderr.decode('utf-8', errors='ignore')}")
+
+        # 2. Install LaunchAgent plist for persistence across reboots
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{LAUNCHAGENT_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>setenv</string>
+        <string>{var_name}</string>
+        <string>{value}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+</dict>
+</plist>
+"""
+        LAUNCHAGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        LAUNCHAGENT_PATH.write_text(plist_content, encoding="utf-8")
+        os.chmod(LAUNCHAGENT_PATH, 0o644)
+        debug_print(f"Installed LaunchAgent plist: {LAUNCHAGENT_PATH}")
+        print("✅ Environment variable set for GUI apps (launchctl + LaunchAgent)")
+        return True
+    except Exception as e:
+        debug_print(f"Failed to set launchd env var: {e}")
+        print(f"⚠️  Could not set GUI environment variable: {e}")
+        return False
+
+
+def clear_launchd_env_var(var_name: str) -> bool:
+    """Remove launchctl env var and LaunchAgent plist."""
+    removed = False
+    try:
+        # Unset from current session
+        subprocess.run(
+            ["launchctl", "unsetenv", var_name],
+            capture_output=True, timeout=5
+        )
+        debug_print(f"launchctl unsetenv {var_name}")
+    except Exception as e:
+        debug_print(f"Failed to unsetenv: {e}")
+
+    # Remove plist
+    if LAUNCHAGENT_PATH.exists():
+        try:
+            LAUNCHAGENT_PATH.unlink()
+            debug_print(f"Removed {LAUNCHAGENT_PATH}")
+            removed = True
+        except Exception as e:
+            debug_print(f"Failed to remove plist: {e}")
+
+    return removed
 
 
 def set_env_var_windows(var_name: str, value: str) -> bool:
@@ -493,6 +565,14 @@ def clear_setup():
     else:
         print(f"   {hooks_dir} does not exist")
 
+    # Remove LaunchAgent plist and launchctl env var
+    if platform.system().lower() == "darwin":
+        print("\n🗑️  Removing GUI environment variable (LaunchAgent)...")
+        if clear_launchd_env_var("UNBOUND_CURSOR_API_KEY"):
+            print("✅ Removed LaunchAgent plist")
+        else:
+            print("   No LaunchAgent plist found")
+
     # Remove environment variable from all users
     print("\n🗑️  Removing environment variables...")
     user_homes = get_all_user_homes()
@@ -661,6 +741,10 @@ def main():
         print(f"❌ Failed to set environment variable: {message}")
         return
     print(f"✅ Environment variable set ({message})")
+
+    # Set env var for GUI apps (macOS launchd)
+    if platform.system().lower() == "darwin":
+        set_launchd_env_var("UNBOUND_CURSOR_API_KEY", cursor_api_key)
 
     # Setup hooks
     debug_print("Setting up hooks...")
