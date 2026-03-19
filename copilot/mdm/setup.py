@@ -10,7 +10,7 @@ import glob
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-DEBUG = True
+DEBUG = False
 ENV_VAR_NAME = "UNBOUND_COPILOT_API_KEY"
 GATEWAY_ENDPOINT = "https://api.getunbound.ai/v1/hooks/copilot"
 
@@ -325,7 +325,7 @@ def fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id):
         response_body = "\n".join(output_lines[:-1])
 
         debug_print(f"HTTP status: {http_code}")
-        debug_print(f"Response: {response_body}")
+        debug_print(f"Response length: {len(response_body)}")
 
         if http_code != "200":
             print(f"API request failed with status {http_code}")

@@ -15,7 +15,7 @@ SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/ma
 LAUNCHAGENT_LABEL = "ai.getunbound.cursor.env"
 LAUNCHAGENT_PATH = Path("/Library/LaunchAgents") / f"{LAUNCHAGENT_LABEL}.plist"
 
-DEBUG = True
+DEBUG = False
 
 
 def debug_print(message: str) -> None:
@@ -628,7 +628,7 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
         response_body = '\n'.join(output_lines[:-1])
 
         debug_print(f"HTTP status: {http_code}")
-        debug_print(f"Response: {response_body}")
+        debug_print(f"Response length: {len(response_body)}")
 
         if http_code != "200":
             print(f"❌ API request failed with status {http_code}")
