@@ -13,6 +13,7 @@ import threading
 import http.server
 import socketserver
 import socket
+import json
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
@@ -265,6 +266,46 @@ def download_file(url: str, dest_path: Path) -> bool:
         print(f"❌ Failed to download {url}: {e}")
         return False
 
+def write_unbound_config(api_key: str) -> bool:
+    """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
+    config_dir = Path.home() / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        os.chmod(config_file, 0o600)
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not write config: {e}")
+        return False
+
+
+def check_enterprise_hooks_conflict() -> bool:
+    """Check if enterprise (MDM) hooks exist. Returns True if conflict found."""
+    system = platform.system().lower()
+    if system == "darwin":
+        enterprise_hooks = Path("/Library/Application Support/Cursor/hooks.json")
+    elif system == "linux":
+        enterprise_hooks = Path("/etc/cursor/hooks.json")
+    else:
+        return False
+    if enterprise_hooks.exists():
+        print("\n❌ Enterprise (MDM) hooks are already installed.")
+        print("   Installing user-level hooks alongside MDM hooks causes duplicate execution.")
+        print("   Remove MDM setup first: sudo python3 cursor/mdm/setup.py --clear")
+        return True
+    return False
+
+
 def setup_hooks():
     hooks_dir = Path.home() / ".cursor" / "hooks"
     hooks_json = Path.home() / ".cursor" / "hooks.json"
@@ -457,6 +498,12 @@ def main():
 
     print("✅ API key received")
     debug_print("API key received from callback")
+
+    if check_enterprise_hooks_conflict():
+        return
+
+    if not write_unbound_config(api_key):
+        print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
 
     debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)

@@ -12,9 +12,6 @@ from typing import Tuple, List
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
-LAUNCHAGENT_LABEL = "ai.getunbound.cursor.env"
-LAUNCHAGENT_PATH = Path("/Library/LaunchAgents") / f"{LAUNCHAGENT_LABEL}.plist"
-
 DEBUG = False
 
 
@@ -134,73 +131,53 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
         return False
 
 
-def set_launchd_env_var(var_name: str, value: str) -> bool:
-    """Set env var for GUI apps on macOS via launchctl + persistent LaunchAgent plist."""
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> bool:
+    """Write API key to user's ~/.unbound/config.json (shared with unbound-cli)."""
+    config_dir = home_dir / ".unbound"
+    config_file = config_dir / "config.json"
     try:
-        # 1. Set immediately for current session
-        result = subprocess.run(
-            ["launchctl", "setenv", var_name, value],
-            capture_output=True, timeout=5
-        )
-        if result.returncode == 0:
-            debug_print(f"launchctl setenv {var_name} succeeded")
-        else:
-            debug_print(f"launchctl setenv failed: {result.stderr.decode('utf-8', errors='ignore')}")
-
-        # 2. Install LaunchAgent plist for persistence across reboots
-        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{LAUNCHAGENT_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/launchctl</string>
-        <string>setenv</string>
-        <string>{var_name}</string>
-        <string>{value}</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-</dict>
-</plist>
-"""
-        LAUNCHAGENT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LAUNCHAGENT_PATH.write_text(plist_content, encoding="utf-8")
-        os.chmod(LAUNCHAGENT_PATH, 0o644)
-        debug_print(f"Installed LaunchAgent plist: {LAUNCHAGENT_PATH}")
-        print("✅ Environment variable set for GUI apps (launchctl + LaunchAgent)")
+        user_info = pwd.getpwnam(username)
+        uid, gid = user_info.pw_uid, user_info.pw_gid
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chown(config_dir, uid, gid)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        os.chmod(config_file, 0o600)
+        os.chown(config_file, uid, gid)
         return True
     except Exception as e:
-        debug_print(f"Failed to set launchd env var: {e}")
-        print(f"⚠️  Could not set GUI environment variable: {e}")
+        debug_print(f"Failed to write config for {username}: {e}")
         return False
 
 
-def clear_launchd_env_var(var_name: str) -> bool:
-    """Remove launchctl env var and LaunchAgent plist."""
+def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
+    """Remove user-level Cursor hooks (from normal setup) to prevent duplicate execution."""
+    hooks_json = home_dir / ".cursor" / "hooks.json"
+    hooks_dir = home_dir / ".cursor" / "hooks"
     removed = False
-    try:
-        # Unset from current session
-        subprocess.run(
-            ["launchctl", "unsetenv", var_name],
-            capture_output=True, timeout=5
-        )
-        debug_print(f"launchctl unsetenv {var_name}")
-    except Exception as e:
-        debug_print(f"Failed to unsetenv: {e}")
-
-    # Remove plist
-    if LAUNCHAGENT_PATH.exists():
+    if hooks_json.exists():
         try:
-            LAUNCHAGENT_PATH.unlink()
-            debug_print(f"Removed {LAUNCHAGENT_PATH}")
+            hooks_json.unlink()
             removed = True
         except Exception as e:
-            debug_print(f"Failed to remove plist: {e}")
-
+            debug_print(f"Failed to remove {hooks_json}: {e}")
+    if hooks_dir.exists():
+        try:
+            import shutil
+            shutil.rmtree(hooks_dir)
+            removed = True
+        except Exception as e:
+            debug_print(f"Failed to remove {hooks_dir}: {e}")
+    if removed:
+        print(f"   Removed user-level hooks for {username} (replaced by enterprise hooks)")
     return removed
 
 
@@ -565,14 +542,6 @@ def clear_setup():
     else:
         print(f"   {hooks_dir} does not exist")
 
-    # Remove LaunchAgent plist and launchctl env var
-    if platform.system().lower() == "darwin":
-        print("\n🗑️  Removing GUI environment variable (LaunchAgent)...")
-        if clear_launchd_env_var("UNBOUND_CURSOR_API_KEY"):
-            print("✅ Removed LaunchAgent plist")
-        else:
-            print("   No LaunchAgent plist found")
-
     # Remove environment variable from all users
     print("\n🗑️  Removing environment variables...")
     user_homes = get_all_user_homes()
@@ -742,9 +711,18 @@ def main():
         return
     print(f"✅ Environment variable set ({message})")
 
-    # Set env var for GUI apps (macOS launchd)
-    if platform.system().lower() == "darwin":
-        set_launchd_env_var("UNBOUND_CURSOR_API_KEY", cursor_api_key)
+    # Write API key to ~/.unbound/config.json for each user and remove user-level hooks
+    print("\n📝 Writing config for all users...")
+    user_homes = get_all_user_homes()
+    config_count = 0
+    for username, home_dir in user_homes:
+        if write_unbound_config_for_user(username, home_dir, cursor_api_key):
+            config_count += 1
+            remove_user_level_hooks(username, home_dir)
+        else:
+            print(f"⚠️  Skipping hook removal for {username}: config write failed")
+    if config_count > 0:
+        print(f"✅ Config written for {config_count} user(s)")
 
     # Setup hooks
     debug_print("Setting up hooks...")
