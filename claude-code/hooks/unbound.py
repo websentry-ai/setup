@@ -12,11 +12,54 @@ from typing import Dict, List, Optional
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
+LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
 MCP_TOOL_PREFIX = 'mcp__'
 
 
-def log_error(message: str):
+_cached_api_key = None
+_reporting_error = False
+
+
+def _should_report():
+    """Rate limit: max 1 remote error report per 60 seconds."""
+    try:
+        if LAST_REPORT_FILE.exists():
+            mtime = LAST_REPORT_FILE.stat().st_mtime
+            if (datetime.now().timestamp() - mtime) < 60:
+                return False
+        LAST_REPORT_FILE.touch()
+        return True
+    except Exception:
+        return True
+
+
+def report_error_to_gateway(message, category='general', api_key=None):
+    """Fire-and-forget error report to gateway. Never blocks, never raises."""
+    global _reporting_error
+    if _reporting_error or not api_key or not _should_report():
+        return
+    _reporting_error = True
+    try:
+        payload = json.dumps({
+            'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
+            'hook_source': 'claude-code',
+        })
+        subprocess.Popen(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "-d", payload,
+             f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+    finally:
+        _reporting_error = False
+
+
+def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     timestamp = datetime.utcnow().isoformat() + 'Z'
     error_entry = f"{timestamp}: {message}\n"
@@ -35,6 +78,9 @@ def log_error(message: str):
                     f.writelines(lines[-25:])
     except Exception:
         pass
+
+    # Report to gateway (fire-and-forget)
+    report_error_to_gateway(message, category, _cached_api_key)
 
 
 def load_existing_logs() -> List[Dict]:
@@ -210,7 +256,7 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
             return json.loads(result.stdout.decode('utf-8'))
         return {}
     except Exception as e:
-        log_error(f"Hook API error: {str(e)}")
+        log_error(f"Hook API error: {str(e)}", 'api_call')
         return {}
 
 
@@ -412,7 +458,7 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
 def send_to_api(exchange: Dict, api_key: str) -> bool:
     """Send exchange data to Unbound API."""
     if not api_key:
-        log_error("No API key present in send_to_api function")
+        log_error("No API key present in send_to_api function", 'config')
         return False
     
     try:
@@ -428,11 +474,11 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
         
         if result.returncode != 0:
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
-            log_error(f"API request failed: {error_msg}")
+            log_error(f"API request failed: {error_msg}", 'api_call')
             return False
         return True
     except Exception as e:
-        log_error(f"Exception in send_to_api: {str(e)}")
+        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
         return False
 
 
@@ -502,7 +548,9 @@ def process_stop_event(event: Dict, api_key: str):
 
 
 def main():
+    global _cached_api_key
     api_key = os.getenv('UNBOUND_CLAUDE_API_KEY')
+    _cached_api_key = api_key
     
     try:
         input_data = sys.stdin.read().strip()
@@ -557,7 +605,7 @@ def main():
         
     except Exception as e:
         # Still return empty JSON object to Claude Code to indicate completion
-        log_error(f"Exception in main: {str(e)}")
+        log_error(f"Exception in main: {str(e)}", 'general')
         print('{"suppressOutput": true}', flush=True)
 
 

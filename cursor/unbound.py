@@ -19,6 +19,7 @@ UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 LOG_DIR = Path.home() / ".cursor" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
+LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
 
 # Ensure log directory exists
@@ -33,7 +34,49 @@ except Exception:
     ERROR_LOG = LOG_DIR / "error.log"
 
 
-def log_error(message):
+_cached_api_key = None
+_reporting_error = False
+
+
+def _should_report():
+    """Rate limit: max 1 remote error report per 60 seconds."""
+    try:
+        if LAST_REPORT_FILE.exists():
+            mtime = LAST_REPORT_FILE.stat().st_mtime
+            if (datetime.now().timestamp() - mtime) < 60:
+                return False
+        LAST_REPORT_FILE.touch()
+        return True
+    except Exception:
+        return True
+
+
+def report_error_to_gateway(message, category='general', api_key=None):
+    """Fire-and-forget error report to gateway. Never blocks, never raises."""
+    global _reporting_error
+    if _reporting_error or not api_key or not _should_report():
+        return
+    _reporting_error = True
+    try:
+        payload = json.dumps({
+            'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
+            'hook_source': 'cursor',
+        })
+        subprocess.Popen(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "-d", payload,
+             f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+    finally:
+        _reporting_error = False
+
+
+def log_error(message, category='general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
     error_entry = f"{timestamp}: {message}\n"
@@ -48,6 +91,9 @@ def log_error(message):
         if len(lines) > 25:
             with open(ERROR_LOG, 'w', encoding='utf-8') as f:
                 f.writelines(lines[-25:])
+
+    # Report to gateway (fire-and-forget)
+    report_error_to_gateway(message, category, _cached_api_key)
 
 
 def load_existing_logs():
@@ -134,7 +180,7 @@ def send_to_hook_api(request_body, api_key):
             return json.loads(result.stdout.decode('utf-8'))
         return {}
     except Exception as e:
-        log_error(f"Hook API error: {str(e)}")
+        log_error(f"Hook API error: {str(e)}", 'api_call')
         return {}
 
 
@@ -288,7 +334,7 @@ def build_llm_exchange(events, api_key=None):
 def send_to_api(exchange, api_key):
     """Send exchange data to Unbound API."""
     if not api_key:
-        log_error("No API key present in send_to_api function")
+        log_error("No API key present in send_to_api function", 'config')
         return False
     
     try:
@@ -304,11 +350,11 @@ def send_to_api(exchange, api_key):
         
         if result.returncode != 0:
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
-            log_error(f"API request failed: {error_msg}")
+            log_error(f"API request failed: {error_msg}", 'api_call')
             return False
         return True
     except Exception as e:
-        log_error(f"Exception in send_to_api: {str(e)}")
+        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
         return False
 
 
@@ -446,14 +492,16 @@ def get_api_key():
     except FileNotFoundError:
         return None
     except Exception as e:
-        log_error(f"Failed to read config file: {e}")
+        log_error(f"Failed to read config file: {e}", 'config')
         return None
 
 
 def main():
     """Main entry point - read from stdin and process events."""
+    global _cached_api_key
     # Get API key (will be None if not set)
     api_key = get_api_key()
+    _cached_api_key = api_key
     
     try:
         # Read JSON from stdin
@@ -536,7 +584,7 @@ def main():
         
     except Exception as e:
         # Log errors but still output {} to not break Cursor
-        log_error(f"Exception in main: {str(e)}")
+        log_error(f"Exception in main: {str(e)}", 'general')
         print("{}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         print("{}")
