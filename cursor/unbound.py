@@ -443,7 +443,10 @@ def get_api_key():
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
             return json.loads(f.read()).get('api_key')
-    except Exception:
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log_error(f"Failed to read config file: {e}")
         return None
 
 

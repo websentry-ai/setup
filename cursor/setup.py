@@ -494,8 +494,13 @@ def main():
             return
 
     print("✅ API key received")
-    write_unbound_config(api_key)
     debug_print("API key received from callback")
+
+    if check_enterprise_hooks_conflict():
+        return
+
+    if not write_unbound_config(api_key):
+        print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
 
     debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)
@@ -505,9 +510,6 @@ def main():
 
     print(f"✅ Environment variable set")
     debug_print("UNBOUND_CURSOR_API_KEY set successfully")
-
-    if check_enterprise_hooks_conflict():
-        return
 
     debug_print("Setting up hooks...")
     if not setup_hooks():
