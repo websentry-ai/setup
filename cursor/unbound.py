@@ -434,10 +434,23 @@ def process_stop_event(generation_id, api_key=None):
                 break
 
 
+def get_api_key():
+    """Get API key from env var or ~/.unbound/config.json."""
+    key = os.getenv('UNBOUND_CURSOR_API_KEY')
+    if key:
+        return key
+    try:
+        config_file = Path.home() / ".unbound" / "config.json"
+        with open(config_file, 'r', encoding='utf-8') as f:
+            return json.loads(f.read()).get('api_key')
+    except Exception:
+        return None
+
+
 def main():
     """Main entry point - read from stdin and process events."""
     # Get API key (will be None if not set)
-    api_key = os.getenv('UNBOUND_CURSOR_API_KEY')
+    api_key = get_api_key()
     
     try:
         # Read JSON from stdin
