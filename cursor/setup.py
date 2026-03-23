@@ -274,8 +274,11 @@ def write_unbound_config(api_key: str) -> bool:
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         config = {}
         if config_file.exists():
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.loads(f.read())
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
         config['api_key'] = api_key
         with open(config_file, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
