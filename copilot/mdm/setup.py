@@ -272,6 +272,34 @@ def set_env_var_for_user(username, home_dir, var_name, value):
         return False, False
 
 
+def write_unbound_config_for_user(username, home_dir, api_key):
+    """Write API key to ~/.unbound/config.json for a given user."""
+    config_dir = home_dir / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        try:
+            import pwd as _pwd
+            user_info = _pwd.getpwnam(username)
+            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
+            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+        except Exception:
+            pass
+        os.chmod(config_file, 0o600)
+    except Exception as e:
+        debug_print(f"Could not write config for {username}: {e}")
+
+
 def set_env_var_system_wide(var_name, value):
     try:
         user_homes = get_all_user_homes()
@@ -895,6 +923,9 @@ def main():
             print(f"Failed to set {ENV_VAR_NAME}")
             return
         debug_print(f"{ENV_VAR_NAME} set successfully")
+
+        for username, home_dir in get_all_user_homes():
+            write_unbound_config_for_user(username, home_dir, api_key)
 
     # --- Step 2: Determine time window ---
     now_utc = datetime.now(timezone.utc)

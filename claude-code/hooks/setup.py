@@ -258,6 +258,40 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
+def write_unbound_config(api_key: str) -> bool:
+    """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
+    config_dir = Path.home() / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        with open(config_file, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        os.chmod(config_file, 0o600)
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not write config: {e}")
+        return False
+
+
+def remove_gateway_artifacts() -> None:
+    """Remove ~/.claude/anthropic_key.sh if present (leftover from gateway setup)."""
+    key_helper_path = Path.home() / ".claude" / "anthropic_key.sh"
+    if key_helper_path.exists():
+        try:
+            key_helper_path.unlink()
+            debug_print(f"Removed {key_helper_path}")
+        except Exception as e:
+            debug_print(f"Failed to remove {key_helper_path}: {e}")
+
+
 def download_file(url: str, dest_path: Path) -> bool:
     try:
         dest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -568,6 +602,14 @@ def main():
 
     debug_print("API key received from callback")
 
+    # Remove gateway setup env vars and artifacts
+    for var_name in ["UNBOUND_API_KEY", "ANTHROPIC_BASE_URL"]:
+        try:
+            remove_env_var(var_name)
+        except Exception:
+            pass
+    remove_gateway_artifacts()
+
     debug_print("Setting UNBOUND_CLAUDE_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
@@ -575,12 +617,7 @@ def main():
         return
     debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
 
-    # Remove ANTHROPIC_BASE_URL if it exists
-    debug_print("Removing ANTHROPIC_BASE_URL if it exists...")
-    try:
-        remove_env_var("ANTHROPIC_BASE_URL")
-    except Exception:
-        pass
+    write_unbound_config(api_key)
 
     debug_print("Setting up hooks...")
     if not setup_hooks():
