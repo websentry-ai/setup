@@ -40,7 +40,7 @@ _reporting_error = False
 
 
 def _should_report():
-    """Rate limit: max 1 remote error report per 60 seconds."""
+    """Rate limit: max 1 remote error report per 60 seconds. Fails closed."""
     try:
         if LAST_REPORT_FILE.exists():
             mtime = LAST_REPORT_FILE.stat().st_mtime
@@ -49,7 +49,7 @@ def _should_report():
         LAST_REPORT_FILE.touch()
         return True
     except Exception:
-        return True
+        return False
 
 
 def report_error_to_gateway(message, category='general', api_key=None):
