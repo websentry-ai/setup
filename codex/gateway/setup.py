@@ -318,6 +318,30 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
+def write_unbound_config(api_key: str) -> bool:
+    """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
+    config_dir = Path.home() / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not write config: {e}")
+        return False
+
+
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
     global DEBUG
@@ -396,7 +420,9 @@ def main():
     debug_print("Setting OPENAI_BASE_URL environment variable...")
     success, message = set_env_var("OPENAI_BASE_URL", "https://api.getunbound.ai/v1")
     debug_print("OPENAI_BASE_URL set successfully")
-    
+
+    write_unbound_config(api_key)
+
     # Final instructions
     print("\n" + "=" * 60)
     print("Setup Complete!")

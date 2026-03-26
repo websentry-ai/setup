@@ -245,6 +245,41 @@ def remove_env_var(var_name: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
+def write_unbound_config(api_key: str) -> bool:
+    """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
+    config_dir = Path.home() / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not write config: {e}")
+        return False
+
+
+def remove_hooks_unbound_script() -> None:
+    """Remove ~/.claude/hooks/unbound.py if present (leftover from hooks setup)."""
+    script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+            debug_print(f"Removed {script_path}")
+        except Exception as e:
+            debug_print(f"Failed to remove {script_path}: {e}")
+
+
 def setup_claude_key_helper() -> None:
     """
     Create ~/.claude/anthropic_key.sh that echoes UNBOUND_API_KEY and
@@ -440,15 +475,19 @@ def main():
     print("Claude Code - Environment Setup")
     print("=" * 60)
 
-    # Flush previously set environment variables at start
+    # Flush previously set environment variables at start (including hooks setup var)
     for var_name in [
         "ANTHROPIC_BASE_URL",
-        "UNBOUND_API_KEY"
+        "UNBOUND_API_KEY",
+        "UNBOUND_CLAUDE_API_KEY",
     ]:
         try:
             remove_env_var(var_name)
         except Exception:
             pass
+
+    # Remove leftover hooks setup artifacts
+    remove_hooks_unbound_script()
 
     api_key = args.api_key
     if not api_key:
@@ -484,6 +523,8 @@ def main():
     debug_print("Setting ANTHROPIC_BASE_URL environment variable...")
     success, message = set_env_var("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
     debug_print("ANTHROPIC_BASE_URL set successfully")
+
+    write_unbound_config(api_key)
 
     # Configure Claude Code helper files
     debug_print("Setting up Claude key helper...")

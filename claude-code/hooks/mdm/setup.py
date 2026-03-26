@@ -469,6 +469,45 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
         return False
 
 
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
+    """Write API key to ~/.unbound/config.json for a given user."""
+    config_dir = home_dir / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        try:
+            user_info = pwd.getpwnam(username)
+            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
+            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+        except Exception as e:
+            debug_print(f"Could not chown config files for {username}: {e}")
+    except Exception as e:
+        debug_print(f"Could not write config for {username}: {e}")
+
+
+def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
+    """Remove ~/.claude/anthropic_key.sh for a given user (leftover from gateway setup)."""
+    key_helper_path = home_dir / ".claude" / "anthropic_key.sh"
+    if key_helper_path.exists():
+        try:
+            key_helper_path.unlink()
+            debug_print(f"Removed {key_helper_path} for {username}")
+        except Exception as e:
+            debug_print(f"Failed to remove {key_helper_path}: {e}")
+
+
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Claude Code."""
     system = platform.system().lower()
@@ -789,11 +828,21 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
+    # Remove leftover gateway setup env vars
+    for username, home_dir in get_all_user_homes():
+        remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
+        remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
         print("Failed to set UNBOUND_CLAUDE_API_KEY")
         return
     debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
+
+    # Remove gateway artifacts and write unbound config for all users
+    for username, home_dir in get_all_user_homes():
+        remove_gateway_artifacts_for_user(username, home_dir)
+        write_unbound_config_for_user(username, home_dir, api_key)
 
     print("\nConfiguring Claude managed hooks...")
     if setup_managed_hooks():
