@@ -32,6 +32,7 @@ except Exception:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
     ERROR_LOG = LOG_DIR / "error.log"
+    LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
 
 _cached_api_key = None
@@ -80,17 +81,20 @@ def log_error(message, category='general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
     error_entry = f"{timestamp}: {message}\n"
-    
-    with open(ERROR_LOG, 'a', encoding='utf-8') as f:
-        f.write(error_entry)
-    
-    # Keep only last 25 errors
-    if ERROR_LOG.exists():
-        with open(ERROR_LOG, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        if len(lines) > 25:
-            with open(ERROR_LOG, 'w', encoding='utf-8') as f:
-                f.writelines(lines[-25:])
+
+    try:
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write(error_entry)
+
+        # Keep only last 25 errors
+        if ERROR_LOG.exists():
+            with open(ERROR_LOG, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            if len(lines) > 25:
+                with open(ERROR_LOG, 'w', encoding='utf-8') as f:
+                    f.writelines(lines[-25:])
+    except Exception:
+        pass
 
     # Report to gateway (fire-and-forget)
     report_error_to_gateway(message, category, _cached_api_key)
