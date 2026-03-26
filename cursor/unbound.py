@@ -155,20 +155,55 @@ def format_hook_response(api_response):
     return response
 
 
-def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
-    """Process beforeShellExecution or beforeMCPExecution event."""
+TRACKED_TOOLS_FOR_POLICY_MATCHING = {'Shell', 'Delete', 'Write', 'Read'}
+
+# read already handled in beforeReadFile hook as that contains the file content
+TRACKED_TOOLS_FOR_LOGGING = {'Shell', 'Delete', 'Write'}
+
+FILE_TOOLS = {'Delete', 'Write', 'Read'}
+
+
+def _is_tracked_tool(tool_name):
+    """Return True if this tool should be policy-checked and logged."""
+    return tool_name in TRACKED_TOOLS_FOR_POLICY_MATCHING or tool_name.startswith('MCP:')
+
+
+def extract_command_for_pretool(tool_name, tool_input):
+    """Extract command string from tool_input based on tool type."""
+    if not tool_input:
+        return ''
+    
+    if tool_name == 'Shell' and 'command' in tool_input:
+        return tool_input['command']
+    
+    if tool_name.startswith('MCP:'):
+        return json.dumps(tool_input)
+
+    return ''
+
+
+def process_pre_tool_use(event, api_key):
+    """Process preToolUse event - check policy before tool execution."""
+    tool_name = event.get('tool_name', '')
+
+    if not _is_tracked_tool(tool_name):
+        return {}
+
     generation_id = event.get('generation_id')
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
+    tool_input = event.get('tool_input') or {}
 
     user_prompt = get_latest_user_prompt(generation_id)
+    command = extract_command_for_pretool(tool_name, tool_input)
 
-    # Build metadata with the raw event, inject mcp fields if present
     metadata = dict(event)
-    if mcp_server is not None:
-        metadata['mcp_server'] = mcp_server
-    if mcp_tool is not None:
-        metadata['mcp_tool'] = mcp_tool
+
+    if tool_name.startswith('MCP:'):
+        metadata['mcp_tool'] = tool_name
+    
+    if 'file_path' in tool_input:
+        metadata['file_path'] = tool_input['file_path']
 
     request_body = {
         'conversation_id': conversation_id,
@@ -235,27 +270,21 @@ def build_llm_exchange(events, api_key=None):
                 'content': event.get('content', ''),
                 'attachments': event.get('attachments', [])
             })
-        
-        elif hook_event_name == 'afterFileEdit':
+
+        elif hook_event_name == 'postToolUse':
+            tool_name = event.get('tool_name', '')
+
+            if tool_name not in TRACKED_TOOLS_FOR_LOGGING:
+                continue
+            
+            tool_output = event.get('tool_output', '')
+
             assistant_tool_uses.append({
                 'type': hook_event_name,
-                'file_path': event.get('file_path'),
-                'edits': event.get('edits', [])
-            })
-        
-        elif hook_event_name == 'afterShellExecution':
-            assistant_tool_uses.append({
-                'type': hook_event_name,
-                'command': event.get('command'),
-                'output': event.get('output', '')
-            })
-        
-        elif hook_event_name == 'afterMCPExecution':
-            assistant_tool_uses.append({
-                'type': hook_event_name,
-                'tool_name': event.get('tool_name'),
+                'tool_name': tool_name,
                 'tool_input': event.get('tool_input'),
-                'result_json': event.get('result_json')
+                'tool_output': tool_output,
+                'duration': event.get('duration')
             })
         
         elif hook_event_name == 'afterAgentResponse':
@@ -475,25 +504,13 @@ def main():
         generation_id = event.get('generation_id')
         conversation_id = event.get('conversation_id')
 
-        # Handle beforeShellExecution / beforeMCPExecution - check policy before execution
-        if hook_event_name == 'beforeShellExecution':
-            response = process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
+        if hook_event_name == 'preToolUse':
+            response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
 
-        if hook_event_name == 'beforeMCPExecution':
-            mcp_tool_name = event.get('tool_name', '')
-            # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
-            response = process_pre_tool_use_execution(
-                event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input') or {}),
-                mcp_server=None, mcp_tool=mcp_tool_name
-            )
-            print(json.dumps(response), flush=True)
-            if response.get('permission') == 'deny':
-                handle_deny_and_exit()
-            return
 
         # Handle beforeSubmitPrompt - check policy before processing
         if hook_event_name == 'beforeSubmitPrompt':
