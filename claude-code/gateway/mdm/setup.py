@@ -474,6 +474,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_file = config_dir / "config.json"
     try:
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
         config = {}
         if config_file.exists():
             try:
@@ -482,15 +483,15 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
-        with open(config_file, 'w', encoding='utf-8') as f:
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
         try:
             user_info = pwd.getpwnam(username)
             os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
             os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
-        except Exception:
-            pass
-        os.chmod(config_file, 0o600)
+        except Exception as e:
+            debug_print(f"Could not chown config files for {username}: {e}")
     except Exception as e:
         debug_print(f"Could not write config for {username}: {e}")
 

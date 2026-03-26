@@ -264,6 +264,7 @@ def write_unbound_config(api_key: str) -> bool:
     config_file = config_dir / "config.json"
     try:
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
         config = {}
         if config_file.exists():
             try:
@@ -272,9 +273,9 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
-        with open(config_file, 'w', encoding='utf-8') as f:
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
-        os.chmod(config_file, 0o600)
         return True
     except Exception as e:
         print(f"⚠️  Could not write config: {e}")
