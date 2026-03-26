@@ -160,8 +160,6 @@ TRACKED_TOOLS_FOR_POLICY_MATCHING = {'Shell', 'Delete', 'Write', 'Read'}
 # read already handled in beforeReadFile hook as that contains the file content
 TRACKED_TOOLS_FOR_LOGGING = {'Shell', 'Delete', 'Write'}
 
-FILE_TOOLS = {'Delete', 'Write', 'Read'}
-
 
 def _is_tracked_tool(tool_name):
     """Return True if this tool should be policy-checked and logged."""
@@ -274,7 +272,7 @@ def build_llm_exchange(events, api_key=None):
         elif hook_event_name == 'postToolUse':
             tool_name = event.get('tool_name', '')
 
-            if tool_name not in TRACKED_TOOLS_FOR_LOGGING:
+            if tool_name not in TRACKED_TOOLS_FOR_LOGGING and not tool_name.startswith('MCP:'):
                 continue
             
             tool_output = event.get('tool_output', '')
