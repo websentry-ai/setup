@@ -660,7 +660,7 @@ def main():
         return
 
     # Parse arguments
-    base_url = None
+    base_url = "https://backend.getunbound.ai"
     app_name = None
     auth_api_key = None
 
@@ -681,9 +681,9 @@ def main():
         else:
             i += 1
 
-    if not base_url or not auth_api_key:
+    if not auth_api_key:
         print("\n❌ Missing required arguments")
-        print("Usage: sudo python3 setup.py --url <base_url> --api_key <api_key> [--app_name <app_name>] [--debug]")
+        print("Usage: sudo python3 setup.py --api_key <api_key> [--url <base_url>] [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
