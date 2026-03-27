@@ -11,7 +11,9 @@ import subprocess
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
-
+import tempfile
+import time
+import hashlib
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 
@@ -32,7 +34,6 @@ try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
     # Fallback to temp directory if home directory is not writable
-    import tempfile
     LOG_DIR = Path(tempfile.gettempdir()) / "cursor-hooks"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
@@ -200,7 +201,6 @@ _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
 
 def _is_approval_retry(command):
     """True if a marker exists for this exact command and is fresh."""
-    import time, hashlib
     try:
         if not _APPROVAL_MARKER_FILE.exists():
             return False
@@ -212,7 +212,6 @@ def _is_approval_retry(command):
 
 
 def _set_approval_marker(command, policy_ids, application_id):
-    import time, hashlib
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -242,7 +241,6 @@ def _clear_approval_marker():
 def poll_approval_status(api_key, policy_ids, application_id, poll_interval=5, timeout=APPROVAL_POLL_TIMEOUT):
     """Poll the approval-status endpoint until approved, denied, or timeout.
     Returns 'approved', 'denied', or 'timeout'."""
-    import time
 
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
     body = json.dumps({"policyIds": policy_ids, "applicationId": application_id})

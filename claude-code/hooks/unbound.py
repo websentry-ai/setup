@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
+import time
+import hashlib
 
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
@@ -131,7 +133,6 @@ _APPROVAL_MARKER_FILE = Path.home() / ".claude" / "hooks" / ".approval_pending"
 
 def _is_approval_retry(command: str) -> bool:
     """True if a marker exists for this exact command and is fresh (< APPROVAL_TIMEOUT)."""
-    import time, hashlib
     try:
         if not _APPROVAL_MARKER_FILE.exists():
             return False
@@ -143,7 +144,6 @@ def _is_approval_retry(command: str) -> bool:
 
 
 def _set_approval_marker(command: str, policy_ids: list, application_id: str) -> None:
-    import time, hashlib
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -314,7 +314,6 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
 def poll_approval_status(api_key: str, policy_ids: list, application_id: str, poll_interval: int = 5, timeout: int = APPROVAL_POLL_TIMEOUT) -> str:
     """Poll the approval-status endpoint until approved, denied, or timeout.
     Returns 'approved', 'denied', or 'timeout'."""
-    import time
 
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
     body = json.dumps({"policyIds": policy_ids, "applicationId": application_id})
