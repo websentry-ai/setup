@@ -897,7 +897,7 @@ def main():
             system = platform.system().lower()
             if system in ("darwin", "linux"):
                 print("This script requires administrator/root privileges to set env vars")
-                print("   Please run with: sudo python3 setup.py ...")
+                print("   Please re-run with sudo.")
             else:
                 print("This script requires administrator privileges")
             return

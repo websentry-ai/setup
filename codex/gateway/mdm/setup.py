@@ -499,7 +499,7 @@ def clear_setup():
 
     if not check_admin_privileges():
         print("❌ This script requires administrator/root privileges")
-        print("   Please run with: sudo python3 setup.py --clear")
+        print("   Please re-run with sudo.")
         return
 
     print("\n🗑️  Removing environment variables...")
@@ -546,7 +546,7 @@ def main():
         system = platform.system().lower()
         if system in ["darwin", "linux"]:
             print("❌ This script requires administrator/root privileges")
-            print("   Please run with: sudo python3 setup.py ...")
+            print("   Please re-run with sudo.")
         else:
             print("❌ This script requires administrator privileges")
             print("   Please run as Administrator")

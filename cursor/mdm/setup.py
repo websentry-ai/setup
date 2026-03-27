@@ -512,7 +512,7 @@ def clear_setup():
     # Check admin privileges
     if not check_admin_privileges():
         print("❌ This script requires administrator/root privileges")
-        print("   Please run with: sudo python3 setup.py --clear")
+        print("   Please re-run with sudo.")
         return
 
     # Remove enterprise hooks files (NOT the entire Cursor directory)
@@ -656,7 +656,7 @@ def main():
     # Check admin privileges
     if not check_admin_privileges():
         print("❌ This script requires administrator/root privileges")
-        print("   Please run with: sudo python3 setup.py ...")
+        print("   Please re-run with sudo.")
         return
 
     # Parse arguments
