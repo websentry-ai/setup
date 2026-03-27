@@ -16,6 +16,11 @@ LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
 MCP_TOOL_PREFIX = 'mcp__'
 
+# Max time (seconds) to wait for Slack approval before timing out.
+# Buffer of 20s ensures poll_approval_status finishes before Claude Code's hook timeout
+APPROVAL_TIMEOUT = 600
+APPROVAL_POLL_TIMEOUT = APPROVAL_TIMEOUT - 20
+
 
 _cached_api_key = None
 _reporting_error = False
@@ -118,6 +123,50 @@ def append_to_audit_log(event_data: Dict):
         with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
             f.write(json.dumps(event_data) + '\n')
     except Exception:
+        pass
+
+
+_APPROVAL_MARKER_FILE = Path.home() / ".claude" / "hooks" / ".approval_pending"
+
+
+def _is_approval_retry(command: str) -> bool:
+    """True if a marker exists for this exact command and is fresh (< APPROVAL_TIMEOUT)."""
+    import time, hashlib
+    try:
+        if not _APPROVAL_MARKER_FILE.exists():
+            return False
+        data = json.loads(_APPROVAL_MARKER_FILE.read_text())
+        cmd_hash = hashlib.sha256(command.encode()).hexdigest()[:16]
+        return data.get('cmd') == cmd_hash and (time.time() - data.get('ts', 0)) < APPROVAL_TIMEOUT
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _set_approval_marker(command: str, policy_ids: list, application_id: str) -> None:
+    import time, hashlib
+    _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
+        'ts': time.time(),
+        'policyIds': policy_ids,
+        'applicationId': application_id,
+    }
+    _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
+
+
+def _get_approval_marker_data() -> Optional[Dict]:
+    try:
+        if _APPROVAL_MARKER_FILE.exists():
+            return json.loads(_APPROVAL_MARKER_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _clear_approval_marker() -> None:
+    try:
+        _APPROVAL_MARKER_FILE.unlink(missing_ok=True)
+    except OSError:
         pass
 
 
@@ -262,6 +311,39 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         return {}
 
 
+def poll_approval_status(api_key: str, policy_ids: list, application_id: str, poll_interval: int = 5, timeout: int = APPROVAL_POLL_TIMEOUT) -> str:
+    """Poll the approval-status endpoint until approved, denied, or timeout.
+    Returns 'approved', 'denied', or 'timeout'."""
+    import time
+
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
+    body = json.dumps({"policyIds": policy_ids, "applicationId": application_id})
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "-d", body, url],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                resp = json.loads(result.stdout.decode('utf-8'))
+                decision = resp.get('decision', 'pending')
+                if decision == 'allow':
+                    return 'approved'
+                if decision == 'denied':
+                    return 'denied'
+        except Exception as e:
+            log_error(f"Approval poll error: {str(e)}")
+
+    return 'timeout'
+
+
 def transform_response_for_claude(api_response: Dict) -> Dict:
     """Transform API response to Claude Code format for PreToolUse."""
     if not api_response:
@@ -323,6 +405,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
+    # for "approval required" policy
+    is_retry = _is_approval_retry(command)
+
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'claude-code',
@@ -336,7 +421,55 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
+    if not is_retry:
+        request_body['first_approval_check'] = True
+
+    # On retry, skip the gateway call — use the cached policy/app IDs from the
+    # marker and go straight to polling.
+    if is_retry:
+        marker_data = _get_approval_marker_data()
+        if marker_data:
+            policy_ids = marker_data.get('policyIds', [])
+            application_id = marker_data.get('applicationId', '')
+            _clear_approval_marker()
+            result = poll_approval_status(api_key, policy_ids, application_id)
+
+            if result == 'approved':
+                return transform_response_for_claude({'decision': 'allow'})
+            elif result == 'denied':
+                return transform_response_for_claude({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. This command was denied via Slack.',
+                    'additionalContext': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                })
+            else:
+                return transform_response_for_claude({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
+                    'additionalContext': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                })
+
     api_response = send_to_hook_api(request_body, api_key)
+
+    if api_response.get('decision') == 'approval_required':
+        approval_check = api_response.get('approvalCheck', {})
+        policy_ids = approval_check.get('policyIds', [])
+        application_id = approval_check.get('applicationId', '')
+
+        _set_approval_marker(command, policy_ids, application_id)
+        return transform_response_for_claude({
+            'decision': 'deny',
+            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'additionalContext': (
+                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+                'Tell the user: "An approval request has been sent to your Slack DMs. '
+                'Please approve it and I will retry automatically." '
+                'Then immediately retry the exact same tool call with the exact same command — '
+                'do not modify the command in any way, do not add sleep or any prefix. '
+                'Retry exactly once — the second attempt will wait for the approval.'
+            ),
+        })
+
     return transform_response_for_claude(api_response)
 
 
