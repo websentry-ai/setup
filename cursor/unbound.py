@@ -18,7 +18,7 @@ import hashlib
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 
 # Max time (seconds) to wait for Slack approval before timing out.
-# Buffer of 20s ensures poll_approval_status finishes before Claude Code's hook timeout
+# Buffer of 20s ensures poll_approval_status finishes before Cursor's hook timeout
 APPROVAL_TIMEOUT = 600
 APPROVAL_POLL_TIMEOUT = APPROVAL_TIMEOUT - 20
 
