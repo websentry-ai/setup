@@ -577,7 +577,6 @@ def main():
     if not api_key:
         if not domain:
             print("❌ Missing required argument: --domain or --api-key")
-            print("   Run setup through the Unbound CLI: unbound setup claude-code")
             return
 
         auth_url = normalize_url(domain)
