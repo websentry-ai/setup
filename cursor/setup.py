@@ -301,7 +301,7 @@ def check_enterprise_hooks_conflict() -> bool:
     if enterprise_hooks.exists():
         print("\n❌ Enterprise (MDM) hooks are already installed.")
         print("   Installing user-level hooks alongside MDM hooks causes duplicate execution.")
-        print("   Remove MDM setup first: sudo python3 cursor/mdm/setup.py --clear")
+        print("   Contact your organization administrator to manage Unbound configuration.")
         return True
     return False
 
@@ -477,7 +477,6 @@ def main():
     if not api_key:
         if not domain:
             print("\n❌ Missing required argument: --domain or --api-key")
-            print("Usage: python3 setup.py --domain gateway.getunbound.ai")
             return
 
         auth_url = normalize_url(domain)

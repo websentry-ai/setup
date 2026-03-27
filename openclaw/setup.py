@@ -481,7 +481,6 @@ def main():
     if not api_key:
         if not domain:
             print("❌ Missing required argument: --domain or --api-key")
-            print("Usage: python3 setup.py --domain gateway.getunbound.ai [--api-key KEY] [--plugin] [--provider] [--model MODEL_ID]")
             return
 
         auth_url = normalize_url(domain)
