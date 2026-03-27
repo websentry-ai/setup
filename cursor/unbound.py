@@ -262,8 +262,8 @@ def poll_approval_status(api_key, policy_ids, application_id, poll_interval=5, t
                 decision = resp.get('decision', 'pending')
                 if decision == 'allow':
                     return 'approved'
-                if decision == 'denied':
-                    return 'denied'
+                if decision == 'deny':
+                    return 'deny'
         except Exception as e:
             log_error(f"Approval poll error: {str(e)}", 'api_call')
 
@@ -331,7 +331,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
 
             if result == 'approved':
                 return {'permission': 'allow'}
-            elif result == 'denied':
+            elif result == 'deny':
                 return {
                     'permission': 'deny',
                     'user_message': 'Blocked by organization policy. This command was denied via Slack.',

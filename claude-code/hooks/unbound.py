@@ -335,8 +335,8 @@ def poll_approval_status(api_key: str, policy_ids: list, application_id: str, po
                 decision = resp.get('decision', 'pending')
                 if decision == 'allow':
                     return 'approved'
-                if decision == 'denied':
-                    return 'denied'
+                if decision == 'deny':
+                    return 'deny'
         except Exception as e:
             log_error(f"Approval poll error: {str(e)}")
 
@@ -435,7 +435,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
             if result == 'approved':
                 return transform_response_for_claude({'decision': 'allow'})
-            elif result == 'denied':
+            elif result == 'deny':
                 return transform_response_for_claude({
                     'decision': 'deny',
                     'reason': 'Blocked by organization policy. This command was denied via Slack.',
