@@ -19,7 +19,9 @@ UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 LOG_DIR = Path.home() / ".cursor" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
+LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
+TRACKED_NATIVE_TOOLS = {'Delete'}
 
 # Ensure log directory exists
 try:
@@ -31,23 +33,74 @@ except Exception:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
     ERROR_LOG = LOG_DIR / "error.log"
+    LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
 
-def log_error(message):
+_cached_api_key = None
+_reporting_error = False
+
+
+def _should_report():
+    """Rate limit: max 1 remote error report per 60 seconds. Fails closed."""
+    try:
+        if LAST_REPORT_FILE.exists():
+            mtime = LAST_REPORT_FILE.stat().st_mtime
+            if (datetime.now().timestamp() - mtime) < 60:
+                return False
+        LAST_REPORT_FILE.touch()
+        return True
+    except Exception:
+        return False
+
+
+def report_error_to_gateway(message, category='general', api_key=None):
+    """Fire-and-forget error report to gateway. Never blocks, never raises."""
+    global _reporting_error
+    if _reporting_error or not api_key or not _should_report():
+        return
+    _reporting_error = True
+    try:
+        payload = json.dumps({
+            'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
+            'hook_source': 'cursor',
+        })
+        proc = subprocess.Popen(
+            ["curl", "-fsSL", "-K", "-", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-d", payload,
+             f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(f'header = "Authorization: Bearer {api_key}"\n'.encode())
+        proc.stdin.close()
+    except Exception:
+        pass
+    finally:
+        _reporting_error = False
+
+
+def log_error(message, category='general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
     error_entry = f"{timestamp}: {message}\n"
-    
-    with open(ERROR_LOG, 'a', encoding='utf-8') as f:
-        f.write(error_entry)
-    
-    # Keep only last 25 errors
-    if ERROR_LOG.exists():
-        with open(ERROR_LOG, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-        if len(lines) > 25:
-            with open(ERROR_LOG, 'w', encoding='utf-8') as f:
-                f.writelines(lines[-25:])
+
+    try:
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write(error_entry)
+
+        # Keep only last 25 errors
+        if ERROR_LOG.exists():
+            with open(ERROR_LOG, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            if len(lines) > 25:
+                with open(ERROR_LOG, 'w', encoding='utf-8') as f:
+                    f.writelines(lines[-25:])
+    except Exception:
+        pass
+
+    # Report to gateway (fire-and-forget)
+    report_error_to_gateway(message, category, _cached_api_key)
 
 
 def load_existing_logs():
@@ -134,7 +187,7 @@ def send_to_hook_api(request_body, api_key):
             return json.loads(result.stdout.decode('utf-8'))
         return {}
     except Exception as e:
-        log_error(f"Hook API error: {str(e)}")
+        log_error(f"Hook API error: {str(e)}", 'api_call')
         return {}
 
 
@@ -154,54 +207,58 @@ def format_hook_response(api_response):
         response['agent_message'] = additional_context
     return response
 
-
-TRACKED_TOOLS_FOR_POLICY_MATCHING = {'Shell', 'Delete', 'Write', 'Read'}
-
-# read already handled in beforeReadFile hook as that contains the file content
-TRACKED_TOOLS_FOR_LOGGING = {'Shell', 'Delete', 'Write'}
-
-
-def _is_tracked_tool(tool_name):
-    """Return True if this tool should be policy-checked and logged."""
-    return tool_name in TRACKED_TOOLS_FOR_POLICY_MATCHING or tool_name.startswith('MCP:')
-
-
-def extract_command_for_pretool(tool_name, tool_input):
-    """Extract command string from tool_input based on tool type."""
-    if not tool_input:
-        return ''
-    
-    if tool_name == 'Shell' and 'command' in tool_input:
-        return tool_input['command']
-    
-    if tool_name.startswith('MCP:'):
-        return json.dumps(tool_input)
-
-    return ''
-
-
 def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
 
-    if not _is_tracked_tool(tool_name):
+    if tool_name not in TRACKED_NATIVE_TOOLS:
         return {}
-
+    
     generation_id = event.get('generation_id')
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
     tool_input = event.get('tool_input') or {}
 
     user_prompt = get_latest_user_prompt(generation_id)
-    command = extract_command_for_pretool(tool_name, tool_input)
-
     metadata = dict(event)
-
-    if tool_name.startswith('MCP:'):
-        metadata['mcp_tool'] = tool_name
-    
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
+
+
+    request_body = {
+        'conversation_id': conversation_id,
+        'unbound_app_label': 'cursor',
+        'model': model,
+        'event_name': 'tool_use',
+        'pre_tool_use_data': {
+            'tool_name': tool_name,
+            'command': '',
+            'metadata': metadata
+        },
+        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+    }
+
+    api_response = send_to_hook_api(request_body, api_key)
+    return format_hook_response(api_response)
+    
+
+
+
+
+def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
+    """Process beforeShellExecution or beforeMCPExecution event."""
+    generation_id = event.get('generation_id')
+    conversation_id = event.get('conversation_id')
+    model = event.get('model') or 'auto'
+
+    user_prompt = get_latest_user_prompt(generation_id)
+
+    # Build metadata with the raw event, inject mcp fields if present
+    metadata = dict(event)
+    if mcp_server is not None:
+        metadata['mcp_server'] = mcp_server
+    if mcp_tool is not None:
+        metadata['mcp_tool'] = mcp_tool
 
     request_body = {
         'conversation_id': conversation_id,
@@ -272,7 +329,7 @@ def build_llm_exchange(events, api_key=None):
         elif hook_event_name == 'postToolUse':
             tool_name = event.get('tool_name', '')
 
-            if tool_name not in TRACKED_TOOLS_FOR_LOGGING and not tool_name.startswith('MCP:'):
+            if tool_name not in TRACKED_NATIVE_TOOLS:
                 continue
             
             tool_output = event.get('tool_output', '')
@@ -283,6 +340,28 @@ def build_llm_exchange(events, api_key=None):
                 'tool_input': event.get('tool_input'),
                 'tool_output': tool_output,
                 'duration': event.get('duration')
+            })
+        
+        elif hook_event_name == 'afterFileEdit':
+            assistant_tool_uses.append({
+                'type': hook_event_name,
+                'file_path': event.get('file_path'),
+                'edits': event.get('edits', [])
+            })
+        
+        elif hook_event_name == 'afterShellExecution':
+            assistant_tool_uses.append({
+                'type': hook_event_name,
+                'command': event.get('command'),
+                'output': event.get('output', '')
+            })
+        
+        elif hook_event_name == 'afterMCPExecution':
+            assistant_tool_uses.append({
+                'type': hook_event_name,
+                'tool_name': event.get('tool_name'),
+                'tool_input': event.get('tool_input'),
+                'result_json': event.get('result_json')
             })
         
         elif hook_event_name == 'afterAgentResponse':
@@ -331,11 +410,11 @@ def send_to_api(exchange, api_key):
         
         if result.returncode != 0:
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
-            log_error(f"API request failed: {error_msg}")
+            log_error(f"API request failed: {error_msg}", 'api_call')
             return False
         return True
     except Exception as e:
-        log_error(f"Exception in send_to_api: {str(e)}")
+        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
         return False
 
 
@@ -473,14 +552,16 @@ def get_api_key():
     except FileNotFoundError:
         return None
     except Exception as e:
-        log_error(f"Failed to read config file: {e}")
+        log_error(f"Failed to read config file: {e}", 'config')
         return None
 
 
 def main():
     """Main entry point - read from stdin and process events."""
+    global _cached_api_key
     # Get API key (will be None if not set)
     api_key = get_api_key()
+    _cached_api_key = api_key
     
     try:
         # Read JSON from stdin
@@ -509,6 +590,25 @@ def main():
                 handle_deny_and_exit()
             return
 
+        # Handle beforeShellExecution / beforeMCPExecution - check policy before execution
+        if hook_event_name == 'beforeShellExecution':
+            response = process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
+            print(json.dumps(response), flush=True)
+            if response.get('permission') == 'deny':
+                handle_deny_and_exit()
+            return
+
+        if hook_event_name == 'beforeMCPExecution':
+            mcp_tool_name = event.get('tool_name', '')
+            # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
+            response = process_pre_tool_use_execution(
+                event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input') or {}),
+                mcp_server=None, mcp_tool=mcp_tool_name
+            )
+            print(json.dumps(response), flush=True)
+            if response.get('permission') == 'deny':
+                handle_deny_and_exit()
+            return
 
         # Handle beforeSubmitPrompt - check policy before processing
         if hook_event_name == 'beforeSubmitPrompt':
@@ -551,7 +651,7 @@ def main():
         
     except Exception as e:
         # Log errors but still output {} to not break Cursor
-        log_error(f"Exception in main: {str(e)}")
+        log_error(f"Exception in main: {str(e)}", 'general')
         print("{}", file=sys.stderr)
         print(f"Error: {e}", file=sys.stderr)
         print("{}")
