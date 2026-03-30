@@ -394,7 +394,7 @@ def build_llm_exchange(events, api_key=None):
 def send_to_api(exchange, api_key):
     """Send exchange data to Unbound API."""
     if not api_key:
-        log_error("No API key present in send_to_api function")
+        log_error("No API key present in send_to_api function", 'config')
         return False
     
     try:

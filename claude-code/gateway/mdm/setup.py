@@ -468,6 +468,45 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
         return False
 
 
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
+    """Write API key to ~/.unbound/config.json for a given user."""
+    config_dir = home_dir / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        try:
+            user_info = pwd.getpwnam(username)
+            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
+            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+        except Exception as e:
+            debug_print(f"Could not chown config files for {username}: {e}")
+    except Exception as e:
+        debug_print(f"Could not write config for {username}: {e}")
+
+
+def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
+    """Remove ~/.claude/hooks/unbound.py for a given user (leftover from hooks setup)."""
+    script_path = home_dir / ".claude" / "hooks" / "unbound.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+            debug_print(f"Removed {script_path} for {username}")
+        except Exception as e:
+            debug_print(f"Failed to remove {script_path}: {e}")
+
+
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Claude Code."""
     system = platform.system().lower()
@@ -572,7 +611,7 @@ def clear_setup():
 
     if not check_admin_privileges():
         print("❌ This script requires administrator/root privileges")
-        print("   Please run with: sudo python3 setup.py --clear")
+        print("   Please re-run with sudo.")
         return
 
     print("\n🗑️  Removing environment variables...")
@@ -627,13 +666,13 @@ def main():
         system = platform.system().lower()
         if system in ["darwin", "linux"]:
             print("❌ This script requires administrator/root privileges")
-            print("   Please run with: sudo python3 setup.py ...")
+            print("   Please re-run with sudo.")
         else:
             print("❌ This script requires administrator privileges")
             print("   Please run as Administrator")
         return
 
-    base_url = None
+    base_url = "https://backend.getunbound.ai"
     app_name = None
     auth_api_key = None
 
@@ -654,9 +693,9 @@ def main():
         else:
             i += 1
 
-    if not base_url or not auth_api_key:
+    if not auth_api_key:
         print("\n❌ Missing required arguments")
-        print("Usage: sudo python3 setup.py --url <base_url> --api_key <api_key> [--app_name <app_name>] [--debug]")
+        print("Usage: sudo python3 setup.py --api_key <api_key> [--url <base_url>] [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
@@ -675,6 +714,10 @@ def main():
     print("✅ API key received")
 
     print("\n📝 Setting environment variables system-wide...")
+    # Remove leftover hooks setup env var
+    for username, home_dir in get_all_user_homes():
+        remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY")
+
     success, env_changed = set_env_var_system_wide("UNBOUND_API_KEY", claude_api_key)
     if not success:
         print(f"❌ Failed to set UNBOUND_API_KEY")
@@ -686,6 +729,11 @@ def main():
         print(f"❌ Failed to set ANTHROPIC_BASE_URL")
         return
     debug_print("ANTHROPIC_BASE_URL set successfully")
+
+    # Remove leftover hooks scripts and write unbound config for all users
+    for username, home_dir in get_all_user_homes():
+        remove_hooks_unbound_script_for_user(username, home_dir)
+        write_unbound_config_for_user(username, home_dir, claude_api_key)
 
     print("\n🔧 Configuring Claude managed settings...")
     if setup_managed_settings():

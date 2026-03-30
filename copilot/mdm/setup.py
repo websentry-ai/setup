@@ -7,6 +7,7 @@ import subprocess
 import json
 import re
 import glob
+import pwd
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -140,7 +141,6 @@ def get_all_user_homes():
     system = platform.system().lower()
     try:
         if system == "darwin":
-            import pwd
             for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
@@ -150,7 +150,6 @@ def get_all_user_homes():
                         user_homes.append((username, home_dir))
 
         elif system == "linux":
-            import pwd
             for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
@@ -253,7 +252,6 @@ def set_env_var_for_user(username, home_dir, var_name, value):
                 if append_to_file(rc_file, export_line, var_name):
                     if system in ("darwin", "linux"):
                         try:
-                            import pwd
                             user_info = pwd.getpwnam(username)
                             os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
                             os.chmod(rc_file, 0o644)
@@ -270,6 +268,34 @@ def set_env_var_for_user(username, home_dir, var_name, value):
     except Exception as e:
         debug_print(f"Error setting env var for {username}: {e}")
         return False, False
+
+
+def write_unbound_config_for_user(username, home_dir, api_key):
+    """Write API key to ~/.unbound/config.json for a given user."""
+    config_dir = home_dir / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        config['api_key'] = api_key
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        try:
+            user_info = pwd.getpwnam(username)
+            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
+            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+        except Exception as e:
+            debug_print(f"Could not chown config files for {username}: {e}")
+    except Exception as e:
+        debug_print(f"Could not write config for {username}: {e}")
 
 
 def set_env_var_system_wide(var_name, value):
@@ -834,7 +860,7 @@ def main():
     print("=" * 60)
 
     # Parse args
-    base_url = None
+    base_url = "https://backend.getunbound.ai"
     app_name = None
     auth_api_key = None
 
@@ -855,9 +881,9 @@ def main():
         else:
             i += 1
 
-    if not base_url or not auth_api_key:
+    if not auth_api_key:
         print("\nMissing required arguments")
-        print("Usage: sudo python3 setup.py --url <base_url> --api_key <api_key> [--app_name <name>]")
+        print("Usage: sudo python3 setup.py --api_key <api_key> [--url <base_url>] [--app_name <name>]")
         return
 
     # --- Step 1: Resolve API key ---
@@ -871,7 +897,7 @@ def main():
             system = platform.system().lower()
             if system in ("darwin", "linux"):
                 print("This script requires administrator/root privileges to set env vars")
-                print("   Please run with: sudo python3 setup.py ...")
+                print("   Please re-run with sudo.")
             else:
                 print("This script requires administrator privileges")
             return
@@ -895,6 +921,9 @@ def main():
             print(f"Failed to set {ENV_VAR_NAME}")
             return
         debug_print(f"{ENV_VAR_NAME} set successfully")
+
+        for username, home_dir in get_all_user_homes():
+            write_unbound_config_for_user(username, home_dir, api_key)
 
     # --- Step 2: Determine time window ---
     now_utc = datetime.now(timezone.utc)
