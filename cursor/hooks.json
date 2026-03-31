@@ -1,14 +1,16 @@
 {
-    "version": 1,
-    "hooks": {
-      "beforeShellExecution": [{ "command": "./hooks/unbound.py" }],
-      "beforeMCPExecution": [{ "command": "./hooks/unbound.py" }],
-      "afterShellExecution": [{ "command": "./hooks/unbound.py" }],
-      "afterMCPExecution": [{ "command": "./hooks/unbound.py" }],
-      "afterFileEdit": [{ "command": "./hooks/unbound.py" }],
-      "beforeReadFile": [{ "command": "./hooks/unbound.py" }],
-      "beforeSubmitPrompt": [{ "command": "./hooks/unbound.py" }],
-      "afterAgentResponse": [{ "command": "./hooks/unbound.py" }],
-      "stop": [{ "command": "./hooks/unbound.py" }]
-    }
+  "version": 1,
+  "hooks": {
+    "preToolUse": [{ "command": "./hooks/unbound.py" }],
+    "postToolUse": [{ "command": "./hooks/unbound.py" }],
+    "beforeShellExecution": [{ "command": "./hooks/unbound.py" }],
+    "beforeMCPExecution": [{ "command": "./hooks/unbound.py" }],
+    "afterShellExecution": [{ "command": "./hooks/unbound.py" }],
+    "afterMCPExecution": [{ "command": "./hooks/unbound.py" }],
+    "afterFileEdit": [{ "command": "./hooks/unbound.py" }],
+    "beforeReadFile": [{ "command": "./hooks/unbound.py" }],
+    "beforeSubmitPrompt": [{ "command": "./hooks/unbound.py" }],
+    "afterAgentResponse": [{ "command": "./hooks/unbound.py" }],
+    "stop": [{ "command": "./hooks/unbound.py" }]
+  }
 }

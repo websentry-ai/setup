@@ -21,6 +21,7 @@ AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
+TRACKED_NATIVE_TOOLS = {'Delete'}
 
 # Ensure log directory exists
 try:
@@ -206,6 +207,43 @@ def format_hook_response(api_response):
         response['agent_message'] = additional_context
     return response
 
+def process_pre_tool_use(event, api_key):
+    """Process preToolUse event - check policy before tool execution."""
+    tool_name = event.get('tool_name', '')
+
+    if tool_name not in TRACKED_NATIVE_TOOLS:
+        return {}
+    
+    generation_id = event.get('generation_id')
+    conversation_id = event.get('conversation_id')
+    model = event.get('model') or 'auto'
+    tool_input = event.get('tool_input') or {}
+
+    user_prompt = get_latest_user_prompt(generation_id)
+    metadata = dict(event)
+    if 'file_path' in tool_input:
+        metadata['file_path'] = tool_input['file_path']
+
+
+    request_body = {
+        'conversation_id': conversation_id,
+        'unbound_app_label': 'cursor',
+        'model': model,
+        'event_name': 'tool_use',
+        'pre_tool_use_data': {
+            'tool_name': tool_name,
+            'command': '',
+            'metadata': metadata
+        },
+        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+    }
+
+    api_response = send_to_hook_api(request_body, api_key)
+    return format_hook_response(api_response)
+    
+
+
+
 
 def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
     """Process beforeShellExecution or beforeMCPExecution event."""
@@ -286,6 +324,22 @@ def build_llm_exchange(events, api_key=None):
                 'file_path': event.get('file_path'),
                 'content': event.get('content', ''),
                 'attachments': event.get('attachments', [])
+            })
+
+        elif hook_event_name == 'postToolUse':
+            tool_name = event.get('tool_name', '')
+
+            if tool_name not in TRACKED_NATIVE_TOOLS:
+                continue
+            
+            tool_output = event.get('tool_output', '')
+
+            assistant_tool_uses.append({
+                'type': hook_event_name,
+                'tool_name': tool_name,
+                'tool_input': event.get('tool_input'),
+                'tool_output': tool_output,
+                'duration': event.get('duration')
             })
         
         elif hook_event_name == 'afterFileEdit':
@@ -528,6 +582,13 @@ def main():
         hook_event_name = event.get('hook_event_name')
         generation_id = event.get('generation_id')
         conversation_id = event.get('conversation_id')
+
+        if hook_event_name == 'preToolUse':
+            response = process_pre_tool_use(event, api_key)
+            print(json.dumps(response), flush=True)
+            if response.get('permission') == 'deny':
+                handle_deny_and_exit()
+            return
 
         # Handle beforeShellExecution / beforeMCPExecution - check policy before execution
         if hook_event_name == 'beforeShellExecution':
