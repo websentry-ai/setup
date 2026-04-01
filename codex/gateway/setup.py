@@ -342,6 +342,70 @@ def write_unbound_config(api_key: str) -> bool:
         return False
 
 
+def write_codex_config(base_url: str) -> bool:
+    """Write openai_base_url to ~/.codex/config.toml."""
+    config_dir = Path.home() / ".codex"
+    config_file = config_dir / "config.toml"
+    key_line = f'openai_base_url = "{base_url}"'
+    try:
+        config_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        if config_file.exists():
+            with open(config_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+
+            # Check if key already exists and update it
+            found = False
+            for i, line in enumerate(lines):
+                if line.strip().startswith("openai_base_url"):
+                    lines[i] = key_line + "\n"
+                    found = True
+                    break
+
+            if not found:
+                # Insert before the first [table] header, or at the end of root keys
+                insert_idx = 0
+                for i, line in enumerate(lines):
+                    if line.strip().startswith("["):
+                        insert_idx = i
+                        break
+                else:
+                    insert_idx = len(lines)
+                lines.insert(insert_idx, key_line + "\n")
+
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        else:
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.write(key_line + "\n")
+
+        os.chmod(config_file, 0o644)
+        debug_print(f"Wrote openai_base_url to {config_file}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to write codex config: {e}")
+        return False
+
+
+def remove_codex_config_base_url() -> bool:
+    """Remove openai_base_url from ~/.codex/config.toml if it exists."""
+    config_file = Path.home() / ".codex" / "config.toml"
+    try:
+        if not config_file.exists():
+            return True
+        with open(config_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines = [l for l in lines if not l.strip().startswith("openai_base_url")]
+        if len(new_lines) < len(lines):
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            debug_print(f"Removed openai_base_url from {config_file}")
+        return True
+    except Exception as e:
+        print(f"❌ Failed to update codex config: {e}")
+        return False
+
+
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
     global DEBUG
@@ -349,7 +413,13 @@ def clear_setup() -> None:
     print("Codex CLI - Clearing Setup")
     print("=" * 60)
 
-    # Remove environment variables
+    # Remove codex config base URL
+    if remove_codex_config_base_url():
+        print("✅ Removed openai_base_url from codex config")
+    else:
+        print("❌ Failed to remove openai_base_url from codex config")
+
+    # Remove environment variables (OPENAI_BASE_URL kept for backwards compatibility)
     env_vars = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
     for var in env_vars:
         success, _ = remove_env_var(var)
@@ -417,9 +487,11 @@ def main():
         return
     debug_print("OPENAI_API_KEY set successfully")
 
-    debug_print("Setting OPENAI_BASE_URL environment variable...")
-    success, message = set_env_var("OPENAI_BASE_URL", "https://api.getunbound.ai/v1")
-    debug_print("OPENAI_BASE_URL set successfully")
+    debug_print("Writing openai_base_url to codex config...")
+    if not write_codex_config("https://api.getunbound.ai/v1"):
+        print("❌ Failed to configure openai_base_url in codex config")
+        return
+    debug_print("openai_base_url written to codex config successfully")
 
     write_unbound_config(api_key)
 
