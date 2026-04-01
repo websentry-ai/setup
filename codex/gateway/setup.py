@@ -342,6 +342,49 @@ def write_unbound_config(api_key: str) -> bool:
         return False
 
 
+def _update_toml_root_key(lines, key_name, key_line):
+    """Update or insert a root-level key in TOML lines.
+    Only matches keys in the root section (before any [table] headers).
+    Returns the modified lines list."""
+    in_section = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = True
+        if not in_section and stripped.startswith(key_name):
+            lines[i] = key_line + "\n"
+            return lines
+
+    # Key not found in root — insert before the first [table] header
+    insert_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith("["):
+            insert_idx = i
+            break
+    else:
+        insert_idx = len(lines)
+    lines.insert(insert_idx, key_line + "\n")
+    return lines
+
+
+def _remove_toml_root_key(lines, key_name):
+    """Remove a root-level key from TOML lines.
+    Only removes keys in the root section (before any [table] headers).
+    Returns (new_lines, was_removed)."""
+    new_lines = []
+    removed = False
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = True
+        if not in_section and stripped.startswith(key_name):
+            removed = True
+            continue
+        new_lines.append(line)
+    return new_lines, removed
+
+
 def write_codex_config(base_url: str) -> bool:
     """Write openai_base_url to ~/.codex/config.toml."""
     config_dir = Path.home() / ".codex"
@@ -353,26 +396,7 @@ def write_codex_config(base_url: str) -> bool:
         if config_file.exists():
             with open(config_file, "r", encoding="utf-8") as f:
                 lines = f.readlines()
-
-            # Check if key already exists and update it
-            found = False
-            for i, line in enumerate(lines):
-                if line.strip().startswith("openai_base_url"):
-                    lines[i] = key_line + "\n"
-                    found = True
-                    break
-
-            if not found:
-                # Insert before the first [table] header, or at the end of root keys
-                insert_idx = 0
-                for i, line in enumerate(lines):
-                    if line.strip().startswith("["):
-                        insert_idx = i
-                        break
-                else:
-                    insert_idx = len(lines)
-                lines.insert(insert_idx, key_line + "\n")
-
+            lines = _update_toml_root_key(lines, "openai_base_url", key_line)
             with open(config_file, "w", encoding="utf-8") as f:
                 f.writelines(lines)
         else:
@@ -383,26 +407,27 @@ def write_codex_config(base_url: str) -> bool:
         debug_print(f"Wrote openai_base_url to {config_file}")
         return True
     except Exception as e:
-        print(f"❌ Failed to write codex config: {e}")
+        debug_print(f"Failed to write codex config: {e}")
         return False
 
 
 def remove_codex_config_base_url() -> bool:
-    """Remove openai_base_url from ~/.codex/config.toml if it exists."""
+    """Remove openai_base_url from ~/.codex/config.toml.
+    Returns True if the key was found and removed, False otherwise."""
     config_file = Path.home() / ".codex" / "config.toml"
     try:
         if not config_file.exists():
-            return True
+            return False
         with open(config_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        new_lines = [l for l in lines if not l.strip().startswith("openai_base_url")]
-        if len(new_lines) < len(lines):
+        new_lines, removed = _remove_toml_root_key(lines, "openai_base_url")
+        if removed:
             with open(config_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
             debug_print(f"Removed openai_base_url from {config_file}")
-        return True
+        return removed
     except Exception as e:
-        print(f"❌ Failed to update codex config: {e}")
+        debug_print(f"Failed to update codex config: {e}")
         return False
 
 
@@ -414,10 +439,9 @@ def clear_setup() -> None:
     print("=" * 60)
 
     # Remove codex config base URL
-    if remove_codex_config_base_url():
+    removed = remove_codex_config_base_url()
+    if removed:
         print("✅ Removed openai_base_url from codex config")
-    else:
-        print("❌ Failed to remove openai_base_url from codex config")
 
     # Remove environment variables (OPENAI_BASE_URL kept for backwards compatibility)
     env_vars = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
