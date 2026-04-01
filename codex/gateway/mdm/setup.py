@@ -492,6 +492,108 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
         debug_print(f"Could not write config for {username}: {e}")
 
 
+def _update_toml_root_key(lines, key_name, key_line):
+    """Update or insert a root-level key in TOML lines.
+    Only matches keys in the root section (before any [table] headers).
+    Returns the modified lines list."""
+    in_section = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = True
+        if not in_section and stripped.startswith(key_name):
+            lines[i] = key_line + "\n"
+            return lines
+
+    # Key not found in root — insert before the first [table] header
+    insert_idx = 0
+    for i, line in enumerate(lines):
+        if line.strip().startswith("["):
+            insert_idx = i
+            break
+    else:
+        insert_idx = len(lines)
+    lines.insert(insert_idx, key_line + "\n")
+    return lines
+
+
+def _remove_toml_root_key(lines, key_name):
+    """Remove a root-level key from TOML lines.
+    Only removes keys in the root section (before any [table] headers).
+    Returns (new_lines, was_removed)."""
+    new_lines = []
+    removed = False
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("["):
+            in_section = True
+        if not in_section and stripped.startswith(key_name):
+            removed = True
+            continue
+        new_lines.append(line)
+    return new_lines, removed
+
+
+def write_codex_config_for_user(username: str, home_dir: Path, base_url: str) -> bool:
+    """Write openai_base_url to {home_dir}/.codex/config.toml for a specific user."""
+    config_dir = home_dir / ".codex"
+    config_file = config_dir / "config.toml"
+    key_line = f'openai_base_url = "{base_url}"'
+    try:
+        config_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+
+        if config_file.exists():
+            with open(config_file, "r", encoding="utf-8") as f:
+                lines = f.readlines()
+            lines = _update_toml_root_key(lines, "openai_base_url", key_line)
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+        else:
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.write(key_line + "\n")
+
+        os.chmod(config_file, 0o644)
+
+        try:
+            user_info = pwd.getpwnam(username)
+            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
+            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+        except Exception as e:
+            debug_print(f"Could not chown codex config for {username}: {e}")
+
+        debug_print(f"Wrote openai_base_url to {config_file} for {username}")
+        return True
+    except Exception as e:
+        debug_print(f"Failed to write codex config for {username}: {e}")
+        return False
+
+
+def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> bool:
+    """Remove openai_base_url from {home_dir}/.codex/config.toml.
+    Returns True if the key was found and removed, False otherwise."""
+    config_file = home_dir / ".codex" / "config.toml"
+    try:
+        if not config_file.exists():
+            return False
+        with open(config_file, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        new_lines, removed = _remove_toml_root_key(lines, "openai_base_url")
+        if removed:
+            with open(config_file, "w", encoding="utf-8") as f:
+                f.writelines(new_lines)
+            try:
+                user_info = pwd.getpwnam(username)
+                os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+            except Exception:
+                pass
+            debug_print(f"Removed openai_base_url from {config_file} for {username}")
+        return removed
+    except Exception as e:
+        debug_print(f"Failed to update codex config for {username}: {e}")
+        return False
+
+
 def clear_setup():
     print("=" * 60)
     print("Codex - Clearing MDM Setup")
@@ -512,7 +614,10 @@ def clear_setup():
         for username, home_dir in user_homes:
             if remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY"):
                 removed_count += 1
+            # Remove OPENAI_BASE_URL env var for backwards compatibility (old setups)
             remove_env_var_from_user(username, home_dir, "OPENAI_BASE_URL")
+            # Remove openai_base_url from codex config.toml
+            remove_codex_config_base_url_for_user(username, home_dir)
 
         if removed_count > 0:
             print(f"✅ Removed environment variables from {removed_count} user(s)")
@@ -600,14 +705,22 @@ def main():
         return
     debug_print("OPENAI_API_KEY set successfully")
 
-    success, url_changed = set_env_var_system_wide("OPENAI_BASE_URL", "https://api.getunbound.ai/v1")
-    if not success:
-        print(f"❌ Failed to set OPENAI_BASE_URL")
+    print("\n📝 Configuring all users...")
+    user_homes = get_all_user_homes()
+    if not user_homes:
+        print("❌ No user home directories found")
         return
-    debug_print("OPENAI_BASE_URL set successfully")
-
-    for username, home_dir in get_all_user_homes():
+    config_count = 0
+    for username, home_dir in user_homes:
+        if write_codex_config_for_user(username, home_dir, "https://api.getunbound.ai/v1"):
+            config_count += 1
         write_unbound_config_for_user(username, home_dir, codex_api_key)
+
+    if config_count == 0:
+        print("❌ Failed to configure codex for any users")
+        return
+
+    print(f"✅ Configured {config_count} user(s)")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
