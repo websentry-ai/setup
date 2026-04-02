@@ -13,7 +13,7 @@ UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 MCP_TOOL_PREFIX = 'mcp__'
 
 
@@ -316,6 +316,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     # Build metadata with the raw event
     metadata = dict(event)
+    tool_input = event.get('tool_input') or {}
+    if 'file_path' in tool_input:
+        metadata['file_path'] = tool_input['file_path']
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
