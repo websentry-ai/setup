@@ -14,7 +14,10 @@ AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
+NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
+POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
+CACHE_TTL_SECONDS = 3600  # 1 hour
 
 
 _cached_api_key = None
@@ -83,6 +86,46 @@ def log_error(message: str, category: str = 'general'):
 
     # Report to gateway (fire-and-forget)
     report_error_to_gateway(message, category, _cached_api_key)
+
+
+def load_policy_cache() -> Optional[Dict]:
+    """Load policy cache from disk. Returns None if missing, corrupt, or expired."""
+    try:
+        if not POLICY_CACHE_FILE.exists():
+            return None
+        with open(POLICY_CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.loads(f.read())
+        if not isinstance(cache, dict) or 'last_synced' not in cache or 'tools_to_check' not in cache:
+            return None
+        if not isinstance(cache['tools_to_check'], list):
+            return None
+        return cache
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_policy_cache(tools_to_check: List[str]):
+    """Write policy cache to disk."""
+    try:
+        POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cache = {
+            'last_synced': datetime.utcnow().isoformat() + 'Z',
+            'tools_to_check': tools_to_check,
+        }
+        with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(cache))
+    except (OSError, TypeError):
+        pass
+
+
+def is_cache_stale(cache: Dict) -> bool:
+    """Check if cached data is older than CACHE_TTL_SECONDS."""
+    try:
+        synced = datetime.fromisoformat(cache['last_synced'].rstrip('Z'))
+        age = (datetime.utcnow() - synced).total_seconds()
+        return age > CACHE_TTL_SECONDS
+    except (ValueError, KeyError):
+        return True
 
 
 def load_existing_logs() -> List[Dict]:
@@ -306,9 +349,15 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
 
-    # Only Bash and MCP tools need policy checking; skip API call for all other tools
     is_mcp = tool_name.startswith(MCP_TOOL_PREFIX)
     if not is_mcp and tool_name not in ALLOWED_NON_MCP_HOOK_NAMES:
+        return {}
+
+    cache = load_policy_cache()
+    tools_to_check = cache.get('tools_to_check', []) if cache else []
+    need_pull_policies = cache is None or is_cache_stale(cache)
+
+    if tool_name in NATIVE_FILE_TOOLS and tool_name not in tools_to_check:
         return {}
 
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
@@ -339,7 +388,14 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
+    if need_pull_policies:
+        request_body['pull_policies'] = True
+
     api_response = send_to_hook_api(request_body, api_key)
+
+    if 'tools_to_check' in api_response:
+        save_policy_cache(api_response['tools_to_check'])
+
     return transform_response_for_claude(api_response)
 
 
