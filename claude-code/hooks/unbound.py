@@ -361,32 +361,14 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
-    all_assistant_responses = []
 
     user_prompt = None
-    user_prompt_timestamp = None
     session_id = None
     permission_mode = None
-    
-    for log_entry in events:
-        event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
-        if event.get('hook_event_name') == 'UserPromptSubmit':
-            user_prompt = event.get('prompt')
-            user_prompt_timestamp = log_entry.get('timestamp')
-            break
-    
-    if main_transcript_data and user_prompt_timestamp:
-        for assistant_msg in main_transcript_data.get('assistant_messages', []):
-            msg_timestamp = assistant_msg.get('timestamp')
-            content = assistant_msg.get('content', '')
-            
-            if msg_timestamp and msg_timestamp > user_prompt_timestamp:
-                if content:
-                    all_assistant_responses.append(content)
-    
+
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
         hook_event_name = event.get('hook_event_name')
@@ -418,33 +400,26 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
                 'tool_response': tool_response
             })
     
-    assistant_response = '\n\n'.join(all_assistant_responses) if all_assistant_responses else ""
-    
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
+
+    all_responses = list(transcript_assistant_messages or [])
+    if stop_assistant_message:
+        if not all_responses or all_responses[-1] != stop_assistant_message:
+            all_responses.append(stop_assistant_message)
+    assistant_response = '\n\n'.join(all_responses) if all_responses else ""
+
     if assistant_response or assistant_tool_uses:
         assistant_msg = {
             'role': 'assistant',
             'content': assistant_response
         }
-        
         if assistant_tool_uses:
             assistant_msg['tool_use'] = assistant_tool_uses
-        
         messages.append(assistant_msg)
-    elif user_prompt and assistant_tool_uses:
-        assistant_msg = {
-            'role': 'assistant',
-            'content': "",
-            'tool_use': assistant_tool_uses
-        }
-        messages.append(assistant_msg)
-    
-    if len(messages) == 1 and messages[0]['role'] == 'user':
-        return None
-    
-    if not messages:
+
+    if len(messages) < 2:
         return None
     
     if not permission_mode:
@@ -514,7 +489,9 @@ def cleanup_old_logs():
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
-    
+    last_assistant_message = event.get('last_assistant_message')
+    stop_timestamp = datetime.utcnow().isoformat() + 'Z'
+
     logs = load_existing_logs()
     
     session_events = []
@@ -533,21 +510,31 @@ def process_stop_event(event: Dict, api_key: str):
                 user_prompt_timestamp = log.get('timestamp')
             elif current_conversation_started:
                 session_events.append(log)
-    
-    main_transcript_data = None
-    if transcript_path and transcript_path != 'undefined':
-        main_transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
-    
-    exchange = build_llm_exchange(session_events, main_transcript_data)
-    
+
+    transcript_assistant_messages = []
+    if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
+        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
+        transcript_assistant_messages = [
+            msg['content'] for msg in transcript_data.get('assistant_messages', [])
+            if msg.get('content')
+        ]
+
+    exchange = build_llm_exchange(
+        session_events,
+        stop_assistant_message=last_assistant_message,
+        transcript_assistant_messages=transcript_assistant_messages,
+    )
+
     if exchange:
         success = send_to_api(exchange, api_key)
-        
+
         if success:
+            current_logs = load_existing_logs()
             remaining_logs = [
-                log for log in logs
-                if log.get('session_id') != session_id and
-                (not log.get('event') or log.get('event', {}).get('session_id') != session_id)
+                log for log in current_logs
+                if log.get('timestamp', '') > stop_timestamp
+                or (log.get('session_id') != session_id
+                    and log.get('event', {}).get('session_id') != session_id)
             ]
             save_logs(remaining_logs)
 
