@@ -406,7 +406,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
     all_responses = list(transcript_assistant_messages or [])
     if stop_assistant_message:
-        if not all_responses or all_responses[-1] != stop_assistant_message:
+        if stop_assistant_message not in all_responses:
             all_responses.append(stop_assistant_message)
     assistant_response = '\n\n'.join(all_responses) if all_responses else ""
 
