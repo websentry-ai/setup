@@ -350,7 +350,7 @@ def stream_approval_status(api_key: str, policy_ids: list, application_id: str, 
                             return 'approved'
                         if decision in ('deny', 'timeout'):
                             proc.terminate()
-                            return 'deny' if decision == 'deny' else 'timeout'
+                            return decision
                     except json.JSONDecodeError:
                         pass
             # Stream ended without a decision — retry
