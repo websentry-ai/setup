@@ -629,6 +629,82 @@ def clear_setup():
     print("=" * 60)
 
 
+def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
+    """Remove ~/.codex/hooks/unbound.py for a given user (leftover from hooks setup)."""
+    script_path = home_dir / ".codex" / "hooks" / "unbound.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+            debug_print(f"Removed {script_path} for {username}")
+        except Exception as e:
+            debug_print(f"Failed to remove {script_path}: {e}")
+
+
+def get_managed_settings_dir() -> Path:
+    """Get the system-wide managed settings directory for Codex."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return Path("/Library/Application Support/Codex")
+    elif system == "linux":
+        return Path("/etc/codex")
+    elif system == "windows":
+        return Path("C:/Program Files/Codex")
+    else:
+        raise OSError(f"Unsupported operating system: {system}")
+
+
+def clear_managed_hooks() -> bool:
+    """Remove the hooks script and hooks setting from managed Codex config."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        settings_path = managed_dir / "hooks.json"
+        hooks_dir = managed_dir / "hooks"
+        script_path = hooks_dir / "unbound.py"
+
+        removed_any = False
+
+        # Remove the hook script
+        if script_path.exists():
+            try:
+                script_path.unlink()
+                debug_print(f"Removed {script_path}")
+                removed_any = True
+            except Exception as e:
+                debug_print(f"Failed to remove {script_path}: {e}")
+
+        # Try to remove hooks directory if empty
+        if hooks_dir.exists():
+            try:
+                if not any(hooks_dir.iterdir()):
+                    hooks_dir.rmdir()
+                    debug_print(f"Removed empty directory {hooks_dir}")
+            except Exception as e:
+                debug_print(f"Could not remove directory {hooks_dir}: {e}")
+
+        # Remove hooks from hooks.json (keep the file)
+        if settings_path.exists():
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                changed = False
+                if "hooks" in settings:
+                    del settings["hooks"]
+                    changed = True
+                if changed:
+                    with open(settings_path, "w", encoding="utf-8") as f:
+                        json.dump(settings, f, indent=2)
+                    debug_print("Removed hooks from hooks.json")
+                    removed_any = True
+            except Exception as e:
+                debug_print(f"Failed to update hooks.json: {e}")
+
+        return removed_any
+
+    except Exception as e:
+        debug_print(f"Error clearing managed hooks: {e}")
+        return False
+
+
 def main():
     global DEBUG
 
@@ -698,6 +774,10 @@ def main():
         return
     print("✅ API key received")
 
+    # Remove leftover hooks setup env var
+    for username, home_dir in get_all_user_homes():
+        remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY")
+
     print("\n📝 Setting environment variables system-wide...")
     success, env_changed = set_env_var_system_wide("OPENAI_API_KEY", codex_api_key)
     if not success:
@@ -714,6 +794,7 @@ def main():
     for username, home_dir in user_homes:
         if write_codex_config_for_user(username, home_dir, "https://api.getunbound.ai/v1"):
             config_count += 1
+        remove_hooks_unbound_script_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, codex_api_key)
 
     if config_count == 0:
@@ -721,6 +802,9 @@ def main():
         return
 
     print(f"✅ Configured {config_count} user(s)")
+
+    # Remove managed hooks if present (leftover from hooks MDM setup)
+    clear_managed_hooks()
 
     print("\n" + "=" * 60)
     print("Setup Complete!")

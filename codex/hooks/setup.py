@@ -593,11 +593,6 @@ def main():
     debug_print("API key received from callback")
 
     # Remove gateway setup env vars and artifacts
-    for var_name in ["UNBOUND_API_KEY"]:
-        try:
-            remove_env_var(var_name)
-        except Exception:
-            pass
     remove_gateway_artifacts()
 
     debug_print("Setting UNBOUND_CODEX_API_KEY environment variable...")
