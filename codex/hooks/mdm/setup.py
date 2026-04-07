@@ -763,6 +763,8 @@ def main():
     global DEBUG
 
     clear_mode = "--clear" in sys.argv
+    # MDM deployments always run with debug logging enabled — administrators
+    # need full diagnostic output for troubleshooting across managed devices.
     DEBUG = True
 
     if clear_mode:

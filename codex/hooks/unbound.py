@@ -246,10 +246,10 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         data = json.dumps(request_body)
 
         result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
+            ["curl", "-fsSL", "-K", "-", "-X", "POST",
              "-H", "Content-Type: application/json",
              "-d", data, url],
+            input=f'header = "Authorization: Bearer {api_key}"\n'.encode(),
             capture_output=True,
             timeout=10
         )
@@ -468,8 +468,9 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
         data = json.dumps(exchange)
 
         result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST", "-H", f"Authorization: Bearer {api_key}",
+            ["curl", "-fsSL", "-K", "-", "-X", "POST",
              "-H", "Content-Type: application/json", "-d", data, url],
+            input=f'header = "Authorization: Bearer {api_key}"\n'.encode(),
             capture_output=True,
             timeout=10
         )
