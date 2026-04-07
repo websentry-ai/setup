@@ -10,9 +10,9 @@ from typing import Dict, List, Optional
 
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
-AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
-ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
-LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
+AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
+ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
+LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
 MCP_TOOL_PREFIX = 'mcp__'
 
@@ -43,7 +43,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
     try:
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
-            'hook_source': 'claude-code',
+            'hook_source': 'codex',
         })
         proc = subprocess.Popen(
             ["curl", "-fsSL", "-K", "-", "-X", "POST",
@@ -65,12 +65,12 @@ def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     timestamp = datetime.utcnow().isoformat() + 'Z'
     error_entry = f"{timestamp}: {message}\n"
-    
+
     try:
         ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(ERROR_LOG, 'a', encoding='utf-8') as f:
             f.write(error_entry)
-        
+
         # Keep only last 25 errors
         if ERROR_LOG.exists():
             with open(ERROR_LOG, 'r', encoding='utf-8') as f:
@@ -127,21 +127,21 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'assistant_messages': [],
         'tool_uses': []
     }
-    
+
     if not transcript_path or not os.path.exists(transcript_path):
         return conversation_data
-    
+
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for line in f:
                 if not line.strip():
                     continue
-                    
+
                 try:
                     entry = json.loads(line)
                     entry_type = entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
-                    
+
                     if entry_type == 'user':
                         message = entry.get('message', {})
                         if message.get('role') == 'user':
@@ -151,12 +151,12 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                     'content': content,
                                     'timestamp': entry_timestamp
                                 })
-                    
+
                     elif entry_type == 'assistant':
                         if user_prompt_timestamp and entry_timestamp:
                             if entry_timestamp <= user_prompt_timestamp:
                                 continue
-                        
+
                         message = entry.get('message', {})
                         if message.get('role') == 'assistant':
                             content_array = message.get('content', [])
@@ -169,13 +169,13 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                             'content': text_content,
                                             'timestamp': entry_timestamp
                                         })
-                        
+
                 except json.JSONDecodeError:
                     continue
-                    
+
     except Exception:
         pass
-    
+
     return conversation_data
 
 
@@ -262,8 +262,8 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         return {}
 
 
-def transform_response_for_claude(api_response: Dict) -> Dict:
-    """Transform API response to Claude Code format for PreToolUse."""
+def transform_response_for_codex(api_response: Dict) -> Dict:
+    """Transform API response to Codex format for PreToolUse."""
     if not api_response:
         return {}
 
@@ -281,8 +281,8 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
     }
 
 
-def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
-    """Transform API response to Claude Code format for UserPromptSubmit."""
+def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
+    """Transform API response to Codex format for UserPromptSubmit."""
     if not api_response:
         return {}
 
@@ -325,7 +325,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
-        'unbound_app_label': 'claude-code',
+        'unbound_app_label': 'codex',
         'model': model,
         'event_name': 'tool_use',
         'pre_tool_use_data': {
@@ -337,7 +337,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     }
 
     api_response = send_to_hook_api(request_body, api_key)
-    return transform_response_for_claude(api_response)
+    return transform_response_for_codex(api_response)
 
 
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
@@ -348,14 +348,14 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
-        'unbound_app_label': 'claude-code',
+        'unbound_app_label': 'codex',
         'model': model,
         'event_name': 'user_prompt',
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 
     api_response = send_to_hook_api(request_body, api_key)
-    return transform_response_for_claude_prompt(api_response)
+    return transform_response_for_codex_prompt(api_response)
 
 
 def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] = None) -> Optional[Dict]:
@@ -367,23 +367,23 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
     user_prompt_timestamp = None
     session_id = None
     permission_mode = None
-    
+
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
         if event.get('hook_event_name') == 'UserPromptSubmit':
             user_prompt = event.get('prompt')
             user_prompt_timestamp = log_entry.get('timestamp')
             break
-    
+
     if main_transcript_data and user_prompt_timestamp:
         for assistant_msg in main_transcript_data.get('assistant_messages', []):
             msg_timestamp = assistant_msg.get('timestamp')
             content = assistant_msg.get('content', '')
-            
+
             if msg_timestamp and msg_timestamp > user_prompt_timestamp:
                 if content:
                     all_assistant_responses.append(content)
-    
+
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
         hook_event_name = event.get('hook_event_name')
@@ -398,37 +398,37 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
             prompt = event.get('prompt')
             if prompt:
                 user_prompt = prompt
-        
+
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
             tool_input = event.get('tool_input', {})
             tool_response = event.get('tool_response', {})
-            
+
             if 'content' in tool_response and 'content' in tool_input:
                 if tool_response['content'] == tool_input['content']:
                     tool_response = {k: v for k, v in tool_response.items() if k != 'content'}
-            
+
             assistant_tool_uses.append({
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response
             })
-    
+
     assistant_response = '\n\n'.join(all_assistant_responses) if all_assistant_responses else ""
-    
+
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
-    
+
     if assistant_response or assistant_tool_uses:
         assistant_msg = {
             'role': 'assistant',
             'content': assistant_response
         }
-        
+
         if assistant_tool_uses:
             assistant_msg['tool_use'] = assistant_tool_uses
-        
+
         messages.append(assistant_msg)
     elif user_prompt and assistant_tool_uses:
         assistant_msg = {
@@ -437,13 +437,13 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
             'tool_use': assistant_tool_uses
         }
         messages.append(assistant_msg)
-    
+
     if len(messages) == 1 and messages[0]['role'] == 'user':
         return None
-    
+
     if not messages:
         return None
-    
+
     if not permission_mode:
         permission_mode = 'default'
 
@@ -453,7 +453,7 @@ def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] 
         'messages': messages,
         'permission_mode': permission_mode
     }
-    
+
     return exchange
 
 
@@ -462,11 +462,11 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
     if not api_key:
         log_error("No API key present in send_to_api function", 'config')
         return False
-    
+
     try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/claude"
+        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/codex"
         data = json.dumps(exchange)
-        
+
         result = subprocess.run(
             ["curl", "-fsSL", "-K", "-", "-X", "POST",
              "-H", "Content-Type: application/json", "-d", data, url],
@@ -474,7 +474,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
             capture_output=True,
             timeout=10
         )
-        
+
         if result.returncode != 0:
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
             log_error(f"API request failed: {error_msg}", 'api_call')
@@ -487,19 +487,19 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
 
 def cleanup_old_logs():
     logs = load_existing_logs()
-    
+
     if len(logs) <= 50:
         return
-    
+
     session_order = []
     seen_sessions = set()
-    
+
     for log in logs:
         session_id = log.get('session_id')
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
-    
+
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
         kept_logs = [
@@ -512,35 +512,35 @@ def cleanup_old_logs():
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
-    
+
     logs = load_existing_logs()
-    
+
     session_events = []
     current_conversation_started = False
     user_prompt_timestamp = None
-    
+
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
-        
+
         if log_session_id == session_id:
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
-            
+
             if event_name == 'UserPromptSubmit':
                 session_events = [log]
                 current_conversation_started = True
                 user_prompt_timestamp = log.get('timestamp')
             elif current_conversation_started:
                 session_events.append(log)
-    
+
     main_transcript_data = None
     if transcript_path and transcript_path != 'undefined':
         main_transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
-    
+
     exchange = build_llm_exchange(session_events, main_transcript_data)
-    
+
     if exchange:
         success = send_to_api(exchange, api_key)
-        
+
         if success:
             remaining_logs = [
                 log for log in logs
@@ -552,12 +552,12 @@ def process_stop_event(event: Dict, api_key: str):
 
 def main():
     global _cached_api_key
-    api_key = os.getenv('UNBOUND_CLAUDE_API_KEY')
+    api_key = os.getenv('UNBOUND_CODEX_API_KEY')
     _cached_api_key = api_key
-    
+
     try:
         input_data = sys.stdin.read().strip()
-        
+
         if not input_data:
             print('{"suppressOutput": true}', flush=True)
             return
@@ -596,18 +596,18 @@ def main():
             'session_id': event.get('session_id'),
             'event': event
         }
-        
+
         append_to_audit_log(log_entry)
-        
+
         if hook_event_name == 'Stop' and session_id:
             process_stop_event(event, api_key)
-        
+
         cleanup_old_logs()
 
         print('{"suppressOutput": true}', flush=True)
-        
+
     except Exception as e:
-        # Still return empty JSON object to Claude Code to indicate completion
+        # Still return empty JSON object to Codex to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')
         print('{"suppressOutput": true}', flush=True)
 

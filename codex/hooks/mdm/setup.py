@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Tuple, List, Optional
 
 DEBUG = False
+SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
 
 
 def debug_print(message: str) -> None:
@@ -106,13 +107,17 @@ def get_device_identifier() -> Optional[str]:
 
             try:
                 result = subprocess.run(
-                    ["reg", "query", "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "/v", "ProcessorNameString"],
+                    ["reg", "query", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
                     capture_output=True,
                     text=True,
                     timeout=10
                 )
                 if result.returncode == 0:
-                    return result.stdout.strip()
+                    for line in result.stdout.split('\n'):
+                        if 'MachineGuid' in line:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                return parts[-1]
             except Exception:
                 pass
 
@@ -129,7 +134,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
 
     try:
         if system == "darwin":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -140,7 +145,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -198,7 +203,7 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
 
         return True
     except Exception as e:
-        print(f"❌ Failed to modify {file_path}: {e}")
+        print(f"Failed to modify {file_path}: {e}")
         return False
 
 
@@ -296,7 +301,7 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         user_homes = get_all_user_homes()
 
         if not user_homes:
-            print("⚠️  No user home directories found")
+            print("No user home directories found")
             return False, False
 
         success_count = 0
@@ -314,16 +319,16 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
             print(f"   Set for {success_count} user(s)")
             return True, changed_count > 0
         else:
-            print("⚠️  Failed to set environment variable for any users")
+            print("Failed to set environment variable for any users")
             return False, False
 
     except Exception as e:
-        print(f"❌ Failed to set system-wide environment variable: {e}")
+        print(f"Failed to set system-wide environment variable: {e}")
         return False, False
 
 
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
-    params = f"serial_number={device_id}&app_type=default"
+    params = f"serial_number={device_id}&app_type=codex"
     if app_name:
         params = f"app_name={app_name}&{params}"
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
@@ -341,7 +346,7 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
 
         output_lines = result.stdout.strip().split('\n')
         if len(output_lines) < 2:
-            print("❌ Invalid response from server")
+            print("Invalid response from server")
             return None
 
         http_code = output_lines[-1]
@@ -351,14 +356,14 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         debug_print(f"Response length: {len(response_body)}")
 
         if http_code != "200":
-            print(f"❌ API request failed with status {http_code}")
+            print(f"API request failed with status {http_code}")
             return None
 
         try:
             data = json.loads(response_body)
             api_key = data.get("api_key")
             if not api_key:
-                print("❌ No api_key in response")
+                print("No api_key in response")
                 return None
             user_email = data.get("email")
             first_name = data.get("first_name")
@@ -367,15 +372,15 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
             print(f"Name: {first_name} {last_name}")
             return api_key
         except json.JSONDecodeError:
-            print("❌ Invalid JSON response from server")
+            print("Invalid JSON response from server")
             return None
 
     except subprocess.TimeoutExpired:
-        print("❌ Request timed out")
+        print("Request timed out")
         return None
     except Exception as e:
         debug_print(f"Request failed: {e}")
-        print("❌ Failed to fetch API key")
+        print("Failed to fetch API key")
         return None
 
 
@@ -493,152 +498,24 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
         debug_print(f"Could not write config for {username}: {e}")
 
 
-def _update_toml_root_key(lines, key_name, key_line):
-    """Update or insert a root-level key in TOML lines.
-    Only matches keys in the root section (before any [table] headers).
-    Returns the modified lines list."""
-    in_section = False
-    for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_section = True
-        if not in_section and stripped.startswith(key_name):
-            lines[i] = key_line + "\n"
-            return lines
+def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
+    """Remove OPENAI_API_KEY env var and openai_base_url from ~/.codex/config.toml for a given user (leftover from gateway setup)."""
+    # Remove OPENAI_API_KEY env var
+    remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
 
-    # Key not found in root — insert before the first [table] header
-    insert_idx = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith("["):
-            insert_idx = i
-            break
-    else:
-        insert_idx = len(lines)
-    lines.insert(insert_idx, key_line + "\n")
-    return lines
-
-
-def _remove_toml_root_key(lines, key_name):
-    """Remove a root-level key from TOML lines.
-    Only removes keys in the root section (before any [table] headers).
-    Returns (new_lines, was_removed)."""
-    new_lines = []
-    removed = False
-    in_section = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith("["):
-            in_section = True
-        if not in_section and stripped.startswith(key_name):
-            removed = True
-            continue
-        new_lines.append(line)
-    return new_lines, removed
-
-
-def write_codex_config_for_user(username: str, home_dir: Path, base_url: str) -> bool:
-    """Write openai_base_url to {home_dir}/.codex/config.toml for a specific user."""
-    config_dir = home_dir / ".codex"
-    config_file = config_dir / "config.toml"
-    key_line = f'openai_base_url = "{base_url}"'
-    try:
-        config_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
-
-        if config_file.exists():
-            with open(config_file, "r", encoding="utf-8") as f:
+    # Remove openai_base_url from config.toml
+    config_path = home_dir / ".codex" / "config.toml"
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-            lines = _update_toml_root_key(lines, "openai_base_url", key_line)
-            with open(config_file, "w", encoding="utf-8") as f:
-                f.writelines(lines)
-        else:
-            with open(config_file, "w", encoding="utf-8") as f:
-                f.write(key_line + "\n")
-
-        os.chmod(config_file, 0o644)
-
-        try:
-            user_info = pwd.getpwnam(username)
-            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
-            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+            new_lines = [l for l in lines if not l.strip().startswith('openai_base_url')]
+            if len(new_lines) != len(lines):
+                with open(config_path, 'w', encoding='utf-8') as f:
+                    f.writelines(new_lines)
+                debug_print(f"Removed openai_base_url from {config_path}")
         except Exception as e:
-            debug_print(f"Could not chown codex config for {username}: {e}")
-
-        debug_print(f"Wrote openai_base_url to {config_file} for {username}")
-        return True
-    except Exception as e:
-        debug_print(f"Failed to write codex config for {username}: {e}")
-        return False
-
-
-def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> bool:
-    """Remove openai_base_url from {home_dir}/.codex/config.toml.
-    Returns True if the key was found and removed, False otherwise."""
-    config_file = home_dir / ".codex" / "config.toml"
-    try:
-        if not config_file.exists():
-            return False
-        with open(config_file, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        new_lines, removed = _remove_toml_root_key(lines, "openai_base_url")
-        if removed:
-            with open(config_file, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-            try:
-                user_info = pwd.getpwnam(username)
-                os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
-            except Exception:
-                pass
-            debug_print(f"Removed openai_base_url from {config_file} for {username}")
-        return removed
-    except Exception as e:
-        debug_print(f"Failed to update codex config for {username}: {e}")
-        return False
-
-
-def clear_setup():
-    print("=" * 60)
-    print("Codex - Clearing MDM Setup")
-    print("=" * 60)
-
-    if not check_admin_privileges():
-        print("❌ This script requires administrator/root privileges")
-        print("   Please re-run with sudo.")
-        return
-
-    print("\n🗑️  Removing environment variables...")
-    user_homes = get_all_user_homes()
-
-    if not user_homes:
-        print("   No user home directories found")
-    else:
-        removed_count = 0
-        for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY"):
-                removed_count += 1
-            # Remove OPENAI_BASE_URL env var for backwards compatibility (old setups)
-            remove_env_var_from_user(username, home_dir, "OPENAI_BASE_URL")
-            # Remove openai_base_url from codex config.toml
-            remove_codex_config_base_url_for_user(username, home_dir)
-
-        if removed_count > 0:
-            print(f"✅ Removed environment variables from {removed_count} user(s)")
-        else:
-            print("   No environment variables found to remove")
-
-    print("\n" + "=" * 60)
-    print("Clear Complete!")
-    print("=" * 60)
-
-
-def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
-    """Remove ~/.codex/hooks/unbound.py for a given user (leftover from hooks setup)."""
-    script_path = home_dir / ".codex" / "hooks" / "unbound.py"
-    if script_path.exists():
-        try:
-            script_path.unlink()
-            debug_print(f"Removed {script_path} for {username}")
-        except Exception as e:
-            debug_print(f"Failed to remove {script_path}: {e}")
+            debug_print(f"Failed to update {config_path}: {e}")
 
 
 def get_managed_settings_dir() -> Path:
@@ -652,6 +529,144 @@ def get_managed_settings_dir() -> Path:
         return Path("C:/Program Files/Codex")
     else:
         raise OSError(f"Unsupported operating system: {system}")
+
+
+def download_file(url: str, dest_path: Path) -> bool:
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", str(dest_path), url],
+            capture_output=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"Failed to download {url}: {e}")
+        return False
+
+
+def setup_managed_hooks() -> bool:
+    """
+    Set up system-wide managed hooks for Codex.
+    Downloads unbound.py and configures hooks.json with hooks.
+    """
+    system = platform.system().lower()
+    try:
+        managed_dir = get_managed_settings_dir()
+        settings_path = managed_dir / "hooks.json"
+        hooks_dir = managed_dir / "hooks"
+        script_path = hooks_dir / "unbound.py"
+
+        # Create directories
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Created managed settings directory: {managed_dir}")
+
+        # Download unbound.py script
+        if not download_file(SCRIPT_URL, script_path):
+            print("Failed to download unbound.py")
+            return False
+        debug_print(f"Downloaded hook script: {script_path}")
+
+        # Make script executable on Unix systems
+        if system in ["darwin", "linux"]:
+            os.chmod(script_path, 0o755)
+            debug_print("Set script as executable")
+
+        # Read existing settings or create new
+        settings = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    settings = json.load(f) or {}
+            except Exception:
+                settings = {}
+
+        # Configure hooks - quote the path to handle spaces (e.g. macOS "Application Support")
+        hook_command = f'"{script_path}"'
+        hooks_config = {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 10
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "async": True,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "SessionStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "async": True,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ]
+        }
+
+        settings["hooks"] = hooks_config
+        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        debug_print(f"Created managed settings: {settings_path}")
+
+        # Set permissions - readable by all users
+        if system in ["darwin", "linux"]:
+            os.chmod(managed_dir, 0o755)
+            os.chmod(hooks_dir, 0o755)
+            os.chmod(settings_path, 0o644)
+            os.chmod(script_path, 0o755)
+
+        return True
+
+    except Exception as e:
+        print(f"Failed to setup managed hooks: {e}")
+        debug_print(f"Error details: {e}")
+        return False
 
 
 def clear_managed_hooks() -> bool:
@@ -706,31 +721,68 @@ def clear_managed_hooks() -> bool:
         return False
 
 
+def clear_setup():
+    print("=" * 60)
+    print("Codex Hooks - Clearing MDM Setup")
+    print("=" * 60)
+
+    if not check_admin_privileges():
+        print("This script requires administrator/root privileges")
+        print("   Please re-run with sudo.")
+        return
+
+    print("\nRemoving environment variables...")
+    user_homes = get_all_user_homes()
+
+    if not user_homes:
+        print("   No user home directories found")
+    else:
+        removed_count = 0
+        for username, home_dir in user_homes:
+            if remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY"):
+                removed_count += 1
+
+        if removed_count > 0:
+            print(f"Removed environment variables from {removed_count} user(s)")
+        else:
+            print("   No environment variables found to remove")
+
+    # Remove managed hooks
+    print("\nRemoving managed hooks...")
+    if clear_managed_hooks():
+        managed_dir = get_managed_settings_dir()
+        print(f"Removed managed hooks from {managed_dir}")
+    else:
+        print("   No managed hooks found to remove")
+
+    print("\n" + "=" * 60)
+    print("Clear Complete!")
+    print("=" * 60)
+
+
 def main():
     global DEBUG
 
     clear_mode = "--clear" in sys.argv
-    debug_mode = "--debug" in sys.argv
-
-    if debug_mode:
-        DEBUG = True
-        debug_print("Debug mode enabled")
+    # MDM deployments always run with debug logging enabled — administrators
+    # need full diagnostic output for troubleshooting across managed devices.
+    DEBUG = True
 
     if clear_mode:
         clear_setup()
         return
 
     print("=" * 60)
-    print("Codex - MDM Setup")
+    print("Codex Hooks - MDM Setup")
     print("=" * 60)
 
     if not check_admin_privileges():
         system = platform.system().lower()
         if system in ["darwin", "linux"]:
-            print("❌ This script requires administrator/root privileges")
+            print("This script requires administrator/root privileges")
             print("   Please re-run with sudo.")
         else:
-            print("❌ This script requires administrator privileges")
+            print("This script requires administrator privileges")
             print("   Please run as Administrator")
         return
 
@@ -756,56 +808,48 @@ def main():
             i += 1
 
     if not auth_api_key:
-        print("\n❌ Missing required arguments")
+        print("\nMissing required arguments")
         print("Usage: sudo python3 setup.py --api_key <api_key> [--url <base_url>] [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
-    print("\n🔍 Getting device identifier...")
+    print("\nGetting device identifier...")
     device_id = get_device_identifier()
     if not device_id:
-        print("❌ Failed to get device identifier")
+        print("Failed to get device identifier")
         return
     debug_print(f"Device identifier: {device_id}")
-    print("✅ Device identifier retrieved")
+    print("Device identifier retrieved")
 
-    print("\n🔑 Fetching API key from MDM...")
-    codex_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
-    if not codex_api_key:
+    print("\nFetching API key from MDM...")
+    api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
+    if not api_key:
         return
-    print("✅ API key received")
+    print("API key received")
 
-    # Remove leftover hooks setup env var
+    print("\nSetting environment variables system-wide...")
+    # Remove leftover gateway setup env vars
     for username, home_dir in get_all_user_homes():
-        remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY")
+        remove_env_var_from_user(username, home_dir, "OPENAI_API_KEY")
 
-    print("\n📝 Setting environment variables system-wide...")
-    success, env_changed = set_env_var_system_wide("OPENAI_API_KEY", codex_api_key)
+    success, _ = set_env_var_system_wide("UNBOUND_CODEX_API_KEY", api_key)
     if not success:
-        print(f"❌ Failed to set OPENAI_API_KEY")
+        print("Failed to set UNBOUND_CODEX_API_KEY")
         return
-    debug_print("OPENAI_API_KEY set successfully")
+    debug_print("UNBOUND_CODEX_API_KEY set successfully")
 
-    print("\n📝 Configuring all users...")
-    user_homes = get_all_user_homes()
-    if not user_homes:
-        print("❌ No user home directories found")
+    # Remove gateway artifacts and write unbound config for all users
+    for username, home_dir in get_all_user_homes():
+        remove_gateway_artifacts_for_user(username, home_dir)
+        write_unbound_config_for_user(username, home_dir, api_key)
+
+    print("\nConfiguring Codex managed hooks...")
+    if setup_managed_hooks():
+        managed_dir = get_managed_settings_dir()
+        print(f"Created managed hooks in {managed_dir}")
+    else:
+        print("Failed to configure managed hooks")
         return
-    config_count = 0
-    for username, home_dir in user_homes:
-        if write_codex_config_for_user(username, home_dir, "https://api.getunbound.ai/v1"):
-            config_count += 1
-        remove_hooks_unbound_script_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, codex_api_key)
-
-    if config_count == 0:
-        print("❌ Failed to configure codex for any users")
-        return
-
-    print(f"✅ Configured {config_count} user(s)")
-
-    # Remove managed hooks if present (leftover from hooks MDM setup)
-    clear_managed_hooks()
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
@@ -816,7 +860,7 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n\n⚠️  Setup cancelled by user.")
+        print("\n\nSetup cancelled.")
     except Exception as e:
-        print(f"\n❌ An error occurred: {e}")
+        print(f"\nError: {e}")
         exit(1)

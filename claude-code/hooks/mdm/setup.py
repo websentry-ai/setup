@@ -337,7 +337,8 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
 
     try:
         result = subprocess.run(
-            ["curl", "-fsSL", "-w", "\n%{http_code}", "-H", f"Authorization: Bearer {auth_api_key}", url],
+            ["curl", "-fsSL", "-K", "-", "-w", "\n%{http_code}", url],
+            input=f'header = "Authorization: Bearer {auth_api_key}"\n',
             capture_output=True,
             text=True,
             timeout=30
@@ -766,6 +767,8 @@ def main():
     global DEBUG
 
     clear_mode = "--clear" in sys.argv
+    # MDM deployments always run with debug logging enabled — administrators
+    # need full diagnostic output for troubleshooting across managed devices.
     DEBUG = True
 
     if clear_mode:
