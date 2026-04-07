@@ -1,6 +1,8 @@
 {
     "version": 1,
     "hooks": {
+      "preToolUse": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
+      "postToolUse": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
       "beforeShellExecution": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
       "beforeMCPExecution": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
       "afterShellExecution": [{ "command": "./hooks/unbound.py" }],
