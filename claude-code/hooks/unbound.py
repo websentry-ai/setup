@@ -524,6 +524,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     api_response = send_to_hook_api(request_body, api_key)
 
+    if 'tools_to_check' in api_response:
+        save_policy_cache(api_response['tools_to_check'])
+
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
         policy_ids = approval_check.get('policyIds', [])
@@ -543,10 +546,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                 'Retry exactly once — the second attempt will wait for the approval.'
             ),
         })
-
-
-    if 'tools_to_check' in api_response:
-        save_policy_cache(api_response['tools_to_check'])
 
     return transform_response_for_claude(api_response)
 
