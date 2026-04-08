@@ -30,8 +30,6 @@ APPROVAL_POLL_PHASES = (
     (4 * 60 * 60,   120),  # 2h - 4h: 2min
 )
 
-
-
 _cached_api_key = None
 _reporting_error = False
 
