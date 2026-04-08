@@ -263,7 +263,14 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
 
 
 def transform_response_for_codex(api_response: Dict) -> Dict:
-    """Transform API response to Codex format for PreToolUse."""
+    """Transform API response to Codex format for PreToolUse.
+
+    Codex PreToolUse hooks:
+    - allow: return empty {}
+    - deny: return hookSpecificOutput with permissionDecision:deny
+    - ask: return hookSpecificOutput with permissionDecision:deny + reason
+           (ask is parsed but not yet supported by Codex, so we deny with reason)
+    """
     if not api_response:
         return {}
 
@@ -271,10 +278,15 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # Allow: return empty response
+    if decision == 'allow':
+        return {}
+
+    # Deny or Ask: use hookSpecificOutput with deny
     return {
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
-            'permissionDecision': decision,
+            'permissionDecision': 'deny',
             'permissionDecisionReason': reason,
             'additionalContext': additional_context
         }
@@ -358,103 +370,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_codex_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], main_transcript_data: Optional[Dict] = None) -> Optional[Dict]:
-    messages = []
-    assistant_tool_uses = []
-    all_assistant_responses = []
 
-    user_prompt = None
-    user_prompt_timestamp = None
-    session_id = None
-    permission_mode = None
-
-    for log_entry in events:
-        event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
-        if event.get('hook_event_name') == 'UserPromptSubmit':
-            user_prompt = event.get('prompt')
-            user_prompt_timestamp = log_entry.get('timestamp')
-            break
-
-    if main_transcript_data and user_prompt_timestamp:
-        for assistant_msg in main_transcript_data.get('assistant_messages', []):
-            msg_timestamp = assistant_msg.get('timestamp')
-            content = assistant_msg.get('content', '')
-
-            if msg_timestamp and msg_timestamp > user_prompt_timestamp:
-                if content:
-                    all_assistant_responses.append(content)
-
-    for log_entry in events:
-        event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
-        hook_event_name = event.get('hook_event_name')
-
-        if not session_id:
-            session_id = event.get('session_id')
-
-        if not permission_mode:
-            permission_mode = event.get('permission_mode')
-
-        if hook_event_name == 'UserPromptSubmit':
-            prompt = event.get('prompt')
-            if prompt:
-                user_prompt = prompt
-
-        elif hook_event_name == 'PostToolUse':
-            tool_name = event.get('tool_name')
-            tool_input = event.get('tool_input', {})
-            tool_response = event.get('tool_response', {})
-
-            if 'content' in tool_response and 'content' in tool_input:
-                if tool_response['content'] == tool_input['content']:
-                    tool_response = {k: v for k, v in tool_response.items() if k != 'content'}
-
-            assistant_tool_uses.append({
-                'type': 'PostToolUse',
-                'tool_name': tool_name,
-                'tool_input': tool_input,
-                'tool_response': tool_response
-            })
-
-    assistant_response = '\n\n'.join(all_assistant_responses) if all_assistant_responses else ""
-
-    if user_prompt:
-        messages.append({'role': 'user', 'content': user_prompt})
-
-    if assistant_response or assistant_tool_uses:
-        assistant_msg = {
-            'role': 'assistant',
-            'content': assistant_response
-        }
-
-        if assistant_tool_uses:
-            assistant_msg['tool_use'] = assistant_tool_uses
-
-        messages.append(assistant_msg)
-    elif user_prompt and assistant_tool_uses:
-        assistant_msg = {
-            'role': 'assistant',
-            'content': "",
-            'tool_use': assistant_tool_uses
-        }
-        messages.append(assistant_msg)
-
-    if len(messages) == 1 and messages[0]['role'] == 'user':
-        return None
-
-    if not messages:
-        return None
-
-    if not permission_mode:
-        permission_mode = 'default'
-
-    exchange = {
-        'conversation_id': session_id or 'unknown',
-        'model': 'auto',
-        'messages': messages,
-        'permission_mode': permission_mode
-    }
-
-    return exchange
 
 
 def send_to_api(exchange: Dict, api_key: str) -> bool:
@@ -509,34 +425,149 @@ def cleanup_old_logs():
         save_logs(kept_logs)
 
 
+def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> List[Dict]:
+    """Parse Codex transcript for function_call/function_call_output pairs.
+
+    Codex transcripts use response_item entries with:
+    - type: 'function_call' (contains name, arguments with cmd)
+    - type: 'function_call_output' (contains output)
+
+    Converts to PostToolUse format matching Claude Code hooks for backend compatibility.
+    """
+    tool_uses = []
+    if not transcript_path or not os.path.exists(transcript_path):
+        return tool_uses
+
+    try:
+        # Collect all function calls and outputs, keyed by call_id
+        function_calls = {}
+        function_outputs = {}
+
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                    entry_type = entry.get('type')
+                    entry_timestamp = entry.get('timestamp', '')
+                    payload = entry.get('payload', {})
+
+                    # Skip entries before user prompt if timestamp provided
+                    if user_prompt_timestamp and entry_timestamp and entry_timestamp <= user_prompt_timestamp:
+                        continue
+
+                    if entry_type == 'response_item':
+                        item_type = payload.get('type', '')
+                        call_id = payload.get('call_id', '')
+
+                        if item_type == 'function_call' and call_id:
+                            arguments = payload.get('arguments', '')
+                            if isinstance(arguments, str):
+                                try:
+                                    arguments = json.loads(arguments)
+                                except json.JSONDecodeError:
+                                    arguments = {'command': arguments}
+                            function_calls[call_id] = {
+                                'name': payload.get('name', ''),
+                                'arguments': arguments
+                            }
+
+                        elif item_type == 'function_call_output' and call_id:
+                            function_outputs[call_id] = payload.get('output', '')
+
+                except json.JSONDecodeError:
+                    continue
+
+        # Match calls with outputs and convert to PostToolUse format
+        for call_id, call_data in function_calls.items():
+            name = call_data.get('name', '')
+            args = call_data.get('arguments', {})
+            output = function_outputs.get(call_id, '')
+
+            # Map Codex function names to tool names
+            # Codex currently only has exec_command (Bash). Other function names
+            # are handled generically as fallback for future Codex tool support.
+            if name == 'exec_command':
+                tool_name = 'Bash'
+                tool_input = {'command': args.get('cmd', '')}
+                # Parse exec_command output format to extract clean stdout and exit_code
+                stdout = output
+                exit_code = 0
+                if 'Output:\n' in output:
+                    stdout = output.split('Output:\n', 1)[1].rstrip()
+                if 'Process exited with code ' in output:
+                    try:
+                        code_str = output.split('Process exited with code ')[1].split('\n')[0].strip()
+                        exit_code = int(code_str)
+                    except (ValueError, IndexError):
+                        pass
+                tool_response = {'stdout': stdout, 'exitCode': exit_code}
+            else:
+                # Generic fallback for any future Codex tools
+                tool_name = name
+                tool_input = args if isinstance(args, dict) else {'command': str(args)}
+                tool_response = {'stdout': output}
+
+            tool_uses.append({
+                'type': 'PostToolUse',
+                'tool_name': tool_name,
+                'tool_input': tool_input,
+                'tool_response': tool_response
+            })
+
+    except Exception:
+        pass
+
+    return tool_uses
+
+
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
+    last_assistant_message = event.get('last_assistant_message', '')
 
     logs = load_existing_logs()
 
-    session_events = []
-    current_conversation_started = False
+    # Find the UserPromptSubmit for this session
+    user_prompt = None
     user_prompt_timestamp = None
+    permission_mode = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
 
         if log_session_id == session_id:
-            event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
+            log_event = log.get('event', {}) if 'event' in log else log
+            event_name = log_event.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                session_events = [log]
-                current_conversation_started = True
+                user_prompt = log_event.get('prompt')
                 user_prompt_timestamp = log.get('timestamp')
-            elif current_conversation_started:
-                session_events.append(log)
+                permission_mode = log_event.get('permission_mode', 'default')
 
-    main_transcript_data = None
-    if transcript_path and transcript_path != 'undefined':
-        main_transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
+    if not user_prompt:
+        return
 
-    exchange = build_llm_exchange(session_events, main_transcript_data)
+    messages = [{'role': 'user', 'content': user_prompt}]
+
+    # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
+    assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
+
+    assistant_msg = {
+        'role': 'assistant',
+        'content': last_assistant_message or ''
+    }
+    if assistant_tool_uses:
+        assistant_msg['tool_use'] = assistant_tool_uses
+    messages.append(assistant_msg)
+
+    exchange = {
+        'conversation_id': session_id or 'unknown',
+        'model': event.get('model', 'auto'),
+        'messages': messages,
+        'permission_mode': permission_mode or 'default'
+    }
 
     if exchange:
         success = send_to_api(exchange, api_key)
@@ -572,9 +603,9 @@ def main():
         session_id = event.get('session_id')
 
         # Handle PreToolUse - return immediately after decision is made
+        # Note: Codex PreToolUse does not support suppressOutput
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
-            response["suppressOutput"] = True
             print(json.dumps(response), flush=True)
             return
 

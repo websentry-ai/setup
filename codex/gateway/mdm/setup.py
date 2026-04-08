@@ -641,6 +641,28 @@ def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
             debug_print(f"Failed to remove {script_path}: {e}")
 
 
+def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
+    """Remove codex_hooks feature flag from user's ~/.codex/config.toml (leftover from hooks setup)."""
+    config_path = home_dir / ".codex" / "config.toml"
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        if len(new_lines) != len(lines):
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            try:
+                user_info = pwd.getpwnam(username)
+                os.chown(config_path, user_info.pw_uid, user_info.pw_gid)
+            except Exception:
+                pass
+            debug_print(f"Removed codex_hooks feature for {username}")
+    except Exception as e:
+        debug_print(f"Failed to remove codex_hooks for {username}: {e}")
+
+
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Codex."""
     system = platform.system().lower()
@@ -796,6 +818,7 @@ def main():
         if write_codex_config_for_user(username, home_dir, "https://api.getunbound.ai/v1"):
             config_count += 1
         remove_hooks_unbound_script_for_user(username, home_dir)
+        disable_codex_hooks_feature_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, codex_api_key)
 
     if config_count == 0:

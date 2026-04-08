@@ -721,6 +721,78 @@ def clear_managed_hooks() -> bool:
         return False
 
 
+def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
+    """Enable codex_hooks feature flag in user's ~/.codex/config.toml.
+    If [features] section exists, adds the key under it.
+    Otherwise appends a new [features] section at the end."""
+    config_path = home_dir / ".codex" / "config.toml"
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lines = []
+        if config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+        content = ''.join(lines)
+        if 'codex_hooks' in content and 'true' in content:
+            debug_print(f"codex_hooks already enabled for {username}")
+            return
+
+        # Check if [features] section already exists
+        features_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == '[features]':
+                features_idx = i
+                break
+
+        if features_idx is not None:
+            lines.insert(features_idx + 1, 'codex_hooks = true\n')
+        else:
+            if lines and not lines[-1].endswith('\n'):
+                lines.append('\n')
+            lines.append('\n[features]\ncodex_hooks = true\n')
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+        try:
+            user_info = pwd.getpwnam(username)
+            os.chown(config_path, user_info.pw_uid, user_info.pw_gid)
+        except Exception:
+            pass
+
+        debug_print(f"Enabled codex_hooks feature for {username}")
+    except Exception as e:
+        debug_print(f"Failed to enable codex_hooks for {username}: {e}")
+
+
+def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
+    """Remove only the codex_hooks line from user's ~/.codex/config.toml.
+    Preserves the [features] section and any other flags within it."""
+    config_path = home_dir / ".codex" / "config.toml"
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+
+        try:
+            user_info = pwd.getpwnam(username)
+            os.chown(config_path, user_info.pw_uid, user_info.pw_gid)
+        except Exception:
+            pass
+
+        debug_print(f"Removed codex_hooks feature for {username}")
+    except Exception as e:
+        debug_print(f"Failed to remove codex_hooks for {username}: {e}")
+
+
 def clear_setup():
     print("=" * 60)
     print("Codex Hooks - Clearing MDM Setup")
@@ -741,6 +813,7 @@ def clear_setup():
         for username, home_dir in user_homes:
             if remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY"):
                 removed_count += 1
+            disable_codex_hooks_feature_for_user(username, home_dir)
 
         if removed_count > 0:
             print(f"Removed environment variables from {removed_count} user(s)")
@@ -842,6 +915,7 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_gateway_artifacts_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key)
+        enable_codex_hooks_feature_for_user(username, home_dir)
 
     print("\nConfiguring Codex managed hooks...")
     if setup_managed_hooks():
