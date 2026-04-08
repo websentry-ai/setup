@@ -512,37 +512,6 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
                     'agent_message': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
 
-    if not is_retry:
-        request_body['first_approval_check'] = True
-    
-    if need_pull_policies:
-        request_body['pull_policies'] = True
-
-    # On retry, skip the gateway call — use cached IDs from the marker and poll.
-    if is_retry:
-        marker_data = _get_approval_marker_data()
-        if marker_data:
-            policy_ids = marker_data.get('policyIds', [])
-            application_id = marker_data.get('applicationId', '')
-            request_id = marker_data.get('requestId', '')
-            _clear_approval_marker()
-            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
-
-            if result == 'approved':
-                return {'permission': 'allow'}
-            elif result == 'deny':
-                return {
-                    'permission': 'deny',
-                    'user_message': 'Blocked by organization policy. This command was denied via Slack.',
-                    'agent_message': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
-                }
-            else:
-                return {
-                    'permission': 'deny',
-                    'user_message': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
-                    'agent_message': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
-                }
-
     if need_pull_policies:
         request_body['pull_policies'] = True
 
