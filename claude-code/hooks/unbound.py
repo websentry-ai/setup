@@ -357,7 +357,11 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tools_to_check = cache.get('tools_to_check', []) if cache else []
     need_pull_policies = cache is None or is_cache_stale(cache)
 
-    if tool_name in NATIVE_FILE_TOOLS and tool_name not in tools_to_check:
+    if (
+        tool_name in NATIVE_FILE_TOOLS
+        and tool_name not in tools_to_check
+        and not need_pull_policies
+    ):
         return {}
 
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)

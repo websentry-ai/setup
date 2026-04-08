@@ -261,7 +261,7 @@ def process_pre_tool_use(event, api_key):
     tools_to_check = cache.get('tools_to_check', []) if cache else []
     need_pull_policies = cache is None or is_cache_stale(cache)
 
-    if tool_name in PRETOOL_NATIVE_TOOLS and tool_name not in tools_to_check:
+    if tool_name not in tools_to_check and not need_pull_policies:
         return {}
 
     generation_id = event.get('generation_id')
