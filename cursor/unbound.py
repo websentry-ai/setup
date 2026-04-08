@@ -421,6 +421,9 @@ def process_pre_tool_use(event, api_key):
 
     api_response = send_to_hook_api(request_body, api_key)
 
+    if 'tools_to_check' in api_response:
+        save_policy_cache(api_response['tools_to_check'])
+
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
         policy_ids = approval_check.get('policyIds', [])
@@ -440,9 +443,6 @@ def process_pre_tool_use(event, api_key):
                 'Retry exactly once — the second attempt will wait for the approval.'
             ),
         }
-
-    if 'tools_to_check' in api_response:
-        save_policy_cache(api_response['tools_to_check'])
 
     return format_hook_response(api_response)
     
@@ -548,6 +548,9 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
 
     api_response = send_to_hook_api(request_body, api_key)
 
+    if 'tools_to_check' in api_response:
+        save_policy_cache(api_response['tools_to_check'])
+
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
         policy_ids = approval_check.get('policyIds', [])
@@ -567,10 +570,6 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
                 'Retry exactly once — the second attempt will wait for the approval.'
             ),
         }
-
-
-    if 'tools_to_check' in api_response:
-        save_policy_cache(api_response['tools_to_check'])
 
     return format_hook_response(api_response)
 
