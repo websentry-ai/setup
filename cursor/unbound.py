@@ -373,7 +373,7 @@ def process_pre_tool_use(event, api_key):
     if file_path:
         metadata['file_path'] = file_path
 
-    approval_key = file_path or tool_name
+    approval_key = f"{tool_name}:{file_path}" if file_path else tool_name
     is_retry = _is_approval_retry(approval_key)
 
     request_body = {
@@ -468,7 +468,8 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
 
-    is_retry = _is_approval_retry(command)
+    approval_key = f"{tool_name}:{command}"
+    is_retry = _is_approval_retry(approval_key)
 
     request_body = {
         'conversation_id': conversation_id,
@@ -553,7 +554,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         application_id = approval_check.get('applicationId', '')
         request_id = approval_check.get('requestId', '')
 
-        _set_approval_marker(command, policy_ids, application_id, request_id=request_id)
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
         return {
             'permission': 'deny',
             'user_message': 'An approval request has been sent to your Slack DMs. Please approve it there.',

@@ -478,7 +478,8 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
-    is_retry = _is_approval_retry(command)
+    approval_key = f"{tool_name}:{command}"
+    is_retry = _is_approval_retry(approval_key)
 
     request_body = {
         'conversation_id': session_id,
@@ -531,7 +532,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         application_id = approval_check.get('applicationId', '')
         request_id = approval_check.get('requestId', '')
 
-        _set_approval_marker(command, policy_ids, application_id, request_id=request_id)
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
         return transform_response_for_claude({
             'decision': 'deny',
             'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
