@@ -457,6 +457,51 @@ def clear_setup() -> None:
     print("=" * 60)
 
 
+def remove_hooks_unbound_script() -> None:
+    """Remove ~/.codex/hooks/unbound.py if present (leftover from hooks setup)."""
+    script_path = Path.home() / ".codex" / "hooks" / "unbound.py"
+    if script_path.exists():
+        try:
+            script_path.unlink()
+            debug_print(f"Removed {script_path}")
+        except Exception as e:
+            debug_print(f"Failed to remove {script_path}: {e}")
+
+
+def remove_hooks_from_codex_config() -> None:
+    """Remove hooks from ~/.codex/hooks.json if present (leftover from hooks setup)."""
+    hooks_json_path = Path.home() / ".codex" / "hooks.json"
+    if not hooks_json_path.exists():
+        return
+    try:
+        with open(hooks_json_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+        if "hooks" in config:
+            del config["hooks"]
+            with open(hooks_json_path, 'w', encoding='utf-8') as f:
+                json.dump(config, f, indent=2)
+            debug_print("Removed hooks from hooks.json")
+    except Exception as e:
+        debug_print(f"Failed to update hooks.json: {e}")
+
+
+def disable_codex_hooks_feature() -> None:
+    """Remove codex_hooks feature flag from ~/.codex/config.toml (leftover from hooks setup)."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        if len(new_lines) != len(lines):
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            debug_print("Removed codex_hooks feature flag from config.toml")
+    except Exception as e:
+        debug_print(f"Failed to remove codex_hooks feature: {e}")
+
+
 def main():
     """Main setup function."""
     global DEBUG
@@ -503,6 +548,15 @@ def main():
 
     print("API Key Verified ✅")
     debug_print("API key verification successful")
+
+    # Remove leftover hooks setup env var and artifacts
+    try:
+        remove_env_var("UNBOUND_CODEX_API_KEY")
+    except Exception:
+        pass
+    remove_hooks_unbound_script()
+    remove_hooks_from_codex_config()
+    disable_codex_hooks_feature()
 
     debug_print("Setting OPENAI_API_KEY environment variable...")
     success, message = set_env_var("OPENAI_API_KEY", api_key)
