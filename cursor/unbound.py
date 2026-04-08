@@ -17,10 +17,14 @@ import hashlib
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 
-# Max time (seconds) to wait for Slack approval before timing out.
-# Buffer of 20s ensures poll_approval_status finishes before Cursor's hook timeout
-APPROVAL_TIMEOUT = 600
-APPROVAL_POLL_TIMEOUT = APPROVAL_TIMEOUT - 20
+APPROVAL_TIMEOUT = 4 * 60 * 60
+
+APPROVAL_POLL_PHASES = (
+    (5 * 60,        3),    # 0-5 min: 3s
+    (30 * 60,       15),   # 5-30 min: 15s
+    (2 * 60 * 60,   60),   # 30 min - 2h: 1min
+    (4 * 60 * 60,   120),  # 2h - 4h: 2min
+)
 
 # Use user's home directory for logs
 LOG_DIR = Path.home() / ".cursor" / "hooks"
@@ -240,7 +244,14 @@ def _clear_approval_marker():
         pass
 
 
-def poll_approval_status(api_key, policy_ids, application_id, request_id='', poll_interval=3, timeout=APPROVAL_POLL_TIMEOUT):
+def _next_poll_interval(elapsed):
+    """Pick the polling interval for the current elapsed time using APPROVAL_POLL_PHASES."""
+    for upto, interval in APPROVAL_POLL_PHASES:
+        if elapsed < upto:
+            return interval
+    return APPROVAL_POLL_PHASES[-1][1]
+
+def poll_approval_status(api_key, policy_ids, application_id, request_id='', timeout=APPROVAL_TIMEOUT):
     """Poll the approval-status endpoint until approved, denied, or timeout.
     Returns 'approved', 'deny', or 'timeout'."""
 
@@ -249,10 +260,12 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', pol
     if request_id:
         payload["requestId"] = request_id
     body = json.dumps(payload)
-    deadline = time.time() + timeout
+    
+    start = time.monotonic()
+    deadline = start + timeout
 
-    while time.time() < deadline:
-        time.sleep(poll_interval)
+    while time.monotonic() < deadline:
+        time.sleep(_next_poll_interval(time.monotonic() - start))
         try:
             result = subprocess.run(
                 ["curl", "-fsSL", "-X", "POST",

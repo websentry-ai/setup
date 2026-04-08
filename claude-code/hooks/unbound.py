@@ -18,10 +18,14 @@ LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
 MCP_TOOL_PREFIX = 'mcp__'
 
-# Max time (seconds) to wait for Slack approval before timing out.
-# Buffer of 20s ensures poll_approval_status finishes before Claude Code's hook timeout
-APPROVAL_TIMEOUT = 600
-APPROVAL_POLL_TIMEOUT = APPROVAL_TIMEOUT - 20
+APPROVAL_TIMEOUT = 4 * 60 * 60
+
+APPROVAL_POLL_PHASES = (
+    (5 * 60,        3),    # 0-5 min: 3s
+    (30 * 60,       15),   # 5-30 min: 15s
+    (2 * 60 * 60,   60),   # 30 min - 2h: 1min
+    (4 * 60 * 60,   120),  # 2h - 4h: 2min
+)
 
 
 _cached_api_key = None
@@ -312,7 +316,14 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         return {}
 
 
-def poll_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', poll_interval: int = 3, timeout: int = APPROVAL_POLL_TIMEOUT) -> str:
+def _next_poll_interval(elapsed: float) -> int:
+    """Pick the polling interval for the current elapsed time using APPROVAL_POLL_PHASES."""
+    for upto, interval in APPROVAL_POLL_PHASES:
+        if elapsed < upto:
+            return interval
+    return APPROVAL_POLL_PHASES[-1][1]
+
+def poll_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', timeout: int = APPROVAL_TIMEOUT) -> str:
     """Poll the approval-status endpoint until approved, denied, or timeout.
     Returns 'approved', 'deny', or 'timeout'."""
 
@@ -321,10 +332,12 @@ def poll_approval_status(api_key: str, policy_ids: list, application_id: str, re
     if request_id:
         payload["requestId"] = request_id
     body = json.dumps(payload)
-    deadline = time.time() + timeout
 
-    while time.time() < deadline:
-        time.sleep(poll_interval)
+    start = time.monotonic()
+    deadline = start + timeout
+
+    while time.monotonic() < deadline:
+        time.sleep(_next_poll_interval(time.monotonic() - start))
         try:
             result = subprocess.run(
                 ["curl", "-fsSL", "-X", "POST",

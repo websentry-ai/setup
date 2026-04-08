@@ -1,10 +1,10 @@
 {
     "version": 1,
     "hooks": {
-      "preToolUse": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
-      "postToolUse": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
-      "beforeShellExecution": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
-      "beforeMCPExecution": [{ "command": "./hooks/unbound.py", "timeout": 600 }],
+      "preToolUse": [{ "command": "./hooks/unbound.py", "timeout": 15000 }],
+      "postToolUse": [{ "command": "./hooks/unbound.py" }],
+      "beforeShellExecution": [{ "command": "./hooks/unbound.py", "timeout": 15000 }],
+      "beforeMCPExecution": [{ "command": "./hooks/unbound.py", "timeout": 15000 }],
       "afterShellExecution": [{ "command": "./hooks/unbound.py" }],
       "afterMCPExecution": [{ "command": "./hooks/unbound.py" }],
       "afterFileEdit": [{ "command": "./hooks/unbound.py" }],
