@@ -369,8 +369,12 @@ def process_pre_tool_use(event, api_key):
 
     user_prompt = get_latest_user_prompt(generation_id)
     metadata = dict(event)
-    if 'file_path' in tool_input:
-        metadata['file_path'] = tool_input['file_path']
+    file_path = tool_input.get('file_path', '')
+    if file_path:
+        metadata['file_path'] = file_path
+
+    approval_key = file_path or tool_name
+    is_retry = _is_approval_retry(approval_key)
 
     request_body = {
         'conversation_id': conversation_id,
@@ -385,10 +389,57 @@ def process_pre_tool_use(event, api_key):
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
+    if not is_retry:
+        request_body['first_approval_check'] = True
+
+    if is_retry:
+        marker_data = _get_approval_marker_data()
+        if marker_data:
+            policy_ids = marker_data.get('policyIds', [])
+            application_id = marker_data.get('applicationId', '')
+            request_id = marker_data.get('requestId', '')
+            _clear_approval_marker()
+            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
+
+            if result == 'approved':
+                return {'permission': 'allow'}
+            elif result == 'deny':
+                return {
+                    'permission': 'deny',
+                    'user_message': 'Blocked by organization policy. This action was denied via Slack.',
+                    'agent_message': 'This action was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                }
+            else:
+                return {
+                    'permission': 'deny',
+                    'user_message': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.',
+                    'agent_message': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                }
+
     if need_pull_policies:
         request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
+
+    if api_response.get('decision') == 'approval_required':
+        approval_check = api_response.get('approvalCheck', {})
+        policy_ids = approval_check.get('policyIds', [])
+        application_id = approval_check.get('applicationId', '')
+        request_id = approval_check.get('requestId', '')
+
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
+        return {
+            'permission': 'deny',
+            'user_message': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'agent_message': (
+                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+                'Tell the user: "An approval request has been sent to your Slack DMs. '
+                'Please approve it and I will retry automatically." '
+                'Then immediately retry the exact same tool call with the exact same arguments — '
+                'do not modify them in any way, do not add sleep or any prefix. '
+                'Retry exactly once — the second attempt will wait for the approval.'
+            ),
+        }
 
     if 'tools_to_check' in api_response:
         save_policy_cache(api_response['tools_to_check'])

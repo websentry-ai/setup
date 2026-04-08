@@ -478,7 +478,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
-    # for "approval required" policy
     is_retry = _is_approval_retry(command)
 
     request_body = {
@@ -497,8 +496,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if not is_retry:
         request_body['first_approval_check'] = True
 
-    # On retry, skip the gateway call — use the cached policy/app IDs from the
-    # marker and go straight to polling.
     if is_retry:
         marker_data = _get_approval_marker_data()
         if marker_data:
