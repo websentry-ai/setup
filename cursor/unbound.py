@@ -24,7 +24,7 @@ LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
-CACHE_TTL_SECONDS = 3600  # 1 hour
+CACHE_TTL_SECONDS = 300
 
 # Ensure log directory exists
 try:
@@ -37,6 +37,7 @@ except Exception:
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
     ERROR_LOG = LOG_DIR / "error.log"
     LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+    POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 
 
 _cached_api_key = None

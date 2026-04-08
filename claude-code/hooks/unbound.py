@@ -17,7 +17,7 @@ ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
-CACHE_TTL_SECONDS = 3600  # 1 hour
+CACHE_TTL_SECONDS = 300
 
 
 _cached_api_key = None
