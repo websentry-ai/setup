@@ -32,7 +32,8 @@ AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
-TRACKED_NATIVE_TOOLS = {'Delete'}
+PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
+EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
 
 # Ensure log directory exists
 try:
@@ -308,7 +309,7 @@ def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
 
-    if tool_name not in TRACKED_NATIVE_TOOLS:
+    if tool_name not in PRETOOL_NATIVE_TOOLS:
         return {}
     
     generation_id = event.get('generation_id')
@@ -477,7 +478,7 @@ def build_llm_exchange(events, api_key=None):
         elif hook_event_name == 'postToolUse':
             tool_name = event.get('tool_name', '')
 
-            if tool_name not in TRACKED_NATIVE_TOOLS:
+            if tool_name not in EXCHANGE_NATIVE_TOOLS:
                 continue
             
             tool_output = event.get('tool_output', '')
