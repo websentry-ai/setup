@@ -735,7 +735,7 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
                 lines = f.readlines()
 
         content = ''.join(lines)
-        if 'codex_hooks' in content and 'true' in content:
+        if 'codex_hooks = true' in content:
             debug_print(f"codex_hooks already enabled for {username}")
             return
 
@@ -778,17 +778,17 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
             lines = f.readlines()
 
         new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        if len(new_lines) != len(lines):
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
 
-        with open(config_path, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
+            try:
+                user_info = pwd.getpwnam(username)
+                os.chown(config_path, user_info.pw_uid, user_info.pw_gid)
+            except Exception:
+                pass
 
-        try:
-            user_info = pwd.getpwnam(username)
-            os.chown(config_path, user_info.pw_uid, user_info.pw_gid)
-        except Exception:
-            pass
-
-        debug_print(f"Removed codex_hooks feature for {username}")
+            debug_print(f"Removed codex_hooks feature for {username}")
     except Exception as e:
         debug_print(f"Failed to remove codex_hooks for {username}: {e}")
 

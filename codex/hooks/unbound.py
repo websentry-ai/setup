@@ -569,16 +569,15 @@ def process_stop_event(event: Dict, api_key: str):
         'permission_mode': permission_mode or 'default'
     }
 
-    if exchange:
-        success = send_to_api(exchange, api_key)
+    success = send_to_api(exchange, api_key)
 
-        if success:
-            remaining_logs = [
-                log for log in logs
-                if log.get('session_id') != session_id and
-                (not log.get('event') or log.get('event', {}).get('session_id') != session_id)
-            ]
-            save_logs(remaining_logs)
+    if success:
+        remaining_logs = [
+            log for log in logs
+            if log.get('session_id') != session_id and
+            (not log.get('event') or log.get('event', {}).get('session_id') != session_id)
+        ]
+        save_logs(remaining_logs)
 
 
 def main():

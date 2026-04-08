@@ -548,7 +548,7 @@ def enable_codex_hooks_feature() -> bool:
 
         # Check if already enabled
         content = ''.join(lines)
-        if 'codex_hooks' in content and 'true' in content:
+        if 'codex_hooks = true' in content:
             debug_print("codex_hooks feature flag already enabled")
             return True
 
@@ -589,10 +589,10 @@ def disable_codex_hooks_feature() -> None:
             lines = f.readlines()
 
         new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
-
-        with open(config_path, 'w', encoding='utf-8') as f:
-            f.writelines(new_lines)
-        debug_print("Removed codex_hooks feature flag from config.toml")
+        if len(new_lines) != len(lines):
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            debug_print("Removed codex_hooks feature flag from config.toml")
     except Exception as e:
         debug_print(f"Failed to remove codex_hooks feature: {e}")
 
