@@ -312,66 +312,9 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         return {}
 
 
-def stream_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', timeout: int = APPROVAL_POLL_TIMEOUT) -> str:
-    """Connect to SSE stream and wait for approval/denial. Falls back to polling on failure.
-    Returns 'approved', 'denied', or 'timeout'."""
-
-    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-stream"
-    payload = {"policyIds": policy_ids, "applicationId": application_id}
-    if request_id:
-        payload["requestId"] = request_id
-    body = json.dumps(payload)
-
-    deadline = time.time() + timeout
-    max_retries = 3
-    for attempt in range(max_retries):
-        remaining = int(deadline - time.time())
-        if remaining <= 0:
-            return 'timeout'
-
-        try:
-            proc = subprocess.Popen(
-                ["curl", "-fsSL", "-N", "-X", "POST",
-                 "--max-time", str(remaining),
-                 "-H", f"Authorization: Bearer {api_key}",
-                 "-H", "Content-Type: application/json",
-                 "-d", body, url],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            for raw_line in proc.stdout:
-                line = raw_line.decode('utf-8', errors='ignore').strip()
-                if line.startswith('data: '):
-                    try:
-                        data = json.loads(line[6:])
-                        decision = data.get('decision', 'pending')
-                        if decision == 'allow':
-                            proc.terminate()
-                            return 'approved'
-                        if decision in ('deny', 'timeout'):
-                            proc.terminate()
-                            return decision
-                    except json.JSONDecodeError:
-                        pass
-            # Stream ended without a decision — retry
-            proc.wait()
-        except Exception as e:
-            log_error(f"SSE stream error (attempt {attempt + 1}): {str(e)}")
-
-        if attempt < max_retries - 1:
-            time.sleep(2)
-
-    # All SSE retries failed — fall back to polling
-    remaining = int(deadline - time.time())
-    if remaining <= 0:
-        return 'timeout'
-    log_error("SSE failed after retries, falling back to polling")
-    return poll_approval_status(api_key, policy_ids, application_id, request_id=request_id, timeout=remaining)
-
-
-def poll_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', poll_interval: int = 5, timeout: int = APPROVAL_POLL_TIMEOUT) -> str:
+def poll_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', poll_interval: int = 3, timeout: int = APPROVAL_POLL_TIMEOUT) -> str:
     """Poll the approval-status endpoint until approved, denied, or timeout.
-    Returns 'approved', 'denied', or 'timeout'. Used as fallback when SSE fails."""
+    Returns 'approved', 'deny', or 'timeout'."""
 
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
     payload = {"policyIds": policy_ids, "applicationId": application_id}
@@ -493,7 +436,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             application_id = marker_data.get('applicationId', '')
             request_id = marker_data.get('requestId', '')
             _clear_approval_marker()
-            result = stream_approval_status(api_key, policy_ids, application_id, request_id=request_id)
+            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
             if result == 'approved':
                 return transform_response_for_claude({'decision': 'allow'})
