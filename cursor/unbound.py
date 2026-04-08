@@ -34,6 +34,8 @@ LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
+POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
+CACHE_TTL_SECONDS = 300
 
 # Ensure log directory exists
 try:
@@ -45,6 +47,7 @@ except Exception:
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
     ERROR_LOG = LOG_DIR / "error.log"
     LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+    POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 
 
 _cached_api_key = None
@@ -112,6 +115,46 @@ def log_error(message, category='general'):
 
     # Report to gateway (fire-and-forget)
     report_error_to_gateway(message, category, _cached_api_key)
+
+
+def load_policy_cache():
+    """Load policy cache from disk. Returns None if missing, corrupt, or expired."""
+    try:
+        if not POLICY_CACHE_FILE.exists():
+            return None
+        with open(POLICY_CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.loads(f.read())
+        if not isinstance(cache, dict) or 'last_synced' not in cache or 'tools_to_check' not in cache:
+            return None
+        if not isinstance(cache['tools_to_check'], list):
+            return None
+        return cache
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def save_policy_cache(tools_to_check):
+    """Write policy cache to disk."""
+    try:
+        POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cache = {
+            'last_synced': datetime.utcnow().isoformat() + 'Z',
+            'tools_to_check': tools_to_check,
+        }
+        with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(cache))
+    except (OSError, TypeError):
+        pass
+
+
+def is_cache_stale(cache):
+    """Check if cached data is older than CACHE_TTL_SECONDS."""
+    try:
+        synced = datetime.fromisoformat(cache['last_synced'].rstrip('Z'))
+        age = (datetime.utcnow() - synced).total_seconds()
+        return age > CACHE_TTL_SECONDS
+    except (ValueError, KeyError):
+        return True
 
 
 def load_existing_logs():
@@ -311,7 +354,14 @@ def process_pre_tool_use(event, api_key):
 
     if tool_name not in PRETOOL_NATIVE_TOOLS:
         return {}
-    
+
+    cache = load_policy_cache()
+    tools_to_check = cache.get('tools_to_check', []) if cache else []
+    need_pull_policies = cache is None or is_cache_stale(cache)
+
+    if tool_name not in tools_to_check and not need_pull_policies:
+        return {}
+
     generation_id = event.get('generation_id')
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
@@ -319,9 +369,12 @@ def process_pre_tool_use(event, api_key):
 
     user_prompt = get_latest_user_prompt(generation_id)
     metadata = dict(event)
-    if 'file_path' in tool_input:
-        metadata['file_path'] = tool_input['file_path']
+    file_path = tool_input.get('file_path', '')
+    if file_path:
+        metadata['file_path'] = file_path
 
+    approval_key = f"{tool_name}:{file_path}" if file_path else tool_name
+    is_retry = _is_approval_retry(approval_key)
 
     request_body = {
         'conversation_id': conversation_id,
@@ -336,7 +389,61 @@ def process_pre_tool_use(event, api_key):
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
+    if not is_retry:
+        request_body['first_approval_check'] = True
+
+    if is_retry:
+        marker_data = _get_approval_marker_data()
+        if marker_data:
+            policy_ids = marker_data.get('policyIds', [])
+            application_id = marker_data.get('applicationId', '')
+            request_id = marker_data.get('requestId', '')
+            _clear_approval_marker()
+            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
+
+            if result == 'approved':
+                return {'permission': 'allow'}
+            elif result == 'deny':
+                return {
+                    'permission': 'deny',
+                    'user_message': 'Blocked by organization policy. This action was denied via Slack.',
+                    'agent_message': 'This action was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                }
+            else:
+                return {
+                    'permission': 'deny',
+                    'user_message': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.',
+                    'agent_message': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                }
+
+    if need_pull_policies:
+        request_body['pull_policies'] = True
+
     api_response = send_to_hook_api(request_body, api_key)
+
+    if 'tools_to_check' in api_response:
+        save_policy_cache(api_response['tools_to_check'])
+
+    if api_response.get('decision') == 'approval_required':
+        approval_check = api_response.get('approvalCheck', {})
+        policy_ids = approval_check.get('policyIds', [])
+        application_id = approval_check.get('applicationId', '')
+        request_id = approval_check.get('requestId', '')
+
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
+        return {
+            'permission': 'deny',
+            'user_message': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'agent_message': (
+                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+                'Tell the user: "An approval request has been sent to your Slack DMs. '
+                'Please approve it and I will retry automatically." '
+                'Then immediately retry the exact same tool call with the exact same arguments — '
+                'do not modify them in any way, do not add sleep or any prefix. '
+                'Retry exactly once — the second attempt will wait for the approval.'
+            ),
+        }
+
     return format_hook_response(api_response)
     
 
@@ -349,6 +456,9 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
 
+    cache = load_policy_cache()
+    need_pull_policies = cache is None or is_cache_stale(cache)
+
     user_prompt = get_latest_user_prompt(generation_id)
 
     # Build metadata with the raw event, inject mcp fields if present
@@ -358,7 +468,8 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
 
-    is_retry = _is_approval_retry(command)
+    approval_key = f"{tool_name}:{command}"
+    is_retry = _is_approval_retry(approval_key)
 
     request_body = {
         'conversation_id': conversation_id,
@@ -401,7 +512,13 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
                     'agent_message': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
 
+    if need_pull_policies:
+        request_body['pull_policies'] = True
+
     api_response = send_to_hook_api(request_body, api_key)
+
+    if 'tools_to_check' in api_response:
+        save_policy_cache(api_response['tools_to_check'])
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
@@ -409,7 +526,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         application_id = approval_check.get('applicationId', '')
         request_id = approval_check.get('requestId', '')
 
-        _set_approval_marker(command, policy_ids, application_id, request_id=request_id)
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
         return {
             'permission': 'deny',
             'user_message': 'An approval request has been sent to your Slack DMs. Please approve it there.',
