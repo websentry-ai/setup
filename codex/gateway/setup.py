@@ -485,6 +485,23 @@ def remove_hooks_from_codex_config() -> None:
         debug_print(f"Failed to update hooks.json: {e}")
 
 
+def disable_codex_hooks_feature() -> None:
+    """Remove codex_hooks feature flag from ~/.codex/config.toml (leftover from hooks setup)."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        if len(new_lines) != len(lines):
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            debug_print("Removed codex_hooks feature flag from config.toml")
+    except Exception as e:
+        debug_print(f"Failed to remove codex_hooks feature: {e}")
+
+
 def main():
     """Main setup function."""
     global DEBUG
@@ -539,6 +556,7 @@ def main():
         pass
     remove_hooks_unbound_script()
     remove_hooks_from_codex_config()
+    disable_codex_hooks_feature()
 
     debug_print("Setting OPENAI_API_KEY environment variable...")
     success, message = set_env_var("OPENAI_API_KEY", api_key)

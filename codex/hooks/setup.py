@@ -525,9 +525,76 @@ def clear_setup() -> None:
     # Remove hooks from hooks.json
     remove_hooks_from_config()
 
+    # Remove codex_hooks feature flag
+    disable_codex_hooks_feature()
+
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+
+
+def enable_codex_hooks_feature() -> bool:
+    """Enable the codex_hooks feature flag in ~/.codex/config.toml.
+    If [features] section exists, adds the key under it.
+    Otherwise appends a new [features] section at the end of the file."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+
+        lines = []
+        if config_path.exists():
+            with open(config_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+        # Check if already enabled
+        content = ''.join(lines)
+        if 'codex_hooks = true' in content:
+            debug_print("codex_hooks feature flag already enabled")
+            return True
+
+        # Check if [features] section already exists
+        features_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == '[features]':
+                features_idx = i
+                break
+
+        if features_idx is not None:
+            # Insert codex_hooks = true right after [features] header
+            lines.insert(features_idx + 1, 'codex_hooks = true\n')
+        else:
+            # Append new [features] section at the end
+            if lines and not lines[-1].endswith('\n'):
+                lines.append('\n')
+            lines.append('\n[features]\ncodex_hooks = true\n')
+
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+
+        debug_print("Enabled codex_hooks feature flag in config.toml")
+        return True
+    except Exception as e:
+        debug_print(f"Failed to enable codex_hooks feature: {e}")
+        return False
+
+
+def disable_codex_hooks_feature() -> None:
+    """Remove only the codex_hooks line from ~/.codex/config.toml.
+    Preserves the [features] section and any other flags within it."""
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        if len(new_lines) != len(lines):
+            with open(config_path, 'w', encoding='utf-8') as f:
+                f.writelines(new_lines)
+            debug_print("Removed codex_hooks feature flag from config.toml")
+    except Exception as e:
+        debug_print(f"Failed to remove codex_hooks feature: {e}")
 
 
 def main():
@@ -615,6 +682,9 @@ def main():
         print("Failed to configure Codex hooks")
         return
     debug_print("Codex hooks configured successfully")
+
+    debug_print("Enabling codex_hooks feature flag...")
+    enable_codex_hooks_feature()
 
     print("API key verified and added")
     print("Setup complete")
