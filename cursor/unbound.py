@@ -11,9 +11,20 @@ import subprocess
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime
-
+import tempfile
+import time
+import hashlib
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+
+APPROVAL_TIMEOUT = 4 * 60 * 60
+
+APPROVAL_POLL_PHASES = (
+    (5 * 60,        3),    # 0-5 min: 3s
+    (30 * 60,       15),   # 5-30 min: 15s
+    (2 * 60 * 60,   60),   # 30 min - 2h: 1min
+    (4 * 60 * 60,   120),  # 2h - 4h: 2min
+)
 
 # Use user's home directory for logs
 LOG_DIR = Path.home() / ".cursor" / "hooks"
@@ -29,7 +40,6 @@ try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
     # Fallback to temp directory if home directory is not writable
-    import tempfile
     LOG_DIR = Path(tempfile.gettempdir()) / "cursor-hooks"
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
@@ -192,6 +202,93 @@ def send_to_hook_api(request_body, api_key):
         return {}
 
 
+_APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
+
+
+def _is_approval_retry(command):
+    """True if a marker exists for this exact command and is fresh."""
+    try:
+        if not _APPROVAL_MARKER_FILE.exists():
+            return False
+        data = json.loads(_APPROVAL_MARKER_FILE.read_text())
+        cmd_hash = hashlib.sha256(command.encode()).hexdigest()[:16]
+        return data.get('cmd') == cmd_hash and (time.time() - data.get('ts', 0)) < APPROVAL_TIMEOUT
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _set_approval_marker(command, policy_ids, application_id, request_id=''):
+    _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
+        'ts': time.time(),
+        'policyIds': policy_ids,
+        'applicationId': application_id,
+        'requestId': request_id,
+    }
+    _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
+
+
+def _get_approval_marker_data():
+    try:
+        if _APPROVAL_MARKER_FILE.exists():
+            return json.loads(_APPROVAL_MARKER_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _clear_approval_marker():
+    try:
+        _APPROVAL_MARKER_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _next_poll_interval(elapsed):
+    """Pick the polling interval for the current elapsed time using APPROVAL_POLL_PHASES."""
+    for upto, interval in APPROVAL_POLL_PHASES:
+        if elapsed < upto:
+            return interval
+    return APPROVAL_POLL_PHASES[-1][1]
+
+def poll_approval_status(api_key, policy_ids, application_id, request_id='', timeout=APPROVAL_TIMEOUT):
+    """Poll the approval-status endpoint until approved, denied, or timeout.
+    Returns 'approved', 'deny', or 'timeout'."""
+
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
+    payload = {"policyIds": policy_ids, "applicationId": application_id}
+    if request_id:
+        payload["requestId"] = request_id
+    body = json.dumps(payload)
+    
+    start = time.monotonic()
+    deadline = start + timeout
+
+    while time.monotonic() < deadline:
+        time.sleep(_next_poll_interval(time.monotonic() - start))
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "-d", body, url],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                resp = json.loads(result.stdout.decode('utf-8'))
+                decision = resp.get('decision', 'pending')
+                if decision == 'allow':
+                    return 'approved'
+                if decision == 'deny':
+                    return 'deny'
+        except Exception as e:
+            log_error(f"Approval poll error: {str(e)}", 'api_call')
+
+    return 'timeout'
+
+
 def format_hook_response(api_response):
     """Convert API response to Cursor hook output format (permission/user_message/agent_message)."""
     if not api_response:
@@ -261,6 +358,8 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
 
+    is_retry = _is_approval_retry(command)
+
     request_body = {
         'conversation_id': conversation_id,
         'unbound_app_label': 'cursor',
@@ -274,7 +373,56 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
+    if not is_retry:
+        request_body['first_approval_check'] = True
+
+    # On retry, skip the gateway call — use cached IDs from the marker and poll.
+    if is_retry:
+        marker_data = _get_approval_marker_data()
+        if marker_data:
+            policy_ids = marker_data.get('policyIds', [])
+            application_id = marker_data.get('applicationId', '')
+            request_id = marker_data.get('requestId', '')
+            _clear_approval_marker()
+            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
+
+            if result == 'approved':
+                return {'permission': 'allow'}
+            elif result == 'deny':
+                return {
+                    'permission': 'deny',
+                    'user_message': 'Blocked by organization policy. This command was denied via Slack.',
+                    'agent_message': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                }
+            else:
+                return {
+                    'permission': 'deny',
+                    'user_message': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
+                    'agent_message': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                }
+
     api_response = send_to_hook_api(request_body, api_key)
+
+    if api_response.get('decision') == 'approval_required':
+        approval_check = api_response.get('approvalCheck', {})
+        policy_ids = approval_check.get('policyIds', [])
+        application_id = approval_check.get('applicationId', '')
+        request_id = approval_check.get('requestId', '')
+
+        _set_approval_marker(command, policy_ids, application_id, request_id=request_id)
+        return {
+            'permission': 'deny',
+            'user_message': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'agent_message': (
+                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+                'Tell the user: "An approval request has been sent to your Slack DMs. '
+                'Please approve it and I will retry automatically." '
+                'Then immediately retry the exact same tool call with the exact same command — '
+                'do not modify the command in any way, do not add sleep or any prefix. '
+                'Retry exactly once — the second attempt will wait for the approval.'
+            ),
+        }
+
     return format_hook_response(api_response)
 
 

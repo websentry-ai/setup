@@ -355,7 +355,7 @@ def configure_claude_settings() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
-                            "timeout": 10
+                            "timeout": 15000
                         }
                     ]
                 }
