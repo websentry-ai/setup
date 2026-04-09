@@ -602,16 +602,18 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
         data = json.dumps({"tool_type": tool_type})
-        result = subprocess.run(
+        proc = subprocess.Popen(
             ["curl", "-fsSL", "-X", "POST",
              "-H", "Content-Type: application/json",
-             "-H", f"X-API-KEY: {api_key}",
-             "-d", data, url],
-            capture_output=True,
-            text=True,
-            timeout=10
+             "-d", data, "--config", "-", url],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
-        debug_print(f"Setup completion reported (exit code {result.returncode})")
+        proc.stdin.write(f'header = "X-API-KEY: {api_key}"
+'.encode())
+        proc.stdin.close()
+        debug_print("Setup completion notification sent")
     except Exception as e:
         debug_print(f"Could not notify backend: {e}")
 
