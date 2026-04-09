@@ -452,6 +452,27 @@ def clear_setup() -> None:
     print("=" * 60)
 
 
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+    """Notify backend that tool setup completed. Never fails the setup."""
+    try:
+        url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
+        data = json.dumps({"tool_type": tool_type})
+        proc = subprocess.Popen(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-d", data, "--config", "-", url],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(f'header = "X-API-KEY: {api_key}"
+'.encode())
+        proc.stdin.close()
+        debug_print("Setup completion notification sent")
+    except Exception as e:
+        debug_print(f"Could not notify backend: {e}")
+
+
 def main():
     """Main setup function."""
     global DEBUG
@@ -535,6 +556,9 @@ def main():
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
+
+    notify_setup_complete(api_key, "unbound-claude-code")
+
     rc_path = get_shell_rc_file()
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")

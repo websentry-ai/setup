@@ -628,6 +628,27 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
         return None
 
 
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+    """Notify backend that tool setup completed. Never fails the setup."""
+    try:
+        url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
+        data = json.dumps({"tool_type": tool_type})
+        proc = subprocess.Popen(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-d", data, "--config", "-", url],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(f'header = "X-API-KEY: {api_key}"
+'.encode())
+        proc.stdin.close()
+        debug_print("Setup completion notification sent")
+    except Exception as e:
+        debug_print(f"Could not notify backend: {e}")
+
+
 def main():
     global DEBUG
 
@@ -735,6 +756,8 @@ def main():
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
+
+    notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url)
 
     if env_changed or hooks_changed:
         debug_print(f"Restart needed: env_changed={env_changed}, hooks_changed={hooks_changed}")
