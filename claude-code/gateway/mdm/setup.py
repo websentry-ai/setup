@@ -645,6 +645,25 @@ def clear_setup():
     print("=" * 60)
 
 
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+    """Notify backend that tool setup completed. Never fails the setup."""
+    try:
+        url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
+        data = json.dumps({"tool_type": tool_type})
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "-H", f"X-API-KEY: {api_key}",
+             "-d", data, url],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        debug_print(f"Setup completion reported (exit code {result.returncode})")
+    except Exception as e:
+        debug_print(f"Could not notify backend: {e}")
+
+
 def main():
     global DEBUG
 
@@ -747,6 +766,8 @@ def main():
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
+
+    notify_setup_complete(claude_api_key, "unbound-claude-code", backend_url=base_url)
 
 
 if __name__ == "__main__":
