@@ -3,11 +3,11 @@
 ## Setup with Browser Authentication
 
 ```bash
-python3 <(curl -fsSl https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/setup.py) --domain gateway.getunbound.ai
+python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/setup.py) --domain gateway.getunbound.ai
 ```
 
 ## Setup with API Key
 
 ```bash
-python3 <(curl -fsSl https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/setup_with_api_key.py) --api-key YOUR_API_KEY
+python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/setup_with_api_key.py) --api-key YOUR_API_KEY
 ```

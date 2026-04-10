@@ -1,7 +1,7 @@
 # codex-mdm-setup
 
 ```bash
-python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py)" --api_key YOUR_ADMIN_API_KEY
+python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py) --api-key YOUR_ADMIN_API_KEY
 ```
 
 ### Optional Parameters
@@ -12,5 +12,5 @@ python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/re
 ### Clearing Setup
 
 ```bash
-python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py)" --clear
+python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/gateway/mdm/setup.py) --clear
 ```

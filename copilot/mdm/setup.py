@@ -853,16 +853,14 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
         data = json.dumps({"tool_type": tool_type})
-        proc = subprocess.Popen(
+        subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", "Content-Type: application/json",
              "-d", data, "--config", "-", url],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            input=f'header = "X-API-KEY: {api_key}"\n'.encode(),
+            capture_output=True,
+            timeout=10,
         )
-        proc.stdin.write(f'header = "X-API-KEY: {api_key}"\n'.encode())
-        proc.stdin.close()
         debug_print("Setup completion notification sent")
     except Exception as e:
         debug_print(f"Could not notify backend: {e}")
@@ -893,7 +891,7 @@ def main():
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
             i += 2
-        elif args[i] == "--api_key" and i + 1 < len(args):
+        elif args[i] == "--api-key" and i + 1 < len(args):
             auth_api_key = args[i + 1]
             i += 2
         elif args[i] == "--debug":
@@ -903,7 +901,7 @@ def main():
 
     if not auth_api_key:
         print("\nMissing required arguments")
-        print("Usage: sudo python3 setup.py --api_key <api_key> [--url <base_url>] [--app_name <name>]")
+        print("Usage: sudo python3 setup.py --api-key <api_key> [--url <base_url>] [--app_name <name>]")
         return
 
     # --- Step 1: Resolve API key ---
