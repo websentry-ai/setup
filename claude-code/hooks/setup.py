@@ -553,8 +553,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        proc.stdin.write(f'header = "X-API-KEY: {api_key}"
-'.encode())
+        proc.stdin.write(f'header = "X-API-KEY: {api_key}"\n'.encode())
         proc.stdin.close()
         debug_print("Setup completion notification sent")
     except Exception as e:
