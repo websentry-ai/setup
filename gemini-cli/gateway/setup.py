@@ -386,6 +386,7 @@ def main():
 
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
+    parser.add_argument("--backend-url", dest="backend_url", default="https://backend.getunbound.ai", help="Override backend URL for local/staging testing (default: https://backend.getunbound.ai)")
     parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
     parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
     parser.add_argument("--api-key", dest="api_key", help="API key (skip browser auth)")
@@ -445,7 +446,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "gemini-cli")
+    notify_setup_complete(api_key, "gemini-cli", backend_url=args.backend_url)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:

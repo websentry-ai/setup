@@ -485,6 +485,12 @@ def main():
             domain = sys.argv[i + 1]
             break
 
+    backend_url = "https://backend.getunbound.ai"
+    for i, arg in enumerate(sys.argv):
+        if arg == "--backend-url" and i + 1 < len(sys.argv):
+            backend_url = sys.argv[i + 1]
+            break
+
     api_key_arg = None
     for i, arg in enumerate(sys.argv):
         if arg == "--api-key" and i + 1 < len(sys.argv):
@@ -541,7 +547,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "cursor")
+    notify_setup_complete(api_key, "cursor", backend_url=backend_url)
 
     restart_cursor()
 

@@ -1,7 +1,9 @@
 # claude-code-mdm-setup
 
+MDM setup requires root. Pass the script to `python3 -c` via command substitution — bash process substitution `<(...)` does not survive the `sudo` boundary and fails with `Bad file descriptor`.
+
 ```bash
-python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/mdm/setup.py) --api-key YOUR_ADMIN_API_KEY
+sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/mdm/setup.py)" --api-key YOUR_ADMIN_API_KEY
 ```
 
 ### Optional Parameters
@@ -12,5 +14,5 @@ python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/h
 ### Clearing Setup
 
 ```bash
-python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/mdm/setup.py) --clear
+sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/mdm/setup.py)" --clear
 ```

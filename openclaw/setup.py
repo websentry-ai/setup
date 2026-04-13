@@ -478,6 +478,7 @@ def main():
     domain = None
     model = None
     api_key_arg = None
+    backend_url = "https://backend.getunbound.ai"
     for i, arg in enumerate(sys.argv):
         if arg == "--domain" and i + 1 < len(sys.argv):
             domain = sys.argv[i + 1]
@@ -485,6 +486,8 @@ def main():
             model = sys.argv[i + 1]
         elif arg == "--api-key" and i + 1 < len(sys.argv):
             api_key_arg = sys.argv[i + 1]
+        elif arg == "--backend-url" and i + 1 < len(sys.argv):
+            backend_url = sys.argv[i + 1]
 
     setup_plugin = "--plugin" in sys.argv
     setup_provider = "--provider" in sys.argv
@@ -533,7 +536,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "openclaw")
+    notify_setup_complete(api_key, "openclaw", backend_url=backend_url)
 
     print("\nYou can now use OpenClaw with Unbound tool policies:")
     print("  openclaw agent --local --agent main --message 'hello world'")

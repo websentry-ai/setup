@@ -885,7 +885,7 @@ def main():
     args = sys.argv[1:]
     i = 0
     while i < len(args):
-        if args[i] == "--url" and i + 1 < len(args):
+        if args[i] == "--backend-url" and i + 1 < len(args):
             base_url = args[i + 1]
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
@@ -900,8 +900,8 @@ def main():
             i += 1
 
     if not auth_api_key:
-        print("\nMissing required arguments")
-        print("Usage: sudo python3 setup.py --api-key <api_key> [--url <base_url>] [--app_name <name>]")
+        print("\nMissing required argument: --api-key")
+        print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <name>]")
         return
 
     # --- Step 1: Resolve API key ---
