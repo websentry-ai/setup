@@ -11,7 +11,9 @@ import time
 import hashlib
 
 
-UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_GATEWAY_URL = os.environ.get(
+    "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
+).rstrip("/")
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
