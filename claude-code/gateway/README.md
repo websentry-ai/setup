@@ -3,6 +3,10 @@
 ## Setup with Browser Authentication
 
 ```bash
+python3 <(curl -fsSL https://getunbound.ai/setup/claude-code/gateway/install) --domain gateway.getunbound.ai
+```
+
+```bash
 python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/gateway/setup.py) --domain gateway.getunbound.ai
 ```
 
