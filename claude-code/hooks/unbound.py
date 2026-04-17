@@ -219,6 +219,27 @@ def _clear_approval_marker() -> None:
         pass
 
 
+def _get_session_model(session_id: str) -> Optional[str]:
+    """Look up the model for `session_id` from the most recent SessionStart
+    entry in the audit log. Returns None if no SessionStart has been logged
+    for this session yet (e.g. the log was rotated)."""
+    if not session_id:
+        return None
+    try:
+        for log in reversed(load_existing_logs()):
+            log_session = log.get('session_id') or log.get('event', {}).get('session_id')
+            if log_session != session_id:
+                continue
+            event = log.get('event', {}) if 'event' in log else log
+            if event.get('hook_event_name') == 'SessionStart':
+                model = event.get('model')
+                if model:
+                    return model
+    except Exception:
+        pass
+    return None
+
+
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
@@ -444,7 +465,7 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
-    model = event.get('model') or 'auto'
+    model = event.get('model') or _get_session_model(session_id) or 'auto'
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
 
@@ -555,7 +576,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking."""
     session_id = event.get('session_id')
-    model = event.get('model') or 'auto'
+    model = event.get('model') or _get_session_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
 
     request_body = {
@@ -634,9 +655,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     if not permission_mode:
         permission_mode = 'default'
 
+    model = _get_session_model(session_id) or 'auto'
+
     exchange = {
         'conversation_id': session_id or 'unknown',
-        'model': 'auto',
+        'model': model,
         'messages': messages,
         'permission_mode': permission_mode
     }
