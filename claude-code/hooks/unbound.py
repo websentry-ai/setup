@@ -219,14 +219,17 @@ def _clear_approval_marker() -> None:
         pass
 
 
-def _get_session_model(session_id: str) -> Optional[str]:
-    """Look up the model for `session_id` from the most recent SessionStart
-    entry in the audit log. Returns None if no SessionStart has been logged
-    for this session yet (e.g. the log was rotated)."""
-    if not session_id:
+def _extract_session_model(logs: List[Dict], session_id: str) -> Optional[str]:
+    """Return the model for `session_id` from the most recent SessionStart
+    entry in `logs`. Forward scan with 'latest wins' — SessionStart is the
+    oldest entry for a session, so scanning forward finds it in O(k) instead
+    of O(n) (n includes every PostToolUse accumulated since). Returns None
+    if no SessionStart has been logged for this session."""
+    if not session_id or not logs:
         return None
+    found = None
     try:
-        for log in reversed(load_existing_logs()):
+        for log in logs:
             log_session = log.get('session_id') or log.get('event', {}).get('session_id')
             if log_session != session_id:
                 continue
@@ -234,10 +237,22 @@ def _get_session_model(session_id: str) -> Optional[str]:
             if event.get('hook_event_name') == 'SessionStart':
                 model = event.get('model')
                 if model:
-                    return model
+                    found = model  # keep scanning — latest SessionStart wins
     except Exception:
         pass
-    return None
+    return found
+
+
+def _get_session_model(session_id: str) -> Optional[str]:
+    """Convenience wrapper for callers that don't already hold the logs in
+    memory (PreToolUse / UserPromptSubmit handlers). Loads the audit log and
+    delegates to `_extract_session_model`."""
+    if not session_id:
+        return None
+    try:
+        return _extract_session_model(load_existing_logs(), session_id)
+    except Exception:
+        return None
 
 
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
@@ -591,7 +606,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
@@ -655,7 +670,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     if not permission_mode:
         permission_mode = 'default'
 
-    model = _get_session_model(session_id) or 'auto'
+    # Prefer caller-supplied model (process_stop_event resolves it from the
+    # already-loaded audit log to avoid a second disk read). Fall back to the
+    # on-demand lookup for any caller that doesn't pass one.
+    if not model:
+        model = _get_session_model(session_id) or 'auto'
 
     exchange = {
         'conversation_id': session_id or 'unknown',
@@ -663,7 +682,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'messages': messages,
         'permission_mode': permission_mode
     }
-    
+
     return exchange
 
 
@@ -752,10 +771,15 @@ def process_stop_event(event: Dict, api_key: str):
             if msg.get('content')
         ]
 
+    # Resolve the session model from the already-loaded logs so
+    # build_llm_exchange doesn't have to re-read the audit log from disk.
+    session_model = _extract_session_model(logs, session_id) or 'auto'
+
     exchange = build_llm_exchange(
         session_events,
         stop_assistant_message=last_assistant_message,
         transcript_assistant_messages=transcript_assistant_messages,
+        model=session_model,
     )
 
     if exchange:
