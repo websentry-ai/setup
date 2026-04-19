@@ -500,7 +500,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             metadata['mcp_server_config'] = server_cfg
 
     if mcp_tool is not None:
-        metadata['mcp_tool'] = mcp_tool        
+        metadata['mcp_tool'] = mcp_tool
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
