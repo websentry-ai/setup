@@ -308,6 +308,10 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
     try:
+        # On Windows, `setx /M` writes machine-wide in one call — no per-user iteration.
+        if platform.system().lower() == "windows":
+            return set_env_var_for_user(None, None, var_name, value)
+
         user_homes = get_all_user_homes()
 
         if not user_homes:

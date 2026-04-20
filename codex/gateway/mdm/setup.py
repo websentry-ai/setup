@@ -141,7 +141,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
 
     try:
         if system == "darwin":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -152,7 +152,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -306,6 +306,10 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
     try:
+        # On Windows, `setx /M` writes machine-wide in one call — no per-user iteration.
+        if platform.system().lower() == "windows":
+            return set_env_var_for_user(None, None, var_name, value)
+
         user_homes = get_all_user_homes()
 
         if not user_homes:

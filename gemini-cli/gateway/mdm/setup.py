@@ -141,7 +141,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
 
     try:
         if system == "darwin":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -152,7 +152,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -306,6 +306,10 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
     try:
+        # On Windows, `setx /M` writes machine-wide in one call — no per-user iteration.
+        if platform.system().lower() == "windows":
+            return set_env_var_for_user(None, None, var_name, value)
+
         user_homes = get_all_user_homes()
 
         if not user_homes:
@@ -546,7 +550,7 @@ def clear_setup():
         else:
             print("   No environment variables found to remove")
 
-    if platform.system() == "Windows":
+    if platform.system().lower() == "windows":
         try:
             program_data = os.environ.get("ProgramData", r"C:\ProgramData")
             settings_dir = Path(program_data) / "gemini-cli"
@@ -683,7 +687,7 @@ def main():
     for username, home_dir in get_all_user_homes():
         write_unbound_config_for_user(username, home_dir, gemini_api_key)
 
-    if platform.system() == "Windows":
+    if platform.system().lower() == "windows":
         debug_print("Creating Windows managed settings file...")
         try:
             program_data = os.environ.get("ProgramData", r"C:\ProgramData")
