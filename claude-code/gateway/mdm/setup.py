@@ -5,9 +5,12 @@ import sys
 import platform
 import subprocess
 import json
-import pwd
 from pathlib import Path
 from typing import Tuple, List, Optional
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
 DEBUG = False
 
@@ -19,8 +22,15 @@ def debug_print(message: str) -> None:
 
 def check_admin_privileges() -> bool:
     try:
-        if platform.system().lower() in ["darwin", "linux"]:
+        system = platform.system().lower()
+        if system in ["darwin", "linux"]:
             return os.geteuid() == 0
+        if system == "windows":
+            import ctypes
+            try:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
         return False
     except Exception as e:
         debug_print(f"Failed to check privileges: {e}")
@@ -91,7 +101,7 @@ def get_device_identifier() -> Optional[str]:
         elif system == "windows":
             try:
                 result = subprocess.run(
-                    ["powershell", "-Command",
+                    ["powershell", "-NoProfile", "-Command",
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True,
                     text=True,
@@ -102,25 +112,23 @@ def get_device_identifier() -> Optional[str]:
                     if serial:
                         return serial
             except Exception:
-                debug_print("PowerShell BIOS query failed, trying registry")
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
 
             try:
-                result = subprocess.run(
-                    ["reg", "query", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.split('\n'):
-                        if 'MachineGuid' in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                return parts[-1]
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
             except Exception:
-                pass
+                debug_print("MachineGuid registry read failed, falling back to hostname")
 
-            return None
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
 
     except Exception as e:
         debug_print(f"Failed to get device identifier: {e}")
@@ -133,7 +141,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
 
     try:
         if system == "darwin":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -144,7 +152,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -155,11 +163,12 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "windows":
-            users_dir = Path("C:/Users")
+            system_drive = os.environ.get("SystemDrive", "C:")
+            users_dir = Path(system_drive + r"\Users")
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator']:
+                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator', 'All Users']:
                             user_homes.append((user_dir.name, user_dir))
                             debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
@@ -297,6 +306,10 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
     try:
+        # On Windows, `setx /M` writes machine-wide in one call — no per-user iteration.
+        if platform.system().lower() == "windows":
+            return set_env_var_for_user(None, None, var_name, value)
+
         user_homes = get_all_user_homes()
 
         if not user_homes:
@@ -474,6 +487,20 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
     try:
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config = {}
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        config = json.loads(f.read())
+                except (json.JSONDecodeError, OSError):
+                    config = {}
+            config['api_key'] = api_key
+            with open(config_file, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(config, indent=2))
+            return
+
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(config_dir, 0o700)
         config = {}
@@ -516,39 +543,57 @@ def get_managed_settings_dir() -> Path:
     elif system == "linux":
         return Path("/etc/claude-code")
     elif system == "windows":
-        return Path("C:/Program Files/ClaudeCode")
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return Path(program_files) / "ClaudeCode"
     else:
         raise OSError(f"Unsupported operating system: {system}")
 
 
-def setup_managed_settings() -> bool:
+def setup_managed_settings(api_key: str = "") -> bool:
     """
     Set up system-wide managed settings for Claude Code.
-    Creates managed-settings.json and anthropic_key.sh in the system location.
+    Unix: writes anthropic_key.sh + apiKeyHelper (runs in /bin/sh per docs).
+    Windows: writes an `env` block with ANTHROPIC_AUTH_TOKEN instead — Claude
+    Code reads it natively and sends it as `Authorization: Bearer`, so no
+    shell/Git-Bash dependency. See https://code.claude.com/docs/en/settings.
     """
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
-        settings_path = managed_dir / "managed-settings.json"
         key_helper_path = managed_dir / "anthropic_key.sh"
 
-        # Create directory
-        managed_dir.mkdir(parents=True, exist_ok=True)
+        # Pick settings path: on Windows prefer the drop-in dir so we don't
+        # clobber an existing managed-settings.json; fall back to the flat
+        # file only if the drop-in dir can't be created.
+        if system == "windows":
+            dropin_dir = managed_dir / "managed-settings.d"
+            try:
+                dropin_dir.mkdir(parents=True, exist_ok=True)
+                settings_path = dropin_dir / "unbound.json"
+            except Exception as e:
+                debug_print(f"Could not create drop-in dir, falling back: {e}")
+                managed_dir.mkdir(parents=True, exist_ok=True)
+                settings_path = managed_dir / "managed-settings.json"
+        else:
+            managed_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = managed_dir / "managed-settings.json"
         debug_print(f"Created managed settings directory: {managed_dir}")
 
-        # Create anthropic_key.sh script
-        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
-        debug_print(f"Created key helper script: {key_helper_path}")
-
-        # Make script executable on Unix systems
-        if system in ["darwin", "linux"]:
+        if system == "windows":
+            # No shell helper on Windows — use `env` block directly.
+            settings = {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": api_key,
+                    "ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
+                }
+            }
+        else:
+            key_helper_path.parent.mkdir(parents=True, exist_ok=True)
+            key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
             os.chmod(key_helper_path, 0o755)
-            debug_print("Set script as executable")
+            debug_print(f"Created key helper script: {key_helper_path}")
+            settings = {"apiKeyHelper": str(key_helper_path)}
 
-        # Create managed-settings.json
-        settings = {
-            "apiKeyHelper": str(key_helper_path)
-        }
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 
@@ -570,8 +615,13 @@ def clear_managed_settings() -> bool:
     """Remove the apiKeyHelper script and setting from managed Claude config."""
     try:
         managed_dir = get_managed_settings_dir()
-        settings_path = managed_dir / "managed-settings.json"
         key_helper_path = managed_dir / "anthropic_key.sh"
+
+        # Potential settings files: drop-in (Windows) and the flat file.
+        settings_candidates = [
+            managed_dir / "managed-settings.d" / "unbound.json",
+            managed_dir / "managed-settings.json",
+        ]
 
         removed_any = False
 
@@ -584,19 +634,40 @@ def clear_managed_settings() -> bool:
             except Exception as e:
                 debug_print(f"Failed to remove {key_helper_path}: {e}")
 
-        # Remove apiKeyHelper from managed-settings.json (keep the file)
-        if settings_path.exists():
+        for settings_path in settings_candidates:
+            if not settings_path.exists():
+                continue
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
+                changed = False
                 if "apiKeyHelper" in settings:
                     del settings["apiKeyHelper"]
-                    with open(settings_path, "w", encoding="utf-8") as f:
-                        json.dump(settings, f, indent=2)
-                    debug_print("Removed apiKeyHelper from managed-settings.json")
+                    changed = True
+                # Also strip our Windows env block keys, if present.
+                env = settings.get("env") if isinstance(settings.get("env"), dict) else None
+                if env:
+                    for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                        if k in env:
+                            del env[k]
+                            changed = True
+                    if not env:
+                        del settings["env"]
+                if changed:
+                    # If this is our drop-in file and nothing else is left,
+                    # remove it to avoid leaving an empty config file around.
+                    if (settings_path.name == "unbound.json"
+                            and settings_path.parent.name == "managed-settings.d"
+                            and not settings):
+                        settings_path.unlink()
+                        debug_print(f"Removed empty drop-in {settings_path}")
+                    else:
+                        with open(settings_path, "w", encoding="utf-8") as f:
+                            json.dump(settings, f, indent=2)
+                        debug_print(f"Updated {settings_path}")
                     removed_any = True
             except Exception as e:
-                debug_print(f"Failed to update managed-settings.json: {e}")
+                debug_print(f"Failed to update {settings_path}: {e}")
 
         return removed_any
 
@@ -616,7 +687,9 @@ def clear_setup():
         return
 
     print("\n🗑️  Removing environment variables...")
-    user_homes = get_all_user_homes()
+    # Windows `reg delete HKLM\...` is machine-wide; one call with a
+    # placeholder handles every user even if C:\Users has no profiles.
+    user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")
@@ -682,13 +755,13 @@ def main():
     print("=" * 60)
 
     if not check_admin_privileges():
-        system = platform.system().lower()
-        if system in ["darwin", "linux"]:
-            print("❌ This script requires administrator/root privileges")
-            print("   Please re-run with sudo.")
-        else:
-            print("❌ This script requires administrator privileges")
-            print("   Please run as Administrator")
+        if platform.system().lower() == "windows":
+            sys.exit(
+                "Error: MDM setup requires an elevated shell on Windows. "
+                "Right-click PowerShell \u2192 Run as Administrator, then rerun."
+            )
+        print("❌ This script requires administrator/root privileges")
+        print("   Please re-run with sudo.")
         return
 
     base_url = "https://backend.getunbound.ai"
@@ -755,7 +828,7 @@ def main():
         write_unbound_config_for_user(username, home_dir, claude_api_key)
 
     print("\n🔧 Configuring Claude managed settings...")
-    if setup_managed_settings():
+    if setup_managed_settings(claude_api_key):
         managed_dir = get_managed_settings_dir()
         print(f"✅ Created managed settings in {managed_dir}")
     else:

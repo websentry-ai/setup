@@ -5,9 +5,12 @@ import sys
 import platform
 import subprocess
 import json
-import pwd
 from pathlib import Path
 from typing import Tuple, List, Optional
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
 DEBUG = False
 
@@ -19,8 +22,15 @@ def debug_print(message: str) -> None:
 
 def check_admin_privileges() -> bool:
     try:
-        if platform.system().lower() in ["darwin", "linux"]:
+        system = platform.system().lower()
+        if system in ["darwin", "linux"]:
             return os.geteuid() == 0
+        if system == "windows":
+            import ctypes
+            try:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
         return False
     except Exception as e:
         debug_print(f"Failed to check privileges: {e}")
@@ -91,7 +101,7 @@ def get_device_identifier() -> Optional[str]:
         elif system == "windows":
             try:
                 result = subprocess.run(
-                    ["powershell", "-Command",
+                    ["powershell", "-NoProfile", "-Command",
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True,
                     text=True,
@@ -102,21 +112,23 @@ def get_device_identifier() -> Optional[str]:
                     if serial:
                         return serial
             except Exception:
-                debug_print("PowerShell BIOS query failed, trying registry")
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
 
             try:
-                result = subprocess.run(
-                    ["reg", "query", "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "/v", "ProcessorNameString"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    return result.stdout.strip()
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
             except Exception:
-                pass
+                debug_print("MachineGuid registry read failed, falling back to hostname")
 
-            return None
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
 
     except Exception as e:
         debug_print(f"Failed to get device identifier: {e}")
@@ -129,7 +141,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
 
     try:
         if system == "darwin":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -140,7 +152,7 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "linux":
-            for user in pwd.getwall():
+            for user in pwd.getpwall():
                 uid = user.pw_uid
                 username = user.pw_name
                 home_dir = Path(user.pw_dir)
@@ -151,11 +163,12 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "windows":
-            users_dir = Path("C:/Users")
+            system_drive = os.environ.get("SystemDrive", "C:")
+            users_dir = Path(system_drive + r"\Users")
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator']:
+                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator', 'All Users']:
                             user_homes.append((user_dir.name, user_dir))
                             debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
@@ -293,6 +306,10 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
     try:
+        # On Windows, `setx /M` writes machine-wide in one call — no per-user iteration.
+        if platform.system().lower() == "windows":
+            return set_env_var_for_user(None, None, var_name, value)
+
         user_homes = get_all_user_homes()
 
         if not user_homes:
@@ -470,6 +487,20 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
     try:
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config = {}
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        config = json.loads(f.read())
+                except (json.JSONDecodeError, OSError):
+                    config = {}
+            config['api_key'] = api_key
+            with open(config_file, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(config, indent=2))
+            return
+
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(config_dir, 0o700)
         config = {}
@@ -542,7 +573,10 @@ def write_codex_config_for_user(username: str, home_dir: Path, base_url: str) ->
     config_file = config_dir / "config.toml"
     key_line = f'openai_base_url = "{base_url}"'
     try:
-        config_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o755, parents=True, exist_ok=True)
 
         if config_file.exists():
             with open(config_file, "r", encoding="utf-8") as f:
@@ -554,14 +588,14 @@ def write_codex_config_for_user(username: str, home_dir: Path, base_url: str) ->
             with open(config_file, "w", encoding="utf-8") as f:
                 f.write(key_line + "\n")
 
-        os.chmod(config_file, 0o644)
-
-        try:
-            user_info = pwd.getpwnam(username)
-            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
-            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
-        except Exception as e:
-            debug_print(f"Could not chown codex config for {username}: {e}")
+        if platform.system().lower() != "windows":
+            os.chmod(config_file, 0o644)
+            try:
+                user_info = pwd.getpwnam(username)
+                os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
+                os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
+            except Exception as e:
+                debug_print(f"Could not chown codex config for {username}: {e}")
 
         debug_print(f"Wrote openai_base_url to {config_file} for {username}")
         return True
@@ -606,7 +640,9 @@ def clear_setup():
         return
 
     print("\n🗑️  Removing environment variables...")
-    user_homes = get_all_user_homes()
+    # Windows `reg delete HKLM\...` is machine-wide; fall through with a
+    # placeholder so the removal runs even if C:\Users has no profiles.
+    user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")
@@ -617,8 +653,9 @@ def clear_setup():
                 removed_count += 1
             # Remove OPENAI_BASE_URL env var for backwards compatibility (old setups)
             remove_env_var_from_user(username, home_dir, "OPENAI_BASE_URL")
-            # Remove openai_base_url from codex config.toml
-            remove_codex_config_base_url_for_user(username, home_dir)
+            # Remove openai_base_url from codex config.toml (per-user file)
+            if home_dir is not None:
+                remove_codex_config_base_url_for_user(username, home_dir)
 
         if removed_count > 0:
             print(f"✅ Removed environment variables from {removed_count} user(s)")
@@ -671,7 +708,8 @@ def get_managed_settings_dir() -> Path:
     elif system == "linux":
         return Path("/etc/codex")
     elif system == "windows":
-        return Path("C:/Program Files/Codex")
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return Path(program_files) / "Codex"
     else:
         raise OSError(f"Unsupported operating system: {system}")
 
@@ -765,13 +803,13 @@ def main():
     print("=" * 60)
 
     if not check_admin_privileges():
-        system = platform.system().lower()
-        if system in ["darwin", "linux"]:
-            print("❌ This script requires administrator/root privileges")
-            print("   Please re-run with sudo.")
-        else:
-            print("❌ This script requires administrator privileges")
-            print("   Please run as Administrator")
+        if platform.system().lower() == "windows":
+            sys.exit(
+                "Error: MDM setup requires an elevated shell on Windows. "
+                "Right-click PowerShell \u2192 Run as Administrator, then rerun."
+            )
+        print("❌ This script requires administrator/root privileges")
+        print("   Please re-run with sudo.")
         return
 
     base_url = "https://backend.getunbound.ai"

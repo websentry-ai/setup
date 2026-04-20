@@ -3,6 +3,7 @@
 
 import os
 import re
+import shutil
 import sys
 import platform
 import subprocess
@@ -345,18 +346,34 @@ def configure_claude_settings() -> bool:
         if "apiKeyHelper" in settings:
             del settings["apiKeyHelper"]
         
-        hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
-        
+        script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
+
+        # On Windows, invoke via the launcher and quote the path (handles spaces
+        # like C:\Users\Jane Doe\ or C:\Program Files\). Use `py -3` if present,
+        # falling back to `python`. Claude hooks honor a per-hook "shell" field;
+        # set it to "powershell" on Windows so the quoted command parses right.
+        is_windows = platform.system().lower() == "windows"
+        if is_windows:
+            launcher = "py -3" if shutil.which("py") else "python"
+            hook_command = f'{launcher} "{script_path}"'
+        else:
+            hook_command = str(script_path)
+
+        def _hook(entry: dict) -> dict:
+            if is_windows:
+                entry = {**entry, "shell": "powershell"}
+            return entry
+
         hooks_config = {
             "PreToolUse": [
                 {
                     "matcher": "*",
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "timeout": 15000
-                        }
+                        })
                     ]
                 }
             ],
@@ -364,34 +381,34 @@ def configure_claude_settings() -> bool:
                 {
                     "matcher": "*",
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "async": True,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
             "UserPromptSubmit": [
                 {
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
             "Stop": [
                 {
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
@@ -399,24 +416,24 @@ def configure_claude_settings() -> bool:
                 {
                     "matcher": "*",
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "async": True,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
             "SessionEnd": [
                 {
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "async": True,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ]
@@ -434,7 +451,10 @@ def configure_claude_settings() -> bool:
                     if isinstance(existing_item, dict):
                         existing_hooks = existing_item.get("hooks", [])
                         for hook in existing_hooks:
-                            if hook.get("command") == hook_command:
+                            existing_cmd = hook.get("command", "")
+                            # Exact match handles every OS; on Windows also
+                            # match the "py -3 ..." launcher form.
+                            if existing_cmd == hook_command or (is_windows and str(script_path) in existing_cmd):
                                 our_hook_exists = True
                                 break
                 
@@ -464,9 +484,14 @@ def remove_hooks_from_settings() -> None:
     """Remove the unbound hooks from settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
     hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
+    is_windows = platform.system().lower() == "windows"
 
     if not settings_path.exists():
         return
+
+    def _is_unbound(cmd: str) -> bool:
+        # Exact match on every OS; on Windows also match the "py -3 ..." form.
+        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
 
     try:
         with open(settings_path, 'r', encoding='utf-8') as f:
@@ -482,7 +507,7 @@ def remove_hooks_from_settings() -> None:
             for item in event_config:
                 if isinstance(item, dict):
                     hooks = item.get("hooks", [])
-                    new_hooks = [h for h in hooks if h.get("command") != hook_command]
+                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
                     if new_hooks:
                         item["hooks"] = new_hooks
                         new_config.append(item)

@@ -3,12 +3,16 @@
 import os
 import sys
 import platform
+import shutil
 import subprocess
 import json
 import time
-import pwd
 from pathlib import Path
 from typing import Tuple, List
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
@@ -30,7 +34,8 @@ def get_enterprise_hooks_dir() -> Path:
     elif system == "linux":
         return Path("/etc/cursor")
     elif system == "windows":
-        return Path("C:/ProgramData/Cursor")
+        program_data = os.environ.get("ProgramData", r"C:\ProgramData")
+        return Path(program_data) / "Cursor"
     else:
         raise OSError(f"Unsupported operating system: {system}")
 
@@ -46,7 +51,10 @@ def check_admin_privileges() -> bool:
         elif system == "windows":
             # Check if running as admin
             import ctypes
-            return ctypes.windll.shell32.IsUserAnAdmin() != 0
+            try:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
         return False
     except Exception as e:
         debug_print(f"Failed to check privileges: {e}")
@@ -74,6 +82,53 @@ def get_mac_serial_number() -> str:
     except Exception as e:
         debug_print(f"Failed to get serial number: {e}")
         return None
+
+
+def get_windows_device_identifier() -> str:
+    """Get a stable device identifier on Windows.
+
+    Tries BIOS serial, then registry MachineGuid, then hostname.
+    """
+    import socket
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            serial = result.stdout.strip()
+            if serial:
+                return serial
+    except Exception:
+        debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
+
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+            if value:
+                return str(value).strip()
+    except Exception:
+        debug_print("MachineGuid registry read failed, falling back to hostname")
+
+    try:
+        return socket.gethostname()
+    except Exception:
+        return None
+
+
+def get_device_identifier() -> str:
+    """Dispatch device identifier lookup based on platform."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return get_mac_serial_number()
+    if system == "windows":
+        return get_windows_device_identifier()
+    return None
 
 
 def get_shell_rc_file() -> Path:
@@ -136,10 +191,13 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
     try:
-        user_info = pwd.getpwnam(username)
-        uid, gid = user_info.pw_uid, user_info.pw_gid
-        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chown(config_dir, uid, gid)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            user_info = pwd.getpwnam(username)
+            uid, gid = user_info.pw_uid, user_info.pw_gid
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(config_dir, uid, gid)
         config = {}
         if config_file.exists():
             try:
@@ -150,8 +208,9 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
         config['api_key'] = api_key
         with open(config_file, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
-        os.chmod(config_file, 0o600)
-        os.chown(config_file, uid, gid)
+        if platform.system().lower() != "windows":
+            os.chmod(config_file, 0o600)
+            os.chown(config_file, uid, gid)
         return True
     except Exception as e:
         debug_print(f"Failed to write config for {username}: {e}")
@@ -182,19 +241,52 @@ def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
 
 
 def set_env_var_windows(var_name: str, value: str) -> bool:
+    # MDM setup runs elevated and provisions every user on the device, so
+    # write machine-wide (HKLM) with /M — matches every other MDM script.
     try:
-        subprocess.run(["setx", var_name, value], check=True, capture_output=True)
+        subprocess.run(["setx", var_name, value, "/M"], check=True, capture_output=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"❌ Failed to set {var_name} on Windows: {e}")
         return False
 
 
+def remove_env_var_on_windows(var_name: str) -> bool:
+    """Remove the machine-wide (HKLM) environment variable on Windows."""
+    try:
+        subprocess.run(
+            ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
+        debug_print(f"Removed {var_name} from Windows registry (HKLM)")
+        return True
+    except subprocess.CalledProcessError:
+        return True
+    except FileNotFoundError:
+        print("❌ 'reg' command not found. Please remove the variable manually.")
+        return False
+
+
 def get_all_user_homes() -> List[Tuple[str, Path]]:
     """Get all real user home directories on the system (excluding system accounts)."""
     user_homes = []
+    system = platform.system().lower()
 
     try:
+        if system == "windows":
+            system_drive = os.environ.get("SystemDrive", "C:")
+            users_dir = Path(system_drive + r"\Users")
+            if users_dir.exists():
+                for user_dir in users_dir.iterdir():
+                    if user_dir.is_dir() and user_dir.name not in [
+                        "Public", "Default", "Default User", "Administrator",
+                        "All Users",
+                    ]:
+                        user_homes.append((user_dir.name, user_dir))
+                        debug_print(f"Found user: {user_dir.name} -> {user_dir}")
+            return user_homes
+
         # Iterate through all users in the password database
         for user in pwd.getpwall():
             uid = user.pw_uid
@@ -361,6 +453,32 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, bool, str]:
         return False, False, f"Unsupported OS: {system}"
 
 
+def rewrite_hook_commands_for_windows(hooks_json_path: Path, script_path: Path) -> None:
+    """Cursor's hook runner on Windows doesn't reliably execute bare `.py`
+    paths (no shebang, depends on file associations). Replace every hook
+    command with an explicit `py -3 "<abs path>"` invocation so Cursor hooks
+    fire even on machines where .py isn't associated with the Python launcher.
+    Mirrors the claude-code/codex hooks pattern in this repo.
+    """
+    try:
+        with open(hooks_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        debug_print(f"Failed to parse hooks.json for Windows rewrite: {e}")
+        return
+    launcher = "py -3" if shutil.which("py") else "python"
+    new_command = f'{launcher} "{script_path}"'
+    hooks = data.get("hooks", {}) if isinstance(data, dict) else {}
+    for event_hooks in hooks.values() if isinstance(hooks, dict) else []:
+        if not isinstance(event_hooks, list):
+            continue
+        for entry in event_hooks:
+            if isinstance(entry, dict) and "command" in entry:
+                entry["command"] = new_command
+    with open(hooks_json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def compare_hooks_json(hooks_json_path: Path, new_content: str) -> bool:
     if not hooks_json_path.exists():
         return True
@@ -405,6 +523,10 @@ def setup_hooks() -> Tuple[bool, bool]:
     print("\n📥 Downloading hooks configuration...")
     if not download_file(HOOKS_URL, temp_hooks_json):
         return False, False
+
+    # Windows: rewrite bare `.py` commands to an explicit Python launcher call.
+    if platform.system().lower() == "windows":
+        rewrite_hook_commands_for_windows(temp_hooks_json, script_path)
 
     hooks_changed = False
     try:
@@ -544,20 +666,27 @@ def clear_setup():
 
     # Remove environment variable from all users
     print("\n🗑️  Removing environment variables...")
-    user_homes = get_all_user_homes()
-
-    if not user_homes:
-        print("   No user home directories found")
-    else:
-        removed_count = 0
-        for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
-                removed_count += 1
-
-        if removed_count > 0:
-            print(f"✅ Removed environment variable from {removed_count} user(s)")
+    system = platform.system().lower()
+    if system == "windows":
+        if remove_env_var_on_windows("UNBOUND_CURSOR_API_KEY"):
+            print("✅ Removed UNBOUND_CURSOR_API_KEY (system)")
         else:
             print("   No environment variables found to remove")
+    else:
+        user_homes = get_all_user_homes()
+
+        if not user_homes:
+            print("   No user home directories found")
+        else:
+            removed_count = 0
+            for username, home_dir in user_homes:
+                if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
+                    removed_count += 1
+
+            if removed_count > 0:
+                print(f"✅ Removed environment variable from {removed_count} user(s)")
+            else:
+                print("   No environment variables found to remove")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -666,13 +795,18 @@ def main():
     print("Unbound Cursor Hooks - MDM Setup")
     print("=" * 60)
 
-    # Check platform
-    if platform.system().lower() != "darwin":
-        print("❌ This script only supports macOS")
-        return
+    system = platform.system().lower()
 
-    # Check admin privileges
+    # cursor/mdm/setup.py supported only macOS in origin; extend to Windows.
+    if system not in ("darwin", "windows"):
+        print("❌ This script only supports macOS and Windows")
+        return
     if not check_admin_privileges():
+        if system == "windows":
+            sys.exit(
+                "Error: MDM setup requires an elevated shell on Windows. "
+                "Right-click PowerShell \u2192 Run as Administrator, then rerun."
+            )
         print("❌ This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
         return
@@ -705,9 +839,9 @@ def main():
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
-    # Get serial number
+    # Get device identifier
     print("\n🔍 Getting device serial number...")
-    serial_number = get_mac_serial_number()
+    serial_number = get_device_identifier()
     if not serial_number:
         print("❌ Failed to get device serial number")
         return

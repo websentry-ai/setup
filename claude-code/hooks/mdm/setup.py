@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 
 import os
+import shutil
 import sys
 import platform
 import subprocess
 import json
-import pwd
 from pathlib import Path
 from typing import Tuple, List, Optional
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
@@ -20,8 +24,15 @@ def debug_print(message: str) -> None:
 
 def check_admin_privileges() -> bool:
     try:
-        if platform.system().lower() in ["darwin", "linux"]:
+        system = platform.system().lower()
+        if system in ["darwin", "linux"]:
             return os.geteuid() == 0
+        if system == "windows":
+            import ctypes
+            try:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
         return False
     except Exception as e:
         debug_print(f"Failed to check privileges: {e}")
@@ -92,7 +103,7 @@ def get_device_identifier() -> Optional[str]:
         elif system == "windows":
             try:
                 result = subprocess.run(
-                    ["powershell", "-Command",
+                    ["powershell", "-NoProfile", "-Command",
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True,
                     text=True,
@@ -103,25 +114,23 @@ def get_device_identifier() -> Optional[str]:
                     if serial:
                         return serial
             except Exception:
-                debug_print("PowerShell BIOS query failed, trying registry")
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
 
             try:
-                result = subprocess.run(
-                    ["reg", "query", "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Cryptography", "/v", "MachineGuid"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.split('\n'):
-                        if 'MachineGuid' in line:
-                            parts = line.split()
-                            if len(parts) >= 3:
-                                return parts[-1]
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
             except Exception:
-                pass
+                debug_print("MachineGuid registry read failed, falling back to hostname")
 
-            return None
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
 
     except Exception as e:
         debug_print(f"Failed to get device identifier: {e}")
@@ -156,11 +165,12 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "windows":
-            users_dir = Path("C:/Users")
+            system_drive = os.environ.get("SystemDrive", "C:")
+            users_dir = Path(system_drive + r"\Users")
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator']:
+                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator', 'All Users']:
                             user_homes.append((user_dir.name, user_dir))
                             debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
@@ -298,6 +308,10 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
     try:
+        # On Windows, `setx /M` writes machine-wide in one call — no per-user iteration.
+        if platform.system().lower() == "windows":
+            return set_env_var_for_user(None, None, var_name, value)
+
         user_homes = get_all_user_homes()
 
         if not user_homes:
@@ -475,6 +489,20 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
     try:
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config = {}
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        config = json.loads(f.read())
+                except (json.JSONDecodeError, OSError):
+                    config = {}
+            config['api_key'] = api_key
+            with open(config_file, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(config, indent=2))
+            return
+
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(config_dir, 0o700)
         config = {}
@@ -517,7 +545,8 @@ def get_managed_settings_dir() -> Path:
     elif system == "linux":
         return Path("/etc/claude-code")
     elif system == "windows":
-        return Path("C:/Program Files/ClaudeCode")
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return Path(program_files) / "ClaudeCode"
     else:
         raise OSError(f"Unsupported operating system: {system}")
 
@@ -547,12 +576,24 @@ def setup_managed_hooks() -> bool:
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
-        settings_path = managed_dir / "managed-settings.json"
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
 
-        # Create directories
-        managed_dir.mkdir(parents=True, exist_ok=True)
+        # On Windows, prefer the drop-in directory to avoid clobbering an
+        # existing admin-managed settings file; fall back if we can't create it.
+        if system == "windows":
+            dropin_dir = managed_dir / "managed-settings.d"
+            try:
+                dropin_dir.mkdir(parents=True, exist_ok=True)
+                settings_path = dropin_dir / "unbound.json"
+            except Exception as e:
+                debug_print(f"Could not create drop-in dir, falling back: {e}")
+                managed_dir.mkdir(parents=True, exist_ok=True)
+                settings_path = managed_dir / "managed-settings.json"
+        else:
+            managed_dir.mkdir(parents=True, exist_ok=True)
+            settings_path = managed_dir / "managed-settings.json"
+
         hooks_dir.mkdir(parents=True, exist_ok=True)
         debug_print(f"Created managed settings directory: {managed_dir}")
 
@@ -576,18 +617,30 @@ def setup_managed_hooks() -> bool:
             except Exception:
                 settings = {}
 
-        # Configure hooks - quote the path to handle spaces (e.g. macOS "Application Support")
-        hook_command = f'"{script_path}"'
+        # Configure hooks - quote the path to handle spaces. On Windows, invoke
+        # via `py -3` (falling back to `python`) and tell Claude to run each
+        # hook through PowerShell so the quoted launcher parses correctly.
+        is_windows = system == "windows"
+        if is_windows:
+            launcher = "py -3" if shutil.which("py") else "python"
+            hook_command = f'{launcher} "{script_path}"'
+        else:
+            hook_command = f'"{script_path}"'
+
+        def _hook(entry: dict) -> dict:
+            if is_windows:
+                entry = {**entry, "shell": "powershell"}
+            return entry
         hooks_config = {
             "PreToolUse": [
                 {
                     "matcher": "*",
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "timeout": 10
-                        }
+                        })
                     ]
                 }
             ],
@@ -595,34 +648,34 @@ def setup_managed_hooks() -> bool:
                 {
                     "matcher": "*",
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "async": True,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
             "UserPromptSubmit": [
                 {
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
             "Stop": [
                 {
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
@@ -630,24 +683,24 @@ def setup_managed_hooks() -> bool:
                 {
                     "matcher": "*",
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "async": True,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ],
             "SessionEnd": [
                 {
                     "hooks": [
-                        {
+                        _hook({
                             "type": "command",
                             "command": hook_command,
                             "async": True,
                             "timeout": 60
-                        }
+                        })
                     ]
                 }
             ]
@@ -676,9 +729,13 @@ def clear_managed_hooks() -> bool:
     """Remove the hooks script and hooks setting from managed Claude config."""
     try:
         managed_dir = get_managed_settings_dir()
-        settings_path = managed_dir / "managed-settings.json"
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
+
+        settings_candidates = [
+            managed_dir / "managed-settings.d" / "unbound.json",
+            managed_dir / "managed-settings.json",
+        ]
 
         removed_any = False
 
@@ -700,22 +757,26 @@ def clear_managed_hooks() -> bool:
             except Exception as e:
                 debug_print(f"Could not remove directory {hooks_dir}: {e}")
 
-        # Remove hooks from managed-settings.json (keep the file)
-        if settings_path.exists():
+        for settings_path in settings_candidates:
+            if not settings_path.exists():
+                continue
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                changed = False
                 if "hooks" in settings:
                     del settings["hooks"]
-                    changed = True
-                if changed:
-                    with open(settings_path, "w", encoding="utf-8") as f:
-                        json.dump(settings, f, indent=2)
-                    debug_print("Removed hooks from managed-settings.json")
+                    if (settings_path.name == "unbound.json"
+                            and settings_path.parent.name == "managed-settings.d"
+                            and not settings):
+                        settings_path.unlink()
+                        debug_print(f"Removed empty drop-in {settings_path}")
+                    else:
+                        with open(settings_path, "w", encoding="utf-8") as f:
+                            json.dump(settings, f, indent=2)
+                        debug_print(f"Removed hooks from {settings_path}")
                     removed_any = True
             except Exception as e:
-                debug_print(f"Failed to update managed-settings.json: {e}")
+                debug_print(f"Failed to update {settings_path}: {e}")
 
         return removed_any
 
@@ -735,7 +796,9 @@ def clear_setup():
         return
 
     print("\nRemoving environment variables...")
-    user_homes = get_all_user_homes()
+    # Windows `reg delete HKLM\...` is machine-wide; fall through with a
+    # placeholder so the removal runs even if C:\Users has no profiles.
+    user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")
@@ -798,13 +861,13 @@ def main():
     print("=" * 60)
 
     if not check_admin_privileges():
-        system = platform.system().lower()
-        if system in ["darwin", "linux"]:
-            print("This script requires administrator/root privileges")
-            print("   Please re-run with sudo.")
-        else:
-            print("This script requires administrator privileges")
-            print("   Please run as Administrator")
+        if platform.system().lower() == "windows":
+            sys.exit(
+                "Error: MDM setup requires an elevated shell on Windows. "
+                "Right-click PowerShell \u2192 Run as Administrator, then rerun."
+            )
+        print("This script requires administrator/root privileges")
+        print("   Please re-run with sudo.")
         return
 
     base_url = "https://backend.getunbound.ai"
