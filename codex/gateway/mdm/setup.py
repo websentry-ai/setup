@@ -640,7 +640,9 @@ def clear_setup():
         return
 
     print("\n🗑️  Removing environment variables...")
-    user_homes = get_all_user_homes()
+    # Windows `reg delete HKLM\...` is machine-wide; fall through with a
+    # placeholder so the removal runs even if C:\Users has no profiles.
+    user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")
@@ -651,8 +653,9 @@ def clear_setup():
                 removed_count += 1
             # Remove OPENAI_BASE_URL env var for backwards compatibility (old setups)
             remove_env_var_from_user(username, home_dir, "OPENAI_BASE_URL")
-            # Remove openai_base_url from codex config.toml
-            remove_codex_config_base_url_for_user(username, home_dir)
+            # Remove openai_base_url from codex config.toml (per-user file)
+            if home_dir is not None:
+                remove_codex_config_base_url_for_user(username, home_dir)
 
         if removed_count > 0:
             print(f"✅ Removed environment variables from {removed_count} user(s)")

@@ -687,7 +687,9 @@ def clear_setup():
         return
 
     print("\n🗑️  Removing environment variables...")
-    user_homes = get_all_user_homes()
+    # Windows `reg delete HKLM\...` is machine-wide; one call with a
+    # placeholder handles every user even if C:\Users has no profiles.
+    user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")

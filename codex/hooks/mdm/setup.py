@@ -839,7 +839,9 @@ def clear_setup():
         return
 
     print("\nRemoving environment variables...")
-    user_homes = get_all_user_homes()
+    # Windows `reg delete HKLM\...` is machine-wide; fall through with a
+    # placeholder so the removal runs even if C:\Users has no profiles.
+    user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")
@@ -848,7 +850,9 @@ def clear_setup():
         for username, home_dir in user_homes:
             if remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY"):
                 removed_count += 1
-            disable_codex_hooks_feature_for_user(username, home_dir)
+            # Per-user codex config — skip when falling through on Windows.
+            if home_dir is not None:
+                disable_codex_hooks_feature_for_user(username, home_dir)
 
         if removed_count > 0:
             print(f"Removed environment variables from {removed_count} user(s)")

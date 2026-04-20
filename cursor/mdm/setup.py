@@ -3,6 +3,7 @@
 import os
 import sys
 import platform
+import shutil
 import subprocess
 import json
 import time
@@ -452,6 +453,32 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, bool, str]:
         return False, False, f"Unsupported OS: {system}"
 
 
+def rewrite_hook_commands_for_windows(hooks_json_path: Path, script_path: Path) -> None:
+    """Cursor's hook runner on Windows doesn't reliably execute bare `.py`
+    paths (no shebang, depends on file associations). Replace every hook
+    command with an explicit `py -3 "<abs path>"` invocation so Cursor hooks
+    fire even on machines where .py isn't associated with the Python launcher.
+    Mirrors the claude-code/codex hooks pattern in this repo.
+    """
+    try:
+        with open(hooks_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        debug_print(f"Failed to parse hooks.json for Windows rewrite: {e}")
+        return
+    launcher = "py -3" if shutil.which("py") else "python"
+    new_command = f'{launcher} "{script_path}"'
+    hooks = data.get("hooks", {}) if isinstance(data, dict) else {}
+    for event_hooks in hooks.values() if isinstance(hooks, dict) else []:
+        if not isinstance(event_hooks, list):
+            continue
+        for entry in event_hooks:
+            if isinstance(entry, dict) and "command" in entry:
+                entry["command"] = new_command
+    with open(hooks_json_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def compare_hooks_json(hooks_json_path: Path, new_content: str) -> bool:
     if not hooks_json_path.exists():
         return True
@@ -496,6 +523,10 @@ def setup_hooks() -> Tuple[bool, bool]:
     print("\n📥 Downloading hooks configuration...")
     if not download_file(HOOKS_URL, temp_hooks_json):
         return False, False
+
+    # Windows: rewrite bare `.py` commands to an explicit Python launcher call.
+    if platform.system().lower() == "windows":
+        rewrite_hook_commands_for_windows(temp_hooks_json, script_path)
 
     hooks_changed = False
     try:
