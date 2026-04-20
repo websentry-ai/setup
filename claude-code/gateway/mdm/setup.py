@@ -549,10 +549,13 @@ def get_managed_settings_dir() -> Path:
         raise OSError(f"Unsupported operating system: {system}")
 
 
-def setup_managed_settings() -> bool:
+def setup_managed_settings(api_key: str = "") -> bool:
     """
     Set up system-wide managed settings for Claude Code.
-    Creates managed-settings.json and anthropic_key.sh in the system location.
+    Unix: writes anthropic_key.sh + apiKeyHelper (runs in /bin/sh per docs).
+    Windows: writes an `env` block with ANTHROPIC_AUTH_TOKEN instead — Claude
+    Code reads it natively and sends it as `Authorization: Bearer`, so no
+    shell/Git-Bash dependency. See https://code.claude.com/docs/en/settings.
     """
     system = platform.system().lower()
     try:
@@ -576,20 +579,21 @@ def setup_managed_settings() -> bool:
             settings_path = managed_dir / "managed-settings.json"
         debug_print(f"Created managed settings directory: {managed_dir}")
 
-        # Create anthropic_key.sh script
-        key_helper_path.parent.mkdir(parents=True, exist_ok=True)
-        key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
-        debug_print(f"Created key helper script: {key_helper_path}")
-
-        # Make script executable on Unix systems
-        if system in ["darwin", "linux"]:
+        if system == "windows":
+            # No shell helper on Windows — use `env` block directly.
+            settings = {
+                "env": {
+                    "ANTHROPIC_AUTH_TOKEN": api_key,
+                    "ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
+                }
+            }
+        else:
+            key_helper_path.parent.mkdir(parents=True, exist_ok=True)
+            key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
             os.chmod(key_helper_path, 0o755)
-            debug_print("Set script as executable")
+            debug_print(f"Created key helper script: {key_helper_path}")
+            settings = {"apiKeyHelper": str(key_helper_path)}
 
-        # Create managed-settings.json
-        settings = {
-            "apiKeyHelper": str(key_helper_path)
-        }
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 
@@ -636,8 +640,20 @@ def clear_managed_settings() -> bool:
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
+                changed = False
                 if "apiKeyHelper" in settings:
                     del settings["apiKeyHelper"]
+                    changed = True
+                # Also strip our Windows env block keys, if present.
+                env = settings.get("env") if isinstance(settings.get("env"), dict) else None
+                if env:
+                    for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                        if k in env:
+                            del env[k]
+                            changed = True
+                    if not env:
+                        del settings["env"]
+                if changed:
                     # If this is our drop-in file and nothing else is left,
                     # remove it to avoid leaving an empty config file around.
                     if (settings_path.name == "unbound.json"
@@ -648,7 +664,7 @@ def clear_managed_settings() -> bool:
                     else:
                         with open(settings_path, "w", encoding="utf-8") as f:
                             json.dump(settings, f, indent=2)
-                        debug_print(f"Removed apiKeyHelper from {settings_path}")
+                        debug_print(f"Updated {settings_path}")
                     removed_any = True
             except Exception as e:
                 debug_print(f"Failed to update {settings_path}: {e}")
@@ -810,7 +826,7 @@ def main():
         write_unbound_config_for_user(username, home_dir, claude_api_key)
 
     print("\n🔧 Configuring Claude managed settings...")
-    if setup_managed_settings():
+    if setup_managed_settings(claude_api_key):
         managed_dir = get_managed_settings_dir()
         print(f"✅ Created managed settings in {managed_dir}")
     else:
