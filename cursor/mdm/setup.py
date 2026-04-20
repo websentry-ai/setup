@@ -240,8 +240,10 @@ def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
 
 
 def set_env_var_windows(var_name: str, value: str) -> bool:
+    # MDM setup runs elevated and provisions every user on the device, so
+    # write machine-wide (HKLM) with /M — matches every other MDM script.
     try:
-        subprocess.run(["setx", var_name, value], check=True, capture_output=True)
+        subprocess.run(["setx", var_name, value, "/M"], check=True, capture_output=True)
         return True
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"❌ Failed to set {var_name} on Windows: {e}")
@@ -249,10 +251,14 @@ def set_env_var_windows(var_name: str, value: str) -> bool:
 
 
 def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove a user environment variable on Windows."""
+    """Remove the machine-wide (HKLM) environment variable on Windows."""
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        debug_print(f"Removed {var_name} from Windows registry")
+        subprocess.run(
+            ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
+        debug_print(f"Removed {var_name} from Windows registry (HKLM)")
         return True
     except subprocess.CalledProcessError:
         return True
