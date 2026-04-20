@@ -234,7 +234,7 @@ def send_to_hook_api(request_body, api_key):
              "-H", "Content-Type: application/json",
              "-d", data, url],
             capture_output=True,
-            timeout=10
+            timeout=20
         )
 
         if result.returncode == 0 and result.stdout:
