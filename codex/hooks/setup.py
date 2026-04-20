@@ -3,6 +3,7 @@
 
 import os
 import re
+import shutil
 import sys
 import platform
 import subprocess
@@ -350,7 +351,16 @@ def configure_codex_hooks() -> bool:
             config = {}
             hooks_path.parent.mkdir(parents=True, exist_ok=True)
 
-        hook_command = str(Path.home() / ".codex" / "hooks" / "unbound.py")
+        script_path = Path.home() / ".codex" / "hooks" / "unbound.py"
+        is_windows = platform.system().lower() == "windows"
+
+        # On Windows, invoke via `py -3` (falling back to `python`) and quote
+        # the path so spaces in C:\Users\<name>\ paths don't break parsing.
+        if is_windows:
+            launcher = "py -3" if shutil.which("py") else "python"
+            hook_command = f'{launcher} "{script_path}"'
+        else:
+            hook_command = str(script_path)
 
         hooks_config = {
             "PreToolUse": [
@@ -427,7 +437,10 @@ def configure_codex_hooks() -> bool:
                     if isinstance(existing_item, dict):
                         existing_hooks = existing_item.get("hooks", [])
                         for hook in existing_hooks:
-                            if hook.get("command") == hook_command:
+                            existing_cmd = hook.get("command", "")
+                            # Exact match handles every OS; on Windows also
+                            # match the "py -3 ..." launcher form.
+                            if existing_cmd == hook_command or (is_windows and str(script_path) in existing_cmd):
                                 our_hook_exists = True
                                 break
 
@@ -454,9 +467,14 @@ def remove_hooks_from_config() -> None:
     """Remove the unbound hooks from hooks.json."""
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hook_command = str(Path.home() / ".codex" / "hooks" / "unbound.py")
+    is_windows = platform.system().lower() == "windows"
 
     if not hooks_path.exists():
         return
+
+    def _is_unbound(cmd: str) -> bool:
+        # Exact match on every OS; on Windows also match the "py -3 ..." form.
+        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
 
     try:
         with open(hooks_path, 'r', encoding='utf-8') as f:
@@ -472,7 +490,7 @@ def remove_hooks_from_config() -> None:
             for item in event_config:
                 if isinstance(item, dict):
                     hooks = item.get("hooks", [])
-                    new_hooks = [h for h in hooks if h.get("command") != hook_command]
+                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
                     if new_hooks:
                         item["hooks"] = new_hooks
                         new_config.append(item)

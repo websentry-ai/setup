@@ -5,9 +5,12 @@ import sys
 import platform
 import subprocess
 import json
-import pwd
 from pathlib import Path
 from typing import Tuple, List, Optional
+try:
+    import pwd
+except ImportError:
+    pwd = None
 
 DEBUG = False
 
@@ -19,8 +22,15 @@ def debug_print(message: str) -> None:
 
 def check_admin_privileges() -> bool:
     try:
-        if platform.system().lower() in ["darwin", "linux"]:
+        system = platform.system().lower()
+        if system in ["darwin", "linux"]:
             return os.geteuid() == 0
+        if system == "windows":
+            import ctypes
+            try:
+                return bool(ctypes.windll.shell32.IsUserAnAdmin())
+            except Exception:
+                return False
         return False
     except Exception as e:
         debug_print(f"Failed to check privileges: {e}")
@@ -91,7 +101,7 @@ def get_device_identifier() -> Optional[str]:
         elif system == "windows":
             try:
                 result = subprocess.run(
-                    ["powershell", "-Command",
+                    ["powershell", "-NoProfile", "-Command",
                      "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
                     capture_output=True,
                     text=True,
@@ -102,21 +112,23 @@ def get_device_identifier() -> Optional[str]:
                     if serial:
                         return serial
             except Exception:
-                debug_print("PowerShell BIOS query failed, trying registry")
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
 
             try:
-                result = subprocess.run(
-                    ["reg", "query", "HKLM\\HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "/v", "ProcessorNameString"],
-                    capture_output=True,
-                    text=True,
-                    timeout=10
-                )
-                if result.returncode == 0:
-                    return result.stdout.strip()
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
             except Exception:
-                pass
+                debug_print("MachineGuid registry read failed, falling back to hostname")
 
-            return None
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
 
     except Exception as e:
         debug_print(f"Failed to get device identifier: {e}")
@@ -151,11 +163,12 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {username} -> {home_dir}")
 
         elif system == "windows":
-            users_dir = Path("C:/Users")
+            system_drive = os.environ.get("SystemDrive", "C:")
+            users_dir = Path(system_drive + r"\Users")
             if users_dir.exists():
                 try:
                     for user_dir in users_dir.iterdir():
-                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator']:
+                        if user_dir.is_dir() and user_dir.name not in ['Public', 'Default', 'Default User', 'Administrator', 'All Users']:
                             user_homes.append((user_dir.name, user_dir))
                             debug_print(f"Found user: {user_dir.name} -> {user_dir}")
                 except Exception as e:
@@ -469,6 +482,20 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
     try:
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+            config = {}
+            if config_file.exists():
+                try:
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        config = json.loads(f.read())
+                except (json.JSONDecodeError, OSError):
+                    config = {}
+            config['api_key'] = api_key
+            with open(config_file, 'w', encoding='utf-8') as f:
+                f.write(json.dumps(config, indent=2))
+            return
+
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(config_dir, 0o700)
         config = {}
@@ -519,6 +546,35 @@ def clear_setup():
         else:
             print("   No environment variables found to remove")
 
+    if platform.system() == "Windows":
+        try:
+            program_data = os.environ.get("ProgramData", r"C:\ProgramData")
+            settings_dir = Path(program_data) / "gemini-cli"
+            settings_path = settings_dir / "settings.json"
+            if settings_path.exists():
+                settings_path.unlink()
+                debug_print(f"Removed {settings_path}")
+            if settings_dir.exists():
+                try:
+                    settings_dir.rmdir()
+                    debug_print(f"Removed {settings_dir}")
+                except OSError as e:
+                    debug_print(f"Could not remove {settings_dir}: {e}")
+        except Exception as e:
+            debug_print(f"Failed to remove Windows managed settings: {e}")
+
+        try:
+            subprocess.run(
+                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+                 "/F", "/V", "GEMINI_CLI_SYSTEM_SETTINGS_PATH"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            debug_print("Cleared GEMINI_CLI_SYSTEM_SETTINGS_PATH (Machine)")
+        except Exception as e:
+            debug_print(f"Failed to clear GEMINI_CLI_SYSTEM_SETTINGS_PATH: {e}")
+
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
@@ -561,13 +617,13 @@ def main():
     print("=" * 60)
 
     if not check_admin_privileges():
-        system = platform.system().lower()
-        if system in ["darwin", "linux"]:
-            print("❌ This script requires administrator/root privileges")
-            print("   Please re-run with sudo.")
-        else:
-            print("❌ This script requires administrator privileges")
-            print("   Please run as Administrator")
+        if platform.system().lower() == "windows":
+            sys.exit(
+                "Error: MDM setup requires an elevated shell on Windows. "
+                "Right-click PowerShell \u2192 Run as Administrator, then rerun."
+            )
+        print("❌ This script requires administrator/root privileges")
+        print("   Please re-run with sudo.")
         return
 
     base_url = "https://backend.getunbound.ai"
@@ -626,6 +682,28 @@ def main():
 
     for username, home_dir in get_all_user_homes():
         write_unbound_config_for_user(username, home_dir, gemini_api_key)
+
+    if platform.system() == "Windows":
+        debug_print("Creating Windows managed settings file...")
+        try:
+            program_data = os.environ.get("ProgramData", r"C:\ProgramData")
+            settings_dir = Path(program_data) / "gemini-cli"
+            settings_path = settings_dir / "settings.json"
+
+            settings_dir.mkdir(parents=True, exist_ok=True)
+            if not settings_path.exists():
+                settings_path.write_text("{}", encoding="utf-8")
+                debug_print(f"Created empty managed settings at {settings_path}")
+
+            subprocess.run(
+                ["setx", "GEMINI_CLI_SYSTEM_SETTINGS_PATH", str(settings_path), "/M"],
+                check=False,
+                capture_output=True,
+                timeout=10,
+            )
+            debug_print("Set GEMINI_CLI_SYSTEM_SETTINGS_PATH (Machine)")
+        except Exception as e:
+            debug_print(f"Failed to setup Windows managed settings: {e}")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
