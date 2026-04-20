@@ -385,7 +385,7 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
              "-d", data, url],
             input=f'header = "Authorization: Bearer {api_key}"\n'.encode(),
             capture_output=True,
-            timeout=10
+            timeout=20
         )
 
         if result.returncode == 0 and result.stdout:
