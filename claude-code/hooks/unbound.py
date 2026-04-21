@@ -20,6 +20,7 @@ LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
+CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 
@@ -477,6 +478,57 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
     return {}
 
 
+def _extract_mcp_server_fields(server: Dict) -> Optional[Dict]:
+    if not isinstance(server, dict):
+        return None
+    result = {}
+    if server.get('url'):
+        result['url'] = server['url']
+    if server.get('command'):
+        result['command'] = server['command']
+    if server.get('args'):
+        result['args'] = server['args']
+    if server.get('type'):
+        result['type'] = server['type']
+    return result if result else None
+
+
+def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
+    try:
+        if not config_path.exists():
+            return None
+
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.loads(f.read())
+
+        if cwd:
+            projects = config.get('projects', {})
+            if isinstance(projects, dict):
+                cwd_path = cwd.rstrip('/')
+                while cwd_path:
+                    proj_data = projects.get(cwd_path)
+                    if isinstance(proj_data, dict):
+                        proj_servers = proj_data.get('mcpServers', {})
+                        if isinstance(proj_servers, dict) and server_name in proj_servers:
+                            result = _extract_mcp_server_fields(proj_servers[server_name])
+                            if result:
+                                return result
+                    parent = os.path.dirname(cwd_path)
+                    if parent == cwd_path:
+                        break
+                    cwd_path = parent
+
+        top_servers = config.get('mcpServers', {})
+        if isinstance(top_servers, dict) and server_name in top_servers:
+            result = _extract_mcp_server_fields(top_servers[server_name])
+            if result:
+                return result
+
+        return None
+    except Exception:
+        return None
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -511,8 +563,17 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
         parts = tool_name[len(MCP_TOOL_PREFIX):].split('__', 1)
-        metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
+        mcp_server_name = parts[0] if len(parts) >= 1 else ''
+        metadata['mcp_server'] = mcp_server_name
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
+
+        if mcp_server_name:
+            cwd = event.get('cwd')
+            server_cfg = _read_mcp_server_config(
+                mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+            )
+            if server_cfg:
+                metadata['mcp_server_config'] = server_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
