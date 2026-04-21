@@ -15,7 +15,9 @@ import tempfile
 import time
 import hashlib
 
-UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_GATEWAY_URL = os.environ.get(
+    "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
+).rstrip("/")
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -865,11 +867,12 @@ def main():
             return
 
         if hook_event_name == 'beforeMCPExecution':
+            mcp_server = event.get('command', '')
             mcp_tool_name = event.get('tool_name', '')
-            # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
+
             response = process_pre_tool_use_execution(
                 event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input') or {}),
-                mcp_server=None, mcp_tool=mcp_tool_name
+                mcp_server=mcp_server, mcp_tool=mcp_tool_name
             )
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
