@@ -16,6 +16,16 @@ except ImportError:
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
+DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+
+
+def normalize_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    if not (value.startswith("http://") or value.startswith("https://")):
+        value = f"https://{value}"
+    return value.rstrip("/")
 DEBUG = False
 
 
@@ -509,7 +519,20 @@ def download_file(url: str, dest_path: Path) -> bool:
         return False
 
 
-def setup_hooks() -> Tuple[bool, bool]:
+def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
+    """Replace the hardcoded default gateway URL inside a downloaded unbound.py."""
+    if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+        new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+        if new_text != text:
+            path.write_text(new_text, encoding="utf-8")
+    except Exception as e:
+        debug_print(f"Could not rewrite gateway URL in {path}: {e}")
+
+
+def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> Tuple[bool, bool]:
     enterprise_dir = get_enterprise_hooks_dir()
     hooks_dir = enterprise_dir / "hooks"
     hooks_json = enterprise_dir / "hooks.json"
@@ -544,6 +567,7 @@ def setup_hooks() -> Tuple[bool, bool]:
     if not download_file(SCRIPT_URL, script_path):
         return False, hooks_changed
     print("✅ unbound.py downloaded")
+    rewrite_gateway_url_in_file(script_path, gateway_url)
 
     try:
         current_mode = script_path.stat().st_mode
@@ -813,6 +837,7 @@ def main():
 
     # Parse arguments
     base_url = "https://backend.getunbound.ai"
+    gateway_url = DEFAULT_GATEWAY_URL
     app_name = None
     auth_api_key = None
 
@@ -821,6 +846,9 @@ def main():
     while i < len(args):
         if args[i] == "--backend-url" and i + 1 < len(args):
             base_url = args[i + 1]
+            i += 2
+        elif args[i] == "--gateway-url" and i + 1 < len(args):
+            gateway_url = normalize_url(args[i + 1])
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -878,7 +906,7 @@ def main():
 
     # Setup hooks
     debug_print("Setting up hooks...")
-    hooks_success, hooks_changed = setup_hooks()
+    hooks_success, hooks_changed = setup_hooks(gateway_url=gateway_url)
     if not hooks_success:
         print("\n❌ Failed to setup hooks")
         return

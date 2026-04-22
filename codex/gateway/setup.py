@@ -527,10 +527,12 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
     parser.add_argument("--backend-url", dest="backend_url", default="https://backend.getunbound.ai", help="Override backend URL for local/staging testing (default: https://backend.getunbound.ai)")
+    parser.add_argument("--gateway-url", dest="gateway_url", default="https://api.getunbound.ai", help="Override AI gateway URL written to the codex config (default: https://api.getunbound.ai)")
     parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
     parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
     parser.add_argument("--api-key", dest="api_key", help="API key (skip browser auth)")
     args, _ = parser.parse_known_args()
+    args.gateway_url = normalize_url(args.gateway_url)
 
     if args.debug:
         DEBUG = True
@@ -585,7 +587,7 @@ def main():
     debug_print("OPENAI_API_KEY set successfully")
 
     debug_print("Writing openai_base_url to codex config...")
-    if not write_codex_config("https://api.getunbound.ai/v1"):
+    if not write_codex_config(f"{args.gateway_url.rstrip('/')}/v1"):
         print("❌ Failed to configure openai_base_url in codex config")
         return
     debug_print("openai_base_url written to codex config successfully")
