@@ -921,11 +921,22 @@ def main():
 
     if gateway_url:
         # Persist for the launchd worker that runs this same script later.
+        # The worker is a separate process, so an in-memory os.environ assignment
+        # alone is not enough — it must land in the system-wide env. If that fails,
+        # the worker would silently fall back to the default gateway, defeating
+        # the tenant's --gateway-url. Surface the failure to the admin.
         os.environ["UNBOUND_GATEWAY_URL"] = gateway_url
         try:
-            set_env_var_system_wide("UNBOUND_GATEWAY_URL", gateway_url)
+            success, _ = set_env_var_system_wide("UNBOUND_GATEWAY_URL", gateway_url)
         except Exception as e:
-            debug_print(f"Could not persist UNBOUND_GATEWAY_URL system-wide: {e}")
+            success = False
+            debug_print(f"set_env_var_system_wide raised: {e}")
+        if not success:
+            print(
+                "⚠️  Could not persist UNBOUND_GATEWAY_URL system-wide. "
+                "The launchd worker will use the default gateway "
+                f"({DEFAULT_GATEWAY_URL}) instead of {gateway_url}."
+            )
 
     if not auth_api_key:
         print("\nMissing required argument: --api-key")
