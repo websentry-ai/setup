@@ -12,6 +12,8 @@ sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/cursor/mdm-install)" -
 sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/mdm/setup.py)" --api-key YOUR_API_KEY
 ```
 
+Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`).
+
 ### Clearing Setup
 
 ```bash

@@ -9,7 +9,9 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 
-UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_GATEWAY_URL = os.environ.get(
+    "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
+).rstrip("/")
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"

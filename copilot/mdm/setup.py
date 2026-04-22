@@ -13,7 +13,23 @@ from pathlib import Path
 
 DEBUG = False
 ENV_VAR_NAME = "UNBOUND_COPILOT_API_KEY"
-GATEWAY_ENDPOINT = "https://api.getunbound.ai/v1/hooks/copilot"
+DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+
+
+def normalize_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    if not (value.startswith("http://") or value.startswith("https://")):
+        value = f"https://{value}"
+    return value.rstrip("/")
+
+
+def get_gateway_endpoint() -> str:
+    """Resolve the copilot gateway endpoint from $UNBOUND_GATEWAY_URL or default.
+    Looked up at call time so the launchd worker picks up an updated install."""
+    base = normalize_url(os.environ.get("UNBOUND_GATEWAY_URL") or DEFAULT_GATEWAY_URL)
+    return f"{base}/v1/hooks/copilot"
 
 
 # ---------------------------------------------------------------------------
@@ -807,7 +823,7 @@ def send_exchange(exchange, api_key):
              "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
              "-d", body,
-             GATEWAY_ENDPOINT],
+             get_gateway_endpoint()],
             capture_output=True, text=True, timeout=30,
         )
         output_lines = result.stdout.strip().split("\n")
@@ -879,6 +895,7 @@ def main():
 
     # Parse args
     base_url = "https://backend.getunbound.ai"
+    gateway_url = None
     app_name = None
     auth_api_key = None
 
@@ -887,6 +904,9 @@ def main():
     while i < len(args):
         if args[i] == "--backend-url" and i + 1 < len(args):
             base_url = args[i + 1]
+            i += 2
+        elif args[i] == "--gateway-url" and i + 1 < len(args):
+            gateway_url = normalize_url(args[i + 1])
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -898,6 +918,14 @@ def main():
             i += 1
         else:
             i += 1
+
+    if gateway_url:
+        # Persist for the launchd worker that runs this same script later.
+        os.environ["UNBOUND_GATEWAY_URL"] = gateway_url
+        try:
+            set_env_var_system_wide("UNBOUND_GATEWAY_URL", gateway_url)
+        except Exception as e:
+            debug_print(f"Could not persist UNBOUND_GATEWAY_URL system-wide: {e}")
 
     if not auth_api_key:
         print("\nMissing required argument: --api-key")

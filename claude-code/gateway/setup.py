@@ -477,10 +477,12 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--domain", dest="domain", help="Base frontend URL (e.g., gateway.getunbound.ai)")
     parser.add_argument("--backend-url", dest="backend_url", default="https://backend.getunbound.ai", help="Override backend URL for local/staging testing (default: https://backend.getunbound.ai)")
+    parser.add_argument("--gateway-url", dest="gateway_url", default="https://api.getunbound.ai", help="Override AI gateway URL written to ANTHROPIC_BASE_URL (default: https://api.getunbound.ai)")
     parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
     parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
     parser.add_argument("--api-key", dest="api_key", help="API key (skip browser auth)")
     args, _ = parser.parse_known_args()
+    args.gateway_url = normalize_url(args.gateway_url)
 
     if args.debug:
         DEBUG = True
@@ -540,7 +542,7 @@ def main():
     debug_print("UNBOUND_API_KEY set successfully")
 
     debug_print("Setting ANTHROPIC_BASE_URL environment variable...")
-    success, message = set_env_var("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
+    success, message = set_env_var("ANTHROPIC_BASE_URL", args.gateway_url)
     debug_print("ANTHROPIC_BASE_URL set successfully")
 
     write_unbound_config(api_key)

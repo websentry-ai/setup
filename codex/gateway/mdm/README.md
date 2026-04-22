@@ -12,6 +12,8 @@ sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/set
 
 ### Optional Parameters
 
+- `--backend-url <url>` - Backend REST API host (default: `https://backend.getunbound.ai`)
+- `--gateway-url <url>` - AI gateway host wired into the codex config (default: `https://api.getunbound.ai`)
 - `--app_name JumpCloud` - Specify MDM provider
 - `--debug` - Show detailed output
 

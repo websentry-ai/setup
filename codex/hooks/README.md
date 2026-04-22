@@ -22,6 +22,8 @@ python3 <(curl -fsSL https://getunbound.ai/setup/codex/hooks/install) --api-key 
 python3 <(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/setup.py) --api-key YOUR_API_KEY
 ```
 
+Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`).
+
 ## Clear Setup
 
 ```bash

@@ -549,7 +549,19 @@ def get_managed_settings_dir() -> Path:
         raise OSError(f"Unsupported operating system: {system}")
 
 
-def setup_managed_settings(api_key: str = "") -> bool:
+DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+
+
+def normalize_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    if not (value.startswith("http://") or value.startswith("https://")):
+        value = f"https://{value}"
+    return value.rstrip("/")
+
+
+def setup_managed_settings(api_key: str = "", gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
     """
     Set up system-wide managed settings for Claude Code.
     Unix: writes anthropic_key.sh + apiKeyHelper (runs in /bin/sh per docs).
@@ -584,7 +596,7 @@ def setup_managed_settings(api_key: str = "") -> bool:
             settings = {
                 "env": {
                     "ANTHROPIC_AUTH_TOKEN": api_key,
-                    "ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
+                    "ANTHROPIC_BASE_URL": gateway_url,
                 }
             }
         else:
@@ -765,6 +777,7 @@ def main():
         return
 
     base_url = "https://backend.getunbound.ai"
+    gateway_url = DEFAULT_GATEWAY_URL
     app_name = None
     auth_api_key = None
 
@@ -773,6 +786,9 @@ def main():
     while i < len(args):
         if args[i] == "--backend-url" and i + 1 < len(args):
             base_url = args[i + 1]
+            i += 2
+        elif args[i] == "--gateway-url" and i + 1 < len(args):
+            gateway_url = normalize_url(args[i + 1])
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -816,7 +832,7 @@ def main():
         return
     debug_print("UNBOUND_API_KEY set successfully")
 
-    success, url_changed = set_env_var_system_wide("ANTHROPIC_BASE_URL", "https://api.getunbound.ai")
+    success, url_changed = set_env_var_system_wide("ANTHROPIC_BASE_URL", gateway_url)
     if not success:
         print(f"❌ Failed to set ANTHROPIC_BASE_URL")
         return
@@ -828,7 +844,7 @@ def main():
         write_unbound_config_for_user(username, home_dir, claude_api_key)
 
     print("\n🔧 Configuring Claude managed settings...")
-    if setup_managed_settings(claude_api_key):
+    if setup_managed_settings(claude_api_key, gateway_url=gateway_url):
         managed_dir = get_managed_settings_dir()
         print(f"✅ Created managed settings in {managed_dir}")
     else:

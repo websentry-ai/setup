@@ -14,10 +14,21 @@ except ImportError:
 
 DEBUG = False
 
+DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+
 
 def debug_print(message: str) -> None:
     if DEBUG:
         print(f"[DEBUG] {message}")
+
+
+def normalize_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return value
+    if not (value.startswith("http://") or value.startswith("https://")):
+        value = f"https://{value}"
+    return value.rstrip("/")
 
 
 def check_admin_privileges() -> bool:
@@ -633,6 +644,7 @@ def main():
         return
 
     base_url = "https://backend.getunbound.ai"
+    gateway_url = DEFAULT_GATEWAY_URL
     app_name = None
     auth_api_key = None
 
@@ -641,6 +653,9 @@ def main():
     while i < len(args):
         if args[i] == "--backend-url" and i + 1 < len(args):
             base_url = args[i + 1]
+            i += 2
+        elif args[i] == "--gateway-url" and i + 1 < len(args):
+            gateway_url = normalize_url(args[i + 1])
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -680,7 +695,7 @@ def main():
         return
     debug_print("GEMINI_API_KEY set successfully")
 
-    success, url_changed = set_env_var_system_wide("GOOGLE_GEMINI_BASE_URL", "https://api.getunbound.ai/v1")
+    success, url_changed = set_env_var_system_wide("GOOGLE_GEMINI_BASE_URL", f"{gateway_url.rstrip('/')}/v1")
     if not success:
         print(f"❌ Failed to set GOOGLE_GEMINI_BASE_URL")
         return
