@@ -599,10 +599,11 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
         return {}
 
-    if 'tools_to_check' in api_response:
-        save_policy_cache(tools_to_check=api_response['tools_to_check'])
-    if 'policy_check_failure_action' in api_response:
-        save_policy_cache(policy_check_failure_action=api_response['policy_check_failure_action'])
+    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+        )
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
