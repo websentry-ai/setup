@@ -22,6 +22,8 @@ NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
+POLICY_CHECK_FAILURE_DEFAULT = 'allow'
+POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -100,29 +102,50 @@ def log_error(message: str, category: str = 'general'):
     report_error_to_gateway(message, category, _cached_api_key)
 
 
-def load_policy_cache() -> Optional[Dict]:
-    """Load policy cache from disk. Returns None if missing, corrupt, or expired."""
+def _read_policy_cache_raw() -> Optional[Dict]:
+    """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
     try:
         if not POLICY_CACHE_FILE.exists():
             return None
         with open(POLICY_CACHE_FILE, 'r', encoding='utf-8') as f:
             cache = json.loads(f.read())
-        if not isinstance(cache, dict) or 'last_synced' not in cache or 'tools_to_check' not in cache:
-            return None
-        if not isinstance(cache['tools_to_check'], list):
-            return None
-        return cache
+        return cache if isinstance(cache, dict) else None
     except (json.JSONDecodeError, OSError):
         return None
 
 
-def save_policy_cache(tools_to_check: List[str]):
-    """Write policy cache to disk."""
+def load_policy_cache() -> Optional[Dict]:
+    """Load policy cache from disk. Returns None if missing, corrupt, or expired."""
+    cache = _read_policy_cache_raw()
+    if cache is None or 'last_synced' not in cache or 'tools_to_check' not in cache:
+        return None
+    if not isinstance(cache['tools_to_check'], list):
+        return None
+    return cache
+
+
+def get_policy_check_failure_action() -> str:
+    """Read failure-action from cache, defaulting to 'allow'. Ignores TTL."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return POLICY_CHECK_FAILURE_DEFAULT
+    value = cache.get('policy_check_failure_action')
+    return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
+
+
+def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None):
+    """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        prior = _read_policy_cache_raw() or {}
+        if tools_to_check is None:
+            tools_to_check = prior.get('tools_to_check', [])
+        if policy_check_failure_action not in ('allow', 'block'):
+            policy_check_failure_action = get_policy_check_failure_action()
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
+            'policy_check_failure_action': policy_check_failure_action,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
@@ -562,8 +585,24 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     api_response = send_to_hook_api(request_body, api_key)
 
+    if not api_response:
+        if get_policy_check_failure_action() == 'block':
+            return transform_response_for_claude({
+                'decision': 'deny',
+                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
+                'additionalContext': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
+            })
+        report_error_to_gateway(
+            f'Hook bypassed_due_to_failure: gateway unreachable for tool={tool_name}',
+            category='bypassed_due_to_failure',
+            api_key=api_key,
+        )
+        return {}
+
     if 'tools_to_check' in api_response:
-        save_policy_cache(api_response['tools_to_check'])
+        save_policy_cache(tools_to_check=api_response['tools_to_check'])
+    if 'policy_check_failure_action' in api_response:
+        save_policy_cache(policy_check_failure_action=api_response['policy_check_failure_action'])
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
