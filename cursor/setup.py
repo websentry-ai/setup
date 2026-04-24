@@ -546,7 +546,9 @@ def main():
     if check_enterprise_hooks_conflict():
         # MDM hooks already in place — the device IS configured, just via the
         # admin path. Notify the backend so this counts as a completed setup
-        # rather than a silent abort.
+        # rather than a silent abort. Print a positive line so the user
+        # doesn't see only the ❌ above and assume the whole thing failed.
+        print("✅ Device already configured via MDM — no user-level setup needed.")
         notify_setup_complete(api_key, "cursor", backend_url=backend_url)
         return
 

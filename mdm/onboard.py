@@ -41,6 +41,12 @@ import urllib.request
 _RAW_SETUP = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main"
 _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main"
 
+# Per-step subprocess timeout. MDM scripts and the discovery installer do
+# legitimate filesystem + network work, so this is a generous safety net
+# rather than a tight bound — picked to surface a hung subprocess as a clear
+# error instead of a silent indefinite hang on the wrapper.
+SUBPROCESS_TIMEOUT_SECONDS = 600
+
 TOOLS = [
     ("Claude Code", f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py"),
     ("Cursor",      f"{_RAW_SETUP}/cursor/mdm/setup.py"),
@@ -73,15 +79,16 @@ def check_admin_privileges() -> bool:
 
 
 def fetch_script(url: str) -> bytes:
-    """Downloads `url` with explicit HTTP error checking. Raises on any failure
-    (network, non-200, empty body) so the caller never silently runs an empty
-    script — the silent-failure mode that `python3 -c "$(curl …)"` has when
-    curl fails (`$(…)` returns empty, `python3 -c ""` exits 0)."""
+    """Downloads `url` with explicit error checking. Raises on any failure
+    (network, HTTP non-2xx, empty body) so the caller never silently runs an
+    empty script — the silent-failure mode that `python3 -c "$(curl …)"` has
+    when curl fails (`$(…)` returns empty, `python3 -c ""` exits 0).
+
+    Note: urllib.request.urlopen raises HTTPError for any non-2xx response,
+    so we don't need an explicit status-code check here — anything reaching
+    `body = resp.read()` is already a 2xx."""
     req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.0"})
     with urllib.request.urlopen(req, timeout=30) as resp:
-        status = getattr(resp, "status", resp.getcode())
-        if status != 200:
-            raise RuntimeError(f"HTTP {status}")
         body = resp.read()
         if not body or not body.strip():
             raise RuntimeError("empty response body")
@@ -107,8 +114,17 @@ def run_tool(name: str, url: str, args: list) -> bool:
         # Use sys.executable so we run with the same Python that's executing
         # this wrapper — avoids `python3` vs `python` vs `py` PATH issues
         # (notably on Windows where python3 may not be on PATH).
-        result = subprocess.run([sys.executable, tmp_path] + args)
-        return result.returncode == 0
+        try:
+            result = subprocess.run(
+                [sys.executable, tmp_path] + args, timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            print(
+                f"❌ [{name}] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                file=sys.stderr,
+            )
+            return False
     finally:
         try:
             os.unlink(tmp_path)
@@ -142,8 +158,15 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
         else:
             os.chmod(tmp_path, 0o755)
             cmd = ["bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url]
-        result = subprocess.run(cmd)
-        return result.returncode == 0
+        try:
+            result = subprocess.run(cmd, timeout=SUBPROCESS_TIMEOUT_SECONDS)
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            print(
+                f"❌ [Discovery] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                file=sys.stderr,
+            )
+            return False
     finally:
         try:
             os.unlink(tmp_path)
