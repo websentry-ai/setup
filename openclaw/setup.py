@@ -479,6 +479,7 @@ def main():
     model = None
     api_key_arg = None
     backend_url = "https://backend.getunbound.ai"
+    gateway_url = "https://api.getunbound.ai"
     for i, arg in enumerate(sys.argv):
         if arg == "--domain" and i + 1 < len(sys.argv):
             domain = sys.argv[i + 1]
@@ -488,6 +489,8 @@ def main():
             api_key_arg = sys.argv[i + 1]
         elif arg == "--backend-url" and i + 1 < len(sys.argv):
             backend_url = sys.argv[i + 1]
+        elif arg == "--gateway-url" and i + 1 < len(sys.argv):
+            gateway_url = normalize_url(sys.argv[i + 1])
 
     setup_plugin = "--plugin" in sys.argv
     setup_provider = "--provider" in sys.argv
@@ -495,8 +498,6 @@ def main():
     if not setup_plugin and not setup_provider:
         setup_plugin = True
         setup_provider = True
-
-    gateway_url = "https://api.getunbound.ai"
 
     api_key = api_key_arg
     if not api_key:

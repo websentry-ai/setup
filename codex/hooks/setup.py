@@ -19,6 +19,7 @@ import json
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
+DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 DEBUG = False
 
@@ -324,17 +325,31 @@ def remove_gateway_artifacts() -> None:
             debug_print(f"Failed to update {config_path}: {e}")
 
 
-def setup_hooks():
+def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
+    """Replace the hardcoded default gateway URL inside a downloaded unbound.py."""
+    if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
+        return
+    try:
+        text = path.read_text(encoding="utf-8")
+        new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+        if new_text != text:
+            path.write_text(new_text, encoding="utf-8")
+    except Exception:
+        pass
+
+
+def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     hooks_dir = Path.home() / ".codex" / "hooks"
     script_path = hooks_dir / "unbound.py"
 
     if not download_file(SCRIPT_URL, script_path):
         return False
+    rewrite_gateway_url_in_file(script_path, gateway_url)
 
     try:
         current_mode = script_path.stat().st_mode
         os.chmod(script_path, current_mode | 0o111)
-    except Exception as e:
+    except Exception:
         pass
 
     return True
@@ -666,6 +681,12 @@ def main():
             backend_url = sys.argv[i + 1]
             break
 
+    gateway_url = DEFAULT_GATEWAY_URL
+    for i, arg in enumerate(sys.argv):
+        if arg == "--gateway-url" and i + 1 < len(sys.argv):
+            gateway_url = normalize_url(sys.argv[i + 1])
+            break
+
     api_key_arg = None
     for i, arg in enumerate(sys.argv):
         if arg == "--api-key" and i + 1 < len(sys.argv):
@@ -714,7 +735,7 @@ def main():
     write_unbound_config(api_key)
 
     debug_print("Setting up hooks...")
-    if not setup_hooks():
+    if not setup_hooks(gateway_url=gateway_url):
         print("Failed to setup hooks")
         return
     debug_print("Hooks downloaded successfully")

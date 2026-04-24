@@ -15,7 +15,9 @@ import tempfile
 import time
 import hashlib
 
-UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_GATEWAY_URL = os.environ.get(
+    "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
+).rstrip("/")
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -35,6 +37,7 @@ LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
+CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
@@ -492,7 +495,35 @@ def process_pre_tool_use(event, api_key):
     return format_hook_response(api_response)
     
 
-
+def _read_mcp_server_config(server_name, config_path):
+    """
+    Read an MCP server's config (url, command, args) from a config file.
+    Returns a dict with only the fields needed for fingerprinting, or None.
+    Never includes env or headers (secrets).
+    """
+    try:
+        if not config_path.exists():
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.loads(f.read())
+        servers = config.get('mcpServers', {})
+        if not isinstance(servers, dict):
+            return None
+        server = servers.get(server_name)
+        if not isinstance(server, dict):
+            return None
+        result = {}
+        if server.get('url'):
+            result['url'] = server['url']
+        if server.get('command'):
+            result['command'] = server['command']
+        if server.get('args'):
+            result['args'] = server['args']
+        if server.get('type'):
+            result['type'] = server['type']
+        return result if result else None
+    except Exception:
+        return None
 
 
 def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
@@ -510,6 +541,11 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     metadata = dict(event)
     if mcp_server is not None:
         metadata['mcp_server'] = mcp_server
+        
+        server_cfg = _read_mcp_server_config(mcp_server, CURSOR_MCP_CONFIG_PATH)
+        if server_cfg:
+            metadata['mcp_server_config'] = server_cfg
+
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
 
@@ -923,11 +959,12 @@ def main():
             return
 
         if hook_event_name == 'beforeMCPExecution':
+            mcp_server = event.get('command', '')
             mcp_tool_name = event.get('tool_name', '')
-            # Cursor doesn't provide mcp_server directly; pass tool_name as mcp_tool
+
             response = process_pre_tool_use_execution(
                 event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input') or {}),
-                mcp_server=None, mcp_tool=mcp_tool_name
+                mcp_server=mcp_server, mcp_tool=mcp_tool_name
             )
             print(json.dumps(response), flush=True)
             if response.get('permission') == 'deny':
