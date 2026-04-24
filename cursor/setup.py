@@ -503,7 +503,7 @@ def main():
     backend_url = "https://backend.getunbound.ai"
     for i, arg in enumerate(sys.argv):
         if arg == "--backend-url" and i + 1 < len(sys.argv):
-            backend_url = sys.argv[i + 1]
+            backend_url = normalize_url(sys.argv[i + 1])
             break
 
     gateway_url = DEFAULT_GATEWAY_URL

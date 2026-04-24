@@ -488,7 +488,7 @@ def main():
         elif arg == "--api-key" and i + 1 < len(sys.argv):
             api_key_arg = sys.argv[i + 1]
         elif arg == "--backend-url" and i + 1 < len(sys.argv):
-            backend_url = sys.argv[i + 1]
+            backend_url = normalize_url(sys.argv[i + 1])
         elif arg == "--gateway-url" and i + 1 < len(sys.argv):
             gateway_url = normalize_url(sys.argv[i + 1])
 

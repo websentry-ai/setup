@@ -483,6 +483,7 @@ def main():
     parser.add_argument("--api-key", dest="api_key", help="API key (skip browser auth)")
     args, _ = parser.parse_known_args()
     args.gateway_url = normalize_url(args.gateway_url)
+    args.backend_url = normalize_url(args.backend_url)
 
     if args.debug:
         DEBUG = True
