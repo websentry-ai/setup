@@ -503,7 +503,7 @@ def main():
     backend_url = "https://backend.getunbound.ai"
     for i, arg in enumerate(sys.argv):
         if arg == "--backend-url" and i + 1 < len(sys.argv):
-            backend_url = sys.argv[i + 1]
+            backend_url = normalize_url(sys.argv[i + 1])
             break
 
     gateway_url = DEFAULT_GATEWAY_URL
@@ -544,6 +544,12 @@ def main():
     debug_print("API key received from callback")
 
     if check_enterprise_hooks_conflict():
+        # MDM hooks already in place — the device IS configured, just via the
+        # admin path. Notify the backend so this counts as a completed setup
+        # rather than a silent abort. Print a positive line so the user
+        # doesn't see only the ❌ above and assume the whole thing failed.
+        print("✅ Device already configured via MDM — no user-level setup needed.")
+        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
         return
 
     if not write_unbound_config(api_key):

@@ -652,7 +652,7 @@ def main():
     i = 0
     while i < len(args):
         if args[i] == "--backend-url" and i + 1 < len(args):
-            base_url = args[i + 1]
+            base_url = normalize_url(args[i + 1])
             i += 2
         elif args[i] == "--gateway-url" and i + 1 < len(args):
             gateway_url = normalize_url(args[i + 1])
