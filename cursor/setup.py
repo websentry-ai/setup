@@ -544,6 +544,10 @@ def main():
     debug_print("API key received from callback")
 
     if check_enterprise_hooks_conflict():
+        # MDM hooks already in place — the device IS configured, just via the
+        # admin path. Notify the backend so this counts as a completed setup
+        # rather than a silent abort.
+        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
         return
 
     if not write_unbound_config(api_key):
