@@ -663,7 +663,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
                         _hook({
                             "type": "command",
                             "command": hook_command,
-                            "timeout": 10
+                            "timeout": 15000
                         })
                     ]
                 }
