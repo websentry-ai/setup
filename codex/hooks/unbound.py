@@ -7,6 +7,8 @@ import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, List, Optional
+import time
+import hashlib
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -15,8 +17,24 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash']  # MCP tools (mcp__*) are always checked separately
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'apply_patch']  # MCP tools (mcp__*) are always checked separately
+NATIVE_FILE_TOOLS = {'apply_patch'}
 MCP_TOOL_PREFIX = 'mcp__'
+POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
+CACHE_TTL_SECONDS = 300
+POLICY_CHECK_FAILURE_DEFAULT = 'allow'
+POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
+
+APPROVAL_TIMEOUT = 4 * 60 * 60
+
+APPROVAL_POLL_PHASES = (
+    (5 * 60,        3),    # 0-5 min: 3s
+    (30 * 60,       15),   # 5-30 min: 15s
+    (2 * 60 * 60,   60),   # 30 min - 2h: 1min
+    (4 * 60 * 60,   120),  # 2h - 4h: 2min
+)
+
+_APPROVAL_MARKER_FILE = Path.home() / ".codex" / "hooks" / ".approval_pending"
 
 
 _cached_api_key = None
@@ -85,6 +103,150 @@ def log_error(message: str, category: str = 'general'):
 
     # Report to gateway (fire-and-forget)
     report_error_to_gateway(message, category, _cached_api_key)
+
+
+def _read_policy_cache_raw() -> Optional[Dict]:
+    """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
+    try:
+        if not POLICY_CACHE_FILE.exists():
+            return None
+        with open(POLICY_CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.loads(f.read())
+        return cache if isinstance(cache, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def load_policy_cache() -> Optional[Dict]:
+    """Load policy cache from disk. Returns None if missing, corrupt, or expired."""
+    cache = _read_policy_cache_raw()
+    if cache is None or 'last_synced' not in cache or 'tools_to_check' not in cache:
+        return None
+    if not isinstance(cache['tools_to_check'], list):
+        return None
+    return cache
+
+
+def get_policy_check_failure_action() -> str:
+    """Read failure-action from cache, defaulting to 'allow'. Ignores TTL."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return POLICY_CHECK_FAILURE_DEFAULT
+    value = cache.get('policy_check_failure_action')
+    return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
+
+
+def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None):
+    """Merge supplied fields into the cache. Fields passed as None are left untouched.
+    last_synced is refreshed only when tools_to_check is being updated."""
+    try:
+        POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        cache = _read_policy_cache_raw() or {}
+        if tools_to_check is not None:
+            cache['tools_to_check'] = tools_to_check
+            cache['last_synced'] = datetime.utcnow().isoformat() + 'Z'
+        if policy_check_failure_action in ('allow', 'block'):
+            cache['policy_check_failure_action'] = policy_check_failure_action
+        with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(cache))
+    except (OSError, TypeError):
+        pass
+
+
+def is_cache_stale(cache: Dict) -> bool:
+    """Check if cached data is older than CACHE_TTL_SECONDS."""
+    try:
+        synced = datetime.fromisoformat(cache['last_synced'].rstrip('Z'))
+        age = (datetime.utcnow() - synced).total_seconds()
+        return age > CACHE_TTL_SECONDS
+    except (ValueError, KeyError):
+        return True
+
+
+def _is_approval_retry(command: str) -> bool:
+    """True if a marker exists for this exact command and is fresh (< APPROVAL_TIMEOUT)."""
+    try:
+        if not _APPROVAL_MARKER_FILE.exists():
+            return False
+        data = json.loads(_APPROVAL_MARKER_FILE.read_text())
+        cmd_hash = hashlib.sha256(command.encode()).hexdigest()[:16]
+        return data.get('cmd') == cmd_hash and (time.time() - data.get('ts', 0)) < APPROVAL_TIMEOUT
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _set_approval_marker(command: str, policy_ids: list, application_id: str, request_id: str = '') -> None:
+    _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
+        'ts': time.time(),
+        'policyIds': policy_ids,
+        'applicationId': application_id,
+        'requestId': request_id,
+    }
+    _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
+
+
+def _get_approval_marker_data() -> Optional[Dict]:
+    try:
+        if not _APPROVAL_MARKER_FILE.exists():
+            return None
+        return json.loads(_APPROVAL_MARKER_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _clear_approval_marker() -> None:
+    try:
+        if _APPROVAL_MARKER_FILE.exists():
+            _APPROVAL_MARKER_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _next_poll_interval(elapsed: float) -> int:
+    """Pick the polling interval for the current elapsed time using APPROVAL_POLL_PHASES."""
+    for upto, interval in APPROVAL_POLL_PHASES:
+        if elapsed < upto:
+            return interval
+    return APPROVAL_POLL_PHASES[-1][1]
+
+
+def poll_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', timeout: int = APPROVAL_TIMEOUT) -> str:
+    """Poll the approval-status endpoint until approved, denied, or timeout.
+    Returns 'approved', 'deny', or 'timeout'."""
+
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
+    payload = {"policyIds": policy_ids, "applicationId": application_id}
+    if request_id:
+        payload["requestId"] = request_id
+    body = json.dumps(payload)
+
+    start = time.monotonic()
+    deadline = start + timeout
+
+    while time.monotonic() < deadline:
+        time.sleep(_next_poll_interval(time.monotonic() - start))
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "-d", body, url],
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                resp = json.loads(result.stdout.decode('utf-8'))
+                decision = resp.get('decision', 'pending')
+                if decision == 'allow':
+                    return 'approved'
+                if decision == 'deny':
+                    return 'deny'
+        except Exception as e:
+            log_error(f"Approval poll error: {str(e)}")
+
+    return 'timeout'
 
 
 def load_existing_logs() -> List[Dict]:
@@ -253,7 +415,7 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
              "-d", data, url],
             input=f'header = "Authorization: Bearer {api_key}"\n'.encode(),
             capture_output=True,
-            timeout=10
+            timeout=20
         )
 
         if result.returncode == 0 and result.stdout:
@@ -320,9 +482,19 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
 
-    # Only Bash and MCP tools need policy checking; skip API call for all other tools
     is_mcp = tool_name.startswith(MCP_TOOL_PREFIX)
     if not is_mcp and tool_name not in ALLOWED_NON_MCP_HOOK_NAMES:
+        return {}
+
+    cache = load_policy_cache()
+    tools_to_check = cache.get('tools_to_check', []) if cache else []
+    need_pull_policies = cache is None or is_cache_stale(cache)
+
+    if (
+        tool_name in NATIVE_FILE_TOOLS
+        and tool_name not in tools_to_check
+        and not need_pull_policies
+    ):
         return {}
 
     user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
@@ -337,6 +509,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
 
+    approval_key = f"{tool_name}:{command}"
+    is_retry = _is_approval_retry(approval_key)
+
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'codex',
@@ -350,7 +525,78 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
     }
 
+    if not is_retry:
+        request_body['first_approval_check'] = True
+
+    if is_retry:
+        marker_data = _get_approval_marker_data()
+        if marker_data:
+            policy_ids = marker_data.get('policyIds', [])
+            application_id = marker_data.get('applicationId', '')
+            request_id = marker_data.get('requestId', '')
+            _clear_approval_marker()
+            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
+
+            if result == 'approved':
+                return transform_response_for_codex({'decision': 'allow'})
+            elif result == 'deny':
+                return transform_response_for_codex({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. This command was denied via Slack.',
+                    'additionalContext': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                })
+            else:
+                return transform_response_for_codex({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
+                    'additionalContext': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                })
+
+    if need_pull_policies:
+        request_body['pull_policies'] = True
+
     api_response = send_to_hook_api(request_body, api_key)
+
+    if not api_response:
+        if get_policy_check_failure_action() == 'block':
+            return transform_response_for_codex({
+                'decision': 'deny',
+                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
+                'additionalContext': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
+            })
+        report_error_to_gateway(
+            f'Hook bypassed_due_to_failure: gateway unreachable for tool={tool_name}',
+            category='bypassed_due_to_failure',
+            api_key=api_key,
+        )
+        return {}
+
+    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+        )
+
+    if api_response.get('decision') == 'approval_required':
+        approval_check = api_response.get('approvalCheck', {})
+        policy_ids = approval_check.get('policyIds', [])
+        application_id = approval_check.get('applicationId', '')
+        request_id = approval_check.get('requestId', '')
+
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
+        return transform_response_for_codex({
+            'decision': 'deny',
+            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'additionalContext': (
+                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+                'Tell the user: "An approval request has been sent to your Slack DMs. '
+                'Please approve it and I will retry automatically." '
+                'Then immediately retry the exact same tool call with the exact same command — '
+                'do not modify the command in any way, do not add sleep or any prefix. '
+                'Retry exactly once — the second attempt will wait for the approval.'
+            ),
+        })
+
     return transform_response_for_codex(api_response)
 
 
