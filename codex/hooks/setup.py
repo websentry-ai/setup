@@ -385,7 +385,7 @@ def configure_codex_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
-                            "timeout": 10
+                            "timeout": 15000
                         }
                     ]
                 }
