@@ -283,23 +283,28 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     conversation_data = {
         'user_messages': [],
         'assistant_messages': [],
-        'tool_uses': []
+        'tool_uses': [],
+        'usage': None,
+        'model': None,
     }
-    
+
     if not transcript_path or not os.path.exists(transcript_path):
         return conversation_data
-    
+
+    usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+    turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
+
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for line in f:
                 if not line.strip():
                     continue
-                    
+
                 try:
                     entry = json.loads(line)
                     entry_type = entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
-                    
+
                     if entry_type == 'user':
                         message = entry.get('message', {})
                         if message.get('role') == 'user':
@@ -309,17 +314,15 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                     'content': content,
                                     'timestamp': entry_timestamp
                                 })
-                    
+
                     elif entry_type == 'assistant':
                         if user_prompt_timestamp and entry_timestamp:
                             if entry_timestamp <= user_prompt_timestamp:
                                 continue
-                        
+
                         message = entry.get('message', {})
                         if message.get('role') == 'assistant':
-                            content_array = message.get('content', [])
-                            text_content = ''
-                            for content_item in content_array:
+                            for content_item in message.get('content', []):
                                 if isinstance(content_item, dict) and content_item.get('type') == 'text':
                                     text_content = content_item.get('text', '')
                                     if text_content:
@@ -327,13 +330,23 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                             'content': text_content,
                                             'timestamp': entry_timestamp
                                         })
-                        
+
+                            msg_usage = message.get('usage') or {}
+                            if msg_usage:
+                                for k in usage:
+                                    usage[k] += int(msg_usage.get(k) or 0)
+                                turn_model = turn_model or message.get('model')
+
                 except json.JSONDecodeError:
                     continue
-                    
+
     except Exception:
         pass
-    
+
+    if any(usage.values()):
+        conversation_data['usage'] = {**usage, 'total_tokens': sum(usage.values())}
+        conversation_data['model'] = turn_model
+
     return conversation_data
 
 
@@ -707,7 +720,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
@@ -783,6 +796,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'messages': messages,
         'permission_mode': permission_mode
     }
+
+    if usage:
+        exchange['usage'] = usage
 
     return exchange
 
@@ -865,22 +881,27 @@ def process_stop_event(event: Dict, api_key: str):
                 session_events.append(log)
 
     transcript_assistant_messages = []
+    transcript_usage = None
+    transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
         transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
         ]
+        transcript_usage = transcript_data.get('usage')
+        transcript_model = transcript_data.get('model')
 
-    # Resolve the session model from the already-loaded logs so
-    # build_llm_exchange doesn't have to re-read the audit log from disk.
-    session_model = _extract_session_model(logs, session_id) or 'auto'
+    # Prefer the dominant model from the transcript (covers sub-agent turns where
+    # the cached session model is wrong). Fall back to the audit log otherwise.
+    session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
     exchange = build_llm_exchange(
         session_events,
         stop_assistant_message=last_assistant_message,
         transcript_assistant_messages=transcript_assistant_messages,
         model=session_model,
+        usage=transcript_usage,
     )
 
     if exchange:
