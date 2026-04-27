@@ -331,11 +331,13 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                             'timestamp': entry_timestamp
                                         })
 
+                            # Model is captured unconditionally so it survives even on usage-less assistant entries.
+                            turn_model = turn_model or message.get('model')
+
                             msg_usage = message.get('usage') or {}
                             if msg_usage:
                                 for k in usage:
                                     usage[k] += int(msg_usage.get(k) or 0)
-                                turn_model = turn_model or message.get('model')
 
                 except json.JSONDecodeError:
                     continue
@@ -345,6 +347,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
     if any(usage.values()):
         conversation_data['usage'] = {**usage, 'total_tokens': sum(usage.values())}
+    if turn_model:
         conversation_data['model'] = turn_model
 
     return conversation_data
