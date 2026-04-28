@@ -771,25 +771,11 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
 
 
 def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
-    """Per-turn token usage from the Codex session JSONL.
-
-    Codex emits event_msg/token_count entries with payload.info either null
-    (rate-limit refresh, no usage) or {total_token_usage, last_token_usage}.
-    last_token_usage gets re-emitted across turn boundaries (openai/codex#14489),
-    so we use total_token_usage deltas instead: subtract the last cumulative
-    total recorded BEFORE this turn from the last cumulative total recorded
-    inside this turn.
-
-    Returns the OpenAI-style dict the gateway's proxy_service.calculate_usage
-    trust path expects (prompt/completion/cache_read/cache_creation/total),
-    or None if the JSONL has no usable usage for this turn.
-    """
+    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
         return None
 
-    before_total = None
-    after_total = None
-
+    before, after = {}, {}
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -799,54 +785,37 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if entry.get('type') != 'event_msg':
-                    continue
                 payload = entry.get('payload') or {}
-                if payload.get('type') != 'token_count':
+                if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
                     continue
-                info = payload.get('info')
-                if not info:
-                    continue
-                total = info.get('total_token_usage')
+                total = (payload.get('info') or {}).get('total_token_usage')
                 if not total:
                     continue
-                ts = entry.get('timestamp', '')
-                if ts < user_prompt_timestamp:
-                    before_total = total
+                if entry.get('timestamp', '') < user_prompt_timestamp:
+                    before = total
                 else:
-                    after_total = total
+                    after = total
 
+        if not after:
+            return None
+
+        delta = lambda k: max(int(after.get(k) or 0) - int(before.get(k) or 0), 0)
+        # Codex input_tokens includes cached_input_tokens; subtract so cache isn't billed at the base rate too.
+        prompt = max(delta('input_tokens') - delta('cached_input_tokens'), 0)
+        completion = delta('output_tokens') + delta('reasoning_output_tokens')
+        cache_read = delta('cached_input_tokens')
     except Exception:
         return None
 
-    if not after_total:
-        return None
-
-    def _g(d, k):
-        return int(d.get(k) or 0)
-
-    before = before_total or {}
-    delta_input    = _g(after_total, 'input_tokens')           - _g(before, 'input_tokens')
-    delta_cached   = _g(after_total, 'cached_input_tokens')    - _g(before, 'cached_input_tokens')
-    delta_output   = _g(after_total, 'output_tokens')          - _g(before, 'output_tokens')
-    delta_reason   = _g(after_total, 'reasoning_output_tokens')- _g(before, 'reasoning_output_tokens')
-
-    # Codex's input_tokens INCLUDES cached_input_tokens — strip cache out so the
-    # gateway charges fresh input at the base rate and cache reads at the cache
-    # rate, instead of double-billing cache through input.
-    prompt_tokens     = max(delta_input - delta_cached, 0)
-    completion_tokens = max(delta_output + delta_reason, 0)
-    cache_read        = max(delta_cached, 0)
-
-    if not (prompt_tokens or completion_tokens or cache_read):
+    if not (prompt or completion or cache_read):
         return None
 
     return {
-        'prompt_tokens': prompt_tokens,
-        'completion_tokens': completion_tokens,
+        'prompt_tokens': prompt,
+        'completion_tokens': completion,
         'cache_read_input_tokens': cache_read,
         'cache_creation_input_tokens': 0,
-        'total_tokens': prompt_tokens + completion_tokens + cache_read,
+        'total_tokens': prompt + completion + cache_read,
     }
 
 
