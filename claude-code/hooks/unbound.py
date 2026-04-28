@@ -938,6 +938,9 @@ def get_api_key():
             return json.loads(f.read()).get('api_key')
     except FileNotFoundError:
         return None
+    except json.JSONDecodeError as e:
+        log_error(f"~/.unbound/config.json is not valid JSON: {e}", 'config')
+        return None
     except Exception as e:
         log_error(f"Failed to read config file: {e}", 'config')
         return None
