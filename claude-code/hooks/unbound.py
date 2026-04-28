@@ -921,9 +921,31 @@ def process_stop_event(event: Dict, api_key: str):
             save_logs(remaining_logs)
 
 
+def get_api_key():
+    """Read API key from env, falling back to ~/.unbound/config.json.
+
+    Claude Desktop (and other GUI launchers) spawn the hook via launchd, which
+    doesn't inherit shell-profile env vars — same root cause as the
+    cursor-from-Finder issue. setup.py already writes the key to
+    ~/.unbound/config.json, so use it as a tier-2 lookup.
+    """
+    key = os.getenv('UNBOUND_CLAUDE_API_KEY')
+    if key:
+        return key
+    try:
+        config_file = Path.home() / ".unbound" / "config.json"
+        with open(config_file, 'r', encoding='utf-8') as f:
+            return json.loads(f.read()).get('api_key')
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log_error(f"Failed to read config file: {e}", 'config')
+        return None
+
+
 def main():
     global _cached_api_key
-    api_key = os.getenv('UNBOUND_CLAUDE_API_KEY')
+    api_key = get_api_key()
     _cached_api_key = api_key
     
     try:
