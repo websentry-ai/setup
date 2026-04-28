@@ -770,6 +770,55 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
     return tool_uses
 
 
+def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
+    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
+    if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
+        return None
+
+    before, after = {}, {}
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = entry.get('payload') or {}
+                if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                    continue
+                total = (payload.get('info') or {}).get('total_token_usage')
+                if not total:
+                    continue
+                if entry.get('timestamp', '') < user_prompt_timestamp:
+                    before = total
+                else:
+                    after = total
+
+        if not after:
+            return None
+
+        delta = lambda k: max(int(after.get(k) or 0) - int(before.get(k) or 0), 0)
+        # Codex input_tokens includes cached_input_tokens; subtract so cache isn't billed at the base rate too.
+        prompt = max(delta('input_tokens') - delta('cached_input_tokens'), 0)
+        completion = delta('output_tokens') + delta('reasoning_output_tokens')
+        cache_read = delta('cached_input_tokens')
+    except Exception:
+        return None
+
+    if not (prompt or completion or cache_read):
+        return None
+
+    return {
+        'prompt_tokens': prompt,
+        'completion_tokens': completion,
+        'cache_read_input_tokens': cache_read,
+        'cache_creation_input_tokens': 0,
+        'total_tokens': prompt + completion + cache_read,
+    }
+
+
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
@@ -816,6 +865,10 @@ def process_stop_event(event: Dict, api_key: str):
         'messages': messages,
         'permission_mode': permission_mode or 'default'
     }
+
+    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
+    if usage:
+        exchange['usage'] = usage
 
     success = send_to_api(exchange, api_key)
 
