@@ -83,14 +83,17 @@ def report_error_to_gateway(message, category='general', api_key=None):
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
             'hook_source': 'cursor',
         })
-        subprocess.Popen(
+        proc = subprocess.Popen(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", payload,
+             "--data-binary", "@-",
              f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
+            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
+        proc.stdin.write(payload.encode())
+        proc.stdin.close()
     except Exception:
         pass
     finally:
@@ -265,7 +268,8 @@ def send_to_hook_api(request_body, api_key):
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", data, url],
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=20
         )
@@ -348,7 +352,8 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
                 ["curl", "-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
-                 "-d", body, url],
+                 "--data-binary", "@-", url],
+                input=body.encode(),
                 capture_output=True,
                 timeout=10
             )
@@ -760,8 +765,11 @@ def send_to_api(exchange, api_key):
         data = json.dumps(exchange)
         
         result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST", "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json", "-d", data, url],
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=10
         )
