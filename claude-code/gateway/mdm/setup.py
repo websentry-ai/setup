@@ -349,8 +349,8 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
 
     try:
         result = subprocess.run(
-            ["curl", "-fsSL", "-K", "-", "-w", "\n%{http_code}", url],
-            input=f'header = "Authorization: Bearer {auth_api_key}"\n',
+            ["curl", "-fsSL", "-w", "\n%{http_code}",
+             "-H", f"Authorization: Bearer {auth_api_key}", url],
             capture_output=True,
             text=True,
             timeout=30
@@ -737,9 +737,10 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         data = json.dumps({"tool_type": tool_type})
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
+             "-H", f"X-API-KEY: {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", data, "--config", "-", url],
-            input=f'header = "X-API-KEY: {api_key}"\n'.encode(),
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=10,
         )
