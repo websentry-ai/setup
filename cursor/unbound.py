@@ -83,16 +83,14 @@ def report_error_to_gateway(message, category='general', api_key=None):
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
             'hook_source': 'cursor',
         })
-        proc = subprocess.Popen(
-            ["curl", "-fsSL", "-K", "-", "-X", "POST",
+        subprocess.Popen(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
              "-d", payload,
              f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
-            stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        proc.stdin.write(f'header = "Authorization: Bearer {api_key}"\n'.encode())
-        proc.stdin.close()
     except Exception:
         pass
     finally:
