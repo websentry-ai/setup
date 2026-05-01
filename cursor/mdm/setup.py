@@ -35,6 +35,77 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
+def _run_as_user(username, fn, *args, **kwargs):
+    """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
+    Returns whatever fn returns on success, or None on failure.
+
+    Security-critical primitive: any MDM op that writes inside a user's
+    home dir must go through this. Running file ops as root against
+    attacker-controlled paths invites symlink-following privilege
+    escalation (e.g. `ln -s /Library/LaunchDaemons ~/.unbound` redirecting
+    a root chmod/chown). After privilege drop, symlinks targeting
+    root-only paths fail naturally with EACCES.
+
+    On Windows (no fork, single-user MDM context, not vulnerable to this
+    class), executes fn directly.
+    """
+    if platform.system().lower() == "windows":
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+    if pwd is None:
+        return None
+    try:
+        info = pwd.getpwnam(username)
+    except KeyError:
+        return None
+    uid, gid = info.pw_uid, info.pw_gid
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            result = fn(*args, **kwargs)
+            import pickle
+            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+            os.close(w_fd)
+            os._exit(0)
+        except Exception:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+            os._exit(1)
+    else:
+        os.close(w_fd)
+        data = b''
+        while True:
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        os.close(r_fd)
+        try:
+            _, status = os.waitpid(pid, 0)
+        except OSError:
+            return None
+        if os.WEXITSTATUS(status) != 0:
+            return None
+        try:
+            import pickle
+            return pickle.loads(data) if data else None
+        except Exception:
+            return None
+
+
 def get_enterprise_hooks_dir() -> Path:
     """Get the enterprise-managed hooks directory based on OS."""
     system = platform.system().lower()
@@ -197,17 +268,14 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> bool:
-    """Write API key to user's ~/.unbound/config.json (shared with unbound-cli)."""
+    """Write API key to user's ~/.unbound/config.json (shared with unbound-cli).
+    On Unix, drops privileges to the target user before any FS op — prevents
+    symlink-following privilege escalation."""
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
-    try:
-        if platform.system().lower() == "windows":
-            config_dir.mkdir(parents=True, exist_ok=True)
-        else:
-            user_info = pwd.getpwnam(username)
-            uid, gid = user_info.pw_uid, user_info.pw_gid
-            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            os.chown(config_dir, uid, gid)
+
+    def _write():
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         config = {}
         if config_file.exists():
             try:
@@ -216,15 +284,17 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
-        with open(config_file, 'w', encoding='utf-8') as f:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(str(config_file), flags, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
-        if platform.system().lower() != "windows":
-            os.chmod(config_file, 0o600)
-            os.chown(config_file, uid, gid)
         return True
-    except Exception as e:
-        debug_print(f"Failed to write config for {username}: {e}")
+
+    result = _run_as_user(username, _write)
+    if not result:
+        debug_print(f"Failed to write config for {username}")
         return False
+    return True
 
 
 def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
@@ -331,40 +401,36 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
         changed_count = 0
         export_line = f'export {var_name}="{value}"'
 
-        # Set environment variable for each user
+        # Set environment variable for each user (privilege-dropped per user)
         for username, home_dir in user_homes:
             debug_print(f"Setting env var for user: {username}")
 
-            # Get user's UID and GID for proper file ownership
-            try:
-                user_info = pwd.getpwnam(username)
-                uid = user_info.pw_uid
-                gid = user_info.pw_gid
-            except KeyError:
-                debug_print(f"Could not get UID/GID for {username}")
-                continue
-
-            # Try both zsh and bash profiles
             rc_files = [
                 home_dir / ".zprofile",
                 home_dir / ".bash_profile"
             ]
             debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
 
-            user_success = False
-            user_changed = False
-            for rc_file in rc_files:
-                try:
-                    exists_already = check_env_var_exists(rc_file, var_name, value)
-                    if append_to_file(rc_file, export_line, var_name):
-                        # Set correct ownership (important when running as root)
-                        os.chown(rc_file, uid, gid)
-                        debug_print(f"Updated {rc_file} for {username}")
-                        user_success = True
-                        if not exists_already:
-                            user_changed = True
-                except Exception as e:
-                    debug_print(f"Failed to update {rc_file}: {e}")
+            def _do_user_writes(_rc_files=rc_files):
+                _success = False
+                _changed = False
+                for rc_file in _rc_files:
+                    try:
+                        exists_already = check_env_var_exists(rc_file, var_name, value)
+                        if append_to_file(rc_file, export_line, var_name):
+                            debug_print(f"Updated {rc_file}")
+                            _success = True
+                            if not exists_already:
+                                _changed = True
+                    except Exception as e:
+                        debug_print(f"Failed to update {rc_file}: {e}")
+                return _success, _changed
+
+            result = _run_as_user(username, _do_user_writes)
+            if result is None:
+                debug_print(f"Could not set env var for {username}")
+                continue
+            user_success, user_changed = result
 
             if user_success:
                 success_count += 1
@@ -384,43 +450,36 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
 
 
 def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
-    """Remove environment variable from a user's shell rc files."""
-    try:
-        rc_files = [
-            home_dir / ".zprofile",
-            home_dir / ".bash_profile"
-        ]
+    """Remove environment variable from a user's shell rc files.
+    Privilege-drops to the user before any FS op."""
+    rc_files = [
+        home_dir / ".zprofile",
+        home_dir / ".bash_profile"
+    ]
+    export_prefix = f"export {var_name}="
 
+    def _remove():
         success = False
-        export_prefix = f"export {var_name}="
-
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
-
             try:
                 with open(rc_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
-
                 new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
-
                 if len(new_lines) < len(lines):
-                    with open(rc_file, 'w', encoding='utf-8') as f:
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+                    fd = os.open(str(rc_file), flags, 0o644)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
-
-                    # Set correct ownership
-                    user_info = pwd.getpwnam(username)
-                    os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
-
                     debug_print(f"Removed {var_name} from {rc_file}")
                     success = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-
         return success
-    except Exception as e:
-        debug_print(f"Error removing env var for {username}: {e}")
-        return False
+
+    result = _run_as_user(username, _remove)
+    return bool(result)
 
 
 def set_env_var_unix(var_name: str, value: str) -> Tuple[bool, bool]:
