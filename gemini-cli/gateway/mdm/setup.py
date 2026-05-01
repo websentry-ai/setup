@@ -22,6 +22,77 @@ def debug_print(message: str) -> None:
         print(f"[DEBUG] {message}")
 
 
+def _run_as_user(username, fn, *args, **kwargs):
+    """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
+    Returns whatever fn returns on success, or None on failure.
+
+    Security-critical primitive: any MDM op that writes inside a user's
+    home dir must go through this. Running file ops as root against
+    attacker-controlled paths invites symlink-following privilege
+    escalation (e.g. `ln -s /Library/LaunchDaemons ~/.unbound` redirecting
+    a root chmod/chown). After privilege drop, symlinks targeting
+    root-only paths fail naturally with EACCES.
+
+    On Windows (no fork, single-user MDM context, not vulnerable to this
+    class), executes fn directly.
+    """
+    if platform.system().lower() == "windows":
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+    if pwd is None:
+        return None
+    try:
+        info = pwd.getpwnam(username)
+    except KeyError:
+        return None
+    uid, gid = info.pw_uid, info.pw_gid
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            result = fn(*args, **kwargs)
+            import pickle
+            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+            os.close(w_fd)
+            os._exit(0)
+        except Exception:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+            os._exit(1)
+    else:
+        os.close(w_fd)
+        data = b''
+        while True:
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        os.close(r_fd)
+        try:
+            _, status = os.waitpid(pid, 0)
+        except OSError:
+            return None
+        if os.WEXITSTATUS(status) != 0:
+            return None
+        try:
+            import pickle
+            return pickle.loads(data) if data else None
+        except Exception:
+            return None
+
+
 def normalize_url(value: str) -> str:
     value = (value or "").strip()
     if not value:
@@ -239,80 +310,52 @@ def check_env_var_exists(rc_file: Path, var_name: str, value: str) -> bool:
 
 
 def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: str) -> Tuple[bool, bool]:
+    """Set env var in user's shell rc files. Privilege-drops on Unix."""
     system = platform.system().lower()
-    try:
-        if system == "darwin":
-            rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
-            debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
-            user_success = False
-            user_changed = False
-            export_line = f'export {var_name}="{value}"'
 
-            for rc_file in rc_files:
-                try:
-                    exists_already = check_env_var_exists(rc_file, var_name, value)
-                    if append_to_file(rc_file, export_line, var_name):
-                        try:
-                            user_info = pwd.getpwnam(username)
-                            os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
-                            os.chmod(rc_file, 0o644)
-                        except Exception as e:
-                            debug_print(f"Failed to set ownership on {rc_file}: {e}")
+    if system == "windows":
+        debug_print(f"Writing to system registry (Windows)")
+        try:
+            subprocess.run(
+                ["setx", var_name, value, "/M"],
+                check=False, capture_output=True, timeout=10,
+            )
+            debug_print(f"Set {var_name} system-wide on Windows")
+            return True, True
+        except Exception as e:
+            debug_print(f"Failed to set {var_name} on Windows: {e}")
+            return False, False
 
-                        debug_print(f"Updated {rc_file} for {username}")
-                        user_success = True
-                        if not exists_already:
-                            user_changed = True
-                except Exception as e:
-                    debug_print(f"Failed to update {rc_file}: {e}")
-
-            return user_success, user_changed
-
-        elif system == "linux":
-            rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
-            debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
-            user_success = False
-            user_changed = False
-            export_line = f'export {var_name}="{value}"'
-
-            for rc_file in rc_files:
-                try:
-                    exists_already = check_env_var_exists(rc_file, var_name, value)
-                    if append_to_file(rc_file, export_line, var_name):
-                        try:
-                            user_info = pwd.getpwnam(username)
-                            os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
-                            os.chmod(rc_file, 0o644)
-                        except Exception as e:
-                            debug_print(f"Failed to set ownership on {rc_file}: {e}")
-
-                        debug_print(f"Updated {rc_file} for {username}")
-                        user_success = True
-                        if not exists_already:
-                            user_changed = True
-                except Exception as e:
-                    debug_print(f"Failed to update {rc_file}: {e}")
-
-            return user_success, user_changed
-
-        elif system == "windows":
-            debug_print(f"Writing to system registry (Windows)")
-            try:
-                subprocess.run(
-                    ["setx", var_name, value, "/M"],
-                    check=False,
-                    capture_output=True,
-                    timeout=10
-                )
-                debug_print(f"Set {var_name} system-wide on Windows")
-                return True, True
-            except Exception as e:
-                debug_print(f"Failed to set {var_name} on Windows: {e}")
-                return False, False
-
-    except Exception as e:
-        debug_print(f"Error setting env var for {username}: {e}")
+    if system == "darwin":
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+    elif system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
         return False, False
+
+    debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
+    export_line = f'export {var_name}="{value}"'
+
+    def _do():
+        _success = False
+        _changed = False
+        for rc_file in rc_files:
+            try:
+                exists_already = check_env_var_exists(rc_file, var_name, value)
+                if append_to_file(rc_file, export_line, var_name):
+                    debug_print(f"Updated {rc_file}")
+                    _success = True
+                    if not exists_already:
+                        _changed = True
+            except Exception as e:
+                debug_print(f"Failed to update {rc_file}: {e}")
+        return _success, _changed
+
+    result = _run_as_user(username, _do)
+    if result is None:
+        debug_print(f"Could not set env var for {username}")
+        return False, False
+    return result
 
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
@@ -407,112 +450,63 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
 
 
 def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
+    """Remove env var from user's shell rc files. Privilege-drops on Unix."""
     system = platform.system().lower()
-    try:
-        if system == "darwin":
-            rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
-            success = False
-            export_prefix = f"export {var_name}="
 
-            for rc_file in rc_files:
-                if not rc_file.exists():
-                    continue
+    if system == "windows":
+        try:
+            subprocess.run(
+                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
+                check=False, capture_output=True, timeout=10,
+            )
+            debug_print(f"Removed {var_name} from system environment")
+            return True
+        except Exception as e:
+            debug_print(f"Failed to remove {var_name}: {e}")
+            return False
 
-                try:
-                    with open(rc_file, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-
-                    new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
-
-                    if len(new_lines) < len(lines):
-                        with open(rc_file, 'w', encoding='utf-8') as f:
-                            f.writelines(new_lines)
-
-                        try:
-                            user_info = pwd.getpwnam(username)
-                            os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
-                        except Exception:
-                            pass
-
-                        debug_print(f"Removed {var_name} from {rc_file}")
-                        success = True
-                except Exception as e:
-                    debug_print(f"Failed to update {rc_file}: {e}")
-
-            return success
-
-        elif system == "linux":
-            rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
-            success = False
-            export_prefix = f"export {var_name}="
-
-            for rc_file in rc_files:
-                if not rc_file.exists():
-                    continue
-
-                try:
-                    with open(rc_file, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-
-                    new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
-
-                    if len(new_lines) < len(lines):
-                        with open(rc_file, 'w', encoding='utf-8') as f:
-                            f.writelines(new_lines)
-
-                        try:
-                            user_info = pwd.getpwnam(username)
-                            os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
-                        except Exception:
-                            pass
-
-                        debug_print(f"Removed {var_name} from {rc_file}")
-                        success = True
-                except Exception as e:
-                    debug_print(f"Failed to update {rc_file}: {e}")
-
-            return success
-
-        elif system == "windows":
-            try:
-                subprocess.run(
-                    ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
-                    check=False,
-                    capture_output=True,
-                    timeout=10
-                )
-                debug_print(f"Removed {var_name} from system environment")
-                return True
-            except Exception as e:
-                debug_print(f"Failed to remove {var_name}: {e}")
-                return False
-
-    except Exception as e:
-        debug_print(f"Error removing env var for {username}: {e}")
+    if system == "darwin":
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+    elif system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
         return False
+
+    export_prefix = f"export {var_name}="
+
+    def _do():
+        success = False
+        for rc_file in rc_files:
+            if not rc_file.exists():
+                continue
+            try:
+                with open(rc_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
+                if len(new_lines) < len(lines):
+                    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+                    fd = os.open(str(rc_file), flags, 0o644)
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.writelines(new_lines)
+                    debug_print(f"Removed {var_name} from {rc_file}")
+                    success = True
+            except Exception as e:
+                debug_print(f"Failed to update {rc_file}: {e}")
+        return success
+
+    return bool(_run_as_user(username, _do))
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
-    """Write API key to ~/.unbound/config.json for a given user."""
+    """Write API key to ~/.unbound/config.json for a given user.
+    Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
-    try:
-        if platform.system().lower() == "windows":
-            config_dir.mkdir(parents=True, exist_ok=True)
-            config = {}
-            if config_file.exists():
-                try:
-                    with open(config_file, 'r', encoding='utf-8') as f:
-                        config = json.loads(f.read())
-                except (json.JSONDecodeError, OSError):
-                    config = {}
-            config['api_key'] = api_key
-            with open(config_file, 'w', encoding='utf-8') as f:
-                f.write(json.dumps(config, indent=2))
-            return
 
+    def _write():
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(config_dir, 0o700)
+        if platform.system().lower() != "windows":
+            os.chmod(config_dir, 0o700)
         config = {}
         if config_file.exists():
             try:
@@ -521,17 +515,13 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
-        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
-        try:
-            user_info = pwd.getpwnam(username)
-            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
-            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
-        except Exception as e:
-            debug_print(f"Could not chown config files for {username}: {e}")
-    except Exception as e:
-        debug_print(f"Could not write config for {username}: {e}")
+
+    if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
+        debug_print(f"Could not write config for {username}")
 
 
 def clear_setup():
@@ -604,9 +594,10 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         data = json.dumps({"tool_type": tool_type})
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
+             "-H", f"X-API-KEY: {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", data, "--config", "-", url],
-            input=f'header = "X-API-KEY: {api_key}"\n'.encode(),
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=10,
         )

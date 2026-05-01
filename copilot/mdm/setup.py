@@ -41,6 +41,75 @@ def debug_print(message):
         print(f"[DEBUG] {message}")
 
 
+def _run_as_user(username, fn, *args, **kwargs):
+    """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
+    Returns whatever fn returns on success, or None on failure.
+
+    Security-critical primitive: any MDM op that writes inside a user's
+    home dir must go through this. Running file ops as root against
+    attacker-controlled paths invites symlink-following privilege
+    escalation (e.g. `ln -s /Library/LaunchDaemons ~/.unbound` redirecting
+    a root chmod/chown). After privilege drop, symlinks targeting
+    root-only paths fail naturally with EACCES.
+
+    On Windows (no fork, single-user MDM context, not vulnerable to this
+    class), executes fn directly.
+    """
+    if platform.system().lower() == "windows":
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+    try:
+        info = pwd.getpwnam(username)
+    except (KeyError, AttributeError):
+        return None
+    uid, gid = info.pw_uid, info.pw_gid
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            result = fn(*args, **kwargs)
+            import pickle
+            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+            os.close(w_fd)
+            os._exit(0)
+        except Exception:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+            os._exit(1)
+    else:
+        os.close(w_fd)
+        data = b''
+        while True:
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        os.close(r_fd)
+        try:
+            _, status = os.waitpid(pid, 0)
+        except OSError:
+            return None
+        if os.WEXITSTATUS(status) != 0:
+            return None
+        try:
+            import pickle
+            return pickle.loads(data) if data else None
+        except Exception:
+            return None
+
+
 def check_admin_privileges():
     try:
         system = platform.system().lower()
@@ -238,61 +307,62 @@ def check_env_var_exists(rc_file, var_name, value):
 
 
 def set_env_var_for_user(username, home_dir, var_name, value):
+    """Set an env var in the user's shell rc files. Privilege-drops on Unix."""
     system = platform.system().lower()
-    try:
-        if system == "darwin":
-            rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
-        elif system == "linux":
-            rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
-        elif system == "windows":
-            try:
-                subprocess.run(
-                    ["setx", var_name, value, "/M"],
-                    check=False, capture_output=True, timeout=10,
-                )
-                debug_print(f"Set {var_name} system-wide on Windows")
-                return True, True
-            except Exception as e:
-                debug_print(f"Failed to set {var_name} on Windows: {e}")
-                return False, False
-        else:
+
+    if system == "windows":
+        try:
+            subprocess.run(
+                ["setx", var_name, value, "/M"],
+                check=False, capture_output=True, timeout=10,
+            )
+            debug_print(f"Set {var_name} system-wide on Windows")
+            return True, True
+        except Exception as e:
+            debug_print(f"Failed to set {var_name} on Windows: {e}")
             return False, False
 
-        export_line = f'export {var_name}="{value}"'
-        user_success = False
-        user_changed = False
+    if system == "darwin":
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+    elif system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
+        return False, False
 
+    export_line = f'export {var_name}="{value}"'
+
+    def _do():
+        _success = False
+        _changed = False
         for rc_file in rc_files:
             try:
                 exists_already = check_env_var_exists(rc_file, var_name, value)
                 if append_to_file(rc_file, export_line, var_name):
-                    if system in ("darwin", "linux"):
-                        try:
-                            user_info = pwd.getpwnam(username)
-                            os.chown(rc_file, user_info.pw_uid, user_info.pw_gid)
-                            os.chmod(rc_file, 0o644)
-                        except Exception as e:
-                            debug_print(f"Failed to set ownership on {rc_file}: {e}")
-                    debug_print(f"Updated {rc_file} for {username}")
-                    user_success = True
+                    debug_print(f"Updated {rc_file}")
+                    _success = True
                     if not exists_already:
-                        user_changed = True
+                        _changed = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
+        return _success, _changed
 
-        return user_success, user_changed
-    except Exception as e:
-        debug_print(f"Error setting env var for {username}: {e}")
+    result = _run_as_user(username, _do)
+    if result is None:
+        debug_print(f"Could not set env var for {username}")
         return False, False
+    return result
 
 
 def write_unbound_config_for_user(username, home_dir, api_key):
-    """Write API key to ~/.unbound/config.json for a given user."""
+    """Write API key to ~/.unbound/config.json for a given user.
+    Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
-    try:
+
+    def _write():
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(config_dir, 0o700)
+        if platform.system().lower() != "windows":
+            os.chmod(config_dir, 0o700)
         config = {}
         if config_file.exists():
             try:
@@ -301,17 +371,13 @@ def write_unbound_config_for_user(username, home_dir, api_key):
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
-        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
-        try:
-            user_info = pwd.getpwnam(username)
-            os.chown(config_dir, user_info.pw_uid, user_info.pw_gid)
-            os.chown(config_file, user_info.pw_uid, user_info.pw_gid)
-        except Exception as e:
-            debug_print(f"Could not chown config files for {username}: {e}")
-    except Exception as e:
-        debug_print(f"Could not write config for {username}: {e}")
+
+    if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
+        debug_print(f"Could not write config for {username}")
 
 
 def set_env_var_system_wide(var_name, value):
@@ -822,8 +888,9 @@ def send_exchange(exchange, api_key):
              "-X", "POST",
              "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", body,
+             "--data-binary", "@-",
              get_gateway_endpoint()],
+            input=body,
             capture_output=True, text=True, timeout=30,
         )
         output_lines = result.stdout.strip().split("\n")
@@ -871,9 +938,10 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         data = json.dumps({"tool_type": tool_type})
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
+             "-H", f"X-API-KEY: {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", data, "--config", "-", url],
-            input=f'header = "X-API-KEY: {api_key}"\n'.encode(),
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=10,
         )

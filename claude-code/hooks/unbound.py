@@ -64,14 +64,15 @@ def report_error_to_gateway(message, category='general', api_key=None):
             'hook_source': 'claude-code',
         })
         proc = subprocess.Popen(
-            ["curl", "-fsSL", "-K", "-", "-X", "POST",
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", payload,
+             "--data-binary", "@-",
              f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        proc.stdin.write(f'header = "Authorization: Bearer {api_key}"\n'.encode())
+        proc.stdin.write(payload.encode())
         proc.stdin.close()
     except Exception:
         pass
@@ -420,10 +421,11 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
         data = json.dumps(request_body)
 
         result = subprocess.run(
-            ["curl", "-fsSL", "-K", "-", "-X", "POST",
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", data, url],
-            input=f'header = "Authorization: Bearer {api_key}"\n'.encode(),
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=20
         )
@@ -463,7 +465,8 @@ def poll_approval_status(api_key: str, policy_ids: list, application_id: str, re
                 ["curl", "-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
-                 "-d", body, url],
+                 "--data-binary", "@-", url],
+                input=body.encode(),
                 capture_output=True,
                 timeout=10
             )
@@ -817,9 +820,11 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
         data = json.dumps(exchange)
         
         result = subprocess.run(
-            ["curl", "-fsSL", "-K", "-", "-X", "POST",
-             "-H", "Content-Type: application/json", "-d", data, url],
-            input=f'header = "Authorization: Bearer {api_key}"\n'.encode(),
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=10
         )

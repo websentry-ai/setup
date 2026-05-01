@@ -459,9 +459,10 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         data = json.dumps({"tool_type": tool_type})
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
+             "-H", f"X-API-KEY: {api_key}",
              "-H", "Content-Type: application/json",
-             "-d", data, "--config", "-", url],
-            input=f'header = "X-API-KEY: {api_key}"\n'.encode(),
+             "--data-binary", "@-", url],
+            input=data.encode(),
             capture_output=True,
             timeout=10,
         )
