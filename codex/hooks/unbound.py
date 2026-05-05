@@ -447,9 +447,6 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
         return {}
 
     reason = api_response.get('reason', '') or 'Blocked by organization policy.'
-    additional_context = api_response.get('additionalContext', '')
-    if additional_context:
-        reason = f"{reason}\n\n{additional_context}"
 
     return {
         'hookSpecificOutput': {
