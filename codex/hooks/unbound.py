@@ -14,6 +14,7 @@ import hashlib
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
+CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
@@ -442,20 +443,16 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
         return {}
 
     decision = api_response.get('decision', 'allow')
-    reason = api_response.get('reason', '')
-    additional_context = api_response.get('additionalContext', '')
-
-    # Allow: return empty response
     if decision == 'allow':
         return {}
 
-    # Deny or Ask: use hookSpecificOutput with deny
+    reason = api_response.get('reason', '') or 'Blocked by organization policy.'
+
     return {
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': 'deny',
             'permissionDecisionReason': reason,
-            'additionalContext': additional_context
         }
     }
 
@@ -476,6 +473,78 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
         }
 
     return {}
+
+
+def _read_mcp_server_config(server_name, config_path):
+    """
+    Read an MCP server's config (url, command, args, type) from the codex
+    config.toml file. Returns a dict with only the fields needed for
+    fingerprinting, or None. Never includes env or headers (secrets).
+
+    Codex uses TOML with sections like [mcp_servers.<name>] or [mcpServers.<name>].
+    """
+    try:
+        if not config_path.exists():
+            return None
+        try:
+            import tomllib  # Python 3.11+
+            with open(config_path, 'rb') as f:
+                data = tomllib.load(f)
+        except ImportError:
+            return _read_mcp_server_config_regex(server_name, config_path)
+
+        servers = data.get('mcp_servers') or data.get('mcpServers')
+        if not isinstance(servers, dict):
+            return None
+        server = servers.get(server_name)
+        if not isinstance(server, dict):
+            return None
+        result = {}
+        if server.get('url'):
+            result['url'] = server['url']
+        if server.get('command'):
+            result['command'] = server['command']
+        if server.get('args'):
+            result['args'] = server['args']
+        if server.get('type'):
+            result['type'] = server['type']
+        return result if result else None
+    except Exception:
+        return None
+
+
+def _read_mcp_server_config_regex(server_name, config_path):
+    """Fallback TOML parser for Python <3.11. Handles only the keys we need."""
+    import re
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        section_re = re.compile(
+            r'\[mcp_?[Ss]ervers\.(?:"([^"]+)"|\'([^\']+)\'|([^\]\s]+))\][^\n]*\n(.*?)(?=\n\s*\[|\Z)',
+            re.MULTILINE | re.DOTALL,
+        )
+        for m in section_re.finditer(content):
+            name = m.group(1) or m.group(2) or m.group(3)
+            if name != server_name:
+                continue
+            body = m.group(4)
+            result = {}
+            for key in ('url', 'command', 'type'):
+                km = re.search(rf'^\s*{key}\s*=\s*"([^"]*)"', body, re.MULTILINE)
+                if not km:
+                    km = re.search(rf"^\s*{key}\s*=\s*'([^']*)'", body, re.MULTILINE)
+                if km:
+                    result[key] = km.group(1)
+            args_match = re.search(r'^\s*args\s*=\s*\[([^\]]*)\]', body, re.MULTILINE | re.DOTALL)
+            if args_match:
+                items = re.findall(r'"([^"]*)"|\'([^\']*)\'', args_match.group(1))
+                args = [a or b for a, b in items]
+                if args:
+                    result['args'] = args
+            return result if result else None
+        return None
+    except Exception:
+        return None
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
@@ -509,8 +578,14 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
         parts = tool_name[len(MCP_TOOL_PREFIX):].split('__', 1)
-        metadata['mcp_server'] = parts[0] if len(parts) >= 1 else ''
+        mcp_server = parts[0] if len(parts) >= 1 else ''
+        metadata['mcp_server'] = mcp_server
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
+
+        if mcp_server:
+            server_cfg = _read_mcp_server_config(mcp_server, CODEX_CONFIG_PATH)
+            if server_cfg:
+                metadata['mcp_server_config'] = server_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
