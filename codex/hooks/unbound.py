@@ -520,7 +520,7 @@ def _read_mcp_server_config_regex(server_name, config_path):
         with open(config_path, 'r', encoding='utf-8') as f:
             content = f.read()
         section_re = re.compile(
-            r'\[mcp_?[Ss]ervers\.(?:"([^"]+)"|\'([^\']+)\'|([^\]\s]+))\]\s*\n(.*?)(?=\n\s*\[|\Z)',
+            r'\[mcp_?[Ss]ervers\.(?:"([^"]+)"|\'([^\']+)\'|([^\]\s]+))\][^\n]*\n(.*?)(?=\n\s*\[|\Z)',
             re.MULTILINE | re.DOTALL,
         )
         for m in section_re.finditer(content):
