@@ -761,10 +761,10 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
             return resp.getcode(), resp.read()
     except urllib.error.HTTPError as e:
         try:
-            body = e.read()
+            error_body = e.read()
         except Exception:
-            body = b''
-        return e.code, body
+            error_body = b''
+        return e.code, error_body
     except (urllib.error.URLError, OSError) as e:
         print(f"[backfill] HTTP request failed: {e}", file=sys.stderr)
         return 0, b''

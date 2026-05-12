@@ -875,7 +875,6 @@ def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
     permission_mode = None
     model = None
     earliest_ts = None
-    latest_ts = None
     user_prompts = []
     assistant_texts = []
     assistant_tool_uses = []
@@ -894,11 +893,8 @@ def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
                     continue
 
                 entry_ts = entry.get('timestamp')
-                if entry_ts:
-                    if earliest_ts is None or entry_ts < earliest_ts:
-                        earliest_ts = entry_ts
-                    if latest_ts is None or entry_ts > latest_ts:
-                        latest_ts = entry_ts
+                if entry_ts and (earliest_ts is None or entry_ts < earliest_ts):
+                    earliest_ts = entry_ts
 
                 if not session_id:
                     session_id = entry.get('sessionId') or entry.get('session_id')
@@ -988,8 +984,6 @@ def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
     }
     if any(usage.values()):
         record['usage'] = {**usage, 'total_tokens': sum(usage.values())}
-    if latest_ts:
-        record['end_timestamp'] = latest_ts
 
     return {'session_id': session_id, 'records': [record]}
 
@@ -1043,10 +1037,10 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
             return resp.getcode(), resp.read()
     except urllib.error.HTTPError as e:
         try:
-            body = e.read()
+            error_body = e.read()
         except Exception:
-            body = b''
-        return e.code, body
+            error_body = b''
+        return e.code, error_body
     except (urllib.error.URLError, OSError) as e:
         print(f"[backfill] HTTP request failed: {e}", file=sys.stderr)
         return 0, b''
