@@ -24,7 +24,6 @@ BACKFILL_TOOL_TYPE = "claude-code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
-BACKFILL_FIELD_MAX_BYTES = 64 * 1024
 
 
 def normalize_url(value: str) -> str:
@@ -857,29 +856,13 @@ def clear_setup():
     print("=" * 60)
 
 
-def _backfill_truncate(value, limit: int = BACKFILL_FIELD_MAX_BYTES):
-    if isinstance(value, str):
-        encoded = value.encode('utf-8', errors='replace')
-        if len(encoded) <= limit:
-            return value
-        return encoded[:limit].decode('utf-8', errors='ignore')
-    if isinstance(value, dict):
-        return {k: _backfill_truncate(v, limit) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_backfill_truncate(v, limit) for v in value]
-    return value
-
-
-def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
+def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
+    """Read a transcript and return {session_id, entries} for server-side parsing.
+    The client only JSON-decodes lines and pulls a session id — all semantic
+    parsing happens server-side in
+    webapp.services.coding_tools_backfill_service."""
+    entries = []
     session_id = None
-    permission_mode = None
-    model = None
-    earliest_ts = None
-    user_prompts = []
-    assistant_texts = []
-    assistant_tool_uses = []
-    usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
-
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for lineno, line in enumerate(f):
@@ -891,101 +874,19 @@ def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
-                entry_ts = entry.get('timestamp')
-                if entry_ts and (earliest_ts is None or entry_ts < earliest_ts):
-                    earliest_ts = entry_ts
-
+                entries.append(entry)
                 if not session_id:
-                    session_id = entry.get('sessionId') or entry.get('session_id')
-
-                entry_type = entry.get('type', '')
-                message = entry.get('message') or {}
-
-                if entry_type == 'user' and message.get('role') == 'user':
-                    content = message.get('content', '')
-                    if isinstance(content, str):
-                        if content:
-                            user_prompts.append(_backfill_truncate(content))
-                    elif isinstance(content, list):
-                        for item in content:
-                            if isinstance(item, dict) and item.get('type') == 'tool_result':
-                                tool_use_id = item.get('tool_use_id')
-                                output = item.get('content', '')
-                                for tu in assistant_tool_uses:
-                                    if tu.get('_tool_use_id') == tool_use_id:
-                                        if isinstance(output, dict):
-                                            tu['tool_response'] = _backfill_truncate(output)
-                                        else:
-                                            tu['tool_response'] = {'content': _backfill_truncate(output)}
-                                        break
-
-                elif entry_type == 'assistant' and message.get('role') == 'assistant':
-                    if not model:
-                        model = message.get('model')
-                    for content_item in message.get('content', []) or []:
-                        if not isinstance(content_item, dict):
-                            continue
-                        item_type = content_item.get('type')
-                        if item_type == 'text':
-                            text = content_item.get('text', '')
-                            if text:
-                                assistant_texts.append(_backfill_truncate(text))
-                        elif item_type == 'tool_use':
-                            assistant_tool_uses.append({
-                                'type': 'PostToolUse',
-                                'tool_name': content_item.get('name', ''),
-                                'tool_input': _backfill_truncate(content_item.get('input', {}) or {}),
-                                'tool_response': {},
-                                '_tool_use_id': content_item.get('id', ''),
-                            })
-                    msg_usage = message.get('usage') or {}
-                    if msg_usage:
-                        for k in usage:
-                            try:
-                                usage[k] += int(msg_usage.get(k) or 0)
-                            except (TypeError, ValueError):
-                                pass
-
-                if not permission_mode:
-                    permission_mode = entry.get('permission_mode')
+                    sid = entry.get('sessionId') or entry.get('session_id')
+                    if sid:
+                        session_id = sid
     except (OSError, UnicodeDecodeError):
         return None
     except Exception:
         return None
 
-    # No filename-stem fallback — corrupted files are skipped.
-    if not session_id:
+    if not session_id or not entries:
         return None
-
-    if not (user_prompts or assistant_texts or assistant_tool_uses):
-        return None
-
-    messages = []
-    if user_prompts:
-        messages.append({'role': 'user', 'content': '\n\n'.join(user_prompts)})
-    if assistant_texts or assistant_tool_uses:
-        assistant_msg = {'role': 'assistant', 'content': '\n\n'.join(assistant_texts)}
-        if assistant_tool_uses:
-            for tu in assistant_tool_uses:
-                tu.pop('_tool_use_id', None)
-            assistant_msg['tool_use'] = assistant_tool_uses
-        messages.append(assistant_msg)
-
-    if len(messages) < 2:
-        return None
-
-    record = {
-        'conversation_id': session_id,
-        'model': model or 'auto',
-        'messages': messages,
-        'permission_mode': permission_mode or 'default',
-        'timestamp': earliest_ts or '',
-    }
-    if any(usage.values()):
-        record['usage'] = {**usage, 'total_tokens': sum(usage.values())}
-
-    return {'session_id': session_id, 'records': [record]}
+    return {'session_id': session_id, 'entries': entries}
 
 
 def _backfill_iter_transcripts(root: Path):
@@ -1012,7 +913,7 @@ def _backfill_collect_sessions(home_dir: Path) -> List[Dict]:
     for transcript_path in sorted(_backfill_iter_transcripts(projects_root)):
         if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
             break
-        session = _backfill_parse_transcript(transcript_path)
+        session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
     return sessions

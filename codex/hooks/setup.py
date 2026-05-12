@@ -28,7 +28,6 @@ BACKFILL_TOOL_TYPE = "codex"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
-BACKFILL_FIELD_MAX_BYTES = 64 * 1024
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -662,35 +661,20 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-def _backfill_truncate(value, limit: int = BACKFILL_FIELD_MAX_BYTES):
-    if isinstance(value, str):
-        encoded = value.encode('utf-8', errors='replace')
-        if len(encoded) <= limit:
-            return value
-        return encoded[:limit].decode('utf-8', errors='ignore')
-    if isinstance(value, dict):
-        return {k: _backfill_truncate(v, limit) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_backfill_truncate(v, limit) for v in value]
-    return value
-
-
 def _backfill_session_id_from_filename(transcript_path: Path) -> Optional[str]:
     # Only `rollout-<isots>-<uuid>.jsonl` — never a generic stem fallback.
     m = ROLLOUT_FILENAME_RE.match(transcript_path.stem)
     return m.group(1) if m else None
 
 
-def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
+def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
+    """Read a transcript and return {session_id, entries} for server-side parsing.
+    The client only JSON-decodes lines and resolves a session id (preferring
+    the session_meta payload, falling back to the rollout filename UUID). All
+    semantic parsing happens server-side in
+    webapp.services.coding_tools_backfill_service."""
+    entries = []
     session_id = None
-    model = None
-    earliest_ts = None
-    user_prompts = []
-    assistant_texts = []
-    function_calls: Dict[str, Dict] = {}
-    function_outputs: Dict[str, str] = {}
-    last_total = {}
-
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for lineno, line in enumerate(f):
@@ -702,63 +686,14 @@ def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
                     entry = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-
-                entry_ts = entry.get('timestamp')
-                if entry_ts and (earliest_ts is None or entry_ts < earliest_ts):
-                    earliest_ts = entry_ts
-
-                payload = entry.get('payload') or {}
+                entries.append(entry)
                 if not session_id:
-                    session_id = (
-                        entry.get('sessionId')
-                        or entry.get('session_id')
-                        or payload.get('id')
-                        or payload.get('session_id')
-                    )
-                if not model:
-                    model = payload.get('model') or entry.get('model')
-
-                entry_type = entry.get('type')
-
-                if entry_type == 'response_item':
-                    item_type = payload.get('type', '')
-                    call_id = payload.get('call_id', '')
-
-                    if item_type == 'message':
-                        role = payload.get('role', '')
-                        content_list = payload.get('content', []) or []
-                        text_parts = []
-                        for c in content_list:
-                            if isinstance(c, dict):
-                                text = c.get('text') or c.get('content') or ''
-                                if text:
-                                    text_parts.append(text)
-                        joined = '\n\n'.join(text_parts)
-                        if joined:
-                            if role == 'user':
-                                user_prompts.append(_backfill_truncate(joined))
-                            elif role == 'assistant':
-                                assistant_texts.append(_backfill_truncate(joined))
-
-                    elif item_type == 'function_call' and call_id:
-                        args = payload.get('arguments', '')
-                        if isinstance(args, str):
-                            try:
-                                args = json.loads(args)
-                            except json.JSONDecodeError:
-                                args = {'command': args}
-                        function_calls[call_id] = {
-                            'name': payload.get('name', ''),
-                            'arguments': args,
-                        }
-
-                    elif item_type == 'function_call_output' and call_id:
-                        function_outputs[call_id] = payload.get('output', '')
-
-                elif entry_type == 'event_msg' and payload.get('type') == 'token_count':
-                    total = (payload.get('info') or {}).get('total_token_usage')
-                    if total:
-                        last_total = total
+                    sid = entry.get('sessionId') or entry.get('session_id')
+                    payload = entry.get('payload')
+                    if not sid and isinstance(payload, dict):
+                        sid = payload.get('id') or payload.get('session_id')
+                    if sid:
+                        session_id = sid
     except (OSError, UnicodeDecodeError):
         return None
     except Exception:
@@ -768,84 +703,10 @@ def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
     # never fall back to a generic stem.
     if not session_id:
         session_id = _backfill_session_id_from_filename(transcript_path)
-        if not session_id:
-            return None
 
-    assistant_tool_uses = []
-    for call_id, call_data in function_calls.items():
-        name = call_data.get('name', '')
-        args = call_data.get('arguments', {})
-        output = function_outputs.get(call_id, '')
-
-        if name == 'exec_command':
-            tool_name = 'Bash'
-            tool_input = {'command': args.get('cmd', '') if isinstance(args, dict) else str(args)}
-            stdout = output
-            exit_code = 0
-            if 'Output:\n' in output:
-                stdout = output.split('Output:\n', 1)[1].rstrip()
-            if 'Process exited with code ' in output:
-                try:
-                    code_str = output.split('Process exited with code ')[1].split('\n')[0].strip()
-                    exit_code = int(code_str)
-                except (ValueError, IndexError):
-                    pass
-            tool_response = {'stdout': _backfill_truncate(stdout), 'exitCode': exit_code}
-        else:
-            tool_name = name
-            tool_input = args if isinstance(args, dict) else {'command': str(args)}
-            tool_response = {'stdout': _backfill_truncate(output)}
-
-        assistant_tool_uses.append({
-            'type': 'PostToolUse',
-            'tool_name': tool_name,
-            'tool_input': _backfill_truncate(tool_input),
-            'tool_response': tool_response,
-        })
-
-    if not (user_prompts or assistant_texts or assistant_tool_uses):
+    if not session_id or not entries:
         return None
-
-    user_content = '\n\n'.join(user_prompts) if user_prompts else ''
-    assistant_content = '\n\n'.join(assistant_texts) if assistant_texts else ''
-
-    messages = []
-    if user_content:
-        messages.append({'role': 'user', 'content': user_content})
-    if assistant_content or assistant_tool_uses:
-        assistant_msg = {'role': 'assistant', 'content': assistant_content}
-        if assistant_tool_uses:
-            assistant_msg['tool_use'] = assistant_tool_uses
-        messages.append(assistant_msg)
-
-    if len(messages) < 2:
-        return None
-
-    record = {
-        'conversation_id': session_id,
-        'model': model or 'auto',
-        'messages': messages,
-        'permission_mode': 'default',
-        'timestamp': earliest_ts or '',
-    }
-
-    if last_total:
-        try:
-            prompt = max(int(last_total.get('input_tokens') or 0) - int(last_total.get('cached_input_tokens') or 0), 0)
-            completion = int(last_total.get('output_tokens') or 0) + int(last_total.get('reasoning_output_tokens') or 0)
-            cache_read = int(last_total.get('cached_input_tokens') or 0)
-            if prompt or completion or cache_read:
-                record['usage'] = {
-                    'prompt_tokens': prompt,
-                    'completion_tokens': completion,
-                    'cache_read_input_tokens': cache_read,
-                    'cache_creation_input_tokens': 0,
-                    'total_tokens': prompt + completion + cache_read,
-                }
-        except (TypeError, ValueError):
-            pass
-
-    return {'session_id': session_id, 'records': [record]}
+    return {'session_id': session_id, 'entries': entries}
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -969,7 +830,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
             if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                 print(f"[backfill] Reached session cap of {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining transcripts skipped.", file=sys.stderr)
                 break
-            session = _backfill_parse_transcript(transcript_path)
+            session = _backfill_collect_session(transcript_path)
             if session:
                 sessions.append(session)
 
