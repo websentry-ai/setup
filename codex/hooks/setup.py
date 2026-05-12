@@ -8,9 +8,11 @@ import sys
 import platform
 import subprocess
 import urllib.parse
+import urllib.request
+import urllib.error
 import webbrowser
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, List
 import threading
 import http.server
 import socketserver
@@ -20,6 +22,17 @@ import json
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+
+BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
+BACKFILL_TOOL_TYPE = "codex"
+BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
+BACKFILL_MAX_LINES_PER_FILE = 50000
+BACKFILL_MAX_SESSIONS_PER_RUN = 5000
+BACKFILL_FIELD_MAX_BYTES = 64 * 1024
+ROLLOUT_FILENAME_RE = re.compile(
+    r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
+    r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
+)
 
 DEBUG = False
 
@@ -649,12 +662,373 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+def _backfill_truncate(value, limit: int = BACKFILL_FIELD_MAX_BYTES):
+    if isinstance(value, str):
+        encoded = value.encode('utf-8', errors='replace')
+        if len(encoded) <= limit:
+            return value
+        return encoded[:limit].decode('utf-8', errors='ignore')
+    if isinstance(value, dict):
+        return {k: _backfill_truncate(v, limit) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_backfill_truncate(v, limit) for v in value]
+    return value
+
+
+def _backfill_session_id_from_filename(transcript_path: Path) -> Optional[str]:
+    # Only `rollout-<isots>-<uuid>.jsonl` — never a generic stem fallback.
+    m = ROLLOUT_FILENAME_RE.match(transcript_path.stem)
+    return m.group(1) if m else None
+
+
+def _backfill_parse_transcript(transcript_path: Path) -> Optional[Dict]:
+    session_id = None
+    model = None
+    earliest_ts = None
+    user_prompts = []
+    assistant_texts = []
+    function_calls: Dict[str, Dict] = {}
+    function_outputs: Dict[str, str] = {}
+    last_total = {}
+
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for lineno, line in enumerate(f):
+                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                entry_ts = entry.get('timestamp')
+                if entry_ts and (earliest_ts is None or entry_ts < earliest_ts):
+                    earliest_ts = entry_ts
+
+                payload = entry.get('payload') or {}
+                if not session_id:
+                    session_id = (
+                        entry.get('sessionId')
+                        or entry.get('session_id')
+                        or payload.get('id')
+                        or payload.get('session_id')
+                    )
+                if not model:
+                    model = payload.get('model') or entry.get('model')
+
+                entry_type = entry.get('type')
+
+                if entry_type == 'response_item':
+                    item_type = payload.get('type', '')
+                    call_id = payload.get('call_id', '')
+
+                    if item_type == 'message':
+                        role = payload.get('role', '')
+                        content_list = payload.get('content', []) or []
+                        text_parts = []
+                        for c in content_list:
+                            if isinstance(c, dict):
+                                text = c.get('text') or c.get('content') or ''
+                                if text:
+                                    text_parts.append(text)
+                        joined = '\n\n'.join(text_parts)
+                        if joined:
+                            if role == 'user':
+                                user_prompts.append(_backfill_truncate(joined))
+                            elif role == 'assistant':
+                                assistant_texts.append(_backfill_truncate(joined))
+
+                    elif item_type == 'function_call' and call_id:
+                        args = payload.get('arguments', '')
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {'command': args}
+                        function_calls[call_id] = {
+                            'name': payload.get('name', ''),
+                            'arguments': args,
+                        }
+
+                    elif item_type == 'function_call_output' and call_id:
+                        function_outputs[call_id] = payload.get('output', '')
+
+                elif entry_type == 'event_msg' and payload.get('type') == 'token_count':
+                    total = (payload.get('info') or {}).get('total_token_usage')
+                    if total:
+                        last_total = total
+    except (OSError, UnicodeDecodeError):
+        return None
+    except Exception:
+        return None
+
+    # session_meta absent → recover from rollout-<ts>-<uuid>.jsonl filename only;
+    # never fall back to a generic stem.
+    if not session_id:
+        session_id = _backfill_session_id_from_filename(transcript_path)
+        if not session_id:
+            return None
+
+    assistant_tool_uses = []
+    for call_id, call_data in function_calls.items():
+        name = call_data.get('name', '')
+        args = call_data.get('arguments', {})
+        output = function_outputs.get(call_id, '')
+
+        if name == 'exec_command':
+            tool_name = 'Bash'
+            tool_input = {'command': args.get('cmd', '') if isinstance(args, dict) else str(args)}
+            stdout = output
+            exit_code = 0
+            if 'Output:\n' in output:
+                stdout = output.split('Output:\n', 1)[1].rstrip()
+            if 'Process exited with code ' in output:
+                try:
+                    code_str = output.split('Process exited with code ')[1].split('\n')[0].strip()
+                    exit_code = int(code_str)
+                except (ValueError, IndexError):
+                    pass
+            tool_response = {'stdout': _backfill_truncate(stdout), 'exitCode': exit_code}
+        else:
+            tool_name = name
+            tool_input = args if isinstance(args, dict) else {'command': str(args)}
+            tool_response = {'stdout': _backfill_truncate(output)}
+
+        assistant_tool_uses.append({
+            'type': 'PostToolUse',
+            'tool_name': tool_name,
+            'tool_input': _backfill_truncate(tool_input),
+            'tool_response': tool_response,
+        })
+
+    if not (user_prompts or assistant_texts or assistant_tool_uses):
+        return None
+
+    user_content = '\n\n'.join(user_prompts) if user_prompts else ''
+    assistant_content = '\n\n'.join(assistant_texts) if assistant_texts else ''
+
+    messages = []
+    if user_content:
+        messages.append({'role': 'user', 'content': user_content})
+    if assistant_content or assistant_tool_uses:
+        assistant_msg = {'role': 'assistant', 'content': assistant_content}
+        if assistant_tool_uses:
+            assistant_msg['tool_use'] = assistant_tool_uses
+        messages.append(assistant_msg)
+
+    if len(messages) < 2:
+        return None
+
+    record = {
+        'conversation_id': session_id,
+        'model': model or 'auto',
+        'messages': messages,
+        'permission_mode': 'default',
+        'timestamp': earliest_ts or '',
+    }
+
+    if last_total:
+        try:
+            prompt = max(int(last_total.get('input_tokens') or 0) - int(last_total.get('cached_input_tokens') or 0), 0)
+            completion = int(last_total.get('output_tokens') or 0) + int(last_total.get('reasoning_output_tokens') or 0)
+            cache_read = int(last_total.get('cached_input_tokens') or 0)
+            if prompt or completion or cache_read:
+                record['usage'] = {
+                    'prompt_tokens': prompt,
+                    'completion_tokens': completion,
+                    'cache_read_input_tokens': cache_read,
+                    'cache_creation_input_tokens': 0,
+                    'total_tokens': prompt + completion + cache_read,
+                }
+        except (TypeError, ValueError):
+            pass
+
+    return {'session_id': session_id, 'records': [record]}
+
+
+def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    # Stable, identifiable UA + ops headers so SOC tooling can whitelist by signature.
+    headers = {
+        'User-Agent': f'Unbound-Setup/{BACKFILL_TOOL_TYPE}-backfill ({platform.platform()})',
+        'X-Unbound-Operation': 'backfill',
+        'X-Unbound-Tool': BACKFILL_TOOL_TYPE,
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read()
+        except Exception:
+            body = b''
+        return e.code, body
+    except (urllib.error.URLError, OSError) as e:
+        print(f"[backfill] HTTP request failed: {e}", file=sys.stderr)
+        return 0, b''
+
+
+def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
+    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
+
+    auth_headers = _backfill_edr_headers({
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    })
+
+    code, body = _backfill_http_request(
+        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
+        method='POST',
+        headers=auth_headers,
+        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
+        timeout=30,
+    )
+    if code < 200 or code >= 300:
+        print(f"[backfill] upload-url request failed: HTTP {code}", file=sys.stderr)
+        return False
+    try:
+        url_resp = json.loads(body.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        print("[backfill] upload-url response was not JSON", file=sys.stderr)
+        return False
+
+    upload_url = url_resp.get('upload_url')
+    object_key = url_resp.get('object_key')
+    if not upload_url or not object_key:
+        print("[backfill] upload-url response missing fields", file=sys.stderr)
+        return False
+
+    code, _ = _backfill_http_request(
+        upload_url,
+        method='PUT',
+        headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
+        body=payload_bytes,
+        timeout=30,
+    )
+    if code < 200 or code >= 300:
+        print(f"[backfill] S3 PUT failed: HTTP {code}", file=sys.stderr)
+        return False
+
+    code, _ = _backfill_http_request(
+        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/from-s3/",
+        method='POST',
+        headers=auth_headers,
+        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
+        timeout=30,
+    )
+    if code < 200 or code >= 300:
+        print(f"[backfill] from-s3 request failed: HTTP {code}", file=sys.stderr)
+        return False
+
+    return True
+
+
+def _backfill_iter_transcripts(root: Path):
+    # Skip hidden, symlinked, or oversized files (50MB cap).
+    for p in root.rglob('rollout-*.jsonl'):
+        if p.name.startswith('.'):
+            continue
+        if not p.is_file() or p.is_symlink():
+            continue
+        try:
+            if p.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        yield p
+
+
+def run_backfill(api_key: str, backend_url: str) -> None:
+    """Walk ~/.codex/sessions and seed historical sessions. Never raises."""
+    if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
+        debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
+        return
+
+    try:
+        sessions_root = Path.home() / '.codex' / 'sessions'
+        print("[backfill] Scanning ~/.codex/sessions for transcripts...")
+        if not sessions_root.exists():
+            print("[backfill] No transcripts found.")
+            return
+
+        transcripts = sorted(_backfill_iter_transcripts(sessions_root))
+        if not transcripts:
+            print("[backfill] No transcripts found.")
+            return
+
+        sessions: List[Dict] = []
+        for transcript_path in transcripts:
+            if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                print(f"[backfill] Reached session cap of {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining transcripts skipped.", file=sys.stderr)
+                break
+            session = _backfill_parse_transcript(transcript_path)
+            if session:
+                sessions.append(session)
+
+        print(f"[backfill] Found {len(transcripts)} transcripts ({len(sessions)} sessions)")
+
+        chunks_total = 0
+        chunks_sent = 0
+        sessions_sent = 0
+        current_chunk: List[Dict] = []
+        current_size = 2
+
+        def _flush():
+            nonlocal current_chunk, current_size, chunks_total, chunks_sent, sessions_sent
+            if not current_chunk:
+                return
+            chunks_total += 1
+            chunk_size = current_size
+            print(f"[backfill] Uploading chunk {chunks_total} ({chunk_size} bytes)...", flush=True)
+            ok = _backfill_upload_chunk(api_key, backend_url, current_chunk)
+            if ok:
+                chunks_sent += 1
+                sessions_sent += len(current_chunk)
+                print(f"[backfill] Chunk {chunks_total} ok ({len(current_chunk)} sessions)")
+            else:
+                print(f"[backfill] Chunk {chunks_total} upload failed, continuing", file=sys.stderr)
+            current_chunk = []
+            current_size = 2
+
+        for session in sessions:
+            try:
+                session_bytes = len(json.dumps(session).encode('utf-8'))
+            except (TypeError, ValueError):
+                print(f"[backfill] Skipping unserializable session {session.get('session_id')}", file=sys.stderr)
+                continue
+            if session_bytes > BACKFILL_CHUNK_BYTES:
+                print(f"[backfill] Skipped oversized session {session.get('session_id')}", file=sys.stderr)
+                continue
+            if current_chunk and current_size + session_bytes + 1 > BACKFILL_CHUNK_BYTES:
+                _flush()
+            current_chunk.append(session)
+            current_size += session_bytes + 1
+
+        _flush()
+
+        if sessions_sent == 0:
+            print("[backfill] No sessions queued.")
+        else:
+            print(f"[backfill] Done. Queued {sessions_sent} sessions across {chunks_sent} chunks for processing.")
+    except Exception as e:
+        print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
+
+
 def main():
     global DEBUG
 
     # Parse arguments
     clear_mode = "--clear" in sys.argv
     debug_mode = "--debug" in sys.argv
+    backfill_mode = "--backfill" in sys.argv
 
     if debug_mode:
         DEBUG = True
@@ -755,6 +1129,9 @@ def main():
     print("=" * 60)
 
     notify_setup_complete(api_key, "codex", backend_url=backend_url)
+
+    if backfill_mode:
+        run_backfill(api_key, backend_url)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:
