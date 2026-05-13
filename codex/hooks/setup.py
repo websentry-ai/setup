@@ -397,7 +397,6 @@ def configure_codex_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
-                            "async": True,
                             "timeout": 60
                         }
                     ]
@@ -432,7 +431,6 @@ def configure_codex_hooks() -> bool:
                         {
                             "type": "command",
                             "command": hook_command,
-                            "async": True,
                             "timeout": 60
                         }
                     ]
