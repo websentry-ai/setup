@@ -666,7 +666,7 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
             error_body = b''
         return e.code, error_body
     except (urllib.error.URLError, OSError) as e:
-        print(f"[backfill] HTTP request failed: {e}", file=sys.stderr)
+        debug_print(f"HTTP request failed: {e}")
         return 0, b''
 
 
@@ -686,18 +686,18 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
         timeout=30,
     )
     if code < 200 or code >= 300:
-        print(f"[backfill] upload-url request failed: HTTP {code}", file=sys.stderr)
+        debug_print(f"upload-url request failed: HTTP {code}")
         return False
     try:
         url_resp = json.loads(body.decode('utf-8'))
     except (ValueError, UnicodeDecodeError):
-        print("[backfill] upload-url response was not JSON", file=sys.stderr)
+        debug_print("upload-url response was not JSON")
         return False
 
     upload_url = url_resp.get('upload_url')
     object_key = url_resp.get('object_key')
     if not upload_url or not object_key:
-        print("[backfill] upload-url response missing fields", file=sys.stderr)
+        debug_print("upload-url response missing fields")
         return False
 
     code, _ = _backfill_http_request(
@@ -708,7 +708,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
         timeout=30,
     )
     if code < 200 or code >= 300:
-        print(f"[backfill] S3 PUT failed: HTTP {code}", file=sys.stderr)
+        debug_print(f"S3 PUT failed: HTTP {code}")
         return False
 
     code, _ = _backfill_http_request(
@@ -719,7 +719,7 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
         timeout=30,
     )
     if code < 200 or code >= 300:
-        print(f"[backfill] from-s3 request failed: HTTP {code}", file=sys.stderr)
+        debug_print(f"from-s3 request failed: HTTP {code}")
         return False
 
     return True
@@ -740,6 +740,99 @@ def _backfill_iter_transcripts(root: Path):
         yield p
 
 
+def _backfill_is_real_user_prompt(content) -> bool:
+    # Mirror server-side parse_claude_code_session._is_real_user_prompt so the
+    # client splits exactly where the server starts a new exchange.
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get('type')
+            if btype in ('text', 'input_text'):
+                if (block.get('text') or '').strip():
+                    return True
+            elif btype == 'image':
+                return True
+    return False
+
+
+def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
+    boundaries = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('isSidechain'):
+            continue
+        if entry.get('type') != 'user':
+            continue
+        msg = entry.get('message') or {}
+        if msg.get('role') != 'user':
+            continue
+        if _backfill_is_real_user_prompt(msg.get('content')):
+            boundaries.append(i)
+    return boundaries
+
+
+def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
+    """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
+    yielded as-is. Oversized sessions are split at server-side exchange
+    boundaries; each slice carries record_index_base = cumulative exchange
+    count of all earlier slices so the server's per-record UUID5 seed stays
+    globally stable per (org, tool, session, record_index)."""
+    session_id = session.get('session_id')
+    entries = session.get('entries') or []
+    try:
+        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
+            yield session
+            return
+        # +2 for the `, ` separator json.dumps puts between array elements.
+        entry_sizes = [len(json.dumps(e).encode('utf-8')) + 2 for e in entries]
+    except (TypeError, ValueError):
+        debug_print(f"skipping unserializable session {session_id}")
+        return
+
+    boundaries = _backfill_exchange_boundaries(entries)
+    n = len(entries)
+    record_index_base = 0
+    start_idx = 0
+    while start_idx < n:
+        ends = [b for b in boundaries if b > start_idx]
+        if not ends or ends[-1] < n:
+            ends.append(n)
+
+        wrap = len(json.dumps({
+            'session_id': session_id,
+            'record_index_base': record_index_base,
+            'entries': [],
+        }).encode('utf-8'))
+        cum = wrap
+        cursor = start_idx
+        last_fit_end = None
+        last_fit_base_count = 0
+        for end_idx in ends:
+            cum += sum(entry_sizes[cursor:end_idx])
+            cursor = end_idx
+            # -2: last entry has no trailing `, ` and `[]` was counted in wrap.
+            if cum - 2 > max_chunk_bytes:
+                break
+            last_fit_end = end_idx
+            last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)
+
+        if last_fit_end is None:
+            debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            return
+
+        yield {
+            'session_id': session_id,
+            'record_index_base': record_index_base,
+            'entries': entries[start_idx:last_fit_end],
+        }
+        record_index_base += last_fit_base_count
+        start_idx = last_fit_end
+
+
 def run_backfill(api_key: str, backend_url: str) -> None:
     """Walk ~/.claude/projects and seed historical sessions. Never raises."""
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
@@ -748,70 +841,62 @@ def run_backfill(api_key: str, backend_url: str) -> None:
 
     try:
         projects_root = Path.home() / '.claude' / 'projects'
-        print("[backfill] Scanning ~/.claude/projects for transcripts...")
-        if not projects_root.exists():
-            print("[backfill] No transcripts found.")
-            return
-
-        transcripts = sorted(_backfill_iter_transcripts(projects_root))
-        if not transcripts:
-            print("[backfill] No transcripts found.")
-            return
-
         sessions: List[Dict] = []
-        for transcript_path in transcripts:
-            if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
-                print(f"[backfill] Reached session cap of {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining transcripts skipped.", file=sys.stderr)
-                break
-            session = _backfill_collect_session(transcript_path)
-            if session:
-                sessions.append(session)
+        if projects_root.exists():
+            for transcript_path in sorted(_backfill_iter_transcripts(projects_root)):
+                if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                    debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
+                    break
+                session = _backfill_collect_session(transcript_path)
+                if session:
+                    sessions.append(session)
+        if not sessions:
+            print("[backfill] No past sessions found.")
+            return
 
-        print(f"[backfill] Found {len(transcripts)} transcripts ({len(sessions)} sessions)")
+        print(f"[backfill] Found {len(sessions)} past sessions. Uploading (this may take a few minutes)...")
 
         chunks_total = 0
         chunks_sent = 0
-        sessions_sent = 0
+        sessions_sent_ids: set = set()
         current_chunk: List[Dict] = []
         current_size = 2  # outer `[]`
 
         def _flush():
-            nonlocal current_chunk, current_size, chunks_total, chunks_sent, sessions_sent
+            nonlocal current_chunk, current_size, chunks_total, chunks_sent
             if not current_chunk:
                 return
             chunks_total += 1
-            chunk_size = current_size
-            print(f"[backfill] Uploading chunk {chunks_total} ({chunk_size} bytes)...", flush=True)
-            ok = _backfill_upload_chunk(api_key, backend_url, current_chunk)
-            if ok:
+            if _backfill_upload_chunk(api_key, backend_url, current_chunk):
                 chunks_sent += 1
-                sessions_sent += len(current_chunk)
-                print(f"[backfill] Chunk {chunks_total} ok ({len(current_chunk)} sessions)")
-            else:
-                print(f"[backfill] Chunk {chunks_total} upload failed, continuing", file=sys.stderr)
+                for s in current_chunk:
+                    sessions_sent_ids.add(s.get('session_id'))
             current_chunk = []
             current_size = 2
 
         for session in sessions:
-            try:
-                session_bytes = len(json.dumps(session).encode('utf-8'))
-            except (TypeError, ValueError):
-                print(f"[backfill] Skipping unserializable session {session.get('session_id')}", file=sys.stderr)
-                continue
-            if session_bytes > BACKFILL_CHUNK_BYTES:
-                print(f"[backfill] Skipped oversized session {session.get('session_id')}", file=sys.stderr)
-                continue
-            if current_chunk and current_size + session_bytes + 1 > BACKFILL_CHUNK_BYTES:
-                _flush()
-            current_chunk.append(session)
-            current_size += session_bytes + 1
+            for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
+                try:
+                    slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
+                except (TypeError, ValueError):
+                    continue
+                if slice_bytes > BACKFILL_CHUNK_BYTES:
+                    continue
+                if current_chunk and current_size + slice_bytes + 1 > BACKFILL_CHUNK_BYTES:
+                    _flush()
+                current_chunk.append(slice_session)
+                current_size += slice_bytes + 1
 
         _flush()
 
+        failed = chunks_total - chunks_sent
+        sessions_sent = len(sessions_sent_ids)
         if sessions_sent == 0:
-            print("[backfill] No sessions queued.")
+            print(f"[backfill] No sessions queued (all {chunks_total} uploads failed).")
+        elif failed:
+            print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
         else:
-            print(f"[backfill] Done. Queued {sessions_sent} sessions across {chunks_sent} chunks for processing.")
+            print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
