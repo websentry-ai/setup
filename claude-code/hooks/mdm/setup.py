@@ -6,8 +6,10 @@ import sys
 import platform
 import subprocess
 import json
+import urllib.request
+import urllib.error
 from pathlib import Path
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Dict
 try:
     import pwd
 except ImportError:
@@ -16,6 +18,12 @@ except ImportError:
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+
+BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
+BACKFILL_TOOL_TYPE = "claude-code"
+BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
+BACKFILL_MAX_LINES_PER_FILE = 50000
+BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 
 
 def normalize_url(value: str) -> str:
@@ -848,6 +856,321 @@ def clear_setup():
     print("=" * 60)
 
 
+def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
+    """Read a transcript and return {session_id, entries} for server-side parsing.
+    The client only JSON-decodes lines and pulls a session id — all semantic
+    parsing happens server-side in
+    webapp.services.coding_tools_backfill_service."""
+    entries = []
+    session_id = None
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for lineno, line in enumerate(f):
+                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
+                    break
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                entries.append(entry)
+                if not session_id:
+                    sid = entry.get('sessionId') or entry.get('session_id')
+                    if sid:
+                        session_id = sid
+    except (OSError, UnicodeDecodeError):
+        return None
+    except Exception:
+        return None
+
+    if not session_id or not entries:
+        return None
+    return {'session_id': session_id, 'entries': entries}
+
+
+def _backfill_iter_transcripts(root: Path):
+    # Skip hidden, symlinked, or oversized files (50MB cap).
+    for p in root.rglob('*.jsonl'):
+        if p.name.startswith('.'):
+            continue
+        if not p.is_file() or p.is_symlink():
+            continue
+        try:
+            if p.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+                continue
+        except OSError:
+            continue
+        yield p
+
+
+def _backfill_is_real_user_prompt(content) -> bool:
+    # Mirror server-side parse_claude_code_session._is_real_user_prompt so the
+    # client splits exactly where the server starts a new exchange.
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            btype = block.get('type')
+            if btype in ('text', 'input_text'):
+                if (block.get('text') or '').strip():
+                    return True
+            elif btype == 'image':
+                return True
+    return False
+
+
+def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
+    boundaries = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('isSidechain'):
+            continue
+        if entry.get('type') != 'user':
+            continue
+        msg = entry.get('message') or {}
+        if msg.get('role') != 'user':
+            continue
+        if _backfill_is_real_user_prompt(msg.get('content')):
+            boundaries.append(i)
+    return boundaries
+
+
+def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
+    """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
+    yielded as-is. Oversized sessions are split at server-side exchange
+    boundaries; each slice carries record_index_base = cumulative exchange
+    count of all earlier slices so the server's per-record UUID5 seed stays
+    globally stable per (org, tool, session, record_index)."""
+    session_id = session.get('session_id')
+    entries = session.get('entries') or []
+    try:
+        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
+            yield session
+            return
+        # +2 for the `, ` separator json.dumps puts between array elements.
+        entry_sizes = [len(json.dumps(e).encode('utf-8')) + 2 for e in entries]
+    except (TypeError, ValueError):
+        debug_print(f"skipping unserializable session {session_id}")
+        return
+
+    boundaries = _backfill_exchange_boundaries(entries)
+    n = len(entries)
+    record_index_base = 0
+    start_idx = 0
+    while start_idx < n:
+        ends = [b for b in boundaries if b > start_idx]
+        if not ends or ends[-1] < n:
+            ends.append(n)
+
+        wrap = len(json.dumps({
+            'session_id': session_id,
+            'record_index_base': record_index_base,
+            'entries': [],
+        }).encode('utf-8'))
+        cum = wrap
+        cursor = start_idx
+        last_fit_end = None
+        last_fit_base_count = 0
+        for end_idx in ends:
+            cum += sum(entry_sizes[cursor:end_idx])
+            cursor = end_idx
+            # -2: last entry has no trailing `, ` and `[]` was counted in wrap.
+            if cum - 2 > max_chunk_bytes:
+                break
+            last_fit_end = end_idx
+            last_fit_base_count = sum(1 for b in boundaries if start_idx <= b < end_idx)
+
+        if last_fit_end is None:
+            debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            return
+
+        yield {
+            'session_id': session_id,
+            'record_index_base': record_index_base,
+            'entries': entries[start_idx:last_fit_end],
+        }
+        record_index_base += last_fit_base_count
+        start_idx = last_fit_end
+
+
+def _backfill_collect_sessions(home_dir: Path) -> List[Dict]:
+    # Must run inside _run_as_user (reads transcripts as the target user).
+    projects_root = home_dir / '.claude' / 'projects'
+    if not projects_root.exists():
+        return []
+    sessions = []
+    for transcript_path in sorted(_backfill_iter_transcripts(projects_root)):
+        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+            break
+        session = _backfill_collect_session(transcript_path)
+        if session:
+            sessions.append(session)
+    return sessions
+
+
+def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    # Stable, identifiable UA + ops headers so SOC tooling can whitelist by signature.
+    headers = {
+        'User-Agent': f'Unbound-Setup/{BACKFILL_TOOL_TYPE}-backfill ({platform.platform()})',
+        'X-Unbound-Operation': 'backfill',
+        'X-Unbound-Tool': BACKFILL_TOOL_TYPE,
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
+    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.getcode(), resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            error_body = e.read()
+        except Exception:
+            error_body = b''
+        return e.code, error_body
+    except (urllib.error.URLError, OSError) as e:
+        debug_print(f"HTTP request failed: {e}")
+        return 0, b''
+
+
+def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
+    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
+
+    auth_headers = _backfill_edr_headers({
+        'Authorization': f'Bearer {api_key}',
+        'Content-Type': 'application/json',
+    })
+
+    code, body = _backfill_http_request(
+        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
+        method='POST',
+        headers=auth_headers,
+        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
+        timeout=30,
+    )
+    if code < 200 or code >= 300:
+        debug_print(f"upload-url request failed: HTTP {code}")
+        return False
+    try:
+        url_resp = json.loads(body.decode('utf-8'))
+    except (ValueError, UnicodeDecodeError):
+        debug_print("upload-url response was not JSON")
+        return False
+
+    upload_url = url_resp.get('upload_url')
+    object_key = url_resp.get('object_key')
+    if not upload_url or not object_key:
+        debug_print("upload-url response missing fields")
+        return False
+
+    code, _ = _backfill_http_request(
+        upload_url,
+        method='PUT',
+        headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
+        body=payload_bytes,
+        timeout=30,
+    )
+    if code < 200 or code >= 300:
+        debug_print(f"S3 PUT failed: HTTP {code}")
+        return False
+
+    code, _ = _backfill_http_request(
+        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/from-s3/",
+        method='POST',
+        headers=auth_headers,
+        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
+        timeout=30,
+    )
+    if code < 200 or code >= 300:
+        debug_print(f"from-s3 request failed: HTTP {code}")
+        return False
+
+    return True
+
+
+def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]) -> Tuple[int, int, int]:
+    """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts
+    distinct input session_ids that landed at least one successful chunk."""
+    chunks_total = 0
+    chunks_sent = 0
+    sessions_sent_ids: set = set()
+    current_chunk: List[Dict] = []
+    current_size = 2
+
+    def _flush():
+        nonlocal current_chunk, current_size, chunks_total, chunks_sent
+        if not current_chunk:
+            return
+        chunks_total += 1
+        if _backfill_upload_chunk(api_key, backend_url, current_chunk):
+            chunks_sent += 1
+            for s in current_chunk:
+                sessions_sent_ids.add(s.get('session_id'))
+        current_chunk = []
+        current_size = 2
+
+    for session in sessions:
+        for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
+            try:
+                slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
+            except (TypeError, ValueError):
+                continue
+            if slice_bytes > BACKFILL_CHUNK_BYTES:
+                continue
+            if current_chunk and current_size + slice_bytes + 1 > BACKFILL_CHUNK_BYTES:
+                _flush()
+            current_chunk.append(slice_session)
+            current_size += slice_bytes + 1
+
+    _flush()
+    return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
+
+
+def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
+    """Walk each user's ~/.claude/projects and seed historical sessions.
+
+    MDM /get_application_api_key/ returns one per-device key with no `home_user`
+    param, so backfilling every user with that key would mis-attribute history.
+    Only run when exactly one user home is present."""
+    if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
+        debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
+        return
+
+    try:
+        if not user_homes:
+            debug_print("no user homes found — skipping backfill")
+            return
+
+        if len(user_homes) > 1:
+            print(f"[backfill] Skipped: MDM device key can't span {len(user_homes)} user homes; run --backfill per account.", file=sys.stderr)
+            return
+
+        username, home_dir = user_homes[0]
+        sessions = _run_as_user(username, _backfill_collect_sessions, home_dir) or []
+        if not sessions:
+            print("[backfill] No past sessions found.")
+            return
+
+        print(f"[backfill] Found {len(sessions)} past sessions. Uploading (this may take a few minutes)...")
+        sessions_sent, _, chunks_failed = _backfill_send_sessions(api_key, backend_url, sessions)
+
+        if sessions_sent == 0:
+            print(f"[backfill] No sessions queued (all {chunks_failed} uploads failed).")
+        elif chunks_failed:
+            print(f"[backfill] Done — queued {sessions_sent} past sessions ({chunks_failed} chunks failed).")
+        else:
+            print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
+    except Exception as e:
+        print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
+
+
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
@@ -897,6 +1220,7 @@ def main():
     gateway_url = DEFAULT_GATEWAY_URL
     app_name = None
     auth_api_key = None
+    backfill_mode = False
 
     args = sys.argv[1:]
     i = 0
@@ -915,12 +1239,15 @@ def main():
             i += 2
         elif args[i] == "--debug":
             i += 1
+        elif args[i] == "--backfill":
+            backfill_mode = True
+            i += 1
         else:
             i += 1
 
     if not auth_api_key:
         print("\nMissing required argument: --api-key")
-        print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug]")
+        print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug] [--backfill]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return
 
@@ -968,6 +1295,9 @@ def main():
     print("=" * 60)
 
     notify_setup_complete(api_key, "claude-code", backend_url=base_url)
+
+    if backfill_mode:
+        run_backfill(api_key, base_url, get_all_user_homes())
 
 
 if __name__ == "__main__":

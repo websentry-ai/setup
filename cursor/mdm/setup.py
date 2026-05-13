@@ -870,6 +870,9 @@ def main():
         DEBUG = True
         debug_print("Debug mode enabled")
 
+    if "--backfill" in sys.argv:
+        print("[backfill] Cursor backfill is not supported — no historical transcript data is available on disk.")
+
     # If clear mode, run cleanup and exit
     if clear_mode:
         clear_setup()
