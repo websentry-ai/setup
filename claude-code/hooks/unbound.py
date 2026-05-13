@@ -26,6 +26,8 @@ CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 
+PRETOOL_USER_MESSAGES_LIMIT = 5
+
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 APPROVAL_POLL_PHASES = (
@@ -354,28 +356,44 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     return conversation_data
 
 
-def get_latest_user_prompt_for_session(session_id: str, transcript_path: Optional[str] = None) -> Optional[str]:
-    """Get the most recent user prompt for this session."""
-    logs = load_existing_logs()
-    latest_prompt = None
+def get_recent_user_prompts_for_session(
+    session_id: str,
+    n: int,
+    transcript_path: Optional[str] = None,
+) -> List[str]:
+    if n <= 0:
+        return []
 
+    prompts: List[str] = []
+    logs = load_existing_logs()
     for log in logs:
         log_session = log.get('session_id') or log.get('event', {}).get('session_id')
-        if log_session == session_id:
-            event = log.get('event', {})
-            if event.get('hook_event_name') == 'UserPromptSubmit':
-                latest_prompt = event.get('prompt')
+        if log_session != session_id:
+            continue
+        event = log.get('event', {})
+        if event.get('hook_event_name') != 'UserPromptSubmit':
+            continue
+        prompt = event.get('prompt')
+        if prompt:
+            prompts.append(prompt)
 
-    if latest_prompt:
-        return latest_prompt
+    if prompts:
+        return prompts[-n:]
 
-    # Fallback: parse transcript file
     if transcript_path and transcript_path != 'undefined' and os.path.exists(transcript_path):
         data = parse_transcript_file(transcript_path)
-        if data.get('user_messages'):
-            return data['user_messages'][-1].get('content')
+        user_messages = data.get('user_messages') or []
+        return [m.get('content') for m in user_messages[-n:] if m.get('content')]
 
-    return None
+    return []
+
+
+def _build_user_prompt_payload(recent_user_prompts: List[str]) -> Dict:
+    last = recent_user_prompts[-1] if recent_user_prompts else None
+    return {
+        'messages': [{'role': 'user', 'content': last}] if last else [],
+        'user_prompts': recent_user_prompts,
+    }
 
 
 def extract_command_for_pretool(event: Dict) -> str:
@@ -593,7 +611,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     ):
         return {}
 
-    user_prompt = get_latest_user_prompt_for_session(session_id, transcript_path)
+    recent_user_prompts = get_recent_user_prompts_for_session(
+        session_id, PRETOOL_USER_MESSAGES_LIMIT, transcript_path
+    )
     command = extract_command_for_pretool(event)
 
     # Build metadata with the raw event
@@ -630,7 +650,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'tool_name': tool_name,
             'metadata': metadata
         },
-        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+        **_build_user_prompt_payload(recent_user_prompts),
     }
 
     if not is_retry:

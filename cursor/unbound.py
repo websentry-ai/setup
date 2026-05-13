@@ -42,6 +42,8 @@ CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 
+PRETOOL_USER_MESSAGES_LIMIT = 5
+
 # Ensure log directory exists
 try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -241,18 +243,30 @@ def group_events_by_generation(logs):
     return grouped
 
 
-def get_latest_user_prompt(generation_id):
-    """Get the most recent user prompt for this generation from logs."""
-    logs = load_existing_logs()
-    latest_prompt = None
+def get_recent_user_prompts_for_session(conversation_id, n):
+    if not conversation_id or n <= 0:
+        return []
 
+    logs = load_existing_logs()
+    prompts = []
     for log in logs:
         event = log.get('event', {})
-        if (event.get('hook_event_name') == 'beforeSubmitPrompt' and
-            event.get('generation_id') == generation_id):
-            latest_prompt = event.get('prompt')
+        if event.get('hook_event_name') != 'beforeSubmitPrompt':
+            continue
+        if event.get('conversation_id') != conversation_id:
+            continue
+        prompt = event.get('prompt')
+        if prompt:
+            prompts.append(prompt)
+    return prompts[-n:]
 
-    return latest_prompt
+
+def _build_user_prompt_payload(recent_user_prompts):
+    last = recent_user_prompts[-1] if recent_user_prompts else None
+    return {
+        'messages': [{'role': 'user', 'content': last}] if last else [],
+        'user_prompts': recent_user_prompts,
+    }
 
 
 def send_to_hook_api(request_body, api_key):
@@ -405,7 +419,9 @@ def process_pre_tool_use(event, api_key):
     model = event.get('model') or 'auto'
     tool_input = event.get('tool_input') or {}
 
-    user_prompt = get_latest_user_prompt(generation_id)
+    recent_user_prompts = get_recent_user_prompts_for_session(
+        conversation_id, PRETOOL_USER_MESSAGES_LIMIT
+    )
     metadata = dict(event)
     file_path = tool_input.get('file_path', '')
     if file_path:
@@ -424,7 +440,7 @@ def process_pre_tool_use(event, api_key):
             'command': '',
             'metadata': metadata
         },
-        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+        **_build_user_prompt_payload(recent_user_prompts),
     }
 
     if not is_retry:
@@ -538,13 +554,15 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     cache = load_policy_cache()
     need_pull_policies = cache is None or is_cache_stale(cache)
 
-    user_prompt = get_latest_user_prompt(generation_id)
+    recent_user_prompts = get_recent_user_prompts_for_session(
+        conversation_id, PRETOOL_USER_MESSAGES_LIMIT
+    )
 
     # Build metadata with the raw event, inject mcp fields if present
     metadata = dict(event)
     if mcp_server is not None:
         metadata['mcp_server'] = mcp_server
-        
+
         server_cfg = _read_mcp_server_config(mcp_server, CURSOR_MCP_CONFIG_PATH)
         if server_cfg:
             metadata['mcp_server_config'] = server_cfg
@@ -565,7 +583,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             'command': command,
             'metadata': metadata
         },
-        'messages': [{'role': 'user', 'content': user_prompt}] if user_prompt else []
+        **_build_user_prompt_payload(recent_user_prompts),
     }
 
     if not is_retry:
