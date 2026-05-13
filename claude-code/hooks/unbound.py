@@ -25,8 +25,8 @@ POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
-
 PRETOOL_USER_MESSAGES_LIMIT = 5
+AUDIT_LOG_TOTAL_LIMIT = 100
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -861,19 +861,19 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
 
 def cleanup_old_logs():
     logs = load_existing_logs()
-    
-    if len(logs) <= 50:
+
+    if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
-    
+
     session_order = []
     seen_sessions = set()
-    
+
     for log in logs:
         session_id = log.get('session_id')
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
-    
+
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
         kept_logs = [
@@ -887,7 +887,6 @@ def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
     last_assistant_message = event.get('last_assistant_message')
-    stop_timestamp = datetime.utcnow().isoformat() + 'Z'
 
     logs = load_existing_logs()
     
@@ -933,17 +932,7 @@ def process_stop_event(event: Dict, api_key: str):
     )
 
     if exchange:
-        success = send_to_api(exchange, api_key)
-
-        if success:
-            current_logs = load_existing_logs()
-            remaining_logs = [
-                log for log in current_logs
-                if log.get('timestamp', '') > stop_timestamp
-                or (log.get('session_id') != session_id
-                    and log.get('event', {}).get('session_id') != session_id)
-            ]
-            save_logs(remaining_logs)
+        send_to_api(exchange, api_key)
 
 
 def get_api_key():

@@ -41,8 +41,8 @@ CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
-
 PRETOOL_USER_MESSAGES_LIMIT = 5
+AUDIT_LOG_TOTAL_LIMIT = 100
 
 # Ensure log directory exists
 try:
@@ -241,7 +241,6 @@ def group_events_by_generation(logs):
             grouped[conversation_id][generation_id].append(log)
     
     return grouped
-
 
 def get_recent_user_prompts_for_session(conversation_id, n):
     if not conversation_id or n <= 0:
@@ -854,37 +853,28 @@ def cleanup_old_logs():
     Manage log file size by removing old generation_ids when log count exceeds 50.
     Keeps only the most recent generation_id's entries to ensure current request is safe.
     """
+    
     logs = load_existing_logs()
-    
-    # If we have 50 or fewer entries, no cleanup needed
-    if len(logs) <= 50:
+
+    if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
-    
-    # Track generation_ids in order of first appearance
-    generation_order = []
-    seen_generations = set()
-    
+
+    conversation_order = []
+    seen_conversations = set()
+
     for log in logs:
         event = log.get('event', {})
-        gen_id = event.get('generation_id')
-        
-        if gen_id and gen_id not in seen_generations:
-            generation_order.append(gen_id)
-            seen_generations.add(gen_id)
-    
-    # If we have multiple generation_ids and log count > 50,
-    # keep only the most recent generation_id's entries
-    if len(generation_order) > 1:
-        # Keep only the most recent generation_id
-        most_recent_gen_id = generation_order[-1]
-        
-        # Filter logs to keep only the most recent generation
+        conv_id = event.get('conversation_id')
+        if conv_id and conv_id not in seen_conversations:
+            conversation_order.append(conv_id)
+            seen_conversations.add(conv_id)
+
+    if len(conversation_order) > 1:
+        most_recent_conv_id = conversation_order[-1]
         kept_logs = [
             log for log in logs
-            if log.get('event', {}).get('generation_id') == most_recent_gen_id
+            if log.get('event', {}).get('conversation_id') == most_recent_conv_id
         ]
-        
-        # Save the filtered logs
         save_logs(kept_logs)
 
 
@@ -907,20 +897,9 @@ def process_stop_event(generation_id, api_key=None):
             )
             
             if has_stop:
-                # Build LLM exchange
                 exchange = build_llm_exchange(events, api_key)
-                
                 if exchange:
-                    # Send to API
                     send_to_api(exchange, api_key)
-                
-                # Remove this generation's logs from agent-audit.log
-                remaining_logs = [
-                    log for log in logs
-                    if log.get('event', {}).get('generation_id') != generation_id
-                ]
-                
-                save_logs(remaining_logs)
                 break
 
 

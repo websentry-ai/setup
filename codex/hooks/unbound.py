@@ -25,8 +25,8 @@ POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
-
 PRETOOL_USER_MESSAGES_LIMIT = 5
+AUDIT_LOG_TOTAL_LIMIT = 100
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
@@ -752,7 +752,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
 def cleanup_old_logs():
     logs = load_existing_logs()
 
-    if len(logs) <= 50:
+    if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
     session_order = []
@@ -970,15 +970,7 @@ def process_stop_event(event: Dict, api_key: str):
     if usage:
         exchange['usage'] = usage
 
-    success = send_to_api(exchange, api_key)
-
-    if success:
-        remaining_logs = [
-            log for log in logs
-            if log.get('session_id') != session_id and
-            (not log.get('event') or log.get('event', {}).get('session_id') != session_id)
-        ]
-        save_logs(remaining_logs)
+    send_to_api(exchange, api_key)
 
 
 def main():
