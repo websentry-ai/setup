@@ -253,6 +253,8 @@ def cleanup_old_logs():
             if log.get('event', {}).get('session_id') == most_recent_session
         ]
         save_logs(kept_logs)
+    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
+        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
 def get_recent_user_prompts_for_session(session_id, n):
@@ -869,6 +871,10 @@ def main():
         if event_name == 'UserPromptSubmit':
             response = process_user_prompt_submit(event, api_key)
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                    'event': event,
+                })
                 print(json.dumps(response), flush=True)
                 return
 
