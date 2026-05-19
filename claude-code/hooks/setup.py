@@ -234,14 +234,13 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         def log_message(self, format: str, *args) -> None:
             return
 
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            host, port = s.getsockname()
-        callback_url = f"http://127.0.0.1:{port}/callback"
+    class _CallbackServer(socketserver.TCPServer):
+        allow_reuse_address = True
 
-        httpd = socketserver.TCPServer(("127.0.0.1", port), CallbackHandler)
-        httpd.allow_reuse_address = True
+    try:
+        httpd = _CallbackServer(("127.0.0.1", 0), CallbackHandler)
+        port = httpd.server_address[1]
+        callback_url = f"http://127.0.0.1:{port}/callback"
 
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         thread.start()
@@ -255,7 +254,9 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         print("Waiting for authentication...")
 
         try:
-            done_evt.wait()
+            if not done_evt.wait(timeout=300):
+                print("Timed out waiting for authentication (5 minutes). Please re-run setup.")
+                return None
         finally:
             try:
                 httpd.shutdown()

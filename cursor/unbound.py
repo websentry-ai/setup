@@ -876,6 +876,8 @@ def cleanup_old_logs():
             if log.get('event', {}).get('conversation_id') == most_recent_conv_id
         ]
         save_logs(kept_logs)
+    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
+        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
 def process_stop_event(generation_id, api_key=None):
@@ -978,8 +980,12 @@ def main():
         if hook_event_name == 'beforeSubmitPrompt':
             response = process_user_prompt_submit(event, api_key)
 
-            # If denied, transform response for Cursor format and exit
+            # If denied, log the event, transform response for Cursor format and exit
             if response.get('decision') == 'deny':
+                append_to_audit_log({
+                    'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                    'event': event
+                })
                 cursor_response = {
                     'continue': False,
                     'user_message': response.get('reason', 'Prompt blocked by policy')

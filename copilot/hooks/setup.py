@@ -3,6 +3,7 @@
 import os
 import sys
 import platform
+import shutil
 import subprocess
 import urllib.parse
 import time
@@ -15,8 +16,7 @@ import socketserver
 import socket
 import json
 
-HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
-SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
+SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 DEBUG = False
@@ -41,19 +41,19 @@ def install_macos_certificates():
 def normalize_url(domain: str) -> str:
     """Normalize domain to proper URL format."""
     domain = domain.strip()
-    
+
     if domain.startswith("http://") or domain.startswith("https://"):
         url = domain
     else:
         url = f"https://{domain}"
-    
+
     return url.rstrip('/')
 
 
 def get_shell_rc_file() -> Path:
     system = platform.system().lower()
     shell = os.environ.get("SHELL", "").lower()
-    
+
     if system == "darwin":
         return Path.home() / ".zprofile" if "zsh" in shell else Path.home() / ".bash_profile"
     elif system == "linux":
@@ -67,29 +67,29 @@ def get_shell_rc_file() -> Path:
 def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
     try:
         file_path.touch(exist_ok=True)
-        
+
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
-        
+
         # Remove existing export for this variable if var_name is provided
         if var_name:
             export_prefix = f"export {var_name}="
             lines = [l for l in lines if not l.strip().startswith(export_prefix)]
-        
+
         # Check if line already exists
         if line + "\n" not in lines and line not in [l.rstrip() for l in lines]:
             lines.append(f"{line}\n")
-            
+
             with open(file_path, "w", encoding="utf-8") as f:
                 f.writelines(lines)
             return True
-        
+
         # If we removed an old export and need to add new one
         if var_name:
             with open(file_path, "w", encoding="utf-8") as f:
                 f.writelines(lines)
             return True
-            
+
         return True
     except Exception as e:
         print(f"❌ Failed to modify {file_path}: {e}")
@@ -229,7 +229,7 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         thread.start()
 
         encoded_callback = urllib.parse.quote(callback_url, safe="")
-        target_url = f"{frontend_url.rstrip('/')}/automations/api-key-callback?callback_url={encoded_callback}&app_type=cursor"
+        target_url = f"{frontend_url.rstrip('/')}/automations/api-key-callback?callback_url={encoded_callback}&app_type=copilot"
         webbrowser.open(target_url)
         print("🌐 Opening browser...")
         print("If browser doesn't open automatically, open this link:")
@@ -274,6 +274,7 @@ def write_unbound_config(api_key: str) -> bool:
     config_file = config_dir / "config.json"
     try:
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(config_dir, 0o700)
         config = {}
         if config_file.exists():
             try:
@@ -282,30 +283,14 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
-        with open(config_file, 'w', encoding='utf-8') as f:
+        # Create with 0o600 atomically so the API key is never briefly world-readable.
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
-        os.chmod(config_file, 0o600)
         return True
     except Exception as e:
         print(f"⚠️  Could not write config: {e}")
         return False
-
-
-def check_enterprise_hooks_conflict() -> bool:
-    """Check if enterprise (MDM) hooks exist. Returns True if conflict found."""
-    system = platform.system().lower()
-    if system == "darwin":
-        enterprise_hooks = Path("/Library/Application Support/Cursor/hooks.json")
-    elif system == "linux":
-        enterprise_hooks = Path("/etc/cursor/hooks.json")
-    else:
-        return False
-    if enterprise_hooks.exists():
-        print("\n❌ Enterprise (MDM) hooks are already installed.")
-        print("   Installing user-level hooks alongside MDM hooks causes duplicate execution.")
-        print("   Contact your organization administrator to manage Unbound configuration.")
-        return True
-    return False
 
 
 def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
@@ -322,16 +307,10 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
 
 
 def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
-    hooks_dir = Path.home() / ".cursor" / "hooks"
-    hooks_json = Path.home() / ".cursor" / "hooks.json"
+    hooks_dir = Path.home() / ".copilot" / "hooks"
     script_path = hooks_dir / "unbound.py"
 
-    print("\n📥 Downloading hooks configuration...")
-    if not download_file(HOOKS_URL, hooks_json):
-        return False
-    print("✅ hooks.json downloaded")
-
-    print("📥 Downloading unbound.py script...")
+    print("\n📥 Downloading unbound.py script...")
     if not download_file(SCRIPT_URL, script_path):
         return False
     print("✅ unbound.py downloaded")
@@ -347,102 +326,75 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     return True
 
 
-def restart_cursor() -> bool:
-    """Attempt to restart Cursor IDE."""
-    system = platform.system().lower()
+def _copilot_hooks_config(script_path: Path) -> dict:
+    """Build the ~/.copilot/hooks/unbound.json config for the 5 Copilot events.
+    Copilot delivers hook_event_name in the payload, so no per-event env is needed."""
+    # Copilot reads `bash` on Unix, `powershell` on Windows. The Unix script is
+    # chmod +x with a python3 shebang, so bash executes it directly. On Windows
+    # invoke via `py -3` (falling back to `python`), quoting the path so spaces
+    # in C:\Users\<name>\ paths don't break parsing.
+    bash_cmd = f'"{script_path}"'
+    launcher = "py -3" if shutil.which("py") else "python"
+    powershell_cmd = f'{launcher} "{script_path}"'
+
+    # Per-event timeout (seconds): PreToolUse is generous for approval polling.
+    event_timeouts = {
+        "SessionStart": 30,
+        "UserPromptSubmit": 60,
+        "PreToolUse": 600,
+        "PostToolUse": 30,
+        "Stop": 60,
+    }
+
+    hooks = {}
+    for event_name, timeout_sec in event_timeouts.items():
+        hooks[event_name] = [
+            {
+                "type": "command",
+                "command": bash_cmd,
+                "bash": bash_cmd,
+                "powershell": powershell_cmd,
+                "timeout": timeout_sec,
+                "timeoutSec": timeout_sec,
+            }
+        ]
+
+    return {"version": 1, "hooks": hooks}
+
+
+def configure_copilot_hooks() -> bool:
+    """Write ~/.copilot/hooks/unbound.json. Unbound owns this file and overwrites
+    it wholesale; other *.json files in the directory are left untouched."""
+    hooks_path = Path.home() / ".copilot" / "hooks" / "unbound.json"
+    script_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
 
     try:
-        if system == "darwin":
-            # macOS: Gracefully quit using AppleScript, then relaunch
-            print("\n🔄 Restarting Cursor IDE...")
-            result = subprocess.run(["osascript", "-e", 'tell application "Cursor" to quit'], 
-                                  capture_output=True, timeout=5)
-            if result.returncode != 0:
-                # Fallback to killall if osascript fails
-                subprocess.run(["killall", "Cursor"], capture_output=True, timeout=5)
-            time.sleep(2)
-            # Launch Cursor and check if it succeeds
-            result = subprocess.run(["open", "-a", "Cursor"],
-                                  capture_output=True, timeout=5)
-            if result.returncode == 0:
-                print("✅ Cursor restarted")
-                return True
-            else:
-                print("Restart Cursor")
-                return False
-
-        elif system == "linux":
-            # Linux: Kill and relaunch cursor
-            print("\n🔄 Restarting Cursor IDE...")
-            subprocess.run(["pkill", "-9", "cursor"], capture_output=True, timeout=5)
-            time.sleep(1)
-            proc = subprocess.Popen(["cursor"],
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-            # Give it a moment to start
-            time.sleep(0.5)
-            # If process is still running (poll returns None) or started successfully, it's good
-            if proc.poll() is None:
-                print("✅ Cursor restarted")
-                return True
-            else:
-                print("Restart Cursor")
-                return False
-
-        elif system == "windows":
-            # Windows: Use taskkill and start
-            print("\n🔄 Restarting Cursor IDE...")
-            subprocess.run(["taskkill", "/F", "/IM", "Cursor.exe"],
-                         capture_output=True, timeout=5)
-            time.sleep(1)
-            proc = subprocess.Popen(["start", "cursor"],
-                                  shell=True,
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-            # Give it a moment to start
-            time.sleep(0.5)
-            # start command returns immediately, so check if process started
-            if proc.poll() is None or proc.returncode == 0:
-                print("✅ Cursor restarted")
-                return True
-            else:
-                print("Restart Cursor")
-                return False
-
-        return False
-
-    except subprocess.TimeoutExpired:
-        return False
+        hooks_path.parent.mkdir(parents=True, exist_ok=True)
+        config = _copilot_hooks_config(script_path)
+        with open(hooks_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+        print("✅ Copilot hooks configured")
+        return True
     except Exception as e:
-        print("Restart Cursor")
+        print(f"❌ Failed to configure Copilot hooks: {e}")
         return False
 
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
     print("=" * 60)
-    print("Unbound Cursor Hooks - Clearing Setup")
+    print("Unbound Copilot Hooks - Clearing Setup")
     print("=" * 60)
 
     # Remove environment variable
-    success, _ = remove_env_var("UNBOUND_CURSOR_API_KEY")
+    success, _ = remove_env_var("UNBOUND_COPILOT_API_KEY")
     if success:
-        print("✅ Removed UNBOUND_CURSOR_API_KEY")
+        print("✅ Removed UNBOUND_COPILOT_API_KEY")
     else:
-        print("❌ Failed to remove UNBOUND_CURSOR_API_KEY")
-
-    # Remove the hooks.json file
-    hooks_json = Path.home() / ".cursor" / "hooks.json"
-    if hooks_json.exists():
-        try:
-            hooks_json.unlink()
-            debug_print(f"Removed {hooks_json}")
-            print(f"✅ Removed {hooks_json}")
-        except Exception as e:
-            print(f"❌ Failed to remove {hooks_json}: {e}")
+        print("❌ Failed to remove UNBOUND_COPILOT_API_KEY")
 
     # Remove the unbound.py script
-    script_path = Path.home() / ".cursor" / "hooks" / "unbound.py"
+    script_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
     if script_path.exists():
         try:
             script_path.unlink()
@@ -450,6 +402,16 @@ def clear_setup() -> None:
             print(f"✅ Removed {script_path}")
         except Exception as e:
             print(f"❌ Failed to remove {script_path}: {e}")
+
+    # Remove the unbound.json hooks config
+    hooks_json = Path.home() / ".copilot" / "hooks" / "unbound.json"
+    if hooks_json.exists():
+        try:
+            hooks_json.unlink()
+            debug_print(f"Removed {hooks_json}")
+            print(f"✅ Removed {hooks_json}")
+        except Exception as e:
+            print(f"❌ Failed to remove {hooks_json}: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -487,7 +449,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if "--backfill" in sys.argv:
-        print("[backfill] Cursor backfill is not supported — no historical transcript data is available on disk.")
+        print("[backfill] Copilot backfill is not supported — no historical transcript data is available on disk.")
 
     if clear_mode:
         clear_setup()
@@ -496,7 +458,7 @@ def main():
     install_macos_certificates()
 
     print("=" * 60)
-    print("Unbound Cursor Hooks - Setup")
+    print("Unbound Copilot Hooks - Setup")
     print("=" * 60)
 
     domain = None
@@ -548,40 +510,35 @@ def main():
     print("✅ API key received")
     debug_print("API key received from callback")
 
-    if check_enterprise_hooks_conflict():
-        # MDM hooks already in place — the device IS configured, just via the
-        # admin path. Notify the backend so this counts as a completed setup
-        # rather than a silent abort. Print a positive line so the user
-        # doesn't see only the ❌ above and assume the whole thing failed.
-        print("✅ Device already configured via MDM — no user-level setup needed.")
-        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
-        return
-
     if not write_unbound_config(api_key):
-        print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
+        print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Copilot is launched from Dock/Spotlight")
 
-    debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")
-    success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)
+    debug_print("Setting UNBOUND_COPILOT_API_KEY environment variable...")
+    success, message = set_env_var("UNBOUND_COPILOT_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
         return
 
     print(f"✅ Environment variable set")
-    debug_print("UNBOUND_CURSOR_API_KEY set successfully")
+    debug_print("UNBOUND_COPILOT_API_KEY set successfully")
 
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):
         print("\n❌ Failed to setup hooks")
         return
     debug_print("Hooks setup complete")
-    
+
+    debug_print("Configuring Copilot hooks...")
+    if not configure_copilot_hooks():
+        print("\n❌ Failed to configure Copilot hooks")
+        return
+    debug_print("Copilot hooks configured")
+
     print("\n" + "=" * 60)
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "cursor", backend_url=backend_url)
-
-    restart_cursor()
+    notify_setup_complete(api_key, "copilot", backend_url=backend_url)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:

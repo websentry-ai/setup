@@ -881,6 +881,8 @@ def cleanup_old_logs():
             if log.get('session_id') == most_recent_session
         ]
         save_logs(kept_logs)
+    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
+        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
 def process_stop_event(event: Dict, api_key: str):
@@ -992,8 +994,13 @@ def main():
         if hook_event_name == 'UserPromptSubmit':
             response = process_user_prompt_submit(event, api_key)
 
-            # If denied (response has decision: block), return and don't log
+            # If denied (response has decision: block), log the event then return
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'session_id': event.get('session_id'),
+                    'event': event
+                })
                 response["suppressOutput"] = True
                 print(json.dumps(response), flush=True)
                 return

@@ -192,8 +192,11 @@ def run_callback_server(frontend_url: str) -> Optional[str]:
         def log_message(self, format, *args):
             return
 
+    class _CallbackServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
     try:
-        httpd = socketserver.TCPServer(("127.0.0.1", 0), CallbackHandler)
+        httpd = _CallbackServer(("127.0.0.1", 0), CallbackHandler)
         _, port = httpd.server_address
         callback_url = f"http://127.0.0.1:{port}/callback"
 
