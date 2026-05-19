@@ -1,0 +1,903 @@
+#!/usr/bin/env python3
+"""
+Real-time GitHub Copilot hook event processor.
+Reads JSON events from stdin, appends to agent-audit.log, and processes them on stop events.
+"""
+
+import sys
+import json
+import os
+import subprocess
+from pathlib import Path
+from datetime import datetime
+import tempfile
+import time
+import hashlib
+
+UNBOUND_GATEWAY_URL = os.environ.get(
+    "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
+).rstrip("/")
+
+APPROVAL_TIMEOUT = 4 * 60 * 60
+
+APPROVAL_POLL_PHASES = (
+    (5 * 60,        3),    # 0-5 min: 3s
+    (30 * 60,       15),   # 5-30 min: 15s
+    (2 * 60 * 60,   60),   # 30 min - 2h: 1min
+    (4 * 60 * 60,   120),  # 2h - 4h: 2min
+)
+
+# Use user's home directory for logs
+LOG_DIR = Path.home() / ".copilot" / "hooks"
+AUDIT_LOG = LOG_DIR / "agent-audit.log"
+ERROR_LOG = LOG_DIR / "error.log"
+LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+
+# Copilot tool names (VS Code + CLI) translated to the canonical gateway vocabulary.
+SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+READ_TOOLS = {'read_file', 'readFile', 'view', 'list_dir', 'listDirectory', 'cat'}
+WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
+EDIT_TOOLS = {'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit', 'replace_string_in_file'}
+ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
+NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
+CACHE_TTL_SECONDS = 300
+POLICY_CHECK_FAILURE_DEFAULT = 'allow'
+POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
+PRETOOL_USER_MESSAGES_LIMIT = 5
+AUDIT_LOG_TOTAL_LIMIT = 100
+
+# Ensure log directory exists
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    # Fallback to temp directory if home directory is not writable
+    LOG_DIR = Path(tempfile.gettempdir()) / "copilot-hooks"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    AUDIT_LOG = LOG_DIR / "agent-audit.log"
+    ERROR_LOG = LOG_DIR / "error.log"
+    LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+    POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
+
+
+_cached_api_key = None
+_reporting_error = False
+
+
+def _should_report():
+    """Rate limit: max 1 remote error report per 60 seconds. Fails closed."""
+    try:
+        if LAST_REPORT_FILE.exists():
+            mtime = LAST_REPORT_FILE.stat().st_mtime
+            if (datetime.now().timestamp() - mtime) < 60:
+                return False
+        LAST_REPORT_FILE.touch()
+        return True
+    except Exception:
+        return False
+
+
+def report_error_to_gateway(message, category='general', api_key=None):
+    """Fire-and-forget error report to gateway. Never blocks, never raises."""
+    global _reporting_error
+    if _reporting_error or not api_key or not _should_report():
+        return
+    _reporting_error = True
+    try:
+        payload = json.dumps({
+            'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
+            'hook_source': 'copilot',
+        })
+        proc = subprocess.Popen(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-",
+             f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        proc.stdin.write(payload.encode())
+        proc.stdin.close()
+    except Exception:
+        pass
+    finally:
+        _reporting_error = False
+
+
+def log_error(message, category='general'):
+    """Log error with timestamp to error.log, keeping only last 25 errors."""
+    timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
+    error_entry = f"{timestamp}: {message}\n"
+
+    try:
+        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+            f.write(error_entry)
+
+        # Keep only last 25 errors
+        if ERROR_LOG.exists():
+            with open(ERROR_LOG, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+            if len(lines) > 25:
+                with open(ERROR_LOG, 'w', encoding='utf-8') as f:
+                    f.writelines(lines[-25:])
+    except Exception:
+        pass
+
+    # Report to gateway (fire-and-forget)
+    report_error_to_gateway(message, category, _cached_api_key)
+
+
+def _read_policy_cache_raw():
+    """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
+    try:
+        if not POLICY_CACHE_FILE.exists():
+            return None
+        with open(POLICY_CACHE_FILE, 'r', encoding='utf-8') as f:
+            cache = json.loads(f.read())
+        return cache if isinstance(cache, dict) else None
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def load_policy_cache():
+    """Load policy cache from disk. Returns None if missing, corrupt, or expired."""
+    cache = _read_policy_cache_raw()
+    if cache is None or 'last_synced' not in cache or 'tools_to_check' not in cache:
+        return None
+    if not isinstance(cache['tools_to_check'], list):
+        return None
+    return cache
+
+
+def get_policy_check_failure_action():
+    """Read failure-action from cache, defaulting to 'allow'. Ignores TTL."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return POLICY_CHECK_FAILURE_DEFAULT
+    value = cache.get('policy_check_failure_action')
+    return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
+
+
+def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
+    """Write policy cache to disk. None for any field preserves the prior value."""
+    try:
+        POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        prior = _read_policy_cache_raw() or {}
+        if tools_to_check is None:
+            tools_to_check = prior.get('tools_to_check', [])
+        if policy_check_failure_action not in ('allow', 'block'):
+            policy_check_failure_action = get_policy_check_failure_action()
+        cache = {
+            'last_synced': datetime.utcnow().isoformat() + 'Z',
+            'tools_to_check': tools_to_check,
+            'policy_check_failure_action': policy_check_failure_action,
+        }
+        with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(cache))
+    except (OSError, TypeError):
+        pass
+
+
+def is_cache_stale(cache):
+    """Check if cached data is older than CACHE_TTL_SECONDS."""
+    try:
+        synced = datetime.fromisoformat(cache['last_synced'].rstrip('Z'))
+        age = (datetime.utcnow() - synced).total_seconds()
+        return age > CACHE_TTL_SECONDS
+    except (ValueError, KeyError):
+        return True
+
+
+def load_existing_logs():
+    """Load existing logs from agent-audit.log into memory."""
+    logs = []
+    if AUDIT_LOG.exists():
+        try:
+            with open(AUDIT_LOG, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            logs.append(json.loads(line))
+                        except json.JSONDecodeError:
+                            continue
+        except Exception:
+            pass
+    return logs
+
+
+def save_logs(logs):
+    """Save logs back to agent-audit.log."""
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, 'w', encoding='utf-8') as f:
+            for log in logs:
+                f.write(json.dumps(log) + '\n')
+    except Exception:
+        pass
+
+
+def append_to_audit_log(event_data):
+    """Append event to agent-audit.log."""
+    try:
+        AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
+            f.write(json.dumps(event_data) + '\n')
+    except Exception:
+        pass
+
+
+def cleanup_old_logs():
+    """Manage log file size by keeping only the most recent session's entries
+    once the audit log exceeds AUDIT_LOG_TOTAL_LIMIT."""
+    logs = load_existing_logs()
+
+    if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
+        return
+
+    session_order = []
+    seen_sessions = set()
+
+    for log in logs:
+        event = log.get('event', {})
+        session_id = event.get('session_id')
+        if session_id and session_id not in seen_sessions:
+            session_order.append(session_id)
+            seen_sessions.add(session_id)
+
+    if len(session_order) > 1:
+        most_recent_session = session_order[-1]
+        kept_logs = [
+            log for log in logs
+            if log.get('event', {}).get('session_id') == most_recent_session
+        ]
+        save_logs(kept_logs)
+
+
+def get_recent_user_prompts_for_session(session_id, n):
+    if not session_id or n <= 0:
+        return []
+
+    logs = load_existing_logs()
+    prompts = []
+    for log in logs:
+        event = log.get('event', {})
+        if event.get('hook_event_name') != 'UserPromptSubmit':
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        prompt = event.get('prompt')
+        if prompt:
+            prompts.append(prompt)
+    return prompts[-n:]
+
+
+def get_session_start_model(session_id):
+    """Return the model from the audit-logged SessionStart event for a session.
+    VS Code's SessionStart payload carries `model`; latest entry wins."""
+    if not session_id:
+        return None
+    found = None
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != 'SessionStart':
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        model = event.get('model')
+        if model:
+            found = model
+    return found
+
+
+def _build_user_prompt_payload(recent_user_prompts):
+    last = recent_user_prompts[-1] if recent_user_prompts else None
+    return {
+        'messages': [{'role': 'user', 'content': last}] if last else [],
+        'user_prompts': recent_user_prompts,
+    }
+
+
+def canonical_tool_name(raw):
+    """Translate a Copilot tool name to the canonical gateway vocabulary.
+    Returns '' when the tool is not security-relevant."""
+    if raw in SHELL_TOOLS:
+        return 'Bash'
+    if raw in READ_TOOLS:
+        return 'Read'
+    if raw in WRITE_TOOLS:
+        return 'Write'
+    if raw in EDIT_TOOLS:
+        return 'Edit'
+    if raw.startswith('mcp'):
+        # MCP tools pass through unchanged — the gateway matches on the raw name.
+        return raw
+    return ''
+
+
+def extract_command_for_pretool(canonical, tool_input):
+    """Extract the policy-check command from tool_input keyed by canonical tool type."""
+    if canonical == 'Bash':
+        return tool_input.get('command', '')
+    if canonical in ('Read', 'Write', 'Edit'):
+        return tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path') or ''
+    if canonical.startswith('mcp'):
+        return json.dumps(tool_input)
+    return ''
+
+
+def send_to_hook_api(request_body, api_key):
+    """Send request to /v1/hooks/pretool endpoint."""
+    if not api_key:
+        return {}
+
+    try:
+        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
+        data = json.dumps(request_body)
+
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", url],
+            input=data.encode(),
+            capture_output=True,
+            timeout=20
+        )
+
+        if result.returncode == 0 and result.stdout:
+            return json.loads(result.stdout.decode('utf-8'))
+        return {}
+    except Exception as e:
+        log_error(f"Hook API error: {str(e)}", 'api_call')
+        return {}
+
+
+_APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
+
+
+def _is_approval_retry(command):
+    """True if a marker exists for this exact command and is fresh."""
+    try:
+        if not _APPROVAL_MARKER_FILE.exists():
+            return False
+        data = json.loads(_APPROVAL_MARKER_FILE.read_text())
+        cmd_hash = hashlib.sha256(command.encode()).hexdigest()[:16]
+        return data.get('cmd') == cmd_hash and (time.time() - data.get('ts', 0)) < APPROVAL_TIMEOUT
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
+def _set_approval_marker(command, policy_ids, application_id, request_id=''):
+    _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
+        'ts': time.time(),
+        'policyIds': policy_ids,
+        'applicationId': application_id,
+        'requestId': request_id,
+    }
+    _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
+
+
+def _get_approval_marker_data():
+    try:
+        if _APPROVAL_MARKER_FILE.exists():
+            return json.loads(_APPROVAL_MARKER_FILE.read_text())
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _clear_approval_marker():
+    try:
+        _APPROVAL_MARKER_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _next_poll_interval(elapsed):
+    """Pick the polling interval for the current elapsed time using APPROVAL_POLL_PHASES."""
+    for upto, interval in APPROVAL_POLL_PHASES:
+        if elapsed < upto:
+            return interval
+    return APPROVAL_POLL_PHASES[-1][1]
+
+
+def poll_approval_status(api_key, policy_ids, application_id, request_id='', timeout=APPROVAL_TIMEOUT):
+    """Poll the approval-status endpoint until approved, denied, or timeout.
+    Returns 'approved', 'deny', or 'timeout'."""
+
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
+    payload = {"policyIds": policy_ids, "applicationId": application_id}
+    if request_id:
+        payload["requestId"] = request_id
+    body = json.dumps(payload)
+
+    start = time.monotonic()
+    deadline = start + timeout
+
+    while time.monotonic() < deadline:
+        time.sleep(_next_poll_interval(time.monotonic() - start))
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=body.encode(),
+                capture_output=True,
+                timeout=10
+            )
+            if result.returncode == 0 and result.stdout:
+                resp = json.loads(result.stdout.decode('utf-8'))
+                decision = resp.get('decision', 'pending')
+                if decision == 'allow':
+                    return 'approved'
+                if decision == 'deny':
+                    return 'deny'
+        except Exception as e:
+            log_error(f"Approval poll error: {str(e)}", 'api_call')
+
+    return 'timeout'
+
+
+def transform_response_for_copilot(api_response):
+    """Transform a gateway response to Copilot PreToolUse output format."""
+    if not api_response:
+        return {}
+
+    decision = api_response.get('decision', 'allow')
+    reason = api_response.get('reason', '')
+    additional_context = api_response.get('additionalContext', '')
+
+    return {
+        'hookSpecificOutput': {
+            'hookEventName': 'PreToolUse',
+            'permissionDecision': decision,
+            'permissionDecisionReason': reason,
+            'additionalContext': additional_context
+        }
+    }
+
+
+def transform_response_for_copilot_prompt(api_response):
+    """Transform a gateway response to Copilot UserPromptSubmit output format."""
+    if not api_response:
+        return {}
+
+    decision = api_response.get('decision', 'allow')
+    reason = api_response.get('reason', '')
+
+    # For UserPromptSubmit, 'deny' maps to 'block'
+    if decision == 'deny':
+        return {
+            'decision': 'block',
+            'reason': reason
+        }
+
+    return {}
+
+
+def process_pre_tool_use(event, api_key):
+    """Process PreToolUse event - check policy before tool execution."""
+    raw_tool = event.get('tool_name', '')
+    tool_input = event.get('tool_input') or {}
+    session_id = event.get('session_id')
+
+    # Translate the Copilot tool name to the canonical gateway vocabulary.
+    canonical = canonical_tool_name(raw_tool)
+    is_mcp = canonical.startswith('mcp')
+    if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
+        return {}
+
+    cache = load_policy_cache()
+    tools_to_check = cache.get('tools_to_check', []) if cache else []
+    need_pull_policies = cache is None or is_cache_stale(cache)
+
+    if (
+        canonical in NATIVE_FILE_TOOLS
+        and canonical not in tools_to_check
+        and not need_pull_policies
+    ):
+        return {}
+
+    model = get_session_start_model(session_id) or 'auto'
+    command = extract_command_for_pretool(canonical, tool_input)
+
+    recent_user_prompts = get_recent_user_prompts_for_session(
+        session_id, PRETOOL_USER_MESSAGES_LIMIT
+    )
+
+    # Preserve the raw event (raw tool_name + tool_input) inside metadata.
+    metadata = dict(event)
+    file_path = tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path')
+    if file_path:
+        metadata['file_path'] = file_path
+
+    approval_key = f"{canonical}:{command}"
+    is_retry = _is_approval_retry(approval_key)
+
+    request_body = {
+        'conversation_id': session_id,
+        'unbound_app_label': 'copilot',
+        'model': model,
+        'event_name': 'tool_use',
+        'pre_tool_use_data': {
+            'tool_name': canonical,
+            'command': command,
+            'metadata': metadata
+        },
+        **_build_user_prompt_payload(recent_user_prompts),
+    }
+
+    if not is_retry:
+        request_body['first_approval_check'] = True
+
+    if is_retry:
+        marker_data = _get_approval_marker_data()
+        if marker_data:
+            policy_ids = marker_data.get('policyIds', [])
+            application_id = marker_data.get('applicationId', '')
+            request_id = marker_data.get('requestId', '')
+            _clear_approval_marker()
+            result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
+
+            if result == 'approved':
+                return {}
+            elif result == 'deny':
+                return transform_response_for_copilot({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. This action was denied via Slack.',
+                    'additionalContext': 'This action was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                })
+            else:
+                return transform_response_for_copilot({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.',
+                    'additionalContext': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                })
+
+    if need_pull_policies:
+        request_body['pull_policies'] = True
+
+    api_response = send_to_hook_api(request_body, api_key)
+
+    if not api_response:
+        if get_policy_check_failure_action() == 'block':
+            return transform_response_for_copilot({
+                'decision': 'deny',
+                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
+                'additionalContext': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
+            })
+        report_error_to_gateway(
+            f'Hook bypassed_due_to_failure: gateway unreachable for tool={raw_tool}',
+            category='bypassed_due_to_failure',
+            api_key=api_key,
+        )
+        return {}
+
+    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+        )
+
+    if api_response.get('decision') == 'approval_required':
+        approval_check = api_response.get('approvalCheck', {})
+        policy_ids = approval_check.get('policyIds', [])
+        application_id = approval_check.get('applicationId', '')
+        request_id = approval_check.get('requestId', '')
+
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
+        return transform_response_for_copilot({
+            'decision': 'deny',
+            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'additionalContext': (
+                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+                'Tell the user: "An approval request has been sent to your Slack DMs. '
+                'Please approve it and I will retry automatically." '
+                'Then immediately retry the exact same tool call with the exact same arguments — '
+                'do not modify them in any way. Retry exactly once — the second attempt will wait for the approval.'
+            ),
+        })
+
+    return transform_response_for_copilot(api_response)
+
+
+def process_user_prompt_submit(event, api_key):
+    """Process UserPromptSubmit event for policy checking."""
+    session_id = event.get('session_id')
+    model = get_session_start_model(session_id) or 'auto'
+    prompt = event.get('prompt', '')
+
+    request_body = {
+        'conversation_id': session_id,
+        'unbound_app_label': 'copilot',
+        'model': model,
+        'event_name': 'user_prompt',
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+    }
+
+    api_response = send_to_hook_api(request_body, api_key)
+    return transform_response_for_copilot_prompt(api_response)
+
+
+def _normalize_arguments(arguments):
+    """Copilot tool arguments may be a dict or a JSON string. Always return a dict."""
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+            return parsed if isinstance(parsed, dict) else {'value': arguments}
+        except json.JSONDecodeError:
+            return {'value': arguments}
+    return {}
+
+
+def map_copilot_tool(name, args, result_content):
+    """Map a Copilot tool call to a cursor-style tool_use entry."""
+    if name in SHELL_TOOLS:
+        entry = {
+            'type': 'afterShellExecution',
+            'command': args.get('command', ''),
+            'output': result_content or '',
+        }
+    elif name in READ_TOOLS:
+        entry = {
+            'type': 'beforeReadFile',
+            'file_path': args.get('filePath') or args.get('path') or args.get('file_path', ''),
+            'content': result_content or '',
+        }
+    elif name in WRITE_TOOLS or name in EDIT_TOOLS:
+        entry = {
+            'type': 'afterFileEdit',
+            'file_path': args.get('filePath') or args.get('path') or args.get('file_path', ''),
+            'content': args.get('content') or args.get('file_text') or result_content or '',
+        }
+    else:
+        entry = {
+            'type': 'afterMCPExecution',
+            'tool_name': name,
+            'tool_input': args,
+            'result_json': result_content or '',
+        }
+    # Drop empty-string values.
+    return {k: v for k, v in entry.items() if v != ''}
+
+
+def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None):
+    """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
+
+    Reads defensively — blank or unparseable lines are skipped, never raised."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return None
+
+    entries = []
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return None
+
+    # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
+    # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
+    # when the payload carries none.
+    conversation_id = fallback_session_id
+    if not conversation_id:
+        p = Path(transcript_path)
+        conversation_id = p.parent.name if p.stem == 'events' else p.stem
+    model = None
+    last_user_index = -1
+
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        entry_type = entry.get('type')
+        data = entry.get('data') or {}
+        if entry_type == 'session.start':
+            sid = data.get('sessionId')
+            if sid and conversation_id == fallback_session_id:
+                conversation_id = sid
+        elif entry_type == 'session.model_change':
+            new_model = data.get('newModel')
+            if new_model:
+                model = new_model
+        elif entry_type == 'user.message':
+            last_user_index = i
+
+    if last_user_index < 0:
+        return None
+
+    user_prompt = (entries[last_user_index].get('data') or {}).get('content')
+
+    text_parts = []
+    tool_calls = []          # ordered list of call ids
+    tool_data = {}           # call_id -> {name, arguments, result, success}
+
+    def _register(call_id):
+        if call_id not in tool_data:
+            tool_data[call_id] = {'name': '', 'arguments': {}, 'result': None, 'success': None}
+            tool_calls.append(call_id)
+        return tool_data[call_id]
+
+    for entry in entries[last_user_index + 1:]:
+        if not isinstance(entry, dict):
+            continue
+        entry_type = entry.get('type')
+        data = entry.get('data') or {}
+
+        if entry_type == 'assistant.message':
+            content = data.get('content')
+            if content:
+                text_parts.append(content)
+            for req in data.get('toolRequests') or []:
+                if not isinstance(req, dict):
+                    continue
+                call_id = req.get('toolCallId')
+                if not call_id:
+                    continue
+                call = _register(call_id)
+                call['name'] = req.get('name') or call['name']
+                call['arguments'] = _normalize_arguments(req.get('arguments'))
+
+        elif entry_type == 'tool.execution_start':
+            call_id = data.get('toolCallId')
+            if not call_id:
+                continue
+            call = _register(call_id)
+            if data.get('toolName'):
+                call['name'] = data['toolName']
+            if data.get('arguments') is not None:
+                call['arguments'] = _normalize_arguments(data.get('arguments'))
+
+        elif entry_type == 'tool.execution_complete':
+            call_id = data.get('toolCallId')
+            if not call_id:
+                continue
+            call = _register(call_id)
+            call['success'] = data.get('success')
+            result = data.get('result') or {}
+            if isinstance(result, dict):
+                call['result'] = result.get('content')
+
+    tool_use = []
+    for call_id in tool_calls:
+        call = tool_data[call_id]
+        tool_use.append(map_copilot_tool(call['name'], call['arguments'], call['result']))
+
+    messages = []
+    if user_prompt:
+        messages.append({'role': 'user', 'content': user_prompt})
+
+    assistant_msg = {'role': 'assistant', 'content': '\n\n'.join(text_parts)}
+    if tool_use:
+        assistant_msg['tool_use'] = tool_use
+    messages.append(assistant_msg)
+
+    if not messages:
+        return None
+
+    return {
+        'conversation_id': conversation_id,
+        'model': model or session_start_model or 'auto',
+        'messages': messages,
+    }
+
+
+def send_to_api(exchange, api_key):
+    """Send exchange data to Unbound API."""
+    if not api_key:
+        log_error("No API key present in send_to_api function", 'config')
+        return False
+
+    try:
+        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/copilot"
+        data = json.dumps(exchange)
+
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", url],
+            input=data.encode(),
+            capture_output=True,
+            timeout=10
+        )
+
+        if result.returncode != 0:
+            error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
+            log_error(f"API request failed: {error_msg}", 'api_call')
+            return False
+        return True
+    except Exception as e:
+        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
+        return False
+
+
+def get_api_key():
+    """Get API key from env var or ~/.unbound/config.json."""
+    key = os.getenv('UNBOUND_COPILOT_API_KEY')
+    if key:
+        return key
+    try:
+        config_file = Path.home() / ".unbound" / "config.json"
+        with open(config_file, 'r', encoding='utf-8') as f:
+            return json.loads(f.read()).get('api_key')
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        log_error(f"Failed to read config file: {e}", 'config')
+        return None
+
+
+def main():
+    """Main entry point - read from stdin and process events."""
+    global _cached_api_key
+    api_key = get_api_key()
+    _cached_api_key = api_key
+
+    try:
+        input_data = sys.stdin.read().strip()
+
+        if not input_data:
+            print("{}")
+            return
+
+        try:
+            event = json.loads(input_data)
+        except json.JSONDecodeError:
+            print("{}")
+            return
+
+        event_name = event.get('hook_event_name')
+
+        if event_name == 'PreToolUse':
+            response = process_pre_tool_use(event, api_key)
+            print(json.dumps(response), flush=True)
+            return
+
+        if event_name == 'UserPromptSubmit':
+            response = process_user_prompt_submit(event, api_key)
+            if response.get('decision') == 'block':
+                print(json.dumps(response), flush=True)
+                return
+
+        # Create log entry with timestamp; the event already carries hook_event_name
+        timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
+        log_entry = {
+            'timestamp': timestamp,
+            'event': event,
+        }
+        append_to_audit_log(log_entry)
+
+        if event_name == 'Stop':
+            session_id = event.get('session_id')
+            exchange = build_exchange_from_transcript(
+                event.get('transcript_path'), session_id,
+                session_start_model=get_session_start_model(session_id),
+            )
+            if exchange:
+                send_to_api(exchange, api_key)
+            cleanup_old_logs()
+
+        # Output required by Copilot hooks
+        print("{}")
+
+    except Exception as e:
+        # Log errors but still output {} to not break Copilot
+        log_error(f"Exception in main: {str(e)}", 'general')
+        print("{}")
+
+
+if __name__ == '__main__':
+    main()
