@@ -607,6 +607,25 @@ def setup_managed_settings(api_key: str = "", gateway_url: str = DEFAULT_GATEWAY
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 
+        # Drop hooks MDM setup so the two setups stay mutually exclusive. Done
+        # after the settings write so a failed write never strands the hooks
+        # config pointing at a now-missing script.
+        hooks_dir = managed_dir / "hooks"
+        hook_script = hooks_dir / "unbound.py"
+        if hook_script.exists():
+            try:
+                hook_script.unlink()
+                debug_print(f"Removed hooks script {hook_script}")
+            except Exception as e:
+                debug_print(f"Failed to remove {hook_script}: {e}")
+        if hooks_dir.exists():
+            try:
+                if not any(hooks_dir.iterdir()):
+                    hooks_dir.rmdir()
+                    debug_print(f"Removed empty directory {hooks_dir}")
+            except Exception as e:
+                debug_print(f"Could not remove directory {hooks_dir}: {e}")
+
         # Set permissions - readable by all users
         if system in ["darwin", "linux"]:
             os.chmod(managed_dir, 0o755)
