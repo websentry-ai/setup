@@ -588,7 +588,7 @@ def _copilot_hooks_config(script_path: Path) -> Dict:
     return {"version": 1, "hooks": hooks}
 
 
-def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, source_script: Path) -> None:
+def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, source_script: Path) -> bool:
     """Install unbound.py and unbound.json into a user's ~/.copilot/hooks.
     Privilege-drops to the target user before any FS op — curl already ran as
     root to fetch source_script; the per-user write happens post-drop."""
@@ -611,10 +611,9 @@ def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, sour
             json.dump(config, f, indent=2)
         return True
 
-    if _run_as_user(username, _install):
-        debug_print(f"Installed Copilot hooks for {username}")
-    else:
-        debug_print(f"Failed to install Copilot hooks for {username}")
+    ok = bool(_run_as_user(username, _install))
+    debug_print(f"{'Installed' if ok else 'Failed to install'} Copilot hooks for {username}")
+    return ok
 
 
 def clear_hooks_for_user(username: str, home_dir: Path) -> bool:
@@ -779,8 +778,10 @@ def main():
     debug_print("UNBOUND_COPILOT_API_KEY set successfully")
 
     # Download unbound.py once as root into a private root-owned temp dir.
-    # mkdtemp gives mode 0700 and an unpredictable name, so a local user
-    # cannot pre-create or symlink the path the root curl writes to.
+    # mkdtemp gives an unpredictable name so a local user cannot pre-create or
+    # symlink the path the root curl writes to. The dir is then widened to
+    # 0o711 (traverse, still no listing) and the file to 0o644 so the per-user
+    # installs — which run after privilege-drop — can read the script.
     print("\nDownloading hook script...")
     staging_dir = Path(tempfile.mkdtemp(prefix="unbound-copilot-"))
     source_script = staging_dir / "unbound.py"
@@ -788,20 +789,28 @@ def main():
         print("Failed to download unbound.py")
         shutil.rmtree(staging_dir, ignore_errors=True)
         return
+    try:
+        os.chmod(staging_dir, 0o711)
+        os.chmod(source_script, 0o644)
+    except OSError:
+        pass
 
     print("\nInstalling Copilot hooks for all users...")
+    user_homes = get_all_user_homes()
     installed_count = 0
-    for username, home_dir in get_all_user_homes():
+    for username, home_dir in user_homes:
         write_unbound_config_for_user(username, home_dir, api_key)
-        install_hooks_for_user(username, home_dir, gateway_url, source_script)
-        installed_count += 1
+        if install_hooks_for_user(username, home_dir, gateway_url, source_script):
+            installed_count += 1
 
     shutil.rmtree(staging_dir, ignore_errors=True)
 
-    if installed_count > 0:
+    if not user_homes:
+        print("No user home directories found")
+    elif installed_count == len(user_homes):
         print(f"Installed Copilot hooks for {installed_count} user(s)")
     else:
-        print("No user home directories found")
+        print(f"Installed Copilot hooks for {installed_count} of {len(user_homes)} user(s) — {len(user_homes) - installed_count} failed")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
