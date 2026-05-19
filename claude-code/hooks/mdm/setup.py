@@ -647,6 +647,18 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             except Exception:
                 settings = {}
 
+        # Drop gateway MDM setup from the same file — leaving its apiKeyHelper
+        # behind makes Claude Code run anthropic_key.sh, which echoes the now
+        # removed UNBOUND_API_KEY and fails with "did not return a valid value".
+        if "apiKeyHelper" in settings:
+            del settings["apiKeyHelper"]
+        env = settings.get("env") if isinstance(settings.get("env"), dict) else None
+        if env:
+            for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                env.pop(k, None)
+            if not env:
+                del settings["env"]
+
         # Configure hooks - quote the path to handle spaces. On Windows, invoke
         # via `py -3` (falling back to `python`) and tell Claude to run each
         # hook through PowerShell so the quoted launcher parses correctly.
@@ -739,6 +751,17 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         settings["hooks"] = hooks_config
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
+
+        # Delete the gateway key helper only after the hooks settings are
+        # written, so a failed write never strands managed-settings.json
+        # pointing at a now-missing apiKeyHelper script.
+        gateway_key_helper = managed_dir / "anthropic_key.sh"
+        if gateway_key_helper.exists():
+            try:
+                gateway_key_helper.unlink()
+                debug_print(f"Removed gateway key helper {gateway_key_helper}")
+            except Exception as e:
+                debug_print(f"Failed to remove {gateway_key_helper}: {e}")
 
         # Set permissions - readable by all users
         if system in ["darwin", "linux"]:
