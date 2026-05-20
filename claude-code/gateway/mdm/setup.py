@@ -533,6 +533,54 @@ def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Removed {script_path} for {username}")
 
 
+def remove_user_level_gateway_for_user(username: str, home_dir: Path) -> None:
+    """Strip Unbound's apiKeyHelper from ~/.claude/settings.json and delete
+    ~/.claude/anthropic_key.sh for a given user. Without this, Claude Code's
+    user-level apiKeyHelper coexists with the MDM-managed one; if the managed
+    layer is ever cleared, the stale per-user helper still tries to echo a
+    no-longer-set UNBOUND_API_KEY. Only Unbound's apiKeyHelper value is
+    removed; other settings survive. Privilege-drops to the target user."""
+    settings_path = home_dir / ".claude" / "settings.json"
+    key_helper_path = home_dir / ".claude" / "anthropic_key.sh"
+    unbound_helpers = {
+        "~/.claude/anthropic_key.sh",
+        str(key_helper_path),
+    }
+
+    def _clean():
+        # safe_to_unlink stays True only if the JSON no longer references
+        # key_helper_path. If the read/write fails partway, we leave the
+        # helper script in place so apiKeyHelper doesn't point at a missing
+        # file (which would break Claude Code on next launch).
+        safe_to_unlink = True
+        if settings_path.exists():
+            try:
+                with open(settings_path, 'r', encoding='utf-8') as f:
+                    settings = json.load(f)
+                if isinstance(settings, dict):
+                    helper = settings.get("apiKeyHelper")
+                    if isinstance(helper, str) and helper in unbound_helpers:
+                        del settings["apiKeyHelper"]
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+                        fd = os.open(str(settings_path), flags, 0o644)
+                        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                            json.dump(settings, f, indent=2)
+                        debug_print(f"Removed Unbound apiKeyHelper from {settings_path}")
+            except Exception as e:
+                safe_to_unlink = False
+                debug_print(f"Failed to clean {settings_path}: {e}")
+
+        if safe_to_unlink and key_helper_path.exists():
+            try:
+                key_helper_path.unlink()
+                debug_print(f"Removed {key_helper_path}")
+            except Exception as e:
+                debug_print(f"Failed to remove {key_helper_path}: {e}")
+        return True
+
+    _run_as_user(username, _clean)
+
+
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Claude Code."""
     system = platform.system().lower()
@@ -856,9 +904,12 @@ def main():
         return
     debug_print("ANTHROPIC_BASE_URL set successfully")
 
-    # Remove leftover hooks scripts and write unbound config for all users
+    # Remove leftover hooks scripts, strip leftover user-level Unbound
+    # apiKeyHelper (so the managed apiKeyHelper is the sole source), and
+    # write unbound config for all users.
     for username, home_dir in get_all_user_homes():
         remove_hooks_unbound_script_for_user(username, home_dir)
+        remove_user_level_gateway_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, claude_api_key)
 
     print("\n🔧 Configuring Claude managed settings...")
