@@ -591,11 +591,16 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                                     h for h in hooks_list
                                     if not (isinstance(h, dict) and _is_unbound(h.get("command", "")))
                                 ]
-                                if len(new_hooks) != len(hooks_list):
-                                    modified = True
-                                if new_hooks:
-                                    item["hooks"] = new_hooks
+                                if len(new_hooks) == len(hooks_list):
+                                    # No Unbound hooks here — preserve as-is so
+                                    # we don't silently drop pre-existing empty
+                                    # items the user authored.
                                     new_event_config.append(item)
+                                else:
+                                    modified = True
+                                    if new_hooks:
+                                        item["hooks"] = new_hooks
+                                        new_event_config.append(item)
                             else:
                                 new_event_config.append(item)
                         if new_event_config:
