@@ -565,6 +565,81 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Removed openai_base_url from {config_path}")
 
 
+def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
+    """Strip Unbound's hook entries from ~/.codex/hooks.json and delete
+    ~/.codex/hooks/unbound.py for a given user. Without this, MDM-managed
+    hooks fire alongside leftover user-level ones and every event runs twice.
+    Only entries pointing to our own unbound.py are removed; unrelated user
+    hooks are preserved. The codex_hooks feature flag in config.toml is left
+    alone — MDM still relies on it. Privilege-drops to the target user."""
+    hooks_path = home_dir / ".codex" / "hooks.json"
+    script_path = home_dir / ".codex" / "hooks" / "unbound.py"
+    hook_command = str(script_path)
+    is_windows = platform.system().lower() == "windows"
+
+    def _is_unbound(cmd: str) -> bool:
+        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+
+    def _clean():
+        # safe_to_unlink stays True only if the JSON no longer references
+        # script_path. If the read/write fails partway, we leave the script
+        # in place so a dangling hook entry doesn't point at a missing file.
+        safe_to_unlink = True
+        if hooks_path.exists():
+            try:
+                with open(hooks_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                if isinstance(config, dict) and isinstance(config.get("hooks"), dict):
+                    hooks_block = config["hooks"]
+                    modified = False
+                    for event in list(hooks_block.keys()):
+                        event_config = hooks_block[event]
+                        if not isinstance(event_config, list):
+                            continue
+                        new_event_config = []
+                        for item in event_config:
+                            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                                hooks_list = item["hooks"]
+                                new_hooks = [
+                                    h for h in hooks_list
+                                    if not (isinstance(h, dict) and _is_unbound(h.get("command", "")))
+                                ]
+                                if len(new_hooks) != len(hooks_list):
+                                    modified = True
+                                if new_hooks:
+                                    item["hooks"] = new_hooks
+                                    new_event_config.append(item)
+                            else:
+                                new_event_config.append(item)
+                        if new_event_config:
+                            hooks_block[event] = new_event_config
+                        else:
+                            del hooks_block[event]
+                            modified = True
+                    if not hooks_block:
+                        del config["hooks"]
+                        modified = True
+                    if modified:
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+                        fd = os.open(str(hooks_path), flags, 0o644)
+                        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                            json.dump(config, f, indent=2)
+                        debug_print(f"Stripped Unbound hooks from {hooks_path}")
+            except Exception as e:
+                safe_to_unlink = False
+                debug_print(f"Failed to clean {hooks_path}: {e}")
+
+        if safe_to_unlink and script_path.exists():
+            try:
+                script_path.unlink()
+                debug_print(f"Removed {script_path}")
+            except Exception as e:
+                debug_print(f"Failed to remove {script_path}: {e}")
+        return True
+
+    _run_as_user(username, _clean)
+
+
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Codex."""
     system = platform.system().lower()
@@ -1323,9 +1398,12 @@ def main():
         return
     debug_print("UNBOUND_CODEX_API_KEY set successfully")
 
-    # Remove gateway artifacts and write unbound config for all users
+    # Remove gateway artifacts, strip leftover user-level Unbound hooks
+    # (so managed hooks don't fire twice), write unbound config, and enable
+    # the codex_hooks feature flag for all users.
     for username, home_dir in get_all_user_homes():
         remove_gateway_artifacts_for_user(username, home_dir)
+        remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key)
         enable_codex_hooks_feature_for_user(username, home_dir)
 
