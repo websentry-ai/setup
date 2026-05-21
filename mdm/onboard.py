@@ -273,7 +273,7 @@ def main() -> int:
         print(f"❌ MDM onboarding finished with {len(failures)} failure(s): {', '.join(failures)}")
         print("Re-run the failed step's individual command to retry.")
         return 1
-    steps = [name for name, _ in TOOLS] + ([] if is_clear else ["Discovery"])
+    steps = [name for name, *_ in TOOLS] + ([] if is_clear else ["Discovery"])
     print(f"✅ MDM onboarding complete: {', '.join(steps)}")
     return 0
 
