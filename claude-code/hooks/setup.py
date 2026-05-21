@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import platform
 import subprocess
 import urllib.parse
@@ -29,6 +30,7 @@ BACKFILL_TOOL_TYPE = "claude-code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
+BACKFILL_MAX_AGE_DAYS = 30
 
 DEBUG = False
 
@@ -727,14 +729,18 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
 
 
 def _backfill_iter_transcripts(root: Path):
-    # Skip hidden, symlinked, or oversized files (50MB cap).
+    # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
+    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
     for p in root.rglob('*.jsonl'):
         if p.name.startswith('.'):
             continue
         if not p.is_file() or p.is_symlink():
             continue
         try:
-            if p.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+            st = p.stat()
+            if st.st_size > BACKFILL_MAX_FILE_BYTES:
+                continue
+            if st.st_mtime < cutoff_mtime:
                 continue
         except OSError:
             continue
