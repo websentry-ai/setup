@@ -218,7 +218,15 @@ def _is_approval_retry(command: str) -> bool:
         return False
 
 
-def _set_approval_marker(command: str, policy_ids: list, application_id: str, request_id: str = '') -> None:
+def _set_approval_marker(
+    command: str,
+    policy_ids: list,
+    application_id: str,
+    request_id: str = '',
+    escalated_to_admin: bool = False,
+    escalated_admin_email: str = '',
+    escalated_admin_name: str = '',
+) -> None:
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -226,6 +234,9 @@ def _set_approval_marker(command: str, policy_ids: list, application_id: str, re
         'policyIds': policy_ids,
         'applicationId': application_id,
         'requestId': request_id,
+        'escalatedToAdmin': escalated_to_admin,
+        'escalatedAdminEmail': escalated_admin_email,
+        'escalatedAdminName': escalated_admin_name,
     }
     _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
 
@@ -244,6 +255,66 @@ def _clear_approval_marker() -> None:
         _APPROVAL_MARKER_FILE.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _format_escalated_admin_contact(admin_email: str = '', admin_name: str = '') -> str:
+    email = (admin_email or '').strip()
+    name = (admin_name or '').strip()
+    if email and name and name != email:
+        return f'{name} ({email})'
+    if email:
+        return email
+    return 'an organization admin'
+
+
+def _escalated_approval_messages(admin_email: str = '', admin_name: str = '') -> tuple:
+    contact = _format_escalated_admin_contact(admin_email, admin_name)
+    default_reason = (
+        f'We could not find your Slack account, so an approval request was sent to {contact}. '
+        'Please ask them to approve it in Slack.'
+    )
+    tell_user = f'Tell the user: "{default_reason}" '
+    return default_reason, tell_user
+
+
+def _handle_approval_required_response(api_response: Dict, approval_key: str) -> Dict:
+    approval_check = api_response.get('approvalCheck', {})
+    policy_ids = approval_check.get('policyIds', [])
+    application_id = approval_check.get('applicationId', '')
+    request_id = approval_check.get('requestId', '')
+    escalated_to_admin = approval_check.get('escalatedToAdmin') is True
+    admin_email = approval_check.get('escalatedAdminEmail', '')
+    admin_name = approval_check.get('escalatedAdminName', '')
+
+    if escalated_to_admin:
+        reason, tell_user = _escalated_approval_messages(admin_email, admin_name)
+    else:
+        reason = 'An approval request has been sent to your Slack DMs. Please approve it there.'
+        tell_user = (
+            'Tell the user: "An approval request has been sent to your Slack DMs. '
+            'Please approve it and I will retry automatically." '
+        )
+
+    _set_approval_marker(
+        approval_key,
+        policy_ids,
+        application_id,
+        request_id=request_id,
+        escalated_to_admin=escalated_to_admin,
+        escalated_admin_email=admin_email,
+        escalated_admin_name=admin_name,
+    )
+    return transform_response_for_claude({
+        'decision': 'deny',
+        'reason': reason,
+        'additionalContext': (
+            'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
+            + tell_user +
+            'Then immediately retry the exact same tool call with the exact same command — '
+            'do not modify the command in any way, do not add sleep or any prefix. '
+            'Retry exactly once — the second attempt will wait for the approval.'
+        ),
+    })
 
 
 def _extract_session_model(logs: List[Dict], session_id: str) -> Optional[str]:
@@ -674,9 +745,20 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                     'additionalContext': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
                 })
             else:
+                escalated_to_admin = marker_data.get('escalatedToAdmin') is True
+                admin_contact = _format_escalated_admin_contact(
+                    marker_data.get('escalatedAdminEmail', ''),
+                    marker_data.get('escalatedAdminName', ''),
+                )
+                timeout_reason = (
+                    f'Blocked by organization policy. Approval request timed out — '
+                    f'ask {admin_contact} to check Slack and retry the command.'
+                    if escalated_to_admin else
+                    'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.'
+                )
                 return transform_response_for_claude({
                     'decision': 'deny',
-                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
+                    'reason': timeout_reason,
                     'additionalContext': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 })
 
@@ -706,24 +788,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
 
     if api_response.get('decision') == 'approval_required':
-        approval_check = api_response.get('approvalCheck', {})
-        policy_ids = approval_check.get('policyIds', [])
-        application_id = approval_check.get('applicationId', '')
-        request_id = approval_check.get('requestId', '')
-
-        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
-        return transform_response_for_claude({
-            'decision': 'deny',
-            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
-            'additionalContext': (
-                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
-                'Tell the user: "An approval request has been sent to your Slack DMs. '
-                'Please approve it and I will retry automatically." '
-                'Then immediately retry the exact same tool call with the exact same command — '
-                'do not modify the command in any way, do not add sleep or any prefix. '
-                'Retry exactly once — the second attempt will wait for the approval.'
-            ),
-        })
+        return _handle_approval_required_response(api_response, approval_key)
 
     return transform_response_for_claude(api_response)
 

@@ -179,7 +179,15 @@ def _is_approval_retry(command: str) -> bool:
         return False
 
 
-def _set_approval_marker(command: str, policy_ids: list, application_id: str, request_id: str = '') -> None:
+def _set_approval_marker(
+    command: str,
+    policy_ids: list,
+    application_id: str,
+    request_id: str = '',
+    escalated_to_admin: bool = False,
+    escalated_admin_email: str = '',
+    escalated_admin_name: str = '',
+) -> None:
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -187,6 +195,9 @@ def _set_approval_marker(command: str, policy_ids: list, application_id: str, re
         'policyIds': policy_ids,
         'applicationId': application_id,
         'requestId': request_id,
+        'escalatedToAdmin': escalated_to_admin,
+        'escalatedAdminEmail': escalated_admin_email,
+        'escalatedAdminName': escalated_admin_name,
     }
     _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
 
@@ -206,6 +217,53 @@ def _clear_approval_marker() -> None:
             _APPROVAL_MARKER_FILE.unlink()
     except OSError:
         pass
+
+
+def _format_escalated_admin_contact(admin_email: str = '', admin_name: str = '') -> str:
+    email = (admin_email or '').strip()
+    name = (admin_name or '').strip()
+    if email and name and name != email:
+        return f'{name} ({email})'
+    if email:
+        return email
+    return 'an organization admin'
+
+
+def _escalated_approval_user_message(admin_email: str = '', admin_name: str = '') -> str:
+    contact = _format_escalated_admin_contact(admin_email, admin_name)
+    return (
+        f'We could not find your Slack account, so an approval request was sent to {contact}. '
+        'Please ask them to approve it in Slack.'
+    )
+
+
+def _handle_approval_required_codex_response(api_response: Dict, approval_key: str) -> Dict:
+    approval_check = api_response.get('approvalCheck', {})
+    policy_ids = approval_check.get('policyIds', [])
+    application_id = approval_check.get('applicationId', '')
+    request_id = approval_check.get('requestId', '')
+    escalated_to_admin = approval_check.get('escalatedToAdmin') is True
+    admin_email = approval_check.get('escalatedAdminEmail', '')
+    admin_name = approval_check.get('escalatedAdminName', '')
+
+    if escalated_to_admin:
+        reason = _escalated_approval_user_message(admin_email, admin_name)
+    else:
+        reason = 'An approval request has been sent to your Slack DMs. Please approve it there.'
+
+    _set_approval_marker(
+        approval_key,
+        policy_ids,
+        application_id,
+        request_id=request_id,
+        escalated_to_admin=escalated_to_admin,
+        escalated_admin_email=admin_email,
+        escalated_admin_name=admin_name,
+    )
+    return transform_response_for_codex({
+        'decision': 'deny',
+        'reason': reason,
+    })
 
 
 def _next_poll_interval(elapsed: float) -> int:
@@ -676,24 +734,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
 
     if api_response.get('decision') == 'approval_required':
-        approval_check = api_response.get('approvalCheck', {})
-        policy_ids = approval_check.get('policyIds', [])
-        application_id = approval_check.get('applicationId', '')
-        request_id = approval_check.get('requestId', '')
-
-        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
-        return transform_response_for_codex({
-            'decision': 'deny',
-            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
-            'additionalContext': (
-                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
-                'Tell the user: "An approval request has been sent to your Slack DMs. '
-                'Please approve it and I will retry automatically." '
-                'Then immediately retry the exact same tool call with the exact same command — '
-                'do not modify the command in any way, do not add sleep or any prefix. '
-                'Retry exactly once — the second attempt will wait for the approval.'
-            ),
-        })
+        return _handle_approval_required_codex_response(api_response, approval_key)
 
     return transform_response_for_codex(api_response)
 
