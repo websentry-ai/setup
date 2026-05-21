@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Unbound MDM onboarding — runs all four steps in one shot:
+Unbound MDM onboarding — runs all five steps in one shot:
 
   1. Claude Code MDM setup (with --backfill of historical transcripts)
   2. Cursor MDM setup
   3. Codex MDM setup (with --backfill of historical transcripts)
-  4. Coding-discovery scan
+  4. GitHub Copilot MDM setup
+  5. Coding-discovery scan
 
-Steps 1-3 use --api-key (admin MDM key). Step 4 uses --discovery-key (a
+Steps 1-4 use --api-key (admin MDM key). Step 5 uses --discovery-key (a
 separate discovery-specific key). The two are different credentials and the
 backend distinguishes them; passing one in place of the other will be rejected.
 
@@ -15,8 +16,8 @@ Backfill is enabled by default for Claude Code and Codex — it seeds the new
 device's existing local transcripts into analytics so the dashboard isn't
 empty until live activity accumulates. Backfill is idempotent (the Task-row
 gate + deterministic uuid5 per record keeps re-runs from duplicating data),
-so leaving it on is safe even if onboard is re-run. Cursor has no
-historical transcript store and is skipped automatically.
+so leaving it on is safe even if onboard is re-run. Cursor and GitHub Copilot
+have no historical transcript store and are skipped automatically.
 
 Usage:
 
@@ -29,7 +30,7 @@ the discovery --domain):
   --backend-url <url>   default https://backend.getunbound.ai
   --gateway-url <url>   default https://api.getunbound.ai  (MDM tools only)
 
-To clear MDM setup for the three tools (no discovery — it's a one-shot scan,
+To clear MDM setup for the four tools (no discovery — it's a one-shot scan,
 nothing to clear; backfill is also skipped because there's nothing to seed):
   sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --clear
 
@@ -55,12 +56,13 @@ _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discover
 SUBPROCESS_TIMEOUT_SECONDS = 600
 
 # (display_name, url, supports_backfill). Only tools whose hook scripts
-# accept `--backfill` get the flag appended; Cursor has no historical
-# transcript store and would just print "not supported" and continue.
+# accept `--backfill` get the flag appended; Cursor and GitHub Copilot have no
+# historical transcript store and would just print "not supported" and continue.
 TOOLS = [
-    ("Claude Code", f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True),
-    ("Cursor",      f"{_RAW_SETUP}/cursor/mdm/setup.py",            False),
-    ("Codex",       f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True),
+    ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True),
+    ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False),
+    ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True),
+    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     False),
 ]
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
