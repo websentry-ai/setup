@@ -315,9 +315,7 @@ def _set_approval_marker(
     policy_ids,
     application_id,
     request_id='',
-    escalated_to_admin=False,
-    escalated_admin_email='',
-    escalated_admin_name='',
+    escalated_admin_contact='',
 ):
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
@@ -326,9 +324,7 @@ def _set_approval_marker(
         'policyIds': policy_ids,
         'applicationId': application_id,
         'requestId': request_id,
-        'escalatedToAdmin': escalated_to_admin,
-        'escalatedAdminEmail': escalated_admin_email,
-        'escalatedAdminName': escalated_admin_name,
+        'escalatedAdminContact': escalated_admin_contact,
     }
     _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
 
@@ -349,45 +345,18 @@ def _clear_approval_marker():
         pass
 
 
-def _format_escalated_admin_contact(admin_email='', admin_name=''):
-    email = (admin_email or '').strip()
-    name = (admin_name or '').strip()
-    if email and name and name != email:
-        return f'{name} ({email})'
-    if email:
-        return email
-    return 'an organization admin'
-
-
-def _escalated_approval_user_message(admin_email='', admin_name=''):
-    contact = _format_escalated_admin_contact(admin_email, admin_name)
-    return (
-        f'We could not find your Slack account, so an approval request was sent to {contact}. '
-        'Please ask them to approve it in Slack.'
-    )
-
-
-def _approval_agent_message(retry_detail):
-    return (
-        'SLACK APPROVAL PENDING. The user already saw the approval message in the hook UI above. '
-        'Do not repeat or paraphrase the approval status in your reply to the user. '
-        f'Immediately retry the exact same tool call once with the exact same {retry_detail}. '
-        f'Do not modify the {retry_detail} in any way, do not add sleep or any prefix. '
-        'Retry exactly once — the second attempt will wait for the approval.'
-    )
-
-
-def _handle_approval_required_cursor_response(api_response, approval_key, retry_detail):
+def _handle_approval_required_cursor_response(api_response, approval_key):
     approval_check = api_response.get('approvalCheck', {})
     policy_ids = approval_check.get('policyIds', [])
     application_id = approval_check.get('applicationId', '')
     request_id = approval_check.get('requestId', '')
-    escalated_to_admin = approval_check.get('escalatedToAdmin') is True
-    admin_email = approval_check.get('escalatedAdminEmail', '')
-    admin_name = approval_check.get('escalatedAdminName', '')
+    admin_contact = approval_check.get('escalatedAdminContact', '') or ''
 
-    if escalated_to_admin:
-        user_message = _escalated_approval_user_message(admin_email, admin_name)
+    if admin_contact:
+        user_message = (
+            f'We could not find your Slack account, so an approval request was sent to {admin_contact}. '
+            'Please ask them to approve it in Slack.'
+        )
     else:
         user_message = 'An approval request has been sent to your Slack DMs. Please approve it there.'
 
@@ -396,14 +365,18 @@ def _handle_approval_required_cursor_response(api_response, approval_key, retry_
         policy_ids,
         application_id,
         request_id=request_id,
-        escalated_to_admin=escalated_to_admin,
-        escalated_admin_email=admin_email,
-        escalated_admin_name=admin_name,
+        escalated_admin_contact=admin_contact,
     )
     return {
         'permission': 'deny',
         'user_message': user_message,
-        'agent_message': _approval_agent_message(retry_detail),
+        'agent_message': (
+            'SLACK APPROVAL PENDING. The user already saw the approval message in the hook UI above. '
+            'Do not repeat or paraphrase the approval status in your reply to the user. '
+            'Immediately retry the exact same tool call once with the exact same arguments. '
+            'Do not modify the arguments in any way, do not add sleep or any prefix. '
+            'Retry exactly once — the second attempt will wait for the approval.'
+        ),
     }
 
 
@@ -532,9 +505,17 @@ def process_pre_tool_use(event, api_key):
                     'agent_message': 'This action was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
                 }
             else:
+                admin_contact = marker_data.get('escalatedAdminContact', '') or ''
+                if admin_contact:
+                    timeout_user_message = (
+                        f'Blocked by organization policy. Approval request timed out — '
+                        f'ask {admin_contact} to check Slack and retry.'
+                    )
+                else:
+                    timeout_user_message = 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.'
                 return {
                     'permission': 'deny',
-                    'user_message': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.',
+                    'user_message': timeout_user_message,
                     'agent_message': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
 
@@ -560,7 +541,7 @@ def process_pre_tool_use(event, api_key):
         )
 
     if api_response.get('decision') == 'approval_required':
-        return _handle_approval_required_cursor_response(api_response, approval_key, 'arguments')
+        return _handle_approval_required_cursor_response(api_response, approval_key)
 
     return format_hook_response(api_response)
     
@@ -659,9 +640,17 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
                     'agent_message': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
                 }
             else:
+                admin_contact = marker_data.get('escalatedAdminContact', '') or ''
+                if admin_contact:
+                    timeout_user_message = (
+                        f'Blocked by organization policy. Approval request timed out — '
+                        f'ask {admin_contact} to check Slack and retry the command.'
+                    )
+                else:
+                    timeout_user_message = 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.'
                 return {
                     'permission': 'deny',
-                    'user_message': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
+                    'user_message': timeout_user_message,
                     'agent_message': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
 
@@ -687,7 +676,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         )
 
     if api_response.get('decision') == 'approval_required':
-        return _handle_approval_required_cursor_response(api_response, approval_key, 'command')
+        return _handle_approval_required_cursor_response(api_response, approval_key)
 
     return format_hook_response(api_response)
 
