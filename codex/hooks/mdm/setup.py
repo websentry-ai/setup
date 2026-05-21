@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import sys
+import time
 import platform
 import subprocess
 import json
@@ -25,6 +26,7 @@ BACKFILL_TOOL_TYPE = "codex"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
+BACKFILL_MAX_AGE_DAYS = 30
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -1019,14 +1021,18 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 
 
 def _backfill_iter_transcripts(root: Path):
-    # Skip hidden, symlinked, or oversized files (50MB cap).
+    # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
+    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
     for p in root.rglob('rollout-*.jsonl'):
         if p.name.startswith('.'):
             continue
         if not p.is_file() or p.is_symlink():
             continue
         try:
-            if p.stat().st_size > BACKFILL_MAX_FILE_BYTES:
+            st = p.stat()
+            if st.st_size > BACKFILL_MAX_FILE_BYTES:
+                continue
+            if st.st_mtime < cutoff_mtime:
                 continue
         except OSError:
             continue
