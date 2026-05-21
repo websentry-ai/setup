@@ -1,13 +1,14 @@
 # mdm-onboard
 
-Runs all four MDM setup steps for an admin device enrollment in one shot:
+Runs all five MDM setup steps for an admin device enrollment in one shot:
 
 1. **Claude Code** MDM setup
 2. **Cursor** MDM setup
 3. **Codex** MDM setup
-4. **Coding-discovery** scan (separate repo, separate API key)
+4. **GitHub Copilot** MDM setup
+5. **Coding-discovery** scan (separate repo, separate API key)
 
-Steps 1–3 use `--api-key` (the admin MDM key). Step 4 uses `--discovery-key` (a separate discovery-specific key — the two are different credentials and the backend distinguishes them).
+Steps 1–4 use `--api-key` (the admin MDM key). Step 5 uses `--discovery-key` (a separate discovery-specific key — the two are different credentials and the backend distinguishes them).
 
 Each step runs in its own subprocess; a failure in one does not abort the others. A summary at the end lists which steps succeeded and which failed.
 
@@ -29,7 +30,7 @@ Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url
 
 ### Clearing Setup
 
-Removes MDM configuration for the three tools. Discovery is skipped — it's a one-shot scan with nothing to remove.
+Removes MDM configuration for the four tools. Discovery is skipped — it's a one-shot scan with nothing to remove.
 
 ```bash
 sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --clear
