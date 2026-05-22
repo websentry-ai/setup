@@ -179,7 +179,13 @@ def _is_approval_retry(command: str) -> bool:
         return False
 
 
-def _set_approval_marker(command: str, policy_ids: list, application_id: str, request_id: str = '') -> None:
+def _set_approval_marker(
+    command: str,
+    policy_ids: list,
+    application_id: str,
+    request_id: str = '',
+    escalated_admin_contact: str = '',
+) -> None:
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -187,6 +193,7 @@ def _set_approval_marker(command: str, policy_ids: list, application_id: str, re
         'policyIds': policy_ids,
         'applicationId': application_id,
         'requestId': request_id,
+        'escalatedAdminContact': escalated_admin_contact,
     }
     _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
 
@@ -206,6 +213,39 @@ def _clear_approval_marker() -> None:
             _APPROVAL_MARKER_FILE.unlink()
     except OSError:
         pass
+
+
+def _handle_approval_required_codex_response(api_response: Dict, approval_key: str) -> Dict:
+    approval_check = api_response.get('approvalCheck', {})
+    policy_ids = approval_check.get('policyIds', [])
+    application_id = approval_check.get('applicationId', '')
+    request_id = approval_check.get('requestId', '')
+    admin_contact = approval_check.get('escalatedAdminContact', '') or ''
+
+    if admin_contact:
+        reason = (
+            f'We could not find your Slack account, so an approval request was sent to {admin_contact}. '
+            'Please ask them to approve it in Slack.'
+        )
+    else:
+        reason = 'An approval request has been sent to your Slack DMs. Please approve it there.'
+
+    _set_approval_marker(
+        approval_key,
+        policy_ids,
+        application_id,
+        request_id=request_id,
+        escalated_admin_contact=admin_contact,
+    )
+    return transform_response_for_codex({
+        'decision': 'deny',
+        'reason': reason,
+        'additionalContext': (
+            'Temporary hold pending Slack approval. Retry the exact same command once — '
+            'the second attempt will wait for the approval and complete automatically. '
+            'Workarounds will be blocked too.'
+        ),
+    })
 
 
 def _next_poll_interval(elapsed: float) -> int:
@@ -465,14 +505,17 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
         return {}
 
     reason = api_response.get('reason', '') or 'Blocked by organization policy.'
+    additional_context = api_response.get('additionalContext', '')
 
-    return {
-        'hookSpecificOutput': {
-            'hookEventName': 'PreToolUse',
-            'permissionDecision': 'deny',
-            'permissionDecisionReason': reason,
-        }
+    hook_output = {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': reason,
     }
+    if additional_context:
+        hook_output['additionalContext'] = additional_context
+
+    return {'hookSpecificOutput': hook_output}
 
 
 def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
@@ -644,9 +687,17 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                     'additionalContext': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
                 })
             else:
+                admin_contact = marker_data.get('escalatedAdminContact', '') or ''
+                if admin_contact:
+                    timeout_reason = (
+                        f'Blocked by organization policy. Approval request timed out — '
+                        f'ask {admin_contact} to check Slack and retry the command.'
+                    )
+                else:
+                    timeout_reason = 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.'
                 return transform_response_for_codex({
                     'decision': 'deny',
-                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.',
+                    'reason': timeout_reason,
                     'additionalContext': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 })
 
@@ -676,24 +727,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
 
     if api_response.get('decision') == 'approval_required':
-        approval_check = api_response.get('approvalCheck', {})
-        policy_ids = approval_check.get('policyIds', [])
-        application_id = approval_check.get('applicationId', '')
-        request_id = approval_check.get('requestId', '')
-
-        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
-        return transform_response_for_codex({
-            'decision': 'deny',
-            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
-            'additionalContext': (
-                'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
-                'Tell the user: "An approval request has been sent to your Slack DMs. '
-                'Please approve it and I will retry automatically." '
-                'Then immediately retry the exact same tool call with the exact same command — '
-                'do not modify the command in any way, do not add sleep or any prefix. '
-                'Retry exactly once — the second attempt will wait for the approval.'
-            ),
-        })
+        return _handle_approval_required_codex_response(api_response, approval_key)
 
     return transform_response_for_codex(api_response)
 
