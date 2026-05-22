@@ -240,6 +240,11 @@ def _handle_approval_required_codex_response(api_response: Dict, approval_key: s
     return transform_response_for_codex({
         'decision': 'deny',
         'reason': reason,
+        'additionalContext': (
+            'Temporary hold pending Slack approval. Retry the exact same command once — '
+            'the second attempt will wait for the approval and complete automatically. '
+            'Workarounds will be blocked too.'
+        ),
     })
 
 
@@ -500,14 +505,17 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
         return {}
 
     reason = api_response.get('reason', '') or 'Blocked by organization policy.'
+    additional_context = api_response.get('additionalContext', '')
 
-    return {
-        'hookSpecificOutput': {
-            'hookEventName': 'PreToolUse',
-            'permissionDecision': 'deny',
-            'permissionDecisionReason': reason,
-        }
+    hook_output = {
+        'hookEventName': 'PreToolUse',
+        'permissionDecision': 'deny',
+        'permissionDecisionReason': reason,
     }
+    if additional_context:
+        hook_output['additionalContext'] = additional_context
+
+    return {'hookSpecificOutput': hook_output}
 
 
 def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
