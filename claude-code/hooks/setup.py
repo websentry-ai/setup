@@ -25,10 +25,6 @@ SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/ma
 
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
-
-AUTO_UPDATE_SH_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound-auto-update.sh"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/setup.py"
-AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
 BACKFILL_TOOL_TYPE = "claude-code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
@@ -360,7 +356,6 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
         # print(f"⚠️  Could not make script executable: {e}")
         pass
     
-    install_auto_update_assets(hooks_dir)
     return True
 
 
@@ -456,16 +451,7 @@ def configure_claude_settings() -> bool:
                             "timeout": 60
                         })
                     ]
-                },
-            {
-                "matcher": "",
-                "hooks": [
-                    _hook({
-                        "type": "command",
-                        "command": str(Path.home() / ".claude/hooks" / "unbound-auto-update.sh")
-                    })
-                ]
-            }
+                }
             ],
             "SessionEnd": [
                 {
@@ -506,16 +492,6 @@ def configure_claude_settings() -> bool:
                 #     print(f"  ✓ Unbound hook already configured for {event}")
             else:
                 settings["hooks"][event] = new_config
-        # Ensure auto-update SessionStart entry (merge above skips siblings).
-        _auto_path = str(Path.home() / ".claude/hooks" / "unbound-auto-update.sh")
-        _ss = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
-        _has_auto = any(
-            any(h.get("command") == _auto_path for h in (e.get("hooks", []) if isinstance(e, dict) else []))
-            for e in _ss
-        )
-        if not _has_auto:
-            _ss.append({"matcher": "", "hooks": [{"type": "command", "command": _auto_path}]})
-
         
         with open(settings_path, 'w', encoding='utf-8') as f:
             json.dump(settings, f, indent=2)
@@ -536,19 +512,14 @@ def remove_hooks_from_settings() -> None:
     """Remove the unbound hooks from settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
     hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
-    auto_update_command = str(Path.home() / ".claude" / "hooks" / "unbound-auto-update.sh")
     is_windows = platform.system().lower() == "windows"
 
     if not settings_path.exists():
         return
 
     def _is_unbound(cmd: str) -> bool:
-        # Match runtime hook (unbound.py) AND auto-update shim.
-        return (
-            cmd == hook_command
-            or cmd == auto_update_command
-            or (is_windows and bool(cmd) and (hook_command in cmd or auto_update_command in cmd))
-        )
+        # Exact match on every OS; on Windows also match the "py -3 ..." form.
+        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
 
     try:
         with open(settings_path, 'r', encoding='utf-8') as f:
@@ -593,7 +564,6 @@ def remove_hooks_from_settings() -> None:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
-
     print("=" * 60)
     print("Claude Code Hooks - Clearing Setup")
     print("=" * 60)
@@ -617,16 +587,6 @@ def clear_setup() -> None:
 
     # Remove hooks from settings.json
     remove_hooks_from_settings()
-
-    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
-    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update"):
-        extra_path = Path.home() / ".claude/hooks" / extra
-        if extra_path.exists():
-            try:
-                extra_path.unlink()
-                print(f"✅ Removed {extra_path}")
-            except Exception as e:
-                print(f"❌ Failed to remove {extra_path}: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -948,76 +908,6 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-
-def install_auto_update_assets(hooks_dir):
-    """Install SessionStart shim + local setup.py copy."""
-    import shutil as _sh
-    try:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        shim_dest = hooks_dir / "unbound-auto-update.sh"
-        setup_dest = hooks_dir / "unbound-setup.py"
-        shim_local = Path(__file__).resolve().parent / "unbound-auto-update.sh"
-        setup_local = Path(__file__).resolve()
-        if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
-            _sh.copyfile(shim_local, shim_dest)
-        elif not shim_local.exists():
-            download_file(AUTO_UPDATE_SH_URL, shim_dest)
-        if shim_dest.exists():
-            os.chmod(shim_dest, 0o755)
-        if setup_local.exists() and setup_local.resolve() != setup_dest.resolve():
-            _sh.copyfile(setup_local, setup_dest)
-        elif not setup_local.exists():
-            download_file(SETUP_SELF_URL, setup_dest)
-        if setup_dest.exists():
-            os.chmod(setup_dest, 0o755)
-        # Touching the cache is the success signal for the TTL gate.
-        (hooks_dir / ".unbound-auto-update").touch()
-    except Exception as _e:
-        try: debug_print(f"auto-update install skipped: {_e}")
-        except Exception: pass
-
-def auto_update_is_fresh(hooks_dir):
-    import time as _t
-    cache = hooks_dir / ".unbound-auto-update"
-    try:
-        return (_t.time() - cache.stat().st_mtime) < AUTO_UPDATE_TTL_SECONDS
-    except Exception:
-        return False
-
-
-def touch_auto_update_cache(hooks_dir):
-    try:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        (hooks_dir / ".unbound-auto-update").touch()
-    except Exception as _e:
-        try: debug_print(f"auto-update touch failed: {_e}")
-        except Exception: pass
-
-
-def detach_to_background():
-    """POSIX double-fork; parent exits, child orphaned."""
-    if os.environ.get("UNBOUND_DETACHED") == "1":
-        return
-    try:
-        if os.fork() != 0:
-            os._exit(0)
-        os.setsid()
-        if os.fork() != 0:
-            os._exit(0)
-        os.environ["UNBOUND_DETACHED"] = "1"
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            try: os.dup2(devnull, fd)
-            except OSError: pass
-    except Exception:
-        pass
-
-
-def _is_background_run() -> bool:
-    """True when invoked as the auto-update grandchild."""
-    return "--background" in sys.argv or os.environ.get("UNBOUND_DETACHED") == "1"
-
-
 def main():
     global DEBUG
 
@@ -1034,16 +924,6 @@ def main():
         clear_setup()
         return
 
-
-    if_stale = "--if-stale" in sys.argv
-    background = "--background" in sys.argv
-
-    # SessionStart shim invokes us with these flags.
-    hooks_dir = Path.home() / ".claude/hooks"
-    if if_stale and auto_update_is_fresh(hooks_dir):
-        return
-    if background:
-        detach_to_background()
     install_macos_certificates()
 
     print("=" * 60)
@@ -1136,8 +1016,7 @@ def main():
     print("✅ Setup complete")
     print("=" * 60)
 
-    if not _is_background_run():
-        notify_setup_complete(api_key, "claude-code", backend_url=backend_url)
+    notify_setup_complete(api_key, "claude-code", backend_url=backend_url)
 
     if backfill_mode:
         run_backfill(api_key, backend_url)

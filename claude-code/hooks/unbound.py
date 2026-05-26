@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import shlex
 import json
 import os
 import subprocess
@@ -1000,6 +1001,47 @@ def get_api_key():
         return None
 
 
+
+# ─── Hook auto-update (TTL-gated re-install) ─────────────────────────────────
+_SETUP_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/setup.py"
+_AUTO_UPDATE_CACHE = Path.home() / ".claude" / "hooks" / ".last_updated"
+_AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
+
+
+def maybe_auto_update(api_key):
+    """Fire-and-forget re-install via the README curl|python3 one-liner.
+    Rate-limited by 2h TTL on .last_updated mtime. Never blocks the caller."""
+    try:
+        if _AUTO_UPDATE_CACHE.exists():
+            if (time.time() - _AUTO_UPDATE_CACHE.stat().st_mtime) < _AUTO_UPDATE_TTL_SECONDS:
+                return
+        if not api_key:
+            return  # no creds = silent skip; never prompts during session start
+        _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        _AUTO_UPDATE_CACHE.touch()
+        if os.fork() != 0:
+            return
+        os.setsid()
+        if os.fork() != 0:
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            try: os.dup2(devnull, fd)
+            except OSError: pass
+        try:
+            subprocess.run(
+                ["sh", "-c",
+                 "curl -fsSL --connect-timeout 10 --max-time 60 " + _SETUP_URL +
+                 " | python3 - --api-key " + shlex.quote(api_key) + " >/dev/null 2>&1"],
+                timeout=120,
+            )
+        except Exception:
+            pass
+        os._exit(0)
+    except Exception:
+        pass
+
+
 def main():
     global _cached_api_key
     api_key = get_api_key()
@@ -1019,6 +1061,12 @@ def main():
             return
 
         hook_event_name = event.get('hook_event_name')
+
+        # Auto-update: SessionStart fires once per session — natural TTL gate.
+        if hook_event_name == "SessionStart":
+            maybe_auto_update(api_key)
+            print("{}")
+            return
         session_id = event.get('session_id')
 
         # Handle PreToolUse - return immediately after decision is made

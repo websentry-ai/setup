@@ -61,7 +61,7 @@
     ],
     "sessionStart": [
       {
-        "command": "./hooks/unbound-auto-update.sh"
+        "command": "./hooks/unbound.py"
       }
     ]
   }

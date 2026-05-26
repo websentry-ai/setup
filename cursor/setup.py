@@ -17,10 +17,7 @@ import json
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
-AUTO_UPDATE_SH_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound-auto-update.sh"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
-AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
 
 DEBUG = False
 
@@ -347,78 +344,7 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     except Exception as e:
         print(f"⚠️  Could not make script executable: {e}")
 
-    install_auto_update_assets(hooks_dir)
     return True
-
-
-def install_auto_update_assets(hooks_dir):
-    """Install SessionStart shim + local setup.py copy."""
-    import shutil as _sh
-    try:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        shim_dest = hooks_dir / "unbound-auto-update.sh"
-        setup_dest = hooks_dir / "unbound-setup.py"
-        shim_local = Path(__file__).resolve().parent / "unbound-auto-update.sh"
-        setup_local = Path(__file__).resolve()
-        if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
-            _sh.copyfile(shim_local, shim_dest)
-        elif not shim_local.exists():
-            download_file(AUTO_UPDATE_SH_URL, shim_dest)
-        if shim_dest.exists():
-            os.chmod(shim_dest, 0o755)
-        if setup_local.exists() and setup_local.resolve() != setup_dest.resolve():
-            _sh.copyfile(setup_local, setup_dest)
-        elif not setup_local.exists():
-            download_file(SETUP_SELF_URL, setup_dest)
-        if setup_dest.exists():
-            os.chmod(setup_dest, 0o755)
-        # Touching the cache is the success signal for the TTL gate.
-        (hooks_dir / ".unbound-auto-update").touch()
-    except Exception as _e:
-        try: debug_print(f"auto-update install skipped: {_e}")
-        except Exception: pass
-
-def auto_update_is_fresh(hooks_dir: Path) -> bool:
-    """True when the TTL cache mtime is within the auto-update window."""
-    cache = hooks_dir / ".unbound-auto-update"
-    try:
-        return (time.time() - cache.stat().st_mtime) < AUTO_UPDATE_TTL_SECONDS
-    except FileNotFoundError:
-        return False
-    except Exception:
-        return False
-
-
-def touch_auto_update_cache(hooks_dir: Path) -> None:
-    """Stamp the TTL cache so the next session honors the 2h backoff."""
-    try:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        (hooks_dir / ".unbound-auto-update").touch()
-    except Exception as e:
-        debug_print(f"auto-update touch failed: {e}")
-
-
-def detach_to_background() -> None:
-    """POSIX double-fork. Parent exits; child runs orphaned from host-app."""
-    if os.environ.get("UNBOUND_DETACHED") == "1":
-        return
-    try:
-        if os.fork() != 0:
-            os._exit(0)
-        os.setsid()
-        if os.fork() != 0:
-            os._exit(0)
-        os.environ["UNBOUND_DETACHED"] = "1"
-        # Re-open stdio to /dev/null so the orphan can't write back to a dead tty.
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            try:
-                os.dup2(devnull, fd)
-            except OSError:
-                pass
-    except Exception:
-        # Fork unsupported (Windows, restricted sandbox): proceed inline.
-        pass
 
 
 def restart_cursor() -> bool:
@@ -494,7 +420,6 @@ def restart_cursor() -> bool:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
-
     print("=" * 60)
     print("Unbound Cursor Hooks - Clearing Setup")
     print("=" * 60)
@@ -526,16 +451,6 @@ def clear_setup() -> None:
         except Exception as e:
             print(f"❌ Failed to remove {script_path}: {e}")
 
-    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
-    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update"):
-        extra_path = Path.home() / ".cursor/hooks" / extra
-        if extra_path.exists():
-            try:
-                extra_path.unlink()
-                print(f"✅ Removed {extra_path}")
-            except Exception as e:
-                print(f"❌ Failed to remove {extra_path}: {e}")
-
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
@@ -560,11 +475,6 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-def _is_background_run() -> bool:
-    """True when invoked as the auto-update grandchild."""
-    return "--background" in sys.argv or os.environ.get("UNBOUND_DETACHED") == "1"
-
-
 def main():
     global DEBUG
 
@@ -583,16 +493,6 @@ def main():
         clear_setup()
         return
 
-
-    if_stale = "--if-stale" in sys.argv
-    background = "--background" in sys.argv
-
-    # SessionStart shim invokes us with these flags.
-    hooks_dir = Path.home() / ".cursor/hooks"
-    if if_stale and auto_update_is_fresh(hooks_dir):
-        return
-    if background:
-        detach_to_background()
     install_macos_certificates()
 
     print("=" * 60)
@@ -679,18 +579,13 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    if not _is_background_run():
-        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
+    notify_setup_complete(api_key, "cursor", backend_url=backend_url)
 
-    # NEVER restart Cursor from the auto-update path — would kill the active
-    # session that just fired the SessionStart hook. Only the interactive
-    # install (user typed `unbound setup cursor`) should bounce the IDE.
-    if not _is_background_run():
-        restart_cursor()
+    restart_cursor()
 
-        rc_path = get_shell_rc_file()
-        if rc_path is not None:
-            print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+    rc_path = get_shell_rc_file()
+    if rc_path is not None:
+        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 
 if __name__ == "__main__":

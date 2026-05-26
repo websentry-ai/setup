@@ -19,10 +19,6 @@ import json
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
-
-AUTO_UPDATE_SH_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound-auto-update.sh"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/setup.py"
-AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
 DEBUG = False
 
 
@@ -363,15 +359,6 @@ def _copilot_hooks_config(script_path: Path) -> dict:
             }
         ]
 
-    # Auto-update shim runs alongside the runtime hook on SessionStart.
-    auto_path = str(Path.home() / ".copilot" / "hooks" / "unbound-auto-update.sh")
-    hooks.setdefault("SessionStart", []).append({
-        "type": "command",
-        "command": auto_path,
-        "bash": auto_path,
-        "timeout": 30,
-        "timeoutSec": 30,
-    })
     return {"version": 1, "hooks": hooks}
 
 
@@ -387,7 +374,6 @@ def configure_copilot_hooks() -> bool:
         with open(hooks_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
         print("✅ Copilot hooks configured")
-        install_auto_update_assets(hooks_path.parent)
         return True
     except Exception as e:
         print(f"❌ Failed to configure Copilot hooks: {e}")
@@ -396,7 +382,6 @@ def configure_copilot_hooks() -> bool:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
-
     print("=" * 60)
     print("Unbound Copilot Hooks - Clearing Setup")
     print("=" * 60)
@@ -428,16 +413,6 @@ def clear_setup() -> None:
         except Exception as e:
             print(f"❌ Failed to remove {hooks_json}: {e}")
 
-    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
-    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update", "unbound-auto-update.json"):
-        extra_path = Path.home() / ".copilot/hooks" / extra
-        if extra_path.exists():
-            try:
-                extra_path.unlink()
-                print(f"✅ Removed {extra_path}")
-            except Exception as e:
-                print(f"❌ Failed to remove {extra_path}: {e}")
-
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
@@ -462,76 +437,6 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-
-def install_auto_update_assets(hooks_dir):
-    """Install SessionStart shim + local setup.py copy."""
-    import shutil as _sh
-    try:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        shim_dest = hooks_dir / "unbound-auto-update.sh"
-        setup_dest = hooks_dir / "unbound-setup.py"
-        shim_local = Path(__file__).resolve().parent / "unbound-auto-update.sh"
-        setup_local = Path(__file__).resolve()
-        if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
-            _sh.copyfile(shim_local, shim_dest)
-        elif not shim_local.exists():
-            download_file(AUTO_UPDATE_SH_URL, shim_dest)
-        if shim_dest.exists():
-            os.chmod(shim_dest, 0o755)
-        if setup_local.exists() and setup_local.resolve() != setup_dest.resolve():
-            _sh.copyfile(setup_local, setup_dest)
-        elif not setup_local.exists():
-            download_file(SETUP_SELF_URL, setup_dest)
-        if setup_dest.exists():
-            os.chmod(setup_dest, 0o755)
-        # Touching the cache is the success signal for the TTL gate.
-        (hooks_dir / ".unbound-auto-update").touch()
-    except Exception as _e:
-        try: debug_print(f"auto-update install skipped: {_e}")
-        except Exception: pass
-
-def auto_update_is_fresh(hooks_dir):
-    import time as _t
-    cache = hooks_dir / ".unbound-auto-update"
-    try:
-        return (_t.time() - cache.stat().st_mtime) < AUTO_UPDATE_TTL_SECONDS
-    except Exception:
-        return False
-
-
-def touch_auto_update_cache(hooks_dir):
-    try:
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        (hooks_dir / ".unbound-auto-update").touch()
-    except Exception as _e:
-        try: debug_print(f"auto-update touch failed: {_e}")
-        except Exception: pass
-
-
-def detach_to_background():
-    """POSIX double-fork; parent exits, child orphaned."""
-    if os.environ.get("UNBOUND_DETACHED") == "1":
-        return
-    try:
-        if os.fork() != 0:
-            os._exit(0)
-        os.setsid()
-        if os.fork() != 0:
-            os._exit(0)
-        os.environ["UNBOUND_DETACHED"] = "1"
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            try: os.dup2(devnull, fd)
-            except OSError: pass
-    except Exception:
-        pass
-
-
-def _is_background_run() -> bool:
-    """True when invoked as the auto-update grandchild."""
-    return "--background" in sys.argv or os.environ.get("UNBOUND_DETACHED") == "1"
-
-
 def main():
     global DEBUG
 
@@ -550,16 +455,6 @@ def main():
         clear_setup()
         return
 
-
-    if_stale = "--if-stale" in sys.argv
-    background = "--background" in sys.argv
-
-    # SessionStart shim invokes us with these flags.
-    hooks_dir = Path.home() / ".copilot/hooks"
-    if if_stale and auto_update_is_fresh(hooks_dir):
-        return
-    if background:
-        detach_to_background()
     install_macos_certificates()
 
     print("=" * 60)
@@ -643,8 +538,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    if not _is_background_run():
-        notify_setup_complete(api_key, "copilot", backend_url=backend_url)
+    notify_setup_complete(api_key, "copilot", backend_url=backend_url)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:
