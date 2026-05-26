@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import sys
-import shlex
 import json
 import os
 import subprocess
@@ -1003,22 +1002,26 @@ def get_api_key():
 
 
 # ─── Hook auto-update (TTL-gated re-install) ─────────────────────────────────
-_SETUP_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/setup.py"
 _AUTO_UPDATE_CACHE = Path.home() / ".claude" / "hooks" / ".last_updated"
 _AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
 
 
 def maybe_auto_update(api_key):
-    """Fire-and-forget re-install via the README curl|python3 one-liner.
-    Rate-limited by 2h TTL on .last_updated mtime. Never blocks the caller."""
+    """Fire-and-forget re-install via the LOCAL setup.py copy installed at
+    setup time. The local file is the trust anchor — it was placed there by
+    the user's manual `curl|python3` and is only refreshed by subsequent
+    successful auto-updates. We never fetch+exec remote code here.
+    Rate-limited by 2h TTL on .last_updated mtime; cache stamped on success
+    only so transient failures don't suppress retries for 2h."""
     try:
         if _AUTO_UPDATE_CACHE.exists():
             if (time.time() - _AUTO_UPDATE_CACHE.stat().st_mtime) < _AUTO_UPDATE_TTL_SECONDS:
                 return
         if not api_key:
             return  # no creds = silent skip; never prompts during session start
-        _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-        _AUTO_UPDATE_CACHE.touch()
+        local_setup = Path.home() / ".claude/hooks" / "unbound-setup.py"
+        if not local_setup.exists():
+            return  # nothing to invoke; user hasn't run setup yet
         if os.fork() != 0:
             return
         os.setsid()
@@ -1029,12 +1032,16 @@ def maybe_auto_update(api_key):
             try: os.dup2(devnull, fd)
             except OSError: pass
         try:
-            subprocess.run(
-                ["sh", "-c",
-                 "curl -fsSL --connect-timeout 10 --max-time 60 " + _SETUP_URL +
-                 " | python3 - --api-key " + shlex.quote(api_key) + " >/dev/null 2>&1"],
+            # API key via env so it's not exposed in /proc/<pid>/cmdline.
+            env = dict(os.environ, UNBOUND_API_KEY=api_key)
+            result = subprocess.run(
+                ["python3", str(local_setup)],
+                env=env,
                 timeout=120,
             )
+            if result.returncode == 0:
+                _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                _AUTO_UPDATE_CACHE.touch()
         except Exception:
             pass
         os._exit(0)

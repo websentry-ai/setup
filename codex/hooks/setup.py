@@ -367,6 +367,7 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     except Exception:
         pass
 
+    install_local_setup_copy()
     return True
 
 
@@ -973,6 +974,23 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
+
+def install_local_setup_copy():
+    """Drop a copy of this setup.py at ~/.<app>/hooks/unbound-setup.py so the
+    runtime hook can re-invoke it on a TTL without re-fetching from the network."""
+    import shutil as _sh
+    try:
+        dest = Path.home() / ".codex/hooks" / "unbound-setup.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        here = Path(__file__).resolve()
+        if here.resolve() == dest.resolve():
+            return  # auto-update re-run; same file
+        _sh.copyfile(here, dest)
+        os.chmod(dest, 0o755)
+    except Exception:
+        pass
+
+
 def main():
     global DEBUG
 
@@ -1019,6 +1037,10 @@ def main():
             api_key_arg = sys.argv[i + 1]
             break
 
+
+    # Auto-update path passes the key via env to keep it out of /proc/<pid>/cmdline.
+    if not api_key_arg:
+        api_key_arg = os.environ.get("UNBOUND_API_KEY")
     api_key = api_key_arg
     if not api_key:
         if not domain:

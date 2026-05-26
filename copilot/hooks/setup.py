@@ -437,6 +437,23 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+
+def install_local_setup_copy():
+    """Drop a copy of this setup.py at ~/.<app>/hooks/unbound-setup.py so the
+    runtime hook can re-invoke it on a TTL without re-fetching from the network."""
+    import shutil as _sh
+    try:
+        dest = Path.home() / ".copilot/hooks" / "unbound-setup.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        here = Path(__file__).resolve()
+        if here.resolve() == dest.resolve():
+            return  # auto-update re-run; same file
+        _sh.copyfile(here, dest)
+        os.chmod(dest, 0o755)
+    except Exception:
+        pass
+
+
 def main():
     global DEBUG
 
@@ -485,6 +502,10 @@ def main():
             api_key_arg = sys.argv[i + 1]
             break
 
+
+    # Auto-update path passes the key via env to keep it out of /proc/<pid>/cmdline.
+    if not api_key_arg:
+        api_key_arg = os.environ.get("UNBOUND_API_KEY")
     api_key = api_key_arg
     if not api_key:
         if not domain:
@@ -536,6 +557,7 @@ def main():
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
+    install_local_setup_copy()
     print("=" * 60)
 
     notify_setup_complete(api_key, "copilot", backend_url=backend_url)
