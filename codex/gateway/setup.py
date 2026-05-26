@@ -485,9 +485,9 @@ def clear_setup() -> None:
     else:
         if any(s == "not_found" for s in _statuses.values()):
             print("API_KEY not set, nothing to clear")
-        for var, label in _var_labels.items():
-            if _statuses[var] == "failed":
-                print(f"Failed to clear {label}")
+    for var, label in _var_labels.items():
+        if _statuses[var] == "failed":
+            print(f"Failed to clear {label}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

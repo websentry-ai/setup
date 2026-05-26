@@ -473,9 +473,9 @@ def clear_setup() -> None:
     else:
         if any(s == "not_found" for s in _statuses.values()):
             print("API_KEY not set, nothing to clear")
-        for var, label in _var_labels.items():
-            if _statuses[var] == "failed":
-                print(f"Failed to clear {label}")
+    for var, label in _var_labels.items():
+        if _statuses[var] == "failed":
+            print(f"Failed to clear {label}")
 
     _clear_path(Path.home() / ".claude" / "anthropic_key.sh", "Claude anthropic_key.sh")
 
