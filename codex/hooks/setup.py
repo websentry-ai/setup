@@ -619,6 +619,7 @@ def clear_setup() -> None:
         any_cleared = True
     elif status == "failed":
         print("Failed to clear API_KEY")
+        any_failed = True
 
     _r = _clear_path(Path.home() / ".codex" / "hooks" / "unbound.py", "Codex unbound.py hook")
     if _r == "cleared":
@@ -631,12 +632,14 @@ def clear_setup() -> None:
         any_cleared = True
     elif hooks_status == "failed":
         print("Failed to clear Unbound hooks in hooks.json")
+        any_failed = True
 
     feature_status = disable_codex_hooks_feature_status()
     if feature_status == "cleared":
         any_cleared = True
     elif feature_status == "failed":
         print("Failed to clear codex_hooks feature flag")
+        any_failed = True
 
     if any_cleared:
         print("Cleared")

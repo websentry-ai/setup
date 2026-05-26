@@ -471,12 +471,14 @@ def clear_setup() -> None:
     print("=" * 60)
 
     any_cleared = False
+    any_failed = False
 
     config_status = remove_codex_config_base_url()
     if config_status == "cleared":
         any_cleared = True
     elif config_status == "failed":
         print("Failed to clear openai_base_url in codex config")
+        any_failed = True
 
     for var, label in {"OPENAI_API_KEY": "API_KEY", "OPENAI_BASE_URL": "BASE_URL"}.items():
         status, _ = remove_env_var(var)
@@ -484,8 +486,12 @@ def clear_setup() -> None:
             any_cleared = True
         elif status == "failed":
             print(f"Failed to clear {label}")
+            any_failed = True
 
-    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
+    if any_cleared:
+        print("Cleared")
+    elif not any_failed:
+        print("API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

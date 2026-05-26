@@ -378,6 +378,7 @@ def clear_setup() -> None:
     print("=" * 60)
 
     any_cleared = False
+    any_failed = False
 
     for var, label in {"GEMINI_API_KEY": "API_KEY", "GOOGLE_GEMINI_BASE_URL": "BASE_URL"}.items():
         status, _ = remove_env_var(var)
@@ -385,8 +386,12 @@ def clear_setup() -> None:
             any_cleared = True
         elif status == "failed":
             print(f"Failed to clear {label}")
+            any_failed = True
 
-    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
+    if any_cleared:
+        print("Cleared")
+    elif not any_failed:
+        print("API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

@@ -444,6 +444,7 @@ def clear_setup() -> None:
         any_cleared = True
     elif status == "failed":
         print("Failed to clear API_KEY")
+        any_failed = True
 
     _r = _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.py", "Copilot unbound.py hook")
     if _r == "cleared":

@@ -613,6 +613,7 @@ def clear_setup() -> None:
         any_cleared = True
     elif status == "failed":
         print("Failed to clear API_KEY")
+        any_failed = True
 
     _r = _clear_path(Path.home() / ".claude" / "hooks" / "unbound.py", "Claude unbound.py hook")
     if _r == "cleared":
@@ -625,6 +626,7 @@ def clear_setup() -> None:
         any_cleared = True
     elif settings_status == "failed":
         print("Failed to clear Unbound hooks in settings.json")
+        any_failed = True
 
     if any_cleared:
         print("Cleared")

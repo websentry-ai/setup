@@ -470,6 +470,7 @@ def clear_setup() -> None:
             any_cleared = True
         elif status == "failed":
             print(f"Failed to clear {label}")
+            any_failed = True
 
     _r = _clear_path(Path.home() / ".claude" / "anthropic_key.sh", "Claude anthropic_key.sh")
     if _r == "cleared":
@@ -482,6 +483,7 @@ def clear_setup() -> None:
         any_cleared = True
     elif settings_status == "failed":
         print("Failed to clear apiKeyHelper in settings.json")
+        any_failed = True
 
     if any_cleared:
         print("Cleared")
