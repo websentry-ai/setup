@@ -402,9 +402,7 @@ def clear_setup() -> None:
 
     # Remove plugin config from openclaw.json
     config_path = Path.home() / ".openclaw" / "openclaw.json"
-    if not config_path.exists():
-        print("openclaw.json not found")
-    else:
+    if config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
@@ -415,21 +413,15 @@ def clear_setup() -> None:
             if entries.pop(PLUGIN_NAME, None) is not None:
                 modified = True
                 print("Cleared plugin entry")
-            else:
-                print("Plugin entry not found")
 
             installs = config.get("plugins", {}).get("installs", {})
             unbound_keywords = (PLUGIN_NAME, "unbound-gateway", "openclaw-unbound")
-            install_removed = False
             for key in list(installs.keys()):
                 install_path = installs[key].get("installPath", "")
                 if any(kw in key or kw in install_path for kw in unbound_keywords):
                     installs.pop(key)
                     modified = True
-                    install_removed = True
                     print(f"Cleared plugin install ({key})")
-            if not install_removed:
-                print("Plugin install entries not found")
 
             load_paths = config.get("plugins", {}).get("load", {}).get("paths", [])
             original_len = len(load_paths)
@@ -437,15 +429,11 @@ def clear_setup() -> None:
             if len(load_paths) < original_len:
                 modified = True
                 print("Cleared plugin load path")
-            else:
-                print("Plugin load path not found")
 
             providers = config.get("models", {}).get("providers", {})
             if providers.pop(PROVIDER_NAME, None) is not None:
                 modified = True
                 print("Cleared unbound provider")
-            else:
-                print("Unbound provider not found")
 
             model_config = config.get("agents", {}).get("defaults", {}).get("model", {})
             primary = model_config.get("primary", "")
@@ -453,8 +441,6 @@ def clear_setup() -> None:
                 model_config.pop("primary")
                 modified = True
                 print(f"Cleared default model ({primary})")
-            else:
-                print("Unbound default model not found")
 
             if modified:
                 with open(config_path, "w", encoding="utf-8") as f:
