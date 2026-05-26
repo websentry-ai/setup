@@ -443,15 +443,12 @@ def _report_status(status: str, label: str) -> None:
     elif status == "not_found":
         if label in ("API_KEY", "BASE_URL"):
             print("API_KEY not set, nothing to clear")
-        else:
-            print(f"{label} not found")
     else:
         print(f"Failed to clear {label}")
 
 
 def _clear_path(path: Path, label: str) -> None:
     if not path.exists():
-        print(f"{label} not found")
         return
     try:
         path.unlink()

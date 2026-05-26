@@ -367,8 +367,6 @@ def _report_status(status: str, label: str) -> None:
     elif status == "not_found":
         if label in ("API_KEY", "BASE_URL"):
             print("API_KEY not set, nothing to clear")
-        else:
-            print(f"{label} not found")
     else:
         print(f"Failed to clear {label}")
 
