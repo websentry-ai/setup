@@ -453,14 +453,14 @@ def remove_codex_config_base_url() -> str:
         return "failed"
 
 
-def _report_status(status: str, label: str) -> None:
+def _report_status(status: str, label: str) -> bool:
     if status == "cleared":
-        print("Cleared")
+        return True
     elif status == "not_found":
-        if label in ("API_KEY", "BASE_URL"):
-            print("API_KEY not set, nothing to clear")
+        return False
     else:
         print(f"Failed to clear {label}")
+        return False
 
 
 def clear_setup() -> None:
@@ -470,22 +470,22 @@ def clear_setup() -> None:
     print("Codex CLI - Clearing Setup")
     print("=" * 60)
 
-    config_status = remove_codex_config_base_url()
-    _report_status(config_status, "openai_base_url in codex config")
+    any_cleared = False
 
-    _var_labels = {"OPENAI_API_KEY": "API_KEY", "OPENAI_BASE_URL": "BASE_URL"}
-    _statuses = {}
-    for var in _var_labels:
-        _statuses[var], _ = remove_env_var(var)
-    _any_cleared = any(s == "cleared" for s in _statuses.values())
-    if _any_cleared:
-        print("Cleared")
-    else:
-        if any(s == "not_found" for s in _statuses.values()):
-            print("API_KEY not set, nothing to clear")
-    for var, label in _var_labels.items():
-        if _statuses[var] == "failed":
+    config_status = remove_codex_config_base_url()
+    if config_status == "cleared":
+        any_cleared = True
+    elif config_status == "failed":
+        print("Failed to clear openai_base_url in codex config")
+
+    for var, label in {"OPENAI_API_KEY": "API_KEY", "OPENAI_BASE_URL": "BASE_URL"}.items():
+        status, _ = remove_env_var(var)
+        if status == "cleared":
+            any_cleared = True
+        elif status == "failed":
             print(f"Failed to clear {label}")
+
+    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

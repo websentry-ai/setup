@@ -583,25 +583,26 @@ def disable_codex_hooks_feature_status() -> str:
         return "failed"
 
 
-def _report_status(status: str, label: str) -> None:
+def _report_status(status: str, label: str) -> bool:
     if status == "cleared":
-        print("Cleared")
+        return True
     elif status == "not_found":
-        if label in ("API_KEY", "BASE_URL"):
-            print("API_KEY not set, nothing to clear")
+        return False
     else:
         print(f"Failed to clear {label}")
+        return False
 
 
-def _clear_path(path: Path, label: str) -> None:
+def _clear_path(path: Path, label: str) -> bool:
     if not path.exists():
-        return
+        return False
     try:
         path.unlink()
         debug_print(f"Removed {path}")
-        print("Cleared")
+        return True
     except Exception as e:
         print(f"Failed to clear {label}: {e}")
+        return False
 
 
 def clear_setup() -> None:
@@ -610,16 +611,30 @@ def clear_setup() -> None:
     print("Codex Hooks - Clearing Setup")
     print("=" * 60)
 
-    status, _ = remove_env_var("UNBOUND_CODEX_API_KEY")
-    _report_status(status, "API_KEY")
+    any_cleared = False
 
-    _clear_path(Path.home() / ".codex" / "hooks" / "unbound.py", "Codex unbound.py hook")
+    status, _ = remove_env_var("UNBOUND_CODEX_API_KEY")
+    if status == "cleared":
+        any_cleared = True
+    elif status == "failed":
+        print("Failed to clear API_KEY")
+
+    if _clear_path(Path.home() / ".codex" / "hooks" / "unbound.py", "Codex unbound.py hook"):
+        any_cleared = True
 
     hooks_status = remove_hooks_from_config()
-    _report_status(hooks_status, "Unbound hooks in hooks.json")
+    if hooks_status == "cleared":
+        any_cleared = True
+    elif hooks_status == "failed":
+        print("Failed to clear Unbound hooks in hooks.json")
 
     feature_status = disable_codex_hooks_feature_status()
-    _report_status(feature_status, "codex_hooks feature flag")
+    if feature_status == "cleared":
+        any_cleared = True
+    elif feature_status == "failed":
+        print("Failed to clear codex_hooks feature flag")
+
+    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
