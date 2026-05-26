@@ -490,9 +490,7 @@ def configure_codex_hooks() -> bool:
                     config["hooks"][event].extend(new_config)
             else:
                 config["hooks"][event] = new_config
-        # Ensure auto-update SessionStart entry is present (idempotent).
-        # The dedup-by-unbound.py merge above can skip adding new sibling
-        # entries when the runtime hook is already registered.
+        # Ensure auto-update SessionStart entry (merge above skips siblings).
         _auto_path = str(Path.home() / ".codex/hooks" / "unbound-auto-update.sh")
         _ss = config.setdefault("hooks", {}).setdefault("SessionStart", [])
         _has_auto = any(
@@ -1001,19 +999,14 @@ def run_backfill(api_key: str, backend_url: str) -> None:
 
 
 def install_auto_update_assets(hooks_dir):
-    """Drop the SessionStart shim + a local setup.py copy so the hook can
-    re-run install on a 2h TTL without a fresh curl|python3.
-    Prefers local sibling files (this checkout) over network download."""
+    """Install SessionStart shim + local setup.py copy."""
     import shutil as _sh
     try:
         hooks_dir.mkdir(parents=True, exist_ok=True)
         shim_dest = hooks_dir / "unbound-auto-update.sh"
         setup_dest = hooks_dir / "unbound-setup.py"
-        here = Path(__file__).resolve().parent
-        shim_local = here / "unbound-auto-update.sh"
-        setup_local = here / "setup.py"
-        # When we run as the local copy (auto-update re-run), source == dest.
-        # Skip the self-copy; the file is already in place.
+        shim_local = Path(__file__).resolve().parent / "unbound-auto-update.sh"
+        setup_local = Path(__file__).resolve()
         if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
             _sh.copyfile(shim_local, shim_dest)
         elif not shim_local.exists():
@@ -1026,8 +1019,8 @@ def install_auto_update_assets(hooks_dir):
             download_file(SETUP_SELF_URL, setup_dest)
         if setup_dest.exists():
             os.chmod(setup_dest, 0o755)
-        cache = hooks_dir / ".unbound-auto-update"
-        cache.touch()  # always stamp; this IS the success signal for the TTL gate
+        # Touching the cache is the success signal for the TTL gate.
+        (hooks_dir / ".unbound-auto-update").touch()
     except Exception as _e:
         try: debug_print(f"auto-update install skipped: {_e}")
         except Exception: pass
@@ -1051,7 +1044,7 @@ def touch_auto_update_cache(hooks_dir):
 
 
 def detach_to_background():
-    """POSIX double-fork. Parent exits; child orphaned from host-app."""
+    """POSIX double-fork; parent exits, child orphaned."""
     if os.environ.get("UNBOUND_DETACHED") == "1":
         return
     try:
@@ -1089,8 +1082,7 @@ def main():
     if_stale = "--if-stale" in sys.argv
     background = "--background" in sys.argv
 
-    # Auto-update entrypoint (SessionStart shim invokes us with both flags).
-    # TTL gate exits cheapest; detach so the host-app hook returns fast.
+    # SessionStart shim invokes us with these flags.
     hooks_dir = Path.home() / ".codex/hooks"
     if if_stale and auto_update_is_fresh(hooks_dir):
         return
