@@ -448,24 +448,18 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
 
 
 def install_local_setup_copy():
-    """Drop a copy of this setup.py at ~/.<app>/hooks/unbound-setup.py so the
-    runtime hook can re-invoke it on a TTL without re-fetching from the network."""
-    import shutil as _sh
+    """Install local setup.py copy for auto-update re-invoke."""
+    import shutil
     try:
         dest = Path.home() / ".copilot/hooks" / "unbound-setup.py"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        here = Path(__file__).resolve()
-        if here.resolve() == dest.resolve():
-            return  # auto-update re-run; same file
-        _sh.copyfile(here, dest)
+        src = Path(__file__).resolve()
+        if src == dest.resolve():
+            return
+        shutil.copyfile(src, dest)
         os.chmod(dest, 0o755)
     except Exception:
         pass
-def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
-    # CLI: ~/.copilot/session-state/<id>/events.jsonl → parent dir name.
-    # VS Code: .../GitHub.copilot-chat/transcripts/<id>.jsonl → file stem.
-    name = transcript_path.parent.name if transcript_path.stem == 'events' else transcript_path.stem
-    return name or None
 
 
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
@@ -828,7 +822,7 @@ def main():
             break
 
 
-    # Auto-update path passes the key via env to keep it out of /proc/<pid>/cmdline.
+    # Env-var fallback keeps key out of /proc/cmdline.
     if not api_key_arg:
         api_key_arg = os.environ.get("UNBOUND_API_KEY")
     api_key = api_key_arg

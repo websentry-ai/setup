@@ -911,16 +911,15 @@ def run_backfill(api_key: str, backend_url: str) -> None:
 
 
 def install_local_setup_copy():
-    """Drop a copy of this setup.py at ~/.<app>/hooks/unbound-setup.py so the
-    runtime hook can re-invoke it on a TTL without re-fetching from the network."""
-    import shutil as _sh
+    """Install local setup.py copy for auto-update re-invoke."""
+    import shutil
     try:
         dest = Path.home() / ".claude/hooks" / "unbound-setup.py"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        here = Path(__file__).resolve()
-        if here.resolve() == dest.resolve():
-            return  # auto-update re-run; same file
-        _sh.copyfile(here, dest)
+        src = Path(__file__).resolve()
+        if src == dest.resolve():
+            return
+        shutil.copyfile(src, dest)
         os.chmod(dest, 0o755)
     except Exception:
         pass
@@ -973,7 +972,7 @@ def main():
             break
 
 
-    # Auto-update path passes the key via env to keep it out of /proc/<pid>/cmdline.
+    # Env-var fallback keeps key out of /proc/cmdline.
     if not api_key_arg:
         api_key_arg = os.environ.get("UNBOUND_API_KEY")
     api_key = api_key_arg

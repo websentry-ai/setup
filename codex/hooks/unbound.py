@@ -1010,27 +1010,22 @@ def process_stop_event(event: Dict, api_key: str):
 
 
 
-# ─── Hook auto-update (TTL-gated re-install) ─────────────────────────────────
+# ─── Auto-update ─────────────────────────────────────────────────────────────
 _AUTO_UPDATE_CACHE = Path.home() / ".codex" / "hooks" / ".last_updated"
 _AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
 
 
 def maybe_auto_update(api_key):
-    """Fire-and-forget re-install via the LOCAL setup.py copy installed at
-    setup time. The local file is the trust anchor — it was placed there by
-    the user's manual `curl|python3` and is only refreshed by subsequent
-    successful auto-updates. We never fetch+exec remote code here.
-    Rate-limited by 2h TTL on .last_updated mtime; cache stamped on success
-    only so transient failures don't suppress retries for 2h."""
+    """TTL-gated re-install via local setup.py copy."""
     try:
-        if _AUTO_UPDATE_CACHE.exists():
-            if (time.time() - _AUTO_UPDATE_CACHE.stat().st_mtime) < _AUTO_UPDATE_TTL_SECONDS:
-                return
+        if _AUTO_UPDATE_CACHE.exists() and (time.time() - _AUTO_UPDATE_CACHE.stat().st_mtime) < _AUTO_UPDATE_TTL_SECONDS:
+            return
         if not api_key:
-            return  # no creds = silent skip; never prompts during session start
+            return
         local_setup = Path.home() / ".codex/hooks" / "unbound-setup.py"
         if not local_setup.exists():
-            return  # nothing to invoke; user hasn't run setup yet
+            return
+        # POSIX double-fork; parent returns, grandchild orphaned.
         if os.fork() != 0:
             return
         os.setsid()
@@ -1041,14 +1036,10 @@ def maybe_auto_update(api_key):
             try: os.dup2(devnull, fd)
             except OSError: pass
         try:
-            # API key via env so it's not exposed in /proc/<pid>/cmdline.
+            # Env-var key keeps it out of /proc/cmdline.
             env = dict(os.environ, UNBOUND_API_KEY=api_key)
-            result = subprocess.run(
-                ["python3", str(local_setup)],
-                env=env,
-                timeout=120,
-            )
-            if result.returncode == 0:
+            r = subprocess.run(["python3", str(local_setup)], env=env, timeout=120)
+            if r.returncode == 0:
                 _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
                 _AUTO_UPDATE_CACHE.touch()
         except Exception:
