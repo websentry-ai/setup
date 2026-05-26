@@ -19,6 +19,10 @@ import json
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
+
+AUTO_UPDATE_SH_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound-auto-update.sh"
+SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/setup.py"
+AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
 DEBUG = False
 
 
@@ -359,6 +363,15 @@ def _copilot_hooks_config(script_path: Path) -> dict:
             }
         ]
 
+    # Auto-update shim runs alongside the runtime hook on SessionStart.
+    auto_path = str(Path.home() / ".copilot" / "hooks" / "unbound-auto-update.sh")
+    hooks.setdefault("SessionStart", []).append({
+        "type": "command",
+        "command": auto_path,
+        "bash": auto_path,
+        "timeout": 30,
+        "timeoutSec": 30,
+    })
     return {"version": 1, "hooks": hooks}
 
 
@@ -437,6 +450,64 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+
+def install_auto_update_assets(hooks_dir):
+    """Drop the SessionStart shim + a local setup.py copy so the hook can
+    re-run install on a 2h TTL without a fresh curl|python3."""
+    import time as _t
+    try:
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        shim = hooks_dir / "unbound-auto-update.sh"
+        copy = hooks_dir / "unbound-setup.py"
+        if download_file(AUTO_UPDATE_SH_URL, shim):
+            os.chmod(shim, 0o755)
+        if download_file(SETUP_SELF_URL, copy):
+            os.chmod(copy, 0o755)
+        cache = hooks_dir / ".unbound-auto-update"
+        if not cache.exists():
+            cache.touch()
+    except Exception as _e:
+        try: debug_print(f"auto-update install skipped: {_e}")
+        except Exception: pass
+
+
+def auto_update_is_fresh(hooks_dir):
+    import time as _t
+    cache = hooks_dir / ".unbound-auto-update"
+    try:
+        return (_t.time() - cache.stat().st_mtime) < AUTO_UPDATE_TTL_SECONDS
+    except Exception:
+        return False
+
+
+def touch_auto_update_cache(hooks_dir):
+    try:
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        (hooks_dir / ".unbound-auto-update").touch()
+    except Exception as _e:
+        try: debug_print(f"auto-update touch failed: {_e}")
+        except Exception: pass
+
+
+def detach_to_background():
+    """POSIX double-fork. Parent exits; child orphaned from host-app."""
+    if os.environ.get("UNBOUND_DETACHED") == "1":
+        return
+    try:
+        if os.fork() != 0:
+            os._exit(0)
+        os.setsid()
+        if os.fork() != 0:
+            os._exit(0)
+        os.environ["UNBOUND_DETACHED"] = "1"
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            try: os.dup2(devnull, fd)
+            except OSError: pass
+    except Exception:
+        pass
+
+
 def main():
     global DEBUG
 
@@ -455,6 +526,17 @@ def main():
         clear_setup()
         return
 
+
+    if_stale = "--if-stale" in sys.argv
+    background = "--background" in sys.argv
+
+    # Auto-update entrypoint (SessionStart shim invokes us with both flags).
+    # TTL gate exits cheapest; detach so the host-app hook returns fast.
+    hooks_dir = Path.home() / ".copilot/hooks"
+    if if_stale and auto_update_is_fresh(hooks_dir):
+        return
+    if background:
+        detach_to_background()
     install_macos_certificates()
 
     print("=" * 60)
