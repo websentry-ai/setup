@@ -378,6 +378,7 @@ def clear_setup() -> None:
     print("=" * 60)
 
     any_cleared = False
+    any_failed = False
 
     # Uninstall plugin npm package
     npm_status = "not_found"
@@ -396,13 +397,17 @@ def clear_setup() -> None:
             except subprocess.CalledProcessError:
                 npm_status = "failed"
     except FileNotFoundError:
-        npm_status = "failed"
+        npm_status = "not_found"
     if _report_status(npm_status, f"{PLUGIN_NAME} npm package"):
         any_cleared = True
+    elif npm_status == "failed":
+        any_failed = True
 
     status, _ = remove_env_var(ENV_VAR_NAME)
     if _report_status(status, "API_KEY"):
         any_cleared = True
+    elif status == "failed":
+        any_failed = True
 
     # Remove plugin config from openclaw.json
     config_path = Path.home() / ".openclaw" / "openclaw.json"
@@ -448,8 +453,12 @@ def clear_setup() -> None:
 
         except Exception as e:
             print(f"Failed to update openclaw.json: {e}")
+            any_failed = True
 
-    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
+    if any_cleared:
+        print("Cleared")
+    elif not any_failed:
+        print("API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
