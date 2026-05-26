@@ -183,15 +183,17 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """
-    Remove an environment variable export line from the user's shell rc file.
+def remove_env_var_on_unix(var_name: str) -> str:
+    """Remove an environment variable export line from the user's shell rc file.
+
+    Returns "cleared", "not_found", or "failed".
     """
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return "failed"
     try:
-        rc_file.touch(exist_ok=True)
+        if not rc_file.exists():
+            return "not_found"
         with open(rc_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines = []
@@ -200,49 +202,58 @@ def remove_env_var_on_unix(var_name: str) -> bool:
         for line in lines:
             if line.strip().startswith(export_prefix):
                 removed = True
+                debug_print(f"Removing {var_name} from {rc_file}")
                 continue
             new_lines.append(line)
         if removed:
             with open(rc_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-        return True
+            return "cleared"
+        return "not_found"
     except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
+        print(f"Failed to modify {rc_file}: {e}")
+        return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """
-    Remove a user environment variable on Windows by deleting it from HKCU\\Environment.
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove a user environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
     """
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        return True
-    except subprocess.CalledProcessError as e:
-        # If it doesn't exist, treat as success
-        return True
+        query = subprocess.run(
+            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
+        debug_print(f"Removed {var_name} from Windows registry")
+        return "cleared"
+    except subprocess.CalledProcessError:
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """
-    Remove an environment variable permanently across OS platforms.
+def remove_env_var(var_name: str) -> Tuple[str, str]:
+    """Remove an environment variable permanently across OS platforms.
+
+    Returns (status, message) where status is "cleared", "not_found", "failed",
+    or "unsupported".
     """
     system = platform.system().lower()
     if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        if success:
-            debug_print(f"Removed {var_name} from Windows registry")
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_windows(var_name), ""
     elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        if success:
-            debug_print(f"Removed {var_name} from shell rc file")
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_unix(var_name), ""
     else:
-        return False, f"Unsupported OS: {system}"
+        return "unsupported", f"Unsupported OS: {system}"
 
 
 def write_unbound_config(api_key: str) -> bool:
@@ -399,34 +410,51 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
-def remove_claude_key_helper() -> None:
-    """Remove the apiKeyHelper script and setting from Claude config."""
-    claude_dir = Path.home() / ".claude"
-    key_helper_path = claude_dir / "anthropic_key.sh"
-    settings_path = claude_dir / "settings.json"
+def _report_status(status: str, label: str) -> None:
+    if status == "cleared":
+        print("Cleared")
+    elif status == "not_found":
+        if label in ("API_KEY", "BASE_URL"):
+            print("API_KEY not set, nothing to clear")
+        else:
+            print(f"{label} not found")
+    else:
+        print(f"Failed to clear {label}")
 
-    # Remove the key helper script
-    if key_helper_path.exists():
-        try:
-            key_helper_path.unlink()
-            debug_print(f"Removed {key_helper_path}")
-            print(f"✅ Removed {key_helper_path}")
-        except Exception as e:
-            print(f"❌ Failed to remove {key_helper_path}: {e}")
 
-    # Remove apiKeyHelper from settings.json
-    if settings_path.exists():
-        try:
-            with open(settings_path, "r", encoding="utf-8") as f:
-                settings = json.load(f)
-            if "apiKeyHelper" in settings:
-                del settings["apiKeyHelper"]
-                with open(settings_path, "w", encoding="utf-8") as f:
-                    json.dump(settings, f, indent=2)
-                debug_print("Removed apiKeyHelper from settings.json")
-                print("✅ Removed apiKeyHelper from settings.json")
-        except Exception as e:
-            print(f"❌ Failed to update settings.json: {e}")
+def _clear_path(path: Path, label: str) -> None:
+    if not path.exists():
+        print(f"{label} not found")
+        return
+    try:
+        path.unlink()
+        debug_print(f"Removed {path}")
+        print("Cleared")
+    except Exception as e:
+        print(f"Failed to clear {label}: {e}")
+
+
+def remove_api_key_helper_setting() -> str:
+    """Remove apiKeyHelper from settings.json.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    settings_path = Path.home() / ".claude" / "settings.json"
+    if not settings_path.exists():
+        return "not_found"
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        if "apiKeyHelper" not in settings:
+            return "not_found"
+        del settings["apiKeyHelper"]
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2)
+        debug_print("Removed apiKeyHelper from settings.json")
+        return "cleared"
+    except Exception as e:
+        print(f"Failed to update settings.json: {e}")
+        return "failed"
 
 
 def clear_setup() -> None:
@@ -435,17 +463,27 @@ def clear_setup() -> None:
     print("Claude Code - Clearing Setup")
     print("=" * 60)
 
-    # Remove environment variables
-    env_vars = ["UNBOUND_API_KEY", "ANTHROPIC_BASE_URL"]
-    for var in env_vars:
-        success, _ = remove_env_var(var)
-        if success:
-            print(f"✅ Removed {var}")
-        else:
-            print(f"❌ Failed to remove {var}")
+    _var_labels = {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}
+    _statuses = {}
+    for var in _var_labels:
+        _statuses[var], _ = remove_env_var(var)
+    _any_cleared = any(s == "cleared" for s in _statuses.values())
+    if _any_cleared:
+        print("Cleared")
+    else:
+        for var, label in _var_labels.items():
+            if _statuses[var] == "not_found":
+                if label in ("API_KEY", "BASE_URL"):
+                    print("API_KEY not set, nothing to clear")
+                else:
+                    print(f"{label} not found")
+            elif _statuses[var] != "cleared":
+                print(f"Failed to clear {label}")
 
-    # Remove Claude key helper files
-    remove_claude_key_helper()
+    _clear_path(Path.home() / ".claude" / "anthropic_key.sh", "Claude anthropic_key.sh")
+
+    settings_status = remove_api_key_helper_setting()
+    _report_status(settings_status, "apiKeyHelper in settings.json")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

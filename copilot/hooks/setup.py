@@ -144,14 +144,17 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """Remove an environment variable export line from the user's shell rc file."""
+def remove_env_var_on_unix(var_name: str) -> str:
+    """Remove an environment variable export line from the user's shell rc file.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return "failed"
     try:
         if not rc_file.exists():
-            return True
+            return "not_found"
         with open(rc_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines = []
@@ -166,36 +169,52 @@ def remove_env_var_on_unix(var_name: str) -> bool:
         if removed:
             with open(rc_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-        return True
+            return "cleared"
+        return "not_found"
     except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
+        print(f"Failed to modify {rc_file}: {e}")
+        return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove a user environment variable on Windows."""
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove a user environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
+        query = subprocess.run(
+            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
         debug_print(f"Removed {var_name} from Windows registry")
-        return True
+        return "cleared"
     except subprocess.CalledProcessError:
-        return True
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """Remove an environment variable permanently across OS platforms."""
+def remove_env_var(var_name: str) -> Tuple[str, str]:
+    """Remove an environment variable permanently across OS platforms.
+
+    Returns (status, message) where status is "cleared", "not_found", "failed",
+    or "unsupported".
+    """
     system = platform.system().lower()
     if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_windows(var_name), ""
     elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_unix(var_name), ""
     else:
-        return False, f"Unsupported OS: {system}"
+        return "unsupported", f"Unsupported OS: {system}"
 
 
 def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -389,38 +408,41 @@ def configure_copilot_hooks() -> bool:
         return False
 
 
+def _report_status(status: str, label: str) -> None:
+    if status == "cleared":
+        print("Cleared")
+    elif status == "not_found":
+        if label in ("API_KEY", "BASE_URL"):
+            print("API_KEY not set, nothing to clear")
+        else:
+            print(f"{label} not found")
+    else:
+        print(f"Failed to clear {label}")
+
+
+def _clear_path(path: Path, label: str) -> None:
+    if not path.exists():
+        print(f"{label} not found")
+        return
+    try:
+        path.unlink()
+        debug_print(f"Removed {path}")
+        print("Cleared")
+    except Exception as e:
+        print(f"Failed to clear {label}: {e}")
+
+
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("Unbound Copilot Hooks - Clearing Setup")
     print("=" * 60)
 
-    # Remove environment variable
-    success, _ = remove_env_var("UNBOUND_COPILOT_API_KEY")
-    if success:
-        print("✅ Removed UNBOUND_COPILOT_API_KEY")
-    else:
-        print("❌ Failed to remove UNBOUND_COPILOT_API_KEY")
+    status, _ = remove_env_var("UNBOUND_COPILOT_API_KEY")
+    _report_status(status, "API_KEY")
 
-    # Remove the unbound.py script
-    script_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
-    if script_path.exists():
-        try:
-            script_path.unlink()
-            debug_print(f"Removed {script_path}")
-            print(f"✅ Removed {script_path}")
-        except Exception as e:
-            print(f"❌ Failed to remove {script_path}: {e}")
-
-    # Remove the unbound.json hooks config
-    hooks_json = Path.home() / ".copilot" / "hooks" / "unbound.json"
-    if hooks_json.exists():
-        try:
-            hooks_json.unlink()
-            debug_print(f"Removed {hooks_json}")
-            print(f"✅ Removed {hooks_json}")
-        except Exception as e:
-            print(f"❌ Failed to remove {hooks_json}: {e}")
+    _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.py", "Copilot unbound.py hook")
+    _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.json", "Copilot unbound.json hooks config")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

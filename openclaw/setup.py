@@ -115,50 +115,60 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_unix(var_name: str) -> bool:
+def remove_env_var_unix(var_name: str) -> str:
+    """Returns "cleared", "not_found", or "failed"."""
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return "failed"
     try:
-        rc_file.touch(exist_ok=True)
+        if not rc_file.exists():
+            return "not_found"
         with open(rc_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         export_prefix = f"export {var_name}="
         new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
-        if len(new_lines) != len(lines):
-            with open(rc_file, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-        return True
+        if len(new_lines) == len(lines):
+            return "not_found"
+        with open(rc_file, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        return "cleared"
     except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
+        print(f"Failed to modify {rc_file}: {e}")
+        return "failed"
 
 
-def remove_env_var_windows(var_name: str) -> bool:
+def remove_env_var_windows(var_name: str) -> str:
+    """Returns "cleared", "not_found", or "failed"."""
     try:
+        query = subprocess.run(
+            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
         subprocess.run(
             ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
             check=True,
             capture_output=True,
         )
-        return True
+        return "cleared"
     except subprocess.CalledProcessError:
-        return True
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
+def remove_env_var(var_name: str) -> Tuple[str, str]:
+    """Returns (status, message) where status is "cleared", "not_found",
+    "failed", or "unsupported"."""
     system = platform.system().lower()
     if system == "windows":
-        success = remove_env_var_windows(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_windows(var_name), ""
     elif system in ["darwin", "linux"]:
-        success = remove_env_var_unix(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_unix(var_name), ""
     else:
-        return False, f"Unsupported OS: {system}"
+        return "unsupported", f"Unsupported OS: {system}"
 
 
 def run_callback_server(frontend_url: str) -> Optional[str]:
@@ -351,6 +361,18 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
         return False
 
 
+def _report_status(status: str, label: str) -> None:
+    if status == "cleared":
+        print("Cleared")
+    elif status == "not_found":
+        if label in ("API_KEY", "BASE_URL"):
+            print("API_KEY not set, nothing to clear")
+        else:
+            print(f"{label} not found")
+    else:
+        print(f"Failed to clear {label}")
+
+
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
     print("=" * 60)
@@ -358,82 +380,92 @@ def clear_setup() -> None:
     print("=" * 60)
 
     # Uninstall plugin npm package
+    npm_status = "not_found"
     try:
         result = subprocess.run(
             ["npm", "list", "-g", PLUGIN_NAME],
             capture_output=True, text=True
         )
         if result.returncode == 0:
-            subprocess.run(
-                ["npm", "uninstall", "-g", PLUGIN_NAME],
-                check=True, capture_output=True
-            )
-            print(f"✅ Uninstalled {PLUGIN_NAME}")
+            try:
+                subprocess.run(
+                    ["npm", "uninstall", "-g", PLUGIN_NAME],
+                    check=True, capture_output=True
+                )
+                npm_status = "cleared"
+            except subprocess.CalledProcessError:
+                npm_status = "failed"
+                print(f"Failed to uninstall {PLUGIN_NAME}. Run manually: npm uninstall -g {PLUGIN_NAME}")
     except FileNotFoundError:
-        pass
-    except subprocess.CalledProcessError:
-        print(f"⚠️  Failed to uninstall {PLUGIN_NAME}. Run manually: npm uninstall -g {PLUGIN_NAME}")
+        npm_status = "failed"
+        print("npm not found; cannot uninstall plugin")
+    _report_status(npm_status, f"{PLUGIN_NAME} npm package")
 
-    # Remove environment variable
-    success, _ = remove_env_var(ENV_VAR_NAME)
-    if success:
-        print(f"✅ Removed {ENV_VAR_NAME}")
-    else:
-        print(f"❌ Failed to remove {ENV_VAR_NAME}")
+    status, _ = remove_env_var(ENV_VAR_NAME)
+    _report_status(status, "API_KEY")
 
     # Remove plugin config from openclaw.json
     config_path = Path.home() / ".openclaw" / "openclaw.json"
-    if config_path.exists():
+    if not config_path.exists():
+        print("openclaw.json not found")
+    else:
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 config = json.load(f)
 
             modified = False
 
-            # Remove plugin entry
             entries = config.get("plugins", {}).get("entries", {})
             if entries.pop(PLUGIN_NAME, None) is not None:
                 modified = True
-                print("✅ Removed plugin entry")
+                print("Cleared plugin entry")
+            else:
+                print("Plugin entry not found")
 
-            # Remove plugin from installs
             installs = config.get("plugins", {}).get("installs", {})
             unbound_keywords = (PLUGIN_NAME, "unbound-gateway", "openclaw-unbound")
+            install_removed = False
             for key in list(installs.keys()):
                 install_path = installs[key].get("installPath", "")
                 if any(kw in key or kw in install_path for kw in unbound_keywords):
                     installs.pop(key)
                     modified = True
-                    print(f"✅ Removed plugin install ({key})")
+                    install_removed = True
+                    print(f"Cleared plugin install ({key})")
+            if not install_removed:
+                print("Plugin install entries not found")
 
-            # Remove plugin from load paths
             load_paths = config.get("plugins", {}).get("load", {}).get("paths", [])
             original_len = len(load_paths)
             load_paths[:] = [p for p in load_paths if PLUGIN_NAME not in p and "openclaw-unbound" not in p]
             if len(load_paths) < original_len:
                 modified = True
-                print("✅ Removed plugin load path")
+                print("Cleared plugin load path")
+            else:
+                print("Plugin load path not found")
 
-            # Remove provider
             providers = config.get("models", {}).get("providers", {})
             if providers.pop(PROVIDER_NAME, None) is not None:
                 modified = True
-                print("✅ Removed unbound provider")
+                print("Cleared unbound provider")
+            else:
+                print("Unbound provider not found")
 
-            # Remove default model if it points to the unbound provider
             model_config = config.get("agents", {}).get("defaults", {}).get("model", {})
             primary = model_config.get("primary", "")
             if primary.startswith("unbound/"):
                 model_config.pop("primary")
                 modified = True
-                print(f"✅ Removed default model ({primary})")
+                print(f"Cleared default model ({primary})")
+            else:
+                print("Unbound default model not found")
 
             if modified:
                 with open(config_path, "w", encoding="utf-8") as f:
                     json.dump(config, f, indent=2)
 
         except Exception as e:
-            print(f"❌ Failed to update openclaw.json: {e}")
+            print(f"Failed to update openclaw.json: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

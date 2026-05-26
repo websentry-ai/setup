@@ -331,21 +331,31 @@ def set_env_var_windows(var_name: str, value: str) -> bool:
         return False
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove the machine-wide (HKLM) environment variable on Windows."""
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove the machine-wide (HKLM) environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
     try:
+        query = subprocess.run(
+            ["reg", "query", reg_path, "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
         subprocess.run(
-            ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
+            ["reg", "delete", reg_path, "/F", "/V", var_name],
             check=True,
             capture_output=True,
         )
         debug_print(f"Removed {var_name} from Windows registry (HKLM)")
-        return True
+        return "cleared"
     except subprocess.CalledProcessError:
-        return True
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
 def get_all_user_homes() -> List[Tuple[str, Path]]:
@@ -449,9 +459,12 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
         return False, False
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
     """Remove environment variable from a user's shell rc files.
-    Privilege-drops to the user before any FS op."""
+    Privilege-drops to the user before any FS op.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     rc_files = [
         home_dir / ".zprofile",
         home_dir / ".bash_profile"
@@ -459,7 +472,8 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
     export_prefix = f"export {var_name}="
 
     def _remove():
-        success = False
+        cleared = False
+        had_error = False
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
@@ -473,13 +487,20 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
                     debug_print(f"Removed {var_name} from {rc_file}")
-                    success = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return success
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
     result = _run_as_user(username, _remove)
-    return bool(result)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def set_env_var_unix(var_name: str, value: str) -> Tuple[bool, bool]:
@@ -721,7 +742,7 @@ def clear_setup():
         return
 
     # Remove enterprise hooks files (NOT the entire Cursor directory)
-    print("\n🗑️  Removing enterprise hooks...")
+    print("\nClearing enterprise hooks...")
     enterprise_dir = get_enterprise_hooks_dir()
     hooks_json = enterprise_dir / "hooks.json"
     hooks_dir = enterprise_dir / "hooks"
@@ -730,46 +751,58 @@ def clear_setup():
     if hooks_json.exists():
         try:
             hooks_json.unlink()
-            print(f"✅ Removed {hooks_json}")
+            print(f"Cleared {hooks_json}")
         except Exception as e:
-            print(f"❌ Failed to remove {hooks_json}: {e}")
+            print(f"Failed to clear {hooks_json}: {e}")
     else:
-        print(f"   {hooks_json} does not exist")
+        print(f"{hooks_json} not found")
 
     # Remove hooks directory
     if hooks_dir.exists():
         try:
             import shutil
             shutil.rmtree(hooks_dir)
-            print(f"✅ Removed {hooks_dir}")
+            print(f"Cleared {hooks_dir}")
         except Exception as e:
-            print(f"❌ Failed to remove {hooks_dir}: {e}")
+            print(f"Failed to clear {hooks_dir}: {e}")
     else:
-        print(f"   {hooks_dir} does not exist")
+        print(f"{hooks_dir} not found")
 
     # Remove environment variable from all users
-    print("\n🗑️  Removing environment variables...")
+    print("\nClearing environment variables...")
     system = platform.system().lower()
     if system == "windows":
-        if remove_env_var_on_windows("UNBOUND_CURSOR_API_KEY"):
-            print("✅ Removed UNBOUND_CURSOR_API_KEY (system)")
+        status = remove_env_var_on_windows("UNBOUND_CURSOR_API_KEY")
+        if status == "cleared":
+            print("Cleared")
+        elif status == "not_found":
+            print("API_KEY not set, nothing to clear")
         else:
-            print("   No environment variables found to remove")
+            print("Failed to clear API_KEY")
     else:
         user_homes = get_all_user_homes()
 
         if not user_homes:
             print("   No user home directories found")
         else:
-            removed_count = 0
+            cleared = 0
+            not_found = 0
+            failed = 0
             for username, home_dir in user_homes:
-                if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
-                    removed_count += 1
+                status = remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY")
+                if status == "cleared":
+                    cleared += 1
+                elif status == "not_found":
+                    not_found += 1
+                else:
+                    failed += 1
 
-            if removed_count > 0:
-                print(f"✅ Removed environment variable from {removed_count} user(s)")
-            else:
-                print("   No environment variables found to remove")
+            if cleared:
+                print(f"Cleared for {cleared} user(s)")
+            if not_found:
+                print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
+            if failed:
+                print(f"Failed to clear API_KEY for {failed} user(s)")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

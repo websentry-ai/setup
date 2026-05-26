@@ -145,15 +145,17 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """
-    Remove an environment variable export line from the user's shell rc file.
+def remove_env_var_on_unix(var_name: str) -> str:
+    """Remove an environment variable export line from the user's shell rc file.
+
+    Returns "cleared", "not_found", or "failed".
     """
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return "failed"
     try:
-        rc_file.touch(exist_ok=True)
+        if not rc_file.exists():
+            return "not_found"
         with open(rc_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines = []
@@ -162,49 +164,58 @@ def remove_env_var_on_unix(var_name: str) -> bool:
         for line in lines:
             if line.strip().startswith(export_prefix):
                 removed = True
+                debug_print(f"Removing {var_name} from {rc_file}")
                 continue
             new_lines.append(line)
         if removed:
             with open(rc_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-        return True
+            return "cleared"
+        return "not_found"
     except Exception as e:
         print(f"Failed to modify {rc_file}: {e}")
-        return False
+        return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """
-    Remove a user environment variable on Windows by deleting it from HKCU\\Environment.
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove a user environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
     """
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        return True
+        query = subprocess.run(
+            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
+        debug_print(f"Removed {var_name} from Windows registry")
+        return "cleared"
     except subprocess.CalledProcessError:
-        # If it doesn't exist, treat as success
-        return True
+        return "failed"
     except FileNotFoundError:
         print("'reg' command not found. Please remove the variable manually.")
-        return False
+        return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """
-    Remove an environment variable permanently across OS platforms.
+def remove_env_var(var_name: str) -> Tuple[str, str]:
+    """Remove an environment variable permanently across OS platforms.
+
+    Returns (status, message) where status is "cleared", "not_found", "failed",
+    or "unsupported".
     """
     system = platform.system().lower()
     if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        if success:
-            debug_print(f"Removed {var_name} from Windows registry")
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_windows(var_name), ""
     elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        if success:
-            debug_print(f"Removed {var_name} from shell rc file")
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_unix(var_name), ""
     else:
-        return False, f"Unsupported OS: {system}"
+        return "unsupported", f"Unsupported OS: {system}"
 
 
 def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -491,14 +502,17 @@ def configure_codex_hooks() -> bool:
         return False
 
 
-def remove_hooks_from_config() -> None:
-    """Remove the unbound hooks from hooks.json."""
+def remove_hooks_from_config() -> str:
+    """Remove the unbound hooks from hooks.json.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hook_command = str(Path.home() / ".codex" / "hooks" / "unbound.py")
     is_windows = platform.system().lower() == "windows"
 
     if not hooks_path.exists():
-        return
+        return "not_found"
 
     def _is_unbound(cmd: str) -> bool:
         # Exact match on every OS; on Windows also match the "py -3 ..." form.
@@ -509,7 +523,7 @@ def remove_hooks_from_config() -> None:
             config = json.load(f)
 
         if "hooks" not in config:
-            return
+            return "not_found"
 
         modified = False
         for event in list(config["hooks"].keys()):
@@ -519,12 +533,12 @@ def remove_hooks_from_config() -> None:
                 if isinstance(item, dict):
                     hooks = item.get("hooks", [])
                     new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                    if new_hooks != hooks:
+                        modified = True
+                        debug_print(f"Removed unbound hook from {event}")
                     if new_hooks:
                         item["hooks"] = new_hooks
                         new_config.append(item)
-                    elif hooks != new_hooks:
-                        modified = True
-                        debug_print(f"Removed unbound hook from {event}")
                 else:
                     new_config.append(item)
             if new_config:
@@ -535,14 +549,62 @@ def remove_hooks_from_config() -> None:
 
         if not config["hooks"]:
             del config["hooks"]
-            modified = True
 
         if modified:
             with open(hooks_path, 'w', encoding='utf-8') as f:
                 json.dump(config, f, indent=2)
-            print("Removed hooks from hooks.json")
+            return "cleared"
+        return "not_found"
     except Exception as e:
         print(f"Failed to update hooks.json: {e}")
+        return "failed"
+
+
+def disable_codex_hooks_feature_status() -> str:
+    """Remove the codex_hooks line from ~/.codex/config.toml.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    config_path = Path.home() / ".codex" / "config.toml"
+    if not config_path.exists():
+        return "not_found"
+    try:
+        with open(config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        if len(new_lines) == len(lines):
+            return "not_found"
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.writelines(new_lines)
+        debug_print("Removed codex_hooks feature flag from config.toml")
+        return "cleared"
+    except Exception as e:
+        print(f"Failed to remove codex_hooks feature: {e}")
+        return "failed"
+
+
+def _report_status(status: str, label: str) -> None:
+    if status == "cleared":
+        print("Cleared")
+    elif status == "not_found":
+        if label in ("API_KEY", "BASE_URL"):
+            print("API_KEY not set, nothing to clear")
+        else:
+            print(f"{label} not found")
+    else:
+        print(f"Failed to clear {label}")
+
+
+def _clear_path(path: Path, label: str) -> None:
+    if not path.exists():
+        print(f"{label} not found")
+        return
+    try:
+        path.unlink()
+        debug_print(f"Removed {path}")
+        print("Cleared")
+    except Exception as e:
+        print(f"Failed to clear {label}: {e}")
 
 
 def clear_setup() -> None:
@@ -551,28 +613,16 @@ def clear_setup() -> None:
     print("Codex Hooks - Clearing Setup")
     print("=" * 60)
 
-    # Remove environment variable
-    success, _ = remove_env_var("UNBOUND_CODEX_API_KEY")
-    if success:
-        print("Removed UNBOUND_CODEX_API_KEY")
-    else:
-        print("Failed to remove UNBOUND_CODEX_API_KEY")
+    status, _ = remove_env_var("UNBOUND_CODEX_API_KEY")
+    _report_status(status, "API_KEY")
 
-    # Remove the unbound.py script
-    script_path = Path.home() / ".codex" / "hooks" / "unbound.py"
-    if script_path.exists():
-        try:
-            script_path.unlink()
-            debug_print(f"Removed {script_path}")
-            print(f"Removed {script_path}")
-        except Exception as e:
-            print(f"Failed to remove {script_path}: {e}")
+    _clear_path(Path.home() / ".codex" / "hooks" / "unbound.py", "Codex unbound.py hook")
 
-    # Remove hooks from hooks.json
-    remove_hooks_from_config()
+    hooks_status = remove_hooks_from_config()
+    _report_status(hooks_status, "Unbound hooks in hooks.json")
 
-    # Remove codex_hooks feature flag
-    disable_codex_hooks_feature()
+    feature_status = disable_codex_hooks_feature_status()
+    _report_status(feature_status, "codex_hooks feature flag")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
