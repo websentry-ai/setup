@@ -462,6 +462,13 @@ def install_local_setup_copy():
         pass
 
 
+def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
+    # CLI: ~/.copilot/session-state/<id>/events.jsonl → parent dir name.
+    # VS Code: .../GitHub.copilot-chat/transcripts/<id>.jsonl → file stem.
+    name = transcript_path.parent.name if transcript_path.stem == 'events' else transcript_path.stem
+    return name or None
+
+
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     """Read a transcript and return {session_id, entries} for server-side parsing.
     The client only JSON-decodes lines and resolves a session id (preferring the
