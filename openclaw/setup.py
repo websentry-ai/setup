@@ -361,14 +361,14 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
         return False
 
 
-def _report_status(status: str, label: str) -> None:
+def _report_status(status: str, label: str) -> bool:
     if status == "cleared":
-        print("Cleared")
+        return True
     elif status == "not_found":
-        if label in ("API_KEY", "BASE_URL"):
-            print("API_KEY not set, nothing to clear")
+        return False
     else:
         print(f"Failed to clear {label}")
+        return False
 
 
 def clear_setup() -> None:
@@ -376,6 +376,8 @@ def clear_setup() -> None:
     print("=" * 60)
     print("OpenClaw Unbound Plugin - Clearing Setup")
     print("=" * 60)
+
+    any_cleared = False
 
     # Uninstall plugin npm package
     npm_status = "not_found"
@@ -395,10 +397,12 @@ def clear_setup() -> None:
                 npm_status = "failed"
     except FileNotFoundError:
         npm_status = "failed"
-    _report_status(npm_status, f"{PLUGIN_NAME} npm package")
+    if _report_status(npm_status, f"{PLUGIN_NAME} npm package"):
+        any_cleared = True
 
     status, _ = remove_env_var(ENV_VAR_NAME)
-    _report_status(status, "API_KEY")
+    if _report_status(status, "API_KEY"):
+        any_cleared = True
 
     # Remove plugin config from openclaw.json
     config_path = Path.home() / ".openclaw" / "openclaw.json"
@@ -412,7 +416,6 @@ def clear_setup() -> None:
             entries = config.get("plugins", {}).get("entries", {})
             if entries.pop(PLUGIN_NAME, None) is not None:
                 modified = True
-                print("Cleared plugin entry")
 
             installs = config.get("plugins", {}).get("installs", {})
             unbound_keywords = (PLUGIN_NAME, "unbound-gateway", "openclaw-unbound")
@@ -421,33 +424,32 @@ def clear_setup() -> None:
                 if any(kw in key or kw in install_path for kw in unbound_keywords):
                     installs.pop(key)
                     modified = True
-                    print(f"Cleared plugin install ({key})")
 
             load_paths = config.get("plugins", {}).get("load", {}).get("paths", [])
             original_len = len(load_paths)
             load_paths[:] = [p for p in load_paths if PLUGIN_NAME not in p and "openclaw-unbound" not in p]
             if len(load_paths) < original_len:
                 modified = True
-                print("Cleared plugin load path")
 
             providers = config.get("models", {}).get("providers", {})
             if providers.pop(PROVIDER_NAME, None) is not None:
                 modified = True
-                print("Cleared unbound provider")
 
             model_config = config.get("agents", {}).get("defaults", {}).get("model", {})
             primary = model_config.get("primary", "")
             if primary.startswith("unbound/"):
                 model_config.pop("primary")
                 modified = True
-                print(f"Cleared default model ({primary})")
 
             if modified:
                 with open(config_path, "w", encoding="utf-8") as f:
                     json.dump(config, f, indent=2)
+                any_cleared = True
 
         except Exception as e:
             print(f"Failed to update openclaw.json: {e}")
+
+    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
