@@ -395,10 +395,8 @@ def clear_setup() -> None:
                 npm_status = "cleared"
             except subprocess.CalledProcessError:
                 npm_status = "failed"
-                print(f"Failed to uninstall {PLUGIN_NAME}. Run manually: npm uninstall -g {PLUGIN_NAME}")
     except FileNotFoundError:
         npm_status = "failed"
-        print("npm not found; cannot uninstall plugin")
     _report_status(npm_status, f"{PLUGIN_NAME} npm package")
 
     status, _ = remove_env_var(ENV_VAR_NAME)
