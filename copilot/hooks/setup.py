@@ -387,6 +387,7 @@ def configure_copilot_hooks() -> bool:
         with open(hooks_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
         print("✅ Copilot hooks configured")
+        install_auto_update_assets(hooks_path.parent)
         return True
     except Exception as e:
         print(f"❌ Failed to configure Copilot hooks: {e}")
@@ -453,23 +454,35 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
 
 def install_auto_update_assets(hooks_dir):
     """Drop the SessionStart shim + a local setup.py copy so the hook can
-    re-run install on a 2h TTL without a fresh curl|python3."""
-    import time as _t
+    re-run install on a 2h TTL without a fresh curl|python3.
+    Prefers local sibling files (this checkout) over network download."""
+    import shutil as _sh
     try:
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        shim = hooks_dir / "unbound-auto-update.sh"
-        copy = hooks_dir / "unbound-setup.py"
-        if download_file(AUTO_UPDATE_SH_URL, shim):
-            os.chmod(shim, 0o755)
-        if download_file(SETUP_SELF_URL, copy):
-            os.chmod(copy, 0o755)
+        shim_dest = hooks_dir / "unbound-auto-update.sh"
+        setup_dest = hooks_dir / "unbound-setup.py"
+        here = Path(__file__).resolve().parent
+        shim_local = here / "unbound-auto-update.sh"
+        setup_local = here / "setup.py"
+        # When we run as the local copy (auto-update re-run), source == dest.
+        # Skip the self-copy; the file is already in place.
+        if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
+            _sh.copyfile(shim_local, shim_dest)
+        elif not shim_local.exists():
+            download_file(AUTO_UPDATE_SH_URL, shim_dest)
+        if shim_dest.exists():
+            os.chmod(shim_dest, 0o755)
+        if setup_local.exists() and setup_local.resolve() != setup_dest.resolve():
+            _sh.copyfile(setup_local, setup_dest)
+        elif not setup_local.exists():
+            download_file(SETUP_SELF_URL, setup_dest)
+        if setup_dest.exists():
+            os.chmod(setup_dest, 0o755)
         cache = hooks_dir / ".unbound-auto-update"
-        if not cache.exists():
-            cache.touch()
+        cache.touch()  # always stamp; this IS the success signal for the TTL gate
     except Exception as _e:
         try: debug_print(f"auto-update install skipped: {_e}")
         except Exception: pass
-
 
 def auto_update_is_fresh(hooks_dir):
     import time as _t

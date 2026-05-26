@@ -351,23 +351,37 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     return True
 
 
-def install_auto_update_assets(hooks_dir: Path) -> None:
-    """Drop the SessionStart shim + a local copy of this setup.py so the
-    hook can re-run install on a 2h TTL without a fresh curl|python3."""
-    shim_path = hooks_dir / "unbound-auto-update.sh"
-    setup_copy = hooks_dir / "unbound-setup.py"
+def install_auto_update_assets(hooks_dir):
+    """Drop the SessionStart shim + a local setup.py copy so the hook can
+    re-run install on a 2h TTL without a fresh curl|python3.
+    Prefers local sibling files (this checkout) over network download."""
+    import shutil as _sh
     try:
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        if download_file(AUTO_UPDATE_SH_URL, shim_path):
-            os.chmod(shim_path, 0o755)
-        if download_file(SETUP_SELF_URL, setup_copy):
-            os.chmod(setup_copy, 0o755)
+        shim_dest = hooks_dir / "unbound-auto-update.sh"
+        setup_dest = hooks_dir / "unbound-setup.py"
+        here = Path(__file__).resolve().parent
+        shim_local = here / "unbound-auto-update.sh"
+        setup_local = here / "setup.py"
+        # When we run as the local copy (auto-update re-run), source == dest.
+        # Skip the self-copy; the file is already in place.
+        if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
+            _sh.copyfile(shim_local, shim_dest)
+        elif not shim_local.exists():
+            download_file(AUTO_UPDATE_SH_URL, shim_dest)
+        if shim_dest.exists():
+            os.chmod(shim_dest, 0o755)
+        if setup_local.exists() and setup_local.resolve() != setup_dest.resolve():
+            _sh.copyfile(setup_local, setup_dest)
+        elif not setup_local.exists():
+            download_file(SETUP_SELF_URL, setup_dest)
+        if setup_dest.exists():
+            os.chmod(setup_dest, 0o755)
         cache = hooks_dir / ".unbound-auto-update"
-        if not cache.exists():
-            cache.touch()
-    except Exception as e:
-        debug_print(f"auto-update install skipped: {e}")
-
+        cache.touch()  # always stamp; this IS the success signal for the TTL gate
+    except Exception as _e:
+        try: debug_print(f"auto-update install skipped: {_e}")
+        except Exception: pass
 
 def auto_update_is_fresh(hooks_dir: Path) -> bool:
     """True when the TTL cache mtime is within the auto-update window."""

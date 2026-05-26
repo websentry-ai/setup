@@ -360,6 +360,7 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
         # print(f"⚠️  Could not make script executable: {e}")
         pass
     
+    install_auto_update_assets(hooks_dir)
     return True
 
 
@@ -505,6 +506,18 @@ def configure_claude_settings() -> bool:
                 #     print(f"  ✓ Unbound hook already configured for {event}")
             else:
                 settings["hooks"][event] = new_config
+        # Ensure auto-update SessionStart entry is present (idempotent).
+        # The dedup-by-unbound.py merge above can skip adding new sibling
+        # entries when the runtime hook is already registered.
+        _auto_path = str(Path.home() / ".claude/hooks" / "unbound-auto-update.sh")
+        _ss = settings.setdefault("hooks", {}).setdefault("SessionStart", [])
+        _has_auto = any(
+            any(h.get("command") == _auto_path for h in (e.get("hooks", []) if isinstance(e, dict) else []))
+            for e in _ss
+        )
+        if not _has_auto:
+            _ss.append({"matcher": "", "hooks": [{"type": "command", "command": _auto_path}]})
+
         
         with open(settings_path, 'w', encoding='utf-8') as f:
             json.dump(settings, f, indent=2)
@@ -924,23 +937,35 @@ def run_backfill(api_key: str, backend_url: str) -> None:
 
 def install_auto_update_assets(hooks_dir):
     """Drop the SessionStart shim + a local setup.py copy so the hook can
-    re-run install on a 2h TTL without a fresh curl|python3."""
-    import time as _t
+    re-run install on a 2h TTL without a fresh curl|python3.
+    Prefers local sibling files (this checkout) over network download."""
+    import shutil as _sh
     try:
         hooks_dir.mkdir(parents=True, exist_ok=True)
-        shim = hooks_dir / "unbound-auto-update.sh"
-        copy = hooks_dir / "unbound-setup.py"
-        if download_file(AUTO_UPDATE_SH_URL, shim):
-            os.chmod(shim, 0o755)
-        if download_file(SETUP_SELF_URL, copy):
-            os.chmod(copy, 0o755)
+        shim_dest = hooks_dir / "unbound-auto-update.sh"
+        setup_dest = hooks_dir / "unbound-setup.py"
+        here = Path(__file__).resolve().parent
+        shim_local = here / "unbound-auto-update.sh"
+        setup_local = here / "setup.py"
+        # When we run as the local copy (auto-update re-run), source == dest.
+        # Skip the self-copy; the file is already in place.
+        if shim_local.exists() and shim_local.resolve() != shim_dest.resolve():
+            _sh.copyfile(shim_local, shim_dest)
+        elif not shim_local.exists():
+            download_file(AUTO_UPDATE_SH_URL, shim_dest)
+        if shim_dest.exists():
+            os.chmod(shim_dest, 0o755)
+        if setup_local.exists() and setup_local.resolve() != setup_dest.resolve():
+            _sh.copyfile(setup_local, setup_dest)
+        elif not setup_local.exists():
+            download_file(SETUP_SELF_URL, setup_dest)
+        if setup_dest.exists():
+            os.chmod(setup_dest, 0o755)
         cache = hooks_dir / ".unbound-auto-update"
-        if not cache.exists():
-            cache.touch()
+        cache.touch()  # always stamp; this IS the success signal for the TTL gate
     except Exception as _e:
         try: debug_print(f"auto-update install skipped: {_e}")
         except Exception: pass
-
 
 def auto_update_is_fresh(hooks_dir):
     import time as _t
