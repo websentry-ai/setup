@@ -584,10 +584,13 @@ def _backfill_vscode_workspace_roots() -> List[Path]:
         for editor in editors:
             bases.append(home / 'Library' / 'Application Support' / editor / 'User' / 'workspaceStorage')
     elif system == 'windows':
+        # Fall back to the conventional Roaming path when APPDATA is unset
+        # (service accounts / stripped environments) so VS Code transcripts
+        # aren't silently skipped.
         appdata = os.environ.get('APPDATA')
-        if appdata:
-            for editor in editors:
-                bases.append(Path(appdata) / editor / 'User' / 'workspaceStorage')
+        appdata_dir = Path(appdata) if appdata else (home / 'AppData' / 'Roaming')
+        for editor in editors:
+            bases.append(appdata_dir / editor / 'User' / 'workspaceStorage')
     else:
         for editor in editors:
             bases.append(home / '.config' / editor / 'User' / 'workspaceStorage')
