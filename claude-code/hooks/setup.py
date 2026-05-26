@@ -997,6 +997,11 @@ def detach_to_background():
         pass
 
 
+def _is_background_run() -> bool:
+    """True when invoked as the auto-update grandchild."""
+    return "--background" in sys.argv or os.environ.get("UNBOUND_DETACHED") == "1"
+
+
 def main():
     global DEBUG
 
@@ -1115,7 +1120,8 @@ def main():
     print("✅ Setup complete")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "claude-code", backend_url=backend_url)
+    if not _is_background_run():
+        notify_setup_complete(api_key, "claude-code", backend_url=backend_url)
 
     if backfill_mode:
         run_backfill(api_key, backend_url)

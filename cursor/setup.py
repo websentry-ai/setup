@@ -549,6 +549,11 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+def _is_background_run() -> bool:
+    """True when invoked as the auto-update grandchild."""
+    return "--background" in sys.argv or os.environ.get("UNBOUND_DETACHED") == "1"
+
+
 def main():
     global DEBUG
 
@@ -663,12 +668,13 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "cursor", backend_url=backend_url)
+    if not _is_background_run():
+        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
 
     # NEVER restart Cursor from the auto-update path — would kill the active
     # session that just fired the SessionStart hook. Only the interactive
     # install (user typed `unbound setup cursor`) should bounce the IDE.
-    if not background and os.environ.get("UNBOUND_DETACHED") != "1":
+    if not _is_background_run():
         restart_cursor()
 
         rc_path = get_shell_rc_file()
