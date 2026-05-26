@@ -587,16 +587,16 @@ def _report_status(status: str, label: str) -> bool:
         return False
 
 
-def _clear_path(path: Path, label: str) -> bool:
+def _clear_path(path: Path, label: str) -> str:
     if not path.exists():
-        return False
+        return "not_found"
     try:
         path.unlink()
         debug_print(f"Removed {path}")
-        return True
+        return "cleared"
     except Exception as e:
         print(f"Failed to clear {label}: {e}")
-        return False
+        return "failed"
 
 
 def clear_setup() -> None:
@@ -606,6 +606,7 @@ def clear_setup() -> None:
     print("=" * 60)
 
     any_cleared = False
+    any_failed = False
 
     status, _ = remove_env_var("UNBOUND_CLAUDE_API_KEY")
     if status == "cleared":
@@ -613,8 +614,11 @@ def clear_setup() -> None:
     elif status == "failed":
         print("Failed to clear API_KEY")
 
-    if _clear_path(Path.home() / ".claude" / "hooks" / "unbound.py", "Claude unbound.py hook"):
+    _r = _clear_path(Path.home() / ".claude" / "hooks" / "unbound.py", "Claude unbound.py hook")
+    if _r == "cleared":
         any_cleared = True
+    elif _r == "failed":
+        any_failed = True
 
     settings_status = remove_hooks_from_settings()
     if settings_status == "cleared":
@@ -622,7 +626,10 @@ def clear_setup() -> None:
     elif settings_status == "failed":
         print("Failed to clear Unbound hooks in settings.json")
 
-    print("Cleared" if any_cleared else "API_KEY not set, nothing to clear")
+    if any_cleared:
+        print("Cleared")
+    elif not any_failed:
+        print("API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
