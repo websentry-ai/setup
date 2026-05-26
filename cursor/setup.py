@@ -665,11 +665,15 @@ def main():
 
     notify_setup_complete(api_key, "cursor", backend_url=backend_url)
 
-    restart_cursor()
+    # NEVER restart Cursor from the auto-update path — would kill the active
+    # session that just fired the SessionStart hook. Only the interactive
+    # install (user typed `unbound setup cursor`) should bounce the IDE.
+    if not background and os.environ.get("UNBOUND_DETACHED") != "1":
+        restart_cursor()
 
-    rc_path = get_shell_rc_file()
-    if rc_path is not None:
-        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+        rc_path = get_shell_rc_file()
+        if rc_path is not None:
+            print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 
 if __name__ == "__main__":
