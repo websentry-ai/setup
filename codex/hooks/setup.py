@@ -519,14 +519,19 @@ def remove_hooks_from_config() -> None:
     """Remove the unbound hooks from hooks.json."""
     hooks_path = Path.home() / ".codex" / "hooks.json"
     hook_command = str(Path.home() / ".codex" / "hooks" / "unbound.py")
+    auto_update_command = str(Path.home() / ".codex" / "hooks" / "unbound-auto-update.sh")
     is_windows = platform.system().lower() == "windows"
 
     if not hooks_path.exists():
         return
 
     def _is_unbound(cmd: str) -> bool:
-        # Exact match on every OS; on Windows also match the "py -3 ..." form.
-        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+        # Match runtime hook (unbound.py) AND auto-update shim.
+        return (
+            cmd == hook_command
+            or cmd == auto_update_command
+            or (is_windows and bool(cmd) and (hook_command in cmd or auto_update_command in cmd))
+        )
 
     try:
         with open(hooks_path, 'r', encoding='utf-8') as f:
@@ -571,6 +576,7 @@ def remove_hooks_from_config() -> None:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
+
     print("=" * 60)
     print("Codex Hooks - Clearing Setup")
     print("=" * 60)
@@ -597,6 +603,16 @@ def clear_setup() -> None:
 
     # Remove codex_hooks feature flag
     disable_codex_hooks_feature()
+
+    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
+    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update"):
+        extra_path = Path.home() / ".codex/hooks" / extra
+        if extra_path.exists():
+            try:
+                extra_path.unlink()
+                print(f"✅ Removed {extra_path}")
+            except Exception as e:
+                print(f"❌ Failed to remove {extra_path}: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

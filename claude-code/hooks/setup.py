@@ -536,14 +536,19 @@ def remove_hooks_from_settings() -> None:
     """Remove the unbound hooks from settings.json."""
     settings_path = Path.home() / ".claude" / "settings.json"
     hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
+    auto_update_command = str(Path.home() / ".claude" / "hooks" / "unbound-auto-update.sh")
     is_windows = platform.system().lower() == "windows"
 
     if not settings_path.exists():
         return
 
     def _is_unbound(cmd: str) -> bool:
-        # Exact match on every OS; on Windows also match the "py -3 ..." form.
-        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+        # Match runtime hook (unbound.py) AND auto-update shim.
+        return (
+            cmd == hook_command
+            or cmd == auto_update_command
+            or (is_windows and bool(cmd) and (hook_command in cmd or auto_update_command in cmd))
+        )
 
     try:
         with open(settings_path, 'r', encoding='utf-8') as f:
@@ -588,6 +593,7 @@ def remove_hooks_from_settings() -> None:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
+
     print("=" * 60)
     print("Claude Code Hooks - Clearing Setup")
     print("=" * 60)
@@ -611,6 +617,16 @@ def clear_setup() -> None:
 
     # Remove hooks from settings.json
     remove_hooks_from_settings()
+
+    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
+    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update"):
+        extra_path = Path.home() / ".claude/hooks" / extra
+        if extra_path.exists():
+            try:
+                extra_path.unlink()
+                print(f"✅ Removed {extra_path}")
+            except Exception as e:
+                print(f"❌ Failed to remove {extra_path}: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

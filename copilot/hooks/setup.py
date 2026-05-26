@@ -396,6 +396,7 @@ def configure_copilot_hooks() -> bool:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
+
     print("=" * 60)
     print("Unbound Copilot Hooks - Clearing Setup")
     print("=" * 60)
@@ -426,6 +427,16 @@ def clear_setup() -> None:
             print(f"✅ Removed {hooks_json}")
         except Exception as e:
             print(f"❌ Failed to remove {hooks_json}: {e}")
+
+    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
+    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update", "unbound-auto-update.json"):
+        extra_path = Path.home() / ".copilot/hooks" / extra
+        if extra_path.exists():
+            try:
+                extra_path.unlink()
+                print(f"✅ Removed {extra_path}")
+            except Exception as e:
+                print(f"❌ Failed to remove {extra_path}: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

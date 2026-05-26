@@ -494,6 +494,7 @@ def restart_cursor() -> bool:
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
+
     print("=" * 60)
     print("Unbound Cursor Hooks - Clearing Setup")
     print("=" * 60)
@@ -524,6 +525,16 @@ def clear_setup() -> None:
             print(f"✅ Removed {script_path}")
         except Exception as e:
             print(f"❌ Failed to remove {script_path}: {e}")
+
+    # Remove auto-update assets (shim, local setup.py copy, TTL cache).
+    for extra in ("unbound-auto-update.sh", "unbound-setup.py", ".unbound-auto-update"):
+        extra_path = Path.home() / ".cursor/hooks" / extra
+        if extra_path.exists():
+            try:
+                extra_path.unlink()
+                print(f"✅ Removed {extra_path}")
+            except Exception as e:
+                print(f"❌ Failed to remove {extra_path}: {e}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
