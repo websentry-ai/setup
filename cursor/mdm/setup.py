@@ -16,7 +16,6 @@ except ImportError:
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 
@@ -298,25 +297,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     return True
 
 
-def install_local_setup_copy_for_user(username: str, home_dir: Path) -> bool:
-    """Per-user setup.py copy for auto-update."""
-    dest = home_dir / ".cursor" / "hooks" / "unbound-setup.py"
-
-    def _do():
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not download_file(SETUP_SELF_URL, dest):
-            return False
-        try:
-            os.chmod(dest, 0o755)
-        except Exception:
-            pass
-        return True
-
-    return bool(_run_as_user(username, _do))
-
-
-def remove_local_setup_copy_for_user(username: str, home_dir: Path) -> bool:
-    """Remove per-user auto-update artifacts."""
+def remove_legacy_auto_update_artifacts_for_user(username: str, home_dir: Path) -> bool:
+    """Clean legacy auto-update files (back-compat)."""
     targets = [
         home_dir / ".cursor" / "hooks" / "unbound-setup.py",
         home_dir / ".cursor" / "hooks" / ".last_updated",
@@ -804,7 +786,7 @@ def clear_setup():
             for username, home_dir in user_homes:
                 if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
                     removed_count += 1
-                remove_local_setup_copy_for_user(username, home_dir)
+                remove_legacy_auto_update_artifacts_for_user(username, home_dir)
 
             if removed_count > 0:
                 print(f"✅ Removed environment variable from {removed_count} user(s)")
@@ -1002,7 +984,6 @@ def main():
         if write_unbound_config_for_user(username, home_dir, cursor_api_key):
             config_count += 1
             remove_user_level_hooks(username, home_dir)
-            install_local_setup_copy_for_user(username, home_dir)
         else:
             print(f"⚠️  Skipping hook removal for {username}: config write failed")
     if config_count > 0:

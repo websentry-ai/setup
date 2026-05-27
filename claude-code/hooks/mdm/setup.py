@@ -18,7 +18,6 @@ except ImportError:
 
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
@@ -556,25 +555,8 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Removed {key_helper_path} for {username}")
 
 
-def install_local_setup_copy_for_user(username: str, home_dir: Path) -> bool:
-    """Per-user setup.py copy for auto-update."""
-    dest = home_dir / ".claude" / "hooks" / "unbound-setup.py"
-
-    def _do():
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not download_file(SETUP_SELF_URL, dest):
-            return False
-        try:
-            os.chmod(dest, 0o755)
-        except Exception:
-            pass
-        return True
-
-    return bool(_run_as_user(username, _do))
-
-
-def remove_local_setup_copy_for_user(username: str, home_dir: Path) -> bool:
-    """Remove per-user auto-update artifacts."""
+def remove_legacy_auto_update_artifacts_for_user(username: str, home_dir: Path) -> bool:
+    """Clean legacy auto-update files (back-compat)."""
     targets = [
         home_dir / ".claude" / "hooks" / "unbound-setup.py",
         home_dir / ".claude" / "hooks" / ".last_updated",
@@ -981,7 +963,7 @@ def clear_setup():
             if remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY"):
                 removed_count += 1
             if username and home_dir:
-                remove_local_setup_copy_for_user(username, home_dir)
+                remove_legacy_auto_update_artifacts_for_user(username, home_dir)
 
         if removed_count > 0:
             print(f"Removed environment variables from {removed_count} user(s)")
@@ -1432,7 +1414,6 @@ def main():
         remove_gateway_artifacts_for_user(username, home_dir)
         remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key)
-        install_local_setup_copy_for_user(username, home_dir)
 
     print("\nConfiguring Claude managed hooks...")
     if setup_managed_hooks(gateway_url=gateway_url):

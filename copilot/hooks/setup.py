@@ -19,7 +19,6 @@ import socket
 import json
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
@@ -457,27 +456,6 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-def install_local_setup_copy():
-    """Local setup.py copy for auto-update."""
-    import shutil
-    try:
-        dest = Path.home() / ".copilot/hooks" / "unbound-setup.py"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            src = Path(__file__).resolve()
-        except Exception:
-            src = None
-        if src is not None and src.exists():
-            if src == dest.resolve():
-                return
-            shutil.copyfile(src, dest)
-        elif not download_file(SETUP_SELF_URL, dest):
-            return
-        os.chmod(dest, 0o755)
-    except Exception:
-        pass
-
-
 def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
     # CLI: ~/.copilot/session-state/<id>/events.jsonl → parent dir name.
     # VS Code: .../GitHub.copilot-chat/transcripts/<id>.jsonl → file stem.
@@ -899,7 +877,6 @@ def main():
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
-    install_local_setup_copy()
     print("=" * 60)
 
     is_auto_update = os.environ.get("UNBOUND_AUTO_UPDATE") == "1"

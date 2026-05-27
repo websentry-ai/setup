@@ -22,7 +22,6 @@ import json
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
@@ -368,7 +367,6 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     except Exception:
         pass
 
-    install_local_setup_copy()
     return True
 
 
@@ -984,27 +982,6 @@ def run_backfill(api_key: str, backend_url: str) -> None:
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
-
-
-def install_local_setup_copy():
-    """Local setup.py copy for auto-update."""
-    import shutil
-    try:
-        dest = Path.home() / ".codex/hooks" / "unbound-setup.py"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            src = Path(__file__).resolve()
-        except Exception:
-            src = None
-        if src is not None and src.exists():
-            if src == dest.resolve():
-                return
-            shutil.copyfile(src, dest)
-        elif not download_file(SETUP_SELF_URL, dest):
-            return
-        os.chmod(dest, 0o755)
-    except Exception:
-        pass
 
 
 def main():

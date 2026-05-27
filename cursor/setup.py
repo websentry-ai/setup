@@ -17,7 +17,6 @@ import json
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 DEBUG = False
@@ -487,27 +486,6 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
 
 
 
-def install_local_setup_copy():
-    """Local setup.py copy for auto-update."""
-    import shutil
-    try:
-        dest = Path.home() / ".cursor/hooks" / "unbound-setup.py"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            src = Path(__file__).resolve()
-        except Exception:
-            src = None
-        if src is not None and src.exists():
-            if src == dest.resolve():
-                return
-            shutil.copyfile(src, dest)
-        elif not download_file(SETUP_SELF_URL, dest):
-            return
-        os.chmod(dest, 0o755)
-    except Exception:
-        pass
-
-
 def main():
     global DEBUG
 
@@ -615,7 +593,6 @@ def main():
     
     print("\n" + "=" * 60)
     print("Setup Complete!")
-    install_local_setup_copy()
     print("=" * 60)
 
     is_auto_update = os.environ.get("UNBOUND_AUTO_UPDATE") == "1"
