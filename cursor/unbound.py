@@ -21,6 +21,16 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
+DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
+DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
+DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
+DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
+DISCOVERY_LOG_PATH = Path.home() / ".unbound" / "discovery.log"
+DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
+DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
     (30 * 60,       15),   # 5-30 min: 15s
@@ -988,6 +998,90 @@ def maybe_auto_update(api_key):
         pass
 
 
+def _dispatch_discovery() -> None:
+    try:
+        cache = {}
+        if DISCOVERY_CACHE_PATH.exists():
+            try:
+                with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
+                    cache = json.load(f) or {}
+            except (OSError, json.JSONDecodeError):
+                cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+
+        last = cache.get("last_run_at")
+        if isinstance(last, str):
+            try:
+                ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").timestamp()
+                if (time.time() - ts) < DISCOVERY_DEBOUNCE_SECONDS:
+                    return
+            except ValueError:
+                pass
+
+        if DISCOVERY_LOCK_PATH.exists():
+            try:
+                age = time.time() - DISCOVERY_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = DISCOVERY_STALE_LOCK_SECONDS + 1
+            if age < DISCOVERY_STALE_LOCK_SECONDS:
+                return
+
+        try:
+            with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                unbound_config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            log_error(f"discovery gate: could not read {UNBOUND_CONFIG_PATH}: {e}", 'discovery_gate')
+            return
+        api_key = unbound_config.get("api_key")
+        backend_url = unbound_config.get("base_url")
+        if not api_key:
+            log_error("discovery gate: api_key missing in ~/.unbound/config.json", 'discovery_gate')
+            return
+        if not backend_url:
+            log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
+            return
+
+        DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        if not DISCOVERY_INSTALL_SH.exists():
+            r = subprocess.run(
+                ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                capture_output=True, timeout=30,
+            )
+            if r.returncode != 0:
+                log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                return
+            os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+
+        cache["last_run_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, sort_keys=True)
+        os.replace(tmp, DISCOVERY_CACHE_PATH)
+
+        log_fd = open(DISCOVERY_LOG_PATH, "ab")
+        try:
+            popen_kwargs = {"stdout": log_fd, "stderr": subprocess.STDOUT,
+                            "stdin": subprocess.DEVNULL, "close_fds": True}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+            subprocess.Popen(
+                ["bash", str(DISCOVERY_INSTALL_SH),
+                 "--api-key", api_key, "--domain", backend_url],
+                **popen_kwargs,
+            )
+        finally:
+            try:
+                log_fd.close()
+            except OSError:
+                pass
+    except Exception as e:
+        log_error(f"discovery gate failed: {e}", 'discovery_gate')
+
+
 def main():
     """Main entry point - read from stdin and process events."""
     global _cached_api_key
@@ -1013,9 +1107,11 @@ def main():
         # Get event details
         hook_event_name = event.get('hook_event_name')
 
-        # Auto-update: SessionStart fires once per session — natural TTL gate.
+        # sessionStart fires once per session — natural TTL gate for both
+        # auto-update and the debounced discovery scan dispatch.
         if hook_event_name == "sessionStart":
             maybe_auto_update(api_key)
+            _dispatch_discovery()
             print("{}")
             return
         generation_id = event.get('generation_id')
