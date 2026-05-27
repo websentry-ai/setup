@@ -215,9 +215,14 @@ def get_linux_device_identifier() -> str:
             timeout=10,
             stderr=subprocess.DEVNULL,
         )
+        _DMIDECODE_PLACEHOLDERS = {
+            "", "0", "default string", "not applicable",
+            "not specified", "system serial number",
+            "to be filled by o.e.m.",
+        }
         if result.returncode == 0:
             device_id = result.stdout.strip()
-            if device_id:
+            if device_id and device_id.lower() not in _DMIDECODE_PLACEHOLDERS:
                 return device_id
     except Exception:
         debug_print("dmidecode failed, trying machine-id")
@@ -815,7 +820,7 @@ def clear_setup():
         else:
             removed_count = 0
             for username, home_dir in user_homes:
-                if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
+                if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY") == "cleared":
                     removed_count += 1
 
             if removed_count > 0:
