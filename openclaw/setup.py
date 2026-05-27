@@ -400,13 +400,13 @@ def clear_setup() -> None:
         npm_status = "not_found"
     if _report_status(npm_status, f"{PLUGIN_NAME} npm package"):
         any_cleared = True
-    elif npm_status == "failed":
+    elif npm_status not in ("cleared", "not_found"):
         any_failed = True
 
     status, _ = remove_env_var(ENV_VAR_NAME)
     if _report_status(status, "API_KEY"):
         any_cleared = True
-    elif status == "failed":
+    elif status not in ("cleared", "not_found"):
         any_failed = True
 
     # Remove plugin config from openclaw.json
