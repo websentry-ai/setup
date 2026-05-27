@@ -973,6 +973,11 @@ def maybe_auto_update(api_key):
             return
         if not api_key:
             return
+        script_path = Path(__file__)
+        try:
+            before_mtime = script_path.stat().st_mtime
+        except OSError:
+            before_mtime = 0
         # POSIX double-fork; parent returns, grandchild orphaned.
         if os.fork() != 0:
             return
@@ -986,11 +991,21 @@ def maybe_auto_update(api_key):
         try:
             # Env-var key keeps it out of /proc/cmdline.
             env = dict(os.environ, UNBOUND_API_KEY=api_key, UNBOUND_AUTO_UPDATE="1")
-            r = subprocess.run(
-                ["sh", "-c", f"set -e; curl -fsSL {_INSTALL_URL} | python3 -"],
-                env=env, timeout=120,
+            dl = subprocess.run(
+                ["curl", "-fsSL", _INSTALL_URL],
+                timeout=60, capture_output=True,
             )
-            if r.returncode == 0:
+            if dl.returncode != 0 or not dl.stdout:
+                return
+            r = subprocess.run(
+                ["python3", "-"], input=dl.stdout, env=env, timeout=120,
+            )
+            # Only stamp when unbound.py actually refreshed.
+            try:
+                after_mtime = script_path.stat().st_mtime
+            except OSError:
+                after_mtime = before_mtime
+            if r.returncode == 0 and after_mtime > before_mtime:
                 _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
                 _AUTO_UPDATE_CACHE.touch()
         except Exception:
