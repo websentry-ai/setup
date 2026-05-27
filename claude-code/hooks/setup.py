@@ -577,15 +577,6 @@ def remove_hooks_from_settings() -> str:
         return "failed"
 
 
-def _report_status(status: str, label: str) -> bool:
-    if status == "cleared":
-        return True
-    elif status == "not_found":
-        return False
-    else:
-        print(f"Failed to clear {label}")
-        return False
-
 
 def _clear_path(path: Path, label: str) -> str:
     if not path.exists():

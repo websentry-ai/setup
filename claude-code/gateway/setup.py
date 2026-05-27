@@ -410,15 +410,6 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
-def _report_status(status: str, label: str) -> bool:
-    if status == "cleared":
-        return True
-    elif status == "not_found":
-        return False
-    else:
-        print(f"Failed to clear {label}")
-        return False
-
 
 def _clear_path(path: Path, label: str) -> str:
     if not path.exists():

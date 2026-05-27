@@ -361,15 +361,6 @@ def write_unbound_config(api_key: str) -> bool:
         return False
 
 
-def _report_status(status: str, label: str) -> bool:
-    if status == "cleared":
-        return True
-    elif status == "not_found":
-        return False
-    else:
-        print(f"Failed to clear {label}")
-        return False
-
 
 def clear_setup() -> None:
     """Undo all changes made by the setup script."""
