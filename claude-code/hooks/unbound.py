@@ -34,7 +34,6 @@ DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
-DISCOVERY_LOG_PATH = Path.home() / ".unbound" / "discovery.log"
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
@@ -1114,24 +1113,17 @@ def _dispatch_discovery() -> None:
             json.dump(cache, f, indent=2, sort_keys=True)
         os.replace(tmp, DISCOVERY_CACHE_PATH)
 
-        log_fd = open(DISCOVERY_LOG_PATH, "ab")
-        try:
-            popen_kwargs = {"stdout": log_fd, "stderr": subprocess.STDOUT,
-                            "stdin": subprocess.DEVNULL, "close_fds": True}
-            if os.name == "nt":
-                popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            else:
-                popen_kwargs["start_new_session"] = True
-            subprocess.Popen(
-                ["bash", str(DISCOVERY_INSTALL_SH),
-                 "--api-key", api_key, "--domain", backend_url],
-                **popen_kwargs,
-            )
-        finally:
-            try:
-                log_fd.close()
-            except OSError:
-                pass
+        popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                        "stdin": subprocess.DEVNULL, "close_fds": True}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(
+            ["bash", str(DISCOVERY_INSTALL_SH),
+             "--api-key", api_key, "--domain", backend_url],
+            **popen_kwargs,
+        )
     except Exception as e:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
