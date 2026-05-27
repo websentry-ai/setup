@@ -457,7 +457,6 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-
 def install_local_setup_copy():
     """Local setup.py copy for auto-update."""
     import shutil
