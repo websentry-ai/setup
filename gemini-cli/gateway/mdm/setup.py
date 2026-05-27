@@ -568,7 +568,7 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
             failed += 1
     if cleared:
         print(f"Cleared for {cleared} user(s)")
-    if not_found:
+    elif not_found:
         print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
     if failed:
         print(f"Failed to clear {_label} for {failed} user(s)")
@@ -604,16 +604,12 @@ def clear_setup():
                 try:
                     settings_path.unlink()
                     debug_print(f"Removed {settings_path}")
-                    print(f"Cleared {settings_path}")
                 except Exception as e:
-                    print(f"Failed to clear {settings_path}: {e}")
-            else:
-                print(f"{settings_path} not found")
+                    print(f"Failed to clear managed settings file: {e}")
             if settings_dir.exists():
                 try:
                     settings_dir.rmdir()
                     debug_print(f"Removed {settings_dir}")
-                    print(f"Cleared {settings_dir}")
                 except OSError as e:
                     debug_print(f"Could not remove {settings_dir}: {e}")
         except Exception as e:
@@ -621,11 +617,9 @@ def clear_setup():
 
         status = remove_env_var_on_windows_machine("GEMINI_CLI_SYSTEM_SETTINGS_PATH")
         if status == "cleared":
-            print("Cleared GEMINI_CLI_SYSTEM_SETTINGS_PATH")
-        elif status == "not_found":
-            print("GEMINI_CLI_SYSTEM_SETTINGS_PATH not found")
-        else:
-            print("Failed to clear GEMINI_CLI_SYSTEM_SETTINGS_PATH")
+            print("Cleared managed settings path")
+        elif status == "failed":
+            print("Failed to clear managed settings path")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

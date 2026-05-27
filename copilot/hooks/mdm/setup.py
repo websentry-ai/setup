@@ -1090,15 +1090,13 @@ def clear_setup():
 
         if env_cleared:
             print(f"Cleared for {env_cleared} user(s)")
-        if env_not_found:
+        elif env_not_found:
             print(f"API_KEY not set, nothing to clear for {env_not_found} user(s)")
         if env_failed:
             print(f"Failed to clear API_KEY for {env_failed} user(s)")
 
         if hooks_cleared:
             print(f"Cleared Copilot hooks for {hooks_cleared} user(s)")
-        if hooks_not_found:
-            print(f"Copilot hooks not found for {hooks_not_found} user(s)")
         if hooks_failed:
             print(f"Failed to clear Copilot hooks for {hooks_failed} user(s)")
 

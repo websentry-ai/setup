@@ -666,7 +666,7 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
             failed += 1
     if cleared:
         print(f"Cleared for {cleared} user(s)")
-    if not_found:
+    elif not_found:
         print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
     if failed:
         print(f"Failed to clear {_label} for {failed} user(s)")

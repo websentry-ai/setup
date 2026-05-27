@@ -751,22 +751,18 @@ def clear_setup():
     if hooks_json.exists():
         try:
             hooks_json.unlink()
-            print(f"Cleared {hooks_json}")
+            debug_print(f"Cleared {hooks_json}")
         except Exception as e:
-            print(f"Failed to clear {hooks_json}: {e}")
-    else:
-        print(f"{hooks_json} not found")
+            print(f"Failed to clear hooks.json: {e}")
 
     # Remove hooks directory
     if hooks_dir.exists():
         try:
             import shutil
             shutil.rmtree(hooks_dir)
-            print(f"Cleared {hooks_dir}")
+            debug_print(f"Cleared {hooks_dir}")
         except Exception as e:
-            print(f"Failed to clear {hooks_dir}: {e}")
-    else:
-        print(f"{hooks_dir} not found")
+            print(f"Failed to clear hooks directory: {e}")
 
     # Remove environment variable from all users
     print("\nClearing environment variables...")

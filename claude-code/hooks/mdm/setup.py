@@ -988,7 +988,7 @@ def clear_setup():
 
         if cleared:
             print(f"Cleared for {cleared} user(s)")
-        if not_found:
+        elif not_found:
             print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
         if failed:
             print(f"Failed to clear API_KEY for {failed} user(s)")
