@@ -1137,13 +1137,6 @@ def _dispatch_discovery() -> None:
                     return
                 os.chmod(DISCOVERY_INSTALL_SH, 0o755)
 
-            cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
-
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
@@ -1152,10 +1145,23 @@ def _dispatch_discovery() -> None:
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 popen_kwargs["start_new_session"] = True
-            subprocess.Popen(
-                ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
-                **popen_kwargs,
-            )
+            try:
+                subprocess.Popen(
+                    ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
+                    **popen_kwargs,
+                )
+            except OSError as e:
+                log_error(f"discovery gate: Popen failed: {e}", 'discovery_gate')
+                return
+
+            # Stamp last_run_at only after Popen succeeds so a launch failure
+            # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
+            cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2, sort_keys=True)
+            os.replace(tmp, DISCOVERY_CACHE_PATH)
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
