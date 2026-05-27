@@ -1037,7 +1037,7 @@ def maybe_auto_update(api_key):
             except OSError: pass
         try:
             # Env-var key keeps it out of /proc/cmdline.
-            env = dict(os.environ, UNBOUND_API_KEY=api_key)
+            env = dict(os.environ, UNBOUND_API_KEY=api_key, UNBOUND_AUTO_UPDATE="1")
             r = subprocess.run(["python3", str(local_setup)], env=env, timeout=120)
             if r.returncode == 0:
                 _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
