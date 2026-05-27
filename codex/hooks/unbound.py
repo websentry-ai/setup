@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import time
 import hashlib
@@ -34,6 +34,8 @@ DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
+DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
+DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
@@ -1087,50 +1089,78 @@ def _dispatch_discovery() -> None:
             if age < DISCOVERY_STALE_LOCK_SECONDS:
                 return
 
+        # Atomic dispatch claim — first hook to create the marker wins;
+        # concurrent peers bail to avoid duplicate fork-detached Popens.
         try:
-            with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-                unbound_config = json.load(f)
-        except (OSError, json.JSONDecodeError) as e:
-            log_error(f"discovery gate: could not read {UNBOUND_CONFIG_PATH}: {e}", 'discovery_gate')
-            return
-        api_key = unbound_config.get("api_key")
-        backend_url = unbound_config.get("base_url")
-        if not api_key:
-            log_error("discovery gate: api_key missing in ~/.unbound/config.json", 'discovery_gate')
-            return
-        if not backend_url:
-            log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
-            return
-
-        DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-        if not DISCOVERY_INSTALL_SH.exists():
-            r = subprocess.run(
-                ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
-                capture_output=True, timeout=30,
-            )
-            if r.returncode != 0:
-                log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+            _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                                   os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(_dispatch_fd)
+        except FileExistsError:
+            try:
+                age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
+            except OSError:
+                age = DISCOVERY_DISPATCH_TTL_SECONDS + 1
+            if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
-            os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+            try:
+                DISCOVERY_DISPATCH_PATH.unlink()
+                _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                                       os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(_dispatch_fd)
+            except (FileExistsError, OSError):
+                return
 
-        cache["last_run_at"] = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
-        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, sort_keys=True)
-        os.replace(tmp, DISCOVERY_CACHE_PATH)
+        try:
+            try:
+                with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                    unbound_config = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                log_error(f"discovery gate: could not read {UNBOUND_CONFIG_PATH}: {e}", 'discovery_gate')
+                return
+            api_key = unbound_config.get("api_key")
+            backend_url = unbound_config.get("base_url")
+            if not api_key:
+                log_error("discovery gate: api_key missing in ~/.unbound/config.json", 'discovery_gate')
+                return
+            if not backend_url:
+                log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
+                return
 
-        popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-                        "stdin": subprocess.DEVNULL, "close_fds": True}
-        if os.name == "nt":
-            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        else:
-            popen_kwargs["start_new_session"] = True
-        subprocess.Popen(
-            ["bash", str(DISCOVERY_INSTALL_SH),
-             "--api-key", api_key, "--domain", backend_url],
-            **popen_kwargs,
-        )
+            DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            if not DISCOVERY_INSTALL_SH.exists():
+                r = subprocess.run(
+                    ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                    capture_output=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                    return
+                os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+
+            cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2, sort_keys=True)
+            os.replace(tmp, DISCOVERY_CACHE_PATH)
+
+            # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
+            popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                            "stdin": subprocess.DEVNULL, "close_fds": True,
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+            subprocess.Popen(
+                ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
+                **popen_kwargs,
+            )
+        finally:
+            try:
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
     except Exception as e:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
