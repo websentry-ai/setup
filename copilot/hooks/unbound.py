@@ -842,46 +842,6 @@ def get_api_key():
         return None
 
 
-
-# ─── Auto-update ─────────────────────────────────────────────────────────────
-_AUTO_UPDATE_CACHE = LOG_DIR / ".last_updated"
-_AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
-
-
-def maybe_auto_update(api_key):
-    """TTL-gated re-install via local setup.py copy."""
-    try:
-        if _AUTO_UPDATE_CACHE.exists() and (time.time() - _AUTO_UPDATE_CACHE.stat().st_mtime) < _AUTO_UPDATE_TTL_SECONDS:
-            return
-        if not api_key:
-            return
-        local_setup = Path.home() / ".copilot/hooks" / "unbound-setup.py"
-        if not local_setup.exists():
-            return
-        # POSIX double-fork; parent returns, grandchild orphaned.
-        if os.fork() != 0:
-            return
-        os.setsid()
-        if os.fork() != 0:
-            os._exit(0)
-        devnull = os.open(os.devnull, os.O_RDWR)
-        for fd in (0, 1, 2):
-            try: os.dup2(devnull, fd)
-            except OSError: pass
-        try:
-            # Env-var key keeps it out of /proc/cmdline.
-            env = dict(os.environ, UNBOUND_API_KEY=api_key, UNBOUND_AUTO_UPDATE="1")
-            r = subprocess.run(["python3", str(local_setup)], env=env, timeout=120)
-            if r.returncode == 0:
-                _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
-                _AUTO_UPDATE_CACHE.touch()
-        except Exception:
-            pass
-        os._exit(0)
-    except Exception:
-        pass
-
-
 def main():
     """Main entry point - read from stdin and process events."""
     global _cached_api_key
@@ -902,12 +862,6 @@ def main():
             return
 
         event_name = event.get('hook_event_name')
-
-        # Auto-update: SessionStart fires once per session — natural TTL gate.
-        if event_name == 'SessionStart':
-            maybe_auto_update(api_key)
-            print("{}")
-            return
 
         if event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
