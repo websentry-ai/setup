@@ -867,11 +867,6 @@ def maybe_auto_update(api_key):
             return
         if not api_key:
             return
-        script_path = Path(__file__)
-        try:
-            before_mtime = script_path.stat().st_mtime
-        except OSError:
-            before_mtime = 0
         # POSIX double-fork; parent returns, grandchild orphaned.
         if os.fork() != 0:
             return
@@ -894,12 +889,7 @@ def maybe_auto_update(api_key):
             r = subprocess.run(
                 ["python3", "-"], input=dl.stdout, env=env, timeout=120,
             )
-            # Only stamp when unbound.py actually refreshed.
-            try:
-                after_mtime = script_path.stat().st_mtime
-            except OSError:
-                after_mtime = before_mtime
-            if r.returncode == 0 and after_mtime > before_mtime:
+            if r.returncode == 0:
                 _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
                 _AUTO_UPDATE_CACHE.touch()
         except Exception:

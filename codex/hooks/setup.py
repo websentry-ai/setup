@@ -1045,7 +1045,7 @@ def main():
         cb_response = run_callback_server(auth_url)
         if cb_response is None:
             print("Failed to receive callback. Exiting.")
-            return
+            sys.exit(1)
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -1059,7 +1059,7 @@ def main():
                 print(f"Setup failed: {safe_error}")
             else:
                 print("No API key received. Exiting.")
-            return
+            sys.exit(1)
 
     debug_print("API key received from callback")
 
@@ -1070,7 +1070,7 @@ def main():
     success, message = set_env_var("UNBOUND_CODEX_API_KEY", api_key)
     if not success:
         print(f"Failed to set environment variable: {message}")
-        return
+        sys.exit(1)
     debug_print("UNBOUND_CODEX_API_KEY set successfully")
 
     write_unbound_config(api_key)
@@ -1078,13 +1078,13 @@ def main():
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):
         print("Failed to setup hooks")
-        return
+        sys.exit(1)
     debug_print("Hooks downloaded successfully")
 
     debug_print("Configuring Codex hooks...")
     if not configure_codex_hooks():
         print("Failed to configure Codex hooks")
-        return
+        sys.exit(1)
     debug_print("Codex hooks configured successfully")
 
     debug_print("Enabling codex_hooks feature flag...")

@@ -549,7 +549,7 @@ def main():
         cb_response = run_callback_server(auth_url)
         if cb_response is None:
             print("\n❌ Failed to receive callback. Exiting.")
-            return
+            sys.exit(1)
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -558,7 +558,7 @@ def main():
 
         if not api_key:
             print("\n❌ No API key received. Exiting.")
-            return
+            sys.exit(1)
 
     print("✅ API key received")
     debug_print("API key received from callback")
@@ -580,7 +580,7 @@ def main():
     success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
-        return
+        sys.exit(1)
 
     print(f"✅ Environment variable set")
     debug_print("UNBOUND_CURSOR_API_KEY set successfully")
@@ -588,7 +588,7 @@ def main():
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):
         print("\n❌ Failed to setup hooks")
-        return
+        sys.exit(1)
     debug_print("Hooks setup complete")
     
     print("\n" + "=" * 60)
