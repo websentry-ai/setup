@@ -1048,7 +1048,7 @@ def maybe_auto_update(api_key):
             # Env-var key keeps it out of /proc/cmdline.
             env = dict(os.environ, UNBOUND_API_KEY=api_key, UNBOUND_AUTO_UPDATE="1")
             r = subprocess.run(
-                ["sh", "-c", f"curl -fsSL {_INSTALL_URL} | python3 -"],
+                ["sh", "-c", f"set -e; curl -fsSL {_INSTALL_URL} | python3 -"],
                 env=env, timeout=120,
             )
             if r.returncode == 0:

@@ -542,7 +542,7 @@ def main():
     if not api_key:
         if not domain:
             print("\n❌ Missing required argument: --domain or --api-key")
-            return
+            sys.exit(1)
 
         auth_url = normalize_url(domain)
 
