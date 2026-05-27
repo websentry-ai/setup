@@ -936,9 +936,6 @@ def main():
 
     system = platform.system().lower()
 
-    if system not in ("darwin", "linux", "windows"):
-        print("❌ This script only supports macOS, Linux, and Windows")
-        return
     if not check_admin_privileges():
         if system == "windows":
             sys.exit(
