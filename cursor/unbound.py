@@ -1014,7 +1014,7 @@ def _dispatch_discovery() -> None:
         last = cache.get("last_run_at")
         if isinstance(last, str):
             try:
-                ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").timestamp()
+                ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
                 if (time.time() - ts) < DISCOVERY_DEBOUNCE_SECONDS:
                     return
             except ValueError:
