@@ -22,6 +22,7 @@ import json
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
+SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
@@ -378,6 +379,7 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     except Exception:
         pass
 
+    install_local_setup_copy()
     return True
 
 
@@ -617,6 +619,16 @@ def clear_setup() -> None:
         any_cleared = True
     elif _r == "failed":
         any_failed = True
+
+    for extra in (
+        Path.home() / ".codex" / "hooks" / "unbound-setup.py",
+        Path.home() / ".codex" / "hooks" / ".last_updated",
+    ):
+        _r = _clear_path(extra, str(extra))
+        if _r == "cleared":
+            any_cleared = True
+        elif _r == "failed":
+            any_failed = True
 
     hooks_status = remove_hooks_from_config()
     if hooks_status == "cleared":
@@ -1036,6 +1048,28 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
+
+def install_local_setup_copy():
+    """Local setup.py copy for auto-update."""
+    import shutil
+    try:
+        dest = Path.home() / ".codex/hooks" / "unbound-setup.py"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            src = Path(__file__).resolve()
+        except Exception:
+            src = None
+        if src is not None and src.exists():
+            if src == dest.resolve():
+                return
+            shutil.copyfile(src, dest)
+        elif not download_file(SETUP_SELF_URL, dest):
+            return
+        os.chmod(dest, 0o755)
+    except Exception:
+        pass
+
+
 def main():
     global DEBUG
 
@@ -1082,6 +1116,10 @@ def main():
             api_key_arg = sys.argv[i + 1]
             break
 
+
+    # Env-var fallback keeps key out of /proc/cmdline.
+    if not api_key_arg:
+        api_key_arg = os.environ.get("UNBOUND_API_KEY")
     api_key = api_key_arg
     if not api_key:
         if not domain:
@@ -1142,14 +1180,16 @@ def main():
     print("Setup complete")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "codex", backend_url=backend_url)
+    is_auto_update = os.environ.get("UNBOUND_AUTO_UPDATE") == "1"
+    if not is_auto_update:
+        notify_setup_complete(api_key, "codex", backend_url=backend_url)
 
-    if backfill_mode:
-        run_backfill(api_key, backend_url)
+        if backfill_mode:
+            run_backfill(api_key, backend_url)
 
-    rc_path = get_shell_rc_file()
-    if rc_path is not None:
-        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+        rc_path = get_shell_rc_file()
+        if rc_path is not None:
+            print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 
 if __name__ == "__main__":

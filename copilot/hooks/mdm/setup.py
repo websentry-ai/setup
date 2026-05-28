@@ -19,6 +19,7 @@ except ImportError:
 
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
+SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
@@ -634,6 +635,7 @@ def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, sour
     hooks_dir = home_dir / ".copilot" / "hooks"
     script_path = hooks_dir / "unbound.py"
     hooks_json = hooks_dir / "unbound.json"
+    setup_copy_path = hooks_dir / "unbound-setup.py"
     system = platform.system().lower()
 
     def _install():
@@ -648,6 +650,13 @@ def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, sour
         fd = os.open(str(hooks_json), flags, 0o644)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2)
+
+        # Local setup.py copy for auto-update
+        if download_file(SETUP_SELF_URL, setup_copy_path) and system in ["darwin", "linux"]:
+            try:
+                os.chmod(setup_copy_path, 0o755)
+            except Exception:
+                pass
         return True
 
     ok = bool(_run_as_user(username, _install))
@@ -664,12 +673,14 @@ def clear_hooks_for_user(username: str, home_dir: Path) -> str:
     hooks_dir = home_dir / ".copilot" / "hooks"
     script_path = hooks_dir / "unbound.py"
     hooks_json = hooks_dir / "unbound.json"
+    setup_copy_path = hooks_dir / "unbound-setup.py"
+    last_updated_path = hooks_dir / ".last_updated"
 
     def _clear():
         cleared = False
         had_error = False
         any_existed = False
-        for path in (script_path, hooks_json):
+        for path in (script_path, hooks_json, setup_copy_path, last_updated_path):
             try:
                 if path.exists():
                     any_existed = True

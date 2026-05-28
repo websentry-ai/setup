@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 import time
 import hashlib
@@ -29,6 +29,17 @@ PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
+
+DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
+DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
+DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
+DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
+DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
+DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
+DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -1000,6 +1011,158 @@ def get_api_key():
         return None
 
 
+
+# ─── Auto-update ─────────────────────────────────────────────────────────────
+_AUTO_UPDATE_CACHE = Path.home() / ".claude" / "hooks" / ".last_updated"
+_AUTO_UPDATE_TTL_SECONDS = 2 * 60 * 60
+
+
+def maybe_auto_update(api_key):
+    """TTL-gated re-install via local setup.py copy."""
+    try:
+        if _AUTO_UPDATE_CACHE.exists() and (time.time() - _AUTO_UPDATE_CACHE.stat().st_mtime) < _AUTO_UPDATE_TTL_SECONDS:
+            return
+        if not api_key:
+            return
+        local_setup = Path.home() / ".claude/hooks" / "unbound-setup.py"
+        if not local_setup.exists():
+            return
+        # POSIX double-fork; parent returns, grandchild orphaned.
+        if os.fork() != 0:
+            return
+        os.setsid()
+        if os.fork() != 0:
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            try: os.dup2(devnull, fd)
+            except OSError: pass
+        try:
+            # Env-var key keeps it out of /proc/cmdline.
+            env = dict(os.environ, UNBOUND_API_KEY=api_key, UNBOUND_AUTO_UPDATE="1")
+            r = subprocess.run(["python3", str(local_setup)], env=env, timeout=120)
+            if r.returncode == 0:
+                _AUTO_UPDATE_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                _AUTO_UPDATE_CACHE.touch()
+        except Exception:
+            pass
+        os._exit(0)
+    except Exception:
+        pass
+
+
+def _dispatch_discovery() -> None:
+    try:
+        cache: Dict = {}
+        if DISCOVERY_CACHE_PATH.exists():
+            try:
+                with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
+                    cache = json.load(f) or {}
+            except (OSError, json.JSONDecodeError):
+                cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+
+        last = cache.get("last_run_at")
+        if isinstance(last, str):
+            try:
+                ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+                if (time.time() - ts) < DISCOVERY_DEBOUNCE_SECONDS:
+                    return
+            except ValueError:
+                pass
+
+        if DISCOVERY_LOCK_PATH.exists():
+            try:
+                age = time.time() - DISCOVERY_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = DISCOVERY_STALE_LOCK_SECONDS + 1
+            if age < DISCOVERY_STALE_LOCK_SECONDS:
+                return
+
+        # Atomic dispatch claim — first hook to create the marker wins;
+        # concurrent peers bail to avoid duplicate fork-detached Popens.
+        # The marker is removed right after the fork (or on any failure path).
+        try:
+            _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                                   os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(_dispatch_fd)
+        except FileExistsError:
+            try:
+                age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
+            except OSError:
+                age = DISCOVERY_DISPATCH_TTL_SECONDS + 1
+            if age < DISCOVERY_DISPATCH_TTL_SECONDS:
+                return
+            try:
+                DISCOVERY_DISPATCH_PATH.unlink()
+                _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                                       os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(_dispatch_fd)
+            except (FileExistsError, OSError):
+                return
+
+        try:
+            try:
+                with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                    unbound_config = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                log_error(f"discovery gate: could not read {UNBOUND_CONFIG_PATH}: {e}", 'discovery_gate')
+                return
+            api_key = unbound_config.get("api_key")
+            backend_url = unbound_config.get("base_url")
+            if not api_key:
+                log_error("discovery gate: api_key missing in ~/.unbound/config.json", 'discovery_gate')
+                return
+            if not backend_url:
+                log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
+                return
+
+            DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            if not DISCOVERY_INSTALL_SH.exists():
+                r = subprocess.run(
+                    ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                    capture_output=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                    return
+                os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+
+            # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
+            popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                            "stdin": subprocess.DEVNULL, "close_fds": True,
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+            try:
+                subprocess.Popen(
+                    ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
+                    **popen_kwargs,
+                )
+            except OSError as e:
+                log_error(f"discovery gate: Popen failed: {e}", 'discovery_gate')
+                return
+
+            # Stamp last_run_at only after Popen succeeds so a launch failure
+            # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
+            cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2, sort_keys=True)
+            os.replace(tmp, DISCOVERY_CACHE_PATH)
+        finally:
+            try:
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception as e:
+        log_error(f"discovery gate failed: {e}", 'discovery_gate')
+
+
 def main():
     global _cached_api_key
     api_key = get_api_key()
@@ -1019,6 +1182,14 @@ def main():
             return
 
         hook_event_name = event.get('hook_event_name')
+
+        # SessionStart fires once per session — natural TTL gate for both
+        # auto-update and the debounced discovery scan dispatch.
+        if hook_event_name == "SessionStart":
+            maybe_auto_update(api_key)
+            _dispatch_discovery()
+            print("{}")
+            return
         session_id = event.get('session_id')
 
         # Handle PreToolUse - return immediately after decision is made
