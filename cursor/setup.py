@@ -17,7 +17,6 @@ import json
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
-SETUP_SELF_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/setup.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 DEBUG = False
@@ -452,16 +451,6 @@ def clear_setup() -> None:
         except Exception as e:
             print(f"❌ Failed to remove {script_path}: {e}")
 
-    # Remove auto-update artifacts
-    for extra in (Path.home() / ".cursor/hooks/unbound-setup.py",
-                  Path.home() / ".cursor/hooks/.last_updated"):
-        if extra.exists():
-            try:
-                extra.unlink()
-                print(f"✅ Removed {extra}")
-            except Exception as e:
-                debug_print(f"Failed to remove {extra}: {e}")
-
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
@@ -484,28 +473,6 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print("Setup completion notification sent")
     except Exception as e:
         debug_print(f"Could not notify backend: {e}")
-
-
-
-def install_local_setup_copy():
-    """Local setup.py copy for auto-update."""
-    import shutil
-    try:
-        dest = Path.home() / ".cursor/hooks" / "unbound-setup.py"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            src = Path(__file__).resolve()
-        except Exception:
-            src = None
-        if src is not None and src.exists():
-            if src == dest.resolve():
-                return
-            shutil.copyfile(src, dest)
-        elif not download_file(SETUP_SELF_URL, dest):
-            return
-        os.chmod(dest, 0o755)
-    except Exception:
-        pass
 
 
 def main():
@@ -556,10 +523,6 @@ def main():
             api_key_arg = sys.argv[i + 1]
             break
 
-
-    # Env-var fallback keeps key out of /proc/cmdline.
-    if not api_key_arg:
-        api_key_arg = os.environ.get("UNBOUND_API_KEY")
     api_key = api_key_arg
     if not api_key:
         if not domain:
@@ -591,8 +554,7 @@ def main():
         # rather than a silent abort. Print a positive line so the user
         # doesn't see only the ❌ above and assume the whole thing failed.
         print("✅ Device already configured via MDM — no user-level setup needed.")
-        if os.environ.get("UNBOUND_AUTO_UPDATE") != "1":
-            notify_setup_complete(api_key, "cursor", backend_url=backend_url)
+        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
         return
 
     if not write_unbound_config(api_key):
@@ -615,16 +577,15 @@ def main():
     
     print("\n" + "=" * 60)
     print("Setup Complete!")
-    install_local_setup_copy()
     print("=" * 60)
 
-    is_auto_update = os.environ.get("UNBOUND_AUTO_UPDATE") == "1"
-    if not is_auto_update:
-        notify_setup_complete(api_key, "cursor", backend_url=backend_url)
-        restart_cursor()
-        rc_path = get_shell_rc_file()
-        if rc_path is not None:
-            print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+    notify_setup_complete(api_key, "cursor", backend_url=backend_url)
+
+    restart_cursor()
+
+    rc_path = get_shell_rc_file()
+    if rc_path is not None:
+        print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
 
 if __name__ == "__main__":
