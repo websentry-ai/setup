@@ -751,7 +751,7 @@ def clear_setup():
     if hooks_json.exists():
         try:
             hooks_json.unlink()
-            debug_print(f"Cleared {hooks_json}")
+            print("Cleared enterprise hooks.json")
         except Exception as e:
             print(f"Failed to clear hooks.json: {e}")
 
@@ -760,7 +760,7 @@ def clear_setup():
         try:
             import shutil
             shutil.rmtree(hooks_dir)
-            debug_print(f"Cleared {hooks_dir}")
+            print("Cleared enterprise hooks directory")
         except Exception as e:
             print(f"Failed to clear hooks directory: {e}")
 
