@@ -691,9 +691,12 @@ def clear_setup():
             print(f"Cleared for {max(c1, c2)} user(s)")
         elif not (f1 or f2):
             print(f"API_KEY not set, nothing to clear for {n1} user(s)")
+        if f1 or f2:
+            print(f"Failed to clear for {max(f1, f2)} user(s)")
         for username, home_dir in user_homes:
             if home_dir is not None:
-                remove_codex_config_base_url_for_user(username, home_dir)
+                if not remove_codex_config_base_url_for_user(username, home_dir):
+                    debug_print(f"Could not remove openai_base_url from codex config for {username}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

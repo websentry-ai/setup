@@ -595,6 +595,8 @@ def clear_setup():
             print(f"Cleared for {max(c1, c2)} user(s)")
         elif not (f1 or f2):
             print(f"API_KEY not set, nothing to clear for {n1} user(s)")
+        if f1 or f2:
+            print(f"Failed to clear for {max(f1, f2)} user(s)")
 
     if platform.system().lower() == "windows":
         try:
