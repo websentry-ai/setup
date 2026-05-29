@@ -1119,7 +1119,11 @@ def _check_self_update() -> None:
                 log_error("self_update skipped: bad download", 'self_update')
                 return
 
-            new_bytes = _rebake_gateway_url(remote_text, gateway_url).encode("utf-8")
+            new_text = _rebake_gateway_url(remote_text, gateway_url)
+            if _baked_gateway_url(new_text) != gateway_url:
+                log_error("self_update skipped: gateway url not preserved", 'self_update')
+                return
+            new_bytes = new_text.encode("utf-8")
             if hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
                 _replace_self(new_bytes)
         finally:

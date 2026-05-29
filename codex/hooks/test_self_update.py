@@ -133,6 +133,20 @@ class SelfUpdateTest(unittest.TestCase):
         unbound._check_self_update()
         run.assert_not_called()
 
+    def test_skip_when_rebake_not_applied(self):
+        original = _script(TENANT, "v1")
+        self.script.write_text(original)
+        # download passes the sentinel but env-line won't match _BAKED_GATEWAY_RE (single quotes)
+        bad_remote = (
+            "#!/usr/bin/env python3\n"
+            "import os\n"
+            "UNBOUND_GATEWAY_URL = os.environ.get('UNBOUND_GATEWAY_URL', 'https://api.getunbound.ai')\n"
+            "# v2\n"
+        )
+        self._set_remote(bad_remote)
+        unbound._check_self_update()
+        self.assertEqual(self.script.read_text(), original)
+
     def test_corrupt_download_rejected(self):
         original = _script(TENANT, "v1")
         self.script.write_text(original)
