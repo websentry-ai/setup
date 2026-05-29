@@ -669,7 +669,7 @@ def clear_hooks_for_user(username: str, home_dir: Path) -> str:
         cleared = False
         had_error = False
         any_existed = False
-        for path in (script_path, hooks_json, setup_copy_path, last_updated_path):
+        for path in (script_path, hooks_json):
             try:
                 if path.exists():
                     any_existed = True
