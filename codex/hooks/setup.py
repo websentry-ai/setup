@@ -608,7 +608,7 @@ def clear_setup() -> None:
     status, _ = remove_env_var("UNBOUND_CODEX_API_KEY")
     if status == "cleared":
         any_cleared = True
-    elif status == "failed":
+    elif status not in ("cleared", "not_found"):
         print("Failed to clear API_KEY")
         any_failed = True
 

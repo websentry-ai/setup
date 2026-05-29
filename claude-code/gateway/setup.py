@@ -459,7 +459,7 @@ def clear_setup() -> None:
         status, _ = remove_env_var(var)
         if status == "cleared":
             any_cleared = True
-        elif status == "failed":
+        elif status not in ("cleared", "not_found"):
             print(f"Failed to clear {label}")
             any_failed = True
 
