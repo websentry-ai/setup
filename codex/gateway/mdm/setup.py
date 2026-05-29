@@ -651,7 +651,8 @@ def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> bool
     return bool(result)
 
 
-def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> None:
+def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
+    """Remove var_name for all users. Returns (cleared, not_found, failed) counts."""
     _label = label or var_name
     cleared = 0
     not_found = 0
@@ -664,12 +665,8 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
             not_found += 1
         else:
             failed += 1
-    if cleared:
-        print(f"Cleared for {cleared} user(s)")
-    elif not_found:
-        print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
-    if failed:
-        print(f"Failed to clear {_label} for {failed} user(s)")
+            print(f"Failed to clear {_label} for {username}")
+    return cleared, not_found, failed
 
 
 def clear_setup():
@@ -688,8 +685,12 @@ def clear_setup():
     if not user_homes:
         print("   No user home directories found")
     else:
-        _clear_env_var_across_users("OPENAI_API_KEY", user_homes, label="API_KEY")
-        _clear_env_var_across_users("OPENAI_BASE_URL", user_homes, label="BASE_URL")
+        c1, n1, f1 = _clear_env_var_across_users("OPENAI_API_KEY", user_homes, label="API_KEY")
+        c2, n2, f2 = _clear_env_var_across_users("OPENAI_BASE_URL", user_homes, label="BASE_URL")
+        if c1 or c2:
+            print(f"Cleared for {max(c1, c2)} user(s)")
+        elif not (f1 or f2):
+            print(f"API_KEY not set, nothing to clear for {n1} user(s)")
         for username, home_dir in user_homes:
             if home_dir is not None:
                 remove_codex_config_base_url_for_user(username, home_dir)
