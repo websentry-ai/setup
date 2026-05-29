@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 import tempfile
 import time
 import hashlib
+import re
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -43,6 +44,14 @@ LOG_DIR = Path.home() / ".copilot" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+
+SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
+SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
+SELF_UPDATE_LOCK_TTL_SECONDS = 30
+SELF_UPDATE_CURL_TIMEOUT = 15
+SELF_SCRIPT_PATH = LOG_DIR / "unbound.py"
+SELF_UPDATE_STATE_PATH = LOG_DIR / ".self_update_check"
+SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 
 # Copilot tool names (VS Code + CLI) translated to the canonical gateway vocabulary.
 SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
@@ -853,6 +862,112 @@ def get_api_key():
         return None
 
 
+_GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')
+_BAKED_GATEWAY_RE = re.compile(r'os\.environ\.get\(\s*"UNBOUND_GATEWAY_URL"\s*,\s*"([^"]*)"')
+
+def _is_valid_gateway_url(url: str) -> bool:
+    if not url or any(c in url for c in '"\\\n\r\x00'):
+        return False
+    return bool(_GATEWAY_URL_RE.fullmatch(url))
+
+
+def _baked_gateway_url(text: str) -> str:
+    # read baked url, not env
+    match = _BAKED_GATEWAY_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _rebake_gateway_url(text: str, gateway_url: str) -> str:
+    # rewrite only the env-var default, nothing else
+    return _BAKED_GATEWAY_RE.sub(
+        lambda m: m.group(0).replace(f'"{m.group(1)}"', f'"{gateway_url}"'),
+        text,
+        count=1,
+    )
+
+
+def _self_update_due() -> bool:
+    try:
+        return (time.time() - SELF_UPDATE_STATE_PATH.stat().st_mtime) >= SELF_UPDATE_INTERVAL_SECONDS
+    except OSError:
+        return True
+
+
+def _acquire_self_update_lock() -> bool:
+    try:
+        if SELF_UPDATE_LOCK_PATH.exists():
+            if (time.time() - SELF_UPDATE_LOCK_PATH.stat().st_mtime) < SELF_UPDATE_LOCK_TTL_SECONDS:
+                return False
+            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
+        fd = os.open(str(SELF_UPDATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return True
+    except (FileExistsError, OSError):
+        return False
+
+
+def _download_latest_hook():
+    try:
+        result = subprocess.run(
+            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL],
+            capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return None
+        return result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _replace_self(new_bytes: bytes) -> None:
+    try:
+        mode = SELF_SCRIPT_PATH.stat().st_mode
+    except OSError:
+        mode = 0o755
+    fd, tmp_path = tempfile.mkstemp(dir=str(SELF_SCRIPT_PATH.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_bytes)
+        os.replace(tmp_path, SELF_SCRIPT_PATH)
+        os.chmod(SELF_SCRIPT_PATH, mode | 0o111)
+    except OSError as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        log_error(f"self_update replace failed: {e}", 'self_update')
+
+
+def _check_self_update() -> None:
+    # refresh hook from main, throttled per interval
+    try:
+        if not _self_update_due() or not _acquire_self_update_lock():
+            return
+        try:
+            SELF_UPDATE_STATE_PATH.touch()  # one attempt per interval
+            local_bytes = SELF_SCRIPT_PATH.read_bytes()
+            gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
+            if not _is_valid_gateway_url(gateway_url):
+                log_error("self_update skipped: invalid gateway url", 'self_update')
+                return
+
+            payload = _download_latest_hook()
+            if not payload:
+                return
+            remote_text = payload.decode("utf-8", errors="replace")
+            if "UNBOUND_GATEWAY_URL" not in remote_text:
+                log_error("self_update skipped: bad download", 'self_update')
+                return
+
+            new_bytes = _rebake_gateway_url(remote_text, gateway_url).encode("utf-8")
+            if hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
+                _replace_self(new_bytes)
+        finally:
+            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
+    except Exception as e:
+        log_error(f"self_update error: {e}", 'self_update')
+
+
 def _dispatch_discovery() -> None:
     try:
         cache = {}
@@ -988,6 +1103,7 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
+            _check_self_update()
             _dispatch_discovery()
             print("{}")
             return
