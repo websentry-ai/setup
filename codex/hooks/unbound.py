@@ -11,11 +11,13 @@ import time
 import hashlib
 import re
 import tempfile
+import base64
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
+CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
@@ -629,6 +631,75 @@ def _read_mcp_server_config_regex(server_name, config_path):
         return None
 
 
+def _email_domain(email: Optional[str]) -> Optional[str]:
+    try:
+        if email and '@' in email:
+            domain = email.rsplit('@', 1)[1].strip().lower()
+            return domain or None
+    except Exception:
+        pass
+    return None
+
+
+def _decode_jwt_claims(id_token: str) -> Dict:
+    try:
+        segment = id_token.split('.')[1]
+        padding = '=' * (-len(segment) % 4)
+        decoded = base64.urlsafe_b64decode(segment + padding)
+        claims = json.loads(decoded.decode('utf-8'))
+        return claims if isinstance(claims, dict) else {}
+    except Exception:
+        return {}
+
+
+def _codex_org_id(auth_claim: Dict) -> Optional[str]:
+    orgs = auth_claim.get('organizations')
+    if not isinstance(orgs, list) or not orgs:
+        return None
+    for org in orgs:
+        if isinstance(org, dict) and org.get('is_default'):
+            return org.get('id') or None
+    first = orgs[0]
+    return first.get('id') if isinstance(first, dict) else None
+
+
+def read_account_identity() -> Dict:
+    org_id = None
+    plan = None
+    auth_mode = None
+    email_domain = None
+    try:
+        auth = json.loads(CODEX_AUTH_PATH.read_text(encoding='utf-8'))
+        raw_mode = auth.get('auth_mode')
+        if raw_mode == 'chatgpt':
+            auth_mode = 'subscription'
+        elif raw_mode == 'apikey':
+            auth_mode = 'api_key'
+        elif not raw_mode and auth.get('OPENAI_API_KEY'):
+            auth_mode = 'api_key'
+
+        id_token = (auth.get('tokens') or {}).get('id_token')
+        if id_token:
+            claims = _decode_jwt_claims(id_token)
+            auth_claim = claims.get('https://api.openai.com/auth') or {}
+            if isinstance(auth_claim, dict):
+                org_id = _codex_org_id(auth_claim)
+                plan = auth_claim.get('chatgpt_plan_type') or None
+            email_domain = _email_domain(claims.get('email'))
+    except Exception:
+        pass
+    return {
+        'org_id': org_id,
+        'plan': plan,
+        'auth_mode': auth_mode,
+        'email_domain': email_domain,
+    }
+
+
+def build_account_identity() -> Dict:
+    return read_account_identity()
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -684,6 +755,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'tool_name': tool_name,
             'metadata': metadata
         },
+        'account_identity': build_account_identity(),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -764,6 +836,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': 'codex',
         'model': model,
         'event_name': 'user_prompt',
+        'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 

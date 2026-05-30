@@ -657,6 +657,54 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
         return None
 
 
+def _email_domain(email: Optional[str]) -> Optional[str]:
+    try:
+        if email and '@' in email:
+            domain = email.rsplit('@', 1)[1].strip().lower()
+            return domain or None
+    except Exception:
+        pass
+    return None
+
+
+def _claude_code_has_api_key() -> bool:
+    try:
+        if os.getenv('ANTHROPIC_API_KEY'):
+            return True
+        config = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
+        approved = (config.get('customApiKeyResponses') or {}).get('approved')
+        return bool(approved)
+    except Exception:
+        return False
+
+
+def read_account_identity() -> Dict:
+    org_id = None
+    auth_mode = None
+    email_domain = None
+    try:
+        config = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
+        oauth = config.get('oauthAccount')
+        if isinstance(oauth, dict):
+            org_id = oauth.get('organizationUuid') or None
+            email_domain = _email_domain(oauth.get('emailAddress'))
+            auth_mode = 'subscription'
+        elif _claude_code_has_api_key():
+            auth_mode = 'api_key'
+    except Exception:
+        pass
+    return {
+        'org_id': org_id,
+        'plan': None,
+        'auth_mode': auth_mode,
+        'email_domain': email_domain,
+    }
+
+
+def build_account_identity() -> Dict:
+    return read_account_identity()
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -718,6 +766,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'tool_name': tool_name,
             'metadata': metadata
         },
+        'account_identity': build_account_identity(),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -798,6 +847,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': 'claude-code',
         'model': model,
         'event_name': 'user_prompt',
+        'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 
