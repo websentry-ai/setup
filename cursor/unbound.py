@@ -442,6 +442,8 @@ def _cursor_state_db_path():
 
 
 def _read_cursor_item_table(db_path, keys):
+    if not keys:
+        return {}
     values = {}
     conn = None
     try:

@@ -667,17 +667,6 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
     return None
 
 
-def _claude_code_has_api_key() -> bool:
-    try:
-        if os.getenv('ANTHROPIC_API_KEY'):
-            return True
-        config = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
-        approved = (config.get('customApiKeyResponses') or {}).get('approved')
-        return bool(approved)
-    except Exception:
-        return False
-
-
 def read_account_identity() -> Dict:
     org_id = None
     auth_mode = None
@@ -689,7 +678,7 @@ def read_account_identity() -> Dict:
             org_id = oauth.get('organizationUuid') or None
             email_domain = _email_domain(oauth.get('emailAddress'))
             auth_mode = 'subscription'
-        elif _claude_code_has_api_key():
+        elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
     except Exception:
         pass
