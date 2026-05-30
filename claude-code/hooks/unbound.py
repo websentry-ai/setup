@@ -669,6 +669,7 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
 
 def read_account_identity() -> Dict:
     org_id = None
+    plan = None
     auth_mode = None
     email_domain = None
     try:
@@ -676,6 +677,7 @@ def read_account_identity() -> Dict:
         oauth = config.get('oauthAccount')
         if isinstance(oauth, dict):
             org_id = oauth.get('organizationUuid') or None
+            plan = oauth.get('organizationType') or None
             email_domain = _email_domain(oauth.get('emailAddress'))
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
@@ -684,7 +686,7 @@ def read_account_identity() -> Dict:
         pass
     return {
         'org_id': org_id,
-        'plan': None,
+        'plan': plan,
         'auth_mode': auth_mode,
         'email_domain': email_domain,
     }

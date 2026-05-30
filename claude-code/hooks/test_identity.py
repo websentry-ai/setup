@@ -85,7 +85,28 @@ class TestReadAccountIdentity(unittest.TestCase):
         result = unbound.read_account_identity()
         self.assertEqual(result["auth_mode"], "subscription")
 
-    def test_plan_is_always_none(self):
+    def test_plan_from_organization_type(self):
+        self._write_config({
+            "oauthAccount": {
+                "organizationUuid": "org-abc-123",
+                "emailAddress": "alice@example.com",
+                "organizationType": "claude_max",
+            }
+        })
+        result = unbound.read_account_identity()
+        self.assertEqual(result["plan"], "claude_max")
+
+    def test_plan_raw_value_not_normalized(self):
+        self._write_config({
+            "oauthAccount": {
+                "organizationUuid": "org-abc-123",
+                "organizationType": "claude_enterprise",
+            }
+        })
+        result = unbound.read_account_identity()
+        self.assertEqual(result["plan"], "claude_enterprise")
+
+    def test_plan_none_when_organization_type_missing(self):
         self._write_config({
             "oauthAccount": {
                 "organizationUuid": "org-abc-123",
@@ -93,6 +114,12 @@ class TestReadAccountIdentity(unittest.TestCase):
             }
         })
         result = unbound.read_account_identity()
+        self.assertIsNone(result["plan"])
+
+    def test_plan_none_in_api_key_mode(self):
+        self._write_config({})
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test-key"}):
+            result = unbound.read_account_identity()
         self.assertIsNone(result["plan"])
 
     def test_org_id_none_when_uuid_missing_from_oauth(self):
