@@ -202,11 +202,57 @@ def get_windows_device_identifier() -> str:
         return None
 
 
+def get_linux_device_identifier() -> str:
+    """Get a stable device identifier on Linux.
+
+    Tries dmidecode serial, then /etc/machine-id, then hostname.
+    """
+    try:
+        result = subprocess.run(
+            ["dmidecode", "-s", "system-serial-number"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stderr=subprocess.DEVNULL,
+        )
+        _DMIDECODE_PLACEHOLDERS = {
+            "", "0", "default string", "not applicable",
+            "not specified", "system serial number",
+            "to be filled by o.e.m.",
+        }
+        if result.returncode == 0:
+            device_id = result.stdout.strip()
+            if device_id and device_id.lower() not in _DMIDECODE_PLACEHOLDERS:
+                return device_id
+    except Exception:
+        debug_print("dmidecode failed, trying machine-id")
+
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                device_id = f.read().strip()
+                if device_id:
+                    return device_id
+        except Exception:
+            continue
+
+    try:
+        result = subprocess.run(["hostname"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+
+    return None
+
+
 def get_device_identifier() -> str:
     """Dispatch device identifier lookup based on platform."""
     system = platform.system().lower()
     if system == "darwin":
         return get_mac_serial_number()
+    if system == "linux":
+        return get_linux_device_identifier()
     if system == "windows":
         return get_windows_device_identifier()
     return None
@@ -377,19 +423,24 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {user_dir.name} -> {user_dir}")
             return user_homes
 
-        # Iterate through all users in the password database
-        for user in pwd.getpwall():
-            uid = user.pw_uid
-            username = user.pw_name
-            home_dir = Path(user.pw_dir)
-
-            # Filter out system accounts (UID < 500 on macOS)
-            # Real users typically have UID >= 501 on macOS
-            if uid >= 500 and home_dir.exists() and home_dir.is_dir():
-                # Additional checks to ensure it's a real user home
-                if str(home_dir).startswith('/Users/') and username not in ['Shared', 'Guest']:
-                    user_homes.append((username, home_dir))
-                    debug_print(f"Found user: {username} -> {home_dir}")
+        if system == "darwin":
+            for user in pwd.getpwall():
+                uid = user.pw_uid
+                username = user.pw_name
+                home_dir = Path(user.pw_dir)
+                if uid >= 500 and home_dir.exists() and home_dir.is_dir():
+                    if str(home_dir).startswith('/Users/') and username not in ['Shared', 'Guest']:
+                        user_homes.append((username, home_dir))
+                        debug_print(f"Found user: {username} -> {home_dir}")
+        elif system == "linux":
+            for user in pwd.getpwall():
+                uid = user.pw_uid
+                username = user.pw_name
+                home_dir = Path(user.pw_dir)
+                if uid >= 1000 and home_dir.exists() and home_dir.is_dir():
+                    if str(home_dir).startswith('/home/'):
+                        user_homes.append((username, home_dir))
+                        debug_print(f"Found user: {username} -> {home_dir}")
 
         return user_homes
     except Exception as e:
@@ -397,10 +448,11 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
         return []
 
 
-def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool]:
-    """Set environment variable for all users on macOS by updating each user's shell rc file.
+def set_env_var_system_wide_unix(var_name: str, value: str) -> Tuple[bool, bool]:
+    """Set environment variable for all users on macOS/Linux via per-user shell rc files.
     Returns: (success, changed)"""
     try:
+        system = platform.system().lower()
         user_homes = get_all_user_homes()
 
         if not user_homes:
@@ -411,14 +463,13 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
         changed_count = 0
         export_line = f'export {var_name}="{value}"'
 
-        # Set environment variable for each user (privilege-dropped per user)
         for username, home_dir in user_homes:
             debug_print(f"Setting env var for user: {username}")
 
-            rc_files = [
-                home_dir / ".zprofile",
-                home_dir / ".bash_profile"
-            ]
+            if system == "linux":
+                rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+            else:
+                rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
             debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
 
             def _do_user_writes(_rc_files=rc_files):
@@ -465,10 +516,11 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
 
     Returns "cleared", "not_found", or "failed".
     """
-    rc_files = [
-        home_dir / ".zprofile",
-        home_dir / ".bash_profile"
-    ]
+    system = platform.system().lower()
+    if system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     export_prefix = f"export {var_name}="
 
     def _remove():
@@ -504,10 +556,10 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
 
 
 def set_env_var_unix(var_name: str, value: str) -> Tuple[bool, bool]:
-    if platform.system().lower() == "darwin" and os.geteuid() == 0:
-        return set_env_var_system_wide_macos(var_name, value)
+    if os.geteuid() == 0:
+        return set_env_var_system_wide_unix(var_name, value)
 
-    # For other cases, use the per-user approach
+    # Non-root fallback: write to current user's rc file only.
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False, False
@@ -530,14 +582,8 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, bool, str]:
     elif system in ["darwin", "linux"]:
         success, changed = set_env_var_unix(var_name, value)
         if success:
-            # Check if we're running as root on macOS (system-wide setup)
-            if system == "darwin" and os.geteuid() == 0:
-                debug_print(f"Environment variable {var_name} set system-wide")
-                return True, changed, "Set system-wide for all users"
-            else:
-                debug_print(f"Environment variable {var_name} added to shell rc file")
-                shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
-                return True, changed, f"Run 'source ~/.{shell_name}rc' or restart terminal"
+            debug_print(f"Environment variable {var_name} set system-wide for all users")
+            return True, changed, "Set system-wide for all users"
         return False, False, "Failed"
     else:
         return False, False, f"Unsupported OS: {system}"
@@ -915,10 +961,6 @@ def main():
 
     system = platform.system().lower()
 
-    # cursor/mdm/setup.py supported only macOS in origin; extend to Windows.
-    if system not in ("darwin", "windows"):
-        print("❌ This script only supports macOS and Windows")
-        return
     if not check_admin_privileges():
         if system == "windows":
             sys.exit(
