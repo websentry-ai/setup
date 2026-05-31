@@ -986,19 +986,25 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state() -> Optional[str]:
     """Inspect each user's ~/.copilot/hooks/unbound.json BEFORE it gets
-    overwritten. 'fresh' (no user has it), 'persisted' (any present file still
-    wires in our unbound.py hook), 'tampered' (present but none do), or None on
-    any read error."""
+    overwritten. 'fresh' (no user has it), 'persisted' (every present file still
+    wires in our unbound.py hook), 'tampered' (any present file has it removed),
+    or None on any read error. Tampered wins: a single user with the hook
+    stripped flags the device even if other users are intact."""
     try:
         any_present = False
+        any_persisted = False
         for _username, home_dir in get_all_user_homes():
             hooks_json = home_dir / ".copilot" / "hooks" / "unbound.json"
             if not hooks_json.exists():
                 continue
             any_present = True
             if "unbound.py" in hooks_json.read_text(encoding="utf-8"):
-                return 'persisted'
-        return 'tampered' if any_present else 'fresh'
+                any_persisted = True
+            else:
+                return 'tampered'
+        if not any_present:
+            return 'fresh'
+        return 'persisted' if any_persisted else 'tampered'
     except Exception:
         return None
 
