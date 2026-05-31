@@ -1279,11 +1279,27 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """Inspect the managed-settings target BEFORE it gets overwritten.
+    'fresh' (absent), 'persisted' (our unbound.py hook still wired in),
+    'tampered' (present but hook stripped), or None on any read error."""
+    try:
+        settings_path = get_managed_settings_dir() / "managed-settings.json"
+        if not settings_path.exists():
+            return 'fresh'
+        return 'persisted' if "unbound.py" in settings_path.read_text(encoding="utf-8") else 'tampered'
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        if install_state is not None:
+            data = json.dumps({"tool_type": tool_type, "install_state": install_state})
+        else:
+            data = json.dumps({"tool_type": tool_type})
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1392,6 +1408,8 @@ def main():
         remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key)
 
+    state = detect_install_state()
+
     print("\nConfiguring Claude managed hooks...")
     if setup_managed_hooks(gateway_url=gateway_url):
         managed_dir = get_managed_settings_dir()
@@ -1404,7 +1422,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "claude-code", backend_url=base_url)
+    notify_setup_complete(api_key, "claude-code", backend_url=base_url, install_state=state)
 
     if backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())
