@@ -101,9 +101,16 @@ find_python() {
 download_onboard_script() {
     local url="$1"
     local content
+    local curl_stderr
 
-    if ! content=$(curl -fsSL "$url" 2>&1); then
-        error_exit "Failed to download onboard.py: $content"
+    # Capture stderr separately to avoid mixing warnings into script content
+    curl_stderr=$(mktemp)
+    trap "rm -f '$curl_stderr'" RETURN
+
+    if ! content=$(curl -fsSL "$url" 2>"$curl_stderr"); then
+        local error_msg
+        error_msg=$(cat "$curl_stderr" 2>/dev/null || echo "unknown error")
+        error_exit "Failed to download onboard.py: $error_msg"
     fi
 
     if [[ -z "$content" ]]; then

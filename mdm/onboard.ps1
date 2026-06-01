@@ -77,9 +77,14 @@ function Find-Python {
     $pythonCommands = @("py", "python3", "python")
 
     foreach ($cmd in $pythonCommands) {
-        $null = & $cmd --version 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            return $cmd
+        try {
+            $null = & $cmd --version 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                return $cmd
+            }
+        } catch {
+            # Command not found, continue to next candidate
+            continue
         }
     }
 
