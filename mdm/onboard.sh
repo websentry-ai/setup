@@ -173,13 +173,18 @@ main() {
 
     # Execute the Python script
     "$python_cmd" "${python_args[@]}"
+    return $?
 }
 
 # Entry point
 main "$@"
+exit_code=$?
 
 # Self-destruct: Remove this script file after execution completes
 # This allows users to run without manual cleanup when downloaded first
 if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
     rm -f "${BASH_SOURCE[0]}" 2>/dev/null || true
 fi
+
+# Exit with the Python script's exit code
+exit $exit_code

@@ -167,7 +167,7 @@ function Main {
 
         # Execute the Python script and capture exit code
         & $pythonCmd @pythonArgs
-        exit $LASTEXITCODE
+        $exitCode = $LASTEXITCODE
 
     } finally {
         # Clean up temporary files
@@ -188,3 +188,6 @@ Main
 if ($MyInvocation.MyCommand.Path) {
     Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
 }
+
+# Exit with the Python script's exit code
+exit $exitCode
