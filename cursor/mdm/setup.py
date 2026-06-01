@@ -25,6 +25,7 @@ if platform.system().lower() == "windows":
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+    del _stream
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
