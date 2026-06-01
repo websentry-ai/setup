@@ -13,7 +13,7 @@
       5. Coding-discovery scan
 
     This PowerShell wrapper:
-    - Checks for Python availability (python, python3, py)
+    - Checks for Python availability (py, python3, python)
     - Downloads the onboard.py script from GitHub
     - Executes it with all provided parameters
     - Provides clear errors if Python is missing
@@ -37,15 +37,15 @@
 
 .EXAMPLE
     # Standard onboarding with both keys
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)" -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+    & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
 
 .EXAMPLE
     # Clear MDM setup
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)" -Clear
+    & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -Clear
 
 .NOTES
     Requires: Python 3, Administrator privileges
-    URL: https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/mdm/onboard.py
+    URL: https://raw.githubusercontent.com/websentry-ai/setup/c3159c9811c8d84ce863435d92a7150750eeef95/mdm/onboard.py
 #>
 
 param(
@@ -59,8 +59,8 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Constants
-$ONBOARD_PY_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/mdm/onboard.py"
-$SCRIPT_NAME = "Unbound MDM Onboarding"
+# Pinned to commit c3159c9 to ensure reproducible deployments and prevent supply-chain attacks
+$ONBOARD_PY_URL = "https://raw.githubusercontent.com/websentry-ai/setup/c3159c9811c8d84ce863435d92a7150750eeef95/mdm/onboard.py"
 
 # Output helpers
 function Write-Error-Exit { param([string]$Message, [int]$Code = 1) Write-Error $Message; exit $Code }
@@ -74,7 +74,7 @@ function Test-Administrator {
 
 # Find Python executable
 function Find-Python {
-    $pythonCommands = @("python", "python3", "py")
+    $pythonCommands = @("py", "python3", "python")
 
     foreach ($cmd in $pythonCommands) {
         try {
@@ -117,11 +117,11 @@ function Main {
     # Validate parameters (unless -Clear is specified)
     if (-not $Clear) {
         if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-            Write-Error-Exit "-ApiKey is required. Usage: iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing | Select -ExpandProperty Content | iex -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
+            Write-Error-Exit "-ApiKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
         }
 
         if ([string]::IsNullOrWhiteSpace($DiscoveryKey)) {
-            Write-Error-Exit "-DiscoveryKey is required. Usage: iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing | Select -ExpandProperty Content | iex -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
+            Write-Error-Exit "-DiscoveryKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
         }
     }
 
