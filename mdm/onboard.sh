@@ -20,15 +20,15 @@
 # Python 3 is required because the underlying MDM setup scripts are Python-based.
 #
 # Usage:
-#   curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | bash -s -- --api-key YOUR_ADMIN_KEY --discovery-key YOUR_DISCOVERY_KEY
+#   curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | sudo bash -s -- --api-key YOUR_ADMIN_KEY --discovery-key YOUR_DISCOVERY_KEY
 #
 #   Or with URL overrides:
-#   curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY --backend-url https://backend.example.com --gateway-url https://api.example.com
+#   curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | sudo bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY --backend-url https://backend.example.com --gateway-url https://api.example.com
 #
 #   To clear MDM setup:
-#   curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | bash -s -- --clear
+#   curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | sudo bash -s -- --clear
 #
-# Requires: Python 3, sudo privileges
+# Requires: Python 3, root privileges (sudo)
 
 set -euo pipefail
 
@@ -123,7 +123,8 @@ download_onboard_script() {
 # Check if running as root
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        error_exit "This script requires root privileges. Run with sudo or as root user."
+        error_exit "Root privileges required. Re-run with sudo:
+    curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | sudo bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY"
     fi
 }
 
@@ -138,11 +139,11 @@ main() {
     # Validate parameters (unless --clear is specified)
     if [[ "$CLEAR_MODE" == false ]]; then
         if [[ -z "$API_KEY" ]]; then
-            error_exit "--api-key is required. Usage: curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY"
+            error_exit "--api-key is required. Usage: curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | sudo bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY"
         fi
 
         if [[ -z "$DISCOVERY_KEY" ]]; then
-            error_exit "--discovery-key is required. Usage: curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY"
+            error_exit "--discovery-key is required. Usage: curl -fsSL https://getunbound.ai/setup/mdm/onboard.sh | sudo bash -s -- --api-key YOUR_KEY --discovery-key YOUR_KEY"
         fi
     fi
 
