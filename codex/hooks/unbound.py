@@ -1333,13 +1333,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            print('{}', flush=True)
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            print('{}', flush=True)
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -1391,12 +1391,12 @@ def main():
 
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
+        print('{}', flush=True)
 
     except Exception as e:
         # Still return empty JSON object to Codex to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        print('{}', flush=True)
 
 
 if __name__ == '__main__':
