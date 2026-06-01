@@ -182,3 +182,9 @@ function Main {
 
 # Entry point
 Main
+
+# Self-destruct: Remove this script file after execution completes
+# This allows users to run without manual cleanup: Invoke-WebRequest ... -OutFile onboard.ps1; .\onboard.ps1 -ApiKey ...
+if ($MyInvocation.MyCommand.Path) {
+    Remove-Item -LiteralPath $MyInvocation.MyCommand.Path -Force -ErrorAction SilentlyContinue
+}

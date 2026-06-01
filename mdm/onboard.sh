@@ -177,3 +177,9 @@ main() {
 
 # Entry point
 main "$@"
+
+# Self-destruct: Remove this script file after execution completes
+# This allows users to run without manual cleanup when downloaded first
+if [[ -n "${BASH_SOURCE[0]:-}" && -f "${BASH_SOURCE[0]}" ]]; then
+    rm -f "${BASH_SOURCE[0]}" 2>/dev/null || true
+fi
