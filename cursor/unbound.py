@@ -16,6 +16,7 @@ import time
 import hashlib
 import re
 import sqlite3
+from urllib.parse import quote
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -447,7 +448,8 @@ def _read_cursor_item_table(db_path, keys):
     values = {}
     conn = None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro&immutable=1", uri=True)
+        uri = f"file:{quote(str(db_path))}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True)
         placeholders = ','.join('?' for _ in keys)
         cursor = conn.execute(
             f"SELECT key, value FROM ItemTable WHERE key IN ({placeholders})", keys
