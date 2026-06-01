@@ -120,8 +120,18 @@ download_onboard_script() {
     echo "$content"
 }
 
+# Check if running as root
+check_root() {
+    if [[ $EUID -ne 0 ]]; then
+        error_exit "This script requires root privileges. Run with sudo or as root user."
+    fi
+}
+
 # Main execution
 main() {
+    # Check root privileges
+    check_root
+
     # Parse arguments
     parse_args "$@"
 
@@ -161,14 +171,15 @@ main() {
         python_args+=(--clear)
     else
         python_args+=(--api-key "$API_KEY" --discovery-key "$DISCOVERY_KEY")
+    fi
 
-        if [[ -n "$BACKEND_URL" ]]; then
-            python_args+=(--backend-url "$BACKEND_URL")
-        fi
+    # URL overrides apply to both normal and clear modes
+    if [[ -n "$BACKEND_URL" ]]; then
+        python_args+=(--backend-url "$BACKEND_URL")
+    fi
 
-        if [[ -n "$GATEWAY_URL" ]]; then
-            python_args+=(--gateway-url "$GATEWAY_URL")
-        fi
+    if [[ -n "$GATEWAY_URL" ]]; then
+        python_args+=(--gateway-url "$GATEWAY_URL")
     fi
 
     # Execute the Python script

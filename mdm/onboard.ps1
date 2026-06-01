@@ -153,16 +153,17 @@ function Main {
             $pythonArgs += $ApiKey
             $pythonArgs += "--discovery-key"
             $pythonArgs += $DiscoveryKey
+        }
 
-            if (-not [string]::IsNullOrWhiteSpace($BackendUrl)) {
-                $pythonArgs += "--backend-url"
-                $pythonArgs += $BackendUrl
-            }
+        # URL overrides apply to both normal and clear modes
+        if (-not [string]::IsNullOrWhiteSpace($BackendUrl)) {
+            $pythonArgs += "--backend-url"
+            $pythonArgs += $BackendUrl
+        }
 
-            if (-not [string]::IsNullOrWhiteSpace($GatewayUrl)) {
-                $pythonArgs += "--gateway-url"
-                $pythonArgs += $GatewayUrl
-            }
+        if (-not [string]::IsNullOrWhiteSpace($GatewayUrl)) {
+            $pythonArgs += "--gateway-url"
+            $pythonArgs += $GatewayUrl
         }
 
         # Execute the Python script and capture exit code
@@ -178,10 +179,13 @@ function Main {
             Remove-Item $tempPyFile -ErrorAction SilentlyContinue
         }
     }
+
+    # Return the exit code
+    return $exitCode
 }
 
-# Entry point
-Main
+# Entry point - capture exit code from Main
+$exitCode = Main
 
 # Self-destruct: Remove this script file after execution completes
 # This allows users to run without manual cleanup: Invoke-WebRequest ... -OutFile onboard.ps1; .\onboard.ps1 -ApiKey ...
