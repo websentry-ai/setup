@@ -449,33 +449,54 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
-    """Remove env var from user's shell rc files. Privilege-drops on Unix."""
+def remove_env_var_on_windows_machine(var_name: str) -> str:
+    """Remove machine-wide (HKLM) env var on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+    try:
+        query = subprocess.run(
+            ["reg", "query", reg_path, "/V", var_name],
+            capture_output=True, timeout=10,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", reg_path, "/F", "/V", var_name],
+            check=True, capture_output=True, timeout=10,
+        )
+        debug_print(f"Removed {var_name} from system environment")
+        return "cleared"
+    except subprocess.CalledProcessError:
+        return "failed"
+    except Exception as e:
+        debug_print(f"Failed to remove {var_name}: {e}")
+        return "failed"
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+    """Remove env var from user's shell rc files. Privilege-drops on Unix.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     system = platform.system().lower()
 
     if system == "windows":
-        try:
-            subprocess.run(
-                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
-                check=False, capture_output=True, timeout=10,
-            )
-            debug_print(f"Removed {var_name} from system environment")
-            return True
-        except Exception as e:
-            debug_print(f"Failed to remove {var_name}: {e}")
-            return False
+        return remove_env_var_on_windows_machine(var_name)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     elif system == "linux":
         rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
     else:
-        return False
+        return "failed"
 
     export_prefix = f"export {var_name}="
 
     def _do():
-        success = False
+        cleared = False
+        had_error = False
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
@@ -489,12 +510,20 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
                     debug_print(f"Removed {var_name} from {rc_file}")
-                    success = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return success
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
-    return bool(_run_as_user(username, _do))
+    result = _run_as_user(username, _do)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
@@ -524,17 +553,35 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
         debug_print(f"Could not write config for {username}")
 
 
+def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
+    """Remove var_name for all users. Returns (cleared, not_found, failed) counts."""
+    _label = label or var_name
+    cleared = 0
+    not_found = 0
+    failed = 0
+    for username, home_dir in user_homes:
+        status = remove_env_var_from_user(username, home_dir, var_name)
+        if status == "cleared":
+            cleared += 1
+        elif status == "not_found":
+            not_found += 1
+        else:
+            failed += 1
+            print(f"Failed to clear {_label} for {username}")
+    return cleared, not_found, failed
+
+
 def clear_setup():
     print("=" * 60)
     print("Gemini CLI - Clearing MDM Setup")
     print("=" * 60)
 
     if not check_admin_privileges():
-        print("❌ This script requires administrator/root privileges")
+        print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
         return
 
-    print("\n🗑️  Removing environment variables...")
+    print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
     # placeholder so the removal runs even if C:\Users has no profiles.
     user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
@@ -542,16 +589,14 @@ def clear_setup():
     if not user_homes:
         print("   No user home directories found")
     else:
-        removed_count = 0
-        for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "GEMINI_API_KEY"):
-                removed_count += 1
-            remove_env_var_from_user(username, home_dir, "GOOGLE_GEMINI_BASE_URL")
-
-        if removed_count > 0:
-            print(f"✅ Removed environment variables from {removed_count} user(s)")
-        else:
-            print("   No environment variables found to remove")
+        c1, n1, f1 = _clear_env_var_across_users("GEMINI_API_KEY", user_homes, label="API_KEY")
+        c2, n2, f2 = _clear_env_var_across_users("GOOGLE_GEMINI_BASE_URL", user_homes, label="BASE_URL")
+        if c1 or c2:
+            print(f"Cleared for {max(c1, c2)} user(s)")
+        elif not (f1 or f2):
+            print(f"API_KEY not set, nothing to clear for {n1} user(s)")
+        if f1 or f2:
+            print(f"Failed to clear for {max(f1, f2)} user(s)")
 
     if platform.system().lower() == "windows":
         try:
@@ -559,8 +604,11 @@ def clear_setup():
             settings_dir = Path(program_data) / "gemini-cli"
             settings_path = settings_dir / "settings.json"
             if settings_path.exists():
-                settings_path.unlink()
-                debug_print(f"Removed {settings_path}")
+                try:
+                    settings_path.unlink()
+                    debug_print(f"Removed {settings_path}")
+                except Exception as e:
+                    print(f"Failed to clear managed settings file: {e}")
             if settings_dir.exists():
                 try:
                     settings_dir.rmdir()
@@ -570,17 +618,11 @@ def clear_setup():
         except Exception as e:
             debug_print(f"Failed to remove Windows managed settings: {e}")
 
-        try:
-            subprocess.run(
-                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
-                 "/F", "/V", "GEMINI_CLI_SYSTEM_SETTINGS_PATH"],
-                check=False,
-                capture_output=True,
-                timeout=10,
-            )
-            debug_print("Cleared GEMINI_CLI_SYSTEM_SETTINGS_PATH (Machine)")
-        except Exception as e:
-            debug_print(f"Failed to clear GEMINI_CLI_SYSTEM_SETTINGS_PATH: {e}")
+        status = remove_env_var_on_windows_machine("GEMINI_CLI_SYSTEM_SETTINGS_PATH")
+        if status == "cleared":
+            print("Cleared managed settings path")
+        elif status == "failed":
+            print("Failed to clear managed settings path")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

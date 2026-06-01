@@ -439,33 +439,54 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
-    """Remove env var from user's shell rc files. Privilege-drops on Unix."""
+def remove_env_var_on_windows_machine(var_name: str) -> str:
+    """Remove machine-wide (HKLM) env var on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+    try:
+        query = subprocess.run(
+            ["reg", "query", reg_path, "/V", var_name],
+            capture_output=True, timeout=10,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", reg_path, "/F", "/V", var_name],
+            check=True, capture_output=True, timeout=10,
+        )
+        debug_print(f"Removed {var_name} from system environment")
+        return "cleared"
+    except subprocess.CalledProcessError:
+        return "failed"
+    except Exception as e:
+        debug_print(f"Failed to remove {var_name}: {e}")
+        return "failed"
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+    """Remove env var from user's shell rc files. Privilege-drops on Unix.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     system = platform.system().lower()
 
     if system == "windows":
-        try:
-            subprocess.run(
-                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
-                check=False, capture_output=True, timeout=10,
-            )
-            debug_print(f"Removed {var_name} from system environment")
-            return True
-        except Exception as e:
-            debug_print(f"Failed to remove {var_name}: {e}")
-            return False
+        return remove_env_var_on_windows_machine(var_name)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     elif system == "linux":
         rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
     else:
-        return False
+        return "failed"
 
     export_prefix = f"export {var_name}="
 
     def _do():
-        success = False
+        cleared = False
+        had_error = False
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
@@ -479,12 +500,20 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
                     debug_print(f"Removed {var_name} from {rc_file}")
-                    success = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return success
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
-    return bool(_run_as_user(username, _do))
+    result = _run_as_user(username, _do)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
@@ -688,28 +717,31 @@ def setup_managed_settings(api_key: str = "", gateway_url: str = DEFAULT_GATEWAY
         return False
 
 
-def clear_managed_settings() -> bool:
-    """Remove the apiKeyHelper script and setting from managed Claude config."""
+def clear_managed_settings() -> str:
+    """Remove the apiKeyHelper script and setting from managed Claude config.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     try:
         managed_dir = get_managed_settings_dir()
         key_helper_path = managed_dir / "anthropic_key.sh"
 
-        # Potential settings files: drop-in (Windows) and the flat file.
         settings_candidates = [
             managed_dir / "managed-settings.d" / "unbound.json",
             managed_dir / "managed-settings.json",
         ]
 
-        removed_any = False
+        cleared_any = False
+        had_error = False
 
-        # Remove the key helper script
         if key_helper_path.exists():
             try:
                 key_helper_path.unlink()
                 debug_print(f"Removed {key_helper_path}")
-                removed_any = True
+                cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to remove {key_helper_path}: {e}")
+                had_error = True
 
         for settings_path in settings_candidates:
             if not settings_path.exists():
@@ -721,7 +753,6 @@ def clear_managed_settings() -> bool:
                 if "apiKeyHelper" in settings:
                     del settings["apiKeyHelper"]
                     changed = True
-                # Also strip our Windows env block keys, if present.
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
                     for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
@@ -731,8 +762,6 @@ def clear_managed_settings() -> bool:
                     if not env:
                         del settings["env"]
                 if changed:
-                    # If this is our drop-in file and nothing else is left,
-                    # remove it to avoid leaving an empty config file around.
                     if (settings_path.name == "unbound.json"
                             and settings_path.parent.name == "managed-settings.d"
                             and not settings):
@@ -742,15 +771,38 @@ def clear_managed_settings() -> bool:
                         with open(settings_path, "w", encoding="utf-8") as f:
                             json.dump(settings, f, indent=2)
                         debug_print(f"Updated {settings_path}")
-                    removed_any = True
+                    cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to update {settings_path}: {e}")
+                had_error = True
 
-        return removed_any
+        if cleared_any:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
     except Exception as e:
         debug_print(f"Error clearing managed settings: {e}")
-        return False
+        return "failed"
+
+
+def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
+    """Remove var_name for all users. Returns (cleared, not_found, failed) counts."""
+    _label = label or var_name
+    cleared = 0
+    not_found = 0
+    failed = 0
+    for username, home_dir in user_homes:
+        status = remove_env_var_from_user(username, home_dir, var_name)
+        if status == "cleared":
+            cleared += 1
+        elif status == "not_found":
+            not_found += 1
+        else:
+            failed += 1
+            print(f"Failed to clear {_label} for {username}")
+    return cleared, not_found, failed
 
 
 def clear_setup():
@@ -759,36 +811,34 @@ def clear_setup():
     print("=" * 60)
 
     if not check_admin_privileges():
-        print("❌ This script requires administrator/root privileges")
+        print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
         return
 
-    print("\n🗑️  Removing environment variables...")
-    # Windows `reg delete HKLM\...` is machine-wide; one call with a
-    # placeholder handles every user even if C:\Users has no profiles.
+    print("\nClearing environment variables...")
     user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
     if not user_homes:
         print("   No user home directories found")
     else:
-        removed_count = 0
-        for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY"):
-                removed_count += 1
-            remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+        c1, n1, f1 = _clear_env_var_across_users("UNBOUND_API_KEY", user_homes, label="API_KEY")
+        c2, n2, f2 = _clear_env_var_across_users("ANTHROPIC_BASE_URL", user_homes, label="BASE_URL")
+        if c1 or c2:
+            print(f"Cleared for {max(c1, c2)} user(s)")
+        elif not (f1 or f2):
+            print(f"API_KEY not set, nothing to clear for {n1} user(s)")
+        if f1 or f2:
+            print(f"Failed to clear for {max(f1, f2)} user(s)")
 
-        if removed_count > 0:
-            print(f"✅ Removed environment variables from {removed_count} user(s)")
-        else:
-            print("   No environment variables found to remove")
-
-    # Remove managed settings
-    print("\n🗑️  Removing managed settings...")
-    if clear_managed_settings():
-        managed_dir = get_managed_settings_dir()
-        print(f"✅ Removed managed settings from {managed_dir}")
+    print("\nClearing managed settings...")
+    status = clear_managed_settings()
+    managed_dir = get_managed_settings_dir()
+    if status == "cleared":
+        print(f"Cleared managed settings from {managed_dir}")
+    elif status == "not_found":
+        print(f"Managed settings not found in {managed_dir}")
     else:
-        print("   No managed settings found to remove")
+        print(f"Failed to clear managed settings in {managed_dir}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

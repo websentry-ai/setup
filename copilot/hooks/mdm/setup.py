@@ -462,33 +462,54 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
-    """Remove env var from user's shell rc files. Privilege-drops on Unix."""
+def remove_env_var_on_windows_machine(var_name: str) -> str:
+    """Remove machine-wide (HKLM) env var on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+    try:
+        query = subprocess.run(
+            ["reg", "query", reg_path, "/V", var_name],
+            capture_output=True, timeout=10,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", reg_path, "/F", "/V", var_name],
+            check=True, capture_output=True, timeout=10,
+        )
+        debug_print(f"Removed {var_name} from system environment")
+        return "cleared"
+    except subprocess.CalledProcessError:
+        return "failed"
+    except Exception as e:
+        debug_print(f"Failed to remove {var_name}: {e}")
+        return "failed"
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+    """Remove env var from user's shell rc files. Privilege-drops on Unix.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     system = platform.system().lower()
 
     if system == "windows":
-        try:
-            subprocess.run(
-                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
-                check=False, capture_output=True, timeout=10,
-            )
-            debug_print(f"Removed {var_name} from system environment")
-            return True
-        except Exception as e:
-            debug_print(f"Failed to remove {var_name}: {e}")
-            return False
+        return remove_env_var_on_windows_machine(var_name)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     elif system == "linux":
         rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
     else:
-        return False
+        return "failed"
 
     export_prefix = f"export {var_name}="
 
     def _do():
-        success = False
+        cleared = False
+        had_error = False
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
@@ -502,12 +523,20 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
                     debug_print(f"Removed {var_name} from {rc_file}")
-                    success = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return success
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
-    return bool(_run_as_user(username, _do))
+    result = _run_as_user(username, _do)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
@@ -626,26 +655,40 @@ def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, sour
     return ok
 
 
-def clear_hooks_for_user(username: str, home_dir: Path) -> bool:
+def clear_hooks_for_user(username: str, home_dir: Path) -> str:
     """Remove unbound.py and unbound.json from a user's ~/.copilot/hooks.
-    Privilege-drops to the target user before any FS op."""
+    Privilege-drops to the target user before any FS op.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     hooks_dir = home_dir / ".copilot" / "hooks"
     script_path = hooks_dir / "unbound.py"
     hooks_json = hooks_dir / "unbound.json"
 
     def _clear():
-        removed = False
+        cleared = False
+        had_error = False
+        any_existed = False
         for path in (script_path, hooks_json):
             try:
                 if path.exists():
+                    any_existed = True
                     path.unlink()
                     debug_print(f"Removed {path}")
-                    removed = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to remove {path}: {e}")
-        return removed
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error or any_existed:
+            return "failed"
+        return "not_found"
 
-    return bool(_run_as_user(username, _clear))
+    result = _run_as_user(username, _clear)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
@@ -1046,7 +1089,7 @@ def clear_setup():
         print("   Please re-run with sudo.")
         return
 
-    print("\nRemoving environment variables...")
+    print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
     # placeholder so the removal runs even if C:\Users has no profiles.
     user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
@@ -1054,24 +1097,41 @@ def clear_setup():
     if not user_homes:
         print("   No user home directories found")
     else:
-        removed_count = 0
-        cleared_count = 0
+        env_cleared = 0
+        env_not_found = 0
+        env_failed = 0
+        hooks_cleared = 0
+        hooks_not_found = 0
+        hooks_failed = 0
         for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "UNBOUND_COPILOT_API_KEY"):
-                removed_count += 1
+            status = remove_env_var_from_user(username, home_dir, "UNBOUND_COPILOT_API_KEY")
+            if status == "cleared":
+                env_cleared += 1
+            elif status == "not_found":
+                env_not_found += 1
+            else:
+                env_failed += 1
             # Per-user copilot hooks — skip when falling through on Windows.
-            if home_dir is not None and clear_hooks_for_user(username, home_dir):
-                cleared_count += 1
+            if home_dir is not None:
+                hstatus = clear_hooks_for_user(username, home_dir)
+                if hstatus == "cleared":
+                    hooks_cleared += 1
+                elif hstatus == "not_found":
+                    hooks_not_found += 1
+                else:
+                    hooks_failed += 1
 
-        if removed_count > 0:
-            print(f"Removed environment variables from {removed_count} user(s)")
-        else:
-            print("   No environment variables found to remove")
+        if env_cleared:
+            print(f"Cleared for {env_cleared} user(s)")
+        elif env_not_found:
+            print(f"API_KEY not set, nothing to clear for {env_not_found} user(s)")
+        if env_failed:
+            print(f"Failed to clear API_KEY for {env_failed} user(s)")
 
-        if cleared_count > 0:
-            print(f"Removed Copilot hooks for {cleared_count} user(s)")
-        else:
-            print("   No Copilot hooks found to remove")
+        if hooks_cleared:
+            print(f"Cleared Copilot hooks for {hooks_cleared} user(s)")
+        if hooks_failed:
+            print(f"Failed to clear Copilot hooks for {hooks_failed} user(s)")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
