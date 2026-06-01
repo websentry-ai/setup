@@ -15,11 +15,12 @@ import tempfile
 import time
 import hashlib
 import re
+import sqlite3
+from urllib.parse import quote
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
@@ -420,6 +421,77 @@ def format_hook_response(api_response):
         response['agent_message'] = additional_context
     return response
 
+def _email_domain(email):
+    try:
+        if email and '@' in email:
+            domain = email.rsplit('@', 1)[1].strip().lower()
+            return domain or None
+    except Exception:
+        pass
+    return None
+
+
+def _cursor_state_db_path():
+    if sys.platform == 'darwin':
+        return Path.home() / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    if os.name == 'nt':
+        appdata = os.environ.get('APPDATA')
+        if not appdata:
+            return None
+        return Path(appdata) / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+    return Path.home() / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb"
+
+
+def _read_cursor_item_table(db_path, keys):
+    if not keys:
+        return {}
+    values = {}
+    conn = None
+    try:
+        uri = f"file:{quote(str(db_path))}?mode=ro&immutable=1"
+        conn = sqlite3.connect(uri, uri=True)
+        placeholders = ','.join('?' for _ in keys)
+        cursor = conn.execute(
+            f"SELECT key, value FROM ItemTable WHERE key IN ({placeholders})", keys
+        )
+        for key, value in cursor.fetchall():
+            values[key] = value
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return values
+
+
+def read_account_identity():
+    plan = None
+    email_domain = None
+    try:
+        db_path = _cursor_state_db_path()
+        if db_path and db_path.exists():
+            values = _read_cursor_item_table(
+                db_path, ['cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType']
+            )
+            email_domain = _email_domain(values.get('cursorAuth/cachedEmail'))
+            plan = values.get('cursorAuth/stripeMembershipType') or None
+    except Exception:
+        pass
+    return {
+        'org_id': None,
+        'plan': plan,
+        'auth_mode': None,
+        'email_domain': email_domain,
+    }
+
+
+def build_account_identity():
+    return read_account_identity()
+
+
 def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
@@ -460,6 +532,7 @@ def process_pre_tool_use(event, api_key):
             'command': '',
             'metadata': metadata
         },
+        'account_identity': build_account_identity(),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -616,6 +689,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             'command': command,
             'metadata': metadata
         },
+        'account_identity': build_account_identity(),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -715,6 +789,7 @@ def process_user_prompt_submit(event, api_key):
         'unbound_app_label': 'cursor',
         'model': model,
         'event_name': 'user_prompt',
+        'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 
