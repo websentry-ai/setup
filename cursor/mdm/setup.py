@@ -8,7 +8,7 @@ import subprocess
 import json
 import time
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 try:
     import pwd
 except ImportError:
@@ -897,11 +897,33 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
         return None
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """Inspect the enterprise hooks.json target BEFORE it gets overwritten.
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy.
+    'fresh' (config absent), 'persisted' (config + unbound.py both present),
+    'tampered' (config present but hook script missing), or None on any error."""
+    try:
+        enterprise_dir = get_enterprise_hooks_dir()
+        hooks_json = enterprise_dir / "hooks.json"
+        script_path = enterprise_dir / "hooks" / "unbound.py"
+        if not hooks_json.exists():
+            return 'fresh'
+        return 'persisted' if script_path.exists() else 'tampered'
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1020,6 +1042,8 @@ def main():
     if config_count > 0:
         print(f"✅ Config written for {config_count} user(s)")
 
+    state = detect_install_state()
+
     # Setup hooks
     debug_print("Setting up hooks...")
     hooks_success, hooks_changed = setup_hooks(gateway_url=gateway_url)
@@ -1032,7 +1056,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url)
+    notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url, install_state=state, serial_number=serial_number)
 
     if env_changed or hooks_changed:
         debug_print(f"Restart needed: env_changed={env_changed}, hooks_changed={hooks_changed}")

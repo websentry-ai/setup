@@ -1304,11 +1304,33 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """Inspect the managed hooks.json target BEFORE it gets overwritten.
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy.
+    'fresh' (config absent), 'persisted' (config + unbound.py both present),
+    'tampered' (config present but hook script missing), or None on any error."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        config_path = managed_dir / "hooks.json"
+        script_path = managed_dir / "hooks" / "unbound.py"
+        if not config_path.exists():
+            return 'fresh'
+        return 'persisted' if script_path.exists() else 'tampered'
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1418,6 +1440,8 @@ def main():
         write_unbound_config_for_user(username, home_dir, api_key)
         enable_codex_hooks_feature_for_user(username, home_dir)
 
+    state = detect_install_state()
+
     print("\nConfiguring Codex managed hooks...")
     if setup_managed_hooks(gateway_url=gateway_url):
         managed_dir = get_managed_settings_dir()
@@ -1430,7 +1454,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "codex", backend_url=base_url)
+    notify_setup_complete(api_key, "codex", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())

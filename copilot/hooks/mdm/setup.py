@@ -984,11 +984,44 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """Inspect each user's ~/.copilot/hooks BEFORE it gets overwritten.
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy. Per user, the pair is
+    the unbound.json config and the unbound.py hook script. 'fresh' (no user
+    has either file), 'persisted' (at least one user has both), 'tampered' (any
+    user has one but not the other), or None on any error. Tampered wins: a
+    single user with an incomplete pair flags the device even if others are
+    intact."""
+    try:
+        any_complete = False
+        for _username, home_dir in get_all_user_homes():
+            hooks_dir = home_dir / ".copilot" / "hooks"
+            config_path = hooks_dir / "unbound.json"
+            script_path = hooks_dir / "unbound.py"
+            config_exists = config_path.exists()
+            script_exists = script_path.exists()
+            if not config_exists and not script_exists:
+                continue
+            if config_exists and script_exists:
+                any_complete = True
+            else:
+                return 'tampered'
+        return 'persisted' if any_complete else 'fresh'
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1145,6 +1178,8 @@ def main():
     except OSError:
         pass
 
+    state = detect_install_state()
+
     print("\nInstalling Copilot hooks for all users...")
     user_homes = get_all_user_homes()
     installed_count = 0
@@ -1166,7 +1201,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "copilot", backend_url=base_url)
+    notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, user_homes)
