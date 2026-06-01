@@ -153,8 +153,7 @@ main() {
     if [[ "$CLEAR_MODE" == true ]]; then
         python_args+=(--clear)
     else
-        python_args+=(--api-key "$API_KEY")
-        python_args+=(--discovery-key "$DISCOVERY_KEY")
+        python_args+=(--api-key "$API_KEY" --discovery-key "$DISCOVERY_KEY")
 
         if [[ -n "$BACKEND_URL" ]]; then
             python_args+=(--backend-url "$BACKEND_URL")

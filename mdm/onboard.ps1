@@ -63,7 +63,7 @@ $ErrorActionPreference = "Stop"
 $ONBOARD_PY_URL = "https://raw.githubusercontent.com/websentry-ai/setup/c3159c9811c8d84ce863435d92a7150750eeef95/mdm/onboard.py"
 
 # Output helpers
-function Write-Error-Exit { param([string]$Message, [int]$Code = 1) Write-Error $Message; exit $Code }
+function Exit-WithError { param([string]$Message, [int]$Code = 1) Write-Error $Message; exit $Code }
 
 # Check if running as Administrator
 function Test-Administrator {
@@ -77,13 +77,9 @@ function Find-Python {
     $pythonCommands = @("py", "python3", "python")
 
     foreach ($cmd in $pythonCommands) {
-        try {
-            $null = & $cmd --version 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                return $cmd
-            }
-        } catch {
-            # Command not found, continue to next
+        $null = & $cmd --version 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            return $cmd
         }
     }
 
@@ -98,12 +94,12 @@ function Get-OnboardScript {
         $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 30
 
         if ([string]::IsNullOrWhiteSpace($response.Content)) {
-            Write-Error-Exit "Failed to download onboard.py: empty response"
+            Exit-WithError "Failed to download onboard.py: empty response"
         }
 
         return $response.Content
     } catch {
-        Write-Error-Exit "Failed to download onboard.py: $_"
+        Exit-WithError "Failed to download onboard.py: $_"
     }
 }
 
@@ -111,24 +107,24 @@ function Get-OnboardScript {
 function Main {
     # Check administrator privileges
     if (-not (Test-Administrator)) {
-        Write-Error-Exit "This script requires administrator privileges. Right-click PowerShell -> Run as Administrator, then rerun."
+        Exit-WithError "This script requires administrator privileges. Right-click PowerShell -> Run as Administrator, then rerun."
     }
 
     # Validate parameters (unless -Clear is specified)
     if (-not $Clear) {
         if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-            Write-Error-Exit "-ApiKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
+            Exit-WithError "-ApiKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
         }
 
         if ([string]::IsNullOrWhiteSpace($DiscoveryKey)) {
-            Write-Error-Exit "-DiscoveryKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
+            Exit-WithError "-DiscoveryKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
         }
     }
 
     # Find Python
     $pythonCmd = Find-Python
     if ($null -eq $pythonCmd) {
-        Write-Error-Exit "Python 3 is required but not found in PATH. Install from https://www.python.org/downloads/ and ensure 'Add Python to PATH' is checked."
+        Exit-WithError "Python 3 is required but not found in PATH. Install from https://www.python.org/downloads/ and ensure 'Add Python to PATH' is checked."
     }
 
     # Download the Python script
