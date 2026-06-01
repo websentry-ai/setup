@@ -985,38 +985,43 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 
 def detect_install_state() -> Optional[str]:
-    """Inspect each user's ~/.copilot/hooks/unbound.json BEFORE it gets
-    overwritten. 'fresh' (no user has it), 'persisted' (every present file still
-    wires in our unbound.py hook), 'tampered' (any present file has it removed),
-    or None on any read error. Tampered wins: a single user with the hook
-    stripped flags the device even if other users are intact."""
+    """Inspect each user's ~/.copilot/hooks BEFORE it gets overwritten.
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy. Per user, the pair is
+    the unbound.json config and the unbound.py hook script. 'fresh' (no user
+    has either file), 'persisted' (at least one user has both), 'tampered' (any
+    user has one but not the other), or None on any error. Tampered wins: a
+    single user with an incomplete pair flags the device even if others are
+    intact."""
     try:
-        any_present = False
-        any_persisted = False
+        any_complete = False
         for _username, home_dir in get_all_user_homes():
-            hooks_json = home_dir / ".copilot" / "hooks" / "unbound.json"
-            if not hooks_json.exists():
+            hooks_dir = home_dir / ".copilot" / "hooks"
+            config_path = hooks_dir / "unbound.json"
+            script_path = hooks_dir / "unbound.py"
+            config_exists = config_path.exists()
+            script_exists = script_path.exists()
+            if not config_exists and not script_exists:
                 continue
-            any_present = True
-            if "unbound.py" in hooks_json.read_text(encoding="utf-8"):
-                any_persisted = True
+            if config_exists and script_exists:
+                any_complete = True
             else:
                 return 'tampered'
-        if not any_present:
-            return 'fresh'
-        return 'persisted' if any_persisted else 'tampered'
+        return 'persisted' if any_complete else 'fresh'
     except Exception:
         return None
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None):
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
+        body = {"tool_type": tool_type}
         if install_state is not None:
-            data = json.dumps({"tool_type": tool_type, "install_state": install_state})
-        else:
-            data = json.dumps({"tool_type": tool_type})
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1196,7 +1201,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state)
+    notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, user_homes)

@@ -1306,25 +1306,31 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state() -> Optional[str]:
     """Inspect the managed hooks.json target BEFORE it gets overwritten.
-    'fresh' (absent), 'persisted' (our unbound.py hook still wired in),
-    'tampered' (present but hook stripped), or None on any read error."""
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy.
+    'fresh' (config absent), 'persisted' (config + unbound.py both present),
+    'tampered' (config present but hook script missing), or None on any error."""
     try:
-        settings_path = get_managed_settings_dir() / "hooks.json"
-        if not settings_path.exists():
+        managed_dir = get_managed_settings_dir()
+        config_path = managed_dir / "hooks.json"
+        script_path = managed_dir / "hooks" / "unbound.py"
+        if not config_path.exists():
             return 'fresh'
-        return 'persisted' if "unbound.py" in settings_path.read_text(encoding="utf-8") else 'tampered'
+        return 'persisted' if script_path.exists() else 'tampered'
     except Exception:
         return None
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None):
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
+        body = {"tool_type": tool_type}
         if install_state is not None:
-            data = json.dumps({"tool_type": tool_type, "install_state": install_state})
-        else:
-            data = json.dumps({"tool_type": tool_type})
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1448,7 +1454,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "codex", backend_url=base_url, install_state=state)
+    notify_setup_complete(api_key, "codex", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())
