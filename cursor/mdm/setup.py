@@ -14,6 +14,19 @@ try:
 except ImportError:
     pwd = None
 
+# On Windows, when this script runs as a child of the MDM onboard wrapper its
+# stdout is a non-console pipe defaulting to the legacy code page (cp1252),
+# which can't encode the emoji we print — the first such print raises
+# UnicodeEncodeError and crashes the step. Force UTF-8 so output never fails.
+# mac/linux stdout is already UTF-8, so they are intentionally left untouched.
+if platform.system().lower() == "windows":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    del _stream
+
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
