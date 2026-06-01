@@ -88,12 +88,13 @@ class TestOnboardShell(unittest.TestCase):
         fi
         """
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(test_script)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                f.write(test_script)
+                f.flush()
+                temp_script = f.name
+
             os.chmod(temp_script, 0o755)
             result = subprocess.run(
                 ["bash", temp_script, "--clear"],
@@ -104,7 +105,8 @@ class TestOnboardShell(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("Clear mode", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
     def test_python_detection_success(self):
         """onboard.sh successfully detects Python when available."""
@@ -132,12 +134,13 @@ class TestOnboardShell(unittest.TestCase):
         exit 0
         """
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(test_script)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                f.write(test_script)
+                f.flush()
+                temp_script = f.name
+
             os.chmod(temp_script, 0o755)
             result = subprocess.run(
                 ["bash", temp_script],
@@ -147,7 +150,8 @@ class TestOnboardShell(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("Found:", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
     def test_download_and_execute_with_local_script(self):
         """onboard.sh downloads script and executes it with correct parameters."""
@@ -182,12 +186,13 @@ print(f"Executed with Discovery key: {args.discovery_key}")
         python3 "$temp_py" "$@"
         """
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(test_wrapper)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                f.write(test_wrapper)
+                f.flush()
+                temp_script = f.name
+
             os.chmod(temp_script, 0o755)
             result = subprocess.run(
                 [
@@ -205,7 +210,8 @@ print(f"Executed with Discovery key: {args.discovery_key}")
             self.assertIn("test-admin-key", result.stdout)
             self.assertIn("test-discovery-key", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
     def test_url_parameters_passed_through(self):
         """onboard.sh correctly passes --backend-url and --gateway-url."""
@@ -238,12 +244,13 @@ print(f"Gateway URL: {args.gateway_url}")
         python3 "$temp_py" "$@"
         """
 
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
-            f.write(test_wrapper)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                f.write(test_wrapper)
+                f.flush()
+                temp_script = f.name
+
             os.chmod(temp_script, 0o755)
             result = subprocess.run(
                 [
@@ -262,7 +269,8 @@ print(f"Gateway URL: {args.gateway_url}")
             self.assertIn("custom-backend.example.com", result.stdout)
             self.assertIn("custom-gateway.example.com", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
 
 class TestOnboardPowerShell(unittest.TestCase):
@@ -356,14 +364,15 @@ class TestOnboardPowerShell(unittest.TestCase):
         exit 0
         """
 
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.ps1', delete=False
-        ) as f:
-            f.write(test_script)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.ps1', delete=False
+            ) as f:
+                f.write(test_script)
+                f.flush()
+                temp_script = f.name
+
             result = subprocess.run(
                 [
                     "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -375,7 +384,8 @@ class TestOnboardPowerShell(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("Found:", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
     def test_download_and_execute_with_local_script(self):
         """onboard.ps1 downloads script and executes it with correct parameters."""
@@ -412,14 +422,15 @@ print(f"Executed with Discovery key: {args.discovery_key}")
         }
         """
 
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.ps1', delete=False
-        ) as f:
-            f.write(test_wrapper)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.ps1', delete=False
+            ) as f:
+                f.write(test_wrapper)
+                f.flush()
+                temp_script = f.name
+
             result = subprocess.run(
                 [
                     "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -438,7 +449,8 @@ print(f"Executed with Discovery key: {args.discovery_key}")
             self.assertIn("test-admin-key", result.stdout)
             self.assertIn("test-discovery-key", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
     def test_url_parameters_passed_through(self):
         """onboard.ps1 correctly passes -BackendUrl and -GatewayUrl."""
@@ -479,14 +491,15 @@ print(f"Gateway URL: {args.gateway_url}")
         }
         """
 
-        with tempfile.NamedTemporaryFile(
-            mode='w', suffix='.ps1', delete=False
-        ) as f:
-            f.write(test_wrapper)
-            f.flush()
-            temp_script = f.name
-
+        temp_script = None
         try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', suffix='.ps1', delete=False
+            ) as f:
+                f.write(test_wrapper)
+                f.flush()
+                temp_script = f.name
+
             result = subprocess.run(
                 [
                     "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
@@ -506,7 +519,8 @@ print(f"Gateway URL: {args.gateway_url}")
             self.assertIn("custom-backend.example.com", result.stdout)
             self.assertIn("custom-gateway.example.com", result.stdout)
         finally:
-            os.unlink(temp_script)
+            if temp_script:
+                os.unlink(temp_script)
 
 
 class TestOnboardPy(unittest.TestCase):

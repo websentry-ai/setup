@@ -33,8 +33,8 @@
 set -euo pipefail
 
 # Constants
-# Pinned to commit c3159c9 to ensure reproducible deployments and prevent supply-chain attacks
-ONBOARD_PY_URL="https://raw.githubusercontent.com/websentry-ai/setup/c3159c9811c8d84ce863435d92a7150750eeef95/mdm/onboard.py"
+# Pinned to commit 42c7b55 to ensure reproducible deployments and prevent supply-chain attacks
+ONBOARD_PY_URL="https://raw.githubusercontent.com/websentry-ai/setup/42c7b5535aaee4bfd65f5ca77ad91ba88b4a23b2/mdm/onboard.py"
 
 # Variables
 API_KEY=""
