@@ -58,7 +58,7 @@
 
 .NOTES
     Requires: Python 3, Administrator privileges
-    URL: https://raw.githubusercontent.com/websentry-ai/setup/42c7b5535aaee4bfd65f5ca77ad91ba88b4a23b2/mdm/onboard.py
+    URL: https://raw.githubusercontent.com/websentry-ai/setup/main/mdm/onboard.py
 #>
 
 param(
