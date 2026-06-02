@@ -59,8 +59,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 # Constants
-# Pinned to commit 42c7b55 to ensure reproducible deployments and prevent supply-chain attacks
-$ONBOARD_PY_URL = "https://raw.githubusercontent.com/websentry-ai/setup/42c7b5535aaee4bfd65f5ca77ad91ba88b4a23b2/mdm/onboard.py"
+$ONBOARD_PY_URL = "https://raw.githubusercontent.com/websentry-ai/setup/main/mdm/onboard.py"
 
 # Output helpers
 function Exit-WithError { param([string]$Message, [int]$Code = 1) Write-Error $Message; exit $Code }
