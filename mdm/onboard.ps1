@@ -32,12 +32,19 @@
 .PARAMETER GatewayUrl
     Gateway URL override for MDM tools (default: https://api.getunbound.ai)
 
+.PARAMETER Backfill
+    Enable backfill of historical transcripts for Claude Code and Codex (enabled by default, can be explicitly set for clarity)
+
 .PARAMETER Clear
     Remove MDM configuration for all four tools (no discovery scan, no backfill)
 
 .EXAMPLE
     # Standard onboarding with both keys
     & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+
+.EXAMPLE
+    # Explicit backfill (already enabled by default)
+    & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -Backfill
 
 .EXAMPLE
     # Clear MDM setup
@@ -53,6 +60,7 @@ param(
     [string]$DiscoveryKey,
     [string]$BackendUrl,
     [string]$GatewayUrl,
+    [switch]$Backfill,
     [switch]$Clear
 )
 
@@ -163,6 +171,11 @@ function Main {
         if (-not [string]::IsNullOrWhiteSpace($GatewayUrl)) {
             $pythonArgs += "--gateway-url"
             $pythonArgs += $GatewayUrl
+        }
+
+        # Add backfill flag if explicitly requested
+        if ($Backfill) {
+            $pythonArgs += "--backfill"
         }
 
         # Execute the Python script and capture exit code
