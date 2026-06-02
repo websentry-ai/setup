@@ -1,0 +1,44 @@
+name: static-checks
+
+# Guards the setup scripts against the bug class that shipped in WEB-4622:
+# a function referenced but never defined (NameError) only surfaced when a
+# user ran the command. These scripts have no other test coverage, so we
+# fail the PR on any syntax error or undefined name across every *.py.
+
+on:
+  pull_request:
+  push:
+    branches: [staging, main]
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pyflakes
+        run: pip install pyflakes==3.4.0
+
+      - name: Compile every Python file (syntax errors)
+        run: |
+          fail=0
+          while IFS= read -r -d '' f; do
+            python -m py_compile "$f" || { echo "COMPILE FAIL: $f"; fail=1; }
+          done < <(find . -name '*.py' -not -path '*/node_modules/*' -print0)
+          exit $fail
+
+      - name: Fail on undefined names (NameError guard)
+        run: |
+          # pyflakes also reports unused imports etc; we only gate on the
+          # NameError class to keep this green on pre-existing style noise.
+          found=$(python -m pyflakes . 2>&1 | grep -i 'undefined name' || true)
+          if [ -n "$found" ]; then
+            echo "$found"
+            echo "::error::Undefined name(s) found — would crash at runtime. Fix before merging."
+            exit 1
+          fi
+          echo "No undefined names."
