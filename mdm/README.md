@@ -12,7 +12,34 @@ Steps 1–4 use `--api-key` (the admin MDM key). Step 5 uses `--discovery-key` (
 
 Each step runs in its own subprocess; a failure in one does not abort the others. A summary at the end lists which steps succeeded and which failed.
 
-MDM setup requires root. Pass the script to `python3 -c` via command substitution — bash process substitution `<(...)` does not survive the `sudo` boundary and fails with `Bad file descriptor`.
+## Windows
+
+MDM setup requires Administrator privileges. Download and execute the PowerShell wrapper:
+
+```powershell
+Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/onboard.ps1' -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_API_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+```
+
+The wrapper automatically:
+- Checks for Administrator privileges
+- Detects Python (py/python3/python)
+- Downloads and executes onboard.py
+- Deletes itself after completion
+
+Optional overrides for tenant deployments:
+```powershell
+.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -BackendUrl https://backend.example.com -GatewayUrl https://api.example.com
+```
+
+### Clearing Setup (Windows)
+
+```powershell
+Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/onboard.ps1' -OutFile onboard.ps1; .\onboard.ps1 -Clear
+```
+
+## macOS/Linux
+
+MDM setup requires root privileges. Pass the script to `python3 -c` via command substitution — bash process substitution `<(...)` does not survive the `sudo` boundary and fails with `Bad file descriptor`.
 
 ```bash
 sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" \
@@ -28,9 +55,7 @@ sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/set
 
 Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`). The `--backend-url` value also becomes the discovery scan's `--domain`.
 
-### Clearing Setup
-
-Removes MDM configuration for the four tools. Discovery is skipped — it's a one-shot scan with nothing to remove.
+### Clearing Setup (macOS/Linux)
 
 ```bash
 sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --clear
