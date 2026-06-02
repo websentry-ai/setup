@@ -126,7 +126,7 @@ def run_tool(name: str, url: str, args: list) -> bool:
     try:
         script = fetch_script(url)
     except Exception as e:
-        print(f"[X] [{name}] failed to download from {url}: {e}", file=sys.stderr)
+        print(f"❌ [{name}] failed to download from {url}: {e}", file=sys.stderr)
         return False
 
     fd, tmp_path = tempfile.mkstemp(
@@ -145,7 +145,7 @@ def run_tool(name: str, url: str, args: list) -> bool:
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             print(
-                f"[X] [{name}] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                f"❌ [{name}] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
                 file=sys.stderr,
             )
             return False
@@ -165,7 +165,7 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
     try:
         script = fetch_script(url)
     except Exception as e:
-        print(f"[X] [Discovery] failed to download {url}: {e}", file=sys.stderr)
+        print(f"❌ [Discovery] failed to download {url}: {e}", file=sys.stderr)
         return False
 
     suffix = ".ps1" if is_windows else ".sh"
@@ -187,7 +187,7 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             print(
-                f"[X] [Discovery] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                f"❌ [Discovery] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
                 file=sys.stderr,
             )
             return False
@@ -282,11 +282,11 @@ def main() -> int:
 
     print(f"\n{'=' * 60}")
     if failures:
-        print(f"[X] MDM onboarding finished with {len(failures)} failure(s): {', '.join(failures)}")
+        print(f"❌ MDM onboarding finished with {len(failures)} failure(s): {', '.join(failures)}")
         print("Re-run the failed step's individual command to retry.")
         return 1
     steps = [name for name, *_ in TOOLS] + ([] if is_clear else ["Discovery"])
-    print(f"[OK] MDM onboarding complete: {', '.join(steps)}")
+    print(f"✅ MDM onboarding complete: {', '.join(steps)}")
     return 0
 
 
