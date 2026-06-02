@@ -177,8 +177,8 @@ function Main {
             $pythonArgs += $GatewayUrl
         }
 
-        # Add backfill flag if explicitly requested
-        if ($Backfill) {
+        # Add backfill flag if explicitly requested (has no effect with -Clear)
+        if ($Backfill -and -not $Clear) {
             $pythonArgs += "--backfill"
         }
 
