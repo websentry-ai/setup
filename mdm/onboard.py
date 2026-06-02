@@ -53,7 +53,8 @@ import urllib.request
 if platform.system().lower() == "windows":
     for _stream in (sys.stdout, sys.stderr):
         try:
-            _stream.reconfigure(encoding="utf-8", errors="replace")
+            if _stream is not None:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
     del _stream
