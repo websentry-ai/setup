@@ -45,6 +45,19 @@ import sys
 import tempfile
 import urllib.request
 
+# On Windows, when this script runs as a child of the MDM onboard wrapper its
+# stdout is a non-console pipe defaulting to the legacy code page (cp1252),
+# which can't encode the emoji we print — the first such print raises
+# UnicodeEncodeError and crashes the step. Force UTF-8 so output never fails.
+# mac/linux stdout is already UTF-8, so they are intentionally left untouched.
+if platform.system().lower() == "windows":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            if _stream is not None:
+                _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    del _stream
 
 _RAW_SETUP = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main"
 _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main"
