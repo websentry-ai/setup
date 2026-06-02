@@ -851,8 +851,6 @@ def clear_setup():
                     not_found += 1
                 else:
                     failed += 1
-                if username and home_dir:
-                    remove_local_setup_copy_for_user(username, home_dir)
 
             if cleared:
                 print(f"Cleared for {cleared} user(s)")
