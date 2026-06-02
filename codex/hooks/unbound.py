@@ -1230,8 +1230,9 @@ def _hook_discovery_enabled_for_org() -> bool:
             cache = {}
     if not isinstance(cache, dict):
         cache = {}
-    flag = cache.get("hook_discovery") if isinstance(cache.get("hook_discovery"), dict) else {}
-    last_fetched = flag.get("fetched_at") if isinstance(flag, dict) else None
+    _hd = cache.get("hook_discovery")
+    flag = _hd if isinstance(_hd, dict) else {}
+    last_fetched = flag.get("fetched_at")
     if isinstance(last_fetched, str):
         try:
             ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()

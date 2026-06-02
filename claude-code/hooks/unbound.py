@@ -1190,8 +1190,9 @@ def _hook_discovery_enabled_for_org() -> bool:
             cache = {}
     if not isinstance(cache, dict):
         cache = {}
-    flag = cache.get("hook_discovery") if isinstance(cache.get("hook_discovery"), dict) else {}
-    last_fetched = flag.get("fetched_at") if isinstance(flag, dict) else None
+    _hd = cache.get("hook_discovery")
+    flag = _hd if isinstance(_hd, dict) else {}
+    last_fetched = flag.get("fetched_at")
     if isinstance(last_fetched, str):
         try:
             ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
@@ -1203,7 +1204,7 @@ def _hook_discovery_enabled_for_org() -> bool:
     try:
         with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
             cfg = json.load(f) or {}
-    except (OSError, json.JSONDecodeError) as e:
+    except (OSError, json.JSONDecodeError):
         return bool(flag.get("enabled", False))
     api_key = cfg.get("api_key")
     if not api_key:
@@ -1221,7 +1222,7 @@ def _hook_discovery_enabled_for_org() -> bool:
             return bool(flag.get("enabled", False))
         body = r.stdout.decode("utf-8", errors="replace")
         enabled = bool(json.loads(body).get("enabled", False))
-    except Exception as e:
+    except Exception:
         return bool(flag.get("enabled", False))
 
     cache["hook_discovery"] = {
