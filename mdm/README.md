@@ -17,7 +17,7 @@ Each step runs in its own subprocess; a failure in one does not abort the others
 MDM setup requires Administrator privileges. Download and execute the PowerShell wrapper:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/onboard.ps1' -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_API_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/windows/onboard' -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_API_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
 ```
 
 The wrapper automatically:
@@ -26,15 +26,19 @@ The wrapper automatically:
 - Downloads and executes onboard.py
 - Deletes itself after completion
 
-Optional overrides for tenant deployments:
+Optional parameters:
 ```powershell
+# Tenant deployment URLs
 .\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -BackendUrl https://backend.example.com -GatewayUrl https://api.example.com
+
+# Enable backfill of historical transcripts (opt-in)
+.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -Backfill
 ```
 
 ### Clearing Setup (Windows)
 
 ```powershell
-Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/onboard.ps1' -OutFile onboard.ps1; .\onboard.ps1 -Clear
+Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/windows/onboard' -OutFile onboard.ps1; .\onboard.ps1 -Clear
 ```
 
 ## macOS/Linux

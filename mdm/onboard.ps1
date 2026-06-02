@@ -6,11 +6,13 @@
     Downloads and executes the Python-based MDM onboarding script (onboard.py)
     that performs all five setup steps:
 
-      1. Claude Code MDM setup (with backfill of historical transcripts)
+      1. Claude Code MDM setup
       2. Cursor MDM setup
-      3. Codex MDM setup (with backfill of historical transcripts)
+      3. Codex MDM setup
       4. GitHub Copilot MDM setup
       5. Coding-discovery scan
+
+    Use -Backfill to seed historical transcripts for Claude Code and Codex.
 
     This PowerShell wrapper:
     - Checks for Python availability (py, python3, python)
@@ -32,20 +34,31 @@
 .PARAMETER GatewayUrl
     Gateway URL override for MDM tools (default: https://api.getunbound.ai)
 
+.PARAMETER Backfill
+    Enable backfill of historical transcripts for Claude Code and Codex (opt-in, disabled by default)
+
 .PARAMETER Clear
     Remove MDM configuration for all four tools (no discovery scan, no backfill)
 
 .EXAMPLE
     # Standard onboarding with both keys
-    & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+
+.EXAMPLE
+    # With backfill of historical transcripts (opt-in)
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -Backfill
+
+.EXAMPLE
+    # Tenant deployment with custom URLs
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -BackendUrl "https://backend.example.com" -GatewayUrl "https://api.example.com"
 
 .EXAMPLE
     # Clear MDM setup
-    & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -Clear
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -Clear
 
 .NOTES
     Requires: Python 3, Administrator privileges
-    URL: https://raw.githubusercontent.com/websentry-ai/setup/42c7b5535aaee4bfd65f5ca77ad91ba88b4a23b2/mdm/onboard.py
+    URL: https://raw.githubusercontent.com/websentry-ai/setup/main/mdm/onboard.py
 #>
 
 param(
@@ -53,6 +66,7 @@ param(
     [string]$DiscoveryKey,
     [string]$BackendUrl,
     [string]$GatewayUrl,
+    [switch]$Backfill,
     [switch]$Clear
 )
 
@@ -163,6 +177,11 @@ function Main {
         if (-not [string]::IsNullOrWhiteSpace($GatewayUrl)) {
             $pythonArgs += "--gateway-url"
             $pythonArgs += $GatewayUrl
+        }
+
+        # Add backfill flag if explicitly requested (has no effect with -Clear)
+        if ($Backfill -and -not $Clear) {
+            $pythonArgs += "--backfill"
         }
 
         # Execute the Python script and capture exit code
