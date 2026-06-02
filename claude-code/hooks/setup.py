@@ -142,15 +142,17 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """
-    Remove an environment variable export line from the user's shell rc file.
+def remove_env_var_on_unix(var_name: str) -> str:
+    """Remove an environment variable export line from the user's shell rc file.
+
+    Returns "cleared", "not_found", or "failed".
     """
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return "failed"
     try:
-        rc_file.touch(exist_ok=True)
+        if not rc_file.exists():
+            return "not_found"
         with open(rc_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines = []
@@ -159,49 +161,58 @@ def remove_env_var_on_unix(var_name: str) -> bool:
         for line in lines:
             if line.strip().startswith(export_prefix):
                 removed = True
+                debug_print(f"Removing {var_name} from {rc_file}")
                 continue
             new_lines.append(line)
         if removed:
             with open(rc_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-        return True
+            return "cleared"
+        return "not_found"
     except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
+        print(f"Failed to modify {rc_file}: {e}")
+        return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """
-    Remove a user environment variable on Windows by deleting it from HKCU\\Environment.
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove a user environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
     """
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
-        return True
+        query = subprocess.run(
+            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
+        debug_print(f"Removed {var_name} from Windows registry")
+        return "cleared"
     except subprocess.CalledProcessError:
-        # If it doesn't exist, treat as success
-        return True
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """
-    Remove an environment variable permanently across OS platforms.
+def remove_env_var(var_name: str) -> Tuple[str, str]:
+    """Remove an environment variable permanently across OS platforms.
+
+    Returns (status, message) where status is "cleared", "not_found", "failed",
+    or "unsupported".
     """
     system = platform.system().lower()
     if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        if success:
-            debug_print(f"Removed {var_name} from Windows registry")
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_windows(var_name), ""
     elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        if success:
-            debug_print(f"Removed {var_name} from shell rc file")
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_unix(var_name), ""
     else:
-        return False, f"Unsupported OS: {system}"
+        return "unsupported", f"Unsupported OS: {system}"
 
 
 def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -508,14 +519,17 @@ def configure_claude_settings() -> bool:
         return False
 
 
-def remove_hooks_from_settings() -> None:
-    """Remove the unbound hooks from settings.json."""
+def remove_hooks_from_settings() -> str:
+    """Remove the unbound hooks from settings.json.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     settings_path = Path.home() / ".claude" / "settings.json"
     hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
     is_windows = platform.system().lower() == "windows"
 
     if not settings_path.exists():
-        return
+        return "not_found"
 
     def _is_unbound(cmd: str) -> bool:
         # Exact match on every OS; on Windows also match the "py -3 ..." form.
@@ -526,7 +540,7 @@ def remove_hooks_from_settings() -> None:
             settings = json.load(f)
 
         if "hooks" not in settings:
-            return
+            return "not_found"
 
         modified = False
         for event in list(settings["hooks"].keys()):
@@ -536,12 +550,12 @@ def remove_hooks_from_settings() -> None:
                 if isinstance(item, dict):
                     hooks = item.get("hooks", [])
                     new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                    if new_hooks != hooks:
+                        modified = True
+                        debug_print(f"Removed unbound hook from {event}")
                     if new_hooks:
                         item["hooks"] = new_hooks
                         new_config.append(item)
-                    elif hooks != new_hooks:
-                        modified = True
-                        debug_print(f"Removed unbound hook from {event}")
                 else:
                     new_config.append(item)
             if new_config:
@@ -552,14 +566,28 @@ def remove_hooks_from_settings() -> None:
 
         if not settings["hooks"]:
             del settings["hooks"]
-            modified = True
 
         if modified:
             with open(settings_path, 'w', encoding='utf-8') as f:
                 json.dump(settings, f, indent=2)
-            print("✅ Removed hooks from settings.json")
+            return "cleared"
+        return "not_found"
     except Exception as e:
-        print(f"❌ Failed to update settings.json: {e}")
+        print(f"Failed to update settings.json: {e}")
+        return "failed"
+
+
+
+def _clear_path(path: Path, label: str) -> str:
+    if not path.exists():
+        return "not_found"
+    try:
+        path.unlink()
+        debug_print(f"Removed {path}")
+        return "cleared"
+    except Exception as e:
+        print(f"Failed to clear {label}: {e}")
+        return "failed"
 
 
 def clear_setup() -> None:
@@ -568,25 +596,43 @@ def clear_setup() -> None:
     print("Claude Code Hooks - Clearing Setup")
     print("=" * 60)
 
-    # Remove environment variable
-    success, _ = remove_env_var("UNBOUND_CLAUDE_API_KEY")
-    if success:
-        print("✅ Removed UNBOUND_CLAUDE_API_KEY")
-    else:
-        print("❌ Failed to remove UNBOUND_CLAUDE_API_KEY")
+    any_cleared = False
+    any_failed = False
 
-    # Remove the unbound.py script
-    script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
-    if script_path.exists():
-        try:
-            script_path.unlink()
-            debug_print(f"Removed {script_path}")
-            print(f"✅ Removed {script_path}")
-        except Exception as e:
-            print(f"❌ Failed to remove {script_path}: {e}")
+    status, _ = remove_env_var("UNBOUND_CLAUDE_API_KEY")
+    if status == "cleared":
+        any_cleared = True
+    elif status not in ("cleared", "not_found"):
+        print("Failed to clear API_KEY")
+        any_failed = True
 
-    # Remove hooks from settings.json
-    remove_hooks_from_settings()
+    _r = _clear_path(Path.home() / ".claude" / "hooks" / "unbound.py", "Claude unbound.py hook")
+    if _r == "cleared":
+        any_cleared = True
+    elif _r == "failed":
+        any_failed = True
+
+    for extra in (
+        Path.home() / ".claude" / "hooks" / "unbound-setup.py",
+        Path.home() / ".claude" / "hooks" / ".last_updated",
+    ):
+        _r = _clear_path(extra, str(extra))
+        if _r == "cleared":
+            any_cleared = True
+        elif _r == "failed":
+            any_failed = True
+
+    settings_status = remove_hooks_from_settings()
+    if settings_status == "cleared":
+        any_cleared = True
+    elif settings_status == "failed":
+        print("Failed to clear Unbound hooks in settings.json")
+        any_failed = True
+
+    if any_cleared:
+        print("Cleared")
+    elif not any_failed:
+        print("API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

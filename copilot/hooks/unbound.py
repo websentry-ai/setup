@@ -9,16 +9,28 @@ import json
 import os
 import subprocess
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 import tempfile
 import time
 import hashlib
+import re
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
+
+DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
+DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
+DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
+DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
+DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
+DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
+DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -32,6 +44,14 @@ LOG_DIR = Path.home() / ".copilot" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+
+SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
+SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
+SELF_UPDATE_LOCK_TTL_SECONDS = 30
+SELF_UPDATE_CURL_TIMEOUT = 10
+SELF_SCRIPT_PATH = LOG_DIR / "unbound.py"
+SELF_UPDATE_STATE_PATH = LOG_DIR / ".self_update_check"
+SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 
 # Copilot tool names (VS Code + CLI) translated to the canonical gateway vocabulary.
 SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
@@ -842,6 +862,227 @@ def get_api_key():
         return None
 
 
+_GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')
+_BAKED_GATEWAY_RE = re.compile(r'os\.environ\.get\(\s*"UNBOUND_GATEWAY_URL"\s*,\s*"([^"]*)"')
+
+def _is_valid_gateway_url(url: str) -> bool:
+    if not url or any(c in url for c in '"\\\n\r\x00'):
+        return False
+    return bool(_GATEWAY_URL_RE.fullmatch(url))
+
+
+def _baked_gateway_url(text: str) -> str:
+    # read baked url, not env
+    match = _BAKED_GATEWAY_RE.search(text)
+    return match.group(1) if match else ""
+
+
+def _rebake_gateway_url(text: str, gateway_url: str) -> str:
+    # rewrite only the env-var default, nothing else
+    return _BAKED_GATEWAY_RE.sub(
+        lambda m: m.group(0).replace(f'"{m.group(1)}"', f'"{gateway_url}"'),
+        text,
+        count=1,
+    )
+
+
+def _self_update_due() -> bool:
+    try:
+        return (time.time() - SELF_UPDATE_STATE_PATH.stat().st_mtime) >= SELF_UPDATE_INTERVAL_SECONDS
+    except OSError:
+        return True
+
+
+def _acquire_self_update_lock() -> bool:
+    try:
+        if SELF_UPDATE_LOCK_PATH.exists():
+            if (time.time() - SELF_UPDATE_LOCK_PATH.stat().st_mtime) < SELF_UPDATE_LOCK_TTL_SECONDS:
+                return False
+            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
+        fd = os.open(str(SELF_UPDATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd)
+        return True
+    except (FileExistsError, OSError):
+        return False
+
+
+def _download_latest_hook():
+    try:
+        result = subprocess.run(
+            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL],
+            capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return None
+        return result.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _replace_self(new_bytes: bytes) -> None:
+    try:
+        mode = SELF_SCRIPT_PATH.stat().st_mode
+    except OSError:
+        mode = 0o755
+    fd, tmp_path = tempfile.mkstemp(dir=str(SELF_SCRIPT_PATH.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(new_bytes)
+        os.replace(tmp_path, SELF_SCRIPT_PATH)
+        os.chmod(SELF_SCRIPT_PATH, mode | 0o111)
+    except OSError as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        log_error(f"self_update replace failed: {e}", 'self_update')
+
+
+def _check_self_update() -> None:
+    # refresh hook from main, throttled per interval
+    try:
+        if not _self_update_due() or not _acquire_self_update_lock():
+            return
+        try:
+            SELF_UPDATE_STATE_PATH.touch()  # one attempt per interval
+            local_bytes = SELF_SCRIPT_PATH.read_bytes()
+            gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
+            if not _is_valid_gateway_url(gateway_url):
+                log_error("self_update skipped: invalid gateway url", 'self_update')
+                return
+
+            payload = _download_latest_hook()
+            if not payload:
+                return
+            remote_text = payload.decode("utf-8", errors="replace")
+            if "UNBOUND_GATEWAY_URL" not in remote_text:
+                log_error("self_update skipped: bad download", 'self_update')
+                return
+
+            new_text = _rebake_gateway_url(remote_text, gateway_url)
+            if _baked_gateway_url(new_text) != gateway_url:
+                log_error("self_update skipped: gateway url not preserved", 'self_update')
+                return
+            new_bytes = new_text.encode("utf-8")
+            if hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
+                _replace_self(new_bytes)
+        finally:
+            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
+    except Exception as e:
+        log_error(f"self_update error: {e}", 'self_update')
+
+
+def _dispatch_discovery() -> None:
+    try:
+        cache = {}
+        if DISCOVERY_CACHE_PATH.exists():
+            try:
+                with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
+                    cache = json.load(f) or {}
+            except (OSError, json.JSONDecodeError):
+                cache = {}
+        if not isinstance(cache, dict):
+            cache = {}
+
+        last = cache.get("last_run_at")
+        if isinstance(last, str):
+            try:
+                ts = datetime.strptime(last, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+                if (time.time() - ts) < DISCOVERY_DEBOUNCE_SECONDS:
+                    return
+            except ValueError:
+                pass
+
+        if DISCOVERY_LOCK_PATH.exists():
+            try:
+                age = time.time() - DISCOVERY_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = DISCOVERY_STALE_LOCK_SECONDS + 1
+            if age < DISCOVERY_STALE_LOCK_SECONDS:
+                return
+
+        # Atomic dispatch claim — first hook to create the marker wins;
+        # concurrent peers bail to avoid duplicate fork-detached Popens.
+        try:
+            _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                                   os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(_dispatch_fd)
+        except FileExistsError:
+            try:
+                age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
+            except OSError:
+                age = DISCOVERY_DISPATCH_TTL_SECONDS + 1
+            if age < DISCOVERY_DISPATCH_TTL_SECONDS:
+                return
+            try:
+                DISCOVERY_DISPATCH_PATH.unlink()
+                _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                                       os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                os.close(_dispatch_fd)
+            except (FileExistsError, OSError):
+                return
+
+        try:
+            try:
+                with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                    unbound_config = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                log_error(f"discovery gate: could not read {UNBOUND_CONFIG_PATH}: {e}", 'discovery_gate')
+                return
+            api_key = unbound_config.get("api_key")
+            backend_url = unbound_config.get("base_url")
+            if not api_key:
+                log_error("discovery gate: api_key missing in ~/.unbound/config.json", 'discovery_gate')
+                return
+            if not backend_url:
+                log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
+                return
+
+            DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            if not DISCOVERY_INSTALL_SH.exists():
+                r = subprocess.run(
+                    ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                    capture_output=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                    return
+                os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+
+            # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
+            popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                            "stdin": subprocess.DEVNULL, "close_fds": True,
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+            if os.name == "nt":
+                popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            else:
+                popen_kwargs["start_new_session"] = True
+            try:
+                subprocess.Popen(
+                    ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
+                    **popen_kwargs,
+                )
+            except OSError as e:
+                log_error(f"discovery gate: Popen failed: {e}", 'discovery_gate')
+                return
+
+            # Stamp last_run_at only after Popen succeeds so a launch failure
+            # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
+            cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2, sort_keys=True)
+            os.replace(tmp, DISCOVERY_CACHE_PATH)
+        finally:
+            try:
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception as e:
+        log_error(f"discovery gate failed: {e}", 'discovery_gate')
+
+
 def main():
     """Main entry point - read from stdin and process events."""
     global _cached_api_key
@@ -862,6 +1103,14 @@ def main():
             return
 
         event_name = event.get('hook_event_name')
+
+        # SessionStart fires once per session — natural TTL gate for the
+        # debounced discovery scan dispatch.
+        if event_name == 'SessionStart':
+            _check_self_update()
+            # _dispatch_discovery()
+            print("{}")
+            return
 
         if event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)

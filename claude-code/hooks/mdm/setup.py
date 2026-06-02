@@ -461,33 +461,54 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
-    """Remove env var from user's shell rc files. Privilege-drops on Unix."""
+def remove_env_var_on_windows_machine(var_name: str) -> str:
+    """Remove machine-wide (HKLM) env var on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+    try:
+        query = subprocess.run(
+            ["reg", "query", reg_path, "/V", var_name],
+            capture_output=True, timeout=10,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", reg_path, "/F", "/V", var_name],
+            check=True, capture_output=True, timeout=10,
+        )
+        debug_print(f"Removed {var_name} from system environment")
+        return "cleared"
+    except subprocess.CalledProcessError:
+        return "failed"
+    except Exception as e:
+        debug_print(f"Failed to remove {var_name}: {e}")
+        return "failed"
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+    """Remove env var from user's shell rc files. Privilege-drops on Unix.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     system = platform.system().lower()
 
     if system == "windows":
-        try:
-            subprocess.run(
-                ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
-                check=False, capture_output=True, timeout=10,
-            )
-            debug_print(f"Removed {var_name} from system environment")
-            return True
-        except Exception as e:
-            debug_print(f"Failed to remove {var_name}: {e}")
-            return False
+        return remove_env_var_on_windows_machine(var_name)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     elif system == "linux":
         rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
     else:
-        return False
+        return "failed"
 
     export_prefix = f"export {var_name}="
 
     def _do():
-        success = False
+        cleared = False
+        had_error = False
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
@@ -501,12 +522,20 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
                     debug_print(f"Removed {var_name} from {rc_file}")
-                    success = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return success
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
-    return bool(_run_as_user(username, _do))
+    result = _run_as_user(username, _do)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
@@ -859,8 +888,11 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         return False
 
 
-def clear_managed_hooks() -> bool:
-    """Remove the hooks script and hooks setting from managed Claude config."""
+def clear_managed_hooks() -> str:
+    """Remove the hooks script and hooks setting from managed Claude config.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     try:
         managed_dir = get_managed_settings_dir()
         hooks_dir = managed_dir / "hooks"
@@ -871,18 +903,18 @@ def clear_managed_hooks() -> bool:
             managed_dir / "managed-settings.json",
         ]
 
-        removed_any = False
+        cleared_any = False
+        had_error = False
 
-        # Remove the hook script
         if script_path.exists():
             try:
                 script_path.unlink()
                 debug_print(f"Removed {script_path}")
-                removed_any = True
+                cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to remove {script_path}: {e}")
+                had_error = True
 
-        # Try to remove hooks directory if empty
         if hooks_dir.exists():
             try:
                 if not any(hooks_dir.iterdir()):
@@ -908,15 +940,20 @@ def clear_managed_hooks() -> bool:
                         with open(settings_path, "w", encoding="utf-8") as f:
                             json.dump(settings, f, indent=2)
                         debug_print(f"Removed hooks from {settings_path}")
-                    removed_any = True
+                    cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to update {settings_path}: {e}")
+                had_error = True
 
-        return removed_any
+        if cleared_any:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
     except Exception as e:
         debug_print(f"Error clearing managed hooks: {e}")
-        return False
+        return "failed"
 
 
 def clear_setup():
@@ -929,7 +966,7 @@ def clear_setup():
         print("   Please re-run with sudo.")
         return
 
-    print("\nRemoving environment variables...")
+    print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
     # placeholder so the removal runs even if C:\Users has no profiles.
     user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
@@ -937,23 +974,36 @@ def clear_setup():
     if not user_homes:
         print("   No user home directories found")
     else:
-        removed_count = 0
+        cleared = 0
+        not_found = 0
+        failed = 0
         for username, home_dir in user_homes:
-            if remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY"):
-                removed_count += 1
+            status = remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY")
+            if status == "cleared":
+                cleared += 1
+            elif status == "not_found":
+                not_found += 1
+            else:
+                failed += 1
+            if username and home_dir:
+                remove_local_setup_copy_for_user(username, home_dir)
 
-        if removed_count > 0:
-            print(f"Removed environment variables from {removed_count} user(s)")
-        else:
-            print("   No environment variables found to remove")
+        if cleared:
+            print(f"Cleared for {cleared} user(s)")
+        elif not_found:
+            print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
+        if failed:
+            print(f"Failed to clear API_KEY for {failed} user(s)")
 
-    # Remove managed hooks
-    print("\nRemoving managed hooks...")
-    if clear_managed_hooks():
-        managed_dir = get_managed_settings_dir()
-        print(f"Removed managed hooks from {managed_dir}")
+    print("\nClearing managed hooks...")
+    status = clear_managed_hooks()
+    managed_dir = get_managed_settings_dir()
+    if status == "cleared":
+        print(f"Cleared managed hooks from {managed_dir}")
+    elif status == "not_found":
+        print(f"Managed hooks not found in {managed_dir}")
     else:
-        print("   No managed hooks found to remove")
+        print(f"Failed to clear managed hooks in {managed_dir}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -1279,11 +1329,33 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """Inspect the managed-settings target BEFORE it gets overwritten.
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy.
+    'fresh' (config absent), 'persisted' (config + unbound.py both present),
+    'tampered' (config present but hook script missing), or None on any error."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        config_path = managed_dir / "managed-settings.json"
+        script_path = managed_dir / "hooks" / "unbound.py"
+        if not config_path.exists():
+            return 'fresh'
+        return 'persisted' if script_path.exists() else 'tampered'
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -1392,6 +1464,8 @@ def main():
         remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key)
 
+    state = detect_install_state()
+
     print("\nConfiguring Claude managed hooks...")
     if setup_managed_hooks(gateway_url=gateway_url):
         managed_dir = get_managed_settings_dir()
@@ -1404,7 +1478,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "claude-code", backend_url=base_url)
+    notify_setup_complete(api_key, "claude-code", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())

@@ -185,14 +185,17 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> bool:
-    """Remove an environment variable export line from the user's shell rc file."""
+def remove_env_var_on_unix(var_name: str) -> str:
+    """Remove an environment variable export line from the user's shell rc file.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     rc_file = get_shell_rc_file()
     if rc_file is None:
-        return False
+        return "failed"
     try:
         if not rc_file.exists():
-            return True
+            return "not_found"
         with open(rc_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines = []
@@ -207,36 +210,52 @@ def remove_env_var_on_unix(var_name: str) -> bool:
         if removed:
             with open(rc_file, "w", encoding="utf-8") as f:
                 f.writelines(new_lines)
-        return True
+            return "cleared"
+        return "not_found"
     except Exception as e:
-        print(f"❌ Failed to modify {rc_file}: {e}")
-        return False
+        print(f"Failed to modify {rc_file}: {e}")
+        return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove a user environment variable on Windows."""
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove a user environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
     try:
-        subprocess.run(["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name], check=True, capture_output=True)
+        query = subprocess.run(
+            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
+        subprocess.run(
+            ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
+            check=True,
+            capture_output=True,
+        )
         debug_print(f"Removed {var_name} from Windows registry")
-        return True
+        return "cleared"
     except subprocess.CalledProcessError:
-        return True
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[bool, str]:
-    """Remove an environment variable permanently across OS platforms."""
+def remove_env_var(var_name: str) -> Tuple[str, str]:
+    """Remove an environment variable permanently across OS platforms.
+
+    Returns (status, message) where status is "cleared", "not_found", "failed",
+    or "unsupported".
+    """
     system = platform.system().lower()
     if system == "windows":
-        success = remove_env_var_on_windows(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_windows(var_name), ""
     elif system in ["darwin", "linux"]:
-        success = remove_env_var_on_unix(var_name)
-        return (True, "Removed") if success else (False, f"Failed to remove {var_name}")
+        return remove_env_var_on_unix(var_name), ""
     else:
-        return False, f"Unsupported OS: {system}"
+        return "unsupported", f"Unsupported OS: {system}"
 
 
 def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -411,24 +430,28 @@ def write_codex_config(base_url: str) -> bool:
         return False
 
 
-def remove_codex_config_base_url() -> bool:
+def remove_codex_config_base_url() -> str:
     """Remove openai_base_url from ~/.codex/config.toml.
-    Returns True if the key was found and removed, False otherwise."""
+
+    Returns "cleared", "not_found", or "failed".
+    """
     config_file = Path.home() / ".codex" / "config.toml"
     try:
         if not config_file.exists():
-            return False
+            return "not_found"
         with open(config_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines, removed = _remove_toml_root_key(lines, "openai_base_url")
-        if removed:
-            with open(config_file, "w", encoding="utf-8") as f:
-                f.writelines(new_lines)
-            debug_print(f"Removed openai_base_url from {config_file}")
-        return removed
+        if not removed:
+            return "not_found"
+        with open(config_file, "w", encoding="utf-8") as f:
+            f.writelines(new_lines)
+        debug_print(f"Removed openai_base_url from {config_file}")
+        return "cleared"
     except Exception as e:
-        debug_print(f"Failed to update codex config: {e}")
-        return False
+        print(f"Failed to update codex config: {e}")
+        return "failed"
+
 
 
 def clear_setup() -> None:
@@ -438,19 +461,28 @@ def clear_setup() -> None:
     print("Codex CLI - Clearing Setup")
     print("=" * 60)
 
-    # Remove codex config base URL
-    removed = remove_codex_config_base_url()
-    if removed:
-        print("✅ Removed openai_base_url from codex config")
+    any_cleared = False
+    any_failed = False
 
-    # Remove environment variables (OPENAI_BASE_URL kept for backwards compatibility)
-    env_vars = ["OPENAI_API_KEY", "OPENAI_BASE_URL"]
-    for var in env_vars:
-        success, _ = remove_env_var(var)
-        if success:
-            print(f"✅ Removed {var}")
-        else:
-            print(f"❌ Failed to remove {var}")
+    config_status = remove_codex_config_base_url()
+    if config_status == "cleared":
+        any_cleared = True
+    elif config_status == "failed":
+        print("Failed to clear openai_base_url in codex config")
+        any_failed = True
+
+    for var, label in {"OPENAI_API_KEY": "API_KEY", "OPENAI_BASE_URL": "BASE_URL"}.items():
+        status, _ = remove_env_var(var)
+        if status == "cleared":
+            any_cleared = True
+        elif status not in ("cleared", "not_found"):
+            print(f"Failed to clear {label}")
+            any_failed = True
+
+    if any_cleared:
+        print("Cleared")
+    elif not any_failed:
+        print("API_KEY not set, nothing to clear")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

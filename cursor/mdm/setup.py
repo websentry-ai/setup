@@ -8,11 +8,24 @@ import subprocess
 import json
 import time
 from pathlib import Path
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 try:
     import pwd
 except ImportError:
     pwd = None
+
+# On Windows, when this script runs as a child of the MDM onboard wrapper its
+# stdout is a non-console pipe defaulting to the legacy code page (cp1252),
+# which can't encode the emoji we print — the first such print raises
+# UnicodeEncodeError and crashes the step. Force UTF-8 so output never fails.
+# mac/linux stdout is already UTF-8, so they are intentionally left untouched.
+if platform.system().lower() == "windows":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    del _stream
 
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
@@ -202,11 +215,57 @@ def get_windows_device_identifier() -> str:
         return None
 
 
+def get_linux_device_identifier() -> str:
+    """Get a stable device identifier on Linux.
+
+    Tries dmidecode serial, then /etc/machine-id, then hostname.
+    """
+    try:
+        result = subprocess.run(
+            ["dmidecode", "-s", "system-serial-number"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stderr=subprocess.DEVNULL,
+        )
+        _DMIDECODE_PLACEHOLDERS = {
+            "", "0", "default string", "not applicable",
+            "not specified", "system serial number",
+            "to be filled by o.e.m.",
+        }
+        if result.returncode == 0:
+            device_id = result.stdout.strip()
+            if device_id and device_id.lower() not in _DMIDECODE_PLACEHOLDERS:
+                return device_id
+    except Exception:
+        debug_print("dmidecode failed, trying machine-id")
+
+    for path in ["/etc/machine-id", "/var/lib/dbus/machine-id"]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                device_id = f.read().strip()
+                if device_id:
+                    return device_id
+        except Exception:
+            continue
+
+    try:
+        result = subprocess.run(["hostname"], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+
+    return None
+
+
 def get_device_identifier() -> str:
     """Dispatch device identifier lookup based on platform."""
     system = platform.system().lower()
     if system == "darwin":
         return get_mac_serial_number()
+    if system == "linux":
+        return get_linux_device_identifier()
     if system == "windows":
         return get_windows_device_identifier()
     return None
@@ -331,21 +390,31 @@ def set_env_var_windows(var_name: str, value: str) -> bool:
         return False
 
 
-def remove_env_var_on_windows(var_name: str) -> bool:
-    """Remove the machine-wide (HKLM) environment variable on Windows."""
+def remove_env_var_on_windows(var_name: str) -> str:
+    """Remove the machine-wide (HKLM) environment variable on Windows.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
     try:
+        query = subprocess.run(
+            ["reg", "query", reg_path, "/V", var_name],
+            capture_output=True,
+        )
+        if query.returncode != 0:
+            return "not_found"
         subprocess.run(
-            ["reg", "delete", "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment", "/F", "/V", var_name],
+            ["reg", "delete", reg_path, "/F", "/V", var_name],
             check=True,
             capture_output=True,
         )
         debug_print(f"Removed {var_name} from Windows registry (HKLM)")
-        return True
+        return "cleared"
     except subprocess.CalledProcessError:
-        return True
+        return "failed"
     except FileNotFoundError:
-        print("❌ 'reg' command not found. Please remove the variable manually.")
-        return False
+        print("'reg' command not found. Please remove the variable manually.")
+        return "failed"
 
 
 def get_all_user_homes() -> List[Tuple[str, Path]]:
@@ -367,19 +436,24 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
                         debug_print(f"Found user: {user_dir.name} -> {user_dir}")
             return user_homes
 
-        # Iterate through all users in the password database
-        for user in pwd.getpwall():
-            uid = user.pw_uid
-            username = user.pw_name
-            home_dir = Path(user.pw_dir)
-
-            # Filter out system accounts (UID < 500 on macOS)
-            # Real users typically have UID >= 501 on macOS
-            if uid >= 500 and home_dir.exists() and home_dir.is_dir():
-                # Additional checks to ensure it's a real user home
-                if str(home_dir).startswith('/Users/') and username not in ['Shared', 'Guest']:
-                    user_homes.append((username, home_dir))
-                    debug_print(f"Found user: {username} -> {home_dir}")
+        if system == "darwin":
+            for user in pwd.getpwall():
+                uid = user.pw_uid
+                username = user.pw_name
+                home_dir = Path(user.pw_dir)
+                if uid >= 500 and home_dir.exists() and home_dir.is_dir():
+                    if str(home_dir).startswith('/Users/') and username not in ['Shared', 'Guest']:
+                        user_homes.append((username, home_dir))
+                        debug_print(f"Found user: {username} -> {home_dir}")
+        elif system == "linux":
+            for user in pwd.getpwall():
+                uid = user.pw_uid
+                username = user.pw_name
+                home_dir = Path(user.pw_dir)
+                if uid >= 1000 and home_dir.exists() and home_dir.is_dir():
+                    if str(home_dir).startswith('/home/'):
+                        user_homes.append((username, home_dir))
+                        debug_print(f"Found user: {username} -> {home_dir}")
 
         return user_homes
     except Exception as e:
@@ -387,10 +461,11 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
         return []
 
 
-def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool]:
-    """Set environment variable for all users on macOS by updating each user's shell rc file.
+def set_env_var_system_wide_unix(var_name: str, value: str) -> Tuple[bool, bool]:
+    """Set environment variable for all users on macOS/Linux via per-user shell rc files.
     Returns: (success, changed)"""
     try:
+        system = platform.system().lower()
         user_homes = get_all_user_homes()
 
         if not user_homes:
@@ -401,14 +476,13 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
         changed_count = 0
         export_line = f'export {var_name}="{value}"'
 
-        # Set environment variable for each user (privilege-dropped per user)
         for username, home_dir in user_homes:
             debug_print(f"Setting env var for user: {username}")
 
-            rc_files = [
-                home_dir / ".zprofile",
-                home_dir / ".bash_profile"
-            ]
+            if system == "linux":
+                rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+            else:
+                rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
             debug_print(f"Writing to shell files: {[str(f) for f in rc_files]}")
 
             def _do_user_writes(_rc_files=rc_files):
@@ -449,17 +523,22 @@ def set_env_var_system_wide_macos(var_name: str, value: str) -> Tuple[bool, bool
         return False, False
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bool:
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
     """Remove environment variable from a user's shell rc files.
-    Privilege-drops to the user before any FS op."""
-    rc_files = [
-        home_dir / ".zprofile",
-        home_dir / ".bash_profile"
-    ]
+    Privilege-drops to the user before any FS op.
+
+    Returns "cleared", "not_found", or "failed".
+    """
+    system = platform.system().lower()
+    if system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     export_prefix = f"export {var_name}="
 
     def _remove():
-        success = False
+        cleared = False
+        had_error = False
         for rc_file in rc_files:
             if not rc_file.exists():
                 continue
@@ -473,20 +552,27 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> bo
                     with os.fdopen(fd, 'w', encoding='utf-8') as f:
                         f.writelines(new_lines)
                     debug_print(f"Removed {var_name} from {rc_file}")
-                    success = True
+                    cleared = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return success
+                had_error = True
+        if cleared:
+            return "cleared"
+        if had_error:
+            return "failed"
+        return "not_found"
 
     result = _run_as_user(username, _remove)
-    return bool(result)
+    if result in ("cleared", "not_found", "failed"):
+        return result
+    return "failed"
 
 
 def set_env_var_unix(var_name: str, value: str) -> Tuple[bool, bool]:
-    if platform.system().lower() == "darwin" and os.geteuid() == 0:
-        return set_env_var_system_wide_macos(var_name, value)
+    if os.geteuid() == 0:
+        return set_env_var_system_wide_unix(var_name, value)
 
-    # For other cases, use the per-user approach
+    # Non-root fallback: write to current user's rc file only.
     rc_file = get_shell_rc_file()
     if rc_file is None:
         return False, False
@@ -509,14 +595,8 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, bool, str]:
     elif system in ["darwin", "linux"]:
         success, changed = set_env_var_unix(var_name, value)
         if success:
-            # Check if we're running as root on macOS (system-wide setup)
-            if system == "darwin" and os.geteuid() == 0:
-                debug_print(f"Environment variable {var_name} set system-wide")
-                return True, changed, "Set system-wide for all users"
-            else:
-                debug_print(f"Environment variable {var_name} added to shell rc file")
-                shell_name = "zsh" if "zsh" in os.environ.get("SHELL", "") else "bash"
-                return True, changed, f"Run 'source ~/.{shell_name}rc' or restart terminal"
+            debug_print(f"Environment variable {var_name} set system-wide for all users")
+            return True, changed, "Set system-wide for all users"
         return False, False, "Failed"
     else:
         return False, False, f"Unsupported OS: {system}"
@@ -721,7 +801,7 @@ def clear_setup():
         return
 
     # Remove enterprise hooks files (NOT the entire Cursor directory)
-    print("\n🗑️  Removing enterprise hooks...")
+    print("\nClearing enterprise hooks...")
     enterprise_dir = get_enterprise_hooks_dir()
     hooks_json = enterprise_dir / "hooks.json"
     hooks_dir = enterprise_dir / "hooks"
@@ -730,46 +810,56 @@ def clear_setup():
     if hooks_json.exists():
         try:
             hooks_json.unlink()
-            print(f"✅ Removed {hooks_json}")
+            print("Cleared enterprise hooks.json")
         except Exception as e:
-            print(f"❌ Failed to remove {hooks_json}: {e}")
-    else:
-        print(f"   {hooks_json} does not exist")
+            print(f"Failed to clear hooks.json: {e}")
 
     # Remove hooks directory
     if hooks_dir.exists():
         try:
             import shutil
             shutil.rmtree(hooks_dir)
-            print(f"✅ Removed {hooks_dir}")
+            print("Cleared enterprise hooks directory")
         except Exception as e:
-            print(f"❌ Failed to remove {hooks_dir}: {e}")
-    else:
-        print(f"   {hooks_dir} does not exist")
+            print(f"Failed to clear hooks directory: {e}")
 
     # Remove environment variable from all users
-    print("\n🗑️  Removing environment variables...")
+    print("\nClearing environment variables...")
     system = platform.system().lower()
     if system == "windows":
-        if remove_env_var_on_windows("UNBOUND_CURSOR_API_KEY"):
-            print("✅ Removed UNBOUND_CURSOR_API_KEY (system)")
+        status = remove_env_var_on_windows("UNBOUND_CURSOR_API_KEY")
+        if status == "cleared":
+            print("Cleared")
+        elif status == "not_found":
+            print("API_KEY not set, nothing to clear")
         else:
-            print("   No environment variables found to remove")
+            print("Failed to clear API_KEY")
     else:
         user_homes = get_all_user_homes()
 
         if not user_homes:
             print("   No user home directories found")
         else:
-            removed_count = 0
+            cleared = 0
+            not_found = 0
+            failed = 0
             for username, home_dir in user_homes:
-                if remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY"):
-                    removed_count += 1
+                status = remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY")
+                if status == "cleared":
+                    cleared += 1
+                elif status == "not_found":
+                    not_found += 1
+                else:
+                    failed += 1
+                if username and home_dir:
+                    remove_local_setup_copy_for_user(username, home_dir)
 
-            if removed_count > 0:
-                print(f"✅ Removed environment variable from {removed_count} user(s)")
-            else:
-                print("   No environment variables found to remove")
+            if cleared:
+                print(f"Cleared for {cleared} user(s)")
+            elif not_found:
+                print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
+            if failed:
+                print(f"Failed to clear API_KEY for {failed} user(s)")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -840,11 +930,33 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
         return None
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """Inspect the enterprise hooks.json target BEFORE it gets overwritten.
+    Existence-based: the self-update rewrites these files, so content checks
+    are unreliable — only file existence is trustworthy.
+    'fresh' (config absent), 'persisted' (config + unbound.py both present),
+    'tampered' (config present but hook script missing), or None on any error."""
+    try:
+        enterprise_dir = get_enterprise_hooks_dir()
+        hooks_json = enterprise_dir / "hooks.json"
+        script_path = enterprise_dir / "hooks" / "unbound.py"
+        if not hooks_json.exists():
+            return 'fresh'
+        return 'persisted' if script_path.exists() else 'tampered'
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -884,10 +996,6 @@ def main():
 
     system = platform.system().lower()
 
-    # cursor/mdm/setup.py supported only macOS in origin; extend to Windows.
-    if system not in ("darwin", "windows"):
-        print("❌ This script only supports macOS and Windows")
-        return
     if not check_admin_privileges():
         if system == "windows":
             sys.exit(
@@ -967,6 +1075,8 @@ def main():
     if config_count > 0:
         print(f"✅ Config written for {config_count} user(s)")
 
+    state = detect_install_state()
+
     # Setup hooks
     debug_print("Setting up hooks...")
     hooks_success, hooks_changed = setup_hooks(gateway_url=gateway_url)
@@ -979,7 +1089,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url)
+    notify_setup_complete(cursor_api_key, "cursor", backend_url=base_url, install_state=state, serial_number=serial_number)
 
     if env_changed or hooks_changed:
         debug_print(f"Restart needed: env_changed={env_changed}, hooks_changed={hooks_changed}")
