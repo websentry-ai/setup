@@ -1294,7 +1294,7 @@ def main():
         # debounced discovery scan dispatch.
         if hook_event_name == "sessionStart":
             _check_self_update()
-            _dispatch_discovery()
+            # _dispatch_discovery()
             print("{}")
             return
         generation_id = event.get('generation_id')

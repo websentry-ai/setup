@@ -1108,7 +1108,7 @@ def main():
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
             _check_self_update()
-            _dispatch_discovery()
+            # _dispatch_discovery()
             print("{}")
             return
 
