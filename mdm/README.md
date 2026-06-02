@@ -31,7 +31,7 @@ Optional parameters:
 # Tenant deployment URLs
 .\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -BackendUrl https://backend.example.com -GatewayUrl https://api.example.com
 
-# Explicit backfill (enabled by default, but can be specified for clarity)
+# Enable backfill of historical transcripts (opt-in)
 .\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -Backfill
 ```
 

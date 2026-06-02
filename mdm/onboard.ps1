@@ -6,11 +6,13 @@
     Downloads and executes the Python-based MDM onboarding script (onboard.py)
     that performs all five setup steps:
 
-      1. Claude Code MDM setup (with backfill of historical transcripts)
+      1. Claude Code MDM setup
       2. Cursor MDM setup
-      3. Codex MDM setup (with backfill of historical transcripts)
+      3. Codex MDM setup
       4. GitHub Copilot MDM setup
       5. Coding-discovery scan
+
+    Use -Backfill to seed historical transcripts for Claude Code and Codex.
 
     This PowerShell wrapper:
     - Checks for Python availability (py, python3, python)
@@ -33,7 +35,7 @@
     Gateway URL override for MDM tools (default: https://api.getunbound.ai)
 
 .PARAMETER Backfill
-    Enable backfill of historical transcripts for Claude Code and Codex (enabled by default, can be explicitly set for clarity)
+    Enable backfill of historical transcripts for Claude Code and Codex (opt-in, disabled by default)
 
 .PARAMETER Clear
     Remove MDM configuration for all four tools (no discovery scan, no backfill)
@@ -43,7 +45,7 @@
     Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
 
 .EXAMPLE
-    # Explicit backfill (already enabled by default)
+    # With backfill of historical transcripts (opt-in)
     Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -Backfill
 
 .EXAMPLE

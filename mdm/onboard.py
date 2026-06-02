@@ -12,12 +12,12 @@ Steps 1-4 use --api-key (admin MDM key). Step 5 uses --discovery-key (a
 separate discovery-specific key). The two are different credentials and the
 backend distinguishes them; passing one in place of the other will be rejected.
 
-Backfill is enabled by default for Claude Code and Codex — it seeds the new
-device's existing local transcripts into analytics so the dashboard isn't
-empty until live activity accumulates. Backfill is idempotent (the Task-row
-gate + deterministic uuid5 per record keeps re-runs from duplicating data),
-so leaving it on is safe even if onboard is re-run. Cursor and GitHub Copilot
-have no historical transcript store and are skipped automatically.
+Backfill must be explicitly enabled via --backfill flag (typically passed from
+PowerShell's -Backfill parameter). When enabled, it seeds Claude Code and Codex
+historical transcripts into analytics so the dashboard isn't empty until live
+activity accumulates. Backfill is idempotent (Task-row gate + deterministic
+uuid5 per record prevents duplication), so re-runs are safe. Cursor and GitHub
+Copilot have no historical transcript store to backfill.
 
 Usage:
 
@@ -75,7 +75,7 @@ TOOLS = [
     ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True),
     ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False),
     ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True),
-    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     False),
+    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True),
 ]
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
@@ -266,12 +266,9 @@ def main() -> int:
 
     for name, url, supports_backfill in TOOLS:
         print(f"\n{'=' * 60}\n[{name}] MDM setup\n{'=' * 60}\n")
-        # Append --backfill for tools that support it. Skipped on --clear
-        # (nothing to seed) and skipped if the user already passed --backfill
-        # explicitly (avoids duplicate args).
+        # Pass through mdm_args as-is. Backfill is only enabled when the user
+        # explicitly passes --backfill (typically via PowerShell's -Backfill flag).
         tool_args = list(mdm_args)
-        if supports_backfill and not is_clear and "--backfill" not in tool_args:
-            tool_args.append("--backfill")
         if not run_tool(name, url, tool_args):
             failures.append(name)
 
