@@ -26,9 +26,13 @@ The wrapper automatically:
 - Downloads and executes onboard.py
 - Deletes itself after completion
 
-Optional overrides for tenant deployments:
+Optional parameters:
 ```powershell
+# Tenant deployment URLs
 .\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -BackendUrl https://backend.example.com -GatewayUrl https://api.example.com
+
+# Enable backfill of historical transcripts (opt-in)
+.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -Backfill
 ```
 
 ### Clearing Setup (Windows)
