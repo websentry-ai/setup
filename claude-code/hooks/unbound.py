@@ -407,7 +407,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                 # is unreliable for them, so the transcript is the source.
                                 elif (isinstance(content_item, dict)
                                         and content_item.get('type') == 'tool_use'
-                                        and content_item.get('name') in ('Skill', 'Task', 'Agent')):
+                                        and content_item.get('name') in ('Skill', 'Task', 'Agent')
+                                        and content_item.get('id')):  # require an id so the row can dedup
                                     conversation_data['tool_uses'].append({
                                         'type': 'PostToolUse',
                                         'tool_name': content_item.get('name'),
@@ -919,7 +920,16 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             trigger = 'agent'
             if skill_name and up.startswith('/'):
                 typed_cmd = up[1:].split(None, 1)[0]
-                if typed_cmd and typed_cmd.split(':')[-1] == skill_name.split(':')[-1]:
+                # Match full name, or bare-vs-namespaced in either direction
+                # (/stripe:test-cards typed vs bare "test-cards" skill, or vice
+                # versa). Deliberately NOT a pure suffix match, so two skills that
+                # merely share a base name across namespaces (ns1:deploy vs
+                # ns2:deploy) don't mislabel an agent invocation as user-typed.
+                if typed_cmd and (
+                    typed_cmd == skill_name
+                    or typed_cmd.split(':')[-1] == skill_name
+                    or typed_cmd == skill_name.split(':')[-1]
+                ):
                     trigger = 'user'
         assistant_tool_uses.append({
             'type': tu.get('type', 'PostToolUse'),
@@ -1069,7 +1079,8 @@ def collect_subagent_skill_tool_uses(transcript_path: str, user_prompt_timestamp
                         for content_item in message.get('content', []) or []:
                             if (isinstance(content_item, dict)
                                     and content_item.get('type') == 'tool_use'
-                                    and content_item.get('name') in ('Skill', 'Task', 'Agent')):
+                                    and content_item.get('name') in ('Skill', 'Task', 'Agent')
+                                    and content_item.get('id')):  # require an id so the row can dedup
                                 tool_uses.append({
                                     'type': 'PostToolUse',
                                     'tool_name': content_item.get('name'),
