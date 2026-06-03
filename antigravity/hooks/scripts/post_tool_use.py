@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Antigravity PostToolUse telemetry hook.
-
-Telemetry only. Posts the event to ``${gateway}/hooks/antigravity`` and
-exits 0 silently regardless of the response. Never blocks the agent.
-"""
+"""Antigravity PostToolUse telemetry hook. Fire-and-forget; never blocks."""
 
 import os
 import sys
@@ -12,17 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from _common import fire_and_forget_telemetry, read_stdin_event  # noqa: E402
 
-
-def main() -> int:
+try:
     event = read_stdin_event()
-    if event is None:
-        return 0
-    fire_and_forget_telemetry(event)
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        sys.exit(main())
-    except Exception:
-        sys.exit(0)
+    if event is not None:
+        fire_and_forget_telemetry(event)
+except Exception:
+    pass
+sys.exit(0)
