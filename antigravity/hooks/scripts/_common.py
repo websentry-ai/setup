@@ -20,10 +20,13 @@ The Antigravity wire format (verified against ``AgusRdz/chop``):
   nothing, exit 0. Never block the agent on our infra.
 """
 
+import http.client
 import json
 import os
-import subprocess
+import socket
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -151,6 +154,17 @@ def build_request_body(event: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Block redirects: returning None from ``redirect_request`` makes urllib
+    surface 3xx as an HTTPError instead of silently following the Location."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
 def post_to_gateway(
     body: Dict[str, Any],
     api_key: str,
@@ -159,39 +173,40 @@ def post_to_gateway(
 ) -> Optional[Dict[str, Any]]:
     """POST to ${gateway_url}/hooks/antigravity. Returns parsed JSON dict on
     HTTP 2xx with a JSON body, otherwise None. Fail-open by contract: any
-    exception, timeout, non-2xx, or non-JSON body returns None."""
+    exception, timeout, non-2xx, or non-JSON body returns None.
+
+    Uses urllib (not curl) so the Authorization header never appears on argv
+    — curl's argv is world-readable via ``ps auxe`` / ``/proc/<pid>/cmdline``
+    and would leak the bearer token to any local user. Redirects are blocked
+    via a custom opener: the gateway is a single hop, so following 3xx would
+    mask misconfig (unintended HTTP→HTTPS, proxy rewrite) instead of
+    surfacing it as a hard failure we can debug.
+    """
     if not api_key or not gateway_url:
         return None
     url = f"{gateway_url}{GATEWAY_HOOK_PATH}"
     try:
-        # No ``-L``: the gateway is a single hop and following redirects can
-        # mask misconfig (e.g. an unintended HTTP→HTTPS or proxy rewrite)
-        # rather than surfacing it as a hard failure we can debug.
-        result = subprocess.run(
-            [
-                "curl",
-                "-fsS",
-                "-X",
-                "POST",
-                "-H",
-                f"Authorization: Bearer {api_key}",
-                "-H",
-                "Content-Type: application/json",
-                "--data-binary",
-                "@-",
-                url,
-            ],
-            input=json.dumps(body).encode("utf-8"),
-            capture_output=True,
-            timeout=timeout,
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
         )
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        with _NO_REDIRECT_OPENER.open(req, timeout=timeout) as resp:
+            if not (200 <= resp.status < 300):
+                return None
+            raw = resp.read()
+    except (urllib.error.URLError, http.client.HTTPException, OSError,
+            socket.timeout, ValueError, UnicodeDecodeError):
         return None
 
-    if result.returncode != 0 or not result.stdout:
+    if not raw:
         return None
     try:
-        parsed = json.loads(result.stdout.decode("utf-8"))
+        parsed = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError):
         return None
     return parsed if isinstance(parsed, dict) else None
