@@ -181,6 +181,39 @@ class SelfUpdateTest(unittest.TestCase):
         unbound._check_self_update()
         self.assertFalse(self.lock.exists())
 
+    def test_heal_when_self_file_missing(self):
+        # dir exists (state/lock live here) but unbound.py is gone
+        self.assertFalse(self.script.exists())
+        self._set_remote(_script(DEFAULT, "v2"))
+        with patch.object(unbound, "UNBOUND_GATEWAY_URL", TENANT):
+            unbound._check_self_update()
+        self.assertTrue(self.script.exists())
+        out = self.script.read_text()
+        self.assertIn(f'"UNBOUND_GATEWAY_URL", "{TENANT}"', out)
+        self.assertIn("v2", out)
+
+    def test_heal_skips_when_recovered_url_invalid(self):
+        self._set_remote(_script(DEFAULT, "v2"))
+        with patch.object(unbound, "UNBOUND_GATEWAY_URL", "https://bad .com"):
+            unbound._check_self_update()
+        self.assertFalse(self.script.exists())
+
+    def test_heal_when_hooks_dir_missing(self):
+        # entire hooks dir gone — must be created before lock acquisition
+        missing = self.tmp / "nested" / "hooks"
+        script, state, lock = (missing / "unbound.py",
+                               missing / ".self_update_check",
+                               missing / ".self_update.lock")
+        self.assertFalse(missing.exists())
+        self._set_remote(_script(DEFAULT, "v2"))
+        with patch.object(unbound, "SELF_SCRIPT_PATH", script), \
+             patch.object(unbound, "SELF_UPDATE_STATE_PATH", state), \
+             patch.object(unbound, "SELF_UPDATE_LOCK_PATH", lock), \
+             patch.object(unbound, "UNBOUND_GATEWAY_URL", TENANT):
+            unbound._check_self_update()
+            self.assertTrue(script.exists())
+            self.assertIn(f'"UNBOUND_GATEWAY_URL", "{TENANT}"', script.read_text())
+
 
 if __name__ == "__main__":
     unittest.main()
