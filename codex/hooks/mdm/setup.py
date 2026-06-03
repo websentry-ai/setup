@@ -1312,10 +1312,11 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
-    """Walk each user's ~/.codex/sessions and seed historical sessions.
+    """Walk every user's ~/.codex/sessions and seed historical sessions.
 
-    MDM /get_application_api_key/ returns one per-device key. Only backfill when
-    exactly one user home is present to avoid mis-attributing transcripts."""
+    MDM /get_application_api_key/ returns one per-device key and attribution is
+    by device, so all profiles' history is seeded under that single key — the
+    same model as install, which configures every user profile."""
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -1325,12 +1326,13 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print("no user homes found — skipping backfill")
             return
 
-        if len(user_homes) > 1:
-            print(f"[backfill] Skipped: MDM device key can't span {len(user_homes)} user homes; run --backfill per account.", file=sys.stderr)
-            return
+        sessions = []
+        for username, home_dir in user_homes:
+            user_sessions = _run_as_user(username, _backfill_collect_sessions, home_dir) or []
+            if user_sessions:
+                debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
+                sessions.extend(user_sessions)
 
-        username, home_dir = user_homes[0]
-        sessions = _run_as_user(username, _backfill_collect_sessions, home_dir) or []
         if not sessions:
             print("[backfill] No past sessions found.")
             return
