@@ -1182,12 +1182,24 @@ def _replace_self(new_bytes: bytes) -> None:
 def _check_self_update() -> None:
     # refresh hook from main, throttled per interval
     try:
-        if not _self_update_due() or not _acquire_self_update_lock():
+        if not _self_update_due():
+            return
+        try:
+            SELF_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        if not _acquire_self_update_lock():
             return
         try:
             SELF_UPDATE_STATE_PATH.touch()  # one attempt per interval
-            local_bytes = SELF_SCRIPT_PATH.read_bytes()
-            gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
+            try:
+                local_bytes = SELF_SCRIPT_PATH.read_bytes()
+                gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
+            except OSError:
+                # self file gone — heal by re-pulling; recover tenant url
+                # from the running instance, no local file to read it from
+                local_bytes = None
+                gateway_url = UNBOUND_GATEWAY_URL
             if not _is_valid_gateway_url(gateway_url):
                 log_error("self_update skipped: invalid gateway url", 'self_update')
                 return
@@ -1205,7 +1217,7 @@ def _check_self_update() -> None:
                 log_error("self_update skipped: gateway url not preserved", 'self_update')
                 return
             new_bytes = new_text.encode("utf-8")
-            if hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
+            if local_bytes is None or hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
                 _replace_self(new_bytes)
         finally:
             SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
