@@ -199,7 +199,7 @@ def write_unbound_config(api_key: str, gateway_url: str) -> bool:
         config["api_key"] = api_key
         if gateway_url:
             config["gateway_url"] = gateway_url
-        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(config, indent=2))
         return True
@@ -335,8 +335,8 @@ def _build_event_entry(event: str, script_filename: str) -> Dict:
         "command": command,
         "timeout": TELEMETRY_TIMEOUT_SECONDS if event != "PreToolUse" else HOOK_TIMEOUT_SECONDS,
     }
-    # PostToolUse and SessionStart are telemetry — let them run async.
-    if event in ("PostToolUse", "SessionStart"):
+    # PostToolUse, UserPromptSubmit, and SessionStart are telemetry — let them run async.
+    if event in ("PostToolUse", "UserPromptSubmit", "SessionStart"):
         inner["async"] = True
     if is_windows:
         inner["shell"] = "powershell"

@@ -392,7 +392,7 @@ def _build_event_entry(event: str, script_path: Path) -> Dict:
         "command": command,
         "timeout": TELEMETRY_TIMEOUT_SECONDS if event != "PreToolUse" else HOOK_TIMEOUT_SECONDS,
     }
-    if event in ("PostToolUse", "SessionStart"):
+    if event in ("PostToolUse", "UserPromptSubmit", "SessionStart"):
         inner["async"] = True
     if is_windows:
         inner["shell"] = "powershell"
@@ -495,8 +495,10 @@ def _write_unbound_config_payload(home_dir: Path, api_key: str, gateway_url: str
 
 def install_for_user_payload(home_dir: Path, gateway_url: str, backend_url: str, api_key: str, script_templates: Dict[str, bytes]) -> bool:
     """Body of the per-user install. Runs inside the privilege-dropped fork.
-    All arguments are pickled across the fork boundary, so script bytes are
-    passed by value (we already read them as root before dropping).
+    Arguments are inherited from the parent via copy-on-write (os.fork), so
+    script bytes are passed by value (we already read them as root before
+    dropping). Only the return value is pickled back to the parent over the
+    write end of the pipe.
 
     Order matters: write ~/.unbound/config.json BEFORE settings.json so a
     settings.json failure never leaves the user with an entry-point hook
