@@ -13,6 +13,7 @@ and the top-level ``setup.main`` against an isolated ``HOME`` so the real
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
@@ -241,8 +242,8 @@ class TestFullInstallFlow(unittest.TestCase):
 
 class TestMatcherShape(unittest.TestCase):
     """Verify the matcher and event-key shape matches the Antigravity wire
-    format documented in the spike (PascalCase keys, regex alternation,
-    case-insensitive ``bash``/``Bash``)."""
+    format documented in the spike (PascalCase keys, catch-all matcher,
+    case-insensitive tool names handled server-side)."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -252,14 +253,55 @@ class TestMatcherShape(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_pre_tool_use_matcher_covers_both_bash_casings(self):
+    def _find_our_entry(self, event_list, expected_script_substr):
+        """Locate the entry whose hook command points at our installed script."""
+        for item in event_list:
+            for h in item.get("hooks", []):
+                if expected_script_substr in h.get("command", ""):
+                    return item
+        return None
+
+    def test_pre_tool_use_matcher_is_catch_all(self):
+        """PreToolUse must use ``"*"`` so unknown tools (WebFetch, WebSearch,
+        MultiEdit, NotebookEdit, TodoWrite, future tools) still trigger our
+        hook. Server-side filtering decides what's policy-relevant."""
         self.setup.configure_antigravity_settings()
         with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
         pre = settings["hooks"]["PreToolUse"]
-        # Our entry is the only one — find it and check matcher.
-        matchers = [item.get("matcher", "") for item in pre]
-        self.assertTrue(any("bash" in m and "Bash" in m for m in matchers))
+        ours = self._find_our_entry(pre, "unbound_pre_tool_use.py")
+        self.assertIsNotNone(ours, "our PreToolUse entry should be present")
+        self.assertEqual(ours.get("matcher"), "*")
+
+    def test_post_tool_use_matcher_is_catch_all(self):
+        self.setup.configure_antigravity_settings()
+        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        post = settings["hooks"]["PostToolUse"]
+        ours = self._find_our_entry(post, "unbound_post_tool_use.py")
+        self.assertIsNotNone(ours, "our PostToolUse entry should be present")
+        self.assertEqual(ours.get("matcher"), "*")
+
+    def test_matcher_does_not_allowlist_specific_tools(self):
+        """Regression: no entry we write may use a regex allowlist like
+        ``Bash|Write|Edit|...``. Any tool not in that list would silently
+        bypass the gate."""
+        self.setup.configure_antigravity_settings()
+        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        for event in ("PreToolUse", "PostToolUse"):
+            for item in settings["hooks"][event]:
+                # Only inspect entries that include our hook script.
+                if not any(
+                    "unbound_" in h.get("command", "")
+                    for h in item.get("hooks", [])
+                ):
+                    continue
+                matcher = item.get("matcher", "")
+                self.assertNotIn(
+                    "|", matcher,
+                    f"{event} matcher contains an allowlist: {matcher!r}",
+                )
 
     def test_user_prompt_submit_has_no_matcher(self):
         self.setup.configure_antigravity_settings()
@@ -269,6 +311,56 @@ class TestMatcherShape(unittest.TestCase):
         # Our entry should NOT have a matcher key.
         for item in ups:
             self.assertNotIn("matcher", item)
+
+
+class TestNotifySetupCompleteNoCurl(unittest.TestCase):
+    """Regression: ``notify_setup_complete`` MUST NOT shell out to ``curl``.
+    Passing ``X-API-KEY: <key>`` on curl's argv leaks the key to any other
+    user on the device via ``ps auxe`` / ``/proc/<pid>/cmdline``. The fix is
+    to use stdlib urllib (headers stay inside the process). We assert that
+    by putting a fake ``curl`` shim first on PATH and verifying it never
+    gets invoked."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp)
+        self.setup = _reload_setup_with_home(self.home)
+
+        # Fake curl shim that logs every invocation. If we still shell to
+        # curl, this log will contain entries.
+        bin_dir = self.home / "bin"
+        bin_dir.mkdir()
+        self.curl_log = self.home / "curl.log"
+        fake = bin_dir / "curl"
+        fake.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys\n"
+            f"with open({repr(str(self.curl_log))}, 'a') as f:\n"
+            "    f.write(' '.join(sys.argv) + '\\n')\n"
+            "sys.exit(0)\n"
+        )
+        os.chmod(fake, fake.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        self._old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{self._old_path}"
+
+    def tearDown(self):
+        os.environ["PATH"] = self._old_path
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_notify_setup_complete_does_not_invoke_curl(self):
+        """Drive notify_setup_complete() at an unreachable URL and assert
+        the curl shim was never executed. urllib raising URLError is fine —
+        the point is that the secret never appeared on any argv."""
+        # 127.0.0.1:1 is closed → urllib raises URLError. notify_setup_complete
+        # is fail-soft (try/except), so the call returns cleanly.
+        self.setup.notify_setup_complete(
+            api_key="super-secret-key",
+            backend_url="http://127.0.0.1:1",
+        )
+        self.assertFalse(
+            self.curl_log.exists(),
+            "curl was invoked from notify_setup_complete — API key leaked via argv",
+        )
 
 
 if __name__ == "__main__":

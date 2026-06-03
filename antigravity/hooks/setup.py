@@ -19,7 +19,7 @@ Wire format (verified against ``AgusRdz/chop``):
   Settings keys:  hooks.{PreToolUse,PostToolUse,UserPromptSubmit,SessionStart}
   Stdin payload:  snake_case  {session_id,cwd,hook_event_name,tool_name,tool_input}
   Stdout payload: camelCase   {hookSpecificOutput:{hookEventName,permissionDecision,...}}
-  Tool names:    accept both "bash" and "Bash" — matcher covers both casings.
+  Tool names:    accept both "bash" and "Bash" — gateway canonicalises casing.
 """
 
 import http.server
@@ -32,7 +32,9 @@ import socketserver
 import subprocess
 import sys
 import threading
+import urllib.error
 import urllib.parse
+import urllib.request
 import webbrowser
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -58,13 +60,16 @@ HOOK_EVENT_SCRIPTS: List[Tuple[str, str]] = [
     ("SessionStart", "unbound_session_start.py"),
 ]
 
-# Matchers per event (None == "no matcher", which is what
-# UserPromptSubmit/SessionStart take). For PreToolUse/PostToolUse, the matcher
-# is a regex alternation; we include both casings because Antigravity emits
-# both "bash" and "Bash" for the same logical tool.
+# Matchers per event. ``None`` means no ``matcher`` key in the emitted entry
+# (UserPromptSubmit/SessionStart never carry one). For PreToolUse/PostToolUse
+# we use the catch-all ``"*"`` so every tool — including WebFetch, WebSearch,
+# MultiEdit, NotebookEdit, TodoWrite, and any future Antigravity tool — runs
+# through the policy gate. Server-side filtering (gateway's
+# APP_NATIVE_FILE_TOOLS / tools_to_check) is the right place to defang;
+# matcher-level allowlists silently bypass our hook for any tool not listed.
 HOOK_EVENT_MATCHERS: Dict[str, Optional[str]] = {
-    "PreToolUse": "Bash|bash|Write|Edit|Read|Glob|Grep|Task",
-    "PostToolUse": "Bash|bash|Write|Edit|Read|Glob|Grep|Task",
+    "PreToolUse": "*",
+    "PostToolUse": "*",
     "UserPromptSubmit": None,
     "SessionStart": None,
 }
@@ -319,7 +324,8 @@ def _build_event_entry(event: str, script_filename: str) -> Dict:
     """Construct the matcher+hooks block for a single event.
 
     UserPromptSubmit and SessionStart take no matcher; PreToolUse and
-    PostToolUse use the case-insensitive ``Bash|bash|Write|...`` alternation.
+    PostToolUse use the catch-all ``"*"`` so every tool flows through the
+    policy gate (server-side filtering, not the matcher, is where we defang).
     """
     command, is_windows = _build_hook_command(script_filename)
     matcher = HOOK_EVENT_MATCHERS.get(event)
@@ -600,20 +606,27 @@ def clear_setup() -> None:
 # -----------------------------------------------------------------------------
 
 def notify_setup_complete(api_key: str, backend_url: str) -> None:
+    # Use stdlib urllib instead of shelling out to curl: passing the API key
+    # via curl's argv leaks it through ``ps auxe`` / ``/proc/<pid>/cmdline``
+    # to any other user on the device. urllib sets the header inside the
+    # process — argv stays secret-free.
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": UNBOUND_APP_LABEL})
-        subprocess.run(
-            [
-                "curl", "-fsSL", "-X", "POST",
-                "-H", f"X-API-KEY: {api_key}",
-                "-H", "Content-Type: application/json",
-                "--data-binary", "@-", url,
-            ],
-            input=data.encode(),
-            capture_output=True,
-            timeout=10,
+        body = json.dumps({"tool_type": UNBOUND_APP_LABEL}).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            method="POST",
+            headers={
+                "X-API-KEY": api_key,
+                "Content-Type": "application/json",
+            },
         )
+        try:
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except urllib.error.HTTPError as e:
+            debug_print(f"Setup-complete returned HTTP {e.code}")
         debug_print("Setup completion notification sent")
     except Exception as e:
         debug_print(f"Could not notify backend: {e}")

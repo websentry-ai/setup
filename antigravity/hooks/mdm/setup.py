@@ -25,6 +25,8 @@ import platform
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -45,9 +47,14 @@ HOOK_EVENT_SCRIPTS: List[Tuple[str, str]] = [
     ("SessionStart", "unbound_session_start.py"),
 ]
 
+# Catch-all matchers for tool-scoped events. A regex allowlist here silently
+# bypasses our hook for any tool not in the list (WebFetch, WebSearch,
+# MultiEdit, NotebookEdit, TodoWrite, future tools...). Server-side filtering
+# (gateway's APP_NATIVE_FILE_TOOLS / tools_to_check) is the right gate; the
+# matcher is the wrong place to defang.
 HOOK_EVENT_MATCHERS: Dict[str, Optional[str]] = {
-    "PreToolUse": "Bash|bash|Write|Edit|Read|Glob|Grep|Task",
-    "PostToolUse": "Bash|bash|Write|Edit|Read|Glob|Grep|Task",
+    "PreToolUse": "*",
+    "PostToolUse": "*",
     "UserPromptSubmit": None,
     "SessionStart": None,
 }
@@ -281,24 +288,39 @@ def get_device_identifier() -> Optional[str]:
 def fetch_api_key_from_mdm(
     base_url: str, app_name: Optional[str], auth_api_key: str, device_id: str
 ) -> Optional[str]:
+    # Use stdlib urllib instead of shelling out to curl: passing the bearer
+    # token via curl's argv leaks it through ``ps auxe`` /
+    # ``/proc/<pid>/cmdline`` to any other user on the device. urllib sets the
+    # header inside our own process — argv stays secret-free.
     params = f"serial_number={device_id}&app_type={UNBOUND_APP_LABEL}"
     if app_name:
         params = f"app_name={app_name}&{params}"
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
     debug_print(f"Fetching API key from: {url}")
     try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "-w", "\n%{http_code}",
-             "-H", f"Authorization: Bearer {auth_api_key}", url],
-            capture_output=True, text=True, timeout=30,
+        req = urllib.request.Request(
+            url,
+            method="GET",
+            headers={"Authorization": f"Bearer {auth_api_key}"},
         )
-        output_lines = result.stdout.strip().split("\n")
-        if len(output_lines) < 2:
-            print("Invalid response from server")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                http_code = resp.getcode()
+                body = resp.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            try:
+                err_body = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                err_body = ""
+            debug_print(f"HTTP {e.code} body: {err_body[:200]}")
+            print(f"API request failed with status {e.code}")
             return None
-        http_code = output_lines[-1]
-        body = "\n".join(output_lines[:-1])
-        if http_code != "200":
+        except urllib.error.URLError as e:
+            debug_print(f"URL error: {e}")
+            print("Failed to reach backend")
+            return None
+
+        if http_code != 200:
             print(f"API request failed with status {http_code}")
             return None
         data = json.loads(body)
@@ -307,9 +329,6 @@ def fetch_api_key_from_mdm(
             print("No api_key in response")
             return None
         return api_key
-    except subprocess.TimeoutExpired:
-        print("Request timed out")
-        return None
     except (json.JSONDecodeError, ValueError):
         print("Invalid JSON response from server")
         return None
@@ -407,10 +426,81 @@ def _atomic_write_json(path: Path, data: Dict) -> None:
     os.replace(tmp, path)
 
 
-def install_for_user_payload(home_dir: Path, gateway_url: str, script_templates: Dict[str, bytes]) -> bool:
+def _write_unbound_config_payload(home_dir: Path, api_key: str, gateway_url: str, backend_url: str) -> bool:
+    """Body of the per-user ~/.unbound/config.json write. Runs inside the
+    privilege-dropped fork so attacker-planted symlinks in $HOME can't
+    redirect a root write. Mirrors claude-code/hooks/mdm/setup.py's
+    write_unbound_config_for_user pattern: tighten perms, atomic write,
+    O_NOFOLLOW + 0o600.
+
+    This is what the runtime hook scripts read in
+    ``scripts/_common.py::load_credentials`` to authenticate to the gateway —
+    without it every PreToolUse silently fail-opens and the org policy is
+    never enforced."""
+    try:
+        config_dir = home_dir / ".unbound"
+        config_file = config_dir / "config.json"
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() != "windows":
+            try:
+                os.chmod(config_dir, 0o700)
+            except OSError:
+                pass
+
+        # Preserve unrelated fields a previous tool's setup may have written
+        # (e.g. claude-code writes the same file). Only api_key/gateway_url/
+        # backend_url are owned by us.
+        config: Dict = {}
+        if config_file.exists():
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    config = json.loads(f.read())
+                if not isinstance(config, dict):
+                    config = {}
+            except (json.JSONDecodeError, OSError):
+                config = {}
+
+        config["api_key"] = api_key
+        if gateway_url:
+            config["gateway_url"] = gateway_url
+        if backend_url:
+            config["backend_url"] = backend_url
+
+        # Atomic write via tmp + rename. O_NOFOLLOW on both the tmp open AND
+        # the rename target so a symlink at either path is refused. 0o600 so
+        # only the target user can read the secret.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        tmp = config_file.with_suffix(config_file.suffix + ".tmp")
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        fd = os.open(str(tmp), flags, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(config, indent=2))
+        os.replace(str(tmp), str(config_file))
+        # os.replace preserves the source's mode, but be defensive in case the
+        # rename target pre-existed with a wider mode and somehow survives.
+        if platform.system().lower() != "windows":
+            try:
+                os.chmod(config_file, 0o600)
+            except OSError:
+                pass
+        return True
+    except Exception as e:
+        debug_print(f"per-user config write failed in {home_dir}: {e}")
+        return False
+
+
+def install_for_user_payload(home_dir: Path, gateway_url: str, backend_url: str, api_key: str, script_templates: Dict[str, bytes]) -> bool:
     """Body of the per-user install. Runs inside the privilege-dropped fork.
     All arguments are pickled across the fork boundary, so script bytes are
-    passed by value (we already read them as root before dropping)."""
+    passed by value (we already read them as root before dropping).
+
+    Order matters: write ~/.unbound/config.json BEFORE settings.json so a
+    settings.json failure never leaves the user with an entry-point hook
+    that can't authenticate (which would fail-open every call)."""
     try:
         antigravity_dir = home_dir / ".antigravity"
         hooks_dir = antigravity_dir / "hooks"
@@ -418,6 +508,12 @@ def install_for_user_payload(home_dir: Path, gateway_url: str, script_templates:
 
         antigravity_dir.mkdir(parents=True, exist_ok=True)
         hooks_dir.mkdir(parents=True, exist_ok=True)
+
+        # 0. Write the credentials file FIRST. Hook scripts read this at
+        # runtime via _common.py::load_credentials; without it the PreToolUse
+        # gate silently fail-opens on every call.
+        if not _write_unbound_config_payload(home_dir, api_key, gateway_url, backend_url):
+            return False
 
         # 1. Write the shared helper, with the gateway URL baked in.
         common_bytes = script_templates["_common.py"]
@@ -444,7 +540,13 @@ def install_for_user_payload(home_dir: Path, gateway_url: str, script_templates:
         # 3. Non-destructive settings.json merge.
         if settings_path.exists():
             try:
-                with open(settings_path, "r", encoding="utf-8") as f:
+                # O_NOFOLLOW so an attacker-planted symlink at this path can't
+                # redirect our read (and the subsequent write) to a file outside
+                # the user's home. Matches the write side and the script-write
+                # loop above.
+                read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                fd = os.open(str(settings_path), read_flags)
+                with os.fdopen(fd, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 if not isinstance(settings, dict):
                     return False
@@ -616,20 +718,28 @@ def remove_policy_marker() -> None:
 
 
 def notify_setup_complete(api_key: str, backend_url: str, device_id: Optional[str]) -> None:
+    # Use stdlib urllib so the API key never appears on the curl argv —
+    # see fetch_api_key_from_mdm above for the same reason.
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        body = {"tool_type": UNBOUND_APP_LABEL}
+        body: Dict = {"tool_type": UNBOUND_APP_LABEL}
         if device_id:
             body["serial_number"] = device_id
-        data = json.dumps(body)
-        subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"X-API-KEY: {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True, timeout=10,
+        data = json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data,
+            method="POST",
+            headers={
+                "X-API-KEY": api_key,
+                "Content-Type": "application/json",
+            },
         )
+        try:
+            with urllib.request.urlopen(req, timeout=10):
+                pass
+        except urllib.error.HTTPError as e:
+            debug_print(f"Setup-complete returned HTTP {e.code}")
         debug_print("Setup completion notification sent")
     except Exception as e:
         debug_print(f"Could not notify backend: {e}")
@@ -659,7 +769,10 @@ def run_install(api_key: str, gateway_url: str, backend_url: str, device_id: Opt
 
     success_count = 0
     for username, home_dir in user_homes:
-        ok = _run_as_user(username, install_for_user_payload, home_dir, gateway_url, templates)
+        ok = _run_as_user(
+            username, install_for_user_payload,
+            home_dir, gateway_url, backend_url, api_key, templates,
+        )
         if ok:
             success_count += 1
             debug_print(f"Installed for {username}")

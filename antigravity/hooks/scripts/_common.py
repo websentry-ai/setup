@@ -164,10 +164,13 @@ def post_to_gateway(
         return None
     url = f"{gateway_url}{GATEWAY_HOOK_PATH}"
     try:
+        # No ``-L``: the gateway is a single hop and following redirects can
+        # mask misconfig (e.g. an unintended HTTP→HTTPS or proxy rewrite)
+        # rather than surfacing it as a hard failure we can debug.
         result = subprocess.run(
             [
                 "curl",
-                "-fsSL",
+                "-fsS",
                 "-X",
                 "POST",
                 "-H",
