@@ -697,8 +697,26 @@ def read_account_identity() -> Dict:
     }
 
 
+# DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
+# shared sentinel string (with a zero exit code), which would map many machines
+# onto one fake serial. Treat these as "no serial" and fall through.
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
+    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+    'to be filled by oem', 'system serial number', 'serial number',
+    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
+    'invalid', '123456789', 'xxxxxxxx',
+}
+
+
+def _valid_serial(value: Optional[str]) -> bool:
+    return bool(value) and value.strip().lower() not in _PLACEHOLDER_SERIALS
+
+
 def _get_device_serial() -> Optional[str]:
-    """Best-effort hardware serial, mirroring the MDM setup scripts."""
+    """Best-effort hardware serial, mirroring the MDM setup scripts. Filters known
+    OEM/VM placeholder values so two machines never collide on the same fake serial,
+    falling through to a stable per-install id (machine-id / MachineGuid) instead."""
     try:
         system = platform.system().lower()
         if system == 'darwin':
@@ -708,20 +726,20 @@ def _get_device_serial() -> Optional[str]:
                 for line in out.stdout.split('\n'):
                     if 'Serial Number' in line:
                         parts = line.split(': ', 1)
-                        if len(parts) >= 2 and parts[1].strip():
+                        if len(parts) >= 2 and _valid_serial(parts[1]):
                             return parts[1].strip()
         elif system == 'linux':
             try:
                 out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
                                      capture_output=True, text=True, timeout=10)
-                if out.returncode == 0 and out.stdout.strip():
+                if out.returncode == 0 and _valid_serial(out.stdout):
                     return out.stdout.strip()
             except Exception:
                 pass
             for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
                 try:
                     value = Path(path).read_text(encoding='utf-8').strip()
-                    if value:
+                    if _valid_serial(value):
                         return value
                 except Exception:
                     continue
@@ -730,7 +748,15 @@ def _get_device_serial() -> Optional[str]:
                 out = subprocess.run(['powershell', '-NoProfile', '-Command',
                                       '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
                                      capture_output=True, text=True, timeout=10)
-                if out.returncode == 0 and out.stdout.strip():
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
                     return out.stdout.strip()
             except Exception:
                 pass
