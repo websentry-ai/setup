@@ -7,7 +7,7 @@ Run from this directory (or anywhere) with:
 These tests exercise the actual setup entrypoint — they call into
 ``setup.configure_antigravity_settings``, ``setup.remove_hooks_from_settings``,
 and the top-level ``setup.main`` against an isolated ``HOME`` so the real
-``~/.antigravity`` is never touched.
+``~/.gemini/config/hooks.json`` and ``~/.unbound/`` are never touched.
 """
 
 import json
@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 def _reload_setup_with_home(home: Path):
     """Re-import setup with HOME pointing at the given temp dir so the
-    module-level path constants (ANTIGRAVITY_DIR, SETTINGS_PATH, etc.) all
+    module-level path constants (HOOKS_JSON_PATH, HOOKS_INSTALL_DIR, etc.) all
     pick up the test home. Returns the freshly imported module."""
     import importlib
     if "setup" in sys.modules:
@@ -41,7 +41,7 @@ def _reload_setup_with_home(home: Path):
 
 
 class TestSettingsMerge(unittest.TestCase):
-    """Verify the non-destructive merge into ~/.antigravity/settings.json."""
+    """Verify the non-destructive merge into ~/.gemini/config/hooks.json."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -58,14 +58,14 @@ class TestSettingsMerge(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _seed_third_party_settings(self):
-        """Pre-seed settings.json with an unrelated third-party hook so we
+        """Pre-seed hooks.json with an unrelated third-party hook so we
         can verify our merge doesn't clobber it."""
-        self.setup.SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        self.setup.HOOKS_JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
         third_party = {
             "hooks": {
                 "PreToolUse": [
                     {
-                        "matcher": "Bash",
+                        "matcher": "run_command",
                         "hooks": [
                             {"type": "command", "command": "/usr/local/bin/some-other-tool"}
                         ],
@@ -77,31 +77,59 @@ class TestSettingsMerge(unittest.TestCase):
             },
             "someUnrelatedSetting": True,
         }
-        with open(self.setup.SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "w", encoding="utf-8") as f:
             json.dump(third_party, f)
         return third_party
 
+    def test_install_path_is_gemini_config_hooks_json(self):
+        """Verified empirically: agy auto-loads ~/.gemini/config/hooks.json.
+        Regression lock-in — never reintroduce the old chop-derived
+        ~/.antigravity/settings.json path."""
+        expected = self.home / ".gemini" / "config" / "hooks.json"
+        self.assertEqual(self.setup.HOOKS_JSON_PATH, expected)
+        # And our scripts land under ~/.unbound/antigravity-hooks/ (Unbound's
+        # own namespace, not inside agy's tree).
+        self.assertEqual(
+            self.setup.HOOKS_INSTALL_DIR,
+            self.home / ".unbound" / "antigravity-hooks",
+        )
+
     def test_install_creates_settings_when_absent(self):
-        """install with no pre-existing settings.json writes a valid file."""
+        """install with no pre-existing hooks.json writes a valid file."""
         ok = self.setup.configure_antigravity_settings()
         self.assertTrue(ok)
-        self.assertTrue(self.setup.SETTINGS_PATH.exists())
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        self.assertTrue(self.setup.HOOKS_JSON_PATH.exists())
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        # All four events should have one entry — ours.
-        for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart"):
-            self.assertIn(event, settings["hooks"])
+        # Only PreToolUse and PostToolUse — agy doesn't actually fire the
+        # other event types in 1.0.5.
+        self.assertEqual(set(settings["hooks"].keys()), {"PreToolUse", "PostToolUse"})
+        for event in ("PreToolUse", "PostToolUse"):
             self.assertEqual(len(settings["hooks"][event]), 1)
+
+    def test_install_does_not_write_unsupported_events(self):
+        """Regression: UserPromptSubmit/SessionStart/PreInvocation/etc. must
+        not be installed — they're either silently dropped (UserPromptSubmit,
+        SessionStart) or log "executing command" but never spawn the process
+        (PreInvocation/PostInvocation/Stop) in agy 1.0.5."""
+        self.setup.configure_antigravity_settings()
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        for unsupported in (
+            "UserPromptSubmit", "SessionStart",
+            "PreInvocation", "PostInvocation", "Stop",
+        ):
+            self.assertNotIn(unsupported, settings["hooks"])
 
     def test_install_preserves_third_party_hooks(self):
         """Pre-existing third-party hooks must survive our install."""
         original = self._seed_third_party_settings()
         ok = self.setup.configure_antigravity_settings()
         self.assertTrue(ok)
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
 
-        # Third-party Bash hook must still be present in PreToolUse.
+        # Third-party run_command hook must still be present in PreToolUse.
         pre = settings["hooks"]["PreToolUse"]
         third_party_cmds = [
             h["command"]
@@ -119,10 +147,10 @@ class TestSettingsMerge(unittest.TestCase):
     def test_install_is_idempotent(self):
         """Running install twice produces the same on-disk state."""
         self.setup.configure_antigravity_settings()
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             first = f.read()
         self.setup.configure_antigravity_settings()
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             second = f.read()
         self.assertEqual(first, second)
 
@@ -135,7 +163,7 @@ class TestSettingsMerge(unittest.TestCase):
         status = self.setup.remove_hooks_from_settings()
         self.assertEqual(status, "cleared")
 
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
 
         # Third-party hooks remain.
@@ -151,19 +179,19 @@ class TestSettingsMerge(unittest.TestCase):
         self.assertTrue(settings["someUnrelatedSetting"])
 
     def test_install_clear_roundtrip_no_third_party(self):
-        """install then clear on a clean slate returns settings.json to a state
+        """install then clear on a clean slate returns hooks.json to a state
         with no Unbound traces. ``hooks`` should be entirely gone."""
         self.setup.configure_antigravity_settings()
         self.setup.remove_hooks_from_settings()
 
         # The file may still exist but should have no `hooks` key.
-        if self.setup.SETTINGS_PATH.exists():
-            with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        if self.setup.HOOKS_JSON_PATH.exists():
+            with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
                 settings = json.load(f)
             self.assertNotIn("hooks", settings)
 
     def test_clear_when_nothing_installed(self):
-        """clear with no settings.json returns not_found and does nothing."""
+        """clear with no hooks.json returns not_found and does nothing."""
         status = self.setup.remove_hooks_from_settings()
         self.assertEqual(status, "not_found")
 
@@ -184,7 +212,7 @@ class TestFullInstallFlow(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_main_with_api_key_installs_files_and_settings(self):
-        """``setup.py --api-key X`` writes settings.json and all four scripts."""
+        """``setup.py --api-key X`` writes hooks.json and both scripts."""
         old_argv = sys.argv
         sys.argv = ["setup.py", "--api-key", "test-api-key"]
         try:
@@ -193,14 +221,13 @@ class TestFullInstallFlow(unittest.TestCase):
         finally:
             sys.argv = old_argv
 
-        # Settings file exists and lists every event.
-        self.assertTrue(self.setup.SETTINGS_PATH.exists())
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        # hooks.json exists and lists only the two events agy actually fires.
+        self.assertTrue(self.setup.HOOKS_JSON_PATH.exists())
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart"):
-            self.assertIn(event, settings["hooks"])
+        self.assertEqual(set(settings["hooks"].keys()), {"PreToolUse", "PostToolUse"})
 
-        # All four hook scripts + _common.py exist on disk.
+        # Both hook scripts + _common.py exist on disk in ~/.unbound/antigravity-hooks/.
         for _event, installed_name in self.setup.HOOK_EVENT_SCRIPTS:
             self.assertTrue((self.setup.HOOKS_INSTALL_DIR / installed_name).exists())
         self.assertTrue((self.setup.HOOKS_INSTALL_DIR / "_common.py").exists())
@@ -233,17 +260,17 @@ class TestFullInstallFlow(unittest.TestCase):
         self.assertFalse((self.setup.HOOKS_INSTALL_DIR / "_common.py").exists())
         # Sentinel gone.
         self.assertFalse(self.setup.SENTINEL_PATH.exists())
-        # settings.json either gone or empty of hooks.
-        if self.setup.SETTINGS_PATH.exists():
-            with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        # hooks.json either gone or empty of hooks.
+        if self.setup.HOOKS_JSON_PATH.exists():
+            with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
                 settings = json.load(f)
             self.assertNotIn("hooks", settings)
 
 
 class TestMatcherShape(unittest.TestCase):
-    """Verify the matcher and event-key shape matches the Antigravity wire
-    format documented in the spike (PascalCase keys, catch-all matcher,
-    case-insensitive tool names handled server-side)."""
+    """Verify the matcher and event-key shape matches the agy wire format
+    documented in AGY-EMPIRICAL-FINDINGS.md (catch-all matcher, only the two
+    events agy actually fires)."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -262,32 +289,32 @@ class TestMatcherShape(unittest.TestCase):
         return None
 
     def test_pre_tool_use_matcher_is_catch_all(self):
-        """PreToolUse must use ``"*"`` so unknown tools (WebFetch, WebSearch,
-        MultiEdit, NotebookEdit, TodoWrite, future tools) still trigger our
+        """PreToolUse must use the empty-string catch-all so unknown tools
+        (browser/*, notebook/*, subagent/*, future tools) still trigger our
         hook. Server-side filtering decides what's policy-relevant."""
         self.setup.configure_antigravity_settings()
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
         pre = settings["hooks"]["PreToolUse"]
         ours = self._find_our_entry(pre, "unbound_pre_tool_use.py")
         self.assertIsNotNone(ours, "our PreToolUse entry should be present")
-        self.assertEqual(ours.get("matcher"), "*")
+        self.assertEqual(ours.get("matcher"), "")
 
     def test_post_tool_use_matcher_is_catch_all(self):
         self.setup.configure_antigravity_settings()
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
         post = settings["hooks"]["PostToolUse"]
         ours = self._find_our_entry(post, "unbound_post_tool_use.py")
         self.assertIsNotNone(ours, "our PostToolUse entry should be present")
-        self.assertEqual(ours.get("matcher"), "*")
+        self.assertEqual(ours.get("matcher"), "")
 
     def test_matcher_does_not_allowlist_specific_tools(self):
         """Regression: no entry we write may use a regex allowlist like
-        ``Bash|Write|Edit|...``. Any tool not in that list would silently
-        bypass the gate."""
+        ``run_command|view_file|edit_file|...``. Any tool not in that list
+        would silently bypass the gate."""
         self.setup.configure_antigravity_settings()
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(self.setup.HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
         for event in ("PreToolUse", "PostToolUse"):
             for item in settings["hooks"][event]:
@@ -302,15 +329,6 @@ class TestMatcherShape(unittest.TestCase):
                     "|", matcher,
                     f"{event} matcher contains an allowlist: {matcher!r}",
                 )
-
-    def test_user_prompt_submit_has_no_matcher(self):
-        self.setup.configure_antigravity_settings()
-        with open(self.setup.SETTINGS_PATH, "r", encoding="utf-8") as f:
-            settings = json.load(f)
-        ups = settings["hooks"]["UserPromptSubmit"]
-        # Our entry should NOT have a matcher key.
-        for item in ups:
-            self.assertNotIn("matcher", item)
 
 
 class TestNotifySetupCompleteNoCurl(unittest.TestCase):

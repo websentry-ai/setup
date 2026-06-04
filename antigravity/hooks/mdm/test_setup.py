@@ -5,7 +5,7 @@ Run from this directory:
     cd antigravity/hooks/mdm && python3 -m unittest test_setup.py -v
 
 These tests drive the privilege-dropped install payload against a tmpdir-rooted
-fake home so the real ``/Users/<you>/.antigravity`` is never touched.
+fake home so the real ``~/.gemini/config/hooks.json`` is never touched.
 
 What they cover (and why):
 
@@ -16,15 +16,19 @@ What they cover (and why):
    never enforced.
 
 2. ``install_for_user_payload`` (called from inside the fork) drops the
-   config file BEFORE the settings.json merge, so a settings.json failure
+   config file BEFORE the hooks.json merge, so a hooks.json failure
    never strands a half-installed device with a hook entry pointing at a
    config that doesn't exist.
 
-3. The matcher shape uses the catch-all ``"*"``, not the regex allowlist
-   that hardcoded the tool list. Any future tool (WebFetch, WebSearch,
-   MultiEdit, NotebookEdit, TodoWrite, ...) still hits our gate.
+3. The matcher shape uses the catch-all ``""`` (verified to fire on every
+   tool), not a regex allowlist that hardcoded the tool list. Any future
+   tool (browser/*, notebook/*, subagent/*) still hits our gate.
 
-4. ``notify_setup_complete`` + ``fetch_api_key_from_mdm`` do NOT shell out
+4. Only the two events agy 1.0.5 actually fires (PreToolUse, PostToolUse)
+   are installed. UserPromptSubmit/SessionStart/PreInvocation/etc. are
+   non-functional in agy and must not be written.
+
+5. ``notify_setup_complete`` + ``fetch_api_key_from_mdm`` do NOT shell out
    to ``curl`` — passing the API key via curl's argv leaks it to any other
    user on the device through ``ps auxe``.
 """
@@ -47,7 +51,7 @@ import setup as mdm_setup  # noqa: E402
 
 class TestWriteUnboundConfig(unittest.TestCase):
     """``_write_unbound_config_payload`` is the fix for CRITICAL #1: MDM was
-    installing scripts + settings.json but never the credentials file the
+    installing scripts + hooks.json but never the credentials file the
     hook scripts read at runtime."""
 
     def setUp(self):
@@ -117,7 +121,7 @@ class TestWriteUnboundConfig(unittest.TestCase):
 class TestInstallForUserPayload(unittest.TestCase):
     """The full per-user install body. Drives it directly (without the fork)
     against a tmpdir home and asserts the credentials file, scripts, and
-    settings.json all land."""
+    hooks.json all land at the agy-verified paths."""
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -135,7 +139,7 @@ class TestInstallForUserPayload(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_install_writes_config_scripts_and_settings(self):
+    def test_install_writes_config_scripts_and_hooks_json(self):
         ok = mdm_setup.install_for_user_payload(
             self.home,
             gateway_url="https://gw.example.test",
@@ -152,24 +156,24 @@ class TestInstallForUserPayload(unittest.TestCase):
             cfg = json.load(f)
         self.assertEqual(cfg["api_key"], "install-key")
 
-        # 2. All four hook scripts + _common.py exist.
-        hooks_dir = self.home / ".antigravity" / "hooks"
+        # 2. Both hook scripts + _common.py exist under our namespace.
+        hooks_dir = self.home / ".unbound" / "antigravity-hooks"
         for _event, installed_name in mdm_setup.HOOK_EVENT_SCRIPTS:
             self.assertTrue((hooks_dir / installed_name).exists())
         self.assertTrue((hooks_dir / "_common.py").exists())
 
-        # 3. settings.json lists every event.
-        settings_path = self.home / ".antigravity" / "settings.json"
-        self.assertTrue(settings_path.exists())
-        with open(settings_path, "r", encoding="utf-8") as f:
+        # 3. hooks.json landed at ~/.gemini/config/ (the path agy auto-loads)
+        # and lists only the two events agy actually fires.
+        hooks_json_path = self.home / ".gemini" / "config" / "hooks.json"
+        self.assertTrue(hooks_json_path.exists())
+        with open(hooks_json_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "SessionStart"):
-            self.assertIn(event, settings["hooks"])
+        self.assertEqual(set(settings["hooks"].keys()), {"PreToolUse", "PostToolUse"})
 
-    def test_matchers_are_catch_all(self):
-        """CRITICAL #3 regression: PreToolUse and PostToolUse matchers must
-        be ``"*"``, not a tool-name allowlist. Any tool not in the list
-        would silently bypass the gate."""
+    def test_does_not_write_unsupported_events(self):
+        """Regression: agy 1.0.5 silently drops UserPromptSubmit/SessionStart
+        and logs-but-never-runs PreInvocation/PostInvocation/Stop. Don't
+        install hooks we know won't fire."""
         ok = mdm_setup.install_for_user_payload(
             self.home,
             gateway_url="https://gw.test",
@@ -179,7 +183,30 @@ class TestInstallForUserPayload(unittest.TestCase):
         )
         self.assertTrue(ok)
 
-        with open(self.home / ".antigravity" / "settings.json", "r", encoding="utf-8") as f:
+        hooks_json_path = self.home / ".gemini" / "config" / "hooks.json"
+        with open(hooks_json_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        for unsupported in (
+            "UserPromptSubmit", "SessionStart",
+            "PreInvocation", "PostInvocation", "Stop",
+        ):
+            self.assertNotIn(unsupported, settings["hooks"])
+
+    def test_matchers_are_catch_all(self):
+        """CRITICAL #3 regression: PreToolUse and PostToolUse matchers must
+        be ``""`` (verified empirically as catch-all), not a tool-name
+        allowlist. Any tool not in the list would silently bypass the gate."""
+        ok = mdm_setup.install_for_user_payload(
+            self.home,
+            gateway_url="https://gw.test",
+            backend_url="https://be.test",
+            api_key="k",
+            script_templates=self.templates,
+        )
+        self.assertTrue(ok)
+
+        hooks_json_path = self.home / ".gemini" / "config" / "hooks.json"
+        with open(hooks_json_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
 
         for event in ("PreToolUse", "PostToolUse"):
@@ -192,24 +219,24 @@ class TestInstallForUserPayload(unittest.TestCase):
                 if ours:
                     break
             self.assertIsNotNone(ours, f"no Unbound entry in {event}")
-            self.assertEqual(ours.get("matcher"), "*", f"{event} matcher not catch-all")
+            self.assertEqual(ours.get("matcher"), "", f"{event} matcher not catch-all")
             # Hard regression assertion: no allowlist alternation.
             self.assertNotIn("|", ours.get("matcher", ""))
 
-    def test_config_written_before_settings(self):
-        """Ordering invariant: if settings.json write fails we MUST still
+    def test_config_written_before_hooks_json(self):
+        """Ordering invariant: if hooks.json write fails we MUST still
         have written the credentials file. (If the order were reversed, a
-        crash between steps could leave settings.json pointing at scripts
+        crash between steps could leave hooks.json pointing at scripts
         that have no creds to read.)"""
         original = mdm_setup._atomic_write_json
         seen_config_first = {"value": False}
 
         def boom(*a, **kw):
-            # By the time we try to write settings.json, the config file must
+            # By the time we try to write hooks.json, the config file must
             # already exist.
             cfg = self.home / ".unbound" / "config.json"
             seen_config_first["value"] = cfg.exists()
-            raise OSError("simulated settings.json failure")
+            raise OSError("simulated hooks.json failure")
 
         try:
             mdm_setup._atomic_write_json = boom
@@ -223,27 +250,27 @@ class TestInstallForUserPayload(unittest.TestCase):
         finally:
             mdm_setup._atomic_write_json = original
 
-        # The install should have failed (settings write raised), but the
+        # The install should have failed (hooks.json write raised), but the
         # config file should have landed first.
         self.assertFalse(ok)
         self.assertTrue(
             seen_config_first["value"],
-            "config.json was not written before settings.json — ordering bug",
+            "config.json was not written before hooks.json — ordering bug",
         )
 
 
 class TestUnknownToolHitsHook(unittest.TestCase):
-    """CRITICAL #3: an unfamiliar tool_name like ``WebFetch`` must still
+    """CRITICAL #3: an unfamiliar tool_name like ``browser_drag`` must still
     match the entry we install. With the old allowlist
-    ``Bash|bash|Write|Edit|Read|Glob|Grep|Task`` it would not. With ``*``
-    it does."""
+    ``Bash|bash|Write|Edit|Read|Glob|Grep|Task`` it would not. With ``""``
+    it does (verified empirically — empty matcher = catch-all)."""
 
-    def test_webfetch_matches_catch_all(self):
+    def test_unknown_tool_matches_catch_all(self):
         entry = mdm_setup._build_event_entry(
             "PreToolUse", Path("/tmp/unbound_pre_tool_use.py"),
         )
         # The catch-all matcher means: anything matches.
-        self.assertEqual(entry.get("matcher"), "*")
+        self.assertEqual(entry.get("matcher"), "")
 
 
 class TestNotifySetupCompleteNoCurl(unittest.TestCase):

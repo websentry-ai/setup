@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""User-level Unbound hooks installer for Antigravity 2.0.
+"""User-level Unbound hooks installer for Antigravity (agy 1.0.5+).
 
 Mirrors the flag surface and idioms of ``claude-code/hooks/setup.py``:
 
@@ -9,17 +9,18 @@ Mirrors the flag surface and idioms of ``claude-code/hooks/setup.py``:
   --backend-url <url>      Backend host for setup-complete notifications.
   --gateway-url <url>      Unbound gateway base URL (baked into hook scripts).
   --clear                  Surgically remove only our entries from
-                           ~/.antigravity/settings.json + delete our scripts.
+                           ~/.gemini/config/hooks.json + delete our scripts.
   --backfill               No-op for Antigravity (no transcript store yet) —
                            accepted for CLI compatibility with other tools.
   --debug                  Verbose logging.
 
-Wire format (verified against ``AgusRdz/chop``):
-  Settings file:  ~/.antigravity/settings.json
-  Settings keys:  hooks.{PreToolUse,PostToolUse,UserPromptSubmit,SessionStart}
-  Stdin payload:  snake_case  {session_id,cwd,hook_event_name,tool_name,tool_input}
-  Stdout payload: camelCase   {hookSpecificOutput:{hookEventName,permissionDecision,...}}
-  Tool names:    accept both "bash" and "Bash" — gateway canonicalises casing.
+Wire format (verified empirically against agy 1.0.5, see
+``AGY-EMPIRICAL-FINDINGS.md``):
+  Hooks file:    ~/.gemini/config/hooks.json
+  Hooks file keys: hooks.{PreToolUse,PostToolUse}
+  Stdin payload: camelCase  {conversationId,stepIdx,toolCall:{name,args},...}
+  Stdout payload: bare native-proto  {decision,reason}
+  Tool names:    agy-native lowercase (run_command, view_file, edit_file, ...)
 """
 
 import http.server
@@ -44,34 +45,34 @@ DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
 UNBOUND_APP_LABEL = "antigravity"
 
-# Directory layout inside the user's home, post-install.
-ANTIGRAVITY_DIR = Path.home() / ".antigravity"
-SETTINGS_PATH = ANTIGRAVITY_DIR / "settings.json"
-HOOKS_INSTALL_DIR = ANTIGRAVITY_DIR / "hooks"
-SENTINEL_PATH = ANTIGRAVITY_DIR / ".unbound-installed.json"
+# agy auto-loads hooks from ~/.gemini/config/hooks.json. Verified empirically;
+# the older chop-derived path (~/.antigravity/settings.json) is not read.
+GEMINI_CONFIG_DIR = Path.home() / ".gemini" / "config"
+HOOKS_JSON_PATH = GEMINI_CONFIG_DIR / "hooks.json"
 
-# Hook event → installed script filename. The PRE_ event is the only one whose
-# stdout actually influences the agent; the rest are telemetry. Filenames are
-# prefixed with `unbound_` so `--clear` can identify exactly what we wrote.
+# Hook scripts live under our own namespace, not inside agy's config tree —
+# keeps Unbound artifacts together with ~/.unbound/config.json so --clear has
+# one place to look and so agy upgrades can't surprise-delete our scripts.
+UNBOUND_DIR = Path.home() / ".unbound"
+HOOKS_INSTALL_DIR = UNBOUND_DIR / "antigravity-hooks"
+SENTINEL_PATH = HOOKS_INSTALL_DIR / ".unbound-installed.json"
+
+# Only PreToolUse and PostToolUse actually wire through to user-supplied
+# commands in agy 1.0.5. UserPromptSubmit/SessionStart are silently dropped at
+# parse time; PreInvocation/PostInvocation/Stop register and log "executing
+# command" but never spawn the process. Don't install hooks we know won't fire.
 HOOK_EVENT_SCRIPTS: List[Tuple[str, str]] = [
     ("PreToolUse", "unbound_pre_tool_use.py"),
     ("PostToolUse", "unbound_post_tool_use.py"),
-    ("UserPromptSubmit", "unbound_user_prompt_submit.py"),
-    ("SessionStart", "unbound_session_start.py"),
 ]
 
-# Matchers per event. ``None`` means no ``matcher`` key in the emitted entry
-# (UserPromptSubmit/SessionStart never carry one). For PreToolUse/PostToolUse
-# we use the catch-all ``"*"`` so every tool — including WebFetch, WebSearch,
-# MultiEdit, NotebookEdit, TodoWrite, and any future Antigravity tool — runs
-# through the policy gate. Server-side filtering (gateway's
-# APP_NATIVE_FILE_TOOLS / tools_to_check) is the right place to defang;
-# matcher-level allowlists silently bypass our hook for any tool not listed.
+# Catch-all matcher for both events. ``""`` (empty string) is verified to fire
+# on every tool. Server-side filtering (gateway's APP_NATIVE_FILE_TOOLS /
+# tools_to_check) is where we defang; the matcher is the wrong place to
+# allowlist — any tool not in the regex would silently bypass our hook.
 HOOK_EVENT_MATCHERS: Dict[str, Optional[str]] = {
-    "PreToolUse": "*",
-    "PostToolUse": "*",
-    "UserPromptSubmit": None,
-    "SessionStart": None,
+    "PreToolUse": "",
+    "PostToolUse": "",
 }
 
 HOOK_TIMEOUT_SECONDS = 15
@@ -261,8 +262,8 @@ def _install_one_script(src_filename: str, dest_path: Path) -> bool:
 
 
 def install_hook_scripts(gateway_url: str) -> bool:
-    """Install the four hook scripts plus the _common helper into
-    ``~/.antigravity/hooks/``. Bake the gateway_url into _common.py so
+    """Install the two hook scripts plus the _common helper into
+    ``~/.unbound/antigravity-hooks/``. Bake the gateway_url into _common.py so
     tenant deployments don't depend on env vars at runtime."""
     HOOKS_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -272,7 +273,7 @@ def install_hook_scripts(gateway_url: str) -> bool:
         return False
     rewrite_gateway_url_in_file(common_dest, gateway_url)
 
-    # 2. The four event scripts. Each gets a stable name so --clear can find them.
+    # 2. The two event scripts. Each gets a stable name so --clear can find them.
     for _event, installed_name in HOOK_EVENT_SCRIPTS:
         # Source filename mirrors event name without the unbound_ prefix.
         src = installed_name.replace("unbound_", "", 1)
@@ -305,7 +306,7 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
 
 
 # -----------------------------------------------------------------------------
-# settings.json merge / unmerge
+# hooks.json merge / unmerge
 # -----------------------------------------------------------------------------
 
 def _build_hook_command(script_filename: str) -> Tuple[str, bool]:
@@ -323,35 +324,32 @@ def _build_hook_command(script_filename: str) -> Tuple[str, bool]:
 def _build_event_entry(event: str, script_filename: str) -> Dict:
     """Construct the matcher+hooks block for a single event.
 
-    UserPromptSubmit and SessionStart take no matcher; PreToolUse and
-    PostToolUse use the catch-all ``"*"`` so every tool flows through the
-    policy gate (server-side filtering, not the matcher, is where we defang).
+    Both PreToolUse and PostToolUse use the catch-all ``""`` (verified to
+    fire on every tool). Server-side filtering, not the matcher, is where
+    we defang.
     """
     command, is_windows = _build_hook_command(script_filename)
-    matcher = HOOK_EVENT_MATCHERS.get(event)
+    matcher = HOOK_EVENT_MATCHERS.get(event, "")
 
     inner: Dict = {
         "type": "command",
         "command": command,
         "timeout": TELEMETRY_TIMEOUT_SECONDS if event != "PreToolUse" else HOOK_TIMEOUT_SECONDS,
     }
-    # PostToolUse, UserPromptSubmit, and SessionStart are telemetry — let them run async.
-    if event in ("PostToolUse", "UserPromptSubmit", "SessionStart"):
+    # PostToolUse is telemetry — let it run async.
+    if event == "PostToolUse":
         inner["async"] = True
     if is_windows:
         inner["shell"] = "powershell"
 
-    entry: Dict = {"hooks": [inner]}
-    if matcher is not None:
-        # Place "matcher" first to mirror the layout chop and Claude Code use.
-        entry = {"matcher": matcher, "hooks": [inner]}
-    return entry
+    # Place "matcher" first to mirror the layout chop and Claude Code use.
+    return {"matcher": matcher if matcher is not None else "", "hooks": [inner]}
 
 
 def _is_our_hook_command(command: str, is_windows: bool) -> bool:
     """Identify a hook entry we wrote. On Unix that's an exact match against
-    ``~/.antigravity/hooks/unbound_*.py``; on Windows we look for the install
-    dir substring because the command is wrapped in ``py -3 "..."``."""
+    ``~/.unbound/antigravity-hooks/unbound_*.py``; on Windows we look for the
+    install dir substring because the command is wrapped in ``py -3 "..."``."""
     if not command:
         return False
     install_prefix = str(HOOKS_INSTALL_DIR)
@@ -381,26 +379,26 @@ def _atomic_write_json(path: Path, data: Dict) -> None:
 
 
 def configure_antigravity_settings() -> bool:
-    """Non-destructively merge our hook entries into ~/.antigravity/settings.json.
+    """Non-destructively merge our hook entries into ~/.gemini/config/hooks.json.
 
     - Creates the file with ``{}`` if absent.
     - Preserves every existing hook entry that we did not write.
     - Idempotent: re-running install is a no-op if our entries are already present.
     """
     try:
-        if SETTINGS_PATH.exists():
+        if HOOKS_JSON_PATH.exists():
             try:
-                with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+                with open(HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
                     settings = json.load(f)
             except json.JSONDecodeError as e:
-                print(f"Failed to parse existing settings.json: {e}")
-                print("   Please check your settings.json file for syntax errors")
+                print(f"Failed to parse existing hooks.json: {e}")
+                print("   Please check your hooks.json file for syntax errors")
                 return False
         else:
             settings = {}
 
         if not isinstance(settings, dict):
-            print(f"Existing settings.json is not a JSON object; refusing to overwrite.")
+            print(f"Existing hooks.json is not a JSON object; refusing to overwrite.")
             return False
 
         if "hooks" not in settings or not isinstance(settings["hooks"], dict):
@@ -439,7 +437,7 @@ def configure_antigravity_settings() -> bool:
             if not already_present:
                 existing.append(our_entry)
 
-        _atomic_write_json(SETTINGS_PATH, settings)
+        _atomic_write_json(HOOKS_JSON_PATH, settings)
 
         sentinel = {"version": 1, "entries": sentinel_entries}
         _atomic_write_json(SENTINEL_PATH, sentinel)
@@ -457,7 +455,7 @@ def configure_antigravity_settings() -> bool:
 
 
 def remove_hooks_from_settings() -> str:
-    """Surgically remove our entries from settings.json. Returns
+    """Surgically remove our entries from hooks.json. Returns
     "cleared" | "not_found" | "failed".
 
     Pattern mirrors ``AgusRdz/chop:hooks/antigravity_install.go::antigravityUninstallFrom``:
@@ -465,16 +463,16 @@ def remove_hooks_from_settings() -> str:
     dir, drop the wrapping matcher entry if its hooks list ends empty, drop
     the event key if no entries remain, drop ``hooks`` if it ends empty.
     """
-    if not SETTINGS_PATH.exists():
+    if not HOOKS_JSON_PATH.exists():
         return "not_found"
 
     is_windows = platform.system().lower() == "windows"
 
     try:
-        with open(SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(HOOKS_JSON_PATH, "r", encoding="utf-8") as f:
             settings = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
-        print(f"Failed to read settings.json: {e}")
+        print(f"Failed to read hooks.json: {e}")
         return "failed"
 
     if not isinstance(settings, dict) or not isinstance(settings.get("hooks"), dict):
@@ -525,9 +523,9 @@ def remove_hooks_from_settings() -> str:
         return "not_found"
 
     try:
-        _atomic_write_json(SETTINGS_PATH, settings)
+        _atomic_write_json(HOOKS_JSON_PATH, settings)
     except OSError as e:
-        print(f"Failed to write settings.json: {e}")
+        print(f"Failed to write hooks.json: {e}")
         return "failed"
     return "cleared"
 
@@ -556,14 +554,14 @@ def clear_setup() -> None:
     any_cleared = False
     any_failed = False
 
-    # 1. Surgically remove our entries from settings.json.
+    # 1. Surgically remove our entries from hooks.json.
     settings_status = remove_hooks_from_settings()
     if settings_status == "cleared":
         any_cleared = True
     elif settings_status == "failed":
         any_failed = True
 
-    # 2. Delete each ~/.antigravity/hooks/unbound_*.py.
+    # 2. Delete each ~/.unbound/antigravity-hooks/unbound_*.py.
     if HOOKS_INSTALL_DIR.exists():
         for _event, installed_name in HOOK_EVENT_SCRIPTS:
             status = _delete_path(HOOKS_INSTALL_DIR / installed_name, installed_name)
@@ -577,6 +575,12 @@ def clear_setup() -> None:
             any_cleared = True
         elif status == "failed":
             any_failed = True
+        # 3. Drop the sentinel (lives inside HOOKS_INSTALL_DIR).
+        sentinel_status = _delete_path(SENTINEL_PATH, "install sentinel")
+        if sentinel_status == "cleared":
+            any_cleared = True
+        elif sentinel_status == "failed":
+            any_failed = True
         # Drop the hooks dir if empty.
         try:
             if not any(HOOKS_INSTALL_DIR.iterdir()):
@@ -584,13 +588,6 @@ def clear_setup() -> None:
                 debug_print(f"Removed empty {HOOKS_INSTALL_DIR}")
         except OSError:
             pass
-
-    # 3. Drop the sentinel.
-    sentinel_status = _delete_path(SENTINEL_PATH, "install sentinel")
-    if sentinel_status == "cleared":
-        any_cleared = True
-    elif sentinel_status == "failed":
-        any_failed = True
 
     if any_cleared:
         print("Cleared")
@@ -696,9 +693,9 @@ def main() -> None:
         print("Failed to install hook scripts")
         sys.exit(1)
 
-    debug_print("Configuring Antigravity settings...")
+    debug_print("Configuring Antigravity hooks.json...")
     if not configure_antigravity_settings():
-        print("Failed to configure Antigravity settings")
+        print("Failed to configure Antigravity hooks.json")
         sys.exit(1)
 
     print("API key verified and added")

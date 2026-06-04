@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""MDM (device-wide) Unbound hooks installer for Antigravity 2.0.
+"""MDM (device-wide) Unbound hooks installer for Antigravity (agy 1.0.5+).
 
 Mirrors ``claude-code/hooks/mdm/setup.py``: enumerates user homes, drops
 privileges to each user, and runs the same user-level install logic against
-``~<user>/.antigravity/settings.json``.
+``~<user>/.gemini/config/hooks.json``.
 
   --api-key <key>          MDM admin API key, used to fetch a per-device key.
   --backend-url <url>      Backend host (default https://backend.getunbound.ai).
@@ -40,23 +40,22 @@ DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
 UNBOUND_APP_LABEL = "antigravity"
 
+# Only PreToolUse and PostToolUse actually wire through to user-supplied
+# commands in agy 1.0.5. UserPromptSubmit/SessionStart are silently dropped at
+# parse time; PreInvocation/PostInvocation/Stop register and log "executing
+# command" but never spawn the process. Don't install hooks we know won't fire.
 HOOK_EVENT_SCRIPTS: List[Tuple[str, str]] = [
     ("PreToolUse", "unbound_pre_tool_use.py"),
     ("PostToolUse", "unbound_post_tool_use.py"),
-    ("UserPromptSubmit", "unbound_user_prompt_submit.py"),
-    ("SessionStart", "unbound_session_start.py"),
 ]
 
-# Catch-all matchers for tool-scoped events. A regex allowlist here silently
-# bypasses our hook for any tool not in the list (WebFetch, WebSearch,
-# MultiEdit, NotebookEdit, TodoWrite, future tools...). Server-side filtering
-# (gateway's APP_NATIVE_FILE_TOOLS / tools_to_check) is the right gate; the
-# matcher is the wrong place to defang.
+# Catch-all matcher for both events. ``""`` (empty string) is verified to fire
+# on every tool. A regex allowlist here silently bypasses our hook for any
+# tool not in the list — server-side filtering (gateway's
+# APP_NATIVE_FILE_TOOLS / tools_to_check) is the right gate.
 HOOK_EVENT_MATCHERS: Dict[str, Optional[str]] = {
-    "PreToolUse": "*",
-    "PostToolUse": "*",
-    "UserPromptSubmit": None,
-    "SessionStart": None,
+    "PreToolUse": "",
+    "PostToolUse": "",
 }
 
 HOOK_TIMEOUT_SECONDS = 15
@@ -386,19 +385,17 @@ def _build_hook_command(script_path: Path) -> Tuple[str, bool]:
 
 def _build_event_entry(event: str, script_path: Path) -> Dict:
     command, is_windows = _build_hook_command(script_path)
-    matcher = HOOK_EVENT_MATCHERS.get(event)
+    matcher = HOOK_EVENT_MATCHERS.get(event, "")
     inner: Dict = {
         "type": "command",
         "command": command,
         "timeout": TELEMETRY_TIMEOUT_SECONDS if event != "PreToolUse" else HOOK_TIMEOUT_SECONDS,
     }
-    if event in ("PostToolUse", "UserPromptSubmit", "SessionStart"):
+    if event == "PostToolUse":
         inner["async"] = True
     if is_windows:
         inner["shell"] = "powershell"
-    if matcher is not None:
-        return {"matcher": matcher, "hooks": [inner]}
-    return {"hooks": [inner]}
+    return {"matcher": matcher if matcher is not None else "", "hooks": [inner]}
 
 
 def _is_our_hook_command(command: str, install_prefix: str, is_windows: bool) -> bool:
@@ -500,16 +497,21 @@ def install_for_user_payload(home_dir: Path, gateway_url: str, backend_url: str,
     dropping). Only the return value is pickled back to the parent over the
     write end of the pipe.
 
-    Order matters: write ~/.unbound/config.json BEFORE settings.json so a
-    settings.json failure never leaves the user with an entry-point hook
+    Order matters: write ~/.unbound/config.json BEFORE hooks.json so a
+    hooks.json failure never leaves the user with an entry-point hook
     that can't authenticate (which would fail-open every call)."""
     try:
-        antigravity_dir = home_dir / ".antigravity"
-        hooks_dir = antigravity_dir / "hooks"
-        settings_path = antigravity_dir / "settings.json"
+        # Hook scripts go under our own namespace (~/.unbound/antigravity-hooks/);
+        # the agy-readable hooks.json lives at ~/.gemini/config/hooks.json
+        # (verified empirically — that's the path agy auto-loads).
+        unbound_dir = home_dir / ".unbound"
+        hooks_dir = unbound_dir / "antigravity-hooks"
+        gemini_config_dir = home_dir / ".gemini" / "config"
+        hooks_json_path = gemini_config_dir / "hooks.json"
 
-        antigravity_dir.mkdir(parents=True, exist_ok=True)
+        unbound_dir.mkdir(parents=True, exist_ok=True)
         hooks_dir.mkdir(parents=True, exist_ok=True)
+        gemini_config_dir.mkdir(parents=True, exist_ok=True)
 
         # 0. Write the credentials file FIRST. Hook scripts read this at
         # runtime via _common.py::load_credentials; without it the PreToolUse
@@ -530,7 +532,7 @@ def install_for_user_payload(home_dir: Path, gateway_url: str, backend_url: str,
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(common_text)
 
-        # 2. Write the four event scripts.
+        # 2. Write the two event scripts.
         for _event, installed_name in HOOK_EVENT_SCRIPTS:
             src_name = installed_name.replace("unbound_", "", 1)
             script_bytes = script_templates[src_name]
@@ -539,15 +541,15 @@ def install_for_user_payload(home_dir: Path, gateway_url: str, backend_url: str,
             with os.fdopen(fd, "wb") as f:
                 f.write(script_bytes)
 
-        # 3. Non-destructive settings.json merge.
-        if settings_path.exists():
+        # 3. Non-destructive hooks.json merge.
+        if hooks_json_path.exists():
             try:
                 # O_NOFOLLOW so an attacker-planted symlink at this path can't
                 # redirect our read (and the subsequent write) to a file outside
                 # the user's home. Matches the write side and the script-write
                 # loop above.
                 read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-                fd = os.open(str(settings_path), read_flags)
+                fd = os.open(str(hooks_json_path), read_flags)
                 with os.fdopen(fd, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 if not isinstance(settings, dict):
@@ -584,7 +586,7 @@ def install_for_user_payload(home_dir: Path, gateway_url: str, backend_url: str,
             if not already_present:
                 existing.append(our_entry)
 
-        _atomic_write_json(settings_path, settings)
+        _atomic_write_json(hooks_json_path, settings)
         return True
     except Exception as e:
         debug_print(f"per-user install failed in {home_dir}: {e}")
@@ -595,19 +597,19 @@ def clear_for_user_payload(home_dir: Path) -> str:
     """Body of the per-user clear. Mirrors install_for_user_payload. Returns
     "cleared" | "not_found" | "failed"."""
     try:
-        antigravity_dir = home_dir / ".antigravity"
-        hooks_dir = antigravity_dir / "hooks"
-        settings_path = antigravity_dir / "settings.json"
+        unbound_dir = home_dir / ".unbound"
+        hooks_dir = unbound_dir / "antigravity-hooks"
+        hooks_json_path = home_dir / ".gemini" / "config" / "hooks.json"
         install_prefix = str(hooks_dir)
         is_windows = platform.system().lower() == "windows"
 
         any_cleared = False
         any_failed = False
 
-        # 1. Remove our hook entries from settings.json.
-        if settings_path.exists():
+        # 1. Remove our hook entries from hooks.json.
+        if hooks_json_path.exists():
             try:
-                with open(settings_path, "r", encoding="utf-8") as f:
+                with open(hooks_json_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 if isinstance(settings, dict) and isinstance(settings.get("hooks"), dict):
                     hooks_block = settings["hooks"]
@@ -650,10 +652,10 @@ def clear_for_user_payload(home_dir: Path) -> str:
                         del settings["hooks"]
                         modified = True
                     if modified:
-                        _atomic_write_json(settings_path, settings)
+                        _atomic_write_json(hooks_json_path, settings)
                         any_cleared = True
             except (json.JSONDecodeError, OSError) as e:
-                debug_print(f"Failed to clean {settings_path}: {e}")
+                debug_print(f"Failed to clean {hooks_json_path}: {e}")
                 any_failed = True
 
         # 2. Delete the installed scripts.

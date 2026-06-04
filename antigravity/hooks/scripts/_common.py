@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 """Shared helpers for Antigravity hook scripts.
 
-All four installed hook scripts (`unbound_pre_tool_use.py`,
-`unbound_post_tool_use.py`, `unbound_user_prompt_submit.py`,
-`unbound_session_start.py`) are deployed side-by-side into
-``~/.antigravity/hooks/`` by ``setup.py`` and import this file via a
-``sys.path`` insert at the top of each script.
+Both installed hook scripts (`unbound_pre_tool_use.py`,
+`unbound_post_tool_use.py`) are deployed side-by-side into
+``~/.unbound/antigravity-hooks/`` by ``setup.py`` and import this file
+via a ``sys.path`` insert at the top of each script.
 
-The Antigravity wire format (verified against ``AgusRdz/chop``):
+The Antigravity (agy 1.0.5) wire format, verified empirically (see
+``AGY-EMPIRICAL-FINDINGS.md``):
 
-- Stdin: snake_case
-  ``{"session_id","cwd","hook_event_name","tool_name","tool_input"}``
-- Stdout (only when overriding the default allow): camelCase
-  ``{"hookSpecificOutput": {"hookEventName", "permissionDecision",
-                            "updatedInput"?}}``
-- Tool names arrive as either ``"bash"`` or ``"Bash"`` for the same
-  logical tool — handle case-insensitively when matching.
+- Stdin: camelCase
+  ``{"artifactDirectoryPath","conversationId","stepIdx",
+     "toolCall":{"name","args":{<PascalCase keys>}},
+     "transcriptPath","workspacePaths":[...],
+     "error":""}``  (``error`` and ``toolCall: null`` are PostToolUse-only)
+- Env: ``ANTIGRAVITY_CONVERSATION_ID`` mirrors ``conversationId``.
+- Stdout (only when overriding the default allow): bare native-proto
+  ``{"decision": "allow"|"deny"|"ask", "reason": "<surfaced to model>"}``.
+  No ``hookSpecificOutput`` wrapper — chop's shape is wrong for agy.
+- Tool names are agy-native and lowercase (``run_command``, ``view_file``,
+  ``edit_file``, ``write_to_file``, ``codebase_search``, ``ask_permission``).
+  No ``bash`` / ``Bash`` duality.
 - Fail-open on any infra error (timeout, non-2xx, JSON parse): print
   nothing, exit 0. Never block the agent on our infra.
 """
@@ -40,7 +45,7 @@ UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 
 def read_stdin_event() -> Optional[Dict[str, Any]]:
-    """Read the Antigravity hook payload from stdin. Returns None on any error."""
+    """Read the agy hook payload from stdin. Returns None on any error."""
     try:
         raw = sys.stdin.read()
     except Exception:
@@ -81,67 +86,117 @@ def load_credentials() -> Dict[str, str]:
     return {"api_key": api_key, "gateway_url": gateway_url.rstrip("/")}
 
 
-def normalize_tool_name(tool_name: str) -> str:
-    """Antigravity emits both ``bash`` and ``Bash``; canonicalise to title-case
-    for matching against our APP_NATIVE_FILE_TOOLS mapping server-side."""
-    if not tool_name:
+def _coerce_str(value: Any) -> str:
+    """Stringify a value for the gateway's ``command`` field; never raise."""
+    if value is None:
         return ""
-    lower = tool_name.lower()
-    if lower == "bash":
-        return "Bash"
-    if lower == "websearch":
-        return "WebSearch"
-    if lower == "webfetch":
-        return "WebFetch"
-    # Title-case for common single-word tool names; passthrough for the rest.
-    return tool_name
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(value)
 
 
-def extract_command_for_pretool(event: Dict[str, Any]) -> str:
-    """Mirror ``codex/hooks/unbound.py::extract_command_for_pretool``.
+def _extract_command_and_metadata(tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Map agy's per-tool PascalCase args onto the gateway's ``command`` +
+    ``metadata`` shape. Unknown tools fall through to a JSON-stringified
+    args blob so we never crash on a tool we haven't taught the map yet."""
+    if not isinstance(args, dict):
+        args = {}
 
-    Returns the most-meaningful identifier for the tool invocation —
-    the command/path/pattern/query/prompt depending on tool_name.
-    """
-    tool_input = event.get("tool_input") or {}
-    if not isinstance(tool_input, dict):
-        return event.get("tool_name", "") or ""
+    if tool_name == "run_command":
+        command = _coerce_str(args.get("CommandLine"))
+        metadata: Dict[str, Any] = {}
+        if args.get("Cwd"):
+            metadata["cwd"] = args["Cwd"]
+        return {"command": command, "metadata": metadata}
 
-    tool_name = normalize_tool_name(event.get("tool_name", "") or "")
+    if tool_name == "view_file":
+        path = _coerce_str(args.get("AbsolutePath"))
+        return {"command": path, "metadata": {"file_path": path}}
 
-    if tool_name == "Bash" and "command" in tool_input:
-        return tool_input["command"] or ""
-    if tool_name in ("Write", "Edit", "Read") and "file_path" in tool_input:
-        return tool_input["file_path"] or ""
-    if tool_name == "Grep" and "pattern" in tool_input:
-        return tool_input["pattern"] or ""
-    if tool_name == "Glob" and "pattern" in tool_input:
-        return tool_input["pattern"] or ""
-    if tool_name == "WebFetch" and "url" in tool_input:
-        return tool_input["url"] or ""
-    if tool_name == "WebSearch" and "query" in tool_input:
-        return tool_input["query"] or ""
-    if tool_name == "Task" and "prompt" in tool_input:
-        return tool_input["prompt"] or ""
-    return tool_name
+    if tool_name == "edit_file":
+        target = _coerce_str(args.get("TargetFile"))
+        metadata = {"file_path": target}
+        if args.get("CodeMarkdownLanguage"):
+            metadata["code_markdown_language"] = args["CodeMarkdownLanguage"]
+        return {
+            "command": _coerce_str(args.get("Instruction")),
+            "metadata": metadata,
+        }
+
+    if tool_name == "write_to_file":
+        target = _coerce_str(args.get("TargetFile"))
+        return {"command": "", "metadata": {"file_path": target}}
+
+    if tool_name == "codebase_search":
+        query = _coerce_str(args.get("Query"))
+        metadata = {}
+        if args.get("TargetDirectories") is not None:
+            metadata["target_directories"] = args["TargetDirectories"]
+        return {"command": query, "metadata": metadata}
+
+    if tool_name == "ask_permission":
+        action = _coerce_str(args.get("Action"))
+        target = _coerce_str(args.get("Target"))
+        reason = _coerce_str(args.get("Reason"))
+        return {
+            "command": f"{action}: {target}".strip(": "),
+            "metadata": {"action": action, "target": target, "reason": reason},
+        }
+
+    # Fallback: stringify args opaquely so unknown tools don't crash.
+    return {"command": _coerce_str(args), "metadata": {"args": args}}
 
 
-def build_request_body(event: Dict[str, Any]) -> Dict[str, Any]:
+def build_request_body(event: Dict[str, Any], event_name: str) -> Dict[str, Any]:
     """Shape the gateway request body to match ``PretoolRequestBody`` in
-    ``ai-gateway/src/handlers/preToolUseHandler.ts:86-100``."""
-    tool_name = normalize_tool_name(event.get("tool_name", "") or "")
-    command = extract_command_for_pretool(event)
-    tool_input = event.get("tool_input") or {}
+    ``ai-gateway/src/handlers/preToolUseHandler.ts:86-100``.
 
-    metadata: Dict[str, Any] = {"hook_event_name": event.get("hook_event_name") or ""}
-    if event.get("cwd"):
-        metadata["cwd"] = event["cwd"]
-    if isinstance(tool_input, dict):
-        metadata["tool_input"] = tool_input
+    ``event_name`` is the script's identity (PreToolUse vs PostToolUse) —
+    agy's stdin payload has no ``hook_event_name`` field, so each script
+    knows its own event from its filename.
+    """
+    tool_call = event.get("toolCall") if isinstance(event, dict) else None
+    if isinstance(tool_call, dict):
+        tool_name = tool_call.get("name") or ""
+        tool_args = tool_call.get("args") or {}
+    else:
+        tool_name = ""
+        tool_args = {}
 
+    mapped = _extract_command_and_metadata(tool_name, tool_args if isinstance(tool_args, dict) else {})
+    command = mapped["command"]
+    metadata: Dict[str, Any] = mapped["metadata"] or {}
+
+    # Always tag the metadata with the hook event and a workspace hint if we
+    # have one — these are the two breadcrumbs the gateway uses for policy
+    # context that aren't already in the per-tool field map.
+    metadata["hook_event_name"] = event_name
+    workspaces = event.get("workspacePaths") if isinstance(event, dict) else None
+    if isinstance(workspaces, list) and workspaces:
+        first = workspaces[0]
+        if isinstance(first, str) and first:
+            metadata.setdefault("cwd", first)
+            metadata["workspace"] = first
+    if isinstance(event, dict) and event.get("stepIdx") is not None:
+        metadata["step_idx"] = event["stepIdx"]
+    if isinstance(event, dict) and event.get("error"):
+        metadata["error"] = event["error"]
+
+    conversation_id = ""
+    if isinstance(event, dict):
+        conversation_id = event.get("conversationId") or ""
+    if not conversation_id:
+        conversation_id = os.environ.get("ANTIGRAVITY_CONVERSATION_ID", "") or ""
+
+    # ``event_name: 'tool_use'`` matches claude-code/hooks/unbound.py — the
+    # gateway treats tool events under a single key regardless of which
+    # pre/post phase fired, the actual phase is in metadata.hook_event_name.
     return {
-        "conversation_id": event.get("session_id") or "",
-        "event_name": event.get("hook_event_name") or "",
+        "conversation_id": conversation_id,
+        "event_name": "tool_use",
         "unbound_app_label": UNBOUND_APP_LABEL,
         "model": "auto",
         "pre_tool_use_data": {
@@ -212,30 +267,30 @@ def post_to_gateway(
     return parsed if isinstance(parsed, dict) else None
 
 
-def emit_hook_output(event_name: str, decision: str, reason: str = "") -> None:
-    """Write the Antigravity stdout payload. Lowercase ``decision``,
-    PascalCase ``event_name``. Only call this when overriding the default
-    allow — silent (no stdout) is the canonical allow."""
+def emit_hook_output(decision: str, reason: str = "") -> None:
+    """Write the agy stdout payload. Bare native-proto shape:
+    ``{"decision": "...", "reason": "..."}``. No wrapper. Only call this
+    when overriding the default allow — empty stdout + exit 0 is the
+    canonical allow."""
     decision = (decision or "").lower()
     if decision not in ("allow", "deny", "ask"):
         return
-    payload: Dict[str, Any] = {
-        "hookSpecificOutput": {
-            "hookEventName": event_name,
-            "permissionDecision": decision,
-        }
-    }
+    payload: Dict[str, Any] = {"decision": decision}
     if reason:
-        payload["hookSpecificOutput"]["permissionDecisionReason"] = reason
+        payload["reason"] = reason
     sys.stdout.write(json.dumps(payload))
 
 
-def fire_and_forget_telemetry(event: Dict[str, Any]) -> None:
-    """Post-tool-use / user-prompt-submit / session-start telemetry. Best-effort,
-    fail-open, exits 0 silently. Used by the three non-decision hook scripts."""
+def fire_and_forget_telemetry(event: Dict[str, Any], event_name: str) -> None:
+    """Post-tool-use telemetry. Best-effort, fail-open, exits 0 silently.
+
+    For PostToolUse with ``toolCall: null`` (non-tool turns — agy fires this
+    on every step), the caller should skip this entirely; we don't have
+    enough context to make a useful telemetry record.
+    """
     creds = load_credentials()
     if not creds["api_key"]:
         return
-    body = build_request_body(event)
+    body = build_request_body(event, event_name)
     # Telemetry endpoints don't gate the agent — we don't even need the response.
     post_to_gateway(body, creds["api_key"], creds["gateway_url"])
