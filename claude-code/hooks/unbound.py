@@ -707,7 +707,7 @@ def _get_device_serial() -> Optional[str]:
             if out.returncode == 0:
                 for line in out.stdout.split('\n'):
                     if 'Serial Number' in line:
-                        parts = line.split(': ')
+                        parts = line.split(': ', 1)
                         if len(parts) >= 2 and parts[1].strip():
                             return parts[1].strip()
         elif system == 'linux':
