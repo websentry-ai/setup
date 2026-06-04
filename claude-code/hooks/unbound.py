@@ -632,7 +632,7 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
         if cwd:
             projects = config.get('projects', {})
             if isinstance(projects, dict):
-                cwd_path = cwd.rstrip('/')
+                cwd_path = cwd.replace('\\', '/').rstrip('/')
                 while cwd_path:
                     proj_data = projects.get(cwd_path)
                     if isinstance(proj_data, dict):
