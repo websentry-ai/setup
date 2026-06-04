@@ -11,6 +11,7 @@ import time
 import hashlib
 import re
 import tempfile
+import platform
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -44,6 +45,7 @@ DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
@@ -673,14 +675,14 @@ def read_account_identity() -> Dict:
     org_id = None
     plan = None
     auth_mode = None
-    email_domain = None
+    email = None
     try:
         config = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
         oauth = config.get('oauthAccount')
         if isinstance(oauth, dict):
             org_id = oauth.get('organizationUuid') or None
             plan = oauth.get('organizationType') or None
-            email_domain = _email_domain(oauth.get('emailAddress'))
+            email = oauth.get('emailAddress') or None
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
@@ -690,12 +692,107 @@ def read_account_identity() -> Dict:
         'org_id': org_id,
         'plan': plan,
         'auth_mode': auth_mode,
-        'email_domain': email_domain,
+        'user_email': email,
+        'email_domain': _email_domain(email),
     }
 
 
-def build_account_identity() -> Dict:
-    return read_account_identity()
+def _get_device_serial() -> Optional[str]:
+    """Best-effort hardware serial, mirroring the MDM setup scripts."""
+    try:
+        system = platform.system().lower()
+        if system == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPHardwareDataType'],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                for line in out.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ')
+                        if len(parts) >= 2 and parts[1].strip():
+                            return parts[1].strip()
+        elif system == 'linux':
+            try:
+                out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                try:
+                    value = Path(path).read_text(encoding='utf-8').strip()
+                    if value:
+                        return value
+                except Exception:
+                    continue
+        elif system == 'windows':
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _device_serial(probe: bool = True) -> Optional[str]:
+    """Hardware serial, computed once and cached. Never raises and never blocks the
+    hook. On the latency-critical pre-tool path callers pass probe=False to read the
+    cache only (no subprocess); SessionStart and the end-of-turn exchange probe and
+    persist. A missing / corrupt / unreadable cache falls back to a fresh probe (when
+    allowed), an unwritable cache is ignored (the probed value is still returned), and
+    an unavailable serial returns None so the caller proceeds without it. The cache is
+    shared with the cursor hook, so we merge and write atomically (no torn file)."""
+    data = {}
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+            cached = data.get('device_serial')
+            if isinstance(cached, str) and cached.strip():
+                return cached.strip()
+    except Exception:
+        data = {}
+    if not probe:
+        return None
+    try:
+        serial = _get_device_serial()
+    except Exception:
+        serial = None
+    if serial:
+        try:
+            data['device_serial'] = serial
+            IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+        except Exception:
+            pass
+    return serial
+
+
+def build_account_identity(probe: bool = False) -> Dict:
+    """read_account_identity pulls the full user_email from ~/.claude.json; just add
+    the device serial. probe defaults False so the latency-critical pre-tool path only
+    reads the cache; the end-of-turn exchange passes probe=True. Never raises — on any
+    failure the hook proceeds with whatever identity it has (possibly none)."""
+    try:
+        identity = read_account_identity()
+        if not isinstance(identity, dict):
+            identity = {}
+    except Exception:
+        identity = {}
+    try:
+        serial = _device_serial(probe=probe)
+        if serial:
+            identity['device_serial'] = serial
+    except Exception:
+        pass
+    return identity
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
@@ -922,7 +1019,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'conversation_id': session_id or 'unknown',
         'model': model,
         'messages': messages,
-        'permission_mode': permission_mode
+        'permission_mode': permission_mode,
+        'account_identity': build_account_identity(probe=True),
     }
 
     if usage:
@@ -1389,6 +1487,7 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if hook_event_name == "SessionStart":
+            _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
             print("{}")

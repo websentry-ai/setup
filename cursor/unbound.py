@@ -16,6 +16,7 @@ import time
 import hashlib
 import re
 import sqlite3
+import platform
 from urllib.parse import quote
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -35,6 +36,7 @@ DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -490,8 +492,108 @@ def read_account_identity():
     }
 
 
-def build_account_identity():
-    return read_account_identity()
+def _get_device_serial():
+    """Best-effort hardware serial, mirroring the MDM setup scripts."""
+    try:
+        system = platform.system().lower()
+        if system == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPHardwareDataType'],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                for line in out.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ')
+                        if len(parts) >= 2 and parts[1].strip():
+                            return parts[1].strip()
+        elif system == 'linux':
+            try:
+                out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                try:
+                    value = Path(path).read_text(encoding='utf-8').strip()
+                    if value:
+                        return value
+                except Exception:
+                    continue
+        elif system == 'windows':
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and out.stdout.strip():
+                    return out.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _device_serial(probe=True):
+    """Hardware serial, computed once and cached. Never raises and never blocks the
+    hook. On the latency-critical pre-tool path callers pass probe=False to read the
+    cache only (no subprocess); sessionStart and the end-of-turn exchange probe and
+    persist. A missing / corrupt / unreadable cache falls back to a fresh probe (when
+    allowed), an unwritable cache is ignored (the probed value is still returned), and
+    an unavailable serial returns None so the caller proceeds without it. The cache is
+    shared with the claude-code hook, so we merge and write atomically (no torn file)."""
+    data = {}
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+            cached = data.get('device_serial')
+            if isinstance(cached, str) and cached.strip():
+                return cached.strip()
+    except Exception:
+        data = {}
+    if not probe:
+        return None
+    try:
+        serial = _get_device_serial()
+    except Exception:
+        serial = None
+    if serial:
+        try:
+            data['device_serial'] = serial
+            IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+        except Exception:
+            pass
+    return serial
+
+
+def build_account_identity(event=None, probe=False):
+    """Cursor reports user_email on every hook (common schema); read it off the event
+    and add the cached device serial. probe defaults False so the latency-critical
+    pre-tool path only reads the cache; the end-of-turn exchange passes probe=True.
+    Never raises — on any failure the hook proceeds with whatever identity it has."""
+    try:
+        identity = read_account_identity()
+        if not isinstance(identity, dict):
+            identity = {}
+    except Exception:
+        identity = {}
+    try:
+        if isinstance(event, dict):
+            email = (event.get('user_email') or '').strip() or None
+            if email:
+                identity['user_email'] = email
+                if not identity.get('email_domain'):
+                    identity['email_domain'] = _email_domain(email)
+        serial = _device_serial(probe=probe)
+        if serial:
+            identity['device_serial'] = serial
+    except Exception:
+        pass
+    return identity
 
 
 def process_pre_tool_use(event, api_key):
@@ -534,7 +636,7 @@ def process_pre_tool_use(event, api_key):
             'command': '',
             'metadata': metadata
         },
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(event),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -691,7 +793,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             'command': command,
             'metadata': metadata
         },
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(event),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -791,7 +893,7 @@ def process_user_prompt_submit(event, api_key):
         'unbound_app_label': 'cursor',
         'model': model,
         'event_name': 'user_prompt',
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(event),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 
@@ -808,16 +910,20 @@ def build_llm_exchange(events, api_key=None):
     assistant_response = None
     conversation_id = None
     model = None
-    
+    user_email = None
+
     for log_entry in events:
         event = log_entry.get('event', {})
         hook_event_name = event.get('hook_event_name')
-        
+
         if not conversation_id:
             conversation_id = event.get('conversation_id')
-        
+
         if not model:
             model = event.get('model')
+
+        if not user_email:
+            user_email = event.get('user_email')
         
         if hook_event_name == 'beforeSubmitPrompt':
             user_prompt = event.get('prompt')
@@ -889,9 +995,10 @@ def build_llm_exchange(events, api_key=None):
     exchange = {
         'conversation_id': conversation_id,
         'model': model,
-        'messages': messages
+        'messages': messages,
+        'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
-    
+
     return exchange
 
 
@@ -1372,6 +1479,7 @@ def main():
         # sessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if hook_event_name == "sessionStart":
+            _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
             print("{}")
