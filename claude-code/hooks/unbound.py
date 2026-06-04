@@ -402,13 +402,11 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                             'content': text_content,
                                             'timestamp': entry_timestamp
                                         })
-                                # Skill invocations and agent/subagent spawns (Task/Agent)
-                                # appear in the transcript as tool_use blocks. PostToolUse
-                                # is unreliable for them, so the transcript is the source.
+                                # Skill/agent invocations (transcript is the reliable source, not PostToolUse).
                                 elif (isinstance(content_item, dict)
                                         and content_item.get('type') == 'tool_use'
                                         and content_item.get('name') in ('Skill', 'Task', 'Agent')
-                                        and content_item.get('id')):  # require an id so the row can dedup
+                                        and content_item.get('id')):  # need an id to dedup
                                     conversation_data['tool_uses'].append({
                                         'type': 'PostToolUse',
                                         'tool_name': content_item.get('name'),
@@ -889,9 +887,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
-            # Skills and agent/subagent spawns are captured from the transcript
-            # (with a stable tool_use_id). The PostToolUse copy lacks a reliable
-            # id and would create duplicate rows — skip it here.
+            # Skills/agents come from the transcript (stable id); skip the id-less PostToolUse duplicate.
             if tool_name in ('Skill', 'Task', 'Agent'):
                 continue
             tool_input = event.get('tool_input', {})
@@ -908,9 +904,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'tool_response': tool_response
             })
 
-    # Skill / agent-spawn tool_uses captured from the transcript (main thread +
-    # subagents). Tagged with trigger (user-typed "/skill" vs agent) and
-    # is_subagent; deduped downstream on tool_use_id.
+    # Transcript-sourced skill/agent invocations: tag trigger (user vs agent) + is_subagent.
     for tu in (transcript_tool_uses or []):
         if tu.get('is_subagent'):
             trigger = 'agent'
@@ -920,11 +914,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             trigger = 'agent'
             if skill_name and up.startswith('/'):
                 typed_cmd = up[1:].split(None, 1)[0]
-                # Match full name, or bare-vs-namespaced in either direction
-                # (/stripe:test-cards typed vs bare "test-cards" skill, or vice
-                # versa). Deliberately NOT a pure suffix match, so two skills that
-                # merely share a base name across namespaces (ns1:deploy vs
-                # ns2:deploy) don't mislabel an agent invocation as user-typed.
+                # Match full or bare-vs-namespaced name (not a pure suffix match,
+                # so ns1:deploy vs ns2:deploy isn't mislabelled user-typed).
                 if typed_cmd and (
                     typed_cmd == skill_name
                     or typed_cmd.split(':')[-1] == skill_name
@@ -1045,12 +1036,10 @@ def cleanup_old_logs():
 
 
 def collect_subagent_skill_tool_uses(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> List[Dict]:
-    """Collect Skill / agent-spawn tool_use blocks from subagent transcripts.
+    """Collect Skill/agent tool_use blocks from subagent transcripts.
 
-    Subagents (Task tool) write to <session_dir>/subagents/agent-*.jsonl — separate
-    files from the parent transcript — so skills/agents invoked inside a subagent
-    are never in the parent Stop transcript. Derive that directory from the parent
-    transcript path and extract any Skill/Task/Agent tool_use (flagged is_subagent).
+    Subagents write to <session>/subagents/agent-*.jsonl (separate from the parent
+    transcript), so their skills/agents are missed otherwise. Flagged is_subagent.
     """
     tool_uses: List[Dict] = []
     try:
@@ -1080,7 +1069,7 @@ def collect_subagent_skill_tool_uses(transcript_path: str, user_prompt_timestamp
                             if (isinstance(content_item, dict)
                                     and content_item.get('type') == 'tool_use'
                                     and content_item.get('name') in ('Skill', 'Task', 'Agent')
-                                    and content_item.get('id')):  # require an id so the row can dedup
+                                    and content_item.get('id')):  # need an id to dedup
                                 tool_uses.append({
                                     'type': 'PostToolUse',
                                     'tool_name': content_item.get('name'),
@@ -1136,8 +1125,7 @@ def process_stop_event(event: Dict, api_key: str):
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
         transcript_tool_uses = list(transcript_data.get('tool_uses', []))
-        # Skills/agents invoked inside subagents live in separate transcripts the
-        # parent Stop never reads — sweep them too (deduped downstream on id).
+        # Subagents write to separate transcripts the parent Stop never reads — sweep them too.
         transcript_tool_uses.extend(
             collect_subagent_skill_tool_uses(transcript_path, user_prompt_timestamp)
         )
