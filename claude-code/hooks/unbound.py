@@ -11,6 +11,7 @@ import time
 import hashlib
 import re
 import tempfile
+import platform
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -33,6 +34,8 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
+DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
+DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
@@ -42,6 +45,7 @@ DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
@@ -671,14 +675,14 @@ def read_account_identity() -> Dict:
     org_id = None
     plan = None
     auth_mode = None
-    email_domain = None
+    email = None
     try:
         config = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
         oauth = config.get('oauthAccount')
         if isinstance(oauth, dict):
             org_id = oauth.get('organizationUuid') or None
             plan = oauth.get('organizationType') or None
-            email_domain = _email_domain(oauth.get('emailAddress'))
+            email = oauth.get('emailAddress') or None
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
@@ -688,12 +692,133 @@ def read_account_identity() -> Dict:
         'org_id': org_id,
         'plan': plan,
         'auth_mode': auth_mode,
-        'email_domain': email_domain,
+        'user_email': email,
+        'email_domain': _email_domain(email),
     }
 
 
-def build_account_identity() -> Dict:
-    return read_account_identity()
+# DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
+# shared sentinel string (with a zero exit code), which would map many machines
+# onto one fake serial. Treat these as "no serial" and fall through.
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
+    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+    'to be filled by oem', 'system serial number', 'serial number',
+    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
+    'invalid', '123456789', 'xxxxxxxx',
+}
+
+
+def _valid_serial(value: Optional[str]) -> bool:
+    return bool(value) and value.strip().lower() not in _PLACEHOLDER_SERIALS
+
+
+def _get_device_serial() -> Optional[str]:
+    """Best-effort hardware serial, mirroring the MDM setup scripts. Filters known
+    OEM/VM placeholder values so two machines never collide on the same fake serial,
+    falling through to a stable per-install id (machine-id / MachineGuid) instead."""
+    try:
+        system = platform.system().lower()
+        if system == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPHardwareDataType'],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                for line in out.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ', 1)
+                        if len(parts) >= 2 and _valid_serial(parts[1]):
+                            return parts[1].strip()
+        elif system == 'linux':
+            try:
+                out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                try:
+                    value = Path(path).read_text(encoding='utf-8').strip()
+                    if _valid_serial(value):
+                        return value
+                except Exception:
+                    continue
+        elif system == 'windows':
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _device_serial(probe: bool = True) -> Optional[str]:
+    """Hardware serial, computed once and cached. Never raises and never blocks the
+    hook. On the latency-critical pre-tool path callers pass probe=False to read the
+    cache only (no subprocess); SessionStart and the end-of-turn exchange probe and
+    persist. A missing / corrupt / unreadable cache falls back to a fresh probe (when
+    allowed), an unwritable cache is ignored (the probed value is still returned), and
+    an unavailable serial returns None so the caller proceeds without it. The cache is
+    shared with the cursor hook, so we merge and write atomically (no torn file)."""
+    data = {}
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+            cached = data.get('device_serial')
+            if isinstance(cached, str) and cached.strip():
+                return cached.strip()
+    except Exception:
+        data = {}
+    if not probe:
+        return None
+    try:
+        serial = _get_device_serial()
+    except Exception:
+        serial = None
+    if serial:
+        try:
+            data['device_serial'] = serial
+            IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+        except Exception:
+            pass
+    return serial
+
+
+def build_account_identity(probe: bool = False) -> Dict:
+    """read_account_identity pulls the full user_email from ~/.claude.json; just add
+    the device serial. probe defaults False so the latency-critical pre-tool path only
+    reads the cache; the end-of-turn exchange passes probe=True. Never raises — on any
+    failure the hook proceeds with whatever identity it has (possibly none)."""
+    try:
+        identity = read_account_identity()
+        if not isinstance(identity, dict):
+            identity = {}
+    except Exception:
+        identity = {}
+    try:
+        serial = _device_serial(probe=probe)
+        if serial:
+            identity['device_serial'] = serial
+    except Exception:
+        pass
+    return identity
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
@@ -920,7 +1045,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'conversation_id': session_id or 'unknown',
         'model': model,
         'messages': messages,
-        'permission_mode': permission_mode
+        'permission_mode': permission_mode,
+        'account_identity': build_account_identity(probe=True),
     }
 
     if usage:
@@ -1185,7 +1311,74 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
+def _hook_discovery_enabled_for_org() -> bool:
+    """Return whether SessionStart-triggered discovery is enabled for this
+    user's org. Reads ~/.unbound/discovery-cache.json first; refetches from
+    the gateway only when the cached value is missing or older than
+    DISCOVERY_HOOK_FLAG_TTL_SECONDS. Fail-closed: any error and no usable
+    cached value means False."""
+    cache: Dict = {}
+    if DISCOVERY_CACHE_PATH.exists():
+        try:
+            with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
+                cache = json.load(f) or {}
+        except (OSError, json.JSONDecodeError):
+            cache = {}
+    if not isinstance(cache, dict):
+        cache = {}
+    _hd = cache.get("hook_discovery")
+    flag = _hd if isinstance(_hd, dict) else {}
+    last_fetched = flag.get("fetched_at")
+    if isinstance(last_fetched, str):
+        try:
+            ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
+            if (time.time() - ts) < DISCOVERY_HOOK_FLAG_TTL_SECONDS:
+                return bool(flag.get("enabled", False))
+        except ValueError:
+            pass
+
+    try:
+        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+            cfg = json.load(f) or {}
+    except (OSError, json.JSONDecodeError):
+        return bool(flag.get("enabled", False))
+    api_key = cfg.get("api_key")
+    if not api_key:
+        return bool(flag.get("enabled", False))
+    url = f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"
+    try:
+        r = subprocess.run(
+            ["curl", "-fsSL",
+             "-H", f"Authorization: Bearer {api_key}",
+             "--max-time", "5",
+             url],
+            capture_output=True, timeout=8,
+        )
+        if r.returncode != 0:
+            return bool(flag.get("enabled", False))
+        body = r.stdout.decode("utf-8", errors="replace")
+        enabled = bool(json.loads(body).get("enabled", False))
+    except Exception:
+        return bool(flag.get("enabled", False))
+
+    cache["hook_discovery"] = {
+        "enabled": enabled,
+        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    }
+    try:
+        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=2, sort_keys=True)
+        os.replace(tmp, DISCOVERY_CACHE_PATH)
+    except OSError:
+        pass
+    return enabled
+
+
 def _dispatch_discovery() -> None:
+    if not _hook_discovery_enabled_for_org():
+        return
     try:
         cache: Dict = {}
         if DISCOVERY_CACHE_PATH.exists():
@@ -1320,8 +1513,9 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if hook_event_name == "SessionStart":
+            _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
-            # _dispatch_discovery()
+            _dispatch_discovery()
             print("{}")
             return
         session_id = event.get('session_id')
