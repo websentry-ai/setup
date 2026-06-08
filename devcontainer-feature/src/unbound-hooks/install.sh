@@ -24,11 +24,11 @@ fi
 # The hook shells out to curl for gateway calls. Most dev base images have it; install
 # it best-effort across common package managers, and warn (don't fail) if we can't.
 if ! command -v curl >/dev/null 2>&1; then
-  if   command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq curl >/dev/null 2>&1 || true
-  elif command -v apk     >/dev/null 2>&1; then apk add --no-cache curl >/dev/null 2>&1 || true
-  elif command -v dnf     >/dev/null 2>&1; then dnf install -y curl >/dev/null 2>&1 || true
-  elif command -v microdnf>/dev/null 2>&1; then microdnf install -y curl >/dev/null 2>&1 || true
-  elif command -v yum     >/dev/null 2>&1; then yum install -y curl >/dev/null 2>&1 || true
+  if   command -v apt-get >/dev/null 2>&1; then apt-get update -qq && apt-get install -y -qq curl 2>&1 || true
+  elif command -v apk     >/dev/null 2>&1; then apk add --no-cache curl 2>&1 || true
+  elif command -v dnf     >/dev/null 2>&1; then dnf install -y curl 2>&1 || true
+  elif command -v microdnf>/dev/null 2>&1; then microdnf install -y curl 2>&1 || true
+  elif command -v yum     >/dev/null 2>&1; then yum install -y curl 2>&1 || true
   fi
 fi
 if ! command -v curl >/dev/null 2>&1; then

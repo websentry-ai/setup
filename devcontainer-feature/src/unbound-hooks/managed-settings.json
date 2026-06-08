@@ -4,14 +4,14 @@
       {
         "matcher": "*",
         "hooks": [
-          { "type": "command", "command": "python3 /unbound/unbound.py", "timeout": 15 }
+          { "type": "command", "command": "python3 /unbound/unbound.py", "timeout": 25 }
         ]
       }
     ],
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "python3 /unbound/unbound.py", "timeout": 15 }
+          { "type": "command", "command": "python3 /unbound/unbound.py", "timeout": 25 }
         ]
       }
     ],
