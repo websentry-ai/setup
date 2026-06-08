@@ -1190,9 +1190,12 @@ def _check_self_update() -> None:
     try:
         running = os.path.normcase(str(Path(__file__).resolve()))
         target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
-        if running != target:
-            return
-    except Exception:
+    except Exception as e:
+        log_error(f"self_update skipped: could not resolve script path: {e}", 'self_update')
+        return
+    if running != target:
+        # Running from a managed/enterprise location (MDM) — the daily cron owns
+        # updates there; skipping is expected, not an error.
         return
     # refresh hook from main, throttled per interval
     try:
