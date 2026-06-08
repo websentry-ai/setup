@@ -156,10 +156,14 @@ def check_admin_privileges() -> bool:
 
 
 def get_mac_serial_number() -> str:
-    """Get the Mac serial number using system_profiler."""
+    """Get the Mac serial number using ioreg.
+
+    ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+    "Serial Number" label is localized and fails on non-English macOS.
+    """
     try:
         result = subprocess.run(
-            ["system_profiler", "SPHardwareDataType"],
+            ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
             capture_output=True,
             text=True,
             timeout=10
@@ -168,10 +172,10 @@ def get_mac_serial_number() -> str:
             return None
 
         for line in result.stdout.split('\n'):
-            if 'Serial Number' in line:
-                parts = line.split(': ')
+            if 'IOPlatformSerialNumber' in line:
+                parts = line.split('=')
                 if len(parts) >= 2:
-                    return parts[1].strip()
+                    return parts[1].strip().strip('"').strip()
         return None
     except Exception as e:
         debug_print(f"Failed to get serial number: {e}")
@@ -941,7 +945,8 @@ def detect_install_state() -> Optional[str]:
         if not hooks_json.exists():
             return 'fresh'
         return 'persisted' if script_path.exists() else 'tampered'
-    except Exception:
+    except Exception as e:
+        debug_print(f"detect_install_state failed: {e}")
         return None
 
 
