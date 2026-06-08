@@ -1182,6 +1182,21 @@ def _replace_self(new_bytes: bytes) -> None:
 
 
 def _check_self_update() -> None:
+    # Under MDM the hook runs from an admin-managed location we can't write to,
+    # so SELF_SCRIPT_PATH (user-level) is not the file executing — updating it
+    # would only write a dead copy the managed settings never run. The daily MDM
+    # cron refreshes the managed script instead. Only self-update when we are
+    # actually running the user-level script (subscription installs).
+    try:
+        running = os.path.normcase(str(Path(__file__).resolve()))
+        target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
+    except Exception as e:
+        log_error(f"self_update skipped: could not resolve script path: {e}", 'self_update')
+        return
+    if running != target:
+        # Running from a managed/enterprise location (MDM) — the daily cron owns
+        # updates there; skipping is expected, not an error.
+        return
     # refresh hook from main, throttled per interval
     try:
         if not _self_update_due():
