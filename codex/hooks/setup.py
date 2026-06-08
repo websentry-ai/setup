@@ -30,6 +30,7 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
+BACKFILL_STATE_FILE = '.unbound_last_backfill'
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -982,9 +983,39 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
     return True
 
 
-def _backfill_iter_transcripts(root: Path):
-    # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
-    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+def _backfill_state_path(home: Path) -> Path:
+    return home / '.codex' / 'hooks' / BACKFILL_STATE_FILE
+
+
+def _backfill_read_cutoff(home: Path) -> float:
+    """mtime cutoff for transcript selection: the last successful backfill when
+    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
+    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    try:
+        last = float(_backfill_state_path(home).read_text().strip())
+    except (OSError, ValueError):
+        return default_cutoff
+    # Ignore corrupt or future timestamps (clock skew).
+    if last <= 0 or last > time.time():
+        return default_cutoff
+    return last
+
+
+def _backfill_write_cutoff(home: Path, ts: float) -> None:
+    # Write via temp + atomic replace so an overlapping cron run never reads a
+    # half-written timestamp.
+    try:
+        path = _backfill_state_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
+        tmp.write_text(str(ts))
+        os.replace(tmp, path)
+    except OSError as e:
+        debug_print(f"failed to persist backfill timestamp: {e}")
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
+    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
     for p in root.rglob('rollout-*.jsonl'):
         if p.name.startswith('.'):
             continue
@@ -1101,10 +1132,13 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         return
 
     try:
-        sessions_root = Path.home() / '.codex' / 'sessions'
+        home = Path.home()
+        started_at = time.time()
+        cutoff_mtime = _backfill_read_cutoff(home)
+        sessions_root = home / '.codex' / 'sessions'
         sessions: List[Dict] = []
         if sessions_root.exists():
-            for transcript_path in sorted(_backfill_iter_transcripts(sessions_root)):
+            for transcript_path in sorted(_backfill_iter_transcripts(sessions_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                     debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
                     break
@@ -1112,6 +1146,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
                 if session:
                     sessions.append(session)
         if not sessions:
+            _backfill_write_cutoff(home, started_at)
             print("[backfill] No past sessions found.")
             return
 
@@ -1157,6 +1192,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         elif failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
         else:
+            _backfill_write_cutoff(home, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)

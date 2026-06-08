@@ -26,6 +26,7 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
+BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 
 def normalize_url(value: str) -> str:
@@ -1043,9 +1044,39 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     return {'session_id': session_id, 'entries': entries}
 
 
-def _backfill_iter_transcripts(root: Path):
-    # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
-    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+def _backfill_state_path(home: Path) -> Path:
+    return home / '.claude' / 'hooks' / BACKFILL_STATE_FILE
+
+
+def _backfill_read_cutoff(home: Path) -> float:
+    """mtime cutoff for transcript selection: the last successful backfill when
+    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
+    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    try:
+        last = float(_backfill_state_path(home).read_text().strip())
+    except (OSError, ValueError):
+        return default_cutoff
+    # Ignore corrupt or future timestamps (clock skew).
+    if last <= 0 or last > time.time():
+        return default_cutoff
+    return last
+
+
+def _backfill_write_cutoff(home: Path, ts: float) -> None:
+    # Write via temp + atomic replace so an overlapping cron run never reads a
+    # half-written timestamp.
+    try:
+        path = _backfill_state_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
+        tmp.write_text(str(ts))
+        os.replace(tmp, path)
+    except OSError as e:
+        debug_print(f"failed to persist backfill timestamp: {e}")
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
+    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
     for p in root.rglob('*.jsonl'):
         if p.name.startswith('.'):
             continue
@@ -1160,8 +1191,9 @@ def _backfill_collect_sessions(home_dir: Path) -> List[Dict]:
     projects_root = home_dir / '.claude' / 'projects'
     if not projects_root.exists():
         return []
+    cutoff_mtime = _backfill_read_cutoff(home_dir)
     sessions = []
-    for transcript_path in sorted(_backfill_iter_transcripts(projects_root)):
+    for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
         if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
             break
         session = _backfill_collect_session(transcript_path)
@@ -1306,14 +1338,23 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print("no user homes found — skipping backfill")
             return
 
+        started_at = time.time()
         sessions = []
+        collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
-            user_sessions = _run_as_user(username, _backfill_collect_sessions, home_dir) or []
+            user_sessions = _run_as_user(username, _backfill_collect_sessions, home_dir)
+            if user_sessions is None:
+                # Could not read this user's home (fork/perms) — don't advance its
+                # cutoff, or we'd permanently skip its history on the next run.
+                continue
+            collected_homes.append((username, home_dir))
             if user_sessions:
                 debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
                 sessions.extend(user_sessions)
 
         if not sessions:
+            for username, home_dir in collected_homes:
+                _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
             print("[backfill] No past sessions found.")
             return
 
@@ -1325,6 +1366,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         elif chunks_failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({chunks_failed} chunks failed).")
         else:
+            for username, home_dir in collected_homes:
+                _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)

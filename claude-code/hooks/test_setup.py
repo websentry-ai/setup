@@ -1,11 +1,14 @@
 import unittest
 from unittest.mock import patch
+import os
 import socket
+import tempfile
 import threading
 import urllib.request
 import urllib.error
 import urllib.parse
 import time
+from pathlib import Path
 
 
 class TestCallbackHandler(unittest.TestCase):
@@ -132,6 +135,137 @@ class TestMainErrorHandling(unittest.TestCase):
         output = self._run_main_with_callback({"error": "access denied"})
         self.assertIn("Setup failed: access denied", output)
         self.assertNotIn("No API key received", output)
+
+
+class TestBackfillCutoffCache(unittest.TestCase):
+    """Tests for the per-tool last-backfill cache that lets cron reruns seed only
+    sessions touched since the previous run instead of the full 30-day window."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_read_cutoff_defaults_to_max_age_when_no_file(self):
+        """No cache file -> fall back to BACKFILL_MAX_AGE_DAYS ago (first run)."""
+        import setup
+        cutoff = setup._backfill_read_cutoff(self.home)
+        expected = time.time() - (setup.BACKFILL_MAX_AGE_DAYS * 86400)
+        self.assertAlmostEqual(cutoff, expected, delta=5)
+
+    def test_write_then_read_roundtrip(self):
+        """A persisted timestamp is read back as the cutoff on the next run."""
+        import setup
+        ts = time.time() - 3600
+        setup._backfill_write_cutoff(self.home, ts)
+        self.assertTrue(setup._backfill_state_path(self.home).exists())
+        self.assertAlmostEqual(setup._backfill_read_cutoff(self.home), ts, delta=0.01)
+
+    def test_read_cutoff_ignores_corrupt_value(self):
+        """A non-numeric cache file falls back to the default window."""
+        import setup
+        path = setup._backfill_state_path(self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not-a-number")
+        expected = time.time() - (setup.BACKFILL_MAX_AGE_DAYS * 86400)
+        self.assertAlmostEqual(setup._backfill_read_cutoff(self.home), expected, delta=5)
+
+    def test_read_cutoff_ignores_future_timestamp(self):
+        """A future timestamp (clock skew) is rejected for the default window."""
+        import setup
+        setup._backfill_write_cutoff(self.home, time.time() + 10000)
+        expected = time.time() - (setup.BACKFILL_MAX_AGE_DAYS * 86400)
+        self.assertAlmostEqual(setup._backfill_read_cutoff(self.home), expected, delta=5)
+
+    def test_iter_transcripts_respects_cutoff(self):
+        """Only transcripts modified at/after the cutoff are yielded."""
+        import setup
+        root = self.home / ".claude" / "projects"
+        root.mkdir(parents=True)
+        old = root / "old.jsonl"
+        new = root / "new.jsonl"
+        old.write_text("{}\n")
+        new.write_text("{}\n")
+        now = time.time()
+        os.utime(old, (now - 10 * 86400, now - 10 * 86400))
+        os.utime(new, (now - 1 * 86400, now - 1 * 86400))
+
+        cutoff = now - (5 * 86400)
+        found = {p.name for p in setup._backfill_iter_transcripts(root, cutoff)}
+        self.assertEqual(found, {"new.jsonl"})
+
+    def test_write_is_atomic_and_leaves_no_temp(self):
+        """The atomic write produces the final file and no leftover .tmp."""
+        import setup
+        setup._backfill_write_cutoff(self.home, 123.0)
+        path = setup._backfill_state_path(self.home)
+        self.assertEqual(path.read_text(), "123.0")
+        self.assertEqual(list(path.parent.glob("*.tmp")), [])
+
+
+class TestMdmBackfillCutoff(unittest.TestCase):
+    """Tests for the multi-user MDM run_backfill: a user's cutoff must advance
+    only when that user's transcripts were actually collected, so a failed
+    privilege-drop never strands their history behind an advanced cutoff."""
+
+    @staticmethod
+    def _load_mdm():
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "mdm_setup", str(Path(__file__).parent / "mdm" / "setup.py")
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _run(self, mdm, collect_by_home, send_result):
+        """Run run_backfill with _run_as_user mocked; return list of homes
+        whose cutoff was written."""
+        writes = []
+
+        def fake_run_as_user(username, fn, *args):
+            if fn is mdm._backfill_collect_sessions:
+                return collect_by_home[args[0]]
+            if fn is mdm._backfill_write_cutoff:
+                writes.append(args[0])
+            return None
+
+        homes = [(f"u{i}", home) for i, home in enumerate(collect_by_home)]
+        with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
+             patch.object(mdm, "_backfill_send_sessions", return_value=send_result):
+            mdm.run_backfill("key", "https://backend", homes)
+        return writes
+
+    def test_failed_home_cutoff_not_advanced(self):
+        """Collection returning None (fork/perms failure) -> no cutoff write."""
+        mdm = self._load_mdm()
+        good, bad = Path("/home/good"), Path("/home/bad")
+        # good: collected but empty; bad: collection failed (None)
+        writes = self._run(mdm, {good: [], bad: None}, send_result=(0, 0, 0))
+        self.assertIn(good, writes)
+        self.assertNotIn(bad, writes)
+
+    def test_collected_homes_advanced_on_success(self):
+        """Full upload success -> cutoff written for every collected home."""
+        mdm = self._load_mdm()
+        home = Path("/home/alice")
+        writes = self._run(
+            mdm,
+            {home: [{"session_id": "s1", "entries": [{}]}]},
+            send_result=(1, 1, 0),
+        )
+        self.assertEqual(writes, [home])
+
+    def test_partial_upload_failure_does_not_advance(self):
+        """A failed chunk -> no cutoff write, so the next cron retries."""
+        mdm = self._load_mdm()
+        home = Path("/home/alice")
+        writes = self._run(
+            mdm,
+            {home: [{"session_id": "s1", "entries": [{}]}]},
+            send_result=(1, 0, 1),  # one chunk failed
+        )
+        self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
