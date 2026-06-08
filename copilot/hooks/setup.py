@@ -27,6 +27,7 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
+BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 DEBUG = False
 
@@ -744,6 +745,37 @@ def _backfill_vscode_workspace_roots() -> List[Path]:
     return bases
 
 
+def _backfill_state_path(home: Path) -> Path:
+    return home / '.copilot' / 'hooks' / BACKFILL_STATE_FILE
+
+
+def _backfill_read_cutoff(home: Path) -> float:
+    """mtime cutoff for transcript selection: the last successful backfill when
+    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
+    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    try:
+        last = float(_backfill_state_path(home).read_text().strip())
+    except (OSError, ValueError):
+        return default_cutoff
+    # Ignore corrupt or future timestamps (clock skew).
+    if last <= 0 or last > time.time():
+        return default_cutoff
+    return last
+
+
+def _backfill_write_cutoff(home: Path, ts: float) -> None:
+    # Write via temp + atomic replace so an overlapping cron run never reads a
+    # half-written timestamp.
+    try:
+        path = _backfill_state_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
+        tmp.write_text(str(ts))
+        os.replace(tmp, path)
+    except OSError as e:
+        debug_print(f"failed to persist backfill timestamp: {e}")
+
+
 def _backfill_should_include(p: Path, cutoff_mtime: float) -> bool:
     # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
     if p.name.startswith('.'):
@@ -761,8 +793,7 @@ def _backfill_should_include(p: Path, cutoff_mtime: float) -> bool:
     return True
 
 
-def _backfill_iter_transcripts():
-    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+def _backfill_iter_transcripts(cutoff_mtime: float):
     cli_root = Path.home() / '.copilot' / 'session-state'
     if cli_root.exists():
         for p in cli_root.glob('*/events.jsonl'):
@@ -854,15 +885,23 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         return
 
     try:
+        home = Path.home()
+        started_at = time.time()
+        cutoff_mtime = _backfill_read_cutoff(home)
         sessions: List[Dict] = []
-        for transcript_path in sorted(_backfill_iter_transcripts()):
+        capped = False
+        for transcript_path in sorted(_backfill_iter_transcripts(cutoff_mtime)):
             if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                # Hit the per-run cap with files still unprocessed — don't advance
+                # the cutoff, or those older files would be skipped permanently.
+                capped = True
                 debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
                 break
             session = _backfill_collect_session(transcript_path)
             if session:
                 sessions.append(session)
         if not sessions:
+            _backfill_write_cutoff(home, started_at)
             print("[backfill] No past sessions found.")
             return
 
@@ -908,6 +947,8 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         elif failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
         else:
+            if not capped:
+                _backfill_write_cutoff(home, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
