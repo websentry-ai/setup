@@ -845,11 +845,37 @@ def clear_setup():
     print("=" * 60)
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """MDM gateway install state, inspected before this run reasserts it.
+    'fresh' = the managed settings this script deploys are absent;
+    'persisted' = present; 'tampered' = the managed settings remain but the
+    apiKeyHelper script was removed (Unix only; Windows enforces via the settings
+    env block alone). None on any error."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        config_present = (
+            (managed_dir / "managed-settings.json").exists()
+            or (managed_dir / "managed-settings.d" / "unbound.json").exists()
+        )
+        if not config_present:
+            return "fresh"
+        if platform.system().lower() == "windows":
+            return "persisted"
+        return "persisted" if (managed_dir / "anthropic_key.sh").exists() else "tampered"
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type, "managed": True}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -931,6 +957,9 @@ def main():
     debug_print(f"Device identifier: {device_id}")
     print("✅ Device identifier retrieved")
 
+    # Capture install state BEFORE this run reasserts the managed settings.
+    install_state = detect_install_state()
+
     print("\n🔑 Fetching API key from MDM...")
     claude_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
     if not claude_api_key:
@@ -974,7 +1003,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(claude_api_key, "unbound-claude-code", backend_url=base_url)
+    notify_setup_complete(claude_api_key, "unbound-claude-code", backend_url=base_url, install_state=install_state, serial_number=device_id)
 
 
 if __name__ == "__main__":

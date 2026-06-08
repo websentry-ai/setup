@@ -534,11 +534,131 @@ def disable_codex_hooks_feature() -> None:
         debug_print(f"Failed to remove codex_hooks feature: {e}")
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def get_device_identifier() -> Optional[str]:
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            result = subprocess.run(
+                ["system_profiler", "SPHardwareDataType"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ')
+                        if len(parts) >= 2:
+                            serial = parts[1].strip()
+                            if serial:
+                                return serial
+            return None
+
+        elif system == "linux":
+            try:
+                result = subprocess.run(
+                    ["dmidecode", "-s", "system-serial-number"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    stderr=subprocess.DEVNULL
+                )
+                if result.returncode == 0:
+                    device_id = result.stdout.strip()
+                    if device_id:
+                        return device_id
+            except Exception:
+                debug_print("dmidecode failed, trying machine-id")
+
+            for machine_id_path in ['/etc/machine-id', '/var/lib/dbus/machine-id']:
+                try:
+                    with open(machine_id_path, 'r', encoding='utf-8') as f:
+                        device_id = f.read().strip()
+                        if device_id:
+                            return device_id
+                except Exception:
+                    continue
+
+            try:
+                result = subprocess.run(
+                    ["hostname"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    hostname = result.stdout.strip()
+                    if hostname:
+                        return hostname
+            except Exception:
+                pass
+
+            return None
+
+        elif system == "windows":
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    serial = result.stdout.strip()
+                    if serial:
+                        return serial
+            except Exception:
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
+
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
+            except Exception:
+                debug_print("MachineGuid registry read failed, falling back to hostname")
+
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
+
+    except Exception as e:
+        debug_print(f"Failed to get device identifier: {e}")
+        return None
+
+
+def detect_install_state() -> str:
+    """User-level install state (informational): 'persisted' if this tool's
+    Unbound setup already exists on this device, else 'fresh'. User-level setups
+    are never tamper-eligible, so 'tampered' is never reported. Detected via the
+    openai_base_url key this script manages in ~/.codex/config.toml (the file
+    itself can exist for plain Codex usage, so we check for the key)."""
+    try:
+        config_file = Path.home() / ".codex" / "config.toml"
+        if not config_file.exists():
+            return "fresh"
+        with open(config_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        return "persisted" if "openai_base_url" in content else "fresh"
+    except Exception:
+        return "fresh"
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -604,6 +724,9 @@ def main():
     print("API Key Verified ✅")
     debug_print("API key verification successful")
 
+    _install_state = detect_install_state()
+    _device_id = get_device_identifier()
+
     # Remove leftover hooks setup env var and artifacts
     try:
         remove_env_var("UNBOUND_CODEX_API_KEY")
@@ -633,7 +756,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "unbound-codex", backend_url=args.backend_url)
+    notify_setup_complete(api_key, "unbound-codex", backend_url=args.backend_url, install_state=_install_state, serial_number=_device_id)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:

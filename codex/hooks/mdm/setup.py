@@ -1371,7 +1371,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        body = {"tool_type": tool_type}
+        body = {"tool_type": tool_type, "managed": True}
         if install_state is not None:
             body["install_state"] = install_state
         if serial_number is not None:

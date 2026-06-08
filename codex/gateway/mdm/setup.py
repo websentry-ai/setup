@@ -811,11 +811,34 @@ def clear_managed_hooks() -> bool:
         return False
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def detect_install_state() -> Optional[str]:
+    """MDM gateway install state, inspected before this run reasserts it.
+    'persisted' if the gateway redirect this script manages (openai_base_url in a
+    user's ~/.codex/config.toml) is already present on this device, else 'fresh'.
+    None on any error."""
+    try:
+        for _username, home_dir in get_all_user_homes():
+            config_file = home_dir / ".codex" / "config.toml"
+            try:
+                if config_file.exists() and "openai_base_url" in config_file.read_text(encoding="utf-8"):
+                    return "persisted"
+            except Exception:
+                continue
+        return "fresh"
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type, "managed": True}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -897,6 +920,9 @@ def main():
     debug_print(f"Device identifier: {device_id}")
     print("✅ Device identifier retrieved")
 
+    # Capture install state BEFORE this run rewrites the per-user gateway config.
+    install_state = detect_install_state()
+
     print("\n🔑 Fetching API key from MDM...")
     codex_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
     if not codex_api_key:
@@ -940,7 +966,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(codex_api_key, "unbound-codex", backend_url=base_url)
+    notify_setup_complete(codex_api_key, "unbound-codex", backend_url=base_url, install_state=install_state, serial_number=device_id)
 
 
 if __name__ == "__main__":
