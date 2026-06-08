@@ -1,0 +1,40 @@
+name: publish-feature
+
+# Publishes the unbound-hooks devcontainer Feature collection to GHCR using the official
+# devcontainers/action. Version comes from devcontainer-feature.json, published as
+# :0.1.0, :0.1, :0, :latest under ghcr.io/websentry-ai/setup/unbound-hooks.
+# Auth uses the built-in GITHUB_TOKEN.
+#
+# Zero-drift: before publishing, the canonical hook is copied from
+# claude-code/hooks/unbound.py into the feature dir (the committed tree does NOT contain
+# that copy — it is .gitignored), so the published Feature always carries the current hook.
+#
+# Triggers (deliberately scoped to NOT collide with this repo's own release tags):
+#   - push a dedicated tag:  git push origin container-addon-v0.1.0
+#   - or run manually via the Actions tab (workflow_dispatch).
+on:
+  push:
+    tags: ["container-addon-v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical hook into the feature (zero-drift)
+        run: cp claude-code/hooks/unbound.py devcontainer-feature/src/unbound-hooks/unbound.py
+
+      - name: Publish Feature
+        uses: devcontainers/action@v1
+        with:
+          publish-features: "true"
+          base-path-to-features: "./devcontainer-feature/src"
+          generate-docs: "true"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
