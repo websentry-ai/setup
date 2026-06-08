@@ -1045,9 +1045,13 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         cutoff_mtime = _backfill_read_cutoff(home)
         projects_root = home / '.claude' / 'projects'
         sessions: List[Dict] = []
+        capped = False
         if projects_root.exists():
             for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                    # Hit the per-run cap with files still unprocessed — don't advance
+                    # the cutoff, or those older files would be skipped permanently.
+                    capped = True
                     debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
                     break
                 session = _backfill_collect_session(transcript_path)
@@ -1100,7 +1104,8 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         elif failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
         else:
-            _backfill_write_cutoff(home, started_at)
+            if not capped:
+                _backfill_write_cutoff(home, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)

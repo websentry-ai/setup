@@ -202,6 +202,20 @@ class TestBackfillCutoffCache(unittest.TestCase):
         self.assertEqual(path.read_text(), "123.0")
         self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
+    def test_cutoff_not_advanced_when_session_cap_fires(self):
+        """When the per-run session cap is hit, the cutoff must NOT advance, or
+        the unprocessed older files would be skipped forever next run."""
+        import setup
+        root = self.home / ".claude" / "projects"
+        root.mkdir(parents=True)
+        for i in range(3):
+            (root / f"s{i}.jsonl").write_text('{"sessionId":"x%d"}\n' % i)
+        with patch.object(setup, "BACKFILL_MAX_SESSIONS_PER_RUN", 2), \
+             patch.object(setup, "_backfill_upload_chunk", return_value=True), \
+             patch.object(Path, "home", return_value=self.home):
+            setup.run_backfill("key", "https://backend")
+        self.assertFalse(setup._backfill_state_path(self.home).exists())
+
 
 class TestMdmBackfillCutoff(unittest.TestCase):
     """Tests for the multi-user MDM run_backfill: a user's cutoff must advance
@@ -240,8 +254,8 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         """Collection returning None (fork/perms failure) -> no cutoff write."""
         mdm = self._load_mdm()
         good, bad = Path("/home/good"), Path("/home/bad")
-        # good: collected but empty; bad: collection failed (None)
-        writes = self._run(mdm, {good: [], bad: None}, send_result=(0, 0, 0))
+        # good: collected, empty, not capped; bad: collection failed (None)
+        writes = self._run(mdm, {good: ([], False), bad: None}, send_result=(0, 0, 0))
         self.assertIn(good, writes)
         self.assertNotIn(bad, writes)
 
@@ -251,7 +265,7 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         home = Path("/home/alice")
         writes = self._run(
             mdm,
-            {home: [{"session_id": "s1", "entries": [{}]}]},
+            {home: ([{"session_id": "s1", "entries": [{}]}], False)},
             send_result=(1, 1, 0),
         )
         self.assertEqual(writes, [home])
@@ -262,10 +276,25 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         home = Path("/home/alice")
         writes = self._run(
             mdm,
-            {home: [{"session_id": "s1", "entries": [{}]}]},
+            {home: ([{"session_id": "s1", "entries": [{}]}], False)},
             send_result=(1, 0, 1),  # one chunk failed
         )
         self.assertEqual(writes, [])
+
+    def test_capped_home_not_advanced(self):
+        """A home that hit the per-run cap -> its cutoff is not advanced even on
+        a fully successful upload, so its overflow stays eligible next run."""
+        mdm = self._load_mdm()
+        capped_home, ok_home = Path("/home/heavy"), Path("/home/light")
+        writes = self._run(
+            mdm,
+            {
+                capped_home: ([{"session_id": "s1", "entries": [{}]}], True),
+                ok_home: ([{"session_id": "s2", "entries": [{}]}], False),
+            },
+            send_result=(2, 1, 0),
+        )
+        self.assertEqual(writes, [ok_home])
 
 
 if __name__ == "__main__":

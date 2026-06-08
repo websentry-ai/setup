@@ -818,17 +818,21 @@ def _backfill_iter_transcripts(home_dir: Path, cutoff_mtime: float):
                 yield p
 
 
-def _backfill_collect_sessions(home_dir: Path) -> List[Dict]:
+def _backfill_collect_sessions(home_dir: Path) -> Tuple[List[Dict], bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
+    # Returns (sessions, capped); capped=True means the per-run cap was hit and
+    # older files remain unprocessed, so this home's cutoff must not advance.
     cutoff_mtime = _backfill_read_cutoff(home_dir)
     sessions = []
+    capped = False
     for transcript_path in sorted(_backfill_iter_transcripts(home_dir, cutoff_mtime)):
         if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+            capped = True
             break
         session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
-    return sessions
+    return sessions, capped
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1042,15 +1046,19 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         sessions = []
         collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
-            user_sessions = _run_as_user(username, _backfill_collect_sessions, home_dir)
-            if user_sessions is None:
+            result = _run_as_user(username, _backfill_collect_sessions, home_dir)
+            if result is None:
                 # Could not read this user's home (fork/perms) — don't advance its
                 # cutoff, or we'd permanently skip its history on the next run.
                 continue
-            collected_homes.append((username, home_dir))
+            user_sessions, capped = result
             if user_sessions:
                 debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
                 sessions.extend(user_sessions)
+            # Capped homes still have unprocessed files — leave their cutoff so the
+            # overflow stays eligible on the next run.
+            if not capped:
+                collected_homes.append((username, home_dir))
 
         if not sessions:
             for username, home_dir in collected_homes:
