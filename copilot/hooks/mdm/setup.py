@@ -135,18 +135,20 @@ def get_device_identifier() -> Optional[str]:
     system = platform.system().lower()
     try:
         if system == "darwin":
+            # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+            # "Serial Number" label is localized and fails on non-English macOS.
             result = subprocess.run(
-                ["system_profiler", "SPHardwareDataType"],
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
-                    if 'Serial Number' in line:
-                        parts = line.split(': ')
+                    if 'IOPlatformSerialNumber' in line:
+                        parts = line.split('=')
                         if len(parts) >= 2:
-                            serial = parts[1].strip()
+                            serial = parts[1].strip().strip('"').strip()
                             if serial:
                                 return serial
             return None
@@ -1052,7 +1054,8 @@ def detect_install_state() -> Optional[str]:
             else:
                 return 'tampered'
         return 'persisted' if any_complete else 'fresh'
-    except Exception:
+    except Exception as e:
+        debug_print(f"detect_install_state failed: {e}")
         return None
 
 
@@ -1060,7 +1063,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        body = {"tool_type": tool_type}
+        body = {"tool_type": tool_type, "managed": True}
         if install_state is not None:
             body["install_state"] = install_state
         if serial_number is not None:

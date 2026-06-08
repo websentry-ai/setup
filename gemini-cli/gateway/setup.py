@@ -389,11 +389,129 @@ def clear_setup() -> None:
     print("=" * 60)
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def get_device_identifier() -> Optional[str]:
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+            # "Serial Number" label is localized and fails on non-English macOS.
+            result = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'IOPlatformSerialNumber' in line:
+                        parts = line.split('=')
+                        if len(parts) >= 2:
+                            serial = parts[1].strip().strip('"').strip()
+                            if serial:
+                                return serial
+            return None
+
+        elif system == "linux":
+            try:
+                result = subprocess.run(
+                    ["dmidecode", "-s", "system-serial-number"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    stderr=subprocess.DEVNULL
+                )
+                if result.returncode == 0:
+                    device_id = result.stdout.strip()
+                    if device_id:
+                        return device_id
+            except Exception:
+                debug_print("dmidecode failed, trying machine-id")
+
+            for machine_id_path in ['/etc/machine-id', '/var/lib/dbus/machine-id']:
+                try:
+                    with open(machine_id_path, 'r', encoding='utf-8') as f:
+                        device_id = f.read().strip()
+                        if device_id:
+                            return device_id
+                except Exception:
+                    continue
+
+            try:
+                result = subprocess.run(
+                    ["hostname"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    hostname = result.stdout.strip()
+                    if hostname:
+                        return hostname
+            except Exception:
+                pass
+
+            return None
+
+        elif system == "windows":
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    serial = result.stdout.strip()
+                    if serial:
+                        return serial
+            except Exception:
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
+
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
+            except Exception:
+                debug_print("MachineGuid registry read failed, falling back to hostname")
+
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
+
+    except Exception as e:
+        debug_print(f"Failed to get device identifier: {e}")
+        return None
+
+
+def detect_install_state() -> str:
+    """User-level install state (informational): 'persisted' if this tool's
+    Unbound setup already exists on this device, else 'fresh'. User-level setups
+    are never tamper-eligible, so 'tampered' is never reported. This gateway flow
+    configures gemini-cli via env vars + the shared ~/.unbound/config.json, which
+    is the only on-disk artifact it writes."""
+    try:
+        return "persisted" if (Path.home() / ".unbound" / "config.json").exists() else "fresh"
+    except Exception as e:
+        debug_print(f"detect_install_state failed: {e}")
+        return "fresh"
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -470,6 +588,9 @@ def main():
     success, message = set_env_var("GOOGLE_GEMINI_BASE_URL", f"{args.gateway_url.rstrip('/')}/v1")
     debug_print("GOOGLE_GEMINI_BASE_URL set successfully")
 
+    _install_state = detect_install_state()
+    _device_id = get_device_identifier()
+
     write_unbound_config(api_key)
 
     # Final instructions
@@ -477,7 +598,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "gemini-cli", backend_url=args.backend_url)
+    notify_setup_complete(api_key, "gemini-cli", backend_url=args.backend_url, install_state=_install_state, serial_number=_device_id)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:
