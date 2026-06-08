@@ -30,6 +30,7 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
+BACKFILL_STATE_FILE = '.unbound_last_backfill'
 ROLLOUT_FILENAME_RE = re.compile(
     r'^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-'
     r'([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$'
@@ -716,11 +717,127 @@ def disable_codex_hooks_feature() -> None:
         debug_print(f"Failed to remove codex_hooks feature: {e}")
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
+def get_device_identifier() -> Optional[str]:
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+            # "Serial Number" label is localized and fails on non-English macOS.
+            result = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'IOPlatformSerialNumber' in line:
+                        parts = line.split('=')
+                        if len(parts) >= 2:
+                            serial = parts[1].strip().strip('"').strip()
+                            if serial:
+                                return serial
+            return None
+
+        elif system == "linux":
+            try:
+                result = subprocess.run(
+                    ["dmidecode", "-s", "system-serial-number"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    stderr=subprocess.DEVNULL
+                )
+                if result.returncode == 0:
+                    device_id = result.stdout.strip()
+                    if device_id:
+                        return device_id
+            except Exception:
+                debug_print("dmidecode failed, trying machine-id")
+
+            for machine_id_path in ['/etc/machine-id', '/var/lib/dbus/machine-id']:
+                try:
+                    with open(machine_id_path, 'r', encoding='utf-8') as f:
+                        device_id = f.read().strip()
+                        if device_id:
+                            return device_id
+                except Exception:
+                    continue
+
+            try:
+                result = subprocess.run(
+                    ["hostname"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    hostname = result.stdout.strip()
+                    if hostname:
+                        return hostname
+            except Exception:
+                pass
+
+            return None
+
+        elif system == "windows":
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    serial = result.stdout.strip()
+                    if serial:
+                        return serial
+            except Exception:
+                debug_print("PowerShell BIOS query failed, trying registry MachineGuid")
+
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
+            except Exception:
+                debug_print("MachineGuid registry read failed, falling back to hostname")
+
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
+
+    except Exception as e:
+        debug_print(f"Failed to get device identifier: {e}")
+        return None
+
+
+def detect_install_state() -> str:
+    """User-level install state (informational): 'persisted' if this tool's
+    Unbound setup already exists on this device, else 'fresh'. User-level setups
+    are never tamper-eligible, so 'tampered' is never reported."""
+    try:
+        return "persisted" if (Path.home() / ".codex" / "hooks" / "unbound.py").exists() else "fresh"
+    except Exception as e:
+        debug_print(f"detect_install_state failed: {e}")
+        return "fresh"
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        data = json.dumps({"tool_type": tool_type})
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        data = json.dumps(body)
         subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
              "-H", f"X-API-KEY: {api_key}",
@@ -866,9 +983,39 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
     return True
 
 
-def _backfill_iter_transcripts(root: Path):
-    # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
-    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+def _backfill_state_path(home: Path) -> Path:
+    return home / '.codex' / 'hooks' / BACKFILL_STATE_FILE
+
+
+def _backfill_read_cutoff(home: Path) -> float:
+    """mtime cutoff for transcript selection: the last successful backfill when
+    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
+    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    try:
+        last = float(_backfill_state_path(home).read_text().strip())
+    except (OSError, ValueError):
+        return default_cutoff
+    # Ignore corrupt or future timestamps (clock skew).
+    if last <= 0 or last > time.time():
+        return default_cutoff
+    return last
+
+
+def _backfill_write_cutoff(home: Path, ts: float) -> None:
+    # Write via temp + atomic replace so an overlapping cron run never reads a
+    # half-written timestamp.
+    try:
+        path = _backfill_state_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
+        tmp.write_text(str(ts))
+        os.replace(tmp, path)
+    except OSError as e:
+        debug_print(f"failed to persist backfill timestamp: {e}")
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
+    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
     for p in root.rglob('rollout-*.jsonl'):
         if p.name.startswith('.'):
             continue
@@ -985,17 +1132,25 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         return
 
     try:
-        sessions_root = Path.home() / '.codex' / 'sessions'
+        home = Path.home()
+        started_at = time.time()
+        cutoff_mtime = _backfill_read_cutoff(home)
+        sessions_root = home / '.codex' / 'sessions'
         sessions: List[Dict] = []
+        capped = False
         if sessions_root.exists():
-            for transcript_path in sorted(_backfill_iter_transcripts(sessions_root)):
+            for transcript_path in sorted(_backfill_iter_transcripts(sessions_root, cutoff_mtime)):
                 if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                    # Hit the per-run cap with files still unprocessed — don't advance
+                    # the cutoff, or those older files would be skipped permanently.
+                    capped = True
                     debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
                     break
                 session = _backfill_collect_session(transcript_path)
                 if session:
                     sessions.append(session)
         if not sessions:
+            _backfill_write_cutoff(home, started_at)
             print("[backfill] No past sessions found.")
             return
 
@@ -1041,6 +1196,8 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         elif failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
         else:
+            if not capped:
+                _backfill_write_cutoff(home, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
@@ -1121,6 +1278,9 @@ def main():
 
     debug_print("API key received from callback")
 
+    _install_state = detect_install_state()
+    _device_id = get_device_identifier()
+
     # Remove gateway setup env vars and artifacts
     remove_gateway_artifacts()
 
@@ -1152,7 +1312,7 @@ def main():
     print("Setup complete")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "codex", backend_url=backend_url)
+    notify_setup_complete(api_key, "codex", backend_url=backend_url, install_state=_install_state, serial_number=_device_id)
 
     if backfill_mode:
         run_backfill(api_key, backend_url)

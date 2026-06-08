@@ -26,6 +26,7 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
+BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 
 def normalize_url(value: str) -> str:
@@ -134,18 +135,20 @@ def get_device_identifier() -> Optional[str]:
     system = platform.system().lower()
     try:
         if system == "darwin":
+            # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+            # "Serial Number" label is localized and fails on non-English macOS.
             result = subprocess.run(
-                ["system_profiler", "SPHardwareDataType"],
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
                 capture_output=True,
                 text=True,
                 timeout=10
             )
             if result.returncode == 0:
                 for line in result.stdout.split('\n'):
-                    if 'Serial Number' in line:
-                        parts = line.split(': ')
+                    if 'IOPlatformSerialNumber' in line:
+                        parts = line.split('=')
                         if len(parts) >= 2:
-                            serial = parts[1].strip()
+                            serial = parts[1].strip().strip('"').strip()
                             if serial:
                                 return serial
             return None
@@ -1041,9 +1044,39 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     return {'session_id': session_id, 'entries': entries}
 
 
-def _backfill_iter_transcripts(root: Path):
-    # Skip hidden, symlinked, oversized (50MB cap), or stale (>30 day) files.
-    cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+def _backfill_state_path(home: Path) -> Path:
+    return home / '.claude' / 'hooks' / BACKFILL_STATE_FILE
+
+
+def _backfill_read_cutoff(home: Path) -> float:
+    """mtime cutoff for transcript selection: the last successful backfill when
+    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
+    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    try:
+        last = float(_backfill_state_path(home).read_text().strip())
+    except (OSError, ValueError):
+        return default_cutoff
+    # Ignore corrupt or future timestamps (clock skew).
+    if last <= 0 or last > time.time():
+        return default_cutoff
+    return last
+
+
+def _backfill_write_cutoff(home: Path, ts: float) -> None:
+    # Write via temp + atomic replace so an overlapping cron run never reads a
+    # half-written timestamp.
+    try:
+        path = _backfill_state_path(home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
+        tmp.write_text(str(ts))
+        os.replace(tmp, path)
+    except OSError as e:
+        debug_print(f"failed to persist backfill timestamp: {e}")
+
+
+def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
+    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
     for p in root.rglob('*.jsonl'):
         if p.name.startswith('.'):
             continue
@@ -1153,19 +1186,24 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
         start_idx = last_fit_end
 
 
-def _backfill_collect_sessions(home_dir: Path) -> List[Dict]:
+def _backfill_collect_sessions(home_dir: Path) -> Tuple[List[Dict], bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
+    # Returns (sessions, capped); capped=True means the per-run cap was hit and
+    # older files remain unprocessed, so this home's cutoff must not advance.
     projects_root = home_dir / '.claude' / 'projects'
     if not projects_root.exists():
-        return []
+        return [], False
+    cutoff_mtime = _backfill_read_cutoff(home_dir)
     sessions = []
-    for transcript_path in sorted(_backfill_iter_transcripts(projects_root)):
+    capped = False
+    for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
         if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+            capped = True
             break
         session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
-    return sessions
+    return sessions, capped
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1304,14 +1342,27 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print("no user homes found — skipping backfill")
             return
 
+        started_at = time.time()
         sessions = []
+        collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
-            user_sessions = _run_as_user(username, _backfill_collect_sessions, home_dir) or []
+            result = _run_as_user(username, _backfill_collect_sessions, home_dir)
+            if result is None:
+                # Could not read this user's home (fork/perms) — don't advance its
+                # cutoff, or we'd permanently skip its history on the next run.
+                continue
+            user_sessions, capped = result
             if user_sessions:
                 debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
                 sessions.extend(user_sessions)
+            # Capped homes still have unprocessed files — leave their cutoff so the
+            # overflow stays eligible on the next run.
+            if not capped:
+                collected_homes.append((username, home_dir))
 
         if not sessions:
+            for username, home_dir in collected_homes:
+                _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
             print("[backfill] No past sessions found.")
             return
 
@@ -1323,6 +1374,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         elif chunks_failed:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({chunks_failed} chunks failed).")
         else:
+            for username, home_dir in collected_homes:
+                _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
@@ -1341,7 +1394,8 @@ def detect_install_state() -> Optional[str]:
         if not config_path.exists():
             return 'fresh'
         return 'persisted' if script_path.exists() else 'tampered'
-    except Exception:
+    except Exception as e:
+        debug_print(f"detect_install_state failed: {e}")
         return None
 
 
@@ -1349,7 +1403,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
-        body = {"tool_type": tool_type}
+        body = {"tool_type": tool_type, "managed": True}
         if install_state is not None:
             body["install_state"] = install_state
         if serial_number is not None:
