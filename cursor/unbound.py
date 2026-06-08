@@ -1257,6 +1257,18 @@ def _replace_self(new_bytes: bytes) -> None:
 
 
 def _check_self_update() -> None:
+    # Under MDM the hook runs from an admin-managed (enterprise) location we
+    # can't write to, so SELF_SCRIPT_PATH (user-level) is not the file executing
+    # — updating it would only write a dead copy the enterprise hooks never run.
+    # The daily MDM cron refreshes the enterprise script instead. Only
+    # self-update when we are actually running the user-level script.
+    try:
+        running = os.path.normcase(str(Path(__file__).resolve()))
+        target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
+        if running != target:
+            return
+    except Exception:
+        return
     # refresh hook from main, throttled per interval
     try:
         if not _self_update_due():
