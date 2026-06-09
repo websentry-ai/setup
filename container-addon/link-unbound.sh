@@ -1,18 +1,25 @@
 #!/bin/sh
 # Bundled by unbound-hooks: symlink a mounted Unbound config into every user's home so the
 # hook (which reads $HOME/.unbound/config.json) works as ANY user, incl. after su/sudo.
-# Idempotent and best-effort (skips homes it can't write). Consumers must mount the config
-# to /usr/local/share/unbound/config.json (e.g. devcontainer.json mounts:
-#   source=${localEnv:HOME}/.unbound/config.json,target=/usr/local/share/unbound/config.json,type=bind,readonly).
+# The host-mounted config is the source of truth and intentionally overrides any
+# container-local config (a local file must not shadow the host-enforced credential).
+# Idempotent and best-effort; only acts when the host config is actually mounted.
 SRC=/usr/local/share/unbound/config.json
-[ -e "$SRC" ] || exit 0   # nothing mounted -> nothing to link (hook can still use env)
+if [ ! -e "$SRC" ]; then
+  echo "unbound-hooks: $SRC not mounted; left existing configs untouched"
+  exit 0
+fi
+linked=0; replaced=0
 for h in /root /home/*; do
   [ -d "$h" ] || continue
+  dest="$h/.unbound/config.json"
+  [ -e "$dest" ] && [ ! -L "$dest" ] && replaced=$((replaced+1))
   mkdir -p "$h/.unbound" 2>/dev/null || continue
-  ln -sf "$SRC" "$h/.unbound/config.json" 2>/dev/null || continue
+  ln -sf "$SRC" "$dest" 2>/dev/null || continue
   u=$(stat -c %u "$h" 2>/dev/null) && g=$(stat -c %g "$h" 2>/dev/null) && {
     chown "$u:$g" "$h/.unbound" 2>/dev/null || true
-    chown -h "$u:$g" "$h/.unbound/config.json" 2>/dev/null || true
+    chown -h "$u:$g" "$dest" 2>/dev/null || true
   }
+  linked=$((linked+1))
 done
-exit 0
+echo "unbound-hooks: linked host config into $linked home(s) (replaced $replaced local file(s))"
