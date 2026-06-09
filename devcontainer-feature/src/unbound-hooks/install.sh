@@ -39,5 +39,10 @@ fi
 install -D -m 0755 "$HERE/unbound.py" /unbound/unbound.py
 install -D -m 0644 "$HERE/managed-settings.json" /etc/claude-code/managed-settings.json
 
+# Symlink helper: links a mounted config (/usr/local/share/unbound/config.json) into every
+# user's ~/.unbound/config.json so the hook works as ANY user (incl. after su/sudo). Run at
+# container start via the Feature's postStartCommand (see devcontainer-feature.json).
+install -D -m 0755 "$HERE/link-unbound.sh" /usr/local/share/unbound/link-unbound.sh
+
 echo "unbound-hooks: installed hook + managed settings"
 echo "unbound-hooks: mount ~/.unbound/config.json (or set UNBOUND_CLAUDE_API_KEY) to supply creds"
