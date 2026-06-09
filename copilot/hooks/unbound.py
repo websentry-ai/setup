@@ -56,10 +56,41 @@ SELF_UPDATE_STATE_PATH = LOG_DIR / ".self_update_check"
 SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 
 # Copilot tool names (VS Code + CLI) translated to the canonical gateway vocabulary.
-SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+# WEB-4606: `send_to_terminal` (Copilot CLI) is a real shell execution and must be
+# canonicalized to Bash like `run_in_terminal` — so it is both policy-checked at
+# pretool AND classified as a terminal command (not MCP) for analytics.
+SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal', 'send_to_terminal'}
 READ_TOOLS = {'read_file', 'readFile', 'view', 'list_dir', 'listDirectory', 'cat'}
 WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
-EDIT_TOOLS = {'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit', 'replace_string_in_file'}
+EDIT_TOOLS = {'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit', 'replace_string_in_file',
+              'multi_replace_string_in_file', 'insert_edit_into_file'}
+
+# WEB-4606: Copilot terminal/search tools that aren't a literal shell call (no
+# `command` arg) but are still terminal operations. Without this they fall into
+# map_copilot_tool's afterMCPExecution catch-all and get scored by the gateway's
+# MCP capability rubric — the dominant source of false-positive high-risk alerts.
+# Mapping them to afterShellExecution routes them to the action-based terminal
+# classifier instead. Value is a builder that turns the tool args into the
+# synthetic command the classifier sees. (Analytics only — these have no command
+# to policy-check at pretool, so they stay out of SHELL_TOOLS.)
+# Builders use `x or ''` (not `.get(k, '')`) so a key present with a None value
+# coerces to '' instead of rendering the literal "None" into the synthetic command.
+TERMINAL_LIKE_TOOLS = {
+    'get_terminal_output': lambda a: 'true',
+    'kill_terminal':       lambda a: 'true',
+    'grep_search':         lambda a: f"grep {a.get('query') or ''} {a.get('includePattern') or ''}".strip(),
+    'file_search':         lambda a: f"find {a.get('query') or ''}".strip(),
+}
+
+# WEB-4606: Copilot's own orchestration / editor / memory tools have no
+# security-relevant action of their own — when a subagent is spawned, the actions
+# it takes are reported and scored as their own tool calls, so scoring the wrapper
+# is meaningless double-counting that produced false alerts. Drop them, the same
+# way Claude Code's Task/Agent tools are simply not scored.
+INTERNAL_TOOLS = {
+    'execution_subagent', 'explore_subagent', 'runSubagent', 'run_task',
+    'run_vscode_command', 'vscode_askQuestions', 'tool_search', 'memory',
+}
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
@@ -662,23 +693,35 @@ def _normalize_arguments(arguments):
 
 
 def map_copilot_tool(name, args, result_content):
-    """Map a Copilot tool call to a cursor-style tool_use entry."""
+    """Map a Copilot tool call to a cursor-style tool_use entry.
+
+    Returns None for internal orchestration tools, which are intentionally not
+    emitted as analytics tool calls (WEB-4606).
+    """
+    if name in INTERNAL_TOOLS:
+        return None
     if name in SHELL_TOOLS:
         entry = {
             'type': 'afterShellExecution',
-            'command': args.get('command', ''),
+            'command': args.get('command') or '',
+            'output': result_content or '',
+        }
+    elif name in TERMINAL_LIKE_TOOLS:
+        entry = {
+            'type': 'afterShellExecution',
+            'command': TERMINAL_LIKE_TOOLS[name](args),
             'output': result_content or '',
         }
     elif name in READ_TOOLS:
         entry = {
             'type': 'beforeReadFile',
-            'file_path': args.get('filePath') or args.get('path') or args.get('file_path', ''),
+            'file_path': args.get('filePath') or args.get('path') or args.get('file_path') or '',
             'content': result_content or '',
         }
     elif name in WRITE_TOOLS or name in EDIT_TOOLS:
         entry = {
             'type': 'afterFileEdit',
-            'file_path': args.get('filePath') or args.get('path') or args.get('file_path', ''),
+            'file_path': args.get('filePath') or args.get('path') or args.get('file_path') or '',
             'content': args.get('content') or args.get('file_text') or result_content or '',
         }
     else:
@@ -797,7 +840,11 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     tool_use = []
     for call_id in tool_calls:
         call = tool_data[call_id]
-        tool_use.append(map_copilot_tool(call['name'], call['arguments'], call['result']))
+        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
+        # `is not None` (not truthiness): None means a consciously-dropped internal
+        # tool; an empty-but-valid dict should still be appended.
+        if mapped is not None:
+            tool_use.append(mapped)
 
     messages = []
     if user_prompt:
