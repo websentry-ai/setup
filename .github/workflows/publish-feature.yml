@@ -1,0 +1,75 @@
+name: publish-feature
+
+# Publishes the unbound-hooks devcontainer Feature collection to GHCR using the official
+# devcontainers/action. Version comes from devcontainer-feature.json, published as
+# :0.1.0, :0.1, :0, :latest under ghcr.io/websentry-ai/setup/unbound-hooks.
+# Auth uses the built-in GITHUB_TOKEN.
+#
+# Zero-drift: before publishing, the canonical hook is copied from
+# claude-code/hooks/unbound.py into the feature dir (the committed tree does NOT contain
+# that copy — it is .gitignored), so the published Feature always carries the current hook.
+#
+# Triggers (deliberately scoped to NOT collide with this repo's own release tags):
+#   - push a dedicated tag:  git push origin container-addon-v0.1.0
+#   - or run manually via the Actions tab (workflow_dispatch).
+on:
+  push:
+    tags: ["container-addon-v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Feature version to publish (e.g. 0.1.0). Leave blank to keep the version currently in devcontainer-feature.json."
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vendor canonical hook into the feature (zero-drift)
+        run: cp claude-code/hooks/unbound.py devcontainer-feature/src/unbound-hooks/unbound.py
+
+      - name: Sync feature version to the release tag (single source of truth)
+        # The git tag is the single source of truth for BOTH the addon image tag and the
+        # feature version. devcontainers/action reads the version ONLY from
+        # devcontainer-feature.json, so we rewrite it here — on the ephemeral runner
+        # checkout, NOT committed back — to match the addon's published version.
+        #   - tag push (container-addon-vX.Y.Z): version = X.Y.Z (strip prefix, same as publish-addon.yml)
+        #   - workflow_dispatch with `tag` input: version = that input
+        #   - workflow_dispatch with empty input: no rewrite, keep the JSON's current version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+        run: |
+          VER="$INPUT_TAG"
+          # Only strip from the ref on an actual tag push. On a dispatch the ref is a
+          # branch, which the prefix would not match — guard against rewriting to it.
+          if [ -z "$VER" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#container-addon-v}"
+          fi
+          if [ -n "$VER" ]; then
+            echo "Setting feature version to $VER"
+            tmp=$(mktemp)
+            jq --arg v "$VER" '.version = $v' devcontainer-feature/src/unbound-hooks/devcontainer-feature.json > "$tmp"
+            mv "$tmp" devcontainer-feature/src/unbound-hooks/devcontainer-feature.json
+          else
+            echo "No version override; keeping the version already in devcontainer-feature.json"
+          fi
+
+      - name: Publish Feature
+        uses: devcontainers/action@v1
+        with:
+          publish-features: "true"
+          base-path-to-features: "./devcontainer-feature/src"
+          # generate-docs intentionally disabled: when enabled the action commits the
+          # generated docs back to the repo, which requires `contents: write` +
+          # `pull-requests: write`. This is a tag-triggered publish that must stay
+          # side-effect-free (no commits back to the repo), so we keep it off and the
+          # job only needs `packages: write` to push the Feature to GHCR.
+          generate-docs: "false"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
