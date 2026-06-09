@@ -906,6 +906,12 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             ),
         }
 
+    
+    if mcp_server is not None and api_response.get('unknown_mcp_server'):
+        server_cfg = metadata.get('mcp_server_config')
+        if server_cfg:
+            _dispatch_mcp_server_scan(mcp_server, server_cfg)
+
     return format_hook_response(api_response)
 
 
@@ -1378,6 +1384,48 @@ def _hook_discovery_enabled_for_org() -> bool:
     except OSError:
         pass
     return enabled
+
+
+def _dispatch_mcp_server_scan(server_name, server_config):
+    
+    try:
+        try:
+            with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                unbound_config = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        api_key = unbound_config.get("api_key")
+        backend_url = unbound_config.get("base_url")
+        if not api_key or not backend_url:
+            return
+
+        DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        if not DISCOVERY_INSTALL_SH.exists():
+            r = subprocess.run(
+                ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                capture_output=True, timeout=30,
+            )
+            if r.returncode != 0:
+                return
+            os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+
+        
+        popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+                        "stdin": subprocess.DEVNULL, "close_fds": True,
+                        "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(
+            ["bash", str(DISCOVERY_INSTALL_SH), "mcp-scan",
+             "--name", server_name,
+             "--server-json", json.dumps(server_config),
+             "--domain", backend_url],
+            **popen_kwargs,
+        )
+    except Exception:
+        return
 
 
 def _dispatch_discovery() -> None:
