@@ -65,6 +65,11 @@ jobs:
         with:
           publish-features: "true"
           base-path-to-features: "./devcontainer-feature/src"
-          generate-docs: "true"
+          # generate-docs intentionally disabled: when enabled the action commits the
+          # generated docs back to the repo, which requires `contents: write` +
+          # `pull-requests: write`. This is a tag-triggered publish that must stay
+          # side-effect-free (no commits back to the repo), so we keep it off and the
+          # job only needs `packages: write` to push the Feature to GHCR.
+          generate-docs: "false"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
