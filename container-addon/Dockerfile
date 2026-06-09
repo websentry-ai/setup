@@ -24,3 +24,4 @@
 FROM scratch AS addon
 COPY claude-code/hooks/unbound.py /unbound/unbound.py
 COPY container-addon/managed-settings.json /etc/claude-code/managed-settings.json
+COPY container-addon/link-unbound.sh /usr/local/share/unbound/link-unbound.sh
