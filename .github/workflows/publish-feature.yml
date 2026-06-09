@@ -16,6 +16,10 @@ on:
   push:
     tags: ["container-addon-v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Feature version to publish (e.g. 0.1.0). Leave blank to keep the version currently in devcontainer-feature.json."
+        required: false
 
 permissions:
   contents: read
@@ -29,6 +33,30 @@ jobs:
 
       - name: Vendor canonical hook into the feature (zero-drift)
         run: cp claude-code/hooks/unbound.py devcontainer-feature/src/unbound-hooks/unbound.py
+
+      - name: Sync feature version to the release tag (single source of truth)
+        # The git tag is the single source of truth for BOTH the addon image tag and the
+        # feature version. devcontainers/action reads the version ONLY from
+        # devcontainer-feature.json, so we rewrite it here — on the ephemeral runner
+        # checkout, NOT committed back — to match the addon's published version.
+        #   - tag push (container-addon-vX.Y.Z): version = X.Y.Z (strip prefix, same as publish-addon.yml)
+        #   - workflow_dispatch with `tag` input: version = that input
+        #   - workflow_dispatch with empty input: no rewrite, keep the JSON's current version
+        run: |
+          VER="${{ github.event.inputs.tag }}"
+          # Only strip from the ref on an actual tag push. On a dispatch the ref is a
+          # branch, which the prefix would not match — guard against rewriting to it.
+          if [ -z "$VER" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VER="${GITHUB_REF_NAME#container-addon-v}"
+          fi
+          if [ -n "$VER" ]; then
+            echo "Setting feature version to $VER"
+            tmp=$(mktemp)
+            jq --arg v "$VER" '.version = $v' devcontainer-feature/src/unbound-hooks/devcontainer-feature.json > "$tmp"
+            mv "$tmp" devcontainer-feature/src/unbound-hooks/devcontainer-feature.json
+          else
+            echo "No version override; keeping the version already in devcontainer-feature.json"
+          fi
 
       - name: Publish Feature
         uses: devcontainers/action@v1
