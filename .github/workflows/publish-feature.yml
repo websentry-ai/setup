@@ -42,8 +42,10 @@ jobs:
         #   - tag push (container-addon-vX.Y.Z): version = X.Y.Z (strip prefix, same as publish-addon.yml)
         #   - workflow_dispatch with `tag` input: version = that input
         #   - workflow_dispatch with empty input: no rewrite, keep the JSON's current version
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          VER="${{ github.event.inputs.tag }}"
+          VER="$INPUT_TAG"
           # Only strip from the ref on an actual tag push. On a dispatch the ref is a
           # branch, which the prefix would not match — guard against rewriting to it.
           if [ -z "$VER" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then

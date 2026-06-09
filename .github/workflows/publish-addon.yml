@@ -41,8 +41,10 @@ jobs:
 
       - name: Resolve tag
         id: meta
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
         run: |
-          TAG="${{ github.event.inputs.tag }}"
+          TAG="$INPUT_TAG"
           # On a tag push, strip the dedicated `container-addon-v` prefix:
           #   container-addon-v0.1.0 -> 0.1.0
           if [ -z "$TAG" ]; then TAG="${GITHUB_REF_NAME#container-addon-v}"; fi
