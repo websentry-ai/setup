@@ -390,7 +390,11 @@ def canonical_tool_name(raw):
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
-        return tool_input.get('command', '')
+        # Shell tools key the payload differently: run_in_terminal/bash use
+        # `command`; send_to_terminal and some variants use `input`/`text`.
+        # Try all so the policy check never sees an empty command for a real
+        # shell execution.
+        return tool_input.get('command') or tool_input.get('input') or tool_input.get('text') or ''
     if canonical in ('Read', 'Write', 'Edit'):
         return tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path') or ''
     if canonical.startswith('mcp'):
@@ -730,7 +734,7 @@ def map_copilot_tool(name, args, result_content):
     if name in SHELL_TOOLS:
         entry = {
             'type': 'afterShellExecution',
-            'command': args.get('command') or '',
+            'command': args.get('command') or args.get('input') or args.get('text') or '',
             'output': result_content or '',
         }
     elif name in TERMINAL_LIKE_TOOLS:
