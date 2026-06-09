@@ -13,6 +13,10 @@ linked=0; replaced=0
 for h in /root /home/*; do
   [ -d "$h" ] || continue
   dest="$h/.unbound/config.json"
+  # INTENTIONAL OVERRIDE: ln -sf below replaces whatever is at $dest, including a real
+  # (non-symlink) config a user/image placed. This is by design for an enforcement tool —
+  # the host-mounted config must win so a local file can't shadow the enforced credential.
+  # We only COUNT real-file replacements here to surface them in the summary log (not skip).
   [ -e "$dest" ] && [ ! -L "$dest" ] && replaced=$((replaced+1))
   mkdir -p "$h/.unbound" 2>/dev/null || continue
   ln -sf "$SRC" "$dest" 2>/dev/null || continue
