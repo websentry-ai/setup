@@ -40,6 +40,7 @@ others. A summary at the end lists which steps succeeded and which failed.
 
 import os
 import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,16 @@ _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discover
 # rather than a tight bound — picked to surface a hung subprocess as a clear
 # error instead of a silent indefinite hang on the wrapper.
 SUBPROCESS_TIMEOUT_SECONDS = 600
+
+# Coding discovery legitimately takes much longer than a per-tool setup (a full
+# filesystem scan + per-user upload), so it gets its OWN, larger timeout instead
+# of the tool one. Discovery self-enforces this via --timeout — on expiry it
+# releases its lock and reports the run as failed, then exits — so it cleans up
+# itself instead of being force-killed with a stale lock left behind. The parent
+# waits a short grace beyond the discovery deadline before its own backstop kill,
+# so the child's graceful self-timeout always fires first.
+DISCOVERY_TIMEOUT_SECONDS = 1800   # 30 min; kept in sync with the discovery --timeout
+DISCOVERY_KILL_GRACE_SECONDS = 120
 
 # (display_name, url, supports_backfill). Only tools whose hook scripts
 # accept `--backfill` get the flag appended; Cursor and GitHub Copilot have no
@@ -112,7 +123,7 @@ def fetch_script(url: str) -> bytes:
     Note: urllib.request.urlopen raises HTTPError for any non-2xx response,
     so we don't need an explicit status-code check here — anything reaching
     `body = resp.read()` is already a 2xx."""
-    req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.1"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         body = resp.read()
         if not body or not body.strip():
@@ -157,6 +168,65 @@ def run_tool(name: str, url: str, args: list) -> bool:
             pass
 
 
+def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -> None:
+    """Kill the discovery subprocess AND its descendants. install.sh runs python
+    (the process that holds the discovery lock) as a child of bash, so killing
+    only the direct child would orphan a stuck discovery that keeps holding its
+    lock with a live PID. SIGTERM the whole group first so discovery's own
+    handler can release the lock and exit cleanly, then SIGKILL whatever ignores
+    it. On Windows there are no POSIX groups, so taskkill /T kills the tree."""
+    host = platform.node() or "unknown-host"
+    if platform.system().lower() == "windows":
+        print(f"[Discovery] [{host}] force-killing discovery process tree (taskkill /T, pid={proc.pid}).", file=sys.stderr)
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=30,
+            )
+        except Exception as e:
+            print(f"[Discovery] [{host}] taskkill failed ({e}); falling back to proc.kill().", file=sys.stderr)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+
+    def _signal_group(sig: int) -> None:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                proc.send_signal(sig)
+        except OSError as e:
+            print(f"[Discovery] [{host}] could not deliver signal {sig} (pgid={pgid}): {e}", file=sys.stderr)
+
+    term_grace = min(grace, 15)
+    print(
+        f"[Discovery] [{host}] SIGTERM -> discovery group (pgid={pgid}); "
+        f"waiting up to {term_grace}s for it to release its lock and exit.",
+        file=sys.stderr,
+    )
+    _signal_group(signal.SIGTERM)
+    try:
+        proc.wait(timeout=term_grace)
+        print(f"[Discovery] [{host}] discovery exited cleanly after SIGTERM.", file=sys.stderr)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    print(f"[Discovery] [{host}] discovery ignored SIGTERM; escalating to SIGKILL on the group.", file=sys.stderr)
+    _signal_group(signal.SIGKILL)
+    try:
+        proc.wait(timeout=10)
+        print(f"[Discovery] [{host}] discovery group reaped after SIGKILL.", file=sys.stderr)
+    except subprocess.TimeoutExpired:
+        print(f"[Discovery] [{host}] discovery not reaped within 10s of SIGKILL.", file=sys.stderr)
+
+
 def run_discovery(discovery_key: str, backend_url: str) -> bool:
     """Downloads and runs the coding-discovery installer. Mac/Linux use
     install.sh via bash; Windows uses install.ps1 via PowerShell. Both accept
@@ -183,14 +253,32 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
         else:
             os.chmod(tmp_path, 0o755)
             cmd = ["bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url]
+        # NOTE: we deliberately do NOT pass --timeout. install.sh is fetched from
+        # coding-discovery-tool/main, and an older discovery there would reject an
+        # unknown --timeout flag (argparse exits non-zero) and fail every
+        # enrollment. Discovery self-times-out via its OWN default, which is kept
+        # equal to DISCOVERY_TIMEOUT_SECONDS — so this stays correct and in sync
+        # whether or not the companion discovery change has landed on main yet.
+        #
+        # Backstop = that deadline + a short grace. Discovery should hit its own
+        # timeout first and clean up; this only force-kills a child that overran.
+        backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
+        # Run discovery in its OWN process group (POSIX) so the backstop kill can
+        # take down the WHOLE tree (bash + the python discovery that holds the
+        # lock), not just the direct child. Orphaning a stuck discovery would
+        # leave its lock held by a live PID, which nothing else can recover.
+        popen_kwargs = {"start_new_session": True} if not is_windows else {}
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
-            result = subprocess.run(cmd, timeout=SUBPROCESS_TIMEOUT_SECONDS)
-            return result.returncode == 0
+            return proc.wait(timeout=backstop) == 0
         except subprocess.TimeoutExpired:
             print(
-                f"❌ [Discovery] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                f"❌ [Discovery] [{platform.node() or 'unknown-host'}] exceeded {backstop}s "
+                f"(self-timeout {DISCOVERY_TIMEOUT_SECONDS}s + {DISCOVERY_KILL_GRACE_SECONDS}s grace) "
+                f"— terminating discovery (pid={proc.pid}) and its children.",
                 file=sys.stderr,
             )
+            _terminate_discovery_tree(proc)
             return False
     finally:
         try:
