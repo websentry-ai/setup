@@ -40,6 +40,7 @@ others. A summary at the end lists which steps succeeded and which failed.
 
 import os
 import platform
+import signal
 import subprocess
 import sys
 import tempfile
@@ -67,6 +68,16 @@ _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discover
 # rather than a tight bound — picked to surface a hung subprocess as a clear
 # error instead of a silent indefinite hang on the wrapper.
 SUBPROCESS_TIMEOUT_SECONDS = 600
+
+# Coding discovery legitimately takes much longer than a per-tool setup (a full
+# filesystem scan + per-user upload), so it gets its OWN, larger timeout instead
+# of the tool one. Discovery self-enforces this via --timeout — on expiry it
+# releases its lock and reports the run as failed, then exits — so it cleans up
+# itself instead of being force-killed with a stale lock left behind. The parent
+# waits a short grace beyond the discovery deadline before its own backstop kill,
+# so the child's graceful self-timeout always fires first.
+DISCOVERY_TIMEOUT_SECONDS = 1800   # 30 min; kept in sync with the discovery --timeout
+DISCOVERY_KILL_GRACE_SECONDS = 120
 
 # (display_name, url, supports_backfill). Only tools whose hook scripts
 # accept `--backfill` get the flag appended; Cursor and GitHub Copilot have no
@@ -157,6 +168,53 @@ def run_tool(name: str, url: str, args: list) -> bool:
             pass
 
 
+def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -> None:
+    """Kill the discovery subprocess AND its descendants. install.sh runs python
+    (the process that holds the discovery lock) as a child of bash, so killing
+    only the direct child would orphan a stuck discovery that keeps holding its
+    lock with a live PID. SIGTERM the whole group first so discovery's own
+    handler can release the lock and exit cleanly, then SIGKILL whatever ignores
+    it. On Windows there are no POSIX groups, so taskkill /T kills the tree."""
+    if platform.system().lower() == "windows":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=30,
+            )
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return
+
+    try:
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        pgid = None
+
+    def _signal_group(sig: int) -> None:
+        try:
+            if pgid is not None:
+                os.killpg(pgid, sig)
+            else:
+                proc.send_signal(sig)
+        except OSError:
+            pass
+
+    _signal_group(signal.SIGTERM)
+    try:
+        proc.wait(timeout=min(grace, 15))  # let discovery clean up + self-exit
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    _signal_group(signal.SIGKILL)
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
 def run_discovery(discovery_key: str, backend_url: str) -> bool:
     """Downloads and runs the coding-discovery installer. Mac/Linux use
     install.sh via bash; Windows uses install.ps1 via PowerShell. Both accept
@@ -182,15 +240,30 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
             ]
         else:
             os.chmod(tmp_path, 0o755)
-            cmd = ["bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url]
+            cmd = [
+                "bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url,
+                "--timeout", str(DISCOVERY_TIMEOUT_SECONDS),
+            ]
+        # Backstop = discovery's own deadline + a short grace. Discovery should
+        # hit its --timeout first and clean up; this only force-kills a child that
+        # ignored its own deadline. (Windows install.ps1 isn't passed --timeout;
+        # the discovery default already equals DISCOVERY_TIMEOUT_SECONDS.)
+        backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
+        # Run discovery in its OWN process group (POSIX) so the backstop kill can
+        # take down the WHOLE tree (bash + the python discovery that holds the
+        # lock), not just the direct child. Orphaning a stuck discovery would
+        # leave its lock held by a live PID, which nothing else can recover.
+        popen_kwargs = {"start_new_session": True} if not is_windows else {}
+        proc = subprocess.Popen(cmd, **popen_kwargs)
         try:
-            result = subprocess.run(cmd, timeout=SUBPROCESS_TIMEOUT_SECONDS)
-            return result.returncode == 0
+            return proc.wait(timeout=backstop) == 0
         except subprocess.TimeoutExpired:
             print(
-                f"❌ [Discovery] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                f"❌ [Discovery] exceeded {backstop}s (self-timeout {DISCOVERY_TIMEOUT_SECONDS}s "
+                f"+ {DISCOVERY_KILL_GRACE_SECONDS}s grace) — terminating discovery and its children.",
                 file=sys.stderr,
             )
+            _terminate_discovery_tree(proc)
             return False
     finally:
         try:
