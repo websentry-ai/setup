@@ -1387,44 +1387,49 @@ def _hook_discovery_enabled_for_org() -> bool:
 
 
 def _dispatch_mcp_server_scan(server_name, server_config):
-    
+    """Report ONE unknown MCP server out-of-band.
+
+    Detached so the blocking PreToolUse hook returns immediately. Secrets
+    (server_config args, api key) go via env, never argv or the shell string.
+    """
     try:
         try:
             with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
                 unbound_config = json.load(f)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError) as e:
+            log_error(f"mcp scan dispatch: cannot read config: {e}", 'mcp_server')
             return
         api_key = unbound_config.get("api_key")
         backend_url = unbound_config.get("base_url")
         if not api_key or not backend_url:
+            log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
 
         DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-        if not DISCOVERY_INSTALL_SH.exists():
-            r = subprocess.run(
-                ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
-                capture_output=True, timeout=30,
-            )
-            if r.returncode != 0:
-                return
-            os.chmod(DISCOVERY_INSTALL_SH, 0o755)
-
-        
-        popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
-                        "stdin": subprocess.DEVNULL, "close_fds": True,
-                        "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+        bootstrap = (
+            'set -e; '
+            f'SH="{DISCOVERY_INSTALL_SH}"; '
+            'if [ ! -f "$SH" ]; then '
+            f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
+            '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
+            'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
+        )
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL, "close_fds": True,
+            "env": {**os.environ,
+                    "UNBOUND_API_KEY": api_key,
+                    "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
+                    "UNBOUND_MCP_SERVER_NAME": server_name,
+                    "UNBOUND_MCP_DOMAIN": backend_url},
+        }
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
-        subprocess.Popen(
-            ["bash", str(DISCOVERY_INSTALL_SH), "mcp-scan",
-             "--name", server_name,
-             "--server-json", json.dumps(server_config),
-             "--domain", backend_url],
-            **popen_kwargs,
-        )
-    except Exception:
+        subprocess.Popen(["bash", "-c", bootstrap], **popen_kwargs)
+    except Exception as e:
+        log_error(f"mcp scan dispatch failed for {server_name}: {e}", 'mcp_server')
         return
 
 
