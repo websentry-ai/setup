@@ -253,26 +253,36 @@ def _write_urls_for_user(username: str, home_dir: Path, explicit: dict, defaults
     config_file = config_dir / "config.json"
 
     def _write():
+        is_windows = platform.system().lower() == "windows"
+        # Windows has no fork/privilege-drop and no O_NOFOLLOW: a non-admin user
+        # can plant ~/.unbound as a directory junction/symlink and redirect this
+        # admin-context write into an admin-only path. The config.json checks
+        # below only guard the file, not the dir, so reject a reparse-point
+        # .unbound here before mkdir/open touches it.
+        if is_windows and config_dir.exists():
+            reparse = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+            if getattr(os.lstat(str(config_dir)), "st_file_attributes", 0) & reparse:
+                raise OSError(".unbound is a reparse point")
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if platform.system().lower() != "windows":
+        if not is_windows:
             os.chmod(config_dir, 0o700)
+        # Read any existing config so its keys (e.g. the api_key a tool step
+        # wrote) survive the merge. The O_NOFOLLOW + O_NONBLOCK + regular-file
+        # open atomically rejects a symlink swap (no lstat→open TOCTOU window)
+        # and a planted FIFO/device that would otherwise hang this root run.
         config = {}
-        # Reject a non-regular config.json (symlink / FIFO / device a user may
-        # have planted) BEFORE any blocking open() — opening a FIFO O_RDONLY
-        # would hang this root run forever. lstat doesn't follow symlinks.
-        existing_is_regular = False
         try:
-            if not stat.S_ISREG(os.lstat(str(config_file)).st_mode):
+            rfd = os.open(str(config_file),
+                          os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+            if not stat.S_ISREG(os.fstat(rfd).st_mode):
+                os.close(rfd)
                 raise OSError("config.json is not a regular file")
-            existing_is_regular = True
+            with os.fdopen(rfd, "r", encoding="utf-8") as f:
+                config = json.loads(f.read())
         except FileNotFoundError:
-            pass
-        if existing_is_regular:
-            try:
-                with open(config_file, "r", encoding="utf-8") as f:
-                    config = json.loads(f.read())
-            except (json.JSONDecodeError, OSError):
-                config = {}
+            config = {}
+        except (json.JSONDecodeError, OSError):
+            config = {}
         if not isinstance(config, dict):
             config = {}
         for k, v in defaults.items():
@@ -316,11 +326,13 @@ def persist_urls_for_all_users(backend_url, gateway_url, frontend_url) -> None:
     }
     written = 0
     for username, home_dir in get_all_user_homes():
-        try:
-            if _write_urls_for_user(username, home_dir, explicit, defaults) is not None:
-                written += 1
-        except Exception as e:
-            print(f"⚠️  [config] could not persist URLs for {username}: {e}", file=sys.stderr)
+        # _run_as_user swallows the child's exception and returns None, so a
+        # failed write surfaces only as a None here — warn rather than fail
+        # silently (a try/except around this call would be dead code).
+        if _write_urls_for_user(username, home_dir, explicit, defaults) is not None:
+            written += 1
+        else:
+            print(f"⚠️  [config] could not persist URLs for {username}", file=sys.stderr)
     print(f"✅ Persisted tenant URLs to ~/.unbound/config.json for {written} user(s).")
 
 
