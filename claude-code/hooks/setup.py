@@ -753,7 +753,7 @@ def detect_install_state() -> str:
 
 def get_managed_settings_dir() -> Path:
     """System-wide managed (MDM) settings directory for Claude Code. Mirrors the
-    path the MDM setup writes to, so user-level setup can detect it read-only."""
+    path the MDM setup writes to; keep this in sync with mdm/setup.py."""
     system = platform.system().lower()
     if system == "darwin":
         return Path("/Library/Application Support/ClaudeCode")
@@ -778,7 +778,8 @@ def check_enterprise_hooks_conflict() -> bool:
             managed_dir / "managed-settings.d" / "unbound.json",
         ]
         return any(marker.exists() for marker in markers)
-    except Exception:
+    except Exception as e:
+        print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False
 
 

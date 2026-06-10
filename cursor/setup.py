@@ -325,7 +325,8 @@ def check_enterprise_hooks_conflict() -> bool:
         else:
             return False
         return (enterprise_dir / "hooks.json").exists()
-    except Exception:
+    except Exception as e:
+        print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False
 
 
