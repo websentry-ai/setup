@@ -284,7 +284,7 @@ def run_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
-def write_unbound_config(api_key: str) -> bool:
+def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
@@ -299,6 +299,8 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
@@ -751,6 +753,38 @@ def detect_install_state() -> str:
         return "fresh"
 
 
+def get_managed_settings_dir() -> Path:
+    """System-wide managed (MDM) settings directory for Claude Code. Mirrors the
+    path the MDM setup writes to; keep this in sync with mdm/setup.py."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return Path("/Library/Application Support/ClaudeCode")
+    elif system == "linux":
+        return Path("/etc/claude-code")
+    elif system == "windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return Path(program_files) / "ClaudeCode"
+    raise OSError(f"Unsupported operating system: {system}")
+
+
+def check_enterprise_hooks_conflict() -> bool:
+    """True if an Unbound MDM (managed) setup already exists for Claude Code on
+    this device. User-level setup must not run alongside it — the managed config
+    already enforces Unbound for every user, so a second user-level install would
+    make every hook fire twice. Read-only; fails open (False) on any error."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        markers = [
+            managed_dir / "hooks" / "unbound.py",
+            managed_dir / "anthropic_key.sh",
+            managed_dir / "managed-settings.d" / "unbound.json",
+        ]
+        return any(marker.exists() for marker in markers)
+    except Exception as e:
+        print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
+        return False
+
+
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
@@ -1127,6 +1161,10 @@ def main():
         clear_setup()
         return
 
+    if check_enterprise_hooks_conflict():
+        print("\n❌ Skipped — Claude Code is managed by your organization (MDM).")
+        raise SystemExit(3)
+
     install_macos_certificates()
 
     print("=" * 60)
@@ -1204,7 +1242,7 @@ def main():
     _install_state = detect_install_state()
     _device_id = get_device_identifier()
 
-    write_unbound_config(api_key)
+    write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None})
 
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):

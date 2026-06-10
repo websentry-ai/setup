@@ -287,7 +287,7 @@ def download_file(url: str, dest_path: Path) -> bool:
         print(f"❌ Failed to download {url}: {e}")
         return False
 
-def write_unbound_config(api_key: str) -> bool:
+def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
@@ -301,6 +301,8 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         with open(config_file, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
         os.chmod(config_file, 0o600)
@@ -311,20 +313,23 @@ def write_unbound_config(api_key: str) -> bool:
 
 
 def check_enterprise_hooks_conflict() -> bool:
-    """Check if enterprise (MDM) hooks exist. Returns True if conflict found."""
-    system = platform.system().lower()
-    if system == "darwin":
-        enterprise_hooks = Path("/Library/Application Support/Cursor/hooks.json")
-    elif system == "linux":
-        enterprise_hooks = Path("/etc/cursor/hooks.json")
-    else:
+    """True if Unbound MDM (managed) Cursor hooks already exist on this device.
+    User-level setup must not run alongside them — installing user hooks on top
+    causes duplicate execution. Read-only; fails open (False) on any error."""
+    try:
+        system = platform.system().lower()
+        if system == "darwin":
+            enterprise_dir = Path("/Library/Application Support/Cursor")
+        elif system == "linux":
+            enterprise_dir = Path("/etc/cursor")
+        elif system == "windows":
+            enterprise_dir = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Cursor"
+        else:
+            return False
+        return (enterprise_dir / "hooks.json").exists()
+    except Exception as e:
+        print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False
-    if enterprise_hooks.exists():
-        print("\n❌ Enterprise (MDM) hooks are already installed.")
-        print("   Installing user-level hooks alongside MDM hooks causes duplicate execution.")
-        print("   Contact your organization administrator to manage Unbound configuration.")
-        return True
-    return False
 
 
 def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
@@ -640,6 +645,10 @@ def main():
         clear_setup()
         return
 
+    if check_enterprise_hooks_conflict():
+        print("\n❌ Skipped — Cursor is managed by your organization (MDM).")
+        raise SystemExit(3)
+
     install_macos_certificates()
 
     print("=" * 60)
@@ -698,16 +707,7 @@ def main():
     _install_state = detect_install_state()
     _device_id = get_device_identifier()
 
-    if check_enterprise_hooks_conflict():
-        # MDM hooks already in place — the device IS configured, just via the
-        # admin path. Notify the backend so this counts as a completed setup
-        # rather than a silent abort. Print a positive line so the user
-        # doesn't see only the ❌ above and assume the whole thing failed.
-        print("✅ Device already configured via MDM — no user-level setup needed.")
-        notify_setup_complete(api_key, "cursor", backend_url=backend_url, install_state=_install_state, serial_number=_device_id)
-        return
-
-    if not write_unbound_config(api_key):
+    if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
         print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
 
     debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")

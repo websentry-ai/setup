@@ -337,7 +337,7 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
-def write_unbound_config(api_key: str) -> bool:
+def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
@@ -352,6 +352,8 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
@@ -652,6 +654,36 @@ def detect_install_state() -> str:
         return "fresh"
 
 
+def get_managed_settings_dir() -> Path:
+    """System-wide managed (MDM) settings directory for Codex. Mirrors the path
+    the MDM setup writes to; keep this in sync with mdm/setup.py."""
+    system = platform.system().lower()
+    if system == "darwin":
+        return Path("/Library/Application Support/Codex")
+    elif system == "linux":
+        return Path("/etc/codex")
+    elif system == "windows":
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        return Path(program_files) / "Codex"
+    raise OSError(f"Unsupported operating system: {system}")
+
+
+def check_enterprise_hooks_conflict() -> bool:
+    """True if an Unbound MDM (managed) setup already exists for Codex on this
+    device. User-level setup must not run alongside it — the managed config
+    already enforces Unbound for every user, so a second user-level install would
+    make every hook fire twice. Read-only; fails open (False) on any error."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        markers = [
+            managed_dir / "hooks" / "unbound.py",
+        ]
+        return any(marker.exists() for marker in markers)
+    except Exception as e:
+        print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
+        return False
+
+
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
@@ -698,6 +730,10 @@ def main():
     if args.clear:
         clear_setup()
         return
+
+    if check_enterprise_hooks_conflict():
+        print("\n❌ Skipped — Codex is managed by your organization (MDM).")
+        raise SystemExit(3)
 
     print("=" * 60)
     print("Codex CLI - Environment Setup")
@@ -752,7 +788,7 @@ def main():
         return
     debug_print("openai_base_url written to codex config successfully")
 
-    write_unbound_config(api_key)
+    write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
 
     # Final instructions
     print("\n" + "=" * 60)

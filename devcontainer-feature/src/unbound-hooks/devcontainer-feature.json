@@ -12,5 +12,6 @@
   },
   "installsAfter": [
     "ghcr.io/devcontainers/features/common-utils"
-  ]
+  ],
+  "postStartCommand": "sudo -n sh /usr/local/share/unbound/link-unbound.sh 2>/dev/null || sh /usr/local/share/unbound/link-unbound.sh"
 }
