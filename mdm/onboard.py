@@ -25,10 +25,12 @@ Usage:
       --api-key YOUR_ADMIN_API_KEY \
       --discovery-key YOUR_DISCOVERY_KEY
 
-Optional overrides for tenant deployments (passed to MDM tools and reused as
-the discovery --domain):
-  --backend-url <url>   default https://backend.getunbound.ai
-  --gateway-url <url>   default https://api.getunbound.ai  (MDM tools only)
+Optional overrides for tenant deployments. All three are written into every
+user's ~/.unbound/config.json so unbound-cli works on the device without a
+manual `unbound config urls`:
+  --backend-url <url>    default https://backend.getunbound.ai
+  --gateway-url <url>    default https://api.getunbound.ai   (also passed to MDM tools)
+  --frontend-url <url>   default https://gateway.getunbound.ai
 
 To clear MDM setup for the four tools (no discovery — it's a one-shot scan,
 nothing to clear; backfill is also skipped because there's nothing to seed):
@@ -38,13 +40,22 @@ Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
 """
 
+import json
 import os
 import platform
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import urllib.request
+from pathlib import Path
+from typing import List, Tuple
+
+try:
+    import pwd
+except ImportError:  # Windows has no pwd module
+    pwd = None
 
 # On Windows, when this script runs as a child of the MDM onboard wrapper its
 # stdout is a non-console pipe defaulting to the legacy code page (cp1252),
@@ -91,13 +102,15 @@ TOOLS = [
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
+DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+DEFAULT_FRONTEND_URL = "https://gateway.getunbound.ai"
 
 USAGE = (
     "Usage:\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" \\\n"
     "      --api-key YOUR_ADMIN_API_KEY \\\n"
     "      --discovery-key YOUR_DISCOVERY_KEY \\\n"
-    "      [--backend-url <url>] [--gateway-url <url>]\n"
+    "      [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]\n"
     "\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" --clear\n"
 )
@@ -129,6 +142,186 @@ def fetch_script(url: str) -> bytes:
         if not body or not body.strip():
             raise RuntimeError("empty response body")
         return body
+
+
+def _run_as_user(username, fn, *args, **kwargs):
+    """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
+    Returns whatever fn returns on success, or None on failure.
+
+    Security-critical: writing inside a user's home dir as root invites
+    symlink-following privilege escalation (e.g. `ln -s /etc ~/.unbound`). After
+    the privilege drop, symlinks targeting root-only paths fail with EACCES. On
+    Windows (no fork) fn runs directly. Mirrors the per-tool MDM setups."""
+    if platform.system().lower() == "windows":
+        try:
+            return fn(*args, **kwargs)
+        except Exception:
+            return None
+    if pwd is None:
+        return None
+    try:
+        info = pwd.getpwnam(username)
+    except KeyError:
+        return None
+    uid, gid = info.pw_uid, info.pw_gid
+
+    r_fd, w_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(r_fd)
+        try:
+            os.setgroups([])
+            os.setgid(gid)
+            os.setuid(uid)
+            result = fn(*args, **kwargs)
+            import pickle
+            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+            os.close(w_fd)
+            os._exit(0)
+        except Exception:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+            os._exit(1)
+    else:
+        os.close(w_fd)
+        data = b""
+        while True:
+            try:
+                chunk = os.read(r_fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            data += chunk
+        os.close(r_fd)
+        try:
+            _, status = os.waitpid(pid, 0)
+        except OSError:
+            return None
+        if os.WEXITSTATUS(status) != 0:
+            return None
+        try:
+            import pickle
+            return pickle.loads(data) if data else None
+        except Exception:
+            return None
+
+
+def get_all_user_homes() -> List[Tuple[str, Path]]:
+    """Enumerate (username, home_dir) for every real local user. Mirrors the
+    per-tool MDM setups' enumeration so URL persistence reaches the same users."""
+    user_homes: List[Tuple[str, Path]] = []
+    system = platform.system().lower()
+    try:
+        if system == "darwin" and pwd is not None:
+            for user in pwd.getpwall():
+                home_dir = Path(user.pw_dir)
+                if (user.pw_uid >= 500 and home_dir.exists() and home_dir.is_dir()
+                        and str(home_dir).startswith("/Users/")
+                        and user.pw_name not in ("Shared", "Guest")):
+                    user_homes.append((user.pw_name, home_dir))
+        elif system == "linux" and pwd is not None:
+            for user in pwd.getpwall():
+                home_dir = Path(user.pw_dir)
+                if (user.pw_uid >= 1000 and home_dir.exists() and home_dir.is_dir()
+                        and str(home_dir).startswith("/home/")):
+                    user_homes.append((user.pw_name, home_dir))
+        elif system == "windows":
+            users_dir = Path(os.environ.get("SystemDrive", "C:") + r"\Users")
+            if users_dir.exists():
+                for user_dir in users_dir.iterdir():
+                    if user_dir.is_dir() and user_dir.name not in (
+                        "Public", "Default", "Default User", "Administrator", "All Users"
+                    ):
+                        user_homes.append((user_dir.name, user_dir))
+    except Exception:
+        return []
+    return user_homes
+
+
+def _write_urls_for_user(username: str, home_dir: Path, explicit: dict, defaults: dict):
+    """Merge the tenant URL keys into ~/.unbound/config.json for one user,
+    preserving existing keys (e.g. the api_key a tool step wrote). Privilege-
+    drops to the user and is symlink-safe (O_NOFOLLOW).
+
+    `explicit` (values from --*-url flags) always wins. `defaults` only fills a
+    key the user hasn't set themselves, so a no-flags run never clobbers a URL a
+    user configured via `unbound config urls`."""
+    config_dir = home_dir / ".unbound"
+    config_file = config_dir / "config.json"
+
+    def _write():
+        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() != "windows":
+            os.chmod(config_dir, 0o700)
+        config = {}
+        # Reject a non-regular config.json (symlink / FIFO / device a user may
+        # have planted) BEFORE any blocking open() — opening a FIFO O_RDONLY
+        # would hang this root run forever. lstat doesn't follow symlinks.
+        existing_is_regular = False
+        try:
+            if not stat.S_ISREG(os.lstat(str(config_file)).st_mode):
+                raise OSError("config.json is not a regular file")
+            existing_is_regular = True
+        except FileNotFoundError:
+            pass
+        if existing_is_regular:
+            try:
+                with open(config_file, "r", encoding="utf-8") as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                config = {}
+        if not isinstance(config, dict):
+            config = {}
+        for k, v in defaults.items():
+            if not config.get(k):
+                config[k] = v
+        config.update(explicit)
+        # O_NOFOLLOW blocks a symlink swap on config.json; O_NONBLOCK + the
+        # regular-file check stop a user-planted FIFO/device from hanging this
+        # root run on open() (the loop is sequential, so one wedge stalls all).
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                 | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0))
+        fd = os.open(str(config_file), flags, 0o600)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            raise OSError("config.json is not a regular file")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(config, indent=2))
+        return True
+
+    return _run_as_user(username, _write)
+
+
+def persist_urls_for_all_users(backend_url, gateway_url, frontend_url) -> None:
+    """Write base_url / gateway_url / frontend_url into every real user's
+    ~/.unbound/config.json so unbound-cli works on this MDM-managed device with
+    no manual `unbound config urls`. Best-effort: never fails the onboarding.
+
+    Each argument is the value from its --*-url flag or None. Explicitly-passed
+    URLs always win; the public defaults only fill a key a user hasn't set, so a
+    no-flags run never overwrites a URL the user configured themselves."""
+    explicit = {
+        "base_url": backend_url,
+        "gateway_url": gateway_url,
+        "frontend_url": frontend_url,
+    }
+    explicit = {k: v for k, v in explicit.items() if v}
+    defaults = {
+        "base_url": DEFAULT_BACKEND_URL,
+        "gateway_url": DEFAULT_GATEWAY_URL,
+        "frontend_url": DEFAULT_FRONTEND_URL,
+    }
+    written = 0
+    for username, home_dir in get_all_user_homes():
+        try:
+            if _write_urls_for_user(username, home_dir, explicit, defaults) is not None:
+                written += 1
+        except Exception as e:
+            print(f"⚠️  [config] could not persist URLs for {username}: {e}", file=sys.stderr)
+    print(f"✅ Persisted tenant URLs to ~/.unbound/config.json for {written} user(s).")
 
 
 def run_tool(name: str, url: str, args: list) -> bool:
@@ -288,14 +481,18 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
 
 
 def parse_args(argv: list) -> tuple:
-    """Splits argv into (discovery_key, mdm_args, backend_url, is_clear).
+    """Splits argv into (discovery_key, mdm_args, backend_url, gateway_url,
+    frontend_url, is_clear).
 
-    --discovery-key is consumed here and NOT forwarded to the per-tool MDM
-    scripts (they don't recognize it; would error). Everything else passes
-    through. We also peek at --backend-url to default discovery's --domain.
+    --discovery-key and --frontend-url are consumed here and NOT forwarded to the
+    per-tool MDM scripts (they don't recognize them). We persist all three URLs
+    into each user's config.json ourselves. --backend-url and --gateway-url are
+    captured AND forwarded (the tool scripts need them to configure the gateway).
     """
     discovery_key = None
     backend_url = None
+    gateway_url = None
+    frontend_url = None
     is_clear = False
     mdm_args = []
     i = 0
@@ -305,8 +502,18 @@ def parse_args(argv: list) -> tuple:
             discovery_key = argv[i + 1]
             i += 2
             continue
+        if token == "--frontend-url" and i + 1 < len(argv):
+            frontend_url = argv[i + 1]
+            i += 2
+            continue
         if token == "--backend-url" and i + 1 < len(argv):
             backend_url = argv[i + 1]
+            mdm_args.append(token)
+            mdm_args.append(argv[i + 1])
+            i += 2
+            continue
+        if token == "--gateway-url" and i + 1 < len(argv):
+            gateway_url = argv[i + 1]
             mdm_args.append(token)
             mdm_args.append(argv[i + 1])
             i += 2
@@ -315,7 +522,7 @@ def parse_args(argv: list) -> tuple:
             is_clear = True
         mdm_args.append(token)
         i += 1
-    return discovery_key, mdm_args, backend_url, is_clear
+    return discovery_key, mdm_args, backend_url, gateway_url, frontend_url, is_clear
 
 
 def main() -> int:
@@ -325,7 +532,7 @@ def main() -> int:
         print(USAGE, file=sys.stderr)
         return 1
 
-    discovery_key, mdm_args, backend_url, is_clear = parse_args(args)
+    discovery_key, mdm_args, backend_url, gateway_url, frontend_url, is_clear = parse_args(args)
 
     # Validate flags. --clear short-circuits the key checks: nothing to
     # authenticate, just remove the configuration.
@@ -359,6 +566,12 @@ def main() -> int:
         tool_args = list(mdm_args)
         if not run_tool(name, url, tool_args):
             failures.append(name)
+
+    # Persist the tenant URLs into every user's ~/.unbound/config.json (merged
+    # with the per-user api_key the tool steps wrote) so unbound-cli works on this
+    # MDM-managed device with no manual `unbound config urls`. Skipped on --clear.
+    if not is_clear:
+        persist_urls_for_all_users(backend_url, gateway_url, frontend_url)
 
     # Discovery is a one-shot scan — skip it on --clear (nothing to remove).
     if not is_clear:
