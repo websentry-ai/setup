@@ -824,6 +824,12 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if api_response.get('decision') == 'approval_required':
         return _handle_approval_required_codex_response(api_response, approval_key)
 
+    
+    if is_mcp and api_response.get('unknown_mcp_server'):
+        server_cfg = metadata.get('mcp_server_config')
+        if server_cfg:
+            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg)
+
     return transform_response_for_codex(api_response)
 
 
@@ -1303,6 +1309,56 @@ def _hook_discovery_enabled_for_org() -> bool:
     except OSError:
         pass
     return enabled
+
+
+def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
+    """Report ONE unknown MCP server out-of-band.
+
+    Detached so the blocking PreToolUse hook returns immediately. Secrets
+    (server_config args, api key) go via env, never argv or the shell string.
+    """
+    if not server_name:
+        log_error("mcp scan dispatch: empty server name, skipping", 'mcp_server')
+        return
+    try:
+        try:
+            with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                unbound_config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            log_error(f"mcp scan dispatch: cannot read config: {e}", 'mcp_server')
+            return
+        api_key = unbound_config.get("api_key")
+        backend_url = unbound_config.get("base_url")
+        if not api_key or not backend_url:
+            log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
+            return
+
+        DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        bootstrap = (
+            'set -e; '
+            f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
+            'if [ ! -f "$SH" ]; then '
+            f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
+            '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
+            'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
+        )
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL, "close_fds": True,
+            "env": {**os.environ,
+                    "UNBOUND_API_KEY": api_key,
+                    "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
+                    "UNBOUND_MCP_SERVER_NAME": server_name,
+                    "UNBOUND_MCP_DOMAIN": backend_url},
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(["bash", "-c", bootstrap], **popen_kwargs)
+    except Exception as e:
+        log_error(f"mcp scan dispatch failed for {server_name}: {e}", 'mcp_server')
+        return
 
 
 def _dispatch_discovery() -> None:
