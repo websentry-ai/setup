@@ -287,7 +287,7 @@ def download_file(url: str, dest_path: Path) -> bool:
         print(f"❌ Failed to download {url}: {e}")
         return False
 
-def write_unbound_config(api_key: str) -> bool:
+def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
@@ -301,6 +301,8 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         with open(config_file, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
         os.chmod(config_file, 0o600)
@@ -705,7 +707,7 @@ def main():
     _install_state = detect_install_state()
     _device_id = get_device_identifier()
 
-    if not write_unbound_config(api_key):
+    if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
         print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
 
     debug_print("Setting UNBOUND_CURSOR_API_KEY environment variable...")

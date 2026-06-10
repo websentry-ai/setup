@@ -337,7 +337,7 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
         return None
 
 
-def write_unbound_config(api_key: str) -> bool:
+def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
@@ -352,6 +352,8 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
@@ -786,7 +788,7 @@ def main():
         return
     debug_print("openai_base_url written to codex config successfully")
 
-    write_unbound_config(api_key)
+    write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
 
     # Final instructions
     print("\n" + "=" * 60)
