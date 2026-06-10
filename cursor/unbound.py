@@ -1392,6 +1392,9 @@ def _dispatch_mcp_server_scan(server_name, server_config):
     Detached so the blocking PreToolUse hook returns immediately. Secrets
     (server_config args, api key) go via env, never argv or the shell string.
     """
+    if not server_name:
+        log_error("mcp scan dispatch: empty server name, skipping", 'mcp_server')
+        return
     try:
         try:
             with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
@@ -1408,7 +1411,7 @@ def _dispatch_mcp_server_scan(server_name, server_config):
         DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
         bootstrap = (
             'set -e; '
-            f'SH="{DISCOVERY_INSTALL_SH}"; '
+            f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
             'if [ ! -f "$SH" ]; then '
             f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
             '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
