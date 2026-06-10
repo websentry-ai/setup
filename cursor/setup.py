@@ -311,20 +311,22 @@ def write_unbound_config(api_key: str) -> bool:
 
 
 def check_enterprise_hooks_conflict() -> bool:
-    """Check if enterprise (MDM) hooks exist. Returns True if conflict found."""
-    system = platform.system().lower()
-    if system == "darwin":
-        enterprise_hooks = Path("/Library/Application Support/Cursor/hooks.json")
-    elif system == "linux":
-        enterprise_hooks = Path("/etc/cursor/hooks.json")
-    else:
+    """True if Unbound MDM (managed) Cursor hooks already exist on this device.
+    User-level setup must not run alongside them — installing user hooks on top
+    causes duplicate execution. Read-only; fails open (False) on any error."""
+    try:
+        system = platform.system().lower()
+        if system == "darwin":
+            enterprise_dir = Path("/Library/Application Support/Cursor")
+        elif system == "linux":
+            enterprise_dir = Path("/etc/cursor")
+        elif system == "windows":
+            enterprise_dir = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "Cursor"
+        else:
+            return False
+        return (enterprise_dir / "hooks.json").exists()
+    except Exception:
         return False
-    if enterprise_hooks.exists():
-        print("\n❌ Enterprise (MDM) hooks are already installed.")
-        print("   Installing user-level hooks alongside MDM hooks causes duplicate execution.")
-        print("   Contact your organization administrator to manage Unbound configuration.")
-        return True
-    return False
 
 
 def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
@@ -640,6 +642,10 @@ def main():
         clear_setup()
         return
 
+    if check_enterprise_hooks_conflict():
+        print("\n❌ Skipped — Cursor is managed by your organization (MDM).")
+        raise SystemExit(3)
+
     install_macos_certificates()
 
     print("=" * 60)
@@ -697,15 +703,6 @@ def main():
 
     _install_state = detect_install_state()
     _device_id = get_device_identifier()
-
-    if check_enterprise_hooks_conflict():
-        # MDM hooks already in place — the device IS configured, just via the
-        # admin path. Notify the backend so this counts as a completed setup
-        # rather than a silent abort. Print a positive line so the user
-        # doesn't see only the ❌ above and assume the whole thing failed.
-        print("✅ Device already configured via MDM — no user-level setup needed.")
-        notify_setup_complete(api_key, "cursor", backend_url=backend_url, install_state=_install_state, serial_number=_device_id)
-        return
 
     if not write_unbound_config(api_key):
         print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Cursor is launched from Dock/Spotlight")
