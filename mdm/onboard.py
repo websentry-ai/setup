@@ -123,7 +123,7 @@ def fetch_script(url: str) -> bytes:
     Note: urllib.request.urlopen raises HTTPError for any non-2xx response,
     so we don't need an explicit status-code check here — anything reaching
     `body = resp.read()` is already a 2xx."""
-    req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.1"})
     with urllib.request.urlopen(req, timeout=30) as resp:
         body = resp.read()
         if not body or not body.strip():
@@ -175,13 +175,16 @@ def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -
     lock with a live PID. SIGTERM the whole group first so discovery's own
     handler can release the lock and exit cleanly, then SIGKILL whatever ignores
     it. On Windows there are no POSIX groups, so taskkill /T kills the tree."""
+    host = platform.node() or "unknown-host"
     if platform.system().lower() == "windows":
+        print(f"[Discovery] [{host}] force-killing discovery process tree (taskkill /T, pid={proc.pid}).", file=sys.stderr)
         try:
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                 capture_output=True, timeout=30,
             )
-        except Exception:
+        except Exception as e:
+            print(f"[Discovery] [{host}] taskkill failed ({e}); falling back to proc.kill().", file=sys.stderr)
             try:
                 proc.kill()
             except Exception:
@@ -199,20 +202,29 @@ def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -
                 os.killpg(pgid, sig)
             else:
                 proc.send_signal(sig)
-        except OSError:
-            pass
+        except OSError as e:
+            print(f"[Discovery] [{host}] could not deliver signal {sig} (pgid={pgid}): {e}", file=sys.stderr)
 
+    term_grace = min(grace, 15)
+    print(
+        f"[Discovery] [{host}] SIGTERM -> discovery group (pgid={pgid}); "
+        f"waiting up to {term_grace}s for it to release its lock and exit.",
+        file=sys.stderr,
+    )
     _signal_group(signal.SIGTERM)
     try:
-        proc.wait(timeout=min(grace, 15))  # let discovery clean up + self-exit
+        proc.wait(timeout=term_grace)
+        print(f"[Discovery] [{host}] discovery exited cleanly after SIGTERM.", file=sys.stderr)
         return
     except subprocess.TimeoutExpired:
         pass
+    print(f"[Discovery] [{host}] discovery ignored SIGTERM; escalating to SIGKILL on the group.", file=sys.stderr)
     _signal_group(signal.SIGKILL)
     try:
         proc.wait(timeout=10)
+        print(f"[Discovery] [{host}] discovery group reaped after SIGKILL.", file=sys.stderr)
     except subprocess.TimeoutExpired:
-        pass
+        print(f"[Discovery] [{host}] discovery not reaped within 10s of SIGKILL.", file=sys.stderr)
 
 
 def run_discovery(discovery_key: str, backend_url: str) -> bool:
@@ -259,8 +271,9 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
             return proc.wait(timeout=backstop) == 0
         except subprocess.TimeoutExpired:
             print(
-                f"❌ [Discovery] exceeded {backstop}s (self-timeout {DISCOVERY_TIMEOUT_SECONDS}s "
-                f"+ {DISCOVERY_KILL_GRACE_SECONDS}s grace) — terminating discovery and its children.",
+                f"❌ [Discovery] [{platform.node() or 'unknown-host'}] exceeded {backstop}s "
+                f"(self-timeout {DISCOVERY_TIMEOUT_SECONDS}s + {DISCOVERY_KILL_GRACE_SECONDS}s grace) "
+                f"— terminating discovery (pid={proc.pid}) and its children.",
                 file=sys.stderr,
             )
             _terminate_discovery_tree(proc)
