@@ -1083,6 +1083,28 @@ def process_stop_event(event: Dict, api_key: str):
     # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
     assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
 
+    # Fold in subagent invocations from SubagentStop hook events. Codex subagents
+    # run in their own transcript and don't appear as function_calls in the parent
+    # rollout, so we recover them from the accumulated hook events (same session,
+    # after the user prompt) and forward them as Task tool_uses for the gateway.
+    for log in logs:
+        log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
+        if log_session_id != session_id:
+            continue
+        log_event = log.get('event', {}) if 'event' in log else log
+        if log_event.get('hook_event_name') != 'SubagentStop':
+            continue
+        if user_prompt_timestamp and log.get('timestamp') and log.get('timestamp') <= user_prompt_timestamp:
+            continue
+        assistant_tool_uses.append({
+            'type': 'SubagentStop',
+            'tool_name': 'Task',
+            'tool_input': {'subagent_type': log_event.get('agent_type')},
+            'tool_response': {
+                'last_assistant_message': log_event.get('last_assistant_message'),
+            },
+        })
+
     assistant_msg = {
         'role': 'assistant',
         'content': last_assistant_message or ''
@@ -1427,13 +1449,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            print("{}", flush=True)
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            print("{}", flush=True)
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -1465,7 +1487,8 @@ def main():
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                response["suppressOutput"] = True
+                # Codex does not support suppressOutput — emit the plain response.
+                response.pop("suppressOutput", None)
                 print(json.dumps(response), flush=True)
                 return
 
@@ -1485,12 +1508,12 @@ def main():
 
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
+        print("{}", flush=True)
 
     except Exception as e:
         # Still return empty JSON object to Codex to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        print("{}", flush=True)
 
 
 if __name__ == '__main__':
