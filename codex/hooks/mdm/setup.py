@@ -546,7 +546,7 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
     return "failed"
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> None:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -564,6 +564,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1473,6 +1475,7 @@ def main():
 
     base_url = "https://backend.getunbound.ai"
     gateway_url = DEFAULT_GATEWAY_URL
+    frontend_url = None
     app_name = None
     auth_api_key = None
     backfill_mode = False
@@ -1485,6 +1488,9 @@ def main():
             i += 2
         elif args[i] == "--gateway-url" and i + 1 < len(args):
             gateway_url = normalize_url(args[i + 1])
+            i += 2
+        elif args[i] == "--frontend-url" and i + 1 < len(args):
+            frontend_url = args[i + 1]
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -1537,7 +1543,7 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_gateway_artifacts_for_user(username, home_dir)
         remove_user_level_hooks_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, api_key)
+        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
         enable_codex_hooks_feature_for_user(username, home_dir)
 
     state = detect_install_state()

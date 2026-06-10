@@ -330,7 +330,7 @@ def append_to_file(file_path: Path, line: str, var_name: str = None) -> bool:
         return False
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> bool:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> bool:
     """Write API key to user's ~/.unbound/config.json (shared with unbound-cli).
     On Unix, drops privileges to the target user before any FS op — prevents
     symlink-following privilege escalation."""
@@ -347,6 +347,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1012,6 +1014,7 @@ def main():
     # Parse arguments
     base_url = "https://backend.getunbound.ai"
     gateway_url = DEFAULT_GATEWAY_URL
+    frontend_url = None
     app_name = None
     auth_api_key = None
 
@@ -1023,6 +1026,9 @@ def main():
             i += 2
         elif args[i] == "--gateway-url" and i + 1 < len(args):
             gateway_url = normalize_url(args[i + 1])
+            i += 2
+        elif args[i] == "--frontend-url" and i + 1 < len(args):
+            frontend_url = args[i + 1]
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -1070,7 +1076,7 @@ def main():
     user_homes = get_all_user_homes()
     config_count = 0
     for username, home_dir in user_homes:
-        if write_unbound_config_for_user(username, home_dir, cursor_api_key):
+        if write_unbound_config_for_user(username, home_dir, cursor_api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url}):
             config_count += 1
             remove_user_level_hooks(username, home_dir)
         else:

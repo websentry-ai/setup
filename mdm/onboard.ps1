@@ -34,6 +34,10 @@
 .PARAMETER GatewayUrl
     Gateway URL override for MDM tools (default: https://api.getunbound.ai)
 
+.PARAMETER FrontendUrl
+    Frontend URL override (default: https://gateway.getunbound.ai). Persisted into
+    each user's ~/.unbound/config.json so unbound-cli works without further setup.
+
 .PARAMETER Backfill
     Enable backfill of historical transcripts for Claude Code and Codex (opt-in, disabled by default)
 
@@ -66,6 +70,7 @@ param(
     [string]$DiscoveryKey,
     [string]$BackendUrl,
     [string]$GatewayUrl,
+    [string]$FrontendUrl,
     [switch]$Backfill,
     [switch]$Clear
 )
@@ -177,6 +182,11 @@ function Main {
         if (-not [string]::IsNullOrWhiteSpace($GatewayUrl)) {
             $pythonArgs += "--gateway-url"
             $pythonArgs += $GatewayUrl
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($FrontendUrl)) {
+            $pythonArgs += "--frontend-url"
+            $pythonArgs += $FrontendUrl
         }
 
         # Add backfill flag if explicitly requested (has no effect with -Clear)

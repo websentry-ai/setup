@@ -297,7 +297,7 @@ def download_file(url: str, dest_path: Path) -> bool:
         print(f"❌ Failed to download {url}: {e}")
         return False
 
-def write_unbound_config(api_key: str) -> bool:
+def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     """Write API key to ~/.unbound/config.json (shared with unbound-cli)."""
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
@@ -312,6 +312,8 @@ def write_unbound_config(api_key: str) -> bool:
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
         # Create with 0o600 atomically so the API key is never briefly world-readable.
         fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1028,7 +1030,7 @@ def main():
     _install_state = detect_install_state()
     _device_id = get_device_identifier()
 
-    if not write_unbound_config(api_key):
+    if not write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None}):
         print("⚠️  Could not write ~/.unbound/config.json — hooks may not work when Copilot is launched from Dock/Spotlight")
 
     debug_print("Setting UNBOUND_COPILOT_API_KEY environment variable...")
