@@ -252,14 +252,16 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
             ]
         else:
             os.chmod(tmp_path, 0o755)
-            cmd = [
-                "bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url,
-                "--timeout", str(DISCOVERY_TIMEOUT_SECONDS),
-            ]
-        # Backstop = discovery's own deadline + a short grace. Discovery should
-        # hit its --timeout first and clean up; this only force-kills a child that
-        # ignored its own deadline. (Windows install.ps1 isn't passed --timeout;
-        # the discovery default already equals DISCOVERY_TIMEOUT_SECONDS.)
+            cmd = ["bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url]
+        # NOTE: we deliberately do NOT pass --timeout. install.sh is fetched from
+        # coding-discovery-tool/main, and an older discovery there would reject an
+        # unknown --timeout flag (argparse exits non-zero) and fail every
+        # enrollment. Discovery self-times-out via its OWN default, which is kept
+        # equal to DISCOVERY_TIMEOUT_SECONDS — so this stays correct and in sync
+        # whether or not the companion discovery change has landed on main yet.
+        #
+        # Backstop = that deadline + a short grace. Discovery should hit its own
+        # timeout first and clean up; this only force-kills a child that overran.
         backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
         # Run discovery in its OWN process group (POSIX) so the backstop kill can
         # take down the WHOLE tree (bash + the python discovery that holds the
