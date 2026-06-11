@@ -4,9 +4,12 @@
 # Verifies the binary works in its real production context: a root LaunchDaemon
 # bootstrapped via `launchctl bootstrap system` (NOT a sudo shell — launchd
 # strips the session environment) with HOME pinned to /var/empty, reproducing
-# the daemon environment where ambient HOME is meaningless. Asserts a
-# discovery report payload is POSTed to a local HTTP sink and that the
-# no-config variant idles with exit 0.
+# the daemon environment where ambient HOME is meaningless. Asserts:
+#   1. the daemon exits 0 and a discovery report payload reaches a local sink
+#   2. multi-user /Users/* iteration ran as root (log says "Users to process: N",
+#      N >= 1, and the console user's home was explored)
+#   3. the no-config variant (HOME entirely unset — the other daemon reality)
+#      idles with a log line and exit 0
 #
 # Must be run as root:  sudo bash packaging/test-discovery-daemon.sh
 set -euo pipefail
@@ -19,10 +22,10 @@ BIN="${UNBOUND_DISCOVERY_BIN:-$HERE/dist/unbound-discovery/unbound-discovery}"
 
 LABEL="ai.unbound.discovery.daemontest"
 PLIST="/Library/LaunchDaemons/$LABEL.plist"
-LOG="/var/tmp/$LABEL.log"
 SINK_DIR="$(mktemp -d /var/tmp/$LABEL.sink.XXXX)"
 PORT="${SINK_PORT:-18924}"
 TIMEOUT_S="${DAEMON_TEST_TIMEOUT:-900}"
+FAIL=0
 
 cleanup() {
     launchctl bootout "system/$LABEL" 2>/dev/null || true
@@ -31,7 +34,80 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# --- local HTTP sink ---------------------------------------------------------
+# write_plist <log-path> <home-mode: varempty|unset> [program args...]
+write_plist() {
+    local log_path="$1" home_mode="$2"
+    shift 2
+    local args_xml=""
+    local a
+    for a in "$BIN" "$@"; do
+        args_xml="$args_xml        <string>$a</string>
+"
+    done
+    local env_xml=""
+    if [ "$home_mode" = "varempty" ]; then
+        env_xml="    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key><string>/var/empty</string>
+        <key>AI_DISCOVERY_SENTRY_DSN</key><string></string>
+        <key>AI_DISCOVERY_SENTRY_ENV</key><string>test</string>
+    </dict>"
+    else
+        # HOME deliberately absent — launchd daemons get no HOME by default
+        env_xml="    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AI_DISCOVERY_SENTRY_DSN</key><string></string>
+        <key>AI_DISCOVERY_SENTRY_ENV</key><string>test</string>
+    </dict>"
+    fi
+    cat > "$PLIST" <<PLISTEOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+$args_xml    </array>
+$env_xml
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>$log_path</string>
+    <key>StandardErrorPath</key><string>$log_path</string>
+</dict>
+</plist>
+PLISTEOF
+    chown root:wheel "$PLIST" && chmod 644 "$PLIST"
+}
+
+# wait_for_daemon_exit <timeout-seconds>  → sets DAEMON_EXIT (code or "unknown")
+# Handles the spawn race: first waits for the job to have run at all (state
+# running, or a recorded exit), then waits for it to stop running.
+wait_for_daemon_exit() {
+    local timeout_s="$1" elapsed=0 started=0 info
+    DAEMON_EXIT="unknown"
+    while [ "$elapsed" -lt "$timeout_s" ]; do
+        info="$(launchctl print "system/$LABEL" 2>/dev/null || true)"
+        if echo "$info" | grep -q "state = running"; then
+            started=1
+        elif [ "$started" -eq 1 ] || \
+             { echo "$info" | grep -q "last exit code" && \
+               ! echo "$info" | grep -q "never exited"; }; then
+            DAEMON_EXIT="$(echo "$info" | awk '/last exit code/ {print $NF}')"
+            [ -n "$DAEMON_EXIT" ] || DAEMON_EXIT="unknown"
+            return 0
+        fi
+        sleep 5
+        elapsed=$((elapsed + 5))
+    done
+    echo "TIMEOUT: daemon still running after ${timeout_s}s"
+    return 1
+}
+
+# --- local HTTP sink ----------------------------------------------------------
+if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+    echo "FAIL: sink port $PORT already in use (set SINK_PORT to override)" >&2
+    exit 1
+fi
 python3 - "$PORT" "$SINK_DIR" <<'PYEOF' &
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -59,80 +135,57 @@ PYEOF
 SINK_PID=$!
 sleep 1
 
-# --- bootstrap the daemon ------------------------------------------------------
+# --- variant 1: full discovery, HOME=/var/empty (incident repro) ---------------
+LOG="/var/tmp/$LABEL.log"
 rm -f "$LOG"
-cat > "$PLIST" <<PLISTEOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>$LABEL</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$BIN</string>
-        <string>--api-key</string><string>daemon-test-key</string>
-        <string>--domain</string><string>http://127.0.0.1:$PORT</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <!-- reproduce the incident environment: HOME is meaningless for a root daemon -->
-        <key>HOME</key><string>/var/empty</string>
-    </dict>
-    <key>RunAtLoad</key><true/>
-    <key>StandardOutPath</key><string>$LOG</string>
-    <key>StandardErrorPath</key><string>$LOG</string>
-</dict>
-</plist>
-PLISTEOF
-chown root:wheel "$PLIST" && chmod 644 "$PLIST"
-
+write_plist "$LOG" varempty \
+    --api-key daemon-test-key --domain "http://127.0.0.1:$PORT"
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 launchctl bootstrap system "$PLIST"
-echo "daemon bootstrapped (system/$LABEL); waiting for discovery to finish (timeout ${TIMEOUT_S}s)..."
+echo "daemon bootstrapped (system/$LABEL, HOME=/var/empty); waiting (timeout ${TIMEOUT_S}s)..."
+wait_for_daemon_exit "$TIMEOUT_S" || { tail -20 "$LOG" 2>/dev/null; exit 1; }
 
-# --- wait for the run to complete ---------------------------------------------
-ELAPSED=0
-while launchctl print "system/$LABEL" 2>/dev/null | grep -q "state = running"; do
-    sleep 5
-    ELAPSED=$((ELAPSED + 5))
-    [ "$ELAPSED" -lt "$TIMEOUT_S" ] || { echo "TIMEOUT after ${TIMEOUT_S}s"; tail -20 "$LOG" 2>/dev/null; exit 1; }
-done
-sleep 2
-
-EXIT_STATUS="$(launchctl print "system/$LABEL" 2>/dev/null | awk '/last exit code/ {print $NF}')"
 REPORTS=$(ls "$SINK_DIR"/report_*.json 2>/dev/null | wc -l | tr -d ' ')
-
-echo "--- results -------------------------------------------------"
-echo "daemon last exit code: ${EXIT_STATUS:-unknown}"
-echo "report payloads received: $REPORTS"
-echo "daemon log: $LOG ($(wc -l < "$LOG" 2>/dev/null || echo 0) lines)"
-grep -m1 "Users to process" "$LOG" 2>/dev/null || true
-grep -c "report.*sent successfully" "$LOG" 2>/dev/null | sed 's/^/reports logged as sent: /' || true
-
-FAIL=0
-[ "${EXIT_STATUS:-1}" = "0" ] || { echo "FAIL: daemon exit code != 0"; FAIL=1; }
+echo "--- variant 1 results ---------------------------------------"
+echo "daemon exit code: $DAEMON_EXIT; report payloads received: $REPORTS"
+[ "$DAEMON_EXIT" = "0" ] || { echo "FAIL: daemon exit code != 0"; FAIL=1; }
 [ "$REPORTS" -gt 0 ] || { echo "FAIL: no report payload reached the sink"; FAIL=1; }
 
-# --- no-config variant: must idle cleanly, exit 0 ------------------------------
+# Multi-user /Users/* iteration must actually have run (AC: WEB-4787).
+USERS_LINE="$(grep -m1 "Users to process:" "$LOG" 2>/dev/null || true)"
+USERS_N="$(echo "$USERS_LINE" | awk -F': ' '{print $NF}' | tr -dc 0-9)"
+CONSOLE_USER="$(stat -f %Su /dev/console 2>/dev/null || echo "")"
+if [ -n "$USERS_N" ] && [ "$USERS_N" -ge 1 ]; then
+    echo "PASS: multi-user iteration ran ($USERS_LINE)"
+else
+    echo "FAIL: log has no 'Users to process: N' with N >= 1 — /Users/* enumeration did not run"
+    FAIL=1
+fi
+if [ -n "$CONSOLE_USER" ] && [ "$CONSOLE_USER" != "root" ]; then
+    if grep -q "Detecting tools for user: $CONSOLE_USER" "$LOG" 2>/dev/null; then
+        echo "PASS: console user '$CONSOLE_USER' explored under /Users"
+    else
+        echo "FAIL: console user '$CONSOLE_USER' not explored — iteration incomplete"
+        FAIL=1
+    fi
+fi
+
+# --- variant 2: no config, HOME unset — must idle cleanly, exit 0 --------------
 launchctl bootout "system/$LABEL" 2>/dev/null || true
 NOCONF_LOG="/var/tmp/$LABEL.noconf.log"
 rm -f "$NOCONF_LOG"
-/usr/bin/sed -i '' \
-    -e 's|<string>--api-key</string><string>daemon-test-key</string>||' \
-    -e 's|<string>--domain</string><string>http://127.0.0.1:'"$PORT"'</string>||' \
-    -e "s|$LABEL.log|$LABEL.noconf.log|g" "$PLIST"
+write_plist "$NOCONF_LOG" unset
 launchctl bootstrap system "$PLIST"
-sleep 5
-NOCONF_EXIT="$(launchctl print "system/$LABEL" 2>/dev/null | awk '/last exit code/ {print $NF}')"
-if [ "${NOCONF_EXIT:-1}" = "0" ] && grep -q "No configuration provided" "$NOCONF_LOG" 2>/dev/null; then
-    echo "PASS: no-config daemon idled with log line, exit 0"
+wait_for_daemon_exit 120 || { tail -5 "$NOCONF_LOG" 2>/dev/null; exit 1; }
+if [ "$DAEMON_EXIT" = "0" ] && grep -q "No configuration provided" "$NOCONF_LOG" 2>/dev/null; then
+    echo "PASS: no-config daemon (HOME unset) idled with log line, exit 0"
 else
-    echo "FAIL: no-config daemon — exit ${NOCONF_EXIT:-unknown}, log:"
-    cat "$NOCONF_LOG" 2>/dev/null | head -5
+    echo "FAIL: no-config daemon — exit $DAEMON_EXIT, log:"
+    head -5 "$NOCONF_LOG" 2>/dev/null
     FAIL=1
 fi
 
-echo "sink artifacts kept at: $SINK_DIR"
+echo "daemon logs: $LOG, $NOCONF_LOG; sink artifacts: $SINK_DIR"
 if [ "$FAIL" -eq 0 ]; then
     echo "DAEMON TEST PASSED"
 else

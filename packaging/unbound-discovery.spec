@@ -30,7 +30,9 @@ from PyInstaller.utils.hooks import collect_submodules
 # The OS-specific tool detectors are all statically imported by
 # coding_tool_factory, but collect explicitly so a future move to dynamic
 # imports cannot silently produce a binary with missing detectors.
-hidden = collect_submodules("coding_discovery_tools")
+hidden = collect_submodules(
+    "coding_discovery_tools", filter=lambda name: not name.endswith(".test")
+)
 
 a = Analysis(
     ["unbound_discovery_entry.py"],

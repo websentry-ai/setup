@@ -43,9 +43,28 @@ check "empty values idle, exit 0"        0 "No configuration provided" --api-key
 check "key=value form recognized"        0 "missing: --domain"        --api-key=k
 check "--help prints usage, exit 0"      0 "usage:"                   --help
 
+# UNBOUND_API_KEY env must satisfy --api-key (the argv-free channel that keeps
+# the key out of ps/cmdline) — only --domain may be reported missing then.
+set +e
+ENV_OUT="$(UNBOUND_API_KEY=env-key "$BIN" 2>&1)"
+ENV_RC=$?
+set -e
+if [ "$ENV_RC" -eq 0 ] && echo "$ENV_OUT" | grep -q "missing: --domain" \
+   && ! echo "$ENV_OUT" | grep -q "api-key"; then
+    echo "PASS: UNBOUND_API_KEY env satisfies --api-key"
+    PASS=$((PASS + 1))
+else
+    echo "FAIL: UNBOUND_API_KEY env not honored (exit $ENV_RC)"; echo "$ENV_OUT" | head -3
+    FAIL=$((FAIL + 1))
+fi
+
 if [ "${RUN_FULL:-0}" = "1" ]; then
     SINK_DIR="$(mktemp -d)"
     PORT="${SINK_PORT:-18923}"
+    if nc -z 127.0.0.1 "$PORT" 2>/dev/null; then
+        echo "FAIL: sink port $PORT already in use (set SINK_PORT to override)"
+        exit 1
+    fi
     python3 - "$PORT" "$SINK_DIR" <<'PYEOF' &
 import json, sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -76,20 +95,31 @@ PYEOF
 
     echo "running full discovery against local sink (this scans the machine)..."
     set +e
-    "$BIN" --api-key test-key --domain "http://127.0.0.1:$PORT" > "$SINK_DIR/run.log" 2>&1
+    # Empty DSN disables the tool's raw-HTTP Sentry reporting so synthetic
+    # sink 404s (the S3 path we deliberately fail) don't pollute production.
+    AI_DISCOVERY_SENTRY_DSN="" AI_DISCOVERY_SENTRY_ENV="test" \
+        "$BIN" --api-key test-key --domain "http://127.0.0.1:$PORT" > "$SINK_DIR/run.log" 2>&1
     RC=$?
     set -e
     REPORTS=$(ls "$SINK_DIR"/report_*.json 2>/dev/null | wc -l | tr -d ' ')
     if [ "$RC" -eq 0 ] && [ "$REPORTS" -gt 0 ]; then
         echo "PASS: full run — exit 0, $REPORTS report payload(s) received"
-        python3 -c "
+        # Lifecycle scan-event payloads carry no tools; require at least one
+        # data payload with device_id + a non-empty tools list.
+        if python3 -c "
 import json, glob, sys
-p = sorted(glob.glob('$SINK_DIR/report_*.json'))[0]
-r = json.load(open(p))
-missing = [k for k in ('device_id', 'tools') if k not in r]
-sys.exit('payload missing keys: %s' % missing if missing else 0)
-" && echo "PASS: payload schema sanity (device_id, tools present)" \
-  || { echo "FAIL: payload schema sanity"; FAIL=$((FAIL + 1)); }
+ok = any(
+    'device_id' in r and r.get('tools')
+    for r in (json.load(open(p)) for p in glob.glob('$SINK_DIR/report_*.json'))
+)
+sys.exit(0 if ok else 1)
+"; then
+            echo "PASS: payload schema sanity (>=1 payload with device_id + tools)"
+            PASS=$((PASS + 1))
+        else
+            echo "FAIL: payload schema sanity — no payload carried a tools list"
+            FAIL=$((FAIL + 1))
+        fi
         PASS=$((PASS + 1))
     else
         echo "FAIL: full run — exit $RC, $REPORTS report(s). Log tail:"

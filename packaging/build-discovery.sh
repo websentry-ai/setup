@@ -35,7 +35,7 @@ while IFS='=' read -r key value; do
             eval "$key=\"\$value\"" ;;
     esac
 done < "$LOCK"
-for var in SOURCE_REPO SOURCE_SHA PYTHON_VERSION PYINSTALLER_VERSION TARGET_ARCH; do
+for var in SOURCE_REPO SOURCE_SHA SOURCE_ENTRYPOINT PYTHON_VERSION PYINSTALLER_VERSION TARGET_ARCH; do
     [ -n "${!var:-}" ] || die "$var not set in discovery.lock"
 done
 log "source: $SOURCE_REPO @ $SOURCE_SHA"
@@ -45,8 +45,9 @@ PYTHON="${UNBOUND_DISCOVERY_PYTHON:-/Library/Frameworks/Python.framework/Version
 command -v "$PYTHON" >/dev/null || die "build python not found: $PYTHON"
 
 PY_ACTUAL="$("$PYTHON" -c 'import platform; print(platform.python_version())')"
-[ "$PY_ACTUAL" = "$PYTHON_VERSION" ] || \
-    log "WARNING: build python is $PY_ACTUAL, lock pins $PYTHON_VERSION"
+if [ "$PY_ACTUAL" != "$PYTHON_VERSION" ] && [ "${ALLOW_PYTHON_MISMATCH:-0}" != "1" ]; then
+    die "build python is $PY_ACTUAL, lock pins $PYTHON_VERSION (set ALLOW_PYTHON_MISMATCH=1 to override)"
+fi
 case "$PY_ACTUAL" in 3.12.*) ;; *) die "build python must be CPython 3.12.x, got $PY_ACTUAL";; esac
 
 PY_REAL="$("$PYTHON" -c 'import os, sys; print(os.path.realpath(sys.executable))')"
@@ -72,19 +73,28 @@ else
     git -C "$SRC" checkout -q FETCH_HEAD
     log "fetched source into $SRC"
 fi
-[ -f "$SRC/scripts/coding_discovery_tools/ai_tools_discovery.py" ] || \
-    die "source checkout missing scripts/coding_discovery_tools/ai_tools_discovery.py"
+[ -f "$SRC/$SOURCE_ENTRYPOINT" ] || \
+    die "source checkout missing $SOURCE_ENTRYPOINT"
 
-# --- 4. Build venv with pinned PyInstaller ----------------------------------
+# --- 4. Build venv with hash-pinned PyInstaller toolchain --------------------
+# requirements-build.txt pins every wheel by sha256 (--require-hashes) so the
+# toolchain that produces a fleet-wide root-daemon binary cannot be swapped
+# out by a compromised PyPI artifact.
 VENV="$BUILD/venv"
+VENV_STAMP="$VENV/.base-interpreter"
+WANT_STAMP="$PY_REAL $PY_ACTUAL pyinstaller==$PYINSTALLER_VERSION"
 if [ ! -x "$VENV/bin/pyinstaller" ] || \
-   [ "$("$VENV/bin/pyinstaller" --version 2>/dev/null)" != "$PYINSTALLER_VERSION" ]; then
+   [ "$(cat "$VENV_STAMP" 2>/dev/null)" != "$WANT_STAMP" ]; then
     rm -rf "$VENV"
     "$PYTHON" -m venv "$VENV"
-    "$VENV/bin/python" -m pip -q install --upgrade pip
-    "$VENV/bin/python" -m pip -q install "pyinstaller==$PYINSTALLER_VERSION"
+    "$VENV/bin/python" -m pip -q install --require-hashes --no-deps \
+        -r "$HERE/requirements-build.txt"
+    echo "$WANT_STAMP" > "$VENV_STAMP"
 fi
-log "pyinstaller $("$VENV/bin/pyinstaller" --version)"
+BUILT_PYI="$("$VENV/bin/pyinstaller" --version)"
+[ "$BUILT_PYI" = "$PYINSTALLER_VERSION" ] || \
+    die "venv pyinstaller is $BUILT_PYI, lock pins $PYINSTALLER_VERSION (update requirements-build.txt + discovery.lock together)"
+log "pyinstaller $BUILT_PYI (hash-pinned toolchain)"
 
 # --- 5. Build ----------------------------------------------------------------
 rm -rf "$DIST/unbound-discovery"
@@ -138,6 +148,6 @@ fi
 # --- 8. Tarball + checksum ----------------------------------------------------
 TARBALL="$DIST/unbound-discovery-macos-universal2.tar.gz"
 tar -czf "$TARBALL" -C "$DIST" unbound-discovery
-shasum -a 256 "$TARBALL" | tee "$TARBALL.sha256"
+(cd "$DIST" && shasum -a 256 "$(basename "$TARBALL")" | tee "$(basename "$TARBALL").sha256")
 log "done: $BUNDLE"
 log "artifact: $TARBALL"
