@@ -15,11 +15,12 @@
 #   APPLE_TEAM_ID
 #   APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID
 #   DISCOVERY_CHECKOUT_TOKEN        read access to coding-discovery-tool
-# Vars (environment `release`):
-#   AWS_RELEASE_ROLE_ARN / AWS_RELEASE_REGION / RUNTIME_S3_BUCKET /
-#   RUNTIME_S3_PREFIX (optional) / RUNTIME_DOWNLOAD_BASE_URL (optional —
-#   public base URL baked into onboard.sh; defaults to the GitHub Release
-#   asset URL when unset)
+#   ARTIFACTS_AWS_ACCESS_KEY_ID / ARTIFACTS_AWS_SECRET_ACCESS_KEY
+#       write access to the release-artifacts bucket below
+#
+# Artifacts publish to s3://unbound-release-artifacts/macos/<version>/ —
+# that bucket REJECTS overwrites (conditional writes). Re-publishing an
+# existing version is a hard error demanding a version bump, never a retry.
 
 name: release-macos-runtime
 
@@ -35,7 +36,10 @@ on:
 
 permissions:
   contents: write # create the GitHub Release
-  id-token: write # OIDC role assumption for the S3 upload
+
+env:
+  ARTIFACTS_BUCKET: unbound-release-artifacts
+  ARTIFACTS_REGION: us-west-2
 
 concurrency:
   group: release-macos-runtime-${{ github.ref }}
@@ -59,8 +63,7 @@ jobs:
           HAS_INSTALLER_CERT: ${{ secrets.APPLE_CERT_INSTALLER_P12 != '' && secrets.APPLE_INSTALLER_SIGNING_IDENTITY != '' }}
           HAS_NOTARY: ${{ secrets.APPLE_NOTARY_KEY_P8 != '' && secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_ISSUER_ID != '' }}
           HAS_DISCOVERY_TOKEN: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN != '' }}
-          HAS_S3: ${{ vars.RUNTIME_S3_BUCKET != '' && vars.AWS_RELEASE_ROLE_ARN != '' }}
-          DOWNLOAD_BASE_URL: ${{ vars.RUNTIME_DOWNLOAD_BASE_URL }}
+          HAS_S3: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID != '' && secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY != '' }}
           INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
@@ -92,8 +95,15 @@ jobs:
             echo "::error::tag release requires full signing+notarization secrets (have: app-cert=$sign installer-cert=$HAS_INSTALLER_CERT notary=$HAS_NOTARY). Dry-run via workflow_dispatch instead."
             exit 1
           fi
+          # Same strictness for publishing: the rendered onboard.sh points
+          # the whole fleet at the S3 artifact URL, so a tag release without
+          # upload credentials would bake a URL that 404s.
+          if [[ "$publish" == "true" && "$HAS_S3" != "true" ]]; then
+            echo "::error::tag release requires ARTIFACTS_AWS_ACCESS_KEY_ID/ARTIFACTS_AWS_SECRET_ACCESS_KEY in the release environment. Dry-run via workflow_dispatch instead."
+            exit 1
+          fi
 
-          artifact_base="${DOWNLOAD_BASE_URL:-https://github.com/$GITHUB_REPOSITORY/releases/download/runtime-v$version}"
+          artifact_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$version"
 
           {
             echo "version=$version"
@@ -314,28 +324,35 @@ jobs:
           path: out/
           retention-days: 14
 
-      - name: Configure AWS credentials (OIDC)
-        if: steps.cfg.outputs.s3 == 'true' && steps.cfg.outputs.publish == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_RELEASE_REGION || 'us-west-2' }}
-
-      - name: Upload to S3
-        if: steps.cfg.outputs.s3 == 'true' && steps.cfg.outputs.publish == 'true'
+      # The bucket rejects overwrites (S3 conditional writes). Each object is
+      # uploaded with --if-none-match '*': a 412/AccessDenied on re-publish of
+      # an existing version is a HARD error demanding a version bump — never a
+      # retry. Published artifacts are immutable; the sha256 baked into the
+      # fleet's onboard.sh must stay true forever.
+      - name: Upload to S3 (immutable, no-overwrite)
+        if: steps.cfg.outputs.publish == 'true'
         env:
-          BUCKET: ${{ vars.RUNTIME_S3_BUCKET }}
-          PREFIX: ${{ vars.RUNTIME_S3_PREFIX }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
           VERSION: ${{ steps.cfg.outputs.version }}
         run: |
           set -euo pipefail
-          dest="s3://$BUCKET/${PREFIX:+$PREFIX/}runtime-v$VERSION"
-          aws s3 cp out/ "$dest/" --recursive --no-progress
-          echo "uploaded to $dest"
-
-      - name: Skipped S3 upload
-        if: steps.cfg.outputs.s3 != 'true' && steps.cfg.outputs.publish == 'true'
-        run: echo "::warning::RUNTIME_S3_BUCKET / AWS_RELEASE_ROLE_ARN not configured — S3 upload skipped (bucket comes from the infra track)"
+          for f in out/*; do
+            key="macos/$VERSION/$(basename "$f")"
+            if err="$(aws s3api put-object \
+                  --bucket "$ARTIFACTS_BUCKET" --key "$key" --body "$f" \
+                  --if-none-match '*' 2>&1 >/dev/null)"; then
+              echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
+            else
+              if echo "$err" | grep -qiE 'PreconditionFailed|412|AccessDenied'; then
+                echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — runtime-v$VERSION has been published before. Published artifacts are immutable: bump the version and cut a new tag; do NOT retry or delete."
+              else
+                echo "::error::S3 upload failed for $key: $err"
+              fi
+              exit 1
+            fi
+          done
 
       - name: Create GitHub Release
         if: steps.cfg.outputs.publish == 'true'

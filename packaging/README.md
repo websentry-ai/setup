@@ -47,12 +47,22 @@ lights up independently:
 | pkg productsign | above + `APPLE_CERT_INSTALLER_P12` + `APPLE_INSTALLER_SIGNING_IDENTITY` |
 | notarytool + staple + spctl | above + `APPLE_NOTARY_KEY_P8/_KEY_ID/_ISSUER_ID` |
 | pinned discovery checkout | `DISCOVERY_CHECKOUT_TOKEN` |
-| S3 upload | vars `RUNTIME_S3_BUCKET` + `AWS_RELEASE_ROLE_ARN` (OIDC; bucket comes from the infra track) |
+| S3 upload | `ARTIFACTS_AWS_ACCESS_KEY_ID` + `ARTIFACTS_AWS_SECRET_ACCESS_KEY` |
 
-A **tag** release refuses to run with partial signing credentials (no
-accidental unsigned fleet artifacts); use `workflow_dispatch` for unsigned
-dry-runs. All secrets live ONLY in the GitHub `release` environment, with
-required reviewers set to the SOC 2 production-approver list.
+Artifacts publish to
+`s3://unbound-release-artifacts/macos/<version>/` (public URL
+`https://unbound-release-artifacts.s3.us-west-2.amazonaws.com/macos/<version>/…`,
+baked into the rendered onboard.sh). The bucket **rejects overwrites**
+(`put-object --if-none-match '*'`): a 412/AccessDenied on re-publish means
+that version already shipped — bump the version and cut a new tag; never
+retry or delete. Published artifacts are immutable so the sha256 baked
+into the fleet's onboard.sh stays true forever.
+
+A **tag** release refuses to run with partial signing credentials or
+missing S3 credentials (no accidental unsigned fleet artifacts, no baked
+URLs that 404); use `workflow_dispatch` for unsigned dry-runs. All secrets
+live ONLY in the GitHub `release` environment, with required reviewers set
+to the SOC 2 production-approver list.
 
 ## Cutting a release
 
