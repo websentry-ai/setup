@@ -23,6 +23,7 @@ BIN="${UNBOUND_DISCOVERY_BIN:-$HERE/dist/unbound-discovery/unbound-discovery}"
 LABEL="ai.unbound.discovery.daemontest"
 PLIST="/Library/LaunchDaemons/$LABEL.plist"
 SINK_DIR="$(mktemp -d /var/tmp/$LABEL.sink.XXXX)"
+STAGE="/var/tmp/$LABEL.bin"
 PORT="${SINK_PORT:-18924}"
 TIMEOUT_S="${DAEMON_TEST_TIMEOUT:-900}"
 FAIL=0
@@ -30,9 +31,21 @@ FAIL=0
 cleanup() {
     launchctl bootout "system/$LABEL" 2>/dev/null || true
     rm -f "$PLIST"
+    rm -rf "$STAGE"
     [ -n "${SINK_PID:-}" ] && kill "$SINK_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
+
+# Stage the bundle to a TCC-free, root-owned path. A root LaunchDaemon has no
+# TCC grants, so a bundle inside ~/Documents (or any TCC-protected dir) makes
+# the PyInstaller bootloader unable to read its own archive (PYI-ERROR:
+# "Could not load PyInstaller's embedded PKG archive"). Production installs
+# to a system path, so this staging also matches deployment semantics.
+rm -rf "$STAGE" && mkdir -p "$STAGE"
+cp -R "$(cd "$(dirname "$BIN")" && pwd)" "$STAGE/"
+DAEMON_BIN="$STAGE/$(basename "$(dirname "$BIN")")/$(basename "$BIN")"
+chown -R root:wheel "$STAGE"
+[ -x "$DAEMON_BIN" ] || { echo "staging failed: $DAEMON_BIN" >&2; exit 1; }
 
 # write_plist <log-path> <home-mode: varempty|unset> [program args...]
 write_plist() {
@@ -40,7 +53,7 @@ write_plist() {
     shift 2
     local args_xml=""
     local a
-    for a in "$BIN" "$@"; do
+    for a in "$DAEMON_BIN" "$@"; do
         args_xml="$args_xml        <string>$a</string>
 "
     done
