@@ -35,6 +35,8 @@ DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+
+DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
@@ -1386,6 +1388,14 @@ def _hook_discovery_enabled_for_org() -> bool:
     return enabled
 
 
+def _install_sh_is_stale():
+    """True if the cached install.sh is missing or older than the refresh TTL."""
+    try:
+        return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
+    except OSError:
+        return True
+
+
 def _dispatch_mcp_server_scan(server_name, server_config):
     """Report ONE unknown MCP server out-of-band.
 
@@ -1409,10 +1419,11 @@ def _dispatch_mcp_server_scan(server_name, server_config):
             return
 
         DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+        
         bootstrap = (
             'set -e; '
             f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
-            'if [ ! -f "$SH" ]; then '
+            f'if [ ! -f "$SH" ] || [ -n "$(find "$SH" -mmin +{DISCOVERY_INSTALL_SH_TTL_SECONDS // 60} 2>/dev/null)" ]; then '
             f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
             '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
             'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
@@ -1505,7 +1516,7 @@ def _dispatch_discovery() -> None:
                 return
 
             DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-            if not DISCOVERY_INSTALL_SH.exists():
+            if _install_sh_is_stale():
                 r = subprocess.run(
                     ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
                     capture_output=True, timeout=30,
