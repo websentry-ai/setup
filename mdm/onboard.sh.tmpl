@@ -28,6 +28,7 @@ API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
 GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
 CURRENT_STEP="init"
 
+# shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 on_exit() {
   local code=$1
   if [[ $code -ne 0 ]]; then
@@ -91,7 +92,7 @@ fi
 if [[ $CLEAR -eq 1 ]]; then
   CURRENT_STEP="clear"
   [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
-  bin="$PREFIX/current/bin/unbound-hook"
+  bin="$PREFIX/current/unbound-hook/unbound-hook"
   if [[ -x "$bin" ]] && run_with_timeout 300 "$bin" clear; then
     echo "binary teardown complete"
   else
@@ -121,7 +122,7 @@ CURRENT_STEP="version_check"
 installed="$(pkgutil --pkg-info "$PKG_ID" 2>/dev/null | awk '/^version:/{print $2}' || true)"
 if [[ "$installed" == "$VERSION" \
       && "$(readlink "$PREFIX/current" 2>/dev/null)" == "$PREFIX/$VERSION" \
-      && -x "$PREFIX/current/bin/unbound-hook" ]]; then
+      && -x "$PREFIX/current/unbound-hook/unbound-hook" ]]; then
   echo "runtime $VERSION already installed; skipping download/install"
 else
   CURRENT_STEP="download"
@@ -164,13 +165,18 @@ if [[ -f /usr/local/bin/unbound-hook && ! -L /usr/local/bin/unbound-hook ]]; the
   rm -f /usr/local/bin/unbound-hook   # legacy script shim, not our symlink
 fi
 
-# --- Hand off to the runtime (replaces this shell; binary owns the exit) ----
+# --- Hand off to the runtime ------------------------------------------------
+# Plain invocation, NOT exec: exec would replace this shell and kill the
+# EXIT trap, so a failing setup would never print UNBOUND_INSTALL_FAILED or
+# POST the install report. set -e propagates a non-zero setup exit through
+# the trap with step=setup.
 CURRENT_STEP="setup"
 backfill_flag=""
 [[ $BACKFILL -eq 1 ]] && backfill_flag="--backfill"
-exec "$PREFIX/current/bin/unbound-hook" setup \
+"$PREFIX/current/unbound-hook/unbound-hook" setup \
   --api-key "$API_KEY" \
   --discovery-key "$DISCOVERY_KEY" \
   --backend-url "$BACKEND_URL" \
   --gateway-url "$GATEWAY_URL" \
   $backfill_flag
+exit 0

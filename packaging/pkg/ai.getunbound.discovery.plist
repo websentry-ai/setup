@@ -11,7 +11,7 @@
     <string>ai.getunbound.discovery</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/opt/unbound/current/bin/unbound-discovery</string>
+        <string>/opt/unbound/current/unbound-discovery/unbound-discovery</string>
         <string>scan</string>
     </array>
     <key>RunAtLoad</key>

@@ -54,13 +54,16 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v6
+      # SHA-pinned (I1): this job holds signing material; a hijacked action
+      # tag must not be able to run code here. SHA = tag v6.
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
       - name: Configure (version + stage gates)
         id: cfg
         env:
           HAS_APP_CERT: ${{ secrets.APPLE_CERT_APPLICATION_P12 != '' && secrets.APPLE_APP_SIGNING_IDENTITY != '' }}
           HAS_INSTALLER_CERT: ${{ secrets.APPLE_CERT_INSTALLER_P12 != '' && secrets.APPLE_INSTALLER_SIGNING_IDENTITY != '' }}
+          HAS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
           HAS_NOTARY: ${{ secrets.APPLE_NOTARY_KEY_P8 != '' && secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_ISSUER_ID != '' }}
           HAS_DISCOVERY_TOKEN: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN != '' }}
           HAS_S3: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID != '' && secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY != '' }}
@@ -75,11 +78,12 @@ jobs:
             publish=false
           fi
           [[ -n "$version" ]] || { echo "::error::could not derive version"; exit 1; }
-          # Tag names can legally contain ;, $(), | etc. — refuse anything
-          # that isn't a plain version string so a hostile tag can never
-          # reach a shell line in the signing job (script-injection guard).
-          if ! [[ "$version" =~ ^[0-9A-Za-z.+-]+$ ]]; then
-            echo "::error::version '$version' contains characters outside [0-9A-Za-z.+-]"
+          # Digit-led semver ONLY (script-injection guard + path sanity):
+          # tag names can legally contain ;, $(), | etc., and a loose charset
+          # would still admit junk like '..', '.', or 'current' that later
+          # becomes a directory name under /opt/unbound.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::version '$version' is not digit-led semver (X.Y.Z with optional -/+ suffix)"
             exit 1
           fi
 
@@ -87,6 +91,13 @@ jobs:
           pkg_sign=false; notarize=false
           [[ "$sign" == "true" && "$HAS_INSTALLER_CERT" == "true" ]] && pkg_sign=true
           [[ "$pkg_sign" == "true" && "$HAS_NOTARY" == "true" ]] && notarize=true
+
+          # A signed pkg whose onboard.sh skips the Team ID assert is a
+          # contradiction: pkg signing REQUIRES the Team ID to be configured.
+          if [[ "$pkg_sign" == "true" && "$HAS_TEAM_ID" != "true" ]]; then
+            echo "::error::APPLE_TEAM_ID must be set whenever installer signing is configured — an empty Team ID assert in a signed release is not allowed"
+            exit 1
+          fi
 
           # A real (tag) release with partial credentials is a misconfig we
           # refuse, not a stage we silently skip: shipping an unsigned or
@@ -102,8 +113,24 @@ jobs:
             echo "::error::tag release requires ARTIFACTS_AWS_ACCESS_KEY_ID/ARTIFACTS_AWS_SECRET_ACCESS_KEY in the release environment. Dry-run via workflow_dispatch instead."
             exit 1
           fi
+          # A tag release must build the REAL discovery binary from the
+          # pinned checkout — the placeholder fallback is dry-run only (and
+          # the install-test version assert would reject it anyway).
+          if [[ "$publish" == "true" && "$HAS_DISCOVERY_TOKEN" != "true" ]]; then
+            echo "::error::tag release requires DISCOVERY_CHECKOUT_TOKEN (pinned coding-discovery-tool checkout). Dry-run via workflow_dispatch instead."
+            exit 1
+          fi
 
           artifact_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$version"
+
+          # discovery.lock is KEY=VALUE (canonical format from WEB-4787).
+          discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
+          lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
+          lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
+          if ! [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::SOURCE_SHA in packaging/discovery.lock is not a full 40-char SHA: '$discovery_sha'"
+            exit 1
+          fi
 
           {
             echo "version=$version"
@@ -116,7 +143,9 @@ jobs:
             echo "pkg_name=unbound-runtime-$version.pkg"
             echo "tar_name=unbound-runtime-$version.tar.gz"
             echo "artifact_url=$artifact_base/unbound-runtime-$version.pkg"
-            echo "discovery_sha=$(grep -v '^#' packaging/discovery.lock | head -1 | tr -d '[:space:]')"
+            echo "discovery_sha=$discovery_sha"
+            echo "lock_python=$lock_python"
+            echo "lock_pyinstaller=$lock_pyinstaller"
           } >> "$GITHUB_OUTPUT"
           echo "version=$version publish=$publish sign=$sign pkg_sign=$pkg_sign notarize=$notarize s3=$HAS_S3"
 
@@ -126,7 +155,7 @@ jobs:
       # DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
       - name: Checkout coding-discovery-tool at pinned SHA
         if: steps.cfg.outputs.discovery_token == 'true'
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: websentry-ai/coding-discovery-tool
           ref: ${{ steps.cfg.outputs.discovery_sha }}
@@ -144,20 +173,47 @@ jobs:
         run: ./packaging/scripts/install-python.sh
 
       - name: Install pinned PyInstaller (hash-verified)
+        env:
+          LOCK_PYTHON: ${{ steps.cfg.outputs.lock_python }}
+          LOCK_PYINSTALLER: ${{ steps.cfg.outputs.lock_pyinstaller }}
         run: |
           set -euo pipefail
           source packaging/versions.env
+          # versions.env (installer URL+sha) and discovery.lock (KEY=VALUE)
+          # must agree — fail loud if one was bumped without the other.
+          actual_py="$("$PYTHON_BIN" --version | awk '{print $2}')"
+          if [[ "$actual_py" != "$LOCK_PYTHON" ]]; then
+            echo "::error::pinned interpreter is $actual_py but discovery.lock says PYTHON_VERSION=$LOCK_PYTHON"
+            exit 1
+          fi
           "$PYTHON_BIN" -m venv .build-venv
-          ./.build-venv/bin/pip install --require-hashes -r packaging/requirements-build.txt
-          ./.build-venv/bin/pyinstaller --version
+          ./.build-venv/bin/pip install --require-hashes --no-deps -r packaging/requirements-build.txt
+          actual_pi="$(./.build-venv/bin/pyinstaller --version)"
+          if [[ "$actual_pi" != "$LOCK_PYINSTALLER" ]]; then
+            echo "::error::installed PyInstaller $actual_pi but discovery.lock says PYINSTALLER_VERSION=$LOCK_PYINSTALLER"
+            exit 1
+          fi
 
       - name: Build bundles from committed .spec files
+        env:
+          HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
         run: |
           set -euo pipefail
           ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
             packaging/specs/unbound-hook.spec
-          ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
-            packaging/specs/unbound-discovery.spec
+          # Canonical discovery spec (WEB-4787) builds from the pinned
+          # checkout; the placeholder spec exists ONLY for tokenless
+          # workflow_dispatch dry-runs (tag releases hard-require the token
+          # in cfg, and the install-test version assert rejects placeholders).
+          if [[ "$HAS_DISCOVERY_SRC" == "true" ]]; then
+            UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src" \
+              ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
+              packaging/unbound-discovery.spec
+          else
+            echo "::warning::building PLACEHOLDER unbound-discovery (no DISCOVERY_CHECKOUT_TOKEN) — dry-run only"
+            ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
+              packaging/specs/unbound-discovery.spec
+          fi
 
       - name: Lipo gate (every Mach-O universal2)
         run: ./packaging/scripts/lipo-gate.sh dist/unbound-hook dist/unbound-discovery
@@ -255,12 +311,26 @@ jobs:
         env:
           PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
           VERSION: ${{ steps.cfg.outputs.version }}
+          PUBLISH: ${{ steps.cfg.outputs.publish }}
         run: |
           set -euo pipefail
           sudo installer -pkg "out/$PKG_NAME" -target /
           [[ "$(readlink /opt/unbound/current)" == "/opt/unbound/$VERSION" ]]
-          /opt/unbound/current/bin/unbound-hook --version
-          /opt/unbound/current/bin/unbound-discovery --version
+          # Version assert: a published binary must self-identify as the
+          # release version — a placeholder reporting 0.0.0-placeholder (or
+          # any stale baked version) must never reach the fleet. Dry-runs
+          # only warn, so the unsigned pipeline keeps working pre-Streams-A/B.
+          for bin in unbound-hook unbound-discovery; do
+            v_out="$(/opt/unbound/current/$bin/$bin --version)"
+            echo "$bin --version -> $v_out"
+            if [[ "$v_out" != *"$VERSION"* ]]; then
+              if [[ "$PUBLISH" == "true" ]]; then
+                echo "::error::$bin reports '$v_out', not release version $VERSION — refusing to publish"
+                exit 1
+              fi
+              echo "::warning::$bin reports '$v_out' (placeholder/dev build) — would fail a tag release"
+            fi
+          done
           pkgutil --pkg-info ai.getunbound.runtime
           sudo launchctl print system/ai.getunbound.discovery >/dev/null
           [[ -d /var/log/unbound && -f /etc/newsyslog.d/ai.getunbound.conf ]]
@@ -318,7 +388,7 @@ jobs:
           ls -lh out/
 
       - name: Upload build artifacts (always, incl. dry-runs)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: unbound-runtime-${{ steps.cfg.outputs.version }}
           path: out/
@@ -336,10 +406,18 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
           VERSION: ${{ steps.cfg.outputs.version }}
+          PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
+          TAR_NAME: ${{ steps.cfg.outputs.tar_name }}
         run: |
           set -euo pipefail
-          for f in out/*; do
-            key="macos/$VERSION/$(basename "$f")"
+          # Explicit upload ORDER (I3): payload first, checksums next,
+          # onboard.sh strictly LAST. If publishing dies halfway, the public
+          # prefix must never contain an onboard.sh that points at a 404 —
+          # the script only appears once everything it references exists.
+          for name in "$PKG_NAME" "$PKG_NAME.sha256" "$TAR_NAME" "$TAR_NAME.sha256" onboard.sh; do
+            f="out/$name"
+            [[ -f "$f" ]] || { echo "::error::expected artifact missing: $f"; exit 1; }
+            key="macos/$VERSION/$name"
             if err="$(aws s3api put-object \
                   --bucket "$ARTIFACTS_BUCKET" --key "$key" --body "$f" \
                   --if-none-match '*' 2>&1 >/dev/null)"; then

@@ -34,12 +34,11 @@ verdir="$root$INSTALL_PREFIX/$version"
 mkdir -p "$verdir" "$root/Library/LaunchDaemons"
 cp -R "$dist/unbound-hook" "$dist/unbound-discovery" "$verdir/"
 
-# Stable entry points: /opt/unbound/current/bin/<name> (LaunchDaemon, PATH,
-# onboard.sh all use these). Relative links so the tree is relocatable
-# between version dirs.
-mkdir -p "$verdir/bin"
-ln -s ../unbound-hook/unbound-hook "$verdir/bin/unbound-hook"
-ln -s ../unbound-discovery/unbound-discovery "$verdir/bin/unbound-discovery"
+# Canonical entry points are the bundle executables themselves:
+#   /opt/unbound/current/unbound-hook/unbound-hook
+#   /opt/unbound/current/unbound-discovery/unbound-discovery
+# (aligned with the unbound-hook binary work in WEB-4786 — no bin/ shim dir,
+# one path for LaunchDaemon, onboard.sh, and tool-hook commands alike).
 
 # Shipped inside the version dir; postinstall copies it to /etc/newsyslog.d
 # (payload writing straight into /private/etc is avoidable churn).

@@ -10,9 +10,10 @@ template), WEB-4792 (pkg payload).
 | Path | What |
 |---|---|
 | `versions.env` | Pinned python.org universal2 CPython (URL + sha256), pkg identifier, install prefix, daemon label |
-| `requirements-build.txt` | Hash-pinned PyInstaller toolchain (`pip install --require-hashes`) |
-| `discovery.lock` | Pinned `coding-discovery-tool` SHA checked out into `./discovery-src` at build time |
-| `specs/*.spec` | Committed PyInstaller specs — **placeholders** until Streams A (`unbound-hook`) and B (`unbound-discovery`) drop the real ones; bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
+| `requirements-build.txt` | Hash-pinned PyInstaller toolchain, canonical from WEB-4787 (`pip install --require-hashes --no-deps`) |
+| `discovery.lock` | KEY=VALUE source pin, canonical from WEB-4787 (`SOURCE_SHA` is checked out into `./discovery-src`; `PYTHON_VERSION`/`PYINSTALLER_VERSION` are asserted against the installed toolchain) |
+| `unbound-discovery.spec` + `unbound_discovery_entry.py` + `build-discovery.sh` | **Canonical** discovery bundle build (WEB-4787); CI invokes the spec with `UNBOUND_DISCOVERY_SRC=./discovery-src` |
+| `specs/*.spec` | `unbound-hook.spec` is a **placeholder** until the WEB-4786 binary lands; `specs/unbound-discovery.spec` is a dry-run-only fallback for tokenless `workflow_dispatch` runs. Bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
 | `placeholder/*.py` | Stdlib-only entry points so the pipeline builds/signs/smokes end-to-end today |
 | `scripts/` | Build steps factored out of the workflow so they're shellcheckable and runnable locally |
 | `pkg/postinstall` | Pre-warms both binaries (Gatekeeper first-exec) **before** flipping `current`, bootstraps the LaunchDaemon, sets up `/var/log/unbound` + newsyslog, keep-2 version GC |
@@ -26,12 +27,21 @@ hash-pinned pkg does.
 ## On-disk layout installed by the pkg
 
 ```
-/opt/unbound/<version>/{unbound-hook/,unbound-discovery/,bin/,share/}
+/opt/unbound/<version>/{unbound-hook/,unbound-discovery/,share/}
 /opt/unbound/current -> /opt/unbound/<version>     (flipped by postinstall AFTER pre-warm)
 /opt/unbound/etc/                                  (config; written by onboard, never by the pkg)
 /Library/LaunchDaemons/ai.getunbound.discovery.plist
 /var/log/unbound/                                  (+ /etc/newsyslog.d/ai.getunbound.conf)
 ```
+
+Canonical binary paths (no `bin/` shim dir — aligned with the WEB-4786
+binary): `/opt/unbound/current/unbound-hook/unbound-hook` and
+`/opt/unbound/current/unbound-discovery/unbound-discovery`.
+
+**Version contract:** `<binary> --version` output must contain the release
+version — the CI install-test hard-fails a tag release whose binaries
+self-identify otherwise (this is what keeps a placeholder build off the
+fleet). Real specs must bake the release version at build time.
 
 Receipts: `pkgutil --pkg-info ai.getunbound.runtime` → Jamf smart groups
 report fleet coverage. Previous version dir is kept for rollback (keep-2 GC).
@@ -44,9 +54,9 @@ lights up independently:
 | Stage | Enabled by |
 |---|---|
 | Mach-O signing | `APPLE_CERT_APPLICATION_P12` + `APPLE_APP_SIGNING_IDENTITY` (+ password) |
-| pkg productsign | above + `APPLE_CERT_INSTALLER_P12` + `APPLE_INSTALLER_SIGNING_IDENTITY` |
+| pkg productsign | above + `APPLE_CERT_INSTALLER_P12` + `APPLE_INSTALLER_SIGNING_IDENTITY` + `APPLE_TEAM_ID` (installer signing without a Team ID is refused — the onboard.sh assert must never be empty in a signed release) |
 | notarytool + staple + spctl | above + `APPLE_NOTARY_KEY_P8/_KEY_ID/_ISSUER_ID` |
-| pinned discovery checkout | `DISCOVERY_CHECKOUT_TOKEN` |
+| pinned discovery checkout (canonical spec) | `DISCOVERY_CHECKOUT_TOKEN` |
 | S3 upload | `ARTIFACTS_AWS_ACCESS_KEY_ID` + `ARTIFACTS_AWS_SECRET_ACCESS_KEY` |
 
 Artifacts publish to
@@ -58,9 +68,11 @@ that version already shipped — bump the version and cut a new tag; never
 retry or delete. Published artifacts are immutable so the sha256 baked
 into the fleet's onboard.sh stays true forever.
 
-A **tag** release refuses to run with partial signing credentials or
-missing S3 credentials (no accidental unsigned fleet artifacts, no baked
-URLs that 404); use `workflow_dispatch` for unsigned dry-runs. All secrets
+A **tag** release refuses to run with partial signing credentials, missing
+S3 credentials, or no discovery checkout token (no accidental unsigned
+fleet artifacts, no baked URLs that 404, no placeholder binaries — the
+install-test version assert backstops the last one); use
+`workflow_dispatch` for unsigned dry-runs. All secrets
 live ONLY in the GitHub `release` environment, with required reviewers set
 to the SOC 2 production-approver list.
 

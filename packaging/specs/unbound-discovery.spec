@@ -1,11 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PLACEHOLDER spec for the `unbound-discovery` bundle (real spec lands with
-# Stream B / WEB-4787). The real Analysis points into the
-# websentry-ai/coding-discovery-tool checkout that CI places at
-# ./discovery-src (pinned by packaging/discovery.lock). Bundle name, onedir
-# COLLECT layout, and target_arch are the pipeline contract — see
-# unbound-hook.spec for the rationale on onedir / no-MERGE / universal2 /
-# no in-spec signing.
+# DRY-RUN-ONLY fallback spec for `unbound-discovery`. The CANONICAL spec is
+# packaging/unbound-discovery.spec (WEB-4787), which builds from the pinned
+# coding-discovery-tool checkout via UNBOUND_DISCOVERY_SRC. CI uses this
+# fallback only on tokenless workflow_dispatch dry-runs; tag releases
+# hard-require the real checkout, and the install-test version assert
+# rejects the placeholder binary. Bundle name, onedir COLLECT layout, and
+# target_arch are the pipeline contract — see unbound-hook.spec for the
+# rationale on onedir / no-MERGE / universal2 / no in-spec signing.
 
 a = Analysis(
     ["../placeholder/unbound_discovery_main.py"],
