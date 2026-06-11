@@ -47,14 +47,19 @@ DAEMON_BIN="$STAGE/$(basename "$(dirname "$BIN")")/$(basename "$BIN")"
 chown -R root:wheel "$STAGE"
 [ -x "$DAEMON_BIN" ] || { echo "staging failed: $DAEMON_BIN" >&2; exit 1; }
 
+xml_escape() {
+    printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
 # write_plist <log-path> <home-mode: varempty|unset> [program args...]
 write_plist() {
     local log_path="$1" home_mode="$2"
     shift 2
+    log_path="$(xml_escape "$log_path")"
     local args_xml=""
     local a
     for a in "$DAEMON_BIN" "$@"; do
-        args_xml="$args_xml        <string>$a</string>
+        args_xml="$args_xml        <string>$(xml_escape "$a")</string>
 "
     done
     local env_xml=""
