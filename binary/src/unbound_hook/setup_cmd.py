@@ -135,6 +135,13 @@ def _remove_stale_managed_script(managed_dir: Path) -> None:
 # structure and timeouts copied verbatim, command strings swapped).
 # ---------------------------------------------------------------------------
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """tmp + os.replace so a crash mid-write never leaves the editor reading
+    a truncated managed-settings file."""
+    tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
 def _claude_hooks_config():
     cmd = lambda ev: hook_command_for_event("claude-code", ev)
     return {
@@ -241,7 +248,7 @@ def _write_claude_managed_settings(m) -> bool:
                 del settings["env"]
 
         settings["hooks"] = _claude_hooks_config()
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        _atomic_write_text(settings_path, json.dumps(settings, indent=2))
 
         gateway_key_helper = managed_dir / "anthropic_key.sh"
         if gateway_key_helper.exists():
@@ -274,7 +281,7 @@ def _write_codex_managed_settings(m) -> bool:
                 settings = {}
 
         settings["hooks"] = _codex_hooks_config()
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        _atomic_write_text(settings_path, json.dumps(settings, indent=2))
 
         if platform.system().lower() in ("darwin", "linux"):
             os.chmod(managed_dir, 0o755)
@@ -306,9 +313,13 @@ def _write_cursor_enterprise_hooks(m) -> tuple:
 
 def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
     """Binary variant of copilot install_hooks_for_user(): writes only
-    unbound.json (no unbound.py copy), privilege-dropped like the original."""
+    unbound.json (no unbound.py copy), privilege-dropped like the original.
+    The python-era unbound.py is removed AFTER the new registration is
+    written — a failed install leaves python-era coverage fully intact
+    (same delete-after-replace rule as the managed-settings tools)."""
     hooks_dir = home_dir / ".copilot" / "hooks"
     hooks_json = hooks_dir / "unbound.json"
+    stale_script = hooks_dir / "unbound.py"
     config = _copilot_hooks_config()
 
     def _install():
@@ -317,6 +328,11 @@ def _install_copilot_hooks_for_user(m, username, home_dir) -> bool:
         fd = os.open(str(hooks_json), flags, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
+        try:
+            if stale_script.is_file():
+                stale_script.unlink()
+        except OSError:
+            pass  # stale script is inert once unbound.json points at the binary
         return True
 
     return bool(m._run_as_user(username, _install))
@@ -547,13 +563,19 @@ def run(argv) -> int:
         return 2
 
     try:
-        admin = load_mdm_setup_module("claude-code").check_admin_privileges()
+        m0 = load_mdm_setup_module("claude-code")
+        admin = m0.check_admin_privileges()
     except Exception:
         admin = False
     if not admin:
         print("unbound-hook setup requires administrator/root privileges. Re-run with sudo.",
               file=sys.stderr)
         return 1
+
+    # Normalize once at the boundary so every consumer (adapters, discovery
+    # --domain) sees a schemed, trailing-slash-free URL.
+    opts["backend_url"] = m0.normalize_url(opts["backend_url"])
+    opts["gateway_url"] = m0.normalize_url(opts["gateway_url"])
 
     statuses = {}
 

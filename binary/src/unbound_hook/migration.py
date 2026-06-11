@@ -13,13 +13,16 @@ replaces, so old and new never run side by side:
     module's own stripper runs FIRST, so a registration is never left
     dangling at a file this sweep already deleted), then the leftover
     unbound.py + .self_update_check/.self_update.lock files as a catch-all
-  - copilot's per-user unbound.json, only when its commands reference the
-    python unbound.py (a binary-era unbound.json is left untouched)
 
-Deliberately NOT swept here: the managed/system unbound.py copies. Those are
-still referenced by managed settings until the per-tool setup adapter
-rewrites them, so each adapter deletes its own stale script immediately
-after its settings write succeeds — never before (see setup_cmd).
+Deliberately NOT swept here — anything that is still the live serving path
+until the per-tool setup adapter replaces it. Each adapter removes its own
+python-era files immediately after its settings write succeeds, never
+before, so a deferred component leaves python-era coverage intact:
+  - the managed/system unbound.py copies (claude-code / codex / cursor
+    adapters, after the managed-settings rewrite)
+  - copilot's per-user unbound.json AND unbound.py (the copilot adapter,
+    after writing the binary-era unbound.json — unbound.json IS copilot's
+    registration, so sweeping it would unhook copilot on a deferral)
 
 Never touched: ~/.unbound/config.json (api key + urls survive migration).
 
@@ -44,6 +47,9 @@ TOOL_USER_HOOKS_DIR = {
     "codex": ".codex/hooks",
 }
 STALE_HOOK_FILES = ("unbound.py", ".self_update_check", ".self_update.lock")
+# Copilot's serving path (unbound.py, referenced by unbound.json) is replaced
+# by its adapter post-write; the sweep only clears its self-update state.
+COPILOT_SWEEP_FILES = (".self_update_check", ".self_update.lock")
 
 # Remote-fetch artifacts under ~/.local/share/unbound/.
 REMOTE_FETCH_FILES = ("install.sh", "run-scheduled.sh")
@@ -75,7 +81,8 @@ def _sweep_user_home(home_str: str, tools) -> list:
         candidates.append(home / ".local" / "share" / "unbound" / name)
     for tool in tools:
         hooks_dir = TOOL_USER_HOOKS_DIR[tool]
-        for name in STALE_HOOK_FILES:
+        names = COPILOT_SWEEP_FILES if tool == "copilot" else STALE_HOOK_FILES
+        for name in names:
             candidates.append(home / hooks_dir / name)
     for path in candidates:
         try:
@@ -84,20 +91,6 @@ def _sweep_user_home(home_str: str, tools) -> list:
                 removed.append(str(path))
         except OSError:
             continue
-
-    # Copilot registers per-user via unbound.json; remove it only when it
-    # still points at the python script — a binary-era unbound.json (this
-    # machine already migrated, or setup scoped to other tools) stays.
-    if "copilot" in tools:
-        copilot_json = home / ".copilot" / "hooks" / "unbound.json"
-        try:
-            if copilot_json.is_file():
-                content = copilot_json.read_text(encoding="utf-8")
-                if "unbound.py" in content:
-                    copilot_json.unlink()
-                    removed.append(str(copilot_json))
-        except (OSError, UnicodeDecodeError):
-            pass
     return removed
 
 

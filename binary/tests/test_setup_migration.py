@@ -204,12 +204,16 @@ def _assert_swept(home: Path, tmp: Path):
     assert not (home / "Library" / "LaunchAgents" / "ai.getunbound.discovery.plist").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".local" / "share" / "unbound" / "run-scheduled.sh").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks"):
         assert not (home / d / "unbound.py").exists()
+    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks"):
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
-    # python-era copilot registration removed (commands pointed at unbound.py)
-    assert not (home / ".copilot" / "hooks" / "unbound.json").exists()
+    # copilot's SERVING files are not the sweep's job: unbound.json is the
+    # registration and unbound.py is what it points at — both replaced by
+    # the copilot adapter after its write succeeds (B2)
+    assert (home / ".copilot" / "hooks" / "unbound.json").exists()
+    assert (home / ".copilot" / "hooks" / "unbound.py").exists()
     # managed scripts are NOT the sweep's job (adapters remove them post-write)
     for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
         assert (tmp / tool / "hooks" / "unbound.py").exists()
@@ -267,9 +271,24 @@ def test_sweep_runs_inside_setup(env):
     # managed stale scripts removed by adapters AFTER their settings rewrite
     for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
-    # python-era copilot registration replaced by a binary-era one
+    # python-era copilot registration replaced by a binary-era one, and the
+    # now-unreferenced python script removed by the adapter (B2)
     copilot = json.loads((env["home"] / ".copilot" / "hooks" / "unbound.json").read_text())
     assert "unbound-hook" in copilot["hooks"]["PreToolUse"][0]["command"]
+    assert not (env["home"] / ".copilot" / "hooks" / "unbound.py").exists()
+
+
+def test_copilot_deferred_keeps_python_era(env, monkeypatch):
+    """B2 regression: a copilot deferral (MDM key fetch fails) must leave the
+    python-era copilot serving path — unbound.json AND the unbound.py it
+    points at — fully intact until a successful re-run replaces them."""
+    _plant_python_era_artifacts(env["home"], env["tmp"])
+    python_json = (env["home"] / ".copilot" / "hooks" / "unbound.json").read_text()
+    monkeypatch.setattr(env["modules"]["copilot"], "fetch_api_key_from_mdm",
+                        lambda *a: None)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    assert (env["home"] / ".copilot" / "hooks" / "unbound.json").read_text() == python_json
+    assert (env["home"] / ".copilot" / "hooks" / "unbound.py").exists()
 
 
 def test_failed_component_keeps_python_serving_path(env, monkeypatch):
