@@ -1314,7 +1314,6 @@ def _hook_discovery_enabled_for_org() -> bool:
 
 
 def _install_sh_is_stale() -> bool:
-    """True if the cached install.sh is missing or older than the refresh TTL."""
     try:
         return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
     except OSError:
@@ -1442,8 +1441,6 @@ def _dispatch_discovery() -> None:
 
             DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
             if _install_sh_is_stale():
-                # Download to a temp path + atomic replace so a failed refresh
-                # can't corrupt or drop a usable cached copy.
                 tmp = DISCOVERY_INSTALL_SH.with_suffix(".tmp")
                 r = subprocess.run(
                     ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
@@ -1454,8 +1451,6 @@ def _dispatch_discovery() -> None:
                     os.replace(tmp, DISCOVERY_INSTALL_SH)
                 else:
                     tmp.unlink(missing_ok=True)
-                    # A failed refresh falls back to the cached copy; only abort
-                    # when there's nothing to run.
                     if not DISCOVERY_INSTALL_SH.exists():
                         log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                         return
