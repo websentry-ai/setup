@@ -53,11 +53,6 @@ def env(tmp_path, monkeypatch):
                         lambda: tmp_path / "managed-codex")
     monkeypatch.setattr(modules["cursor"], "get_enterprise_hooks_dir",
                         lambda: tmp_path / "enterprise-cursor")
-    monkeypatch.setattr(
-        migration, "MANAGED_STALE_SCRIPTS",
-        (tmp_path / "managed-claude" / "hooks" / "unbound.py",
-         tmp_path / "managed-codex" / "hooks" / "unbound.py",
-         tmp_path / "enterprise-cursor" / "hooks" / "unbound.py"))
     # NEVER run real launchctl from tests — the dev machine may have live
     # agents under these labels. Record the bootout calls instead.
     bootouts = []
@@ -187,7 +182,12 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
         (p / ".self_update.lock").write_text("")
     (home / ".unbound").mkdir(exist_ok=True)
     (home / ".unbound" / "config.json").write_text(json.dumps({"api_key": "KEEP-ME"}))
-    # stale managed scripts (paths patched into migration.MANAGED_STALE_SCRIPTS)
+    # python-era copilot registration (commands point at unbound.py)
+    (home / ".copilot" / "hooks" / "unbound.json").write_text(json.dumps(
+        {"version": 1, "hooks": {"PreToolUse": [
+            {"command": f'"{home}/.copilot/hooks/unbound.py"'}]}}))
+    # stale managed scripts — removed by the setup adapters AFTER their
+    # settings rewrite succeeds (never by the sweep; see F1 in review)
     for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
         (tmp / tool / "hooks").mkdir(parents=True, exist_ok=True)
         (tmp / tool / "hooks" / "unbound.py").write_text("# stale managed hook")
@@ -208,8 +208,11 @@ def _assert_swept(home: Path, tmp: Path):
         assert not (home / d / "unbound.py").exists()
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
+    # python-era copilot registration removed (commands pointed at unbound.py)
+    assert not (home / ".copilot" / "hooks" / "unbound.json").exists()
+    # managed scripts are NOT the sweep's job (adapters remove them post-write)
     for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
-        assert not (tmp / tool / "hooks" / "unbound.py").exists()
+        assert (tmp / tool / "hooks" / "unbound.py").exists()
     # the user-authored part of settings.json survives, unbound entries don't
     settings = json.loads((home / ".claude" / "settings.json").read_text())
     assert settings.get("model") == "opus"
@@ -261,3 +264,46 @@ def test_sweep_runs_inside_setup(env):
     assert not (env["home"] / ".claude" / "hooks" / "unbound.py").exists()
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
     assert json.loads((env["home"] / ".unbound" / "config.json").read_text())["api_key"] == "per-device-key"
+    # managed stale scripts removed by adapters AFTER their settings rewrite
+    for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
+        assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
+    # python-era copilot registration replaced by a binary-era one
+    copilot = json.loads((env["home"] / ".copilot" / "hooks" / "unbound.json").read_text())
+    assert "unbound-hook" in copilot["hooks"]["PreToolUse"][0]["command"]
+
+
+def test_failed_component_keeps_python_serving_path(env, monkeypatch):
+    """F1 regression: when a tool's setup defers (MDM key fetch fails), its
+    managed python script must survive so existing hook registrations never
+    point at a deleted file."""
+    _plant_python_era_artifacts(env["home"], env["tmp"])
+    monkeypatch.setattr(env["modules"]["codex"], "fetch_api_key_from_mdm",
+                        lambda *a: None)
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 1
+    # codex deferred -> its managed script intact; others rewritten + cleaned
+    assert (env["tmp"] / "managed-codex" / "hooks" / "unbound.py").exists()
+    assert not (env["tmp"] / "managed-claude" / "hooks" / "unbound.py").exists()
+    assert not (env["tmp"] / "enterprise-cursor" / "hooks" / "unbound.py").exists()
+
+
+def test_sweep_scoped_to_tools_leaves_other_tools_alone(env):
+    _plant_python_era_artifacts(env["home"], env["tmp"])
+    status, _ = migration.run_sweep(tools=["claude-code"], log=lambda *_: None)
+    assert status == "configured"
+    assert not (env["home"] / ".claude" / "hooks" / "unbound.py").exists()
+    # other tools' user artifacts untouched
+    assert (env["home"] / ".codex" / "hooks" / "unbound.py").exists()
+    assert (env["home"] / ".copilot" / "hooks" / "unbound.json").exists()
+
+
+def test_sweep_keeps_binary_era_copilot_registration(env):
+    """Previously-binary fixture detail: a copilot unbound.json whose
+    commands already point at the binary must survive the sweep."""
+    hooks_dir = env["home"] / ".copilot" / "hooks"
+    hooks_dir.mkdir(parents=True)
+    binary_json = json.dumps({"version": 1, "hooks": {"PreToolUse": [
+        {"command": '"/opt/unbound/current/unbound-hook/unbound-hook" hook copilot PreToolUse'}]}})
+    (hooks_dir / "unbound.json").write_text(binary_json)
+    status, _ = migration.run_sweep(log=lambda *_: None)
+    assert status == "configured"
+    assert (hooks_dir / "unbound.json").read_text() == binary_json

@@ -4,6 +4,9 @@ Reuses the vendored MDM modules' backfill machinery wholesale: collection,
 exchange-boundary chunking with record_index_base (which keeps the server's
 per-record uuid5 seed stable), S3 staging, Task-row idempotent import, and
 the per-home mtime-cutoff bookkeeping. Cursor has no transcript store.
+Default tools are claude-code + codex (the WEB-4786 scope); copilot also
+has backfill machinery and can be opted in via --tools (setup's --backfill
+runs it, mirroring mdm/onboard.py).
 
   unbound-hook backfill --all [--tools claude-code,codex] [--dry-run]
   unbound-hook backfill --user <name> [...]
@@ -89,7 +92,7 @@ def run(argv) -> int:
     # Device-wide key: every profile's config carries the same per-device
     # api key (the model run_backfill documents). First readable one wins.
     api_key = None
-    backend_url = opts["backend_url"]
+    backend_url = m0.normalize_url(opts["backend_url"]) if opts["backend_url"] else None
     for username, home_dir in user_homes:
         cfg = _read_user_config(m0, username, home_dir) or {}
         api_key = api_key or cfg.get("api_key")

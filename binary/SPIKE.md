@@ -76,10 +76,11 @@ dist dir), 3 trials:
 This is syspolicyd scanning each new Mach-O inode on first launch (ad-hoc
 signed, not notarized). Implications:
 - The stall recurs **on every install/update** (new inodes), then never again.
-- Mitigation for WEB-4786: `setup` runs the binary once (empty stdin) at
-  install time so the stall is absorbed during MDM install, not on the
-  user's first prompt. Notarization (separate cert track) should shrink it
-  further.
+- Mitigation: the pkg postinstall (WEB-4792) pre-warms each binary with
+  `--version` before flipping the `current` symlink, so the stall is
+  absorbed during MDM install, not on the user's first prompt — which is
+  why `unbound-hook --version` must exit fast without reading stdin.
+  Notarization (separate cert track) should shrink it further.
 - No codesigning/notarization attempted in this spike per ticket scope.
 
 ## Decision

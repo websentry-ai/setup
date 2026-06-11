@@ -94,18 +94,38 @@ def _normalized_urls(m, opts):
     return base, gateway
 
 
-def _detect_state(settings_path: Path) -> str:
+def _detect_state(settings_path: Path):
     """Binary-era analog of the python detect_install_state(): the python
     version checked managed unbound.py existence, which no longer exists.
-    'persisted' = settings present and pointing at this binary; 'tampered' =
-    settings present but not referencing the binary."""
+    'persisted' = settings present and pointing at this binary OR at the
+    python-era unbound.py (a legitimate install being migrated — reporting
+    those as 'tampered' would flood the backend with false tamper signals on
+    rollout day); 'tampered' = settings present referencing neither."""
     try:
         if not settings_path.exists():
             return "fresh"
         text = settings_path.read_text(encoding="utf-8")
-        return "persisted" if str(HOOK_BINARY) in text else "tampered"
+        if str(HOOK_BINARY) in text or "unbound.py" in text:
+            return "persisted"
+        return "tampered"
     except Exception:
         return None
+
+
+def _remove_stale_managed_script(managed_dir: Path) -> None:
+    """Delete the python-era managed hook script — called ONLY after the
+    settings rewrite succeeded, so hook registrations are never left
+    pointing at a deleted script (a failed setup must leave the python
+    serving path intact)."""
+    script = managed_dir / "hooks" / "unbound.py"
+    try:
+        if script.is_file():
+            script.unlink()
+        hooks_dir = script.parent
+        if hooks_dir.is_dir() and not any(hooks_dir.iterdir()):
+            hooks_dir.rmdir()
+    except OSError as e:
+        print(f"[migration] could not remove {script}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -334,6 +354,7 @@ def _setup_claude_code(opts):
     state = _detect_state(m.get_managed_settings_dir() / "managed-settings.json")
     if not _write_claude_managed_settings(m):
         return ("deferred", "managed settings write failed")
+    _remove_stale_managed_script(m.get_managed_settings_dir())
 
     m.notify_setup_complete(api_key, "claude-code", backend_url=base,
                             install_state=state, serial_number=device_id)
@@ -370,6 +391,7 @@ def _setup_codex(opts):
     state = _detect_state(m.get_managed_settings_dir() / "hooks.json")
     if not _write_codex_managed_settings(m):
         return ("deferred", "managed settings write failed")
+    _remove_stale_managed_script(m.get_managed_settings_dir())
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id)
@@ -404,6 +426,7 @@ def _setup_cursor(opts):
     hooks_ok, hooks_changed = _write_cursor_enterprise_hooks(m)
     if not hooks_ok:
         return ("deferred", "enterprise hooks.json write failed")
+    _remove_stale_managed_script(m.get_enterprise_hooks_dir())
 
     m.notify_setup_complete(api_key, "cursor", backend_url=base,
                             install_state=state, serial_number=device_id)
@@ -417,20 +440,21 @@ def _copilot_detect_state(user_homes) -> str:
     'fresh' = no user has an unbound.json; 'persisted' = at least one user's
     unbound.json already points at the binary; 'tampered' otherwise."""
     saw_json = False
-    saw_binary_ref = False
+    saw_known_ref = False
     try:
         for _username, home_dir in user_homes:
             p = home_dir / ".copilot" / "hooks" / "unbound.json"
             if p.exists():
                 saw_json = True
                 try:
-                    if str(HOOK_BINARY) in p.read_text(encoding="utf-8"):
-                        saw_binary_ref = True
+                    text = p.read_text(encoding="utf-8")
+                    if str(HOOK_BINARY) in text or "unbound.py" in text:
+                        saw_known_ref = True
                 except OSError:
                     pass
         if not saw_json:
             return "fresh"
-        return "persisted" if saw_binary_ref else "tampered"
+        return "persisted" if saw_known_ref else "tampered"
     except Exception:
         return None
 
@@ -476,12 +500,14 @@ def _run_discovery(opts):
         return ("skipped", "no --discovery-key provided")
     if not DISCOVERY_BINARY.is_file():
         return ("deferred", f"discovery binary not installed at {DISCOVERY_BINARY}")
-    cmd = [str(DISCOVERY_BINARY),
-           "--api-key", opts["discovery_key"],
-           "--domain", opts["backend_url"]]
+    # Key via env, never argv — the scan runs up to 90 min and argv is
+    # visible to every local user via ps (same contract the hook modules'
+    # frozen discovery dispatch uses).
+    cmd = [str(DISCOVERY_BINARY), "--domain", opts["backend_url"]]
+    env = {**os.environ, "UNBOUND_API_KEY": opts["discovery_key"]}
     backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
     try:
-        proc = subprocess.Popen(cmd, start_new_session=True)
+        proc = subprocess.Popen(cmd, start_new_session=True, env=env)
         try:
             rc = proc.wait(timeout=backstop)
         except subprocess.TimeoutExpired:
@@ -531,7 +557,7 @@ def run(argv) -> int:
     statuses = {}
 
     print(f"\n{'=' * 60}\n[migration] python→binary sweep\n{'=' * 60}")
-    statuses["migration"] = migration.run_sweep()
+    statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:
         adapter = _ADAPTERS.get(tool)

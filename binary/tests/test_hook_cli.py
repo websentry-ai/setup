@@ -51,12 +51,25 @@ EVENT_PAYLOADS = {
     "cursor": {
         "preToolUse": {**S, "hook_event_name": "preToolUse", "tool_name": "Read",
                        "tool_input": {"file_path": "/tmp/x"}},
+        "postToolUse": {**S, "hook_event_name": "postToolUse", "tool_name": "Read",
+                        "tool_input": {"file_path": "/tmp/x"}, "tool_response": {}},
         "beforeShellExecution": {**S, "hook_event_name": "beforeShellExecution",
                                  "command": "git status"},
         "beforeMCPExecution": {**S, "hook_event_name": "beforeMCPExecution",
                                "tool_name": "linear_search", "tool_input": {}},
+        "afterShellExecution": {**S, "hook_event_name": "afterShellExecution",
+                                "command": "git status", "output": "clean"},
+        "afterMCPExecution": {**S, "hook_event_name": "afterMCPExecution",
+                              "tool_name": "linear_search", "tool_input": {},
+                              "tool_response": {}},
+        "afterFileEdit": {**S, "hook_event_name": "afterFileEdit",
+                          "file_path": "/tmp/x", "edits": []},
+        "beforeReadFile": {**S, "hook_event_name": "beforeReadFile",
+                           "file_path": "/tmp/x"},
         "beforeSubmitPrompt": {**S, "hook_event_name": "beforeSubmitPrompt",
                                "prompt": "hello"},
+        "afterAgentResponse": {**S, "hook_event_name": "afterAgentResponse",
+                               "text": "done"},
         "stop": {**S, "hook_event_name": "stop"},
         "sessionStart": {**S, "hook_event_name": "sessionStart"},
     },
@@ -102,6 +115,35 @@ def test_missing_tool_fails_open(sandbox_home):
     got = run_cli_dev(["hook"], "{}", sandbox_home)
     assert got.returncode == 0
     assert json.loads(got.stdout) == {}
+
+
+def test_module_exit_code_propagates(monkeypatch):
+    """Cursor denies by raising SystemExit(2) from main() — the dispatcher
+    must propagate it untouched, not swallow it as fail-open."""
+    from unbound_hook import hook_cmd
+
+    class FakeModule:
+        @staticmethod
+        def main():
+            raise SystemExit(2)
+
+    monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
+    with pytest.raises(SystemExit) as exc:
+        hook_cmd.run(["cursor"])
+    assert exc.value.code == 2
+
+
+def test_module_crash_fails_open(monkeypatch, capsys):
+    from unbound_hook import hook_cmd
+
+    class FakeModule:
+        @staticmethod
+        def main():
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
+    assert hook_cmd.run(["cursor"]) == 0
+    assert capsys.readouterr().out.strip() == "{}"
 
 
 def test_version_does_not_read_stdin(sandbox_home):

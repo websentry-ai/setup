@@ -44,6 +44,14 @@ When `sys.frozen` (or `UNBOUND_HOOK_FROZEN=1` for tests):
   fallback**. The frozen hook path makes zero network calls except the
   backend/gateway APIs.
 
+**Contract with the `unbound-discovery` binary (WEB-4792 track — verify
+before pkg rollout):** accepts `--domain <url>` for a full sweep and
+`mcp-scan --name <n> --domain <url>` for single-server scans; reads the api
+key from the `UNBOUND_API_KEY` env var (never argv); honors
+`UNBOUND_MCP_SERVER_JSON`/`UNBOUND_MCP_SERVER_NAME`/`UNBOUND_MCP_DOMAIN`
+for mcp-scan. This mirrors install.sh's pass-through interface; nothing in
+this repo can pin it, so it's asserted here as a cross-stream contract.
+
 ## setup
 
 In-binary port of `mdm/onboard.py` + the per-tool `mdm/setup.py` flows,

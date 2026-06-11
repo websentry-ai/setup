@@ -26,8 +26,12 @@ def run(args) -> int:
     tool = args[0]
     try:
         module = load_hook_module(tool)
+        module.main()
+    except SystemExit:
+        # The module decided its own exit code (cursor exits 2 on deny) —
+        # that's contract, not failure. Propagate untouched.
+        raise
     except Exception:
         print("{}", flush=True)
         return 0
-    module.main()
     return 0
