@@ -11,9 +11,8 @@ set -euo pipefail
 fail=0
 checked=0
 while IFS= read -r -d '' f; do
-  # `file` is the cheap Mach-O detector; symlinks are skipped by find -type f
-  # only when they dangle — use -L test to skip links so each inode is
-  # checked once.
+  # find -type f (without -L) already excludes symlinks; the -L test is
+  # belt-and-suspenders so each inode is only ever checked once.
   [[ -L "$f" ]] && continue
   if file -b "$f" | grep -q 'Mach-O'; then
     checked=$((checked + 1))

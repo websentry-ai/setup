@@ -72,6 +72,13 @@ jobs:
             publish=false
           fi
           [[ -n "$version" ]] || { echo "::error::could not derive version"; exit 1; }
+          # Tag names can legally contain ;, $(), | etc. — refuse anything
+          # that isn't a plain version string so a hostile tag can never
+          # reach a shell line in the signing job (script-injection guard).
+          if ! [[ "$version" =~ ^[0-9A-Za-z.+-]+$ ]]; then
+            echo "::error::version '$version' contains characters outside [0-9A-Za-z.+-]"
+            exit 1
+          fi
 
           sign=$HAS_APP_CERT
           pkg_sign=false; notarize=false
@@ -170,7 +177,11 @@ jobs:
           fi
           rm -f "$RUNNER_TEMP"/app.p12 "$RUNNER_TEMP"/installer.p12
           security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
-          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+          # Prepend to the existing search list instead of replacing it —
+          # replacing would drop whatever keychains the runner image relies on.
+          existing="$(security list-keychains -d user | tr -d '"' | xargs)"
+          # shellcheck disable=SC2086  # word-splitting the list is intended
+          security list-keychains -d user -s "$KEYCHAIN" $existing
 
       - name: Sign every nested Mach-O individually
         if: steps.cfg.outputs.sign == 'true'
@@ -184,11 +195,13 @@ jobs:
         run: ./packaging/scripts/smoke-test.sh dist
 
       - name: Build pkg (payload + pre-warm postinstall + LaunchDaemon)
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+          PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
         run: |
           set -euo pipefail
           mkdir -p out
-          ./packaging/scripts/build-pkg.sh "${{ steps.cfg.outputs.version }}" dist \
-            "out/unsigned-${{ steps.cfg.outputs.pkg_name }}"
+          ./packaging/scripts/build-pkg.sh "$VERSION" dist "out/unsigned-$PKG_NAME"
 
       - name: Productsign pkg (Developer ID Installer)
         env:
@@ -249,14 +262,16 @@ jobs:
           PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
           ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          NOTARIZE: ${{ steps.cfg.outputs.notarize }}
+          PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
         run: |
           set -euo pipefail
           pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
-          # Only bake the Team ID assert when the pkg is actually signed+
-          # notarized — otherwise onboard.sh would reject its own artifact.
+          # Bake the Team ID assert whenever the pkg is productsigned —
+          # signature presence is what the assert checks, independent of
+          # notarization. Unsigned pkg => empty Team ID => assert skipped,
+          # otherwise onboard.sh would reject its own artifact.
           team_id=""
-          [[ "$NOTARIZE" == "true" ]] && team_id="$TEAM_ID"
+          [[ "$PKG_SIGN" == "true" ]] && team_id="$TEAM_ID"
           sed -e "s|@VERSION@|$VERSION|g" \
               -e "s|@PKG_SHA256@|$pkg_sha256|g" \
               -e "s|@ARTIFACT_URL@|$ARTIFACT_URL|g" \
@@ -264,7 +279,14 @@ jobs:
               mdm/onboard.sh.tmpl > out/onboard.sh
           chmod +x out/onboard.sh
           bash -n out/onboard.sh
-          ! grep -q '@[A-Z_]*@' out/onboard.sh   # no placeholder survived
+          # `! grep` would NOT fail the step under set -e (bash ignores
+          # errexit for ! pipelines) — use an explicit if so an unrendered
+          # @TOKEN@ really blocks the release.
+          if grep -q '@[A-Z_]*@' out/onboard.sh; then
+            echo "::error::unrendered placeholder left in onboard.sh"
+            grep -n '@[A-Z_]*@' out/onboard.sh
+            exit 1
+          fi
           echo "$pkg_sha256" > "out/$PKG_NAME.sha256"
 
       - name: Test rendered onboard.sh --clear (bash fallback teardown)

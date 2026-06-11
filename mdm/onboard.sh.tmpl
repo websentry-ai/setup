@@ -43,18 +43,26 @@ on_exit() {
 trap 'on_exit $?' EXIT
 
 # macOS has no `timeout`; bash-only watchdog so a wedged binary cannot hang
-# the Jamf policy forever.
+# the Jamf policy forever. The watchdog's stdio is detached (>/dev/null) so
+# an orphaned sleep can never hold the pipe Jamf/installer reads open past
+# script exit (which reads as a multi-minute hang), and pkill -P reaps the
+# sleep on the fast path.
 run_with_timeout() {
   local secs="$1"; shift
   "$@" & local pid=$!
-  ( sleep "$secs" && kill -9 "$pid" 2>/dev/null ) & local watchdog=$!
+  ( sleep "$secs" && kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 & local watchdog=$!
   local rc=0
   wait "$pid" 2>/dev/null || rc=$?
+  pkill -P "$watchdog" 2>/dev/null || true
   kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
   return "$rc"
 }
 
-truthy() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|clear|--clear|backfill|--backfill) return 0;; *) return 1;; esac; }
+# Positional token matchers for the Jamf $4-$9 mapping: each slot accepts
+# generic booleans plus ONLY its own named token, so a value landing in the
+# wrong slot (e.g. "backfill" in the clear slot) can never trigger teardown.
+is_clear_token()    { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|clear|--clear) return 0;; *) return 1;; esac; }
+is_backfill_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|backfill|--backfill) return 0;; *) return 1;; esac; }
 
 # --- Arguments: --flags for direct runs, $4-$9 positional from Jamf ----------
 CURRENT_STEP="parse_args"
@@ -63,8 +71,8 @@ if [[ $# -gt 0 && "${1:-}" != --* ]]; then
   API_KEY="${4:-}"; DISCOVERY_KEY="${5:-}"
   [[ -n "${6:-}" ]] && BACKEND_URL="$6"
   [[ -n "${7:-}" ]] && GATEWAY_URL="$7"
-  truthy "${8:-}" && CLEAR=1
-  truthy "${9:-}" && BACKFILL=1
+  is_clear_token "${8:-}" && CLEAR=1
+  is_backfill_token "${9:-}" && BACKFILL=1
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -119,6 +127,8 @@ else
   CURRENT_STEP="download"
   tmpdir="$(mktemp -d /tmp/unbound-onboard.XXXXXX)"
   pkg="$tmpdir/unbound-runtime.pkg"
+  # The preflight HEAD and this GET are two separate fetches; the baked
+  # sha256 below is what makes that safe — swapped content fails shasum -c.
   curl -fSL --retry 3 --retry-delay 2 -m 600 -o "$pkg" "$ARTIFACT_URL"
 
   CURRENT_STEP="verify_sha256"
@@ -127,9 +137,13 @@ else
   CURRENT_STEP="verify_signature"
   if [[ -n "$EXPECTED_TEAM_ID" ]]; then
     sig="$(pkgutil --check-signature "$pkg")"
-    printf '%s\n' "$sig" | grep -q "Developer ID Installer" \
+    # Anchor the Team ID to the Developer ID Installer LEAF line itself —
+    # a bare substring match over the whole output could be satisfied by
+    # other cert-subject text.
+    leaf="$(printf '%s\n' "$sig" | grep 'Developer ID Installer' | head -1)"
+    [[ -n "$leaf" ]] \
       || { echo "pkg is not signed with a Developer ID Installer cert" >&2; exit 1; }
-    printf '%s\n' "$sig" | grep -qF "($EXPECTED_TEAM_ID)" \
+    printf '%s\n' "$leaf" | grep -qF "($EXPECTED_TEAM_ID)" \
       || { echo "pkg Team ID mismatch (expected $EXPECTED_TEAM_ID)" >&2; exit 1; }
   else
     echo "WARNING: EXPECTED_TEAM_ID empty — skipping signature assert (unsigned build)"
