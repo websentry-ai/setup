@@ -1,0 +1,5 @@
+# Pinned commit of websentry-ai/coding-discovery-tool baked into each
+# runtime release (WEB-4789: release reproducible from this repo's history).
+# CI checks the repo out at exactly this SHA into ./discovery-src; Stream B's
+# unbound-discovery.spec builds from that checkout. Update via PR only.
+a7f225f6c8b1e8e70bcbaf733a35333e7fdf25d5

@@ -1,0 +1,328 @@
+# Release pipeline for the macOS runtime (WEB-4789): tag runtime-v* in,
+# stapled pkg + tar.gz on S3 + GitHub Release out, zero manual steps.
+#
+# Signing / notarization / S3 are each independently GATED on their secrets
+# and vars being configured, so the pipeline runs end-to-end UNSIGNED today
+# (certs pending) and lights up stage by stage as credentials land in the
+# `release` environment. Configure that environment with required reviewers
+# = the SOC 2 production-approver list.
+#
+# Secrets (GitHub environment `release` ONLY — never repo-level):
+#   APPLE_CERT_APPLICATION_P12 / APPLE_CERT_APPLICATION_PASSWORD   (base64 p12)
+#   APPLE_APP_SIGNING_IDENTITY      "Developer ID Application: ... (TEAMID)"
+#   APPLE_CERT_INSTALLER_P12 / APPLE_CERT_INSTALLER_PASSWORD
+#   APPLE_INSTALLER_SIGNING_IDENTITY "Developer ID Installer: ... (TEAMID)"
+#   APPLE_TEAM_ID
+#   APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID
+#   DISCOVERY_CHECKOUT_TOKEN        read access to coding-discovery-tool
+# Vars (environment `release`):
+#   AWS_RELEASE_ROLE_ARN / AWS_RELEASE_REGION / RUNTIME_S3_BUCKET /
+#   RUNTIME_S3_PREFIX (optional) / RUNTIME_DOWNLOAD_BASE_URL (optional —
+#   public base URL baked into onboard.sh; defaults to the GitHub Release
+#   asset URL when unset)
+
+name: release-macos-runtime
+
+on:
+  push:
+    tags: ["runtime-v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Dry-run version (build+smoke only; no Release, no S3)"
+        required: true
+        default: "0.0.0-dev"
+
+permissions:
+  contents: write # create the GitHub Release
+  id-token: write # OIDC role assumption for the S3 upload
+
+concurrency:
+  group: release-macos-runtime-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # macos-14 = Apple Silicon GitHub-hosted runner (with Rosetta, so the
+    # smoke test can execute the x86_64 slice too).
+    runs-on: macos-14
+    environment: release
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure (version + stage gates)
+        id: cfg
+        env:
+          HAS_APP_CERT: ${{ secrets.APPLE_CERT_APPLICATION_P12 != '' && secrets.APPLE_APP_SIGNING_IDENTITY != '' }}
+          HAS_INSTALLER_CERT: ${{ secrets.APPLE_CERT_INSTALLER_P12 != '' && secrets.APPLE_INSTALLER_SIGNING_IDENTITY != '' }}
+          HAS_NOTARY: ${{ secrets.APPLE_NOTARY_KEY_P8 != '' && secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_ISSUER_ID != '' }}
+          HAS_DISCOVERY_TOKEN: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN != '' }}
+          HAS_S3: ${{ vars.RUNTIME_S3_BUCKET != '' && vars.AWS_RELEASE_ROLE_ARN != '' }}
+          DOWNLOAD_BASE_URL: ${{ vars.RUNTIME_DOWNLOAD_BASE_URL }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            version="${GITHUB_REF_NAME#runtime-v}"
+            publish=true
+          else
+            version="$INPUT_VERSION"
+            publish=false
+          fi
+          [[ -n "$version" ]] || { echo "::error::could not derive version"; exit 1; }
+
+          sign=$HAS_APP_CERT
+          pkg_sign=false; notarize=false
+          [[ "$sign" == "true" && "$HAS_INSTALLER_CERT" == "true" ]] && pkg_sign=true
+          [[ "$pkg_sign" == "true" && "$HAS_NOTARY" == "true" ]] && notarize=true
+
+          # A real (tag) release with partial credentials is a misconfig we
+          # refuse, not a stage we silently skip: shipping an unsigned or
+          # unnotarized pkg to the fleet must be impossible by accident.
+          if [[ "$publish" == "true" && "$notarize" != "true" ]]; then
+            echo "::error::tag release requires full signing+notarization secrets (have: app-cert=$sign installer-cert=$HAS_INSTALLER_CERT notary=$HAS_NOTARY). Dry-run via workflow_dispatch instead."
+            exit 1
+          fi
+
+          artifact_base="${DOWNLOAD_BASE_URL:-https://github.com/$GITHUB_REPOSITORY/releases/download/runtime-v$version}"
+
+          {
+            echo "version=$version"
+            echo "publish=$publish"
+            echo "sign=$sign"
+            echo "pkg_sign=$pkg_sign"
+            echo "notarize=$notarize"
+            echo "s3=$HAS_S3"
+            echo "discovery_token=$HAS_DISCOVERY_TOKEN"
+            echo "pkg_name=unbound-runtime-$version.pkg"
+            echo "tar_name=unbound-runtime-$version.tar.gz"
+            echo "artifact_url=$artifact_base/unbound-runtime-$version.pkg"
+            echo "discovery_sha=$(grep -v '^#' packaging/discovery.lock | head -1 | tr -d '[:space:]')"
+          } >> "$GITHUB_OUTPUT"
+          echo "version=$version publish=$publish sign=$sign pkg_sign=$pkg_sign notarize=$notarize s3=$HAS_S3"
+
+      # Pinned-SHA checkout (packaging/discovery.lock) so each release is
+      # reproducible from this repo's history. Gated: the placeholder build
+      # doesn't read the checkout yet; Stream B's spec will, at which point
+      # DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
+      - name: Checkout coding-discovery-tool at pinned SHA
+        if: steps.cfg.outputs.discovery_token == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: websentry-ai/coding-discovery-tool
+          ref: ${{ steps.cfg.outputs.discovery_sha }}
+          token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
+          path: discovery-src
+
+      - name: Note skipped discovery checkout
+        if: steps.cfg.outputs.discovery_token != 'true'
+        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — skipping pinned discovery checkout (placeholder build only)"
+
+      # Pinned python.org universal2 CPython — deliberately NOT
+      # actions/setup-python (thin, non-relocatable build; cannot produce
+      # universal2 PyInstaller bundles).
+      - name: Install pinned universal2 CPython
+        run: ./packaging/scripts/install-python.sh
+
+      - name: Install pinned PyInstaller (hash-verified)
+        run: |
+          set -euo pipefail
+          source packaging/versions.env
+          "$PYTHON_BIN" -m venv .build-venv
+          ./.build-venv/bin/pip install --require-hashes -r packaging/requirements-build.txt
+          ./.build-venv/bin/pyinstaller --version
+
+      - name: Build bundles from committed .spec files
+        run: |
+          set -euo pipefail
+          ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
+            packaging/specs/unbound-hook.spec
+          ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
+            packaging/specs/unbound-discovery.spec
+
+      - name: Lipo gate (every Mach-O universal2)
+        run: ./packaging/scripts/lipo-gate.sh dist/unbound-hook dist/unbound-discovery
+
+      - name: Import Developer ID certs into throwaway keychain
+        if: steps.cfg.outputs.sign == 'true'
+        env:
+          APP_P12_B64: ${{ secrets.APPLE_CERT_APPLICATION_P12 }}
+          APP_P12_PWD: ${{ secrets.APPLE_CERT_APPLICATION_PASSWORD }}
+          INSTALLER_P12_B64: ${{ secrets.APPLE_CERT_INSTALLER_P12 }}
+          INSTALLER_P12_PWD: ${{ secrets.APPLE_CERT_INSTALLER_PASSWORD }}
+          PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PWD="$(uuidgen)"
+          security create-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PWD" "$KEYCHAIN"
+          echo "$APP_P12_B64" | base64 -d > "$RUNNER_TEMP/app.p12"
+          security import "$RUNNER_TEMP/app.p12" -k "$KEYCHAIN" -f pkcs12 \
+            -P "$APP_P12_PWD" -T /usr/bin/codesign
+          if [[ "$PKG_SIGN" == "true" ]]; then
+            echo "$INSTALLER_P12_B64" | base64 -d > "$RUNNER_TEMP/installer.p12"
+            security import "$RUNNER_TEMP/installer.p12" -k "$KEYCHAIN" -f pkcs12 \
+              -P "$INSTALLER_P12_PWD" -T /usr/bin/productsign
+          fi
+          rm -f "$RUNNER_TEMP"/app.p12 "$RUNNER_TEMP"/installer.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PWD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" login.keychain-db
+
+      - name: Sign every nested Mach-O individually
+        if: steps.cfg.outputs.sign == 'true'
+        env:
+          IDENTITY: ${{ secrets.APPLE_APP_SIGNING_IDENTITY }}
+        run: |
+          ./packaging/scripts/sign-machos.sh "$IDENTITY" packaging/entitlements.plist \
+            dist/unbound-hook dist/unbound-discovery
+
+      - name: Smoke-run both binaries (--version + sample stdin event)
+        run: ./packaging/scripts/smoke-test.sh dist
+
+      - name: Build pkg (payload + pre-warm postinstall + LaunchDaemon)
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ./packaging/scripts/build-pkg.sh "${{ steps.cfg.outputs.version }}" dist \
+            "out/unsigned-${{ steps.cfg.outputs.pkg_name }}"
+
+      - name: Productsign pkg (Developer ID Installer)
+        env:
+          PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
+          INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_SIGNING_IDENTITY }}
+          PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$PKG_SIGN" == "true" ]]; then
+            productsign --sign "$INSTALLER_IDENTITY" "out/unsigned-$PKG_NAME" "out/$PKG_NAME"
+            rm "out/unsigned-$PKG_NAME"
+          else
+            echo "::warning::installer cert not configured — pkg ships UNSIGNED (dry-run only)"
+            mv "out/unsigned-$PKG_NAME" "out/$PKG_NAME"
+          fi
+
+      # API-key flags only (--key/--key-id/--issuer): no keychain profiles on
+      # ephemeral runners. --wait blocks until Apple returns a verdict.
+      - name: Notarize, staple, Gatekeeper-assess
+        if: steps.cfg.outputs.notarize == 'true'
+        env:
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
+        run: |
+          set -euo pipefail
+          key_file="$RUNNER_TEMP/notary-key.p8"
+          printf '%s' "$NOTARY_KEY_P8" > "$key_file"
+          xcrun notarytool submit "out/$PKG_NAME" \
+            --key "$key_file" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m
+          rm -f "$key_file"
+          xcrun stapler staple "out/$PKG_NAME"
+          spctl -a -vv -t install "out/$PKG_NAME"
+
+      # Live install on the runner: exercises the postinstall (pre-warm ->
+      # symlink flip -> daemon bootstrap -> GC) and then the rendered
+      # onboard.sh --clear fallback teardown, end to end.
+      - name: Install-test pkg on runner
+        env:
+          PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          sudo installer -pkg "out/$PKG_NAME" -target /
+          [[ "$(readlink /opt/unbound/current)" == "/opt/unbound/$VERSION" ]]
+          /opt/unbound/current/bin/unbound-hook --version
+          /opt/unbound/current/bin/unbound-discovery --version
+          pkgutil --pkg-info ai.getunbound.runtime
+          sudo launchctl print system/ai.getunbound.discovery >/dev/null
+          [[ -d /var/log/unbound && -f /etc/newsyslog.d/ai.getunbound.conf ]]
+          echo "install-test OK"
+
+      - name: Render onboard.sh (version + sha + artifact URL baked in)
+        env:
+          VERSION: ${{ steps.cfg.outputs.version }}
+          PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
+          ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
+          TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          NOTARIZE: ${{ steps.cfg.outputs.notarize }}
+        run: |
+          set -euo pipefail
+          pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
+          # Only bake the Team ID assert when the pkg is actually signed+
+          # notarized — otherwise onboard.sh would reject its own artifact.
+          team_id=""
+          [[ "$NOTARIZE" == "true" ]] && team_id="$TEAM_ID"
+          sed -e "s|@VERSION@|$VERSION|g" \
+              -e "s|@PKG_SHA256@|$pkg_sha256|g" \
+              -e "s|@ARTIFACT_URL@|$ARTIFACT_URL|g" \
+              -e "s|@TEAM_ID@|$team_id|g" \
+              mdm/onboard.sh.tmpl > out/onboard.sh
+          chmod +x out/onboard.sh
+          bash -n out/onboard.sh
+          ! grep -q '@[A-Z_]*@' out/onboard.sh   # no placeholder survived
+          echo "$pkg_sha256" > "out/$PKG_NAME.sha256"
+
+      - name: Test rendered onboard.sh --clear (bash fallback teardown)
+        run: |
+          set -euo pipefail
+          sudo bash out/onboard.sh --clear
+          [[ ! -e /opt/unbound ]]
+          [[ ! -f /Library/LaunchDaemons/ai.getunbound.discovery.plist ]]
+          ! pkgutil --pkg-info ai.getunbound.runtime >/dev/null 2>&1
+          echo "onboard --clear OK"
+
+      - name: Package tar.gz + checksums
+        env:
+          TAR_NAME: ${{ steps.cfg.outputs.tar_name }}
+        run: |
+          set -euo pipefail
+          tar -czf "out/$TAR_NAME" -C dist unbound-hook unbound-discovery
+          (cd out && shasum -a 256 "$TAR_NAME" > "$TAR_NAME.sha256")
+          ls -lh out/
+
+      - name: Upload build artifacts (always, incl. dry-runs)
+        uses: actions/upload-artifact@v4
+        with:
+          name: unbound-runtime-${{ steps.cfg.outputs.version }}
+          path: out/
+          retention-days: 14
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.cfg.outputs.s3 == 'true' && steps.cfg.outputs.publish == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_RELEASE_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_RELEASE_REGION || 'us-west-2' }}
+
+      - name: Upload to S3
+        if: steps.cfg.outputs.s3 == 'true' && steps.cfg.outputs.publish == 'true'
+        env:
+          BUCKET: ${{ vars.RUNTIME_S3_BUCKET }}
+          PREFIX: ${{ vars.RUNTIME_S3_PREFIX }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          dest="s3://$BUCKET/${PREFIX:+$PREFIX/}runtime-v$VERSION"
+          aws s3 cp out/ "$dest/" --recursive --no-progress
+          echo "uploaded to $dest"
+
+      - name: Skipped S3 upload
+        if: steps.cfg.outputs.s3 != 'true' && steps.cfg.outputs.publish == 'true'
+        run: echo "::warning::RUNTIME_S3_BUCKET / AWS_RELEASE_ROLE_ARN not configured — S3 upload skipped (bucket comes from the infra track)"
+
+      - name: Create GitHub Release
+        if: steps.cfg.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          gh release create "runtime-v$VERSION" \
+            --title "macOS runtime $VERSION" \
+            --notes "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh." \
+            out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh
