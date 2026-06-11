@@ -55,6 +55,14 @@ SELF_SCRIPT_PATH = Path.home() / ".codex" / "hooks" / "unbound.py"
 SELF_UPDATE_STATE_PATH = SELF_SCRIPT_PATH.parent / ".self_update_check"
 SELF_UPDATE_LOCK_PATH = SELF_SCRIPT_PATH.parent / ".self_update.lock"
 
+# Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
+# binary must make ZERO network calls other than the backend/gateway APIs:
+# self-update is owned by the MDM package (never in-place), and discovery runs
+# from the locally installed binary instead of a GitHub-fetched install.sh.
+# UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without freezing.
+RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
+FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
+
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
     (30 * 60,       15),   # 5-30 min: 15s
@@ -1188,6 +1196,9 @@ def _replace_self(new_bytes: bytes) -> None:
 
 
 def _check_self_update() -> None:
+    if RUNNING_FROZEN:
+        # Binary deployments are updated by the MDM package, never in place.
+        return
     # Under MDM the hook runs from an admin-managed location we can't write to,
     # so SELF_SCRIPT_PATH (user-level) is not the file executing — updating it
     # would only write a dead copy the managed settings never run. The daily MDM
@@ -1333,15 +1344,25 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
 
-        DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-        bootstrap = (
-            'set -e; '
-            f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
-            'if [ ! -f "$SH" ]; then '
-            f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
-            '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
-            'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
-        )
+        if RUNNING_FROZEN:
+            # Frozen binary: never fetch install.sh — run the locally
+            # installed discovery binary, or skip if it isn't there.
+            if not os.path.isfile(FROZEN_DISCOVERY_BIN):
+                log_error(f"mcp scan dispatch: discovery binary missing at {FROZEN_DISCOVERY_BIN}", 'mcp_server')
+                return
+            scan_cmd = [FROZEN_DISCOVERY_BIN, "mcp-scan",
+                        "--name", server_name, "--domain", backend_url]
+        else:
+            DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+            bootstrap = (
+                'set -e; '
+                f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
+                'if [ ! -f "$SH" ]; then '
+                f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
+                '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
+                'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
+            )
+            scan_cmd = ["bash", "-c", bootstrap]
         popen_kwargs = {
             "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
             "stdin": subprocess.DEVNULL, "close_fds": True,
@@ -1355,7 +1376,7 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
             popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs["start_new_session"] = True
-        subprocess.Popen(["bash", "-c", bootstrap], **popen_kwargs)
+        subprocess.Popen(scan_cmd, **popen_kwargs)
     except Exception as e:
         log_error(f"mcp scan dispatch failed for {server_name}: {e}", 'mcp_server')
         return
@@ -1429,16 +1450,25 @@ def _dispatch_discovery() -> None:
                 log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
                 return
 
-            DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-            if not DISCOVERY_INSTALL_SH.exists():
-                r = subprocess.run(
-                    ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
-                    capture_output=True, timeout=30,
-                )
-                if r.returncode != 0:
-                    log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+            if RUNNING_FROZEN:
+                # Frozen binary: never fetch install.sh — run the locally
+                # installed discovery binary, or skip if it isn't there.
+                if not os.path.isfile(FROZEN_DISCOVERY_BIN):
+                    log_error(f"discovery gate: discovery binary missing at {FROZEN_DISCOVERY_BIN}", 'discovery_gate')
                     return
-                os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
+            else:
+                DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+                if not DISCOVERY_INSTALL_SH.exists():
+                    r = subprocess.run(
+                        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                        capture_output=True, timeout=30,
+                    )
+                    if r.returncode != 0:
+                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                        return
+                    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
@@ -1449,10 +1479,7 @@ def _dispatch_discovery() -> None:
             else:
                 popen_kwargs["start_new_session"] = True
             try:
-                subprocess.Popen(
-                    ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
-                    **popen_kwargs,
-                )
+                subprocess.Popen(discovery_cmd, **popen_kwargs)
             except OSError as e:
                 log_error(f"discovery gate: Popen failed: {e}", 'discovery_gate')
                 return
