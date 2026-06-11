@@ -6,7 +6,7 @@
 #   AFTER signing so the payload hashes match the signatures).
 #
 # Payload:
-#   /opt/unbound/<version>/{unbound-hook/,unbound-discovery/,bin/,share/}
+#   /opt/unbound/<version>/{unbound-hook/,unbound-discovery/,share/}
 #   /Library/LaunchDaemons/ai.getunbound.discovery.plist
 # Everything else (current symlink, /var/log/unbound, newsyslog conf,
 # daemon bootstrap, version GC) happens in postinstall — the `current`

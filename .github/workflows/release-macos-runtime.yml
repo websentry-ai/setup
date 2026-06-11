@@ -323,7 +323,9 @@ jobs:
           for bin in unbound-hook unbound-discovery; do
             v_out="$(/opt/unbound/current/$bin/$bin --version)"
             echo "$bin --version -> $v_out"
-            if [[ "$v_out" != *"$VERSION"* ]]; then
+            # Whole-token match: '1.2.3' must not accept a binary reporting
+            # '1.2.30' or '0.0.0-placeholder'-style suffixed versions.
+            if [[ " $v_out " != *" $VERSION "* ]]; then
               if [[ "$PUBLISH" == "true" ]]; then
                 echo "::error::$bin reports '$v_out', not release version $VERSION — refusing to publish"
                 exit 1

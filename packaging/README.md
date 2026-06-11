@@ -39,9 +39,10 @@ binary): `/opt/unbound/current/unbound-hook/unbound-hook` and
 `/opt/unbound/current/unbound-discovery/unbound-discovery`.
 
 **Version contract:** `<binary> --version` output must contain the release
-version — the CI install-test hard-fails a tag release whose binaries
-self-identify otherwise (this is what keeps a placeholder build off the
-fleet). Real specs must bake the release version at build time.
+version as a whitespace-delimited token (e.g. `unbound-hook 1.2.3`) — the
+CI install-test hard-fails a tag release whose binaries self-identify
+otherwise (this is what keeps a placeholder build off the fleet). Real
+specs must bake the release version at build time.
 
 Receipts: `pkgutil --pkg-info ai.getunbound.runtime` → Jamf smart groups
 report fleet coverage. Previous version dir is kept for rollback (keep-2 GC).
