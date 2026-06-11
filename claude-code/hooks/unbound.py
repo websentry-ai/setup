@@ -1527,7 +1527,9 @@ def _dispatch_discovery() -> None:
 
             DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
             if _install_sh_is_stale():
-                tmp = DISCOVERY_INSTALL_SH.with_suffix(".tmp")
+                fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
+                os.close(fd)
+                tmp = Path(_tmp)
                 r = subprocess.run(
                     ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
                     capture_output=True, timeout=30,
