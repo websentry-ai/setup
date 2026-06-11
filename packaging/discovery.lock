@@ -1,5 +1,9 @@
-# Pinned commit of websentry-ai/coding-discovery-tool baked into each
-# runtime release (WEB-4789: release reproducible from this repo's history).
-# CI checks the repo out at exactly this SHA into ./discovery-src; Stream B's
-# unbound-discovery.spec builds from that checkout. Update via PR only.
-a7f225f6c8b1e8e70bcbaf733a35333e7fdf25d5
+# Source pin for the unbound-discovery binary (WEB-4787, Stream B).
+# The binary IS the distribution — no git clone / install.sh on target machines.
+# build-discovery.sh reads this file; bump SOURCE_SHA to rebuild from newer source.
+SOURCE_REPO=https://github.com/websentry-ai/coding-discovery-tool.git
+SOURCE_SHA=a7f225f6c8b1e8e70bcbaf733a35333e7fdf25d5
+SOURCE_ENTRYPOINT=scripts/coding_discovery_tools/ai_tools_discovery.py
+PYTHON_VERSION=3.12.10
+PYINSTALLER_VERSION=6.14.1
+TARGET_ARCH=universal2

@@ -1,21 +1,9 @@
-# Hash-pinned PyInstaller toolchain for release-macos-runtime.yml.
-# Install with:  pip install --require-hashes -r requirements-build.txt
-# Hashes cover exactly the artifacts pip resolves on macOS + CPython 3.12
-# (universal2/py3-none-any wheels), so a tampered or substituted package
-# fails the install instead of entering the signed release.
-#
-# To bump: update versions, then refresh each sha256 from
-# https://pypi.org/pypi/<package>/json (releases[<version>][].digests.sha256).
-
-pyinstaller==6.20.0 \
-    --hash=sha256:bf3be4e1284ee78ddccba5e29f99443a12a7b4673168288ffc4c9d38c6f7b90e
-pyinstaller-hooks-contrib==2026.6 \
-    --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
-altgraph==0.17.5 \
-    --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
-macholib==1.16.4 \
-    --hash=sha256:da1a3fa8266e30f0ce7e97c6a54eefaae8edd1e5f86f3eb8b95457cae90265ea
-packaging==26.2 \
-    --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
-setuptools==82.0.1 \
-    --hash=sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb
+# Hash-pinned build toolchain for unbound-discovery (WEB-4787).
+# Regenerate: pip download --only-binary :all: -d wheels pyinstaller==<ver> && pip hash wheels/*.whl
+# Install:    pip install --require-hashes --no-deps -r requirements-build.txt
+altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+macholib==1.16.4 --hash=sha256:da1a3fa8266e30f0ce7e97c6a54eefaae8edd1e5f86f3eb8b95457cae90265ea
+packaging==26.2 --hash=sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e
+pyinstaller-hooks-contrib==2026.6 --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
+pyinstaller==6.14.1 --hash=sha256:da559cfe4f7a20a7ebdafdf12ea2a03ea94d3caa49736ef53ee2c155d78422c9
+setuptools==82.0.1 --hash=sha256:a59e362652f08dcd477c78bb6e7bd9d80a7995bc73ce773050228a348ce2e5bb
