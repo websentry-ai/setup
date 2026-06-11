@@ -1,0 +1,86 @@
+#!/bin/bash
+# postinstall for ai.getunbound.runtime (WEB-4792). @VERSION@ is baked in by
+# packaging/scripts/build-pkg.sh at pkg-assembly time.
+#
+# Ordering is the whole point of this script:
+#   pre-warm BOTH binaries --> flip `current` symlink --> (re)bootstrap daemon
+#
+# Gatekeeper's first-exec assessment of a freshly installed (new-inode)
+# notarized binary measured at 3-5s (Defect 2). Pre-warming runs it during
+# install — where a few seconds is invisible — instead of inside the user's
+# first hook call, and doubles as an on-device smoke test: a binary that
+# cannot even print --version never becomes `current`, so an upgrade that
+# ships a broken build leaves the previous version live.
+set -euo pipefail
+
+VERSION="@VERSION@"
+PREFIX="/opt/unbound"
+NEW="$PREFIX/$VERSION"
+DAEMON_LABEL="ai.getunbound.discovery"
+DAEMON_PLIST="/Library/LaunchDaemons/ai.getunbound.discovery.plist"
+
+log() { echo "[ai.getunbound.runtime postinstall] $*"; }
+
+# macOS ships no `timeout`; bash-only watchdog so a hung binary fails the
+# install instead of wedging Installer.app/Jamf forever.
+run_with_timeout() {
+  local secs="$1"; shift
+  "$@" & local pid=$!
+  ( sleep "$secs" && kill -9 "$pid" 2>/dev/null ) & local watchdog=$!
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  return "$rc"
+}
+
+# --- 1. Pre-warm (and smoke-test) both binaries BEFORE touching `current` ---
+for bin in unbound-hook unbound-discovery; do
+  exe="$NEW/$bin/$bin"
+  if [[ ! -x "$exe" ]]; then
+    log "ERROR: payload binary missing: $exe"
+    exit 1
+  fi
+  log "pre-warming $bin (Gatekeeper first-exec assessment)"
+  if ! run_with_timeout 120 "$exe" --version; then
+    log "ERROR: $bin failed pre-warm; NOT flipping current symlink"
+    exit 1
+  fi
+done
+
+# --- 2. Config dir + atomic-ish current flip -------------------------------
+install -d -o root -g wheel -m 0750 "$PREFIX/etc"
+ln -sfn "$NEW" "$PREFIX/current"
+log "current -> $NEW"
+
+# --- 3. Logging: /var/log/unbound + newsyslog rotation ----------------------
+install -d -o root -g wheel -m 0755 /var/log/unbound
+install -o root -g wheel -m 0644 \
+  "$NEW/share/newsyslog-ai.getunbound.conf" /etc/newsyslog.d/ai.getunbound.conf
+
+# --- 4. (Re)load the discovery LaunchDaemon ---------------------------------
+# bootout is idempotent-ish but errors when the job isn't loaded; that's the
+# normal first-install case, so ignore it. bootstrap failing is NOT ignored:
+# a pkg that can't start its daemon should fail visibly in Jamf.
+launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
+launchctl bootstrap system "$DAEMON_PLIST"
+launchctl enable "system/$DAEMON_LABEL"
+log "daemon $DAEMON_LABEL bootstrapped"
+
+# --- 5. Keep-2 GC: newest two version dirs survive (rollback headroom) ------
+# `current` (just flipped to $VERSION) is excluded by the head -2 window by
+# construction, but guard against deleting its target anyway — a botched
+# manual downgrade must never end with GC removing the live runtime.
+current_target="$(readlink "$PREFIX/current" || true)"
+while IFS= read -r dir; do
+  [[ -n "$dir" ]] || continue
+  [[ "$PREFIX/$dir" == "$current_target" ]] && continue
+  log "GC: removing old runtime version $dir"
+  rm -rf "${PREFIX:?}/$dir"
+done < <(
+  find "$PREFIX" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec basename {} \; |
+  sort -rV | tail -n +3
+)
+
+log "install of $VERSION complete"
+exit 0
