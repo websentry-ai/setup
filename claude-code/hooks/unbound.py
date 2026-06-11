@@ -1435,7 +1435,7 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
             f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
             f'if [ ! -f "$SH" ] || [ -n "$(find "$SH" -mmin +{DISCOVERY_INSTALL_SH_TTL_SECONDS // 60} 2>/dev/null)" ]; then '
             f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
-            '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
+            '&& chmod 755 "$T" && mv -f "$T" "$SH" || rm -f "$T"; fi; '
             'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
         )
         popen_kwargs = {
@@ -1528,14 +1528,23 @@ def _dispatch_discovery() -> None:
 
             DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
             if _install_sh_is_stale():
+                # Download to a temp path + atomic replace so a failed refresh
+                # can't corrupt or drop a usable cached copy.
+                tmp = DISCOVERY_INSTALL_SH.with_suffix(".tmp")
                 r = subprocess.run(
-                    ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                    ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
                     capture_output=True, timeout=30,
                 )
-                if r.returncode != 0:
-                    log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                    return
-                os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                if r.returncode == 0:
+                    os.chmod(tmp, 0o755)
+                    os.replace(tmp, DISCOVERY_INSTALL_SH)
+                else:
+                    tmp.unlink(missing_ok=True)
+                    # A failed refresh falls back to the cached copy; only abort
+                    # when there's nothing to run.
+                    if not DISCOVERY_INSTALL_SH.exists():
+                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                        return
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
