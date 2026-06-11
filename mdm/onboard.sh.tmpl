@@ -1,0 +1,162 @@
+#!/bin/bash
+# Unbound macOS runtime bootstrap — delivered as a Jamf Script payload
+# (WEB-4791). The script itself never travels over the network; only the
+# hash-pinned pkg does (TLS + sha256 + Developer ID Team ID must all agree).
+# macOS built-ins only: curl, system_profiler, plutil, shasum, pkgutil,
+# installer, launchctl. No jq — it does not ship with macOS.
+#
+# Rendered by release-macos-runtime.yml: VERSION / PKG_SHA256 / ARTIFACT_URL
+# / TEAM_ID below are baked in per release.
+#
+# NOTE for admins: script parameters (including the MDM key) are visible in
+# Jamf policy logs — true of the python onboarding today as well. Use a
+# scoped MDM enrollment key, not a personal/admin API key.
+VERSION="@VERSION@"
+PKG_SHA256="@PKG_SHA256@"
+ARTIFACT_URL="@ARTIFACT_URL@"
+EXPECTED_TEAM_ID="@TEAM_ID@"   # empty = skip signature assert (unsigned dev builds only)
+
+PREFIX="/opt/unbound"
+PKG_ID="ai.getunbound.runtime"
+DAEMON_LABEL="ai.getunbound.discovery"
+MIN_MACOS_MAJOR=13
+REQUIRED_MB=300
+
+set -euo pipefail
+
+API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
+GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
+CURRENT_STEP="init"
+
+on_exit() {
+  local code=$1
+  if [[ $code -ne 0 ]]; then
+    echo "UNBOUND_INSTALL_FAILED step=${CURRENT_STEP} code=${code}" >&2
+    # Best-effort failure report; never let reporting mask the real failure.
+    curl -m 10 -fsS -X POST "${BACKEND_URL}/api/v1/mdm/install-report" \
+      -H 'Content-Type: application/json' \
+      -d "$(printf '{"event":"install_failed","step":"%s","code":%d,"version":"%s","hostname":"%s","os":"%s"}' \
+            "$CURRENT_STEP" "$code" "$VERSION" "$(hostname)" "$(sw_vers -productVersion)")" \
+      >/dev/null 2>&1 || true
+  fi
+}
+trap 'on_exit $?' EXIT
+
+# macOS has no `timeout`; bash-only watchdog so a wedged binary cannot hang
+# the Jamf policy forever.
+run_with_timeout() {
+  local secs="$1"; shift
+  "$@" & local pid=$!
+  ( sleep "$secs" && kill -9 "$pid" 2>/dev/null ) & local watchdog=$!
+  local rc=0
+  wait "$pid" 2>/dev/null || rc=$?
+  kill "$watchdog" 2>/dev/null || true; wait "$watchdog" 2>/dev/null || true
+  return "$rc"
+}
+
+truthy() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|clear|--clear|backfill|--backfill) return 0;; *) return 1;; esac; }
+
+# --- Arguments: --flags for direct runs, $4-$9 positional from Jamf ----------
+CURRENT_STEP="parse_args"
+if [[ $# -gt 0 && "${1:-}" != --* ]]; then
+  # Jamf convention: $1 mount point, $2 computer name, $3 username, params at $4+.
+  API_KEY="${4:-}"; DISCOVERY_KEY="${5:-}"
+  [[ -n "${6:-}" ]] && BACKEND_URL="$6"
+  [[ -n "${7:-}" ]] && GATEWAY_URL="$7"
+  truthy "${8:-}" && CLEAR=1
+  truthy "${9:-}" && BACKFILL=1
+else
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --api-key)       API_KEY="$2"; shift 2 ;;
+      --discovery-key) DISCOVERY_KEY="$2"; shift 2 ;;
+      --backend-url)   BACKEND_URL="$2"; shift 2 ;;
+      --gateway-url)   GATEWAY_URL="$2"; shift 2 ;;
+      --clear)         CLEAR=1; shift ;;
+      --backfill)      BACKFILL=1; shift ;;
+      *) echo "Unknown argument: $1" >&2; exit 2 ;;
+    esac
+  done
+fi
+
+# --- Clear: binary first, bash-only fallback that needs no healthy binary ---
+if [[ $CLEAR -eq 1 ]]; then
+  CURRENT_STEP="clear"
+  [[ $EUID -eq 0 ]] || { echo "must run as root" >&2; exit 1; }
+  bin="$PREFIX/current/bin/unbound-hook"
+  if [[ -x "$bin" ]] && run_with_timeout 300 "$bin" clear; then
+    echo "binary teardown complete"
+  else
+    echo "binary unavailable or failed; using bash fallback teardown"
+  fi
+  # Always sweep system-level pieces, even after a successful binary clear.
+  launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
+  rm -f "/Library/LaunchDaemons/${DAEMON_LABEL}.plist" /etc/newsyslog.d/ai.getunbound.conf
+  rm -rf "$PREFIX"
+  pkgutil --forget "$PKG_ID" >/dev/null 2>&1 || true
+  echo "UNBOUND_CLEAR_OK"
+  exit 0
+fi
+
+# --- Preflight ---------------------------------------------------------------
+CURRENT_STEP="preflight"
+[[ $EUID -eq 0 ]] || { echo "must run as root (Jamf runs scripts as root)" >&2; exit 1; }
+[[ -n "$API_KEY" && -n "$DISCOVERY_KEY" ]] || { echo "--api-key and --discovery-key are required" >&2; exit 2; }
+os_major="$(sw_vers -productVersion | cut -d. -f1)"
+[[ "$os_major" -ge $MIN_MACOS_MAJOR ]] || { echo "macOS $os_major < required $MIN_MACOS_MAJOR" >&2; exit 1; }
+avail_mb="$(df -Pm / | awk 'NR==2{print $4}')"
+[[ "$avail_mb" -ge $REQUIRED_MB ]] || { echo "need ${REQUIRED_MB}MB free, have ${avail_mb}MB" >&2; exit 1; }
+curl -fsI -m 15 "$ARTIFACT_URL" >/dev/null || { echo "artifact host unreachable: $ARTIFACT_URL" >&2; exit 1; }
+
+# --- Idempotent re-run: same version already live -> skip straight to setup --
+CURRENT_STEP="version_check"
+installed="$(pkgutil --pkg-info "$PKG_ID" 2>/dev/null | awk '/^version:/{print $2}' || true)"
+if [[ "$installed" == "$VERSION" \
+      && "$(readlink "$PREFIX/current" 2>/dev/null)" == "$PREFIX/$VERSION" \
+      && -x "$PREFIX/current/bin/unbound-hook" ]]; then
+  echo "runtime $VERSION already installed; skipping download/install"
+else
+  CURRENT_STEP="download"
+  tmpdir="$(mktemp -d /tmp/unbound-onboard.XXXXXX)"
+  pkg="$tmpdir/unbound-runtime.pkg"
+  curl -fSL --retry 3 --retry-delay 2 -m 600 -o "$pkg" "$ARTIFACT_URL"
+
+  CURRENT_STEP="verify_sha256"
+  printf '%s  %s\n' "$PKG_SHA256" "$pkg" | shasum -a 256 -c -
+
+  CURRENT_STEP="verify_signature"
+  if [[ -n "$EXPECTED_TEAM_ID" ]]; then
+    sig="$(pkgutil --check-signature "$pkg")"
+    printf '%s\n' "$sig" | grep -q "Developer ID Installer" \
+      || { echo "pkg is not signed with a Developer ID Installer cert" >&2; exit 1; }
+    printf '%s\n' "$sig" | grep -qF "($EXPECTED_TEAM_ID)" \
+      || { echo "pkg Team ID mismatch (expected $EXPECTED_TEAM_ID)" >&2; exit 1; }
+  else
+    echo "WARNING: EXPECTED_TEAM_ID empty — skipping signature assert (unsigned build)"
+  fi
+
+  CURRENT_STEP="install_pkg"
+  installer -pkg "$pkg" -target /
+  rm -rf "$tmpdir"
+fi
+
+# --- Migration sweep: python-era leftovers ----------------------------------
+# Per-user tool config migration is owned by `unbound-hook setup`; this only
+# removes system-level python-era artifacts that would shadow the runtime.
+CURRENT_STEP="migration_sweep"
+launchctl bootout system/ai.getunbound.coding-discovery 2>/dev/null || true
+rm -f /Library/LaunchDaemons/ai.getunbound.coding-discovery.plist
+if [[ -f /usr/local/bin/unbound-hook && ! -L /usr/local/bin/unbound-hook ]]; then
+  rm -f /usr/local/bin/unbound-hook   # legacy script shim, not our symlink
+fi
+
+# --- Hand off to the runtime (replaces this shell; binary owns the exit) ----
+CURRENT_STEP="setup"
+backfill_flag=""
+[[ $BACKFILL -eq 1 ]] && backfill_flag="--backfill"
+exec "$PREFIX/current/bin/unbound-hook" setup \
+  --api-key "$API_KEY" \
+  --discovery-key "$DISCOVERY_KEY" \
+  --backend-url "$BACKEND_URL" \
+  --gateway-url "$GATEWAY_URL" \
+  $backfill_flag
