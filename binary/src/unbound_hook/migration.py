@@ -28,7 +28,6 @@ half-installed, or previously-binary machine is a no-op for whatever is
 already gone.
 """
 
-import json
 import subprocess
 from pathlib import Path
 

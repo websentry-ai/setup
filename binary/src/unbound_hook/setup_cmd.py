@@ -121,6 +121,7 @@ def _remove_stale_managed_script(managed_dir: Path) -> None:
     try:
         if script.is_file():
             script.unlink()
+            print(f"[migration] removed {script}")
         hooks_dir = script.parent
         if hooks_dir.is_dir() and not any(hooks_dir.iterdir()):
             hooks_dir.rmdir()
