@@ -154,6 +154,11 @@ SINK_PID=$!
 sleep 1
 
 # --- variant 1: full discovery, HOME=/var/empty (incident repro) ---------------
+# Clear root's upload cache (HOME=/var/empty is unwritable, so the daemon
+# resolves its state dir to the per-uid fallback /var/tmp/unbound-0) so the
+# run deterministically re-uploads everything for the sink assertion.
+rm -f /var/tmp/unbound-0/discovery-cache.json /var/root/.unbound/discovery-cache.json
+
 LOG="/var/tmp/$LABEL.log"
 rm -f "$LOG"
 write_plist "$LOG" varempty \

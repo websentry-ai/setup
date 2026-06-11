@@ -114,6 +114,13 @@ PYEOF
     trap 'kill $SINK_PID 2>/dev/null || true' EXIT
     sleep 1
 
+    # The tool short-circuits uploads when its local cache shows no change
+    # since the last successful upload (~/.unbound/discovery-cache.json, with
+    # a per-uid /var/tmp/unbound-$UID fallback). Clear it so this run
+    # deterministically re-uploads everything for the sink assertion.
+    # Harmless beyond the test: the backend dedups by payload_hash anyway.
+    rm -f "$HOME/.unbound/discovery-cache.json" "/var/tmp/unbound-$(id -u)/discovery-cache.json"
+
     echo "running full discovery against local sink (this scans the machine)..."
     set +e
     # Empty DSN disables the tool's raw-HTTP Sentry reporting so synthetic
