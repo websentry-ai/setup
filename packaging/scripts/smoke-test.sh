@@ -50,7 +50,7 @@ esac
 # (b) Load-bearing: the vendored claude-code module MUST have run. The
 # fail-open neutral `{}` (missing/corrupt vendored module) lacks this token.
 case "$out" in
-  *suppressOutput*) ;;
+  *'"suppressOutput": true'*|*'"suppressOutput":true'*) ;;
   *) echo "FAIL: hook claude-code PreToolUse returned '$out', not the vendored module's fail-open response — the vendored module did not load (missing/corrupt _internal/vendored/). The bundle would silently STOP enforcing on the fleet." >&2
      exit 1 ;;
 esac
