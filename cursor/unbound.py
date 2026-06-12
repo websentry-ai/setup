@@ -35,6 +35,8 @@ DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+
+DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
@@ -1397,6 +1399,13 @@ def _hook_discovery_enabled_for_org() -> bool:
     return enabled
 
 
+def _install_sh_is_stale():
+    try:
+        return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
+    except OSError:
+        return True
+
+
 def _dispatch_mcp_server_scan(server_name, server_config):
     """Report ONE unknown MCP server out-of-band.
 
@@ -1432,9 +1441,9 @@ def _dispatch_mcp_server_scan(server_name, server_config):
             bootstrap = (
                 'set -e; '
                 f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
-                'if [ ! -f "$SH" ]; then '
+                f'if [ ! -f "$SH" ] || [ -n "$(find "$SH" -mmin +{DISCOVERY_INSTALL_SH_TTL_SECONDS // 60} 2>/dev/null)" ]; then '
                 f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
-                '&& chmod 755 "$T" && mv -f "$T" "$SH"; fi; '
+                '&& chmod 755 "$T" && mv -f "$T" "$SH" || rm -f "$T"; fi; '
                 'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
             )
             scan_cmd = ["bash", "-c", bootstrap]
@@ -1534,15 +1543,23 @@ def _dispatch_discovery() -> None:
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
                 DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if not DISCOVERY_INSTALL_SH.exists():
+                if _install_sh_is_stale():
+                    fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
+                    os.close(fd)
+                    tmp = Path(_tmp)
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                        ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
                         capture_output=True, timeout=30,
                     )
-                    if r.returncode != 0:
-                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                        return
-                    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                    if r.returncode == 0:
+                        os.chmod(tmp, 0o755)
+                        os.replace(tmp, DISCOVERY_INSTALL_SH)
+                    else:
+                        tmp.unlink(missing_ok=True)
+                        if not DISCOVERY_INSTALL_SH.exists():
+                            log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                            return
+                        log_error(f"discovery install.sh refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                 discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
