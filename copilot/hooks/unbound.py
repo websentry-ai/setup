@@ -55,6 +55,14 @@ SELF_SCRIPT_PATH = LOG_DIR / "unbound.py"
 SELF_UPDATE_STATE_PATH = LOG_DIR / ".self_update_check"
 SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 
+# Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
+# binary must make ZERO network calls other than the backend/gateway APIs:
+# self-update is owned by the MDM package (never in-place), and discovery runs
+# from the locally installed binary instead of a GitHub-fetched install.sh.
+# UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without freezing.
+RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
+FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
+
 # Copilot tool names (VS Code agent mode + CLI) translated to the canonical
 # gateway vocabulary. Covers both surfaces: VS Code's model-facing tool names
 # and the CLI's shell/glob/grep/view/write tools. Anything not listed here and
@@ -1020,6 +1028,9 @@ def _replace_self(new_bytes: bytes) -> None:
 
 
 def _check_self_update() -> None:
+    if RUNNING_FROZEN:
+        # Binary deployments are updated by the MDM package, never in place.
+        return
     # refresh hook from main, throttled per interval
     try:
         if not _self_update_due():
@@ -1196,16 +1207,25 @@ def _dispatch_discovery() -> None:
                 log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
                 return
 
-            DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-            if not DISCOVERY_INSTALL_SH.exists():
-                r = subprocess.run(
-                    ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
-                    capture_output=True, timeout=30,
-                )
-                if r.returncode != 0:
-                    log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+            if RUNNING_FROZEN:
+                # Frozen binary: never fetch install.sh — run the locally
+                # installed discovery binary, or skip if it isn't there.
+                if not os.path.isfile(FROZEN_DISCOVERY_BIN):
+                    log_error(f"discovery gate: discovery binary missing at {FROZEN_DISCOVERY_BIN}", 'discovery_gate')
                     return
-                os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
+            else:
+                DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+                if not DISCOVERY_INSTALL_SH.exists():
+                    r = subprocess.run(
+                        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                        capture_output=True, timeout=30,
+                    )
+                    if r.returncode != 0:
+                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                        return
+                    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
@@ -1216,10 +1236,7 @@ def _dispatch_discovery() -> None:
             else:
                 popen_kwargs["start_new_session"] = True
             try:
-                subprocess.Popen(
-                    ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url],
-                    **popen_kwargs,
-                )
+                subprocess.Popen(discovery_cmd, **popen_kwargs)
             except OSError as e:
                 log_error(f"discovery gate: Popen failed: {e}", 'discovery_gate')
                 return
