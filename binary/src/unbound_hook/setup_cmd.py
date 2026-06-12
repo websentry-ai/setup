@@ -108,7 +108,12 @@ def _detect_state(settings_path: Path):
         if str(HOOK_BINARY) in text or "unbound.py" in text:
             return "persisted"
         return "tampered"
-    except Exception:
+    except Exception as e:
+        # None = "unknown" — notify_setup_complete omits the field entirely,
+        # which is more honest than guessing 'fresh' over an unreadable but
+        # real install. Loud so fleet logs show WHY the state was unknown.
+        print(f"[setup] install_state detection failed for {settings_path}: {e}",
+              file=sys.stderr)
         return None
 
 
@@ -472,7 +477,8 @@ def _copilot_detect_state(user_homes) -> str:
         if not saw_json:
             return "fresh"
         return "persisted" if saw_known_ref else "tampered"
-    except Exception:
+    except Exception as e:
+        print(f"[setup] copilot install_state detection failed: {e}", file=sys.stderr)
         return None
 
 

@@ -113,18 +113,25 @@ def run(argv) -> int:
         m.DEBUG = True
         print(f"\n[backfill] tool={tool}")
         if opts["dry_run"]:
-            total_sessions = 0
-            for username, home_dir in user_homes:
-                result = m._run_as_user(username, m._backfill_collect_sessions, home_dir)
-                if result is None:
-                    print(f"  {username}: unreadable (skipped)")
-                    continue
-                sessions, capped = result
-                total_sessions += len(sessions)
-                note = " (capped — more remain)" if capped else ""
-                print(f"  {username}: {len(sessions)} session(s) eligible{note}")
-            print(f"  dry-run: {total_sessions} session(s) would be uploaded; "
-                  f"no uploads performed, cutoffs not advanced.")
+            try:
+                total_sessions = 0
+                for username, home_dir in user_homes:
+                    result = m._run_as_user(username, m._backfill_collect_sessions, home_dir)
+                    if result is None:
+                        print(f"  {username}: unreadable (skipped)")
+                        continue
+                    sessions, capped = result
+                    total_sessions += len(sessions)
+                    note = " (capped — more remain)" if capped else ""
+                    print(f"  {username}: {len(sessions)} session(s) eligible{note}")
+                print(f"  dry-run: {total_sessions} session(s) would be uploaded; "
+                      f"no uploads performed, cutoffs not advanced.")
+            except Exception as e:
+                # Same loud-failure contract as the upload path below: report
+                # the tool's failure and surface it in the exit code instead
+                # of crashing out of the remaining tools.
+                print(f"[backfill] {tool}: dry-run failed: {e}", file=sys.stderr)
+                exit_code = 1
             continue
         try:
             m.run_backfill(api_key, backend_url, user_homes)

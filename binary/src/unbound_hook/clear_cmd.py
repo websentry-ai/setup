@@ -45,7 +45,7 @@ def run(argv) -> int:
             print(f"[{tool}] clear failed: {e}", file=sys.stderr)
             failures.append(tool)
 
-    print(f"\n{'=' * 60}\n[migration] removing legacy discovery LaunchAgents\n{'=' * 60}")
+    print(f"\n{'=' * 60}\n[migration] python-era sweep (LaunchAgents, hook files, remote-fetch artifacts)\n{'=' * 60}")
     status, reason = migration.run_sweep()
     if status == "deferred":
         print(f"[migration] {reason}", file=sys.stderr)

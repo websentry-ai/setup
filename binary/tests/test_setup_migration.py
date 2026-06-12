@@ -315,6 +315,37 @@ def test_sweep_scoped_to_tools_leaves_other_tools_alone(env):
     assert (env["home"] / ".copilot" / "hooks" / "unbound.json").exists()
 
 
+def test_sweep_user_failure_is_isolated_and_loud(env, monkeypatch):
+    """One user's failing stripper must not abort the sweep silently — it is
+    logged, the sweep continues, and the status is deferred (retryable)."""
+    _plant_python_era_artifacts(env["home"], env["tmp"])
+
+    def _boom(username, home_dir):
+        raise RuntimeError("locked home")
+
+    monkeypatch.setattr(env["modules"]["claude-code"],
+                        "remove_user_level_hooks_for_user", _boom)
+    logs = []
+    status, reason = migration.run_sweep(log=logs.append)
+    assert status == "deferred"
+    assert ME in reason
+    assert any("sweep failed for user" in line for line in logs)
+
+
+def test_backfill_dry_run_failure_is_loud_not_crash(env, monkeypatch, capsys):
+    """P1 regression: a tool whose collection machinery is missing/broken
+    must produce a clean per-tool error + exit 1, not an unhandled traceback,
+    and must not stop the remaining tools."""
+    from unbound_hook import backfill_cmd
+    monkeypatch.delattr(env["modules"]["claude-code"], "_backfill_collect_sessions")
+    rc = backfill_cmd.run(["--all", "--dry-run"])
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "claude-code: dry-run failed" in captured.err
+    # codex still ran its dry-run after claude-code failed
+    assert "tool=codex" in captured.out
+
+
 def test_sweep_keeps_binary_era_copilot_registration(env):
     """Previously-binary fixture detail: a copilot unbound.json whose
     commands already point at the binary must survive the sweep."""

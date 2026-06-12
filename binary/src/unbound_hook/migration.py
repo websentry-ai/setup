@@ -115,24 +115,35 @@ def run_sweep(tools=TOOLS, log=print) -> tuple:
             # unbound.json, handled inside _sweep_user_home
         }
 
+        failed_users = []
         for username, home in m.get_all_user_homes():
             try:
                 uid = pwd.getpwnam(username).pw_uid
             except KeyError:
                 continue
-            _bootout_legacy_agents(username, uid, home, log)
-            # Strip registrations BEFORE deleting the scripts they point at —
-            # the strippers intentionally keep a script in place when the
-            # settings cleanup fails, and deleting first would defeat that.
-            for tool in tools:
-                stripper = strippers.get(tool)
-                if stripper:
-                    stripper(username, home)
-            removed = m._run_as_user(username, _sweep_user_home, str(home), tools)
-            for path in removed or []:
-                log(f"[migration] removed {path}")
+            # Isolate each user: one user's locked/corrupt home must not
+            # abort the sweep for everyone after them. Failures are logged
+            # loudly and surfaced via 'deferred' so a re-run retries.
+            try:
+                _bootout_legacy_agents(username, uid, home, log)
+                # Strip registrations BEFORE deleting the scripts they point
+                # at — the strippers intentionally keep a script in place
+                # when the settings cleanup fails, and deleting first would
+                # defeat that.
+                for tool in tools:
+                    stripper = strippers.get(tool)
+                    if stripper:
+                        stripper(username, home)
+                removed = m._run_as_user(username, _sweep_user_home, str(home), tools)
+                for path in removed or []:
+                    log(f"[migration] removed {path}")
+            except Exception as e:
+                log(f"[migration] sweep failed for user {username}: {e}")
+                failed_users.append(username)
             # NOTE: ~/.unbound/config.json is deliberately never touched.
 
+        if failed_users:
+            return ("deferred", f"sweep failed for user(s): {', '.join(failed_users)}")
         return ("configured", None)
     except Exception as e:
         return ("deferred", f"migration sweep error: {e}")
