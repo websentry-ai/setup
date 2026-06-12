@@ -21,6 +21,14 @@
 # Artifacts publish to s3://unbound-release-artifacts/macos/<version>/ —
 # that bucket REJECTS overwrites (conditional writes). Re-publishing an
 # existing version is a hard error demanding a version bump, never a retry.
+#
+# Builder choice (WEB-4804 EDR bake-off): workflow_dispatch accepts
+# builder=pyinstaller (default) | nuitka. Tag releases ALWAYS build with
+# PyInstaller; the Nuitka path (packaging/scripts/build-nuitka.sh, per-arch
+# + lipo merge, Apache-2.0 Nuitka 2.8.x only) produces dist/ with the same
+# layout, so the lipo gate / signing / smoke / pkg stages below run on it
+# unchanged. Nuitka artifacts carry a -nuitka suffix so both builders'
+# outputs can sit side by side for the EDR rehearsal.
 
 name: release-macos-runtime
 
@@ -33,6 +41,13 @@ on:
         description: "Dry-run version (build+smoke only; no Release, no S3)"
         required: true
         default: "0.0.0-dev"
+      builder:
+        description: "Bundle builder (WEB-4804 EDR bake-off; tag releases always use pyinstaller)"
+        type: choice
+        options:
+          - pyinstaller
+          - nuitka
+        default: pyinstaller
 
 permissions:
   contents: write # create the GitHub Release
@@ -68,6 +83,7 @@ jobs:
           HAS_DISCOVERY_TOKEN: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN != '' }}
           HAS_S3: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID != '' && secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY != '' }}
           INPUT_VERSION: ${{ inputs.version }}
+          INPUT_BUILDER: ${{ inputs.builder }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
@@ -76,6 +92,28 @@ jobs:
           else
             version="$INPUT_VERSION"
             publish=false
+          fi
+
+          # Builder choice (WEB-4804 EDR bake-off). Tag releases ALWAYS use
+          # PyInstaller — the Nuitka path is reachable only via
+          # workflow_dispatch, so the fleet release path is unaffected until
+          # the bake-off concludes and a deliberate default change lands.
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            builder="pyinstaller"
+          else
+            builder="${INPUT_BUILDER:-pyinstaller}"
+          fi
+          if [[ "$builder" != "pyinstaller" && "$builder" != "nuitka" ]]; then
+            echo "::error::unknown builder '$builder'"
+            exit 1
+          fi
+          # Artifact names carry the builder so both can exist side by side
+          # for the EDR rehearsal; the default builder keeps today's names.
+          builder_suffix=""
+          [[ "$builder" == "nuitka" ]] && builder_suffix="-nuitka"
+          if [[ "$publish" == "true" && "$builder" != "pyinstaller" ]]; then
+            echo "::error::tag releases must use the pyinstaller builder (got '$builder')"
+            exit 1
           fi
           [[ -n "$version" ]] || { echo "::error::could not derive version"; exit 1; }
           # Digit-led semver ONLY (script-injection guard + path sanity):
@@ -135,19 +173,21 @@ jobs:
           {
             echo "version=$version"
             echo "publish=$publish"
+            echo "builder=$builder"
             echo "sign=$sign"
             echo "pkg_sign=$pkg_sign"
             echo "notarize=$notarize"
             echo "s3=$HAS_S3"
             echo "discovery_token=$HAS_DISCOVERY_TOKEN"
-            echo "pkg_name=unbound-runtime-$version.pkg"
-            echo "tar_name=unbound-runtime-$version.tar.gz"
-            echo "artifact_url=$artifact_base/unbound-runtime-$version.pkg"
+            echo "pkg_name=unbound-runtime-$version$builder_suffix.pkg"
+            echo "tar_name=unbound-runtime-$version$builder_suffix.tar.gz"
+            echo "artifact_name=unbound-runtime-$version$builder_suffix"
+            echo "artifact_url=$artifact_base/unbound-runtime-$version$builder_suffix.pkg"
             echo "discovery_sha=$discovery_sha"
             echo "lock_python=$lock_python"
             echo "lock_pyinstaller=$lock_pyinstaller"
           } >> "$GITHUB_OUTPUT"
-          echo "version=$version publish=$publish sign=$sign pkg_sign=$pkg_sign notarize=$notarize s3=$HAS_S3"
+          echo "version=$version publish=$publish builder=$builder sign=$sign pkg_sign=$pkg_sign notarize=$notarize s3=$HAS_S3"
 
       # Pinned-SHA checkout (packaging/discovery.lock) so each release is
       # reproducible from this repo's history. Gated: the placeholder build
@@ -173,6 +213,7 @@ jobs:
         run: ./packaging/scripts/install-python.sh
 
       - name: Install pinned PyInstaller (hash-verified)
+        if: steps.cfg.outputs.builder == 'pyinstaller'
         env:
           LOCK_PYTHON: ${{ steps.cfg.outputs.lock_python }}
           LOCK_PYINSTALLER: ${{ steps.cfg.outputs.lock_pyinstaller }}
@@ -194,7 +235,61 @@ jobs:
             exit 1
           fi
 
+      # --- Nuitka builder (WEB-4804 EDR bake-off; workflow_dispatch only) ---
+      # ccache + Nuitka's object cache make the two C-compilation passes
+      # (arm64 + x86_64) tolerable on repeat runs. SHA-pinned like every
+      # other action in this job (I1).
+      - name: Restore Nuitka compilation cache (ccache)
+        if: steps.cfg.outputs.builder == 'nuitka'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: .nuitka-cache
+          key: nuitka-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/requirements-nuitka-build.txt', 'packaging/versions.env') }}
+          restore-keys: |
+            nuitka-cache-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Install pinned Nuitka (hash-verified) + ccache
+        if: steps.cfg.outputs.builder == 'nuitka'
+        run: |
+          set -euo pipefail
+          source packaging/versions.env
+          # ccache for Nuitka's C compile step; macos-14 ships clang but not
+          # ccache. Nuitka finds it on PATH and keeps its object cache under
+          # NUITKA_CACHE_DIR (restored above).
+          brew list ccache >/dev/null 2>&1 || brew install ccache
+          "$PYTHON_BIN" -m venv .build-venv-nuitka
+          # Nuitka ships as an sdist: install the pinned setuptools FIRST,
+          # then build the sdist with --no-build-isolation so it builds with
+          # that pinned setuptools instead of an unpinned PyPI download.
+          grep '^setuptools' packaging/requirements-nuitka-build.txt > "$RUNNER_TEMP/setuptools-pin.txt"
+          ./.build-venv-nuitka/bin/pip install --require-hashes --no-deps \
+            -r "$RUNNER_TEMP/setuptools-pin.txt"
+          ./.build-venv-nuitka/bin/pip install --require-hashes --no-deps \
+            --no-build-isolation -r packaging/requirements-nuitka-build.txt
+          # Version + free-tier (Apache-2.0) asserts live in build-nuitka.sh.
+          ./.build-venv-nuitka/bin/python -m nuitka --version
+
+      - name: Build bundles with Nuitka (per-arch + lipo merge)
+        if: steps.cfg.outputs.builder == 'nuitka'
+        env:
+          HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
+          NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
+        run: |
+          set -euo pipefail
+          # Same source-selection contract as the PyInstaller step below:
+          # pinned checkout when the token is configured, placeholder
+          # discovery only on tokenless dry-runs (tag releases hard-require
+          # the token in cfg — and can never reach this step anyway).
+          if [[ "$HAS_DISCOVERY_SRC" == "true" ]]; then
+            export UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src"
+          else
+            echo "::warning::building PLACEHOLDER unbound-discovery (no DISCOVERY_CHECKOUT_TOKEN) — dry-run only"
+          fi
+          NUITKA_PYTHON=./.build-venv-nuitka/bin/python \
+            ./packaging/scripts/build-nuitka.sh dist
+
       - name: Build bundles from committed .spec files
+        if: steps.cfg.outputs.builder == 'pyinstaller'
         env:
           HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
         run: |
@@ -395,7 +490,7 @@ jobs:
       - name: Upload build artifacts (always, incl. dry-runs)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: unbound-runtime-${{ steps.cfg.outputs.version }}
+          name: ${{ steps.cfg.outputs.artifact_name }}
           path: out/
           retention-days: 14
 

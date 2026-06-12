@@ -14,6 +14,7 @@ template), WEB-4792 (pkg payload).
 | `discovery.lock` | KEY=VALUE source pin, canonical from WEB-4787 (`SOURCE_SHA` is checked out into `./discovery-src`; `PYTHON_VERSION`/`PYINSTALLER_VERSION` are asserted against the installed toolchain) |
 | `unbound-discovery.spec` + `unbound_discovery_entry.py` + `build-discovery.sh` | **Canonical** discovery bundle build (WEB-4787); CI invokes the spec with `UNBOUND_DISCOVERY_SRC=./discovery-src` |
 | `specs/*.spec` | `unbound-hook.spec` is a **placeholder** until the WEB-4786 binary lands; `specs/unbound-discovery.spec` is a dry-run-only fallback for tokenless `workflow_dispatch` runs. Bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
+| `requirements-nuitka-build.txt` + `nuitka/` + `scripts/build-nuitka.sh` + `scripts/lipo-merge.sh` | **Alternative Nuitka builder** (WEB-4804 EDR bake-off, `workflow_dispatch` `builder=nuitka` only — tag releases always use PyInstaller). Nuitka pinned to 2.8.x, the last Apache-2.0 series. `--standalone` only, never `--onefile` (onefile's self-extract-to-temp is the EDR "packer" pattern the bake-off exists to avoid). Nuitka 2.8 cannot emit universal binaries, so the script builds arm64 + x86_64 from the same universal2 CPython and `lipo -create`-merges them; output layout is contract-identical (`dist/<name>/<name>`), so the lipo gate, per-Mach-O signing, smoke test, and pkg stages run unchanged. `unbound-hook` builds the real `binary/src` package — vendored data files and hidden imports are parsed from `binary/unbound-hook.spec` so the two builders cannot drift; `nuitka/unbound_hook_entry.py` is a build-only shim supplying the `sys.frozen`/`sys._MEIPASS` contract PyInstaller's bootloader provides |
 | `placeholder/*.py` | Stdlib-only entry points so the pipeline builds/signs/smokes end-to-end today |
 | `scripts/` | Build steps factored out of the workflow so they're shellcheckable and runnable locally |
 | `pkg/postinstall` | Pre-warms both binaries (Gatekeeper first-exec) **before** flipping `current`, bootstraps the LaunchDaemon, sets up `/var/log/unbound` + newsyslog, keep-2 version GC |
@@ -84,3 +85,7 @@ git tag runtime-v0.1.0 && git push origin runtime-v0.1.0
 ```
 
 Dry-run without a tag: Actions → release-macos-runtime → Run workflow.
+The `builder` input selects PyInstaller (default) or Nuitka (WEB-4804
+bake-off); Nuitka artifacts carry a `-nuitka` suffix in the pkg/tar/Actions
+artifact names so both builders' outputs can sit side by side for the EDR
+rehearsal. Tag releases ignore the input and always build with PyInstaller.
