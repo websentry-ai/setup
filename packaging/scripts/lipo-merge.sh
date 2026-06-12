@@ -59,7 +59,10 @@ while IFS= read -r rel; do
     ln -s "$target_a" "$dest"
   elif file -b "$src_a" | grep -q 'Mach-O'; then
     lipo -create "$src_a" "$src_x" -output "$dest"
-    chmod "$(stat -f '%Lp' "$src_a")" "$dest"
+    perm_a="$(stat -f '%Lp' "$src_a")"
+    perm_x="$(stat -f '%Lp' "$src_x")"
+    [[ "$perm_a" == "$perm_x" ]] || { echo "ERROR: permission mismatch for Mach-O $rel: arm64 $perm_a vs x86_64 $perm_x" >&2; exit 1; }
+    chmod "$perm_a" "$dest"
     merged=$((merged + 1))
   else
     cmp -s "$src_a" "$src_x" || {

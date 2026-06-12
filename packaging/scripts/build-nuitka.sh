@@ -101,7 +101,7 @@ for node in tree.body:
         elif node.targets[0].id == "HIDDEN":
             hidden = ast.literal_eval(node.value)
 
-if not vendored or not hidden:
+if vendored is None or hidden is None:
     raise SystemExit("VENDORED/HIDDEN not found in %s" % spec_path)
 
 for src, dest_dir in vendored:
