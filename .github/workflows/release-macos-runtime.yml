@@ -66,7 +66,7 @@ jobs:
     # smoke test can execute the x86_64 slice too).
     runs-on: macos-14
     environment: release
-    timeout-minutes: 90
+    timeout-minutes: 180 # must exceed the 2h notary --wait (WEB-4802) plus build/sign/test time
 
     steps:
       # SHA-pinned (I1): this job holds signing material; a hijacked action
@@ -452,7 +452,7 @@ jobs:
           printf '%s' "$NOTARY_KEY_P8" > "$key_file"
           xcrun notarytool submit "out/$PKG_NAME" \
             --key "$key_file" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
-            --wait --timeout 30m
+            --wait --timeout 7200s # first notarization from a new Developer ID account can take ~1h; subsequent are fast
           xcrun stapler staple "out/$PKG_NAME"
           spctl -a -vv -t install "out/$PKG_NAME"
 
