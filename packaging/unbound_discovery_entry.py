@@ -22,6 +22,17 @@ import logging
 import os
 import sys
 
+# Discovery's user-facing version. Mirrors unbound-hook's __version__
+# (binary/src/unbound_hook/__init__.py) so both binaries report the same
+# string. The release workflow's publish-safety assert requires
+# `<bin> --version` to contain the release version space-delimited
+# (release-macos-runtime.yml: `[[ " $v_out " != *" $VERSION "* ]]`).
+#
+# TODO(WEB-4802): hook and discovery versions must be bumped in lockstep on
+# every tag until build-time version injection lands (the workflow already
+# notes this). Keep this equal to unbound_hook.__version__ until then.
+__version__ = "0.1.0"
+
 
 def _missing_required_config(argv):
     """Return human-readable names of required config that is absent/empty.
@@ -56,6 +67,15 @@ def _log_crash():
 
 def main():
     argv = sys.argv[1:]
+
+    # Version pre-check: must run BEFORE config parsing / the no-config idle
+    # path, otherwise `--version` falls through to the fail-open idle branch
+    # which logs to stderr and leaves stdout empty — tripping the release
+    # workflow's publish-safety assert (WEB-4802). Mirrors unbound-hook's
+    # contract: print "<name> <version>" to stdout, exit 0, read no stdin.
+    if argv and argv[0] in ("--version", "-V"):
+        print(f"unbound-discovery {__version__}")
+        return 0
 
     if argv and argv[0] == "mcp-scan":
         # Same shift as install.sh: the subcommand token must not reach the
