@@ -29,10 +29,15 @@ die() { echo "[build-discovery] ERROR: $*" >&2; exit 1; }
 
 # --- 1. Read the lock file -------------------------------------------------
 [ -f "$LOCK" ] || die "missing $LOCK"
+# Direct per-key assignment — never eval/re-interpret lock values as shell.
 while IFS='=' read -r key value; do
     case "$key" in
-        SOURCE_REPO|SOURCE_SHA|SOURCE_ENTRYPOINT|PYTHON_VERSION|PYINSTALLER_VERSION|TARGET_ARCH)
-            eval "$key=\"\$value\"" ;;
+        SOURCE_REPO)         SOURCE_REPO="$value" ;;
+        SOURCE_SHA)          SOURCE_SHA="$value" ;;
+        SOURCE_ENTRYPOINT)   SOURCE_ENTRYPOINT="$value" ;;
+        PYTHON_VERSION)      PYTHON_VERSION="$value" ;;
+        PYINSTALLER_VERSION) PYINSTALLER_VERSION="$value" ;;
+        TARGET_ARCH)         TARGET_ARCH="$value" ;;
     esac
 done < "$LOCK"
 for var in SOURCE_REPO SOURCE_SHA SOURCE_ENTRYPOINT PYTHON_VERSION PYINSTALLER_VERSION TARGET_ARCH; do
