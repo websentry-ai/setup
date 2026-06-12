@@ -464,6 +464,30 @@ def configure_codex_hooks() -> bool:
                         }
                     ]
                 }
+            ],
+            "SubagentStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "SubagentStop": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
             ]
         }
 
