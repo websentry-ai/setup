@@ -222,6 +222,32 @@ jobs:
       - name: Lipo gate (every Mach-O universal2)
         run: ./packaging/scripts/lipo-gate.sh dist/unbound-hook dist/unbound-discovery
 
+      # Vendored-import parity gate (WEB-4786). The hooks run as ROOT on the
+      # fleet and fail OPEN by design: a hook bundle whose vendored module
+      # tree is missing/corrupt silently STOPS enforcing — invisible at
+      # runtime, so CI is the only place it can be caught. The 104-test
+      # CLI-boundary suite pipes every tool x event through the freshly built
+      # bundle and asserts byte-for-byte parity with `python3 <tool>/unbound.py`
+      # (stdout + exit code), which only holds if every vendored module
+      # actually imported and ran. This runs on BOTH the tag path and the
+      # workflow_dispatch dry-run, and BEFORE any signing/publish — a failure
+      # fails the build before a broken bundle can be signed or shipped.
+      #
+      # Builder-agnostic: it validates whatever landed at
+      # dist/unbound-hook/unbound-hook, so the Nuitka builder (PR #132)
+      # inherits this coverage with no change.
+      - name: Install pinned pytest (hash-verified) for the parity suite
+        run: |
+          set -euo pipefail
+          ./.build-venv/bin/pip install --require-hashes --no-deps -r packaging/requirements-test.txt
+
+      - name: Parity gate — 104-test CLI-boundary suite vs built hook bundle
+        env:
+          UNBOUND_HOOK_BINARY: ${{ github.workspace }}/dist/unbound-hook/unbound-hook
+        run: |
+          set -euo pipefail
+          ./.build-venv/bin/python -m pytest binary/tests/ -q
+
       - name: Import Developer ID certs into throwaway keychain
         if: steps.cfg.outputs.sign == 'true'
         env:
