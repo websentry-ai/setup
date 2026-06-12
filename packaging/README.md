@@ -13,8 +13,8 @@ template), WEB-4792 (pkg payload).
 | `requirements-build.txt` | Hash-pinned PyInstaller toolchain, canonical from WEB-4787 (`pip install --require-hashes --no-deps`) |
 | `discovery.lock` | KEY=VALUE source pin, canonical from WEB-4787 (`SOURCE_SHA` is checked out into `./discovery-src`; `PYTHON_VERSION`/`PYINSTALLER_VERSION` are asserted against the installed toolchain) |
 | `unbound-discovery.spec` + `unbound_discovery_entry.py` + `build-discovery.sh` | **Canonical** discovery bundle build (WEB-4787); CI invokes the spec with `UNBOUND_DISCOVERY_SRC=./discovery-src` |
-| `specs/*.spec` | `unbound-hook.spec` is a **placeholder** until the WEB-4786 binary lands; `specs/unbound-discovery.spec` is a dry-run-only fallback for tokenless `workflow_dispatch` runs. Bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
-| `placeholder/*.py` | Stdlib-only entry points so the pipeline builds/signs/smokes end-to-end today |
+| `../binary/unbound-hook.spec` | **Canonical** hook bundle build (WEB-4786, Stream A): vendored hook/MDM sources + hidden imports; CI builds this spec directly. Bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
+| `specs/unbound-discovery.spec` + `placeholder/unbound_discovery_main.py` | Dry-run-only discovery fallback for tokenless `workflow_dispatch` runs (the hook side has no placeholder anymore — it always builds from `binary/`) |
 | `scripts/` | Build steps factored out of the workflow so they're shellcheckable and runnable locally |
 | `pkg/postinstall` | Pre-warms both binaries (Gatekeeper first-exec) **before** flipping `current`, bootstraps the LaunchDaemon, sets up `/var/log/unbound` + newsyslog, keep-2 version GC |
 | `pkg/ai.getunbound.discovery.plist` | System LaunchDaemon: local binary, `StartInterval` 43200, `RunAtLoad`, `LowPriorityIO`, `Nice` 10, zero network code fetch |

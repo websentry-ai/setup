@@ -1,0 +1,21 @@
+# Hash-pinned test toolchain for the binary/ parity suite (WEB-4786).
+# Installed into the SAME .build-venv as requirements-build.txt so the
+# 104-test CLI-boundary parity suite (binary/tests/) can run against the
+# freshly built hook bundle in CI — catching vendored-import drift that the
+# fail-open hooks would otherwise hide on the fleet.
+#
+# `packaging` is intentionally NOT listed here: requirements-build.txt
+# already pins packaging==26.2 (same hash) into the shared venv, and pytest
+# is installed with --no-deps, so the dependency is satisfied without a
+# duplicate (conflicting) pin.
+#
+# Regenerate:
+#   pip download --only-binary :all: --no-deps -d wheels \
+#     pytest==<ver> iniconfig==<ver> pluggy==<ver> pygments==<ver>
+#   pip hash wheels/*.whl
+# Install:
+#   pip install --require-hashes --no-deps -r requirements-test.txt
+pytest==9.0.3 --hash=sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9
+iniconfig==2.1.0 --hash=sha256:9deba5723312380e77435581c6bf4935c94cbfab9b1ed33ef8d238ea168eb760
+pluggy==1.6.0 --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
+pygments==2.19.2 --hash=sha256:86540386c03d588bb81d44bc3928634ff26449851e99741617ecb9037ee5ec0b
