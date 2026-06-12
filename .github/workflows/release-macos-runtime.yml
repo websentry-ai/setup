@@ -244,18 +244,42 @@ jobs:
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .nuitka-cache
+          # EXACT-MATCH ONLY — deliberately no restore-keys (WEB-4804, F1/M1).
+          # This cache feeds object files into a C compile whose output is
+          # later codesigned. A restore-keys prefix would let ANY branch's or
+          # PR's cache be restored into this job (cache scope is the whole
+          # repo), poisoning the compiled bytes. A cache miss just means a
+          # slower clean compile — acceptable. This cache MUST stay exact-match,
+          # and pinning ccache itself (see the TODO in the install step below)
+          # is a precondition before Nuitka could ever become the publish/
+          # default builder.
           key: nuitka-cache-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('packaging/requirements-nuitka-build.txt', 'packaging/versions.env') }}
-          restore-keys: |
-            nuitka-cache-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Install pinned Nuitka (hash-verified) + ccache
         if: steps.cfg.outputs.builder == 'nuitka'
+        env:
+          LOCK_PYTHON: ${{ steps.cfg.outputs.lock_python }}
         run: |
           set -euo pipefail
           source packaging/versions.env
+          # versions.env (installer URL+sha) and discovery.lock (KEY=VALUE)
+          # must agree — fail loud if one was bumped without the other. Same
+          # cross-assert the PyInstaller install step runs, replicated here so
+          # a mismatched python bump is caught on nuitka runs too (WEB-4804, E).
+          actual_py="$("$PYTHON_BIN" --version | awk '{print $2}')"
+          if [[ "$actual_py" != "$LOCK_PYTHON" ]]; then
+            echo "::error::pinned interpreter is $actual_py but discovery.lock says PYTHON_VERSION=$LOCK_PYTHON"
+            exit 1
+          fi
           # ccache for Nuitka's C compile step; macos-14 ships clang but not
           # ccache. Nuitka finds it on PATH and keeps its object cache under
           # NUITKA_CACHE_DIR (restored above).
+          # TODO(WEB-4804): pin ccache before promoting Nuitka past the
+          # dispatch-only bake-off — this is the only unpinned executable
+          # touching artifact bytes in an otherwise fully hash-pinned,
+          # signed-binary compile path. Acceptable today ONLY because this lane
+          # is workflow_dispatch-only and publish-blocked (tag releases hard-
+          # fail on builder=nuitka in the cfg step).
           brew list ccache >/dev/null 2>&1 || brew install ccache
           "$PYTHON_BIN" -m venv .build-venv-nuitka
           # Nuitka ships as an sdist: install the pinned setuptools FIRST,

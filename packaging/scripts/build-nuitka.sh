@@ -112,8 +112,8 @@ for src, dest_dir in vendored:
     print("--include-data-files=%s=%s" % (src_path, dest_path))
 
 for module in hidden:
-    if module == "winreg":  # platform-guarded, never on macOS (spec parity)
-        continue
+    if module == "winreg":  # Windows-only stdlib; cannot resolve on the macOS
+        continue            # build host, so Nuitka can't --include-module it.
     print("--include-module=%s" % module)
 PYEOF
 
@@ -128,12 +128,16 @@ if [[ -n "${UNBOUND_DISCOVERY_SRC:-}" ]]; then
       die "UNBOUND_DISCOVERY_SRC missing $entrypoint"
   discovery_entry="$PKG/unbound_discovery_entry.py"
   discovery_pythonpath="$UNBOUND_DISCOVERY_SRC/scripts"
-  # Mirrors the PyInstaller spec: collect the whole detector package, keep
-  # the test module and the spec's excludes out.
+  # Mirrors the PyInstaller spec excludes (["tkinter","test","unittest",
+  # "pydoc_data"]) one-for-one so the EDR-scored artifact surface matches the
+  # canonical builder (WEB-4804, D). Also drops the detector package's own
+  # test subpackage.
   discovery_flags=(
     "--include-package=coding_discovery_tools"
     "--nofollow-import-to=coding_discovery_tools.test"
     "--nofollow-import-to=tkinter"
+    "--nofollow-import-to=test"
+    "--nofollow-import-to=unittest"
     "--nofollow-import-to=pydoc_data"
   )
 else

@@ -38,6 +38,17 @@ while IFS= read -r rel; do
   dest="$out_dir/$rel"
   mkdir -p "$(dirname "$dest")"
 
+  # Symlink/regular-file parity (WEB-4804, L1): a path that is a symlink in
+  # one arch tree and a regular file in the other is a real build divergence.
+  # Without this check the asymmetry is lost — readlink on the non-symlink
+  # side returns empty (confusing error), or the regular-file-vs-symlink case
+  # silently follows the symlink through cmp/file/lipo. Fail closed, name the
+  # path, before any branch below assumes both sides share a type.
+  if [[ -L "$src_a" || -L "$src_x" ]] && ! { [[ -L "$src_a" ]] && [[ -L "$src_x" ]]; }; then
+    echo "ERROR: symlink/regular-file divergence for $rel: arm64 is $( [[ -L "$src_a" ]] && echo symlink || echo regular-file ), x86_64 is $( [[ -L "$src_x" ]] && echo symlink || echo regular-file )" >&2
+    exit 1
+  fi
+
   if [[ -L "$src_a" ]]; then
     target_a="$(readlink "$src_a")"
     target_x="$(readlink "$src_x")"
