@@ -6,6 +6,19 @@
 # python serving path. Because data files aren't import-analyzed, every
 # stdlib module they use is listed as a hidden import; build.sh re-derives
 # that set from the sources and fails the build on drift.
+#
+# Deliberate choices (do NOT "simplify" these away — each is load-bearing for
+# the release pipeline; carried forward from the original placeholder spec):
+#   * onedir (COLLECT), NOT onefile — every nested Mach-O stays a real file on
+#     disk so CI can sign each one individually (deep signing is deprecated)
+#     and the Gatekeeper pre-warm in the pkg postinstall hits real inodes.
+#   * two separate bundles, no MERGE — hook and discovery ship as independent
+#     bundles per WEB-4789; MERGE would couple their dependency graphs.
+#   * target_arch='universal2' — requires the pinned python.org universal2
+#     CPython; CI's lipo gate fails the build if any Mach-O is thin.
+#   * codesign_identity=None here — signing is a dedicated, gated CI step
+#     against a throwaway keychain; baking an identity into the spec would
+#     sign at build time outside that control and break the unsigned dry-run.
 
 VENDORED = [
     ("../claude-code/hooks/unbound.py", "vendored/claude-code/hooks"),
