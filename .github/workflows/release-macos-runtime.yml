@@ -296,11 +296,14 @@ jobs:
         run: |
           set -euo pipefail
           key_file="$RUNNER_TEMP/notary-key.p8"
+          # trap, not a trailing rm: set -e would skip cleanup when submit
+          # fails or the run is cancelled mid --wait, leaving the P8 on the
+          # runner for the rest of its lifetime.
+          trap 'rm -f "$key_file"' EXIT
           printf '%s' "$NOTARY_KEY_P8" > "$key_file"
           xcrun notarytool submit "out/$PKG_NAME" \
             --key "$key_file" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
             --wait --timeout 30m
-          rm -f "$key_file"
           xcrun stapler staple "out/$PKG_NAME"
           spctl -a -vv -t install "out/$PKG_NAME"
 

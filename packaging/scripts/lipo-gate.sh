@@ -28,5 +28,9 @@ while IFS= read -r -d '' f; do
 done < <(find "$@" -type f -print0)
 
 [[ $checked -gt 0 ]] || { echo "ERROR: no Mach-O files found under: $*" >&2; exit 1; }
-echo "lipo gate: $checked Mach-O files checked, all universal2."
+if [[ $fail -eq 0 ]]; then
+  echo "lipo gate: $checked Mach-O files checked, all universal2."
+else
+  echo "lipo gate: $checked Mach-O files checked — thin Mach-O failures listed above." >&2
+fi
 exit $fail

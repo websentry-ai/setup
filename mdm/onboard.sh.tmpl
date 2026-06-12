@@ -27,17 +27,30 @@ set -euo pipefail
 API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
 GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
 CURRENT_STEP="init"
+tmpdir=""
+
+# Minimal JSON string escaping (backslash + double quote): hostnames are
+# admin-settable via scutil and CAN contain either — an unescaped value
+# would make the payload invalid JSON and the report would be silently
+# dropped exactly when we need it.
+# shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
 
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 on_exit() {
   local code=$1
+  # Always reap the download dir: on failure, set -e skips the inline rm
+  # and a leftover ~100MB pkg in /tmp can fail the NEXT run's free-space
+  # preflight.
+  [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
   if [[ $code -ne 0 ]]; then
     echo "UNBOUND_INSTALL_FAILED step=${CURRENT_STEP} code=${code}" >&2
     # Best-effort failure report; never let reporting mask the real failure.
     curl -m 10 -fsS -X POST "${BACKEND_URL}/api/v1/mdm/install-report" \
       -H 'Content-Type: application/json' \
       -d "$(printf '{"event":"install_failed","step":"%s","code":%d,"version":"%s","hostname":"%s","os":"%s"}' \
-            "$CURRENT_STEP" "$code" "$VERSION" "$(hostname)" "$(sw_vers -productVersion)")" \
+            "$CURRENT_STEP" "$code" "$VERSION" \
+            "$(json_escape "$(hostname)")" "$(sw_vers -productVersion)")" \
       >/dev/null 2>&1 || true
   fi
 }
