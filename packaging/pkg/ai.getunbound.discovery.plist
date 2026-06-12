@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- ai.getunbound.discovery — system LaunchDaemon (NOT a LaunchAgent: scans
+     run as root, independent of who is logged in). ProgramArguments is the
+     LOCAL binary behind the `current` symlink — zero network code fetch
+     (WEB-4792). The binary idles fail-open (exit 0) until onboard.sh writes
+     config, so installing the pkg before onboarding never crash-loops. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.getunbound.discovery</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/unbound/current/unbound-discovery/unbound-discovery</string>
+        <string>scan</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>43200</integer>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/unbound/discovery.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/unbound/discovery.err.log</string>
+</dict>
+</plist>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Deliberately empty: the runtime needs no entitlements. PyInstaller
+     bundles do NOT need com.apple.security.cs.allow-unsigned-executable-memory
+     on modern PyInstaller (>=6); start from zero and add an entitlement only
+     when notarization or runtime behavior demonstrably requires it. -->
+<plist version="1.0">
+<dict/>
+</plist>
