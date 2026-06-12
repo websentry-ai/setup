@@ -199,8 +199,12 @@ jobs:
           HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
         run: |
           set -euo pipefail
+          # Real Stream A spec (WEB-4786): vendored hook/MDM sources + hidden
+          # imports live in binary/unbound-hook.spec (single source of truth;
+          # the Nuitka builder parses the same file). Spec-relative paths
+          # resolve from binary/, so invoking from the repo root is fine.
           ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
-            packaging/specs/unbound-hook.spec
+            binary/unbound-hook.spec
           # Canonical discovery spec (WEB-4787) builds from the pinned
           # checkout; the placeholder spec exists ONLY for tokenless
           # workflow_dispatch dry-runs (tag releases hard-require the token
