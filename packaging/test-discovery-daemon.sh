@@ -28,10 +28,26 @@ PORT="${SINK_PORT:-18924}"
 TIMEOUT_S="${DAEMON_TEST_TIMEOUT:-900}"
 FAIL=0
 
+# Variant 3 (WEB-4808) writes the real production config path so the frozen
+# binary's own fallback read is exercised. Back up any pre-existing config and
+# restore it on exit so running this on a real install is non-destructive.
+DISCOVERY_CONFIG="/opt/unbound/etc/discovery.json"
+CONFIG_BACKUP="/var/tmp/$LABEL.discovery.json.bak"
+CONFIG_WAS_PRESENT=0
+CONFIG_WE_CREATED=0
+[ -f "$DISCOVERY_CONFIG" ] && { cp -p "$DISCOVERY_CONFIG" "$CONFIG_BACKUP" && CONFIG_WAS_PRESENT=1; }
+
 cleanup() {
     launchctl bootout "system/$LABEL" 2>/dev/null || true
     rm -f "$PLIST"
     rm -rf "$STAGE"
+    # Restore the host's discovery config exactly as we found it.
+    if [ "$CONFIG_WAS_PRESENT" -eq 1 ]; then
+        cp -p "$CONFIG_BACKUP" "$DISCOVERY_CONFIG" 2>/dev/null || true
+        rm -f "$CONFIG_BACKUP"
+    elif [ "$CONFIG_WE_CREATED" -eq 1 ]; then
+        rm -f "$DISCOVERY_CONFIG"
+    fi
     [ -n "${SINK_PID:-}" ] && kill "$SINK_PID" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -208,7 +224,45 @@ else
     FAIL=1
 fi
 
-echo "daemon logs: $LOG, $NOCONF_LOG; sink artifacts: $SINK_DIR"
+# --- variant 3: production repro (WEB-4808) ----------------------------------
+# The exact production shape: plist carries the `scan` token and NO creds
+# (secret-free, world-readable plist), creds live ONLY in the root-only config
+# file. The daemon must read the file, strip `scan`, scan, and POST — proving
+# the scheduled run no longer idles. This is the case the live plist ships.
+launchctl bootout "system/$LABEL" 2>/dev/null || true
+rm -f /var/tmp/unbound-0/discovery-cache.json /var/root/.unbound/discovery-cache.json
+REPORTS_BEFORE=$(ls "$SINK_DIR"/report_*.json 2>/dev/null | wc -l | tr -d ' ')
+install -d -o root -g wheel -m 0750 /opt/unbound/etc 2>/dev/null || true
+umask 077
+cat > "$DISCOVERY_CONFIG" <<JSONEOF
+{"api_key": "daemon-cfgfile-key", "domain": "http://127.0.0.1:$PORT"}
+JSONEOF
+chown root:wheel "$DISCOVERY_CONFIG" 2>/dev/null || true
+chmod 600 "$DISCOVERY_CONFIG"
+[ "$CONFIG_WAS_PRESENT" -eq 1 ] || CONFIG_WE_CREATED=1
+
+CFG_LOG="/var/tmp/$LABEL.cfgfile.log"
+rm -f "$CFG_LOG"
+# `scan` token in argv + HOME=/var/empty + NO creds in the plist — production.
+write_plist "$CFG_LOG" varempty scan
+launchctl bootstrap system "$PLIST"
+echo "daemon bootstrapped (system/$LABEL, scan token, creds via config file); waiting..."
+wait_for_daemon_exit "$TIMEOUT_S" || { tail -20 "$CFG_LOG" 2>/dev/null; exit 1; }
+
+CFG_REPORTS=$(ls "$SINK_DIR"/report_*.json 2>/dev/null | wc -l | tr -d ' ')
+echo "--- variant 3 results (WEB-4808 production repro) -----------"
+echo "daemon exit code: $DAEMON_EXIT; new report payloads: $((CFG_REPORTS - REPORTS_BEFORE))"
+if [ "$DAEMON_EXIT" = "0" ] && [ "$CFG_REPORTS" -gt "$REPORTS_BEFORE" ] && \
+   ! grep -q "No configuration provided" "$CFG_LOG" 2>/dev/null && \
+   ! grep -q "unrecognized arguments" "$CFG_LOG" 2>/dev/null; then
+    echo "PASS: config-file daemon (scan token, no plist creds) scanned + POSTed"
+else
+    echo "FAIL: config-file daemon — exit $DAEMON_EXIT, reports $CFG_REPORTS, log:"
+    tail -8 "$CFG_LOG" 2>/dev/null
+    FAIL=1
+fi
+
+echo "daemon logs: $LOG, $NOCONF_LOG, $CFG_LOG; sink artifacts: $SINK_DIR"
 if [ "$FAIL" -eq 0 ]; then
     echo "DAEMON TEST PASSED"
 else

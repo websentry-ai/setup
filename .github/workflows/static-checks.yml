@@ -42,3 +42,16 @@ jobs:
             exit 1
           fi
           echo "No undefined names."
+
+      # Fail-open contract gate (WEB-4808). packaging/ holds the hermetic
+      # boundary tests for the scheduled root discovery daemon's credential
+      # channel: the SACRED fail-open path (absent/unreadable/malformed config
+      # must idle-and-exit-0) and the writer side (atomic 0600 file, 0750 dir).
+      # These tests need no built bundle and no upstream package, so they run
+      # here on EVERY PR — the parity suite under binary/tests/ only runs on
+      # the macOS release build, which would let a fail-open regression merge.
+      - name: Install pytest
+        run: pip install pytest==9.0.3
+
+      - name: Run packaging boundary tests (discovery fail-open + writer)
+        run: python -m pytest packaging/ -q
