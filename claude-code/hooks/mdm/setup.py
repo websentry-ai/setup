@@ -712,6 +712,33 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         debug_print(f"Could not rewrite gateway URL in {path}: {e}")
 
 
+def _entry_is_unbound(entry, owner_substr: str) -> bool:
+    """True when a hooks-array entry ({matcher?, hooks:[...]}) owns at least
+    one command pointing at our managed hook script. Substring match (not
+    exact equality) so a changed command form still matches our own entry."""
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks", []) or []:
+        if isinstance(hook, dict) and owner_substr in (hook.get("command") or ""):
+            return True
+    return False
+
+
+def _merge_hooks(existing_hooks, our_hooks: dict, owner_substr: str) -> dict:
+    """Merge our per-event hook config into the editor's existing hooks block
+    instead of overwriting it (WEB-4814). Per event: drop prior Unbound-owned
+    entries (idempotency), keep everyone else's, append the current one. Fails
+    safe — a non-dict existing block is treated as empty rather than crashing."""
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    for event, our_entries in our_hooks.items():
+        prior = merged.get(event)
+        if not isinstance(prior, list):
+            prior = []
+        kept = [e for e in prior if not _entry_is_unbound(e, owner_substr)]
+        merged[event] = kept + list(our_entries)
+    return merged
+
+
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
     """
     Set up system-wide managed hooks for Claude Code.
@@ -863,7 +890,13 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             ]
         }
 
-        settings["hooks"] = hooks_config
+        # Merge into any pre-existing hooks block rather than overwriting it,
+        # so other tools' managed hooks survive setup (WEB-4814). Idempotent:
+        # stale Unbound entries (matched on the script path, which covers both
+        # the Unix '"path"' and Windows 'py -3 "path"' command forms) are
+        # stripped before the current one is appended.
+        settings["hooks"] = _merge_hooks(
+            settings.get("hooks"), hooks_config, str(script_path))
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 

@@ -147,6 +147,42 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
+
+def _entry_is_unbound(entry, owner_substr: str) -> bool:
+    """True when a Claude-Code-style hooks-array entry (a {matcher?, hooks:[...]}
+    group) owns at least one command pointing at the Unbound hook binary.
+
+    Matching is by binary-path substring rather than exact command equality so
+    that re-running setup after a binary path/version change still recognizes —
+    and replaces — our own stale entries instead of stacking a duplicate.
+    """
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks", []) or []:
+        if isinstance(hook, dict) and owner_substr in (hook.get("command") or ""):
+            return True
+    return False
+
+
+def _merge_hooks(existing_hooks, our_hooks, owner_substr: str) -> dict:
+    """Merge Unbound's per-event hook config into whatever hooks the editor's
+    managed settings already declared (other tools, hand-authored entries).
+
+    Per event: drop any prior Unbound-owned entry (idempotency — never stack
+    duplicates of our own hook), preserve everyone else's entries, then append
+    the current Unbound entry. Fails safe: if the existing hooks block is not a
+    dict we start from an empty one rather than crashing the installer.
+    """
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    for event, our_entries in our_hooks.items():
+        prior = merged.get(event)
+        if not isinstance(prior, list):
+            prior = []
+        kept = [e for e in prior if not _entry_is_unbound(e, owner_substr)]
+        merged[event] = kept + list(our_entries)
+    return merged
+
+
 def _claude_hooks_config():
     cmd = lambda ev: hook_command_for_event("claude-code", ev)
     return {
@@ -252,7 +288,13 @@ def _write_claude_managed_settings(m) -> bool:
             if not env:
                 del settings["env"]
 
-        settings["hooks"] = _claude_hooks_config()
+        # Merge our hooks into any pre-existing hooks block instead of
+        # overwriting it — a blind assignment here clobbers other tools'
+        # managed hooks (WEB-4814). Idempotent: stale Unbound entries are
+        # stripped (matched on the binary path) before our current one is
+        # appended, so re-running setup never stacks duplicates.
+        settings["hooks"] = _merge_hooks(
+            settings.get("hooks"), _claude_hooks_config(), str(HOOK_BINARY))
         _atomic_write_text(settings_path, json.dumps(settings, indent=2))
 
         gateway_key_helper = managed_dir / "anthropic_key.sh"
