@@ -39,7 +39,7 @@ install_succeeded=0
 # would make the payload invalid JSON and the report would be silently
 # dropped exactly when we need it.
 # shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
-json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'; }
 
 # Hardware serial — the key the install-report endpoint joins on (one row per
 # device, keyed by org+serial_number). ioreg's IOPlatformSerialNumber is
@@ -73,7 +73,7 @@ on_exit() {
     # longer silent: a non-2xx (or no-response) prints a diagnostic to stderr
     # so a regression can't hide in empty fleet telemetry again.
     local report_serial report_body http_code
-    report_serial="$(json_escape "$(device_serial)")"
+    report_serial="$(json_escape "$(device_serial)")" || report_serial=""
     report_body="$(printf '{"serial_number":"%s","step":"%s","exit_code":%d,"installer_version":"%s","hostname":"%s","os_version":"%s","ts":%d}' \
       "$report_serial" "$(json_escape "$CURRENT_STEP")" "$code" \
       "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
@@ -103,7 +103,7 @@ on_exit() {
     # failure mode (curl error, timeout, 4xx/5xx, 404, no response) is swallowed
     # to a stderr diagnostic only — identical tolerance to the failure branch.
     local report_serial report_body http_code
-    report_serial="$(json_escape "$(device_serial)")"
+    report_serial="$(json_escape "$(device_serial)")" || report_serial=""
     report_body="$(printf '{"serial_number":"%s","step":"%s","exit_code":0,"installer_version":"%s","hostname":"%s","os_version":"%s","ts":%d}' \
       "$report_serial" "$(json_escape "$CURRENT_STEP")" \
       "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
