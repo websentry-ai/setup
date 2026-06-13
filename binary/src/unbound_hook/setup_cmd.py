@@ -530,10 +530,11 @@ def _write_discovery_config(opts):
     """Persist the discovery key + domain for the scheduled daemon.
 
     Writes /opt/unbound/etc/discovery.json atomically as 0600 root:wheel (it
-    holds a credential). Best-effort: a failure here is reported but never
-    aborts onboarding — the one-shot scan below still runs, and a daemon with
-    no config simply idles fail-open. Returns None on success or a short
-    reason string on failure.
+    holds a credential). The `etc` dir itself is created/enforced as 0750
+    root-owned (not the umask-default 0755) so it is not world-traversable.
+    Best-effort: a failure here is reported but never aborts onboarding — the
+    one-shot scan below still runs, and a daemon with no config simply idles
+    fail-open. Returns None on success or a short reason string on failure.
     """
     import tempfile
 
@@ -543,7 +544,25 @@ def _write_discovery_config(opts):
     ) + "\n"
     parent = DISCOVERY_CONFIG_PATH.parent
     try:
-        parent.mkdir(parents=True, exist_ok=True)
+        # Create ONLY the leaf `etc` dir, not the whole tree: /opt/unbound is
+        # provisioned (and owned) by the pkg postinstall, so its absence means
+        # something is wrong — building the tree here would risk leaving an
+        # ancestor world-readable. Refuse rather than mask that.
+        if not parent.parent.is_dir():
+            return (f"could not persist discovery config: parent "
+                    f"{parent.parent} missing (expected pkg-provisioned)")
+        # 0750 (not the umask default 0755) so the dir is not world-traversable
+        # — it reinforces the directory-level symlink/TOCTOU barrier the 0600
+        # credential file relies on. When root (the production path), enforce
+        # mode + root:root ownership even if the dir already existed; tolerate
+        # non-root/dev contexts where chmod/chown would be denied.
+        os.makedirs(parent, mode=0o750, exist_ok=True)
+        if hasattr(os, "geteuid") and os.geteuid() == 0:
+            try:
+                os.chmod(parent, 0o750)
+                os.chown(parent, 0, 0)
+            except OSError:
+                pass  # best-effort hardening; never block the credential write
         # Write to a temp file in the same dir (mkstemp is already 0600 by
         # default), set explicit perms + owner, then atomically rename so a
         # reader never observes a partial or wrong-permission file.
