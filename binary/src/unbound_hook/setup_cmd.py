@@ -148,18 +148,54 @@ def _atomic_write_text(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _command_is_unbound(command, owner_path: str) -> bool:
+    """True only when a hook command INVOKES the Unbound hook at owner_path —
+    i.e. the command starts with our path in one of the forms our writers emit:
+      "<path>" ...        (quoted, the binary + Unix python writers)
+      <path> ...          (bare path)
+      py -3 "<path>" ...  (the Windows python writer)
+    plus the bare Windows-launcher form for tolerance.
+
+    Prefix-anchored on purpose (WEB-4814): an earlier substring match would
+    mis-claim — and then DELETE — a *foreign* hook whose command merely
+    references our install path mid-string (e.g. a wrapper that execs our
+    binary as an argument). Trailing args/version drift after the path are
+    still tolerated, so idempotency is preserved.
+    """
+    if not isinstance(command, str) or not owner_path:
+        return False
+    text = command.lstrip()
+    quoted = f'"{owner_path}"'
+    # Forms where our path is the program being run, optionally behind a
+    # Windows python launcher. Bare-path forms require a trailing boundary
+    # (whitespace or end) so "/a/foo" doesn't match a command for "/a/foobar".
+    if text.startswith(quoted):
+        return True
+    for launcher in ("py -3 ", "py ", "python "):
+        if text.startswith(launcher + quoted):
+            return True
+    if text == owner_path or text.startswith(owner_path + " "):
+        return True
+    for launcher in ("py -3 ", "py ", "python "):
+        rest = launcher + owner_path
+        if text == rest or text.startswith(rest + " "):
+            return True
+    return False
+
+
 def _entry_is_unbound(entry, owner_substr: str) -> bool:
     """True when a Claude-Code-style hooks-array entry (a {matcher?, hooks:[...]}
-    group) owns at least one command pointing at the Unbound hook binary.
+    group) owns at least one command that INVOKES the Unbound hook binary.
 
-    Matching is by binary-path substring rather than exact command equality so
-    that re-running setup after a binary path/version change still recognizes —
-    and replaces — our own stale entries instead of stacking a duplicate.
+    Matching is path-prefix (not exact command equality) so that re-running
+    setup after a path/version change still recognizes — and replaces — our own
+    stale entries instead of stacking a duplicate, while refusing to claim a
+    foreign command that only references our path mid-string (WEB-4814).
     """
     if not isinstance(entry, dict):
         return False
     for hook in entry.get("hooks", []) or []:
-        if isinstance(hook, dict) and owner_substr in (hook.get("command") or ""):
+        if isinstance(hook, dict) and _command_is_unbound(hook.get("command"), owner_substr):
             return True
     return False
 

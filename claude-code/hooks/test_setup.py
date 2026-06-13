@@ -360,6 +360,56 @@ class TestMdmManagedHooksMerge(unittest.TestCase):
             self.assertEqual(
                 len(self._unbound_entries(settings2, script_path, "PreToolUse")), 1)
 
+    def test_keeps_foreign_hook_that_references_our_path_midcommand(self):
+        """WEB-4814 ownership tightening: a FOREIGN hook whose command merely
+        contains our script path mid-string (a wrapper exec'ing it as an arg)
+        is NOT Unbound-owned and MUST survive the merge — only path-prefixed
+        commands that invoke our script get stripped-and-replaced. Fails on the
+        pre-fix substring matcher; passes after."""
+        mdm = self._load_mdm()
+        with tempfile.TemporaryDirectory() as td:
+            managed = Path(td) / "managed"
+            managed.mkdir()
+            script_path = managed / "hooks" / "unbound.py"
+            sp = str(script_path)
+            wrapper = {"matcher": "*", "hooks": [
+                {"type": "command", "command": f'/usr/local/bin/foo "{sp}" --as-arg pre'}]}
+            drifted_unbound = {"matcher": "*", "hooks": [
+                {"type": "command", "command": f'"{sp}" --old-flag'}]}
+            (managed / "managed-settings.json").write_text(json.dumps(
+                {"model": "opus",
+                 "hooks": {"PreToolUse": [wrapper, drifted_unbound]}}))
+
+            settings = self._run_setup(mdm, managed)
+
+            entries = settings["hooks"]["PreToolUse"]
+            # the foreign wrapper survives despite referencing our path
+            self.assertIn(wrapper, entries)
+            # by the PRODUCTION ownership matcher, exactly one entry is ours and
+            # the wrapper is NOT ours
+            owned = [e for e in entries if mdm._entry_is_unbound(e, sp)]
+            self.assertEqual(len(owned), 1)
+            self.assertFalse(mdm._entry_is_unbound(wrapper, sp))
+            # the drifted form is gone (replaced, not stacked)
+            cmds = [h["command"] for e in entries for h in e["hooks"]]
+            self.assertNotIn(f'"{sp}" --old-flag', cmds)
+
+    def test_managed_settings_write_is_atomic_and_leaves_no_temp(self):
+        """WEB-4814 LOW-1: setup_managed_hooks must write managed-settings.json
+        atomically (tmp + os.replace) so a crash mid-write never leaves a
+        truncated file that Claude Code silently ignores. Asserts valid JSON and
+        no stray .tmp left in the managed dir."""
+        mdm = self._load_mdm()
+        with tempfile.TemporaryDirectory() as td:
+            managed = Path(td) / "managed"
+            managed.mkdir()
+            settings = self._run_setup(mdm, managed)
+            # file is complete, parseable JSON with our hooks
+            self.assertIsInstance(settings["hooks"], dict)
+            # no temp artifacts left behind in the managed dir
+            leftover = list(managed.glob("managed-settings.json.*.tmp"))
+            self.assertEqual(leftover, [], f"stray temp files: {leftover}")
+
     def test_malformed_existing_hooks_block_does_not_crash(self):
         mdm = self._load_mdm()
         with tempfile.TemporaryDirectory() as td:

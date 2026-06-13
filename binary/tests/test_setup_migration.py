@@ -241,6 +241,39 @@ def test_setup_strips_stale_unbound_hook_with_changed_command(env):
     assert unbound[0]["hooks"][0]["command"] == _cmd("claude-code", "PreToolUse")
 
 
+def test_setup_keeps_foreign_hook_that_references_our_path_midcommand(env):
+    """WEB-4814 ownership tightening: a FOREIGN hook whose command merely
+    contains our binary path mid-string (a wrapper that execs our binary as an
+    argument) is NOT Unbound-owned and MUST survive the merge — only commands
+    that *invoke* our binary (path-prefixed) get stripped-and-replaced.
+
+    Fails on the pre-fix substring matcher (it would delete the wrapper); passes
+    after. Also asserts the genuine, args-drifted Unbound entry is replaced once.
+    """
+    wrapper = {"matcher": "*", "hooks": [
+        {"type": "command",
+         "command": f'/usr/local/bin/foo "{BIN}" --as-arg pre', "timeout": 5}]}
+    drifted_unbound = {"matcher": "*", "hooks": [
+        {"type": "command", "command": f'"{BIN}" hook claude-code PreToolUse --old'}]}
+    _seed_managed_settings(env, {"PreToolUse": [wrapper, drifted_unbound]})
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+
+    entries = settings["hooks"]["PreToolUse"]
+    # (a) the foreign wrapper survives byte-for-byte despite referencing our path
+    assert wrapper in entries
+    # (b) by the PRODUCTION ownership matcher, exactly one entry is ours and it
+    #     is the freshly-emitted (un-drifted) command — the wrapper is NOT ours
+    owned = [e for e in entries if setup_cmd._entry_is_unbound(e, BIN)]
+    assert len(owned) == 1
+    assert owned[0]["hooks"][0]["command"] == _cmd("claude-code", "PreToolUse")
+    assert not setup_cmd._entry_is_unbound(wrapper, BIN)
+    # the drifted form is gone (replaced, not stacked)
+    cmds = [h["command"] for e in entries for h in e["hooks"]]
+    assert f'"{BIN}" hook claude-code PreToolUse --old' not in cmds
+
+
 def test_setup_survives_malformed_existing_hooks_block(env):
     """Fail-open: a hooks key that isn't a dict must not crash the installer —
     Unbound's hooks are written, the malformed value is discarded."""
