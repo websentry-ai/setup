@@ -712,6 +712,76 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         debug_print(f"Could not rewrite gateway URL in {path}: {e}")
 
 
+def _command_is_unbound(command, owner_path: str) -> bool:
+    """True only when a hook command INVOKES the Unbound hook at owner_path —
+    i.e. the command starts with our path in one of the forms our writers emit:
+      "<path>" ...        (quoted, the Unix python writer)
+      <path> ...          (bare path)
+      py -3 "<path>" ...  (the Windows python writer)
+    plus the bare Windows-launcher form for tolerance.
+
+    Prefix-anchored on purpose (WEB-4814): an earlier substring match would
+    mis-claim — and then DELETE — a *foreign* hook whose command merely
+    references our install path mid-string. Trailing args/version drift after
+    the path are still tolerated, so idempotency is preserved."""
+    if not isinstance(command, str) or not owner_path:
+        return False
+    text = command.lstrip()
+    quoted = f'"{owner_path}"'
+    if text.startswith(quoted):
+        return True
+    for launcher in ("py -3 ", "py ", "python "):
+        if text.startswith(launcher + quoted):
+            return True
+    if text == owner_path or text.startswith(owner_path + " "):
+        return True
+    for launcher in ("py -3 ", "py ", "python "):
+        rest = launcher + owner_path
+        if text == rest or text.startswith(rest + " "):
+            return True
+    return False
+
+
+def _entry_is_unbound(entry, owner_substr: str) -> bool:
+    """True when a hooks-array entry ({matcher?, hooks:[...]}) owns at least
+    one command that INVOKES our managed hook script. Path-prefix match (not
+    exact equality) so a changed command form still matches our own entry,
+    while refusing to claim a foreign command that only references our path
+    mid-string (WEB-4814)."""
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks", []) or []:
+        if isinstance(hook, dict) and _command_is_unbound(hook.get("command"), owner_substr):
+            return True
+    return False
+
+
+def _merge_hooks(existing_hooks, our_hooks: dict, owner_substr: str) -> dict:
+    """Merge our per-event hook config into the editor's existing hooks block
+    instead of overwriting it (WEB-4814). Per event: drop prior Unbound-owned
+    entries (idempotency), keep everyone else's, append the current one. Fails
+    safe — a non-dict existing block is treated as empty rather than crashing."""
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    for event, our_entries in our_hooks.items():
+        prior = merged.get(event)
+        if not isinstance(prior, list):
+            prior = []
+        kept = [e for e in prior if not _entry_is_unbound(e, owner_substr)]
+        merged[event] = kept + list(our_entries)
+    return merged
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """tmp + os.replace so a crash mid-write never leaves Claude Code reading a
+    truncated managed-settings.json — which it would silently ignore, dropping
+    the security control (WEB-4814 LOW-1). The tmp file lives in the same dir
+    so os.replace is an atomic rename on the same filesystem. File mode is left
+    to the caller's existing chmod step (unchanged behavior)."""
+    tmp = path.parent / (path.name + "." + str(os.getpid()) + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(str(tmp), str(path))
+
+
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
     """
     Set up system-wide managed hooks for Claude Code.
@@ -863,8 +933,14 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             ]
         }
 
-        settings["hooks"] = hooks_config
-        settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        # Merge into any pre-existing hooks block rather than overwriting it,
+        # so other tools' managed hooks survive setup (WEB-4814). Idempotent:
+        # stale Unbound entries (matched on the script path, which covers both
+        # the Unix '"path"' and Windows 'py -3 "path"' command forms) are
+        # stripped before the current one is appended.
+        settings["hooks"] = _merge_hooks(
+            settings.get("hooks"), hooks_config, str(script_path))
+        _atomic_write_text(settings_path, json.dumps(settings, indent=2))
         debug_print(f"Created managed settings: {settings_path}")
 
         # Delete the gateway key helper only after the hooks settings are
