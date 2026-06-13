@@ -586,6 +586,38 @@ jobs:
             fi
           done
 
+      # Stable "latest" alias for onboard.sh ONLY (WEB-4826). getunbound.ai
+      # proxies /setup/mdm/onboard.sh to this object so the install one-liner
+      # is version-agnostic. Copied server-side from the immutable versioned
+      # object we just uploaded — same bytes, fresh headers.
+      # CRITICAL: the alias is rewritten with Cache-Control: no-cache so a new
+      # release is never masked by a stale cached copy — without --metadata-
+      # directive REPLACE the cp would inherit the versioned object's
+      # cacheable headers. Content-type is set explicitly because, unlike the
+      # versioned objects (consumed by curl | bash), this `latest` object is
+      # the browser-reachable URL the proxy serves, and a default
+      # binary/octet-stream can trip content-sniffing/attachment behavior.
+      # The versioned objects stay immutable/cacheable; only this `latest`
+      # object is no-cache. The pkg/tar.gz are NOT aliased — the rendered
+      # onboard.sh already bakes the versioned pkg ARTIFACT_URL, so the
+      # payload stays correctly version-pinned.
+      - name: Publish latest onboard.sh alias (no-cache)
+        if: steps.cfg.outputs.publish == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          aws s3 cp \
+            "s3://$ARTIFACTS_BUCKET/macos/$VERSION/onboard.sh" \
+            "s3://$ARTIFACTS_BUCKET/macos/latest/onboard.sh" \
+            --metadata-directive REPLACE \
+            --content-type "text/x-shellscript; charset=utf-8" \
+            --cache-control "no-cache, max-age=0"
+          echo "aliased s3://$ARTIFACTS_BUCKET/macos/latest/onboard.sh -> $VERSION"
+
       - name: Create GitHub Release
         if: steps.cfg.outputs.publish == 'true'
         env:
