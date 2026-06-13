@@ -1491,6 +1491,58 @@ def _fetch_device_owner_key(opts):
     )
 
 
+# Root-only credential file the scheduled discovery LaunchDaemon reads to find
+# its api key + domain (WEB-4808). Lives in the pkg-provisioned config dir
+# (postinstall: install -d -m 0750 root:wheel /opt/unbound/etc). The recurring
+# daemon runs as root with no shell env and a world-readable plist that
+# deliberately carries no secrets, so this file is its only credential channel.
+# The entry point (packaging/unbound_discovery_entry.py:DISCOVERY_CONFIG_PATH)
+# reads it as an OPTIONAL fallback; keep the two paths in sync.
+DISCOVERY_CONFIG_PATH = Path("/opt/unbound/etc/discovery.json")
+
+
+def _write_discovery_config(api_key, domain):
+    """Persist the discovery key + domain for the scheduled daemon.
+
+    Writes /opt/unbound/etc/discovery.json atomically as 0600 root:wheel (it
+    holds a credential). Best-effort: a failure here is reported but never
+    aborts onboarding — the one-shot scan below still runs, and a daemon with
+    no config simply idles fail-open. Returns None on success or a short
+    reason string on failure.
+    """
+    import tempfile
+
+    payload = json.dumps(
+        {"api_key": api_key, "domain": domain},
+        indent=2,
+    ) + "\n"
+    parent = DISCOVERY_CONFIG_PATH.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        # Write to a temp file in the same dir (mkstemp is already 0600 by
+        # default), set explicit perms + owner, then atomically rename so a
+        # reader never observes a partial or wrong-permission file.
+        fd, tmp = tempfile.mkstemp(dir=str(parent), prefix=".discovery.", suffix=".json")
+        try:
+            os.fchmod(fd, 0o600)
+            try:
+                os.fchown(fd, 0, 0)  # root:wheel; no-op-equivalent if already root
+            except (PermissionError, OSError):
+                pass  # not root (shouldn't happen — setup requires sudo); keep going
+            with os.fdopen(fd, "w") as f:
+                f.write(payload)
+            os.replace(tmp, str(DISCOVERY_CONFIG_PATH))
+        except Exception:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        return f"could not persist discovery config: {e}"
+    return None
+
+
 def _run_discovery(opts):
     """Run the locally installed discovery binary (no install.sh download).
     Mirrors onboard.py's process-group + backstop-kill discipline."""
@@ -1499,6 +1551,10 @@ def _run_discovery(opts):
     scan_key = _fetch_device_owner_key(opts)
     if not scan_key:
         return ("skipped", "could not resolve the device owner's key from the serial")
+    # Persist creds so the scheduled LaunchDaemon (no shell env, secret-free plist) can scan every 12h (WEB-4808).
+    config_err = _write_discovery_config(scan_key, opts["backend_url"])
+    if config_err:
+        print(f"[setup] discovery: {config_err}", file=sys.stderr)
     # Key via env, never argv — the scan runs up to 90 min and argv is
     # visible to every local user via ps (same contract the hook modules'
     # frozen discovery dispatch uses).
