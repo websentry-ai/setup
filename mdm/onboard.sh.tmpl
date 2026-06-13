@@ -28,13 +28,29 @@ API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
 GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
 CURRENT_STEP="init"
 tmpdir=""
+# Set to 1 only on the install path right before its `exit 0`, so the EXIT
+# trap can tell a real install completion apart from the other zero-exit
+# paths (CLEAR teardown, early arg errors). Without this flag the trap would
+# misreport `--clear` runs as successful installs.
+install_succeeded=0
 
 # Minimal JSON string escaping (backslash + double quote): hostnames are
 # admin-settable via scutil and CAN contain either — an unescaped value
 # would make the payload invalid JSON and the report would be silently
 # dropped exactly when we need it.
 # shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
-json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'; }
+json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'; }
+
+# Hardware serial — the key the install-report endpoint joins on (one row per
+# device, keyed by org+serial_number). ioreg's IOPlatformSerialNumber is
+# locale-stable; system_profiler's "Serial Number" label is localized and
+# breaks on non-English macOS. Empty string if it can't be read (the trap
+# report just gets dropped server-side rather than misattributing the row).
+# shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
+device_serial() {
+  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+    | awk -F'"' '/IOPlatformSerialNumber/{print $4; exit}'
+}
 
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 on_exit() {
@@ -45,13 +61,62 @@ on_exit() {
   [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
   if [[ $code -ne 0 ]]; then
     echo "UNBOUND_INSTALL_FAILED step=${CURRENT_STEP} code=${code}" >&2
-    # Best-effort failure report; never let reporting mask the real failure.
-    curl -m 10 -fsS -X POST "${BACKEND_URL}/api/v1/mdm/install-report" \
+    # Best-effort failure report: this is the bash-trap "failure report" shape
+    # the endpoint validates (serial_number + step + exit_code, plus optional
+    # installer_version/ts) — NOT a full component snapshot. Field names must
+    # match the handler exactly or it 400s and is dropped silently, which is
+    # the bug this trap is supposed to surface (WEB-4826). Auth is the gateway
+    # API key in X-API-KEY, the same header every setup path uses.
+    #
+    # Fail-open: the install has already finished by the time on_exit runs, so
+    # a failed POST must never change the script's exit status — but it is no
+    # longer silent: a non-2xx (or no-response) prints a diagnostic to stderr
+    # so a regression can't hide in empty fleet telemetry again.
+    local report_serial report_body http_code
+    report_serial="$(json_escape "$(device_serial)")" || report_serial=""
+    report_body="$(printf '{"serial_number":"%s","step":"%s","exit_code":%d,"installer_version":"%s","hostname":"%s","os_version":"%s","ts":%d}' \
+      "$report_serial" "$(json_escape "$CURRENT_STEP")" "$code" \
+      "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
+      "$(json_escape "$(sw_vers -productVersion)")" "$(date +%s)")"
+    # -f dropped on purpose: we WANT the body/status on 4xx/5xx, not a curl
+    # exit. -o /dev/null discards the response body; -w prints just the code.
+    http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
+      -X POST "${BACKEND_URL}/api/v1/automations/mdm/install-report/" \
       -H 'Content-Type: application/json' \
-      -d "$(printf '{"event":"install_failed","step":"%s","code":%d,"version":"%s","hostname":"%s","os":"%s"}' \
-            "$CURRENT_STEP" "$code" "$VERSION" \
-            "$(json_escape "$(hostname)")" "$(sw_vers -productVersion)")" \
-      >/dev/null 2>&1 || true
+      -H "X-API-KEY: ${API_KEY}" \
+      -d "$report_body" 2>/dev/null)" || http_code="000"
+    case "$http_code" in
+      2??) ;;  # reported
+      *) echo "::install-report POST failed: HTTP ${http_code} (step=${CURRENT_STEP})" >&2 ;;
+    esac
+  elif [[ $install_succeeded -eq 1 ]]; then
+    # Best-effort SUCCESS report (WEB-4826): without this, fleet install
+    # coverage was failure-only and a healthy install reported nothing —
+    # blank coverage was indistinguishable from total rollout failure. Same
+    # endpoint/auth/payload shape as the failure branch above; the backend
+    # distinguishes success purely by exit_code:0 (no new schema), so step is
+    # the final "setup" step and exit_code is hard-coded 0.
+    #
+    # Fail-open is sacred here: the install has already fully succeeded by the
+    # time the trap runs, so this POST must NEVER change the exit status, block
+    # the install, or turn a telemetry hiccup into a reported failure. Every
+    # failure mode (curl error, timeout, 4xx/5xx, 404, no response) is swallowed
+    # to a stderr diagnostic only — identical tolerance to the failure branch.
+    local report_serial report_body http_code
+    report_serial="$(json_escape "$(device_serial)")" || report_serial=""
+    report_body="$(printf '{"serial_number":"%s","step":"%s","exit_code":0,"installer_version":"%s","hostname":"%s","os_version":"%s","ts":%d}' \
+      "$report_serial" "$(json_escape "$CURRENT_STEP")" \
+      "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
+      "$(json_escape "$(sw_vers -productVersion)")" "$(date +%s)")"
+    http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
+      -X POST "${BACKEND_URL}/api/v1/automations/mdm/install-report/" \
+      -H 'Content-Type: application/json' \
+      -H "X-API-KEY: ${API_KEY}" \
+      -d "$report_body" 2>/dev/null)" || http_code="000"
+    case "$http_code" in
+      2??) ;;  # reported
+      *) echo "::install-report POST failed: HTTP ${http_code} (step=${CURRENT_STEP})" >&2 ;;
+    esac
   fi
 }
 trap 'on_exit $?' EXIT
@@ -192,4 +257,10 @@ backfill_flag=""
   --backend-url "$BACKEND_URL" \
   --gateway-url "$GATEWAY_URL" \
   $backfill_flag
+
+# Reached only when every step above (incl. the idempotent re-run skip) and
+# the runtime `setup` handoff succeeded. Mark success so the EXIT trap emits a
+# success install-report; the trap is what actually POSTs (telemetry stays out
+# of the main flow, and a success report can never block this exit).
+install_succeeded=1
 exit 0
