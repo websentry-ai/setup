@@ -2,11 +2,6 @@
 # Build the unbound-hook + unbound-discovery onedir bundles with Nuitka
 # --standalone (WEB-4804: EDR bake-off vs the default PyInstaller path).
 #
-# Cross-OS: on macOS this builds universal2 (per-arch + lipo merge); on Linux
-# it builds a native single-arch standalone (no --macos-target-arch, no lipo).
-# The Linux release lane uses this as its ONLY builder — there is no PyInstaller
-# Linux path.
-#
 # ADDITIVE: this is an alternative builder behind the workflow's
 # builder=nuitka input. The PyInstaller path stays canonical and untouched;
 # output layout here is contract-identical (dist/<name>/<name>) so the
@@ -159,30 +154,6 @@ build_bundle() {
   local entry_base arch_dists=() arch
   entry_base="$(basename "$entry" .py)"
 
-  # Linux: native single-arch standalone. No --macos-target-arch (Nuitka
-  # rejects it off-macOS) and no lipo merge. Nuitka uses patchelf for RPATH
-  # (the build job installs it); --assume-yes-for-downloads lets it fetch any
-  # other helper non-interactively.
-  if [[ "$(uname -s)" == "Linux" ]]; then
-    log "building $name (linux native) from $entry"
-    PYTHONPATH="$pythonpath" "$PYTHON" -m nuitka \
-      --standalone \
-      --deployment \
-      --static-libpython=no \
-      --assume-yes-for-downloads \
-      --output-dir="$BUILD/$name" \
-      --output-filename="$name" \
-      ${extra_flags[@]+"${extra_flags[@]}"} \
-      "$entry"
-    [[ -x "$BUILD/$name/$entry_base.dist/$name" ]] || die "$name: no executable produced"
-    rm -rf "${dist_out:?}/$name"
-    cp -R "$BUILD/$name/$entry_base.dist" "$dist_out/$name"
-    [[ -x "$dist_out/$name/$name" ]] || die "$name: bundle assembly failed"
-    log "built $dist_out/$name"
-    return
-  fi
-
-  # macOS: per-arch builds + universal2 lipo merge (unchanged).
   # shellcheck disable=SC2086  # word-splitting the arch list is intended
   for arch in $archs; do
     log "building $name ($arch) from $entry"
