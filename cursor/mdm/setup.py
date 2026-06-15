@@ -934,10 +934,10 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
 
     try:
         result = subprocess.run(
-            ["curl", "-fsSL", "-w", "\n%{http_code}", "-H", f"Authorization: Bearer {auth_api_key}", url],
+            ["curl", "-fsSL", "-w", "\n%{http_code}", "--max-time", "30", "--retry", "3", "--retry-delay", "2", "--retry-connrefused", "-H", f"Authorization: Bearer {auth_api_key}", url],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=140
         )
 
         output_lines = result.stdout.strip().split('\n')

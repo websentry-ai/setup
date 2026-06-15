@@ -165,8 +165,11 @@ def _claude_hooks_config():
     }
 
 
-def _codex_hooks_config():
-    cmd = lambda ev: hook_command_for_event("codex", ev)
+def _codex_hooks_config(hook_command):
+    # Codex execs the command as a single on-disk program (its python path
+    # registers a bare script, not a shell line), so every event shares one
+    # wrapper command; the event is read from stdin.
+    cmd = lambda ev: hook_command
     return {
         "PreToolUse": [{"matcher": "*", "hooks": [
             {"type": "command", "command": cmd("PreToolUse"), "timeout": 15000}]}],
@@ -274,9 +277,20 @@ def _write_claude_managed_settings(m) -> bool:
 def _write_codex_managed_settings(m) -> bool:
     try:
         managed_dir = m.get_managed_settings_dir()
-        managed_dir.mkdir(parents=True, exist_ok=True)
-        settings_path = managed_dir / "hooks.json"
+        hooks_dir = managed_dir / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
 
+        # Codex execs the hooks.json command as a single on-disk program — its
+        # python path registers a bare "<dir>/unbound.py" (no args). Mirror that
+        # exactly with a tiny sh wrapper that execs the binary (no python3
+        # needed; the binary reads the event from stdin). The write overwrites
+        # any python-era unbound.py, so no separate stale-script removal is run.
+        wrapper = hooks_dir / "unbound.py"
+        _atomic_write_text(wrapper, '#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY)
+        if platform.system().lower() in ("darwin", "linux"):
+            os.chmod(wrapper, 0o755)
+
+        settings_path = managed_dir / "hooks.json"
         settings = {}
         if settings_path.exists():
             try:
@@ -285,11 +299,12 @@ def _write_codex_managed_settings(m) -> bool:
             except Exception:
                 settings = {}
 
-        settings["hooks"] = _codex_hooks_config()
+        settings["hooks"] = _codex_hooks_config('"%s"' % wrapper)
         _atomic_write_text(settings_path, json.dumps(settings, indent=2))
 
         if platform.system().lower() in ("darwin", "linux"):
             os.chmod(managed_dir, 0o755)
+            os.chmod(hooks_dir, 0o755)
             os.chmod(settings_path, 0o644)
         return True
     except Exception as e:
@@ -413,7 +428,6 @@ def _setup_codex(opts):
     state = _detect_state(m.get_managed_settings_dir() / "hooks.json")
     if not _write_codex_managed_settings(m):
         return ("deferred", "managed settings write failed")
-    _remove_stale_managed_script(m.get_managed_settings_dir())
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id)

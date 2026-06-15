@@ -418,10 +418,11 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
     try:
         result = subprocess.run(
             ["curl", "-fsSL", "-w", "\n%{http_code}",
+             "--max-time", "30", "--retry", "3", "--retry-delay", "2", "--retry-connrefused",
              "-H", f"Authorization: Bearer {auth_api_key}", url],
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=140
         )
 
         output_lines = result.stdout.strip().split('\n')
@@ -614,6 +615,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
+        return True
 
     if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
         debug_print(f"Could not write config for {username}")
@@ -1273,14 +1275,18 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     # curl subprocess, not urllib: the frozen binary ships no CA bundle, so
     # Python's ssl fails CERTIFICATE_VERIFY_FAILED; curl uses the system trust
     # store (the corporate-CA/Zscaler contract every other call here relies on).
-    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}"]
+    # --retry rides out transient backend errors (5xx/429/timeout/conn-refused)
+    # so a flaky gateway during onboard doesn't drop a chunk; --max-time caps
+    # each attempt and the subprocess budget below outlasts all the retries.
+    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}",
+           "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
     for header_name, header_value in headers.items():
         cmd += ["-H", f"{header_name}: {header_value}"]
     if body is not None:
         cmd += ["--data-binary", "@-"]
     cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
-        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout)
+        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout * 4 + 20)
     except (subprocess.TimeoutExpired, OSError) as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''

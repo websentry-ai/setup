@@ -88,12 +88,24 @@ def test_setup_full_run_configures_everything(env):
             {"type": "command", "command": _cmd("claude-code", "SessionEnd"), "async": True, "timeout": 60}]}],
     }
 
-    # codex hooks.json — no async flags, no SessionEnd.
+    # codex hooks.json — codex execs the command as a single on-disk program,
+    # so every event registers the bare wrapper PATH (no " hook codex" args),
+    # and a sh wrapper that execs the binary lives at <managed>/hooks/unbound.py.
+    codex_wrapper = env["tmp"] / "managed-codex" / "hooks" / "unbound.py"
+    codex_cmd = f'"{codex_wrapper}"'
     codex = json.loads((env["tmp"] / "managed-codex" / "hooks.json").read_text())
     assert set(codex["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"}
-    assert codex["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"] == 15000
+    assert codex["hooks"]["PreToolUse"][0]["hooks"][0] == {
+        "type": "command", "command": codex_cmd, "timeout": 15000}
     assert codex["hooks"]["PostToolUse"][0]["hooks"][0] == {
-        "type": "command", "command": _cmd("codex", "PostToolUse"), "timeout": 60}
+        "type": "command", "command": codex_cmd, "timeout": 60}
+    for ev in codex["hooks"]:
+        c = codex["hooks"][ev][0]["hooks"][0]["command"]
+        assert c == codex_cmd and " hook codex" not in c
+    # the wrapper is a real executable that execs the binary — no python needed
+    assert codex_wrapper.exists() and (codex_wrapper.stat().st_mode & 0o111)
+    body = codex_wrapper.read_text()
+    assert body.startswith("#!/bin/sh") and f'exec "{BIN}" hook codex' in body
 
     # cursor enterprise hooks.json — 12 events, 15000 on the 3 pre-execution
     # events, no timeout key on the rest (verbatim from cursor/hooks.json).
@@ -268,9 +280,13 @@ def test_sweep_runs_inside_setup(env):
     assert not (env["home"] / ".claude" / "hooks" / "unbound.py").exists()
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
     assert json.loads((env["home"] / ".unbound" / "config.json").read_text())["api_key"] == "per-device-key"
-    # managed stale scripts removed by adapters AFTER their settings rewrite
-    for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
+    # claude/cursor remove their python-era managed script; codex instead hosts
+    # a binary wrapper at hooks/unbound.py (its hook-command target).
+    for tool in ("managed-claude", "enterprise-cursor"):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
+    codex_wrapper = env["tmp"] / "managed-codex" / "hooks" / "unbound.py"
+    assert codex_wrapper.exists()
+    assert 'exec "%s" hook codex' % BIN in codex_wrapper.read_text()
     # python-era copilot registration replaced by a binary-era one, and the
     # now-unreferenced python script removed by the adapter (B2)
     copilot = json.loads((env["home"] / ".copilot" / "hooks" / "unbound.json").read_text())
