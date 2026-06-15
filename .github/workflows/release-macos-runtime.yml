@@ -38,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Dry-run version (build+smoke only; no Release, no S3)"
+        description: "Version to build (and publish, if publish=true). Dry-run default builds+smokes only."
         required: true
         default: "0.0.0-dev"
       builder:
@@ -48,6 +48,10 @@ on:
           - pyinstaller
           - nuitka
         default: pyinstaller
+      publish:
+        description: "Publish to S3 + latest/onboard.sh + GitHub Release. Required to ship a Nuitka build (tag pushes always publish)."
+        type: boolean
+        default: false
 
 permissions:
   contents: write # create the GitHub Release
@@ -84,6 +88,7 @@ jobs:
           HAS_S3: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID != '' && secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY != '' }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_BUILDER: ${{ inputs.builder }}
+          INPUT_PUBLISH: ${{ inputs.publish }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
@@ -91,7 +96,7 @@ jobs:
             publish=true
           else
             version="$INPUT_VERSION"
-            publish=false
+            publish="${INPUT_PUBLISH:-false}"
           fi
 
           # Builder choice (WEB-4804 EDR bake-off). Tag releases ALWAYS use
@@ -111,9 +116,12 @@ jobs:
           # for the EDR rehearsal; the default builder keeps today's names.
           builder_suffix=""
           [[ "$builder" == "nuitka" ]] && builder_suffix="-nuitka"
+          # A tag always builds pyinstaller (above), so a non-pyinstaller publish
+          # can only come from a deliberate workflow_dispatch with publish=true —
+          # that is how a Nuitka build ships. Allow it, but make it loud: the
+          # latest/onboard.sh alias the fleet installs from will serve it.
           if [[ "$publish" == "true" && "$builder" != "pyinstaller" ]]; then
-            echo "::error::tag releases must use the pyinstaller builder (got '$builder')"
-            exit 1
+            echo "::warning::publishing a '$builder' build — fleet onboard.sh (latest alias) will serve it"
           fi
           [[ -n "$version" ]] || { echo "::error::could not derive version"; exit 1; }
           # Digit-led semver ONLY (script-injection guard + path sanity):
