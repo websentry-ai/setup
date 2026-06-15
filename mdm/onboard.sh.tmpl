@@ -311,7 +311,10 @@ install_artifact() {  # $1=artifact path
       # print --version must never become the live version (the previous
       # `current` stays put as rollback, matching the macOS postinstall).
       for b in unbound-hook unbound-discovery; do
-        run_with_timeout 10 "$PREFIX/$VERSION/$b/$b" --version >/dev/null \
+        # 60s, not 10: this gates whether `current` flips, so a false timeout
+        # on a slow VM aborts the whole install (no runtime). --version is fast;
+        # the ceiling only bounds a genuinely hung/corrupt binary.
+        run_with_timeout 60 "$PREFIX/$VERSION/$b/$b" --version >/dev/null \
           || { echo "pre-warm failed for $b; not flipping current" >&2; return 1; }
       done
       ln -sfn "$PREFIX/$VERSION" "$PREFIX/current"

@@ -119,6 +119,16 @@ jobs:
           if [[ "$publish" == "true" && "$HAS_S3" != "true" ]]; then
             echo "::error::publish requires ARTIFACTS_AWS_* credentials"; exit 1
           fi
+          # Version-lockstep (mirror the macOS cfg added in main): both binaries'
+          # __version__ must equal the release version. Fail fast BEFORE the
+          # Nuitka build so a forgotten bump can't upload an orphaned,
+          # mis-versioned tarball to the immutable bucket.
+          hook_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' binary/src/unbound_hook/__init__.py)"
+          disc_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' packaging/unbound_discovery_entry.py)"
+          if [[ "$hook_ver" != "$version" || "$disc_ver" != "$version" ]]; then
+            msg="version mismatch: release=$version unbound_hook=$hook_ver unbound_discovery=$disc_ver — bump BOTH __version__ to $version"
+            if [[ "$publish" == "true" ]]; then echo "::error::$msg"; exit 1; else echo "::warning::$msg (dry-run)"; fi
+          fi
           discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
           lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
           [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]] \
@@ -159,8 +169,12 @@ jobs:
             echo "::warning::Linux build interpreter $py_full != discovery.lock PYTHON_VERSION $LOCK_PYTHON (runner-provided, not pinned)"
           fi
           echo "Linux build interpreter: $py_full (discovery.lock: $LOCK_PYTHON)"
-          # Nuitka --standalone on Linux uses patchelf to set RPATH on the bundle.
-          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+          # Nuitka --standalone COMPILES to C: it needs a C toolchain
+          # (build-essential) and the CPython dev headers (python3-dev →
+          # Python.h) for the interpreter the venv was created from, plus
+          # patchelf to set the bundle RPATH. None are guaranteed on the
+          # arm64 runner image, so install explicitly.
+          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf python3-dev build-essential
           # Mirror the macOS Nuitka install: setuptools FIRST, then the sdist with
           # --no-build-isolation so it builds against that pinned setuptools.
           python3 -m venv .build-venv-nuitka
@@ -714,6 +728,12 @@ jobs:
           if [[ "$PUBLISH" == "true" ]]; then
             linux_amd64_sha="$(aws s3 cp "s3://$ARTIFACTS_BUCKET/linux/$VERSION/unbound-runtime-$VERSION-linux-amd64.tar.gz.sha256" - 2>/dev/null | awk '{print $1}')" || linux_amd64_sha=""
             linux_arm64_sha="$(aws s3 cp "s3://$ARTIFACTS_BUCKET/linux/$VERSION/unbound-runtime-$VERSION-linux-arm64.tar.gz.sha256" - 2>/dev/null | awk '{print $1}')" || linux_arm64_sha=""
+            # Loud signal: continue-on-error means a failed/absent Linux arch
+            # degrades silently to an empty token. Surface it so a publish that
+            # drops an arch isn't invisible (the release still ships — macOS +
+            # the other arch are unaffected — but the gap is now in the log).
+            [[ -n "$linux_amd64_sha" ]] || echo "::warning::publishing WITHOUT linux/amd64 — its runtime is missing from S3 (build failed or runner unavailable); amd64 Linux installs will fail preflight"
+            [[ -n "$linux_arm64_sha" ]] || echo "::warning::publishing WITHOUT linux/arm64 — its runtime is missing from S3 (build failed or runner unavailable); arm64 Linux installs will fail preflight"
           fi
           # Every placeholder must be substituted (incl. all four Linux tokens)
           # or the guard below fails the release.
