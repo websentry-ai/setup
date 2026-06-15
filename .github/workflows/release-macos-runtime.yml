@@ -133,6 +133,18 @@ jobs:
             exit 1
           fi
 
+          # Fail fast on a version-lockstep mismatch BEFORE the ~5-min
+          # build+sign+notarize. unbound-hook and unbound-discovery carry their
+          # own __version__ and the install-test asserts each binary self-reports
+          # the release version; checking the source here turns a forgotten bump
+          # into a seconds-long failure instead of one after notarization.
+          hook_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' binary/src/unbound_hook/__init__.py)"
+          disc_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' packaging/unbound_discovery_entry.py)"
+          if [[ "$hook_ver" != "$version" || "$disc_ver" != "$version" ]]; then
+            msg="version mismatch: release=$version unbound_hook=$hook_ver unbound_discovery=$disc_ver — bump BOTH __version__ (binary/src/unbound_hook/__init__.py + packaging/unbound_discovery_entry.py) to $version"
+            if [[ "$publish" == "true" ]]; then echo "::error::$msg"; exit 1; else echo "::warning::$msg (dry-run)"; fi
+          fi
+
           sign=$HAS_APP_CERT
           pkg_sign=false; notarize=false
           [[ "$sign" == "true" && "$HAS_INSTALLER_CERT" == "true" ]] && pkg_sign=true
