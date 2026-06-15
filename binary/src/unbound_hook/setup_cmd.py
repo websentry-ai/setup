@@ -274,42 +274,65 @@ def _write_claude_managed_settings(m) -> bool:
         return False
 
 
-def _write_codex_managed_settings(m) -> bool:
-    try:
-        managed_dir = m.get_managed_settings_dir()
-        hooks_dir = managed_dir / "hooks"
+def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
+    """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
+    actually discovers them from), mirroring the python user-level
+    configure_codex_hooks exactly. Codex execs the hooks.json command as a
+    single on-disk program, so a tiny sh wrapper at ~/.codex/hooks/unbound.py
+    execs the binary (no python3 needed; the event is read from stdin) and the
+    registered command is that bare wrapper PATH. Privilege-dropped; merge is
+    idempotent (match-by-command) and preserves other tools' hooks."""
+    hooks_dir = home_dir / ".codex" / "hooks"
+    wrapper = hooks_dir / "unbound.py"
+    hooks_path = home_dir / ".codex" / "hooks.json"
+    hook_command = str(wrapper)
+
+    def _install():
         hooks_dir.mkdir(parents=True, exist_ok=True)
-
-        # Codex execs the hooks.json command as a single on-disk program — its
-        # python path registers a bare "<dir>/unbound.py" (no args). Mirror that
-        # exactly with a tiny sh wrapper that execs the binary (no python3
-        # needed; the binary reads the event from stdin). The write overwrites
-        # any python-era unbound.py, so no separate stale-script removal is run.
-        wrapper = hooks_dir / "unbound.py"
-        _atomic_write_text(wrapper, '#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY)
-        if platform.system().lower() in ("darwin", "linux"):
-            os.chmod(wrapper, 0o755)
-
-        settings_path = managed_dir / "hooks.json"
-        settings = {}
-        if settings_path.exists():
-            try:
-                with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f) or {}
-            except Exception:
-                settings = {}
-
-        settings["hooks"] = _codex_hooks_config('"%s"' % wrapper)
-        _atomic_write_text(settings_path, json.dumps(settings, indent=2))
-
-        if platform.system().lower() in ("darwin", "linux"):
-            os.chmod(managed_dir, 0o755)
-            os.chmod(hooks_dir, 0o755)
-            os.chmod(settings_path, 0o644)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(str(wrapper), flags, 0o755)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write('#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY)
+        os.chmod(wrapper, 0o755)
+        _merge_codex_hooks_json(hooks_path, hook_command)
         return True
-    except Exception as e:
-        print(f"Failed to write managed settings: {e}")
-        return False
+
+    return bool(m._run_as_user(username, _install))
+
+
+def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
+    """Idempotent merge of the codex hook events into hooks.json, mirroring the
+    python configure_codex_hooks merge: re-runs don't duplicate our entry and
+    other tools' hooks are preserved."""
+    if hooks_path.exists():
+        with open(hooks_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+    else:
+        config = {}
+
+    hooks_config = _codex_hooks_config(hook_command)
+    if "hooks" not in config:
+        config["hooks"] = {}
+
+    for event, new_config in hooks_config.items():
+        if event in config["hooks"]:
+            existing_config = config["hooks"][event]
+            our_hook_exists = False
+            for existing_item in existing_config:
+                if isinstance(existing_item, dict):
+                    for hook in existing_item.get("hooks", []):
+                        if hook.get("command", "") == hook_command:
+                            our_hook_exists = True
+                            break
+            if not our_hook_exists:
+                config["hooks"][event].extend(new_config)
+        else:
+            config["hooks"][event] = new_config
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(hooks_path), flags, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
 
 
 def _write_cursor_enterprise_hooks(m) -> tuple:
@@ -417,23 +440,56 @@ def _setup_codex(opts):
     if not success:
         return ("deferred", "failed to set UNBOUND_CODEX_API_KEY")
 
-    for username, home_dir in m.get_all_user_homes():
+    # codex 0.125 discovers hooks from ~/.codex/hooks.json (user layer), not the
+    # managed dir — so register per-user there, mirroring the python user-level
+    # setup. No managed write and no user-level strip (the install IS the user
+    # registration).
+    user_homes = m.get_all_user_homes()
+    state = _codex_detect_state(user_homes)
+    installed = 0
+    for username, home_dir in user_homes:
         m.remove_gateway_artifacts_for_user(username, home_dir)
-        m.remove_user_level_hooks_for_user(username, home_dir)
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
         m.enable_codex_hooks_feature_for_user(username, home_dir)
+        if _install_codex_hooks_for_user(m, username, home_dir):
+            installed += 1
 
-    state = _detect_state(m.get_managed_settings_dir() / "hooks.json")
-    if not _write_codex_managed_settings(m):
-        return ("deferred", "managed settings write failed")
+    if user_homes and installed == 0:
+        return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
                             install_state=state, serial_number=device_id)
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
+
+
+def _codex_detect_state(user_homes) -> str:
+    """Per-user analog of the python detect_install_state(): now that codex
+    registers in ~/.codex/hooks.json, install state is read from there.
+    'fresh' = no user has a hooks.json; 'persisted' = at least one references
+    this binary or the python-era unbound.py; 'tampered' otherwise."""
+    saw_json = False
+    saw_known_ref = False
+    try:
+        for _username, home_dir in user_homes:
+            p = home_dir / ".codex" / "hooks.json"
+            if p.exists():
+                saw_json = True
+                try:
+                    text = p.read_text(encoding="utf-8")
+                    if str(HOOK_BINARY) in text or "unbound.py" in text:
+                        saw_known_ref = True
+                except OSError:
+                    pass
+        if not saw_json:
+            return "fresh"
+        return "persisted" if saw_known_ref else "tampered"
+    except Exception as e:
+        print(f"[setup] codex install_state detection failed: {e}", file=sys.stderr)
+        return None
 
 
 def _setup_cursor(opts):
