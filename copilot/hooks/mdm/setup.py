@@ -616,6 +616,7 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
+        return True
 
     if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
         debug_print(f"Could not write config for {username}")

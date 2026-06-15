@@ -1,6 +1,8 @@
 import unittest
 from unittest.mock import patch
+import json
 import os
+import shutil
 import socket
 import tempfile
 import threading
@@ -295,6 +297,66 @@ class TestMdmBackfillCutoff(unittest.TestCase):
             send_result=(2, 1, 0),
         )
         self.assertEqual(writes, [ok_home])
+
+
+class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
+    """A successful per-user config write must NOT be logged as a failure.
+
+    Regression for the missing ``return True`` in the privilege-dropped
+    ``_write`` closure of ``write_unbound_config_for_user``: without it the
+    closure returned None on success, ``_run_as_user`` relayed that None, and
+    the caller misreported every successful write as
+    ``Could not write config for <user>``. The same closure ships verbatim in
+    claude-code, codex and copilot, so all three are checked here.
+    """
+
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+    TOOLS = {
+        "claude-code": _REPO_ROOT / "claude-code" / "hooks" / "mdm" / "setup.py",
+        "codex": _REPO_ROOT / "codex" / "hooks" / "mdm" / "setup.py",
+        "copilot": _REPO_ROOT / "copilot" / "hooks" / "mdm" / "setup.py",
+    }
+
+    @staticmethod
+    def _load(name, path):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            f"mdm_setup_{name.replace('-', '_')}", str(path)
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_successful_write_is_not_reported_as_failure(self):
+        for name, path in self.TOOLS.items():
+            with self.subTest(tool=name):
+                mdm = self._load(name, path)
+                logs = []
+                home = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+
+                # Mimic a successful privilege drop: _run_as_user runs the
+                # callback in-process and relays its return value verbatim.
+                def fake_run_as_user(username, fn, *args, **kwargs):
+                    return fn(*args, **kwargs)
+
+                with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
+                     patch.object(mdm, "_repair_user_ownership", lambda *a, **k: None), \
+                     patch.object(mdm, "debug_print", side_effect=logs.append):
+                    mdm.write_unbound_config_for_user(
+                        "tester", home, "sk-test-key",
+                        urls={"base_url": "https://backend", "gateway_url": "https://gw"},
+                    )
+
+                config_file = home / ".unbound" / "config.json"
+                self.assertTrue(config_file.exists(), f"{name}: config.json was not written")
+                data = json.loads(config_file.read_text())
+                self.assertEqual(data["api_key"], "sk-test-key")
+                self.assertEqual(data["base_url"], "https://backend")
+                self.assertFalse(
+                    any("Could not write config" in m for m in logs),
+                    f"{name}: success path falsely logged a failure: {logs}",
+                )
 
 
 if __name__ == "__main__":
