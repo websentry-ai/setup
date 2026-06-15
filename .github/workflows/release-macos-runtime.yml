@@ -358,14 +358,18 @@ jobs:
       - name: Install pinned pytest (hash-verified) for the parity suite
         run: |
           set -euo pipefail
-          ./.build-venv/bin/pip install --require-hashes --no-deps -r packaging/requirements-test.txt
+          # PyInstaller builds .build-venv; Nuitka builds .build-venv-nuitka. Use
+          # whichever the active builder created so the parity suite has a pip.
+          VENV=$([ "${{ steps.cfg.outputs.builder }}" = "nuitka" ] && echo .build-venv-nuitka || echo .build-venv)
+          "$VENV/bin/pip" install --require-hashes --no-deps -r packaging/requirements-test.txt
 
       - name: Parity gate — 104-test CLI-boundary suite vs built hook bundle
         env:
           UNBOUND_HOOK_BINARY: ${{ github.workspace }}/dist/unbound-hook/unbound-hook
         run: |
           set -euo pipefail
-          ./.build-venv/bin/python -m pytest binary/tests/ -q
+          VENV=$([ "${{ steps.cfg.outputs.builder }}" = "nuitka" ] && echo .build-venv-nuitka || echo .build-venv)
+          "$VENV/bin/python" -m pytest binary/tests/ -q
 
       - name: Import Developer ID certs into throwaway keychain
         if: steps.cfg.outputs.sign == 'true'
