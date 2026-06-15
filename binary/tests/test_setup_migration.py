@@ -90,12 +90,13 @@ def test_setup_full_run_configures_everything(env):
             {"type": "command", "command": _cmd("claude-code", "SessionEnd"), "async": True, "timeout": 60}]}],
     }
 
-    # codex hooks.json — codex execs the command as a single on-disk program,
-    # so every event registers the bare wrapper PATH (no " hook codex" args),
-    # and a sh wrapper that execs the binary lives at <managed>/hooks/unbound.py.
-    codex_wrapper = env["tmp"] / "managed-codex" / "hooks" / "unbound.py"
-    codex_cmd = f'"{codex_wrapper}"'
-    codex = json.loads((env["tmp"] / "managed-codex" / "hooks.json").read_text())
+    # codex hooks.json — codex 0.125 discovers hooks from ~/.codex/hooks.json
+    # (the user layer), so every event registers the BARE wrapper PATH (no
+    # quotes, no " hook codex" args), and a sh wrapper that execs the binary
+    # lives at ~/.codex/hooks/unbound.py.
+    codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    codex_cmd = str(codex_wrapper)
+    codex = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
     assert set(codex["hooks"]) == {"PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop", "SessionStart"}
     assert codex["hooks"]["PreToolUse"][0]["hooks"][0] == {
         "type": "command", "command": codex_cmd, "timeout": 15000}
@@ -108,6 +109,8 @@ def test_setup_full_run_configures_everything(env):
     assert codex_wrapper.exists() and (codex_wrapper.stat().st_mode & 0o111)
     body = codex_wrapper.read_text()
     assert body.startswith("#!/bin/sh") and f'exec "{BIN}" hook codex' in body
+    # the dead managed hooks.json location is NOT written
+    assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
 
     # cursor enterprise hooks.json — 12 events, 15000 on the 3 pre-execution
     # events, no timeout key on the rest (verbatim from cursor/hooks.json).
@@ -153,7 +156,7 @@ def test_setup_component_failure_does_not_abort_others(env, monkeypatch):
     rc = setup_cmd.run(["--api-key", "admin-key"])
     assert rc == 1  # deferred component surfaces in the exit code
     assert not (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
-    assert (env["tmp"] / "managed-codex" / "hooks.json").exists()
+    assert (env["home"] / ".codex" / "hooks.json").exists()
     assert (env["tmp"] / "enterprise-cursor" / "hooks.json").exists()
     assert (env["home"] / ".copilot" / "hooks" / "unbound.json").exists()
 
@@ -201,6 +204,21 @@ def test_setup_is_idempotent(env):
     first = (env["tmp"] / "managed-claude" / "managed-settings.json").read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").read_text() == first
+
+
+def test_setup_codex_user_hooks_idempotent(env):
+    """A second run must not duplicate the codex hook entry in ~/.codex/hooks.json
+    nor clobber the per-user wrapper."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    hooks_path = env["home"] / ".codex" / "hooks.json"
+    first = json.loads(hooks_path.read_text())
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    second = json.loads(hooks_path.read_text())
+    assert first == second
+    for ev in second["hooks"]:
+        # exactly one item, one hook entry per event — no duplication
+        assert len(second["hooks"][ev]) == 1
+        assert len(second["hooks"][ev][0]["hooks"]) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +328,13 @@ def test_sweep_runs_inside_setup(env):
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").exists()
     assert json.loads((env["home"] / ".unbound" / "config.json").read_text())["api_key"] == "per-device-key"
     # claude/cursor remove their python-era managed script; codex instead hosts
-    # a binary wrapper at hooks/unbound.py (its hook-command target).
+    # a binary wrapper at the per-user ~/.codex/hooks/unbound.py (its hook target).
     for tool in ("managed-claude", "enterprise-cursor"):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
-    codex_wrapper = env["tmp"] / "managed-codex" / "hooks" / "unbound.py"
+    codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
     assert codex_wrapper.exists()
     assert 'exec "%s" hook codex' % BIN in codex_wrapper.read_text()
+    assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
     # python-era copilot registration replaced by a binary-era one, and the
     # now-unreferenced python script removed by the adapter (B2)
     copilot = json.loads((env["home"] / ".copilot" / "hooks" / "unbound.json").read_text())
@@ -337,17 +356,19 @@ def test_copilot_deferred_keeps_python_era(env, monkeypatch):
 
 
 def test_failed_component_keeps_python_serving_path(env, monkeypatch):
-    """F1 regression: when a tool's setup defers (MDM key fetch fails), its
-    managed python script must survive so existing hook registrations never
+    """F1 regression: when a managed-settings tool defers (MDM key fetch fails),
+    its managed python script must survive so existing hook registrations never
     point at a deleted file."""
     _plant_python_era_artifacts(env["home"], env["tmp"])
-    monkeypatch.setattr(env["modules"]["codex"], "fetch_api_key_from_mdm",
+    monkeypatch.setattr(env["modules"]["claude-code"], "fetch_api_key_from_mdm",
                         lambda *a: None)
     assert setup_cmd.run(["--api-key", "admin-key"]) == 1
-    # codex deferred -> its managed script intact; others rewritten + cleaned
-    assert (env["tmp"] / "managed-codex" / "hooks" / "unbound.py").exists()
-    assert not (env["tmp"] / "managed-claude" / "hooks" / "unbound.py").exists()
+    # claude-code deferred -> its managed script intact; others rewritten + cleaned
+    assert (env["tmp"] / "managed-claude" / "hooks" / "unbound.py").exists()
     assert not (env["tmp"] / "enterprise-cursor" / "hooks" / "unbound.py").exists()
+    # codex configured fine -> per-user hooks.json registered, no managed write
+    assert (env["home"] / ".codex" / "hooks.json").exists()
+    assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
 
 
 def test_sweep_scoped_to_tools_leaves_other_tools_alone(env):
