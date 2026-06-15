@@ -65,188 +65,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # ---- Linux runtime lane (per-arch tarball, Nuitka) ------------------------
-  # ONE matrix job builds linux/amd64 + linux/arm64 natively with Nuitka
-  # --standalone (build-nuitka.sh detects Linux and skips the macOS
-  # universal2/lipo path), then uploads each arch's tarball + .sha256 to
-  # s3://.../linux/<version>/. The macOS `release` job (which `needs` this one)
-  # reads those shas back from S3 at render time and bakes them into the SINGLE
-  # onboard.sh — that's why there is no per-job sha output here.
-  #
-  # continue-on-error: a Linux build failure (or an unavailable arm64 runner)
-  # must NEVER block the proven macOS release. A missing arch -> its sha is
-  # absent from S3 -> onboard.sh token renders empty -> that arch fails
-  # preflight cleanly ("no published runtime") while macOS + the other arch
-  # ship normally. Gated like the macOS lane: placeholder discovery on tokenless
-  # dry-runs, real pinned checkout on tag/publish.
-  #
-  # NOTE: unproven — validate with a workflow_dispatch dry-run (publish=false)
-  # before a tag. arm64 needs GitHub-hosted arm64 runners enabled for the org.
-  linux:
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
-    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
-    environment: release
-    timeout-minutes: 60
-    continue-on-error: true   # never block the macOS release on the Linux lane
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-
-      - name: Configure (version + gates)
-        id: cfg
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_PUBLISH: ${{ inputs.publish }}
-          HAS_DISCOVERY_TOKEN: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN != '' }}
-          HAS_S3: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID != '' && secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY != '' }}
-        run: |
-          set -euo pipefail
-          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
-            version="${GITHUB_REF_NAME#runtime-v}"; publish=true
-          else
-            version="$INPUT_VERSION"; publish="${INPUT_PUBLISH:-false}"
-          fi
-          # Same digit-led semver guard as the macOS lane (the version becomes a
-          # dir under /opt/unbound and an S3 key).
-          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
-            echo "::error::version '$version' is not digit-led semver"; exit 1
-          fi
-          if [[ "$publish" == "true" && "$HAS_DISCOVERY_TOKEN" != "true" ]]; then
-            echo "::error::publish requires DISCOVERY_CHECKOUT_TOKEN"; exit 1
-          fi
-          if [[ "$publish" == "true" && "$HAS_S3" != "true" ]]; then
-            echo "::error::publish requires ARTIFACTS_AWS_* credentials"; exit 1
-          fi
-          # Version-lockstep (mirror the macOS cfg added in main): both binaries'
-          # __version__ must equal the release version. Fail fast BEFORE the
-          # Nuitka build so a forgotten bump can't upload an orphaned,
-          # mis-versioned tarball to the immutable bucket.
-          hook_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' binary/src/unbound_hook/__init__.py)"
-          disc_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' packaging/unbound_discovery_entry.py)"
-          if [[ "$hook_ver" != "$version" || "$disc_ver" != "$version" ]]; then
-            msg="version mismatch: release=$version unbound_hook=$hook_ver unbound_discovery=$disc_ver — bump BOTH __version__ to $version"
-            if [[ "$publish" == "true" ]]; then echo "::error::$msg"; exit 1; else echo "::warning::$msg (dry-run)"; fi
-          fi
-          discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
-          lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
-          [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]] \
-            || { echo "::error::SOURCE_SHA is not a 40-char SHA: '$discovery_sha'"; exit 1; }
-          [[ -n "$lock_python" ]] || { echo "::error::PYTHON_VERSION missing from discovery.lock"; exit 1; }
-          {
-            echo "version=$version"
-            echo "publish=$publish"
-            echo "discovery_token=$HAS_DISCOVERY_TOKEN"
-            echo "discovery_sha=$discovery_sha"
-            echo "lock_python=$lock_python"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Checkout coding-discovery-tool at pinned SHA
-        if: steps.cfg.outputs.discovery_token == 'true'
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
-        with:
-          repository: websentry-ai/coding-discovery-tool
-          ref: ${{ steps.cfg.outputs.discovery_sha }}
-          token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
-          path: discovery-src
-
-      - name: Note skipped discovery checkout
-        if: steps.cfg.outputs.discovery_token != 'true'
-        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — placeholder discovery build (dry-run only)"
-
-      - name: Install pinned Nuitka (hash-verified) + patchelf
-        env:
-          LOCK_PYTHON: ${{ steps.cfg.outputs.lock_python }}
-        run: |
-          set -euo pipefail
-          py_full="$(python3 -c 'import platform;print(platform.python_version())')"
-          [[ "${py_full%.*}" == "3.12" ]] || { echo "::error::need python 3.12, have $py_full"; exit 1; }
-          # macOS pins the interpreter EXACTLY (install-python.sh); the Linux
-          # runner provides its own patch, so warn (don't fail) on drift to
-          # leave a trace. TODO: pin the exact CPython patch on Linux.
-          if [[ "$py_full" != "$LOCK_PYTHON" ]]; then
-            echo "::warning::Linux build interpreter $py_full != discovery.lock PYTHON_VERSION $LOCK_PYTHON (runner-provided, not pinned)"
-          fi
-          echo "Linux build interpreter: $py_full (discovery.lock: $LOCK_PYTHON)"
-          # Nuitka --standalone COMPILES to C: it needs a C toolchain
-          # (build-essential) and the CPython dev headers (python3-dev →
-          # Python.h) for the interpreter the venv was created from, plus
-          # patchelf to set the bundle RPATH. None are guaranteed on the
-          # arm64 runner image, so install explicitly.
-          sudo apt-get update -qq && sudo apt-get install -y -qq patchelf python3-dev build-essential
-          # Mirror the macOS Nuitka install: setuptools FIRST, then the sdist with
-          # --no-build-isolation so it builds against that pinned setuptools.
-          python3 -m venv .build-venv-nuitka
-          grep '^setuptools' packaging/requirements-nuitka-build.txt > "$RUNNER_TEMP/setuptools-pin.txt"
-          ./.build-venv-nuitka/bin/pip install --require-hashes --no-deps -r "$RUNNER_TEMP/setuptools-pin.txt"
-          ./.build-venv-nuitka/bin/pip install --require-hashes --no-deps --no-build-isolation \
-            -r packaging/requirements-nuitka-build.txt
-          ./.build-venv-nuitka/bin/python -m nuitka --version
-
-      # Native Nuitka build (build-nuitka.sh detects Linux); tar with the SAME
-      # layout the macOS pkg installs (unbound-hook/ + unbound-discovery/).
-      - name: Build tarball (Nuitka)
-        env:
-          HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
-          VERSION: ${{ steps.cfg.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          [[ "$HAS_DISCOVERY_SRC" == "true" ]] && export UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src"
-          NUITKA_PYTHON="$GITHUB_WORKSPACE/.build-venv-nuitka/bin/python" \
-            ./packaging/scripts/build-nuitka.sh dist
-          for b in unbound-hook unbound-discovery; do
-            [[ -x "dist/$b/$b" ]] || { echo "::error::missing bundle dist/$b/$b"; exit 1; }
-            echo "smoke: $b --version -> $("dist/$b/$b" --version)"
-          done
-          tar="unbound-runtime-$VERSION-linux-$ARCH.tar.gz"
-          mkdir -p out
-          tar -czf "out/$tar" -C dist unbound-hook unbound-discovery
-          ( cd out && sha256sum "$tar" > "$tar.sha256" )
-
-      - name: Upload build artifact (always, incl. dry-runs)
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: linux-${{ matrix.arch }}
-          path: out/
-          retention-days: 14
-
-      - name: Upload to S3 (immutable, no-overwrite)
-        if: steps.cfg.outputs.publish == 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
-          VERSION: ${{ steps.cfg.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          tar="unbound-runtime-$VERSION-linux-$ARCH.tar.gz"
-          # tarball + checksum only; onboard.sh is rendered+uploaded by the macOS
-          # job (the single script needs BOTH OSes' shas). Immutable: re-publish
-          # of an existing version is a hard error demanding a version bump.
-          for name in "$tar" "$tar.sha256"; do
-            key="linux/$VERSION/$name"
-            if err="$(aws s3api put-object --bucket "$ARTIFACTS_BUCKET" \
-                  --key "$key" --body "out/$name" --if-none-match '*' 2>&1 >/dev/null)"; then
-              echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
-            else
-              if echo "$err" | grep -qiE 'PreconditionFailed|412'; then
-                echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — bump the version; published artifacts are immutable."
-              elif echo "$err" | grep -qi 'AccessDenied'; then
-                echo "::error::S3 AccessDenied for $key — EITHER the object already exists on a deny-overwrite bucket (bump the version) OR the ARTIFACTS_AWS creds lack PutObject / are expired. Verify credentials before assuming a collision."
-              else
-                echo "::error::S3 upload failed for $key: $err"
-              fi
-              exit 1
-            fi
-          done
-
   release:
     # macos-14 = Apple Silicon GitHub-hosted runner (with Rosetta, so the
     # smoke test can execute the x86_64 slice too).
-    needs: [linux]
     runs-on: macos-14
     environment: release
     timeout-minutes: 180 # must exceed the 2h notary --wait (WEB-4802) plus build/sign/test time
@@ -693,20 +514,13 @@ jobs:
           [[ -d /var/log/unbound && -f /etc/newsyslog.d/ai.getunbound.conf ]]
           echo "install-test OK"
 
-      - name: Render onboard.sh (version + sha + artifact URLs baked in)
+      - name: Render onboard.sh (version + sha + artifact URL baked in)
         env:
           VERSION: ${{ steps.cfg.outputs.version }}
           PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
           ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
-          PUBLISH: ${{ steps.cfg.outputs.publish }}
-          # Read the Linux shas back from S3 (the `linux` job, a dependency,
-          # uploaded them). Creds are read-only here; the publish upload below
-          # uses the same secrets.
-          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
         run: |
           set -euo pipefail
           pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
@@ -716,47 +530,19 @@ jobs:
           # otherwise onboard.sh would reject its own artifact.
           team_id=""
           [[ "$PKG_SIGN" == "true" ]] && team_id="$TEAM_ID"
-          linux_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/linux/$VERSION"
-          linux_amd64_url="$linux_base/unbound-runtime-$VERSION-linux-amd64.tar.gz"
-          linux_arm64_url="$linux_base/unbound-runtime-$VERSION-linux-arm64.tar.gz"
-          # Linux shas: only baked on publish (that's when the `linux` job put
-          # the tarballs on S3). A missing object — build failed, arm64 runner
-          # absent, or dry-run — leaves the sha empty so that arch's onboard.sh
-          # token renders empty and fails preflight cleanly; macOS + the other
-          # arch still ship.
-          linux_amd64_sha=""; linux_arm64_sha=""
-          if [[ "$PUBLISH" == "true" ]]; then
-            linux_amd64_sha="$(aws s3 cp "s3://$ARTIFACTS_BUCKET/linux/$VERSION/unbound-runtime-$VERSION-linux-amd64.tar.gz.sha256" - 2>/dev/null | awk '{print $1}')" || linux_amd64_sha=""
-            linux_arm64_sha="$(aws s3 cp "s3://$ARTIFACTS_BUCKET/linux/$VERSION/unbound-runtime-$VERSION-linux-arm64.tar.gz.sha256" - 2>/dev/null | awk '{print $1}')" || linux_arm64_sha=""
-            # Loud signal: continue-on-error means a failed/absent Linux arch
-            # degrades silently to an empty token. Surface it so a publish that
-            # drops an arch isn't invisible (the release still ships — macOS +
-            # the other arch are unaffected — but the gap is now in the log).
-            [[ -n "$linux_amd64_sha" ]] || echo "::warning::publishing WITHOUT linux/amd64 — its runtime is missing from S3 (build failed or runner unavailable); amd64 Linux installs will fail preflight"
-            [[ -n "$linux_arm64_sha" ]] || echo "::warning::publishing WITHOUT linux/arm64 — its runtime is missing from S3 (build failed or runner unavailable); arm64 Linux installs will fail preflight"
-          fi
-          # Every placeholder must be substituted (incl. all four Linux tokens)
-          # or the guard below fails the release.
           sed -e "s|@VERSION@|$VERSION|g" \
               -e "s|@PKG_SHA256@|$pkg_sha256|g" \
               -e "s|@ARTIFACT_URL@|$ARTIFACT_URL|g" \
               -e "s|@TEAM_ID@|$team_id|g" \
-              -e "s|@LINUX_AMD64_URL@|$linux_amd64_url|g" \
-              -e "s|@LINUX_AMD64_SHA256@|$linux_amd64_sha|g" \
-              -e "s|@LINUX_ARM64_URL@|$linux_arm64_url|g" \
-              -e "s|@LINUX_ARM64_SHA256@|$linux_arm64_sha|g" \
               mdm/onboard.sh.tmpl > out/onboard.sh
           chmod +x out/onboard.sh
           bash -n out/onboard.sh
           # `! grep` would NOT fail the step under set -e (bash ignores
           # errexit for ! pipelines) — use an explicit if so an unrendered
           # @TOKEN@ really blocks the release.
-          # [A-Z0-9_] (not [A-Z_]) so digit-bearing tokens like
-          # @LINUX_AMD64_SHA256@ / @PKG_SHA256@ are also caught if a sed line
-          # is ever dropped.
-          if grep -q '@[A-Z0-9_]*@' out/onboard.sh; then
+          if grep -q '@[A-Z_]*@' out/onboard.sh; then
             echo "::error::unrendered placeholder left in onboard.sh"
-            grep -n '@[A-Z0-9_]*@' out/onboard.sh
+            grep -n '@[A-Z_]*@' out/onboard.sh
             exit 1
           fi
           echo "$pkg_sha256" > "out/$PKG_NAME.sha256"
@@ -815,10 +601,8 @@ jobs:
                   --if-none-match '*' 2>&1 >/dev/null)"; then
               echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
             else
-              if echo "$err" | grep -qiE 'PreconditionFailed|412'; then
+              if echo "$err" | grep -qiE 'PreconditionFailed|412|AccessDenied'; then
                 echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — runtime-v$VERSION has been published before. Published artifacts are immutable: bump the version and cut a new tag; do NOT retry or delete."
-              elif echo "$err" | grep -qi 'AccessDenied'; then
-                echo "::error::S3 AccessDenied for $key — EITHER the object already exists on a deny-overwrite bucket (version already published -> bump the version) OR the ARTIFACTS_AWS creds lack PutObject / are expired. Verify credentials before assuming an immutability collision."
               else
                 echo "::error::S3 upload failed for $key: $err"
               fi
