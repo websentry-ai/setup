@@ -68,14 +68,15 @@ jobs:
   # ---- Linux runtime lane (per-arch tarball, Nuitka) ------------------------
   # ONE matrix job builds linux/amd64 + linux/arm64 natively with Nuitka
   # --standalone (build-nuitka.sh detects Linux and skips the macOS
-  # universal2/lipo path), then uploads each arch's tarball + .sha256 to
-  # s3://.../linux/<version>/. The macOS `release` job (which `needs` this one)
-  # reads those shas back from S3 at render time and bakes them into the SINGLE
-  # onboard.sh — that's why there is no per-job sha output here.
+  # universal2/lipo path) and uploads each arch's tarball + .sha256 as a
+  # WORKFLOW ARTIFACT only. The macOS `release` job (which `needs` this one)
+  # downloads them and publishes them through its single existing S3 loop under
+  # macos/<version>/ — so there is no separate Linux S3 upload and no second
+  # bucket prefix to permission/own.
   #
   # continue-on-error: a Linux build failure (or an unavailable arm64 runner)
-  # must NEVER block the proven macOS release. A missing arch -> its sha is
-  # absent from S3 -> onboard.sh token renders empty -> that arch fails
+  # must NEVER block the proven macOS release. A missing arch -> the macOS job
+  # finds no tarball -> onboard.sh token renders empty -> that arch fails
   # preflight cleanly ("no published runtime") while macOS + the other arch
   # ship normally. Gated like the macOS lane: placeholder discovery on tokenless
   # dry-runs, real pinned checkout on tag/publish.
@@ -205,43 +206,16 @@ jobs:
           tar -czf "out/$tar" -C dist unbound-hook unbound-discovery
           ( cd out && sha256sum "$tar" > "$tar.sha256" )
 
+      # The tarball + .sha256 ride out ONLY as a workflow artifact. The macOS
+      # `release` job downloads them and publishes them to S3 through its single
+      # existing upload loop (under macos/<version>/) — so there is no separate
+      # Linux S3 upload and no second bucket prefix to permission/own.
       - name: Upload build artifact (always, incl. dry-runs)
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: linux-${{ matrix.arch }}
           path: out/
           retention-days: 14
-
-      - name: Upload to S3 (immutable, no-overwrite)
-        if: steps.cfg.outputs.publish == 'true'
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
-          VERSION: ${{ steps.cfg.outputs.version }}
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          tar="unbound-runtime-$VERSION-linux-$ARCH.tar.gz"
-          # tarball + checksum only; onboard.sh is rendered+uploaded by the macOS
-          # job (the single script needs BOTH OSes' shas). Immutable: re-publish
-          # of an existing version is a hard error demanding a version bump.
-          for name in "$tar" "$tar.sha256"; do
-            key="linux/$VERSION/$name"
-            if err="$(aws s3api put-object --bucket "$ARTIFACTS_BUCKET" \
-                  --key "$key" --body "out/$name" --if-none-match '*' 2>&1 >/dev/null)"; then
-              echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
-            else
-              if echo "$err" | grep -qiE 'PreconditionFailed|412'; then
-                echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — bump the version; published artifacts are immutable."
-              elif echo "$err" | grep -qi 'AccessDenied'; then
-                echo "::error::S3 AccessDenied for $key — EITHER the object already exists on a deny-overwrite bucket (bump the version) OR the ARTIFACTS_AWS creds lack PutObject / are expired. Verify credentials before assuming a collision."
-              else
-                echo "::error::S3 upload failed for $key: $err"
-              fi
-              exit 1
-            fi
-          done
 
   release:
     # macos-14 = Apple Silicon GitHub-hosted runner (with Rosetta, so the
@@ -693,6 +667,20 @@ jobs:
           [[ -d /var/log/unbound && -f /etc/newsyslog.d/ai.getunbound.conf ]]
           echo "install-test OK"
 
+      # Pull the Linux tarballs (+ .sha256) the `linux` matrix job produced into
+      # out/, so the render step can bake their shas and the single S3 upload
+      # loop below publishes them under macos/<version>/ — no separate Linux
+      # upload, no second bucket prefix. continue-on-error: a missing arch (build
+      # failed / arm64 runner absent) must not break the macOS release; its sha
+      # is then empty -> onboard.sh token empty -> clean preflight skip.
+      - name: Download Linux runtime tarballs
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: linux-*
+          path: out
+          merge-multiple: true
+
       - name: Render onboard.sh (version + sha + artifact URLs baked in)
         env:
           VERSION: ${{ steps.cfg.outputs.version }}
@@ -700,13 +688,6 @@ jobs:
           ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
-          PUBLISH: ${{ steps.cfg.outputs.publish }}
-          # Read the Linux shas back from S3 (the `linux` job, a dependency,
-          # uploaded them). Creds are read-only here; the publish upload below
-          # uses the same secrets.
-          AWS_ACCESS_KEY_ID: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
-          AWS_DEFAULT_REGION: ${{ env.ARTIFACTS_REGION }}
         run: |
           set -euo pipefail
           pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
@@ -716,25 +697,25 @@ jobs:
           # otherwise onboard.sh would reject its own artifact.
           team_id=""
           [[ "$PKG_SIGN" == "true" ]] && team_id="$TEAM_ID"
-          linux_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/linux/$VERSION"
-          linux_amd64_url="$linux_base/unbound-runtime-$VERSION-linux-amd64.tar.gz"
-          linux_arm64_url="$linux_base/unbound-runtime-$VERSION-linux-arm64.tar.gz"
-          # Linux shas: only baked on publish (that's when the `linux` job put
-          # the tarballs on S3). A missing object — build failed, arm64 runner
-          # absent, or dry-run — leaves the sha empty so that arch's onboard.sh
-          # token renders empty and fails preflight cleanly; macOS + the other
-          # arch still ship.
-          linux_amd64_sha=""; linux_arm64_sha=""
-          if [[ "$PUBLISH" == "true" ]]; then
-            linux_amd64_sha="$(aws s3 cp "s3://$ARTIFACTS_BUCKET/linux/$VERSION/unbound-runtime-$VERSION-linux-amd64.tar.gz.sha256" - 2>/dev/null | awk '{print $1}')" || linux_amd64_sha=""
-            linux_arm64_sha="$(aws s3 cp "s3://$ARTIFACTS_BUCKET/linux/$VERSION/unbound-runtime-$VERSION-linux-arm64.tar.gz.sha256" - 2>/dev/null | awk '{print $1}')" || linux_arm64_sha=""
-            # Loud signal: continue-on-error means a failed/absent Linux arch
-            # degrades silently to an empty token. Surface it so a publish that
-            # drops an arch isn't invisible (the release still ships — macOS +
-            # the other arch are unaffected — but the gap is now in the log).
-            [[ -n "$linux_amd64_sha" ]] || echo "::warning::publishing WITHOUT linux/amd64 — its runtime is missing from S3 (build failed or runner unavailable); amd64 Linux installs will fail preflight"
-            [[ -n "$linux_arm64_sha" ]] || echo "::warning::publishing WITHOUT linux/arm64 — its runtime is missing from S3 (build failed or runner unavailable); arm64 Linux installs will fail preflight"
-          fi
+          # Everything lives under ONE release folder: macos/<version>/. The
+          # Linux tarballs were downloaded into out/ above and are uploaded there
+          # by the single S3 loop below.
+          base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$VERSION"
+          linux_amd64_url="$base/unbound-runtime-$VERSION-linux-amd64.tar.gz"
+          linux_arm64_url="$base/unbound-runtime-$VERSION-linux-arm64.tar.gz"
+          # Linux shas come from the downloaded .sha256 files (present on both
+          # dry-run and publish). A missing arch (build failed / runner absent)
+          # leaves its sha empty -> token empty -> that arch fails preflight
+          # cleanly while macOS + the other arch ship.
+          read_sha() { [[ -f "out/$1" ]] && awk '{print $1}' "out/$1" || true; }
+          linux_amd64_sha="$(read_sha "unbound-runtime-$VERSION-linux-amd64.tar.gz.sha256")"
+          linux_arm64_sha="$(read_sha "unbound-runtime-$VERSION-linux-arm64.tar.gz.sha256")"
+          # Loud signal: continue-on-error means a failed/absent Linux arch
+          # degrades silently to an empty token. Surface it so a dropped arch
+          # isn't invisible (the release still ships — macOS + the other arch
+          # are unaffected — but the gap is now in the log).
+          [[ -n "$linux_amd64_sha" ]] || echo "::warning::no linux/amd64 runtime — its build failed or runner was unavailable; amd64 Linux installs will fail preflight"
+          [[ -n "$linux_arm64_sha" ]] || echo "::warning::no linux/arm64 runtime — its build failed or runner was unavailable; arm64 Linux installs will fail preflight"
           # Every placeholder must be substituted (incl. all four Linux tokens)
           # or the guard below fails the release.
           sed -e "s|@VERSION@|$VERSION|g" \
@@ -802,11 +783,20 @@ jobs:
           TAR_NAME: ${{ steps.cfg.outputs.tar_name }}
         run: |
           set -euo pipefail
-          # Explicit upload ORDER (I3): payload first, checksums next,
-          # onboard.sh strictly LAST. If publishing dies halfway, the public
-          # prefix must never contain an onboard.sh that points at a 404 —
-          # the script only appears once everything it references exists.
-          for name in "$PKG_NAME" "$PKG_NAME.sha256" "$TAR_NAME" "$TAR_NAME.sha256" onboard.sh; do
+          # Explicit upload ORDER (I3): payloads + checksums first, onboard.sh
+          # strictly LAST. If publishing dies halfway, the public prefix must
+          # never contain an onboard.sh that points at a 404 — the script only
+          # appears once everything it references exists.
+          names=( "$PKG_NAME" "$PKG_NAME.sha256" "$TAR_NAME" "$TAR_NAME.sha256" )
+          # Linux tarballs (downloaded from the `linux` job into out/). OPTIONAL:
+          # an arch may be absent under continue-on-error — upload whatever is
+          # present, BEFORE onboard.sh so it never references a missing object.
+          for lt in out/unbound-runtime-"$VERSION"-linux-*.tar.gz; do
+            [[ -e "$lt" ]] || continue
+            b="$(basename "$lt")"; names+=( "$b" "$b.sha256" )
+          done
+          names+=( onboard.sh )   # strictly LAST (I3)
+          for name in "${names[@]}"; do
             f="out/$name"
             [[ -f "$f" ]] || { echo "::error::expected artifact missing: $f"; exit 1; }
             key="macos/$VERSION/$name"
