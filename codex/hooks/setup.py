@@ -957,6 +957,9 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     except (subprocess.TimeoutExpired, OSError) as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    if result.returncode != 0:
+        # curl transport error (DNS/TLS/refused); -sS keeps the message on stderr.
+        debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
     out = result.stdout or b''
     # curl appended "\n<http_code>" after the response body; split it off.
     sep = out.rfind(b'\n')

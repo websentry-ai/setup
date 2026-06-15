@@ -352,7 +352,10 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
     except KeyError:
         return
     uid, gid = info.pw_uid, info.pw_gid
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", None)
+    if o_nofollow is None:
+        return  # can't open safely without the symlink guard — skip, don't degrade it
+    flags = os.O_RDONLY | o_nofollow | getattr(os, "O_NONBLOCK", 0)
     for path in paths:
         try:
             fd = os.open(str(path), flags)
@@ -363,8 +366,8 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
             safe = stat.S_ISDIR(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
             if safe and st.st_uid != uid:
                 os.fchown(fd, uid, gid)
-        except OSError:
-            pass
+        except OSError as e:
+            debug_print(f"_repair_user_ownership: could not chown {path}: {e}")
         finally:
             os.close(fd)
 
