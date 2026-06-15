@@ -128,7 +128,7 @@ def run(argv) -> int:
         try:
             subprocess.run([str(exe), "--version"], check=True,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                           timeout=120)
+                           timeout=10)  # --version is a fast smoke test; bound a hung binary
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
             print(f"ERROR: {exe} failed pre-warm ({e}); not scheduling daemon", file=sys.stderr)
             return 1

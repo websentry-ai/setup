@@ -273,7 +273,7 @@ install_artifact() {  # $1=artifact path
       # print --version must never become the live version (the previous
       # `current` stays put as rollback, matching the macOS postinstall).
       for b in unbound-hook unbound-discovery; do
-        run_with_timeout 120 "$PREFIX/$VERSION/$b/$b" --version >/dev/null \
+        run_with_timeout 10 "$PREFIX/$VERSION/$b/$b" --version >/dev/null \
           || { echo "pre-warm failed for $b; not flipping current" >&2; return 1; }
       done
       ln -sfn "$PREFIX/$VERSION" "$PREFIX/current"
