@@ -902,6 +902,128 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         return False
 
 
+def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
+    """Register Unbound's codex hooks per-user in ~/.codex/hooks.json — the
+    layer codex actually discovers hooks from. Downloads unbound.py to
+    ~/.codex/hooks/ and merge-registers the bare script path, mirroring the
+    user-level configure_codex_hooks exactly. Privilege-drops to the target
+    user; merge is idempotent and preserves other tools' hooks."""
+    hooks_dir = home_dir / ".codex" / "hooks"
+    script_path = hooks_dir / "unbound.py"
+    hooks_path = home_dir / ".codex" / "hooks.json"
+    is_windows = platform.system().lower() == "windows"
+
+    if is_windows:
+        launcher = "py -3" if shutil.which("py") else "python"
+        hook_command = f'{launcher} "{script_path}"'
+    else:
+        hook_command = str(script_path)
+
+    def _install():
+        if not download_file(SCRIPT_URL, script_path):
+            return False
+        rewrite_gateway_url_in_file(script_path, gateway_url)
+        try:
+            current_mode = script_path.stat().st_mode
+            os.chmod(script_path, current_mode | 0o111)
+        except OSError:
+            pass
+
+        if hooks_path.exists():
+            with open(hooks_path, 'r', encoding='utf-8') as f:
+                config = json.load(f)
+        else:
+            config = {}
+
+        hooks_config = {
+            "PreToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 15000
+                        }
+                    ]
+                }
+            ],
+            "PostToolUse": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "UserPromptSubmit": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ],
+            "SessionStart": [
+                {
+                    "matcher": "*",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": hook_command,
+                            "timeout": 60
+                        }
+                    ]
+                }
+            ]
+        }
+
+        if "hooks" not in config:
+            config["hooks"] = {}
+
+        for event, new_config in hooks_config.items():
+            if event in config["hooks"]:
+                existing_config = config["hooks"][event]
+                our_hook_exists = False
+                for existing_item in existing_config:
+                    if isinstance(existing_item, dict):
+                        for hook in existing_item.get("hooks", []):
+                            existing_cmd = hook.get("command", "")
+                            if existing_cmd == hook_command or (is_windows and str(script_path) in existing_cmd):
+                                our_hook_exists = True
+                                break
+                if not our_hook_exists:
+                    config["hooks"][event].extend(new_config)
+            else:
+                config["hooks"][event] = new_config
+
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+        fd = os.open(str(hooks_path), flags, 0o644)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=2)
+        return True
+
+    return bool(_run_as_user(username, _install))
+
+
 def clear_managed_hooks() -> str:
     """Remove the hooks script and hooks setting from managed Codex config.
 
@@ -1608,23 +1730,25 @@ def main():
         return
     debug_print("UNBOUND_CODEX_API_KEY set successfully")
 
-    # Remove gateway artifacts, strip leftover user-level Unbound hooks
-    # (so managed hooks don't fire twice), write unbound config, and enable
-    # the codex_hooks feature flag for all users.
-    for username, home_dir in get_all_user_homes():
-        remove_gateway_artifacts_for_user(username, home_dir)
-        remove_user_level_hooks_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
-        enable_codex_hooks_feature_for_user(username, home_dir)
-
+    # codex 0.125 discovers hooks from ~/.codex/hooks.json (user layer), not the
+    # managed dir — so remove gateway artifacts, write unbound config, enable the
+    # codex_hooks feature flag, and register the hook per-user (the install IS the
+    # user registration; no managed write and no user-level strip).
     state = detect_install_state()
 
-    print("\nConfiguring Codex managed hooks...")
-    if setup_managed_hooks(gateway_url=gateway_url):
-        managed_dir = get_managed_settings_dir()
-        print(f"Created managed hooks in {managed_dir}")
-    else:
-        print("Failed to configure managed hooks")
+    print("\nConfiguring Codex user hooks...")
+    installed = 0
+    user_homes = get_all_user_homes()
+    for username, home_dir in user_homes:
+        remove_gateway_artifacts_for_user(username, home_dir)
+        write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+        enable_codex_hooks_feature_for_user(username, home_dir)
+        if configure_codex_hooks_for_user(username, home_dir, gateway_url):
+            print(f"Registered codex hooks for {username}")
+            installed += 1
+
+    if user_homes and installed == 0:
+        print("Failed to configure codex hooks for any user")
         return
 
     print("\n" + "=" * 60)
