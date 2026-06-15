@@ -59,7 +59,9 @@ exe = EXE(
     strip=False,
     upx=False,
     console=True,
-    target_arch="universal2",
+    # Defaults to universal2 (macOS); the Linux release lane sets
+    # UNBOUND_TARGET_ARCH="" -> None to build native. macOS leaves it unset.
+    target_arch=os.environ.get("UNBOUND_TARGET_ARCH", "universal2") or None,
     codesign_identity=None,
     entitlements_file=None,
 )

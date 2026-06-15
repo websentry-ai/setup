@@ -4,6 +4,8 @@ Subcommands:
   hook <tool> [<event>]   stdin/stdout hook dispatch (fail-open, exit 0)
   setup [...]             MDM onboarding (port of mdm/onboard.py)
   backfill [...]          historical transcript seeding
+  install-daemon [...]    register the periodic discovery daemon (Linux systemd;
+                          no-op on macOS, where the pkg owns launchd)
   clear [...]             full deregistration
   --version / version     print version (pkg postinstall pre-warm contract:
                           must exit fast without reading stdin)
@@ -19,6 +21,7 @@ Usage:
   unbound-hook hook <tool> [<event>]      tools: claude-code|cursor|copilot|codex
   unbound-hook setup --api-key <key> [--discovery-key <key>] [options]
   unbound-hook backfill (--all | --user <name>) [--dry-run] [options]
+  unbound-hook install-daemon
   unbound-hook clear
   unbound-hook --version
 """ % __version__
@@ -44,6 +47,9 @@ def main(argv=None) -> int:
     if cmd == "backfill":
         from . import backfill_cmd
         return backfill_cmd.run(rest)
+    if cmd == "install-daemon":
+        from . import daemon_cmd
+        return daemon_cmd.run(rest)
     if cmd == "clear":
         from . import clear_cmd
         return clear_cmd.run(rest)

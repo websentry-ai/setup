@@ -1,0 +1,166 @@
+name: build-linux-runtime
+description: >
+  Build (and on publish, upload to S3) the per-arch Linux runtime tarball.
+  Factored out of release-macos-runtime.yml so linux-amd64 and linux-arm64
+  share one implementation. Secrets are passed in as inputs (composite actions
+  cannot read `secrets` directly).
+
+inputs:
+  arch:
+    description: amd64 | arm64 (tarball-name only; the build is native to the runner)
+    required: true
+  input_version:
+    description: workflow_dispatch version input (ignored on tag pushes)
+    required: false
+    default: ""
+  input_publish:
+    description: workflow_dispatch publish input (tag pushes always publish)
+    required: false
+    default: "false"
+  discovery_token:
+    description: DISCOVERY_CHECKOUT_TOKEN secret (empty -> placeholder build, dry-run only)
+    required: false
+    default: ""
+  aws_access_key_id:
+    required: false
+    default: ""
+  aws_secret_access_key:
+    required: false
+    default: ""
+  artifacts_bucket:
+    required: true
+  artifacts_region:
+    required: true
+
+outputs:
+  sha256:
+    description: sha256 of the built tarball (baked into onboard.sh by the macOS render step)
+    value: ${{ steps.build.outputs.sha256 }}
+
+runs:
+  using: composite
+  steps:
+    - name: Configure (version + gates)
+      id: cfg
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.input_version }}
+        INPUT_PUBLISH: ${{ inputs.input_publish }}
+        HAS_DISCOVERY_TOKEN: ${{ inputs.discovery_token != '' }}
+        HAS_S3: ${{ inputs.aws_access_key_id != '' && inputs.aws_secret_access_key != '' }}
+      run: |
+        set -euo pipefail
+        if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+          version="${GITHUB_REF_NAME#runtime-v}"; publish=true
+        else
+          version="$INPUT_VERSION"; publish="${INPUT_PUBLISH:-false}"
+        fi
+        # Same digit-led semver guard as the macOS lane (script-injection +
+        # path-sanity: the version becomes a dir under /opt/unbound and an S3 key).
+        if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+          echo "::error::version '$version' is not digit-led semver"; exit 1
+        fi
+        # A tag (publish) release must build the REAL discovery binary and be
+        # able to upload it — mirror the macOS lane's refusals.
+        if [[ "$publish" == "true" && "$HAS_DISCOVERY_TOKEN" != "true" ]]; then
+          echo "::error::publish requires DISCOVERY_CHECKOUT_TOKEN"; exit 1
+        fi
+        if [[ "$publish" == "true" && "$HAS_S3" != "true" ]]; then
+          echo "::error::publish requires ARTIFACTS_AWS_* credentials"; exit 1
+        fi
+        discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
+        lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
+        [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]] \
+          || { echo "::error::SOURCE_SHA is not a 40-char SHA: '$discovery_sha'"; exit 1; }
+        {
+          echo "version=$version"
+          echo "publish=$publish"
+          echo "discovery_token=$HAS_DISCOVERY_TOKEN"
+          echo "discovery_sha=$discovery_sha"
+          echo "lock_pyinstaller=$lock_pyinstaller"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Checkout coding-discovery-tool at pinned SHA
+      if: steps.cfg.outputs.discovery_token == 'true'
+      uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      with:
+        repository: websentry-ai/coding-discovery-tool
+        ref: ${{ steps.cfg.outputs.discovery_sha }}
+        token: ${{ inputs.discovery_token }}
+        path: discovery-src
+
+    - name: Note skipped discovery checkout
+      if: steps.cfg.outputs.discovery_token != 'true'
+      shell: bash
+      run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — placeholder discovery build (dry-run only)"
+
+    - name: Install pinned PyInstaller (hash-verified)
+      shell: bash
+      env:
+        LOCK_PYINSTALLER: ${{ steps.cfg.outputs.lock_pyinstaller }}
+      run: |
+        set -euo pipefail
+        # ubuntu-24.04 ships CPython 3.12 as python3; require the minor line
+        # (exact patch isn't reproducibility-critical on Linux the way the
+        # universal2 build is on macOS — warn, don't fail, on a patch drift).
+        py_mm="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
+        [[ "$py_mm" == "3.12" ]] || { echo "::error::need python 3.12, have $py_mm"; exit 1; }
+        python3 -m venv .build-venv
+        ./.build-venv/bin/pip install --require-hashes --no-deps \
+          -r packaging/requirements-build-linux.txt
+        actual_pi="$(./.build-venv/bin/pyinstaller --version)"
+        [[ "$actual_pi" == "$LOCK_PYINSTALLER" ]] \
+          || { echo "::error::installed PyInstaller $actual_pi != lock $LOCK_PYINSTALLER"; exit 1; }
+
+    - name: Build tarball
+      id: build
+      shell: bash
+      env:
+        HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
+        VERSION: ${{ steps.cfg.outputs.version }}
+        ARCH: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        [[ "$HAS_DISCOVERY_SRC" == "true" ]] && export UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src"
+        PYINSTALLER="$GITHUB_WORKSPACE/.build-venv/bin/pyinstaller" \
+          ./packaging/scripts/build-linux.sh "$VERSION" "$ARCH" out
+        sha="$(awk '{print $1}' "out/unbound-runtime-$VERSION-linux-$ARCH.tar.gz.sha256")"
+        echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+    - name: Upload build artifact (always, incl. dry-runs)
+      uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      with:
+        name: linux-${{ inputs.arch }}
+        path: out/
+        retention-days: 14
+
+    - name: Upload to S3 (immutable, no-overwrite)
+      if: steps.cfg.outputs.publish == 'true'
+      shell: bash
+      env:
+        AWS_ACCESS_KEY_ID: ${{ inputs.aws_access_key_id }}
+        AWS_SECRET_ACCESS_KEY: ${{ inputs.aws_secret_access_key }}
+        AWS_DEFAULT_REGION: ${{ inputs.artifacts_region }}
+        ARTIFACTS_BUCKET: ${{ inputs.artifacts_bucket }}
+        VERSION: ${{ steps.cfg.outputs.version }}
+        ARCH: ${{ inputs.arch }}
+      run: |
+        set -euo pipefail
+        tar="unbound-runtime-$VERSION-linux-$ARCH.tar.gz"
+        # tarball + checksum only; onboard.sh is rendered+uploaded by the macOS
+        # job (the single script needs BOTH OSes' shas). Immutable: re-publish
+        # of an existing version is a hard error demanding a version bump.
+        for name in "$tar" "$tar.sha256"; do
+          key="linux/$VERSION/$name"
+          if err="$(aws s3api put-object --bucket "$ARTIFACTS_BUCKET" \
+                --key "$key" --body "out/$name" --if-none-match '*' 2>&1 >/dev/null)"; then
+            echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
+          else
+            if echo "$err" | grep -qiE 'PreconditionFailed|412|AccessDenied'; then
+              echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — bump the version; published artifacts are immutable."
+            else
+              echo "::error::S3 upload failed for $key: $err"
+            fi
+            exit 1
+          fi
+        done

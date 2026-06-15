@@ -65,9 +65,63 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # ---- Linux runtime lane (per-arch tarball) --------------------------------
+  # Native single-arch PyInstaller builds. The shared specs default to macOS
+  # universal2; UNBOUND_TARGET_ARCH="" (set by build-linux.sh) makes them build
+  # native. Each arch is its own job so it exposes a clean per-arch tar_sha256
+  # output that the macOS render step seds into the SINGLE onboard.sh — that is
+  # why the macOS job `needs` both. Gated like the macOS lane: placeholder
+  # discovery on tokenless dry-runs, real pinned checkout on tag/publish.
+  #
+  # NOTE: untested in CI as of this commit — validate with a workflow_dispatch
+  # dry-run (publish=false) before relying on it for a tag release. linux-arm64
+  # requires GitHub-hosted arm64 runners to be enabled for the org.
+  linux-amd64:
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 60
+    outputs:
+      tar_sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Build + publish linux/amd64 tarball
+        id: build
+        uses: ./.github/actions/build-linux-runtime
+        with:
+          arch: amd64
+          input_version: ${{ inputs.version }}
+          input_publish: ${{ inputs.publish }}
+          discovery_token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
+          aws_access_key_id: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
+          artifacts_bucket: ${{ env.ARTIFACTS_BUCKET }}
+          artifacts_region: ${{ env.ARTIFACTS_REGION }}
+
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    environment: release
+    timeout-minutes: 60
+    outputs:
+      tar_sha256: ${{ steps.build.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - name: Build + publish linux/arm64 tarball
+        id: build
+        uses: ./.github/actions/build-linux-runtime
+        with:
+          arch: arm64
+          input_version: ${{ inputs.version }}
+          input_publish: ${{ inputs.publish }}
+          discovery_token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
+          aws_access_key_id: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID }}
+          aws_secret_access_key: ${{ secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY }}
+          artifacts_bucket: ${{ env.ARTIFACTS_BUCKET }}
+          artifacts_region: ${{ env.ARTIFACTS_REGION }}
+
   release:
     # macos-14 = Apple Silicon GitHub-hosted runner (with Rosetta, so the
     # smoke test can execute the x86_64 slice too).
+    needs: [linux-amd64, linux-arm64]
     runs-on: macos-14
     environment: release
     timeout-minutes: 180 # must exceed the 2h notary --wait (WEB-4802) plus build/sign/test time
@@ -502,13 +556,18 @@ jobs:
           [[ -d /var/log/unbound && -f /etc/newsyslog.d/ai.getunbound.conf ]]
           echo "install-test OK"
 
-      - name: Render onboard.sh (version + sha + artifact URL baked in)
+      - name: Render onboard.sh (version + sha + artifact URLs baked in)
         env:
           VERSION: ${{ steps.cfg.outputs.version }}
           PKG_NAME: ${{ steps.cfg.outputs.pkg_name }}
           ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
+          # Linux shas come from the per-arch jobs this one `needs`; the URLs
+          # are deterministic from version+arch. On a dry-run the linux tarball
+          # isn't on S3 yet, exactly like the macOS pkg URL — fine for inspection.
+          LINUX_AMD64_SHA256: ${{ needs.linux-amd64.outputs.tar_sha256 }}
+          LINUX_ARM64_SHA256: ${{ needs.linux-arm64.outputs.tar_sha256 }}
         run: |
           set -euo pipefail
           pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
@@ -518,10 +577,19 @@ jobs:
           # otherwise onboard.sh would reject its own artifact.
           team_id=""
           [[ "$PKG_SIGN" == "true" ]] && team_id="$TEAM_ID"
+          linux_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/linux/$VERSION"
+          linux_amd64_url="$linux_base/unbound-runtime-$VERSION-linux-amd64.tar.gz"
+          linux_arm64_url="$linux_base/unbound-runtime-$VERSION-linux-arm64.tar.gz"
+          # Every placeholder must be substituted (incl. all four Linux tokens)
+          # or the guard below fails the release.
           sed -e "s|@VERSION@|$VERSION|g" \
               -e "s|@PKG_SHA256@|$pkg_sha256|g" \
               -e "s|@ARTIFACT_URL@|$ARTIFACT_URL|g" \
               -e "s|@TEAM_ID@|$team_id|g" \
+              -e "s|@LINUX_AMD64_URL@|$linux_amd64_url|g" \
+              -e "s|@LINUX_AMD64_SHA256@|$LINUX_AMD64_SHA256|g" \
+              -e "s|@LINUX_ARM64_URL@|$linux_arm64_url|g" \
+              -e "s|@LINUX_ARM64_SHA256@|$LINUX_ARM64_SHA256|g" \
               mdm/onboard.sh.tmpl > out/onboard.sh
           chmod +x out/onboard.sh
           bash -n out/onboard.sh
