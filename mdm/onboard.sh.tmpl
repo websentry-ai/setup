@@ -1,38 +1,51 @@
 #!/bin/bash
-# Unbound macOS runtime bootstrap — delivered as a Jamf Script payload
-# (WEB-4791). The script itself never travels over the network; only the
-# hash-pinned pkg does (TLS + sha256 + Developer ID Team ID must all agree).
-# macOS built-ins only: curl, system_profiler, plutil, shasum, pkgutil,
-# installer, launchctl. No jq — it does not ship with macOS.
+# Unbound runtime bootstrap — macOS (Jamf Script payload) + Linux (Intune/MDM
+# or curl|bash). ONE script, branched on `uname`. WEB-4791 (mac).
 #
-# Rendered by release-macos-runtime.yml: VERSION / PKG_SHA256 / ARTIFACT_URL
-# / TEAM_ID below are baked in per release.
+# The script itself never travels over the network with trust attached; only
+# the hash-pinned artifact does. Trust floor on BOTH OSes is TLS + a baked
+# sha256. macOS adds a Developer ID Installer Team-ID assert on top (pkg
+# signing). Linux has no OS package-signing equivalent, so sha256+TLS is the
+# floor there until a minisign/cosign hook lands (see verify_signature).
+#
+# Tooling assumed:
+#   macOS  built-ins only: curl, shasum, ioreg, sw_vers, pkgutil, installer,
+#          launchctl. No jq — it does not ship with macOS.
+#   Linux  coreutils + curl + tar + sha256sum + (systemd for the daemon). No
+#          distro package manager is assumed — the runtime is a self-contained
+#          tarball dropped under /opt/unbound, mirroring the macOS layout.
+#
+# Rendered by release-macos-runtime.yml: each placeholder below is baked in
+# per release. Linux tokens render EMPTY until Linux binaries are published — a
+# Linux run then fails preflight cleanly ("no published runtime") instead of
+# fetching the macOS-only artifact.
 #
 # NOTE for admins: script parameters (including the MDM key) are visible in
-# Jamf policy logs — true of the python onboarding today as well. Use a
+# Jamf/Intune policy logs — true of the python onboarding today as well. Use a
 # scoped MDM enrollment key, not a personal/admin API key.
 VERSION="@VERSION@"
-PKG_SHA256="@PKG_SHA256@"
-ARTIFACT_URL="@ARTIFACT_URL@"
+
+# macOS artifact (universal2 pkg; one artifact covers both arches).
+MACOS_PKG_URL="@ARTIFACT_URL@"
+MACOS_PKG_SHA256="@PKG_SHA256@"
 EXPECTED_TEAM_ID="@TEAM_ID@"   # empty = skip signature assert (unsigned dev builds only)
 
+# Linux artifacts (per-arch tarball; EMPTY until Linux binaries are published).
+LINUX_AMD64_URL="@LINUX_AMD64_URL@"
+LINUX_AMD64_SHA256="@LINUX_AMD64_SHA256@"
+LINUX_ARM64_URL="@LINUX_ARM64_URL@"
+LINUX_ARM64_SHA256="@LINUX_ARM64_SHA256@"
+
 PREFIX="/opt/unbound"
-PKG_ID="ai.getunbound.runtime"
-DAEMON_LABEL="ai.getunbound.discovery"
+PKG_ID="ai.getunbound.runtime"               # macOS pkgutil receipt id
+DAEMON_LABEL="ai.getunbound.discovery"       # macOS launchd label
+# Linux systemd units written by install_linux_daemon (a oneshot service driven
+# by a 12h timer); both are torn down on --clear.
+SYSTEMD_UNITS=("unbound-discovery.timer" "unbound-discovery.service")
 MIN_MACOS_MAJOR=13
 REQUIRED_MB=300
 
 set -euo pipefail
-
-# macOS-only: the runtime is a Mach-O .pkg and this script uses sw_vers /
-# pkgutil / installer / launchctl, none present on Linux. Refuse on any other
-# OS BEFORE the EXIT trap is installed, so a non-Mac run fails with one clear
-# line instead of a cascade of "sw_vers: command not found" and a malformed
-# install-report POST (empty OS field -> backend 400).
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  echo "Unbound runtime installer is macOS-only (detected $(uname -s)). No changes made." >&2
-  exit 1
-fi
 
 API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
 GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
@@ -44,30 +57,70 @@ tmpdir=""
 # misreport `--clear` runs as successful installs.
 install_succeeded=0
 
+# --- OS / arch detection + per-OS artifact resolution ------------------------
+# Replaces the old macOS-only guard. Resolved here WITHOUT a hard-exit on empty
+# URLs so `--clear` teardown still runs on a platform whose runtime was never
+# published; the "is the artifact actually published" assert lives in preflight,
+# on the install path only.
+case "$(uname -s)" in
+  Darwin) OS="macos" ;;
+  Linux)  OS="linux" ;;
+  *) echo "Unbound runtime installer: unsupported OS ($(uname -s)). No changes made." >&2; exit 1 ;;
+esac
+case "$(uname -m)" in
+  arm64|aarch64) ARCH="arm64" ;;
+  x86_64|amd64)  ARCH="amd64" ;;
+  *) echo "Unbound runtime installer: unsupported arch ($(uname -m)). No changes made." >&2; exit 1 ;;
+esac
+case "$OS" in
+  macos)
+    ARTIFACT_URL="$MACOS_PKG_URL"; ARTIFACT_SHA256="$MACOS_PKG_SHA256"; ARTIFACT_KIND="pkg" ;;
+  linux)
+    case "$ARCH" in
+      amd64) ARTIFACT_URL="$LINUX_AMD64_URL"; ARTIFACT_SHA256="$LINUX_AMD64_SHA256" ;;
+      arm64) ARTIFACT_URL="$LINUX_ARM64_URL"; ARTIFACT_SHA256="$LINUX_ARM64_SHA256" ;;
+    esac
+    ARTIFACT_KIND="tar" ;;
+esac
+
 # Minimal JSON string escaping (backslash + double quote): hostnames are
-# admin-settable via scutil and CAN contain either — an unescaped value
-# would make the payload invalid JSON and the report would be silently
-# dropped exactly when we need it.
+# admin-settable and CAN contain either — an unescaped value would make the
+# payload invalid JSON and the report would be silently dropped exactly when
+# we need it.
 # shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
 json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:cntrl:]]//g'; }
 
+# OS version string for the install-report payload. macOS: sw_vers (locale
+# stable). Linux: /etc/os-release in a subshell so its vars never leak, with a
+# kernel fallback.
+# shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
+os_version() {
+  case "$OS" in
+    macos) sw_vers -productVersion 2>/dev/null ;;
+    linux) ( . /etc/os-release 2>/dev/null || true; printf '%s %s' "${ID:-linux}" "${VERSION_ID:-$(uname -r)}" ) ;;
+  esac
+}
+
 # Hardware serial — the key the install-report endpoint joins on (one row per
-# device, keyed by org+serial_number). ioreg's IOPlatformSerialNumber is
+# device, keyed by org+serial_number). macOS: ioreg's IOPlatformSerialNumber is
 # locale-stable; system_profiler's "Serial Number" label is localized and
-# breaks on non-English macOS. Empty string if it can't be read (the trap
-# report just gets dropped server-side rather than misattributing the row).
+# breaks on non-English macOS. Linux: DMI product_serial (root-readable; we are
+# root). Empty string if it can't be read — common on VMs, where the report is
+# then dropped server-side rather than misattributing the row.
 # shellcheck disable=SC2329  # invoked from on_exit (EXIT trap)
 device_serial() {
-  ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
-    | awk -F'"' '/IOPlatformSerialNumber/{print $4; exit}'
+  case "$OS" in
+    macos) ioreg -rd1 -c IOPlatformExpertDevice 2>/dev/null \
+             | awk -F'"' '/IOPlatformSerialNumber/{print $4; exit}' ;;
+    linux) tr -d '[:cntrl:]' < /sys/class/dmi/id/product_serial 2>/dev/null ;;
+  esac
 }
 
 # shellcheck disable=SC2329  # invoked indirectly via the EXIT trap below
 on_exit() {
   local code=$1
-  # Always reap the download dir: on failure, set -e skips the inline rm
-  # and a leftover ~100MB pkg in /tmp can fail the NEXT run's free-space
-  # preflight.
+  # Always reap the download dir: on failure, set -e skips the inline rm and a
+  # leftover ~100MB artifact in /tmp can fail the NEXT run's free-space check.
   [[ -n "$tmpdir" ]] && rm -rf "$tmpdir"
   if [[ $code -ne 0 ]]; then
     echo "UNBOUND_INSTALL_FAILED step=${CURRENT_STEP} code=${code}" >&2
@@ -81,13 +134,14 @@ on_exit() {
     # Fail-open: the install has already finished by the time on_exit runs, so
     # a failed POST must never change the script's exit status — but it is no
     # longer silent: a non-2xx (or no-response) prints a diagnostic to stderr
-    # so a regression can't hide in empty fleet telemetry again.
+    # so a regression can't hide in empty fleet telemetry again. (An empty
+    # serial on a VM -> backend 400 here is the documented fail-open path.)
     local report_serial report_body http_code
     report_serial="$(json_escape "$(device_serial)")" || report_serial=""
     report_body="$(printf '{"serial_number":"%s","step":"%s","exit_code":%d,"installer_version":"%s","hostname":"%s","os_version":"%s","ts":%d}' \
       "$report_serial" "$(json_escape "$CURRENT_STEP")" "$code" \
       "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
-      "$(json_escape "$(sw_vers -productVersion)")" "$(date +%s)")"
+      "$(json_escape "$(os_version)")" "$(date +%s)")"
     # -f dropped on purpose: we WANT the body/status on 4xx/5xx, not a curl
     # exit. -o /dev/null discards the response body; -w prints just the code.
     http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
@@ -117,7 +171,7 @@ on_exit() {
     report_body="$(printf '{"serial_number":"%s","step":"%s","exit_code":0,"installer_version":"%s","hostname":"%s","os_version":"%s","ts":%d}' \
       "$report_serial" "$(json_escape "$CURRENT_STEP")" \
       "$(json_escape "$VERSION")" "$(json_escape "$(hostname)")" \
-      "$(json_escape "$(sw_vers -productVersion)")" "$(date +%s)")"
+      "$(json_escape "$(os_version)")" "$(date +%s)")"
     http_code="$(curl -sS -m 10 -o /dev/null -w '%{http_code}' \
       -X POST "${BACKEND_URL}/api/v1/automations/mdm/install-report/" \
       -H 'Content-Type: application/json' \
@@ -131,11 +185,11 @@ on_exit() {
 }
 trap 'on_exit $?' EXIT
 
-# macOS has no `timeout`; bash-only watchdog so a wedged binary cannot hang
-# the Jamf policy forever. The watchdog's stdio is detached (>/dev/null) so
-# an orphaned sleep can never hold the pipe Jamf/installer reads open past
-# script exit (which reads as a multi-minute hang), and pkill -P reaps the
-# sleep on the fast path.
+# Neither macOS nor a minimal container is guaranteed `timeout`; bash-only
+# watchdog so a wedged binary cannot hang the MDM policy forever. The
+# watchdog's stdio is detached (>/dev/null) so an orphaned sleep can never
+# hold the pipe the MDM reads open past script exit (which reads as a hang),
+# and pkill -P reaps the sleep on the fast path.
 run_with_timeout() {
   local secs="$1"; shift
   "$@" & local pid=$!
@@ -153,10 +207,150 @@ run_with_timeout() {
 is_clear_token()    { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|clear|--clear) return 0;; *) return 1;; esac; }
 is_backfill_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|backfill|--backfill) return 0;; *) return 1;; esac; }
 
+# --- sha256 verify (branched on the tool guaranteed present per OS) -----------
+# macOS ships `shasum` (perl); minimal Linux ships coreutils `sha256sum` but
+# not always `shasum`.
+verify_sha256() {  # $1=expected $2=file
+  case "$OS" in
+    macos) printf '%s  %s\n' "$1" "$2" | shasum -a 256 -c - ;;
+    linux) printf '%s  %s\n' "$1" "$2" | sha256sum -c - ;;
+  esac
+}
+
+# --- native signature verify (OS-specific; on top of the sha256 floor) -------
+verify_signature() {  # $1=artifact path
+  case "$OS" in
+    macos)
+      if [[ -n "$EXPECTED_TEAM_ID" ]]; then
+        local sig leaf
+        sig="$(pkgutil --check-signature "$1")"
+        # Anchor the Team ID to the Developer ID Installer LEAF line itself — a
+        # bare substring match over the whole output could be satisfied by
+        # other cert-subject text.
+        leaf="$(printf '%s\n' "$sig" | grep 'Developer ID Installer' | head -1)"
+        [[ -n "$leaf" ]] \
+          || { echo "pkg is not signed with a Developer ID Installer cert" >&2; exit 1; }
+        printf '%s\n' "$leaf" | grep -qF "($EXPECTED_TEAM_ID)" \
+          || { echo "pkg Team ID mismatch (expected $EXPECTED_TEAM_ID)" >&2; exit 1; }
+      else
+        echo "WARNING: EXPECTED_TEAM_ID empty — skipping signature assert (unsigned build)"
+      fi ;;
+    linux)
+      # No OS package-signing equivalent. The sha256 pin + TLS already gate
+      # content integrity. A minisign/cosign detached-signature check over the
+      # tarball is the future native layer (mirroring the macOS Team-ID
+      # assert) — wire it here behind a baked pubkey when keys land.
+      : ;;
+  esac
+}
+
+# --- Linux: register the periodic discovery scan -----------------------------
+# systemd analog of the macOS launchd job (which the pkg postinstall owns).
+# Output goes to journald (no StandardOutput=append:, which needs systemd >=240
+# and breaks older distros). Best-effort by contract: returns 0 even on failure
+# so a systemctl hiccup never aborts onboarding. Teardown lives in --clear.
+install_linux_daemon() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || {
+    echo "WARNING: systemd not present; skipping periodic discovery timer" >&2; return 0; }
+  local disc="$PREFIX/current/unbound-discovery/unbound-discovery"
+  cat > /etc/systemd/system/unbound-discovery.service <<EOF || { echo "WARNING: could not write discovery.service; periodic scan disabled" >&2; return 0; }
+[Unit]
+Description=Unbound coding-agent discovery scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$disc scan
+Nice=10
+IOSchedulingClass=idle
+EOF
+  cat > /etc/systemd/system/unbound-discovery.timer <<EOF || { echo "WARNING: could not write discovery.timer; periodic scan disabled" >&2; return 0; }
+[Unit]
+Description=Unbound discovery scan schedule (every 43200s)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=43200
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload && systemctl enable --now unbound-discovery.timer \
+    || echo "WARNING: failed to enable discovery timer; periodic scan disabled" >&2
+  return 0
+}
+
+# --- install the verified artifact (OS-specific layout) ----------------------
+# Post-install layout is IDENTICAL on both OSes:
+#   $PREFIX/<version>/unbound-hook/unbound-hook  (+ unbound-discovery)
+#   $PREFIX/current -> $PREFIX/<version>
+# so every downstream path (handoff, idempotency, clear) is OS-agnostic.
+install_artifact() {  # $1=artifact path
+  case "$OS" in
+    macos)
+      # The pkg's postinstall owns pre-warm -> symlink flip -> daemon
+      # bootstrap -> GC; the script just runs the installer.
+      installer -pkg "$1" -target / ;;
+    linux)
+      # No pkg manager assumed: extract to a staging dir, stamp VERSION, swap
+      # into place, PRE-WARM both binaries, and only THEN flip `current` — the
+      # same "never make a broken build current" guarantee the macOS pkg
+      # postinstall provides. The systemd daemon is registered below by
+      # install_linux_daemon (the macOS launchd job is owned by the pkg).
+      local b current_target kept_other dir
+      mkdir -p "$PREFIX"
+      local staging="$PREFIX/.staging.$VERSION.$$"
+      rm -rf "$staging"; mkdir -p "$staging"
+      tar -xzf "$1" -C "$staging"
+      printf '%s\n' "$VERSION" > "$staging/VERSION"
+      rm -rf "$PREFIX/$VERSION"
+      mv "$staging" "$PREFIX/$VERSION"
+      # Pre-warm BOTH binaries BEFORE flipping current: a build that can't even
+      # print --version must never become the live version (the previous
+      # `current` stays put as rollback, matching the macOS postinstall).
+      for b in unbound-hook unbound-discovery; do
+        # 60s, not 10: this gates whether `current` flips, so a false timeout
+        # on a slow VM aborts the whole install (no runtime). --version is fast;
+        # the ceiling only bounds a genuinely hung/corrupt binary.
+        run_with_timeout 60 "$PREFIX/$VERSION/$b/$b" --version >/dev/null \
+          || { echo "pre-warm failed for $b; not flipping current" >&2; return 1; }
+      done
+      ln -sfn "$PREFIX/$VERSION" "$PREFIX/current"
+      # Keep-2 GC (mirror the macOS postinstall): keep the live version + the
+      # newest other; reap older trees so /opt/unbound can't grow unbounded.
+      current_target="$(readlink "$PREFIX/current" 2>/dev/null || true)"
+      kept_other=""
+      while IFS= read -r dir; do
+        [[ -n "$dir" ]] || continue
+        [[ "$PREFIX/$dir" == "$current_target" || "$dir" == "$VERSION" ]] && continue
+        if [[ -z "$kept_other" ]]; then kept_other="$dir"; continue; fi
+        rm -rf "${PREFIX:?}/$dir"
+      done < <(find "$PREFIX" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec basename {} \; | sort -rV)
+      # Register the periodic discovery scan (systemd analog of the macOS
+      # launchd job). BEST-EFFORT: no systemd / a systemctl hiccup must not
+      # abort onboarding — the hooks + setup-time scan are the critical path,
+      # the 12h timer is not.
+      install_linux_daemon || true ;;
+  esac
+}
+
+# --- Idempotent re-run check (OS-specific receipt source) --------------------
+is_already_installed() {
+  [[ -x "$PREFIX/current/unbound-hook/unbound-hook" ]] || return 1
+  [[ "$(readlink "$PREFIX/current" 2>/dev/null)" == "$PREFIX/$VERSION" ]] || return 1
+  case "$OS" in
+    macos) [[ "$(pkgutil --pkg-info "$PKG_ID" 2>/dev/null | awk '/^version:/{print $2}')" == "$VERSION" ]] ;;
+    linux) [[ "$(cat "$PREFIX/current/VERSION" 2>/dev/null)" == "$VERSION" ]] ;;
+  esac
+}
+
 # --- Arguments: --flags for direct runs, $4-$9 positional from Jamf ----------
 CURRENT_STEP="parse_args"
 if [[ $# -gt 0 && "${1:-}" != --* ]]; then
-  # Jamf convention: $1 mount point, $2 computer name, $3 username, params at $4+.
+  # Jamf convention: $1 mount point, $2 computer name, $3 username, params at
+  # $4+. Linux MDMs (Intune) pass --flags and take the else branch.
   API_KEY="${4:-}"; DISCOVERY_KEY="${5:-}"
   [[ -n "${6:-}" ]] && BACKEND_URL="$6"
   [[ -n "${7:-}" ]] && GATEWAY_URL="$7"
@@ -187,77 +381,83 @@ if [[ $CLEAR -eq 1 ]]; then
     echo "binary unavailable or failed; using bash fallback teardown"
   fi
   # Always sweep system-level pieces, even after a successful binary clear.
-  launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
-  rm -f "/Library/LaunchDaemons/${DAEMON_LABEL}.plist" /etc/newsyslog.d/ai.getunbound.conf
+  case "$OS" in
+    macos)
+      launchctl bootout "system/$DAEMON_LABEL" 2>/dev/null || true
+      rm -f "/Library/LaunchDaemons/${DAEMON_LABEL}.plist" /etc/newsyslog.d/ai.getunbound.conf
+      pkgutil --forget "$PKG_ID" >/dev/null 2>&1 || true ;;
+    linux)
+      for unit in "${SYSTEMD_UNITS[@]}"; do
+        systemctl disable --now "$unit" 2>/dev/null || true
+        rm -f "/etc/systemd/system/$unit"
+      done
+      rm -f /etc/logrotate.d/unbound          # legacy logrotate conf (pre-journald builds)
+      systemctl daemon-reload 2>/dev/null || true ;;
+  esac
   rm -rf "$PREFIX"
-  pkgutil --forget "$PKG_ID" >/dev/null 2>&1 || true
   echo "UNBOUND_CLEAR_OK"
   exit 0
 fi
 
 # --- Preflight ---------------------------------------------------------------
 CURRENT_STEP="preflight"
-[[ $EUID -eq 0 ]] || { echo "must run as root (Jamf runs scripts as root)" >&2; exit 1; }
+[[ $EUID -eq 0 ]] || { echo "must run as root (MDM runs scripts as root)" >&2; exit 1; }
 [[ -n "$API_KEY" && -n "$DISCOVERY_KEY" ]] || { echo "--api-key and --discovery-key are required" >&2; exit 2; }
-os_major="$(sw_vers -productVersion | cut -d. -f1)"
-[[ "$os_major" -ge $MIN_MACOS_MAJOR ]] || { echo "macOS $os_major < required $MIN_MACOS_MAJOR" >&2; exit 1; }
-avail_mb="$(df -Pm / | awk 'NR==2{print $4}')"
+# Install path requires a published artifact for this OS/arch. Empty URL/sha
+# means this platform isn't released yet (Linux tokens render empty until Linux
+# binaries ship) — fail clean rather than fetch the wrong artifact.
+[[ -n "$ARTIFACT_URL" && -n "$ARTIFACT_SHA256" ]] \
+  || { echo "no published $OS/$ARCH runtime for $VERSION" >&2; exit 1; }
+if [[ "$OS" == "macos" ]]; then
+  os_major="$(sw_vers -productVersion | cut -d. -f1)"
+  [[ "$os_major" -ge $MIN_MACOS_MAJOR ]] || { echo "macOS $os_major < required $MIN_MACOS_MAJOR" >&2; exit 1; }
+fi
+# Portable free-space check: GNU df lacks `-m`; `-Pk` (POSIX, both OSes) -> MB.
+avail_mb="$(df -Pk / | awk 'NR==2{print int($4/1024)}')"
 [[ "$avail_mb" -ge $REQUIRED_MB ]] || { echo "need ${REQUIRED_MB}MB free, have ${avail_mb}MB" >&2; exit 1; }
 curl -fsI -m 15 "$ARTIFACT_URL" >/dev/null || { echo "artifact host unreachable: $ARTIFACT_URL" >&2; exit 1; }
 
 # --- Idempotent re-run: same version already live -> skip straight to setup --
 CURRENT_STEP="version_check"
-installed="$(pkgutil --pkg-info "$PKG_ID" 2>/dev/null | awk '/^version:/{print $2}' || true)"
-if [[ "$installed" == "$VERSION" \
-      && "$(readlink "$PREFIX/current" 2>/dev/null)" == "$PREFIX/$VERSION" \
-      && -x "$PREFIX/current/unbound-hook/unbound-hook" ]]; then
+if is_already_installed; then
   echo "runtime $VERSION already installed; skipping download/install"
 else
   CURRENT_STEP="download"
   tmpdir="$(mktemp -d /tmp/unbound-onboard.XXXXXX)"
-  pkg="$tmpdir/unbound-runtime.pkg"
-  # The preflight HEAD and this GET are two separate fetches; the baked
-  # sha256 below is what makes that safe — swapped content fails shasum -c.
-  curl -fSL --retry 3 --retry-delay 2 -m 600 -o "$pkg" "$ARTIFACT_URL"
+  artifact="$tmpdir/unbound-runtime.$ARTIFACT_KIND"
+  # The preflight HEAD and this GET are two separate fetches; the baked sha256
+  # is what makes that safe — swapped content fails the checksum.
+  curl -fSL --retry 3 --retry-delay 2 -m 600 -o "$artifact" "$ARTIFACT_URL"
 
   CURRENT_STEP="verify_sha256"
-  printf '%s  %s\n' "$PKG_SHA256" "$pkg" | shasum -a 256 -c -
+  verify_sha256 "$ARTIFACT_SHA256" "$artifact"
 
   CURRENT_STEP="verify_signature"
-  if [[ -n "$EXPECTED_TEAM_ID" ]]; then
-    sig="$(pkgutil --check-signature "$pkg")"
-    # Anchor the Team ID to the Developer ID Installer LEAF line itself —
-    # a bare substring match over the whole output could be satisfied by
-    # other cert-subject text.
-    leaf="$(printf '%s\n' "$sig" | grep 'Developer ID Installer' | head -1)"
-    [[ -n "$leaf" ]] \
-      || { echo "pkg is not signed with a Developer ID Installer cert" >&2; exit 1; }
-    printf '%s\n' "$leaf" | grep -qF "($EXPECTED_TEAM_ID)" \
-      || { echo "pkg Team ID mismatch (expected $EXPECTED_TEAM_ID)" >&2; exit 1; }
-  else
-    echo "WARNING: EXPECTED_TEAM_ID empty — skipping signature assert (unsigned build)"
-  fi
+  verify_signature "$artifact"
 
   CURRENT_STEP="install_pkg"
-  installer -pkg "$pkg" -target /
-  rm -rf "$tmpdir"
+  install_artifact "$artifact"
+  rm -rf "$tmpdir"; tmpdir=""
 fi
 
-# --- Migration sweep: python-era leftovers ----------------------------------
+# --- Migration sweep: python-era leftovers (macOS only) ----------------------
 # Per-user tool config migration is owned by `unbound-hook setup`; this only
 # removes system-level python-era artifacts that would shadow the runtime.
-CURRENT_STEP="migration_sweep"
-launchctl bootout system/ai.getunbound.coding-discovery 2>/dev/null || true
-rm -f /Library/LaunchDaemons/ai.getunbound.coding-discovery.plist
-if [[ -f /usr/local/bin/unbound-hook && ! -L /usr/local/bin/unbound-hook ]]; then
-  rm -f /usr/local/bin/unbound-hook   # legacy script shim, not our symlink
+# Linux is a new platform with no python-era fleet, so nothing to sweep.
+if [[ "$OS" == "macos" ]]; then
+  CURRENT_STEP="migration_sweep"
+  launchctl bootout system/ai.getunbound.coding-discovery 2>/dev/null || true
+  rm -f /Library/LaunchDaemons/ai.getunbound.coding-discovery.plist
+  if [[ -f /usr/local/bin/unbound-hook && ! -L /usr/local/bin/unbound-hook ]]; then
+    rm -f /usr/local/bin/unbound-hook   # legacy script shim, not our symlink
+  fi
 fi
 
 # --- Hand off to the runtime ------------------------------------------------
-# Plain invocation, NOT exec: exec would replace this shell and kill the
-# EXIT trap, so a failing setup would never print UNBOUND_INSTALL_FAILED or
-# POST the install report. set -e propagates a non-zero setup exit through
-# the trap with step=setup.
+# Plain invocation, NOT exec: exec would replace this shell and kill the EXIT
+# trap, so a failing setup would never print UNBOUND_INSTALL_FAILED or POST the
+# install report. set -e propagates a non-zero setup exit through the trap with
+# step=setup.
 CURRENT_STEP="setup"
 backfill_flag=""
 [[ $BACKFILL -eq 1 ]] && backfill_flag="--backfill"
@@ -268,8 +468,8 @@ backfill_flag=""
   --gateway-url "$GATEWAY_URL" \
   $backfill_flag
 
-# Reached only when every step above (incl. the idempotent re-run skip) and
-# the runtime `setup` handoff succeeded. Mark success so the EXIT trap emits a
+# Reached only when every step above (incl. the idempotent re-run skip) and the
+# runtime `setup` handoff succeeded. Mark success so the EXIT trap emits a
 # success install-report; the trap is what actually POSTs (telemetry stays out
 # of the main flow, and a success report can never block this exit).
 install_succeeded=1
