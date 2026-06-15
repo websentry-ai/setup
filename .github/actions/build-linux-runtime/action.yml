@@ -69,18 +69,18 @@ runs:
           echo "::error::publish requires ARTIFACTS_AWS_* credentials"; exit 1
         fi
         discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
-        lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
         lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
         [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]] \
           || { echo "::error::SOURCE_SHA is not a 40-char SHA: '$discovery_sha'"; exit 1; }
-        [[ -n "$lock_pyinstaller" && -n "$lock_python" ]] \
-          || { echo "::error::PYINSTALLER_VERSION/PYTHON_VERSION missing from packaging/discovery.lock"; exit 1; }
+        [[ -n "$lock_python" ]] \
+          || { echo "::error::PYTHON_VERSION missing from packaging/discovery.lock"; exit 1; }
+        # The Nuitka version pin lives in requirements-nuitka-build.txt and is
+        # asserted by build-nuitka.sh, so no pyinstaller pin is needed here.
         {
           echo "version=$version"
           echo "publish=$publish"
           echo "discovery_token=$HAS_DISCOVERY_TOKEN"
           echo "discovery_sha=$discovery_sha"
-          echo "lock_pyinstaller=$lock_pyinstaller"
           echo "lock_python=$lock_python"
         } >> "$GITHUB_OUTPUT"
 
@@ -98,10 +98,9 @@ runs:
       shell: bash
       run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — placeholder discovery build (dry-run only)"
 
-    - name: Install pinned PyInstaller (hash-verified)
+    - name: Install pinned Nuitka (hash-verified) + patchelf
       shell: bash
       env:
-        LOCK_PYINSTALLER: ${{ steps.cfg.outputs.lock_pyinstaller }}
         LOCK_PYTHON: ${{ steps.cfg.outputs.lock_python }}
       run: |
         set -euo pipefail
@@ -110,25 +109,28 @@ runs:
         [[ "${py_full%.*}" == "3.12" ]] || { echo "::error::need python 3.12, have $py_full"; exit 1; }
         # Reproducibility record: macOS pins the interpreter EXACTLY via
         # install-python.sh; the Linux runner provides its own patch, so we
-        # can't hard-assert without pinning. Warn (don't fail) on drift so a
-        # silent runner-image bump still leaves a trace in the build log.
+        # warn (don't fail) on drift to leave a trace.
         # TODO: pin the exact CPython patch on Linux for full reproducibility.
         if [[ "$py_full" != "$LOCK_PYTHON" ]]; then
           echo "::warning::Linux build interpreter $py_full != discovery.lock PYTHON_VERSION $LOCK_PYTHON (runner-provided, not pinned)"
         fi
         echo "Linux build interpreter: $py_full (discovery.lock: $LOCK_PYTHON)"
-        python3 -m venv .build-venv
-        ./.build-venv/bin/pip install --require-hashes --no-deps \
-          -r packaging/requirements-build-linux.txt
-        actual_pi="$(./.build-venv/bin/pyinstaller --version)"
-        [[ "$actual_pi" == "$LOCK_PYINSTALLER" ]] \
-          || { echo "::error::installed PyInstaller $actual_pi != lock $LOCK_PYINSTALLER"; exit 1; }
+        # Nuitka --standalone on Linux uses patchelf to set RPATH on the bundle.
+        sudo apt-get update -qq && sudo apt-get install -y -qq patchelf
+        # Mirror the macOS Nuitka install: setuptools FIRST, then the sdist with
+        # --no-build-isolation so it builds against that pinned setuptools.
+        python3 -m venv .build-venv-nuitka
+        grep '^setuptools' packaging/requirements-nuitka-build.txt > "$RUNNER_TEMP/setuptools-pin.txt"
+        ./.build-venv-nuitka/bin/pip install --require-hashes --no-deps -r "$RUNNER_TEMP/setuptools-pin.txt"
+        ./.build-venv-nuitka/bin/pip install --require-hashes --no-deps --no-build-isolation \
+          -r packaging/requirements-nuitka-build.txt
+        ./.build-venv-nuitka/bin/python -m nuitka --version
 
     # Linux analog of build-pkg.sh (which makes the macOS .pkg): build both
-    # bundles native via the shared specs, tar them with the SAME layout the
-    # pkg installs (unbound-hook/ + unbound-discovery/), and emit the sha256.
-    # onboard.sh extracts the tarball to /opt/unbound/<version>/ at runtime.
-    - name: Build tarball
+    # bundles native with Nuitka (build-nuitka.sh detects Linux), tar them with
+    # the SAME layout the pkg installs (unbound-hook/ + unbound-discovery/), and
+    # emit the sha256. onboard.sh extracts the tarball to /opt/unbound/<version>/.
+    - name: Build tarball (Nuitka)
       id: build
       shell: bash
       env:
@@ -137,20 +139,9 @@ runs:
         ARCH: ${{ inputs.arch }}
       run: |
         set -euo pipefail
-        PYI="$GITHUB_WORKSPACE/.build-venv/bin/pyinstaller"
-        # Native single-arch on Linux: "" -> None in the specs (vs universal2).
-        export UNBOUND_TARGET_ARCH=""
-        # Hook bundle: the same single-source-of-truth spec the macOS lane builds.
-        "$PYI" --noconfirm --distpath dist --workpath build binary/unbound-hook.spec
-        # Discovery bundle: canonical spec from the pinned checkout, else the
-        # placeholder (tokenless dry-run only — tag releases require the real one).
-        if [[ "$HAS_DISCOVERY_SRC" == "true" ]]; then
-          UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src" \
-            "$PYI" --noconfirm --distpath dist --workpath build packaging/unbound-discovery.spec
-        else
-          echo "::warning::building PLACEHOLDER unbound-discovery (no discovery checkout) — dry-run only"
-          "$PYI" --noconfirm --distpath dist --workpath build packaging/specs/unbound-discovery.spec
-        fi
+        [[ "$HAS_DISCOVERY_SRC" == "true" ]] && export UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src"
+        NUITKA_PYTHON="$GITHUB_WORKSPACE/.build-venv-nuitka/bin/python" \
+          ./packaging/scripts/build-nuitka.sh dist
         for b in unbound-hook unbound-discovery; do
           [[ -x "dist/$b/$b" ]] || { echo "::error::missing bundle dist/$b/$b"; exit 1; }
           echo "smoke: $b --version -> $("dist/$b/$b" --version)"

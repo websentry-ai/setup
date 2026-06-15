@@ -66,12 +66,12 @@ concurrency:
 
 jobs:
   # ---- Linux runtime lane (per-arch tarball) --------------------------------
-  # Native single-arch PyInstaller builds. The shared specs default to macOS
-  # universal2; UNBOUND_TARGET_ARCH="" (set by the build-linux-runtime action) makes them build
-  # native. Each arch is its own job so it exposes a clean per-arch tar_sha256
-  # output that the macOS render step seds into the SINGLE onboard.sh — that is
-  # why the macOS job `needs` both. Gated like the macOS lane: placeholder
-  # discovery on tokenless dry-runs, real pinned checkout on tag/publish.
+  # Native single-arch Nuitka --standalone builds (build-nuitka.sh detects Linux
+  # and skips the macOS universal2/lipo path). Each arch is its own job so it
+  # exposes a clean per-arch tar_sha256 output that the macOS render step seds
+  # into the SINGLE onboard.sh — that is why the macOS job `needs` both. Gated
+  # like the macOS lane: placeholder discovery on tokenless dry-runs, real
+  # pinned checkout on tag/publish.
   #
   # Both jobs are continue-on-error: a Linux build failure (or an unavailable
   # arm64 runner) must NEVER block the proven macOS release. A failed/skipped

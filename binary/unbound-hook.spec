@@ -19,12 +19,6 @@
 #   * codesign_identity=None here — signing is a dedicated, gated CI step
 #     against a throwaway keychain; baking an identity into the spec would
 #     sign at build time outside that control and break the unsigned dry-run.
-#   * target_arch defaults to universal2 (macOS) but is overridable via
-#     UNBOUND_TARGET_ARCH so the Linux release lane can build native (empty
-#     string -> None -> host arch). macOS CI leaves it unset, so its behavior
-#     and the lipo gate are unchanged.
-
-import os
 
 VENDORED = [
     ("../claude-code/hooks/unbound.py", "vendored/claude-code/hooks"),
@@ -74,7 +68,7 @@ exe = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=os.environ.get("UNBOUND_TARGET_ARCH", "universal2") or None,
+    target_arch="universal2",
     codesign_identity=None,
     entitlements_file=None,
 )

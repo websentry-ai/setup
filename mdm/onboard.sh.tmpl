@@ -39,8 +39,8 @@ LINUX_ARM64_SHA256="@LINUX_ARM64_SHA256@"
 PREFIX="/opt/unbound"
 PKG_ID="ai.getunbound.runtime"               # macOS pkgutil receipt id
 DAEMON_LABEL="ai.getunbound.discovery"       # macOS launchd label
-# Linux systemd units installed by `unbound-hook install-daemon` (a oneshot
-# service driven by a 12h timer); both are torn down on --clear.
+# Linux systemd units written by install_linux_daemon (a oneshot service driven
+# by a 12h timer); both are torn down on --clear.
 SYSTEMD_UNITS=("unbound-discovery.timer" "unbound-discovery.service")
 MIN_MACOS_MAJOR=13
 REQUIRED_MB=300
@@ -244,6 +244,44 @@ verify_signature() {  # $1=artifact path
   esac
 }
 
+# --- Linux: register the periodic discovery scan -----------------------------
+# systemd analog of the macOS launchd job (which the pkg postinstall owns).
+# Output goes to journald (no StandardOutput=append:, which needs systemd >=240
+# and breaks older distros). Best-effort by contract: returns 0 even on failure
+# so a systemctl hiccup never aborts onboarding. Teardown lives in --clear.
+install_linux_daemon() {
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] || {
+    echo "WARNING: systemd not present; skipping periodic discovery timer" >&2; return 0; }
+  local disc="$PREFIX/current/unbound-discovery/unbound-discovery"
+  cat > /etc/systemd/system/unbound-discovery.service <<EOF || { echo "WARNING: could not write discovery.service; periodic scan disabled" >&2; return 0; }
+[Unit]
+Description=Unbound coding-agent discovery scan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$disc scan
+Nice=10
+IOSchedulingClass=idle
+EOF
+  cat > /etc/systemd/system/unbound-discovery.timer <<EOF || { echo "WARNING: could not write discovery.timer; periodic scan disabled" >&2; return 0; }
+[Unit]
+Description=Unbound discovery scan schedule (every 43200s)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=43200
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload && systemctl enable --now unbound-discovery.timer \
+    || echo "WARNING: failed to enable discovery timer; periodic scan disabled" >&2
+  return 0
+}
+
 # --- install the verified artifact (OS-specific layout) ----------------------
 # Post-install layout is IDENTICAL on both OSes:
 #   $PREFIX/<version>/unbound-hook/unbound-hook  (+ unbound-discovery)
@@ -259,8 +297,8 @@ install_artifact() {  # $1=artifact path
       # No pkg manager assumed: extract to a staging dir, stamp VERSION, swap
       # into place, PRE-WARM both binaries, and only THEN flip `current` — the
       # same "never make a broken build current" guarantee the macOS pkg
-      # postinstall provides. Daemon registration (systemd vs launchd) is owned
-      # by the binary (`unbound-hook install-daemon`).
+      # postinstall provides. The systemd daemon is registered below by
+      # install_linux_daemon (the macOS launchd job is owned by the pkg).
       local b current_target kept_other dir
       mkdir -p "$PREFIX"
       local staging="$PREFIX/.staging.$VERSION.$$"
@@ -287,11 +325,11 @@ install_artifact() {  # $1=artifact path
         if [[ -z "$kept_other" ]]; then kept_other="$dir"; continue; fi
         rm -rf "${PREFIX:?}/$dir"
       done < <(find "$PREFIX" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec basename {} \; | sort -rV)
-      # Daemon registration is BEST-EFFORT: a systemctl hiccup (or no systemd)
-      # must not abort onboarding — the hooks + setup-time scan are the critical
-      # path, the periodic timer is not.
-      run_with_timeout 120 "$PREFIX/current/unbound-hook/unbound-hook" install-daemon \
-        || echo "WARNING: discovery daemon registration failed; periodic scan disabled, continuing" >&2 ;;
+      # Register the periodic discovery scan (systemd analog of the macOS
+      # launchd job). BEST-EFFORT: no systemd / a systemctl hiccup must not
+      # abort onboarding — the hooks + setup-time scan are the critical path,
+      # the 12h timer is not.
+      install_linux_daemon || true ;;
   esac
 }
 
