@@ -147,6 +147,78 @@ def _atomic_write_text(path: Path, text: str) -> None:
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
 
+
+def _command_is_unbound(command, owner_path: str) -> bool:
+    """True only when a hook command INVOKES the Unbound hook at owner_path —
+    i.e. the command starts with our path in one of the forms our writers emit:
+      "<path>" ...        (quoted, the binary + Unix python writers)
+      <path> ...          (bare path)
+      py -3 "<path>" ...  (the Windows python writer)
+    plus the bare Windows-launcher form for tolerance.
+
+    Prefix-anchored on purpose (WEB-4814): an earlier substring match would
+    mis-claim — and then DELETE — a *foreign* hook whose command merely
+    references our install path mid-string (e.g. a wrapper that execs our
+    binary as an argument). Trailing args/version drift after the path are
+    still tolerated, so idempotency is preserved.
+    """
+    if not isinstance(command, str) or not owner_path:
+        return False
+    text = command.lstrip()
+    quoted = f'"{owner_path}"'
+    # Forms where our path is the program being run, optionally behind a
+    # Windows python launcher. Bare-path forms require a trailing boundary
+    # (whitespace or end) so "/a/foo" doesn't match a command for "/a/foobar".
+    if text.startswith(quoted):
+        return True
+    for launcher in ("py -3 ", "py ", "python "):
+        if text.startswith(launcher + quoted):
+            return True
+    if text == owner_path or text.startswith(owner_path + " "):
+        return True
+    for launcher in ("py -3 ", "py ", "python "):
+        rest = launcher + owner_path
+        if text == rest or text.startswith(rest + " "):
+            return True
+    return False
+
+
+def _entry_is_unbound(entry, owner_substr: str) -> bool:
+    """True when a Claude-Code-style hooks-array entry (a {matcher?, hooks:[...]}
+    group) owns at least one command that INVOKES the Unbound hook binary.
+
+    Matching is path-prefix (not exact command equality) so that re-running
+    setup after a path/version change still recognizes — and replaces — our own
+    stale entries instead of stacking a duplicate, while refusing to claim a
+    foreign command that only references our path mid-string (WEB-4814).
+    """
+    if not isinstance(entry, dict):
+        return False
+    for hook in entry.get("hooks", []) or []:
+        if isinstance(hook, dict) and _command_is_unbound(hook.get("command"), owner_substr):
+            return True
+    return False
+
+
+def _merge_hooks(existing_hooks, our_hooks, owner_substr: str) -> dict:
+    """Merge Unbound's per-event hook config into whatever hooks the editor's
+    managed settings already declared (other tools, hand-authored entries).
+
+    Per event: drop any prior Unbound-owned entry (idempotency — never stack
+    duplicates of our own hook), preserve everyone else's entries, then append
+    the current Unbound entry. Fails safe: if the existing hooks block is not a
+    dict we start from an empty one rather than crashing the installer.
+    """
+    merged = dict(existing_hooks) if isinstance(existing_hooks, dict) else {}
+    for event, our_entries in our_hooks.items():
+        prior = merged.get(event)
+        if not isinstance(prior, list):
+            prior = []
+        kept = [e for e in prior if not _entry_is_unbound(e, owner_substr)]
+        merged[event] = kept + list(our_entries)
+    return merged
+
+
 def _claude_hooks_config():
     cmd = lambda ev: hook_command_for_event("claude-code", ev)
     return {
@@ -252,7 +324,13 @@ def _write_claude_managed_settings(m) -> bool:
             if not env:
                 del settings["env"]
 
-        settings["hooks"] = _claude_hooks_config()
+        # Merge our hooks into any pre-existing hooks block instead of
+        # overwriting it — a blind assignment here clobbers other tools'
+        # managed hooks (WEB-4814). Idempotent: stale Unbound entries are
+        # stripped (matched on the binary path) before our current one is
+        # appended, so re-running setup never stacks duplicates.
+        settings["hooks"] = _merge_hooks(
+            settings.get("hooks"), _claude_hooks_config(), str(HOOK_BINARY))
         _atomic_write_text(settings_path, json.dumps(settings, indent=2))
 
         gateway_key_helper = managed_dir / "anthropic_key.sh"

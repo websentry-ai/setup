@@ -163,6 +163,133 @@ def test_setup_is_idempotent(env):
 
 
 # ---------------------------------------------------------------------------
+# WEB-4814: the managed-settings hooks writer must MERGE, not overwrite — a
+# blind assignment clobbered hooks belonging to other tools / prior config.
+# ---------------------------------------------------------------------------
+
+def _foreign_pretooluse_entry():
+    """A PreToolUse entry owned by some other tool (not the Unbound binary)."""
+    return {"matcher": "*", "hooks": [
+        {"type": "command", "command": "/usr/local/bin/other-tool pre", "timeout": 5}]}
+
+
+def _unbound_entries(settings, event):
+    return [e for e in settings["hooks"].get(event, [])
+            if any(BIN in h.get("command", "") for h in e.get("hooks", []))]
+
+
+def _seed_managed_settings(env, hooks):
+    managed = env["tmp"] / "managed-claude"
+    managed.mkdir(parents=True, exist_ok=True)
+    (managed / "managed-settings.json").write_text(
+        json.dumps({"model": "opus", "hooks": hooks}, indent=2))
+
+
+def test_setup_preserves_foreign_hooks_and_adds_unbound_once(env):
+    """A pre-existing foreign PreToolUse hook must survive setup, Unbound's own
+    PreToolUse entry must be present exactly once, and unrelated top-level keys
+    must be preserved."""
+    foreign = _foreign_pretooluse_entry()
+    _seed_managed_settings(env, {"PreToolUse": [foreign]})
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+
+    # (a) foreign entry survives, byte-for-byte
+    assert foreign in settings["hooks"]["PreToolUse"]
+    # (b) Unbound's PreToolUse entry present exactly once
+    unbound = _unbound_entries(settings, "PreToolUse")
+    assert len(unbound) == 1
+    assert unbound[0]["hooks"][0]["command"] == _cmd("claude-code", "PreToolUse")
+    # unrelated top-level key preserved
+    assert settings["model"] == "opus"
+
+
+def test_setup_merge_is_idempotent_on_rerun(env):
+    """Re-running setup over a settings file that already has both a foreign
+    hook and a prior Unbound hook must NOT duplicate the Unbound entry, and
+    must keep the foreign one."""
+    foreign = _foreign_pretooluse_entry()
+    stale_unbound = {"matcher": "*", "hooks": [
+        {"type": "command", "command": _cmd("claude-code", "PreToolUse"), "timeout": 15000}]}
+    _seed_managed_settings(env, {"PreToolUse": [foreign, stale_unbound]})
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+    assert foreign in settings["hooks"]["PreToolUse"]
+    assert len(_unbound_entries(settings, "PreToolUse")) == 1
+
+    # second run is a no-op on the hooks shape
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings2 = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+    assert foreign in settings2["hooks"]["PreToolUse"]
+    assert len(_unbound_entries(settings2, "PreToolUse")) == 1
+
+
+def test_setup_strips_stale_unbound_hook_with_changed_command(env):
+    """Idempotency must match by binary path, not exact command string: a prior
+    Unbound entry whose command differs only in trailing args is replaced, not
+    stacked."""
+    drifted = {"matcher": "*", "hooks": [
+        {"type": "command", "command": f'"{BIN}" hook claude-code PreToolUse --old-flag'}]}
+    _seed_managed_settings(env, {"PreToolUse": [drifted]})
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+    unbound = _unbound_entries(settings, "PreToolUse")
+    assert len(unbound) == 1
+    assert unbound[0]["hooks"][0]["command"] == _cmd("claude-code", "PreToolUse")
+
+
+def test_setup_keeps_foreign_hook_that_references_our_path_midcommand(env):
+    """WEB-4814 ownership tightening: a FOREIGN hook whose command merely
+    contains our binary path mid-string (a wrapper that execs our binary as an
+    argument) is NOT Unbound-owned and MUST survive the merge — only commands
+    that *invoke* our binary (path-prefixed) get stripped-and-replaced.
+
+    Fails on the pre-fix substring matcher (it would delete the wrapper); passes
+    after. Also asserts the genuine, args-drifted Unbound entry is replaced once.
+    """
+    wrapper = {"matcher": "*", "hooks": [
+        {"type": "command",
+         "command": f'/usr/local/bin/foo "{BIN}" --as-arg pre', "timeout": 5}]}
+    drifted_unbound = {"matcher": "*", "hooks": [
+        {"type": "command", "command": f'"{BIN}" hook claude-code PreToolUse --old'}]}
+    _seed_managed_settings(env, {"PreToolUse": [wrapper, drifted_unbound]})
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings = json.loads((env["tmp"] / "managed-claude" / "managed-settings.json").read_text())
+
+    entries = settings["hooks"]["PreToolUse"]
+    # (a) the foreign wrapper survives byte-for-byte despite referencing our path
+    assert wrapper in entries
+    # (b) by the PRODUCTION ownership matcher, exactly one entry is ours and it
+    #     is the freshly-emitted (un-drifted) command — the wrapper is NOT ours
+    owned = [e for e in entries if setup_cmd._entry_is_unbound(e, BIN)]
+    assert len(owned) == 1
+    assert owned[0]["hooks"][0]["command"] == _cmd("claude-code", "PreToolUse")
+    assert not setup_cmd._entry_is_unbound(wrapper, BIN)
+    # the drifted form is gone (replaced, not stacked)
+    cmds = [h["command"] for e in entries for h in e["hooks"]]
+    assert f'"{BIN}" hook claude-code PreToolUse --old' not in cmds
+
+
+def test_setup_survives_malformed_existing_hooks_block(env):
+    """Fail-open: a hooks key that isn't a dict must not crash the installer —
+    Unbound's hooks are written, the malformed value is discarded."""
+    managed = env["tmp"] / "managed-claude"
+    managed.mkdir(parents=True, exist_ok=True)
+    (managed / "managed-settings.json").write_text(
+        json.dumps({"model": "opus", "hooks": "garbage-not-a-dict"}))
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    settings = json.loads((managed / "managed-settings.json").read_text())
+    assert isinstance(settings["hooks"], dict)
+    assert len(_unbound_entries(settings, "PreToolUse")) == 1
+    assert settings["model"] == "opus"
+
+
+# ---------------------------------------------------------------------------
 # WEB-4788 migration sweep fixtures: clean, half-installed, previously-binary
 # ---------------------------------------------------------------------------
 
