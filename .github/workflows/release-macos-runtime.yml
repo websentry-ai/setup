@@ -67,19 +67,27 @@ concurrency:
 jobs:
   # ---- Linux runtime lane (per-arch tarball) --------------------------------
   # Native single-arch PyInstaller builds. The shared specs default to macOS
-  # universal2; UNBOUND_TARGET_ARCH="" (set by build-linux.sh) makes them build
+  # universal2; UNBOUND_TARGET_ARCH="" (set by the build-linux-runtime action) makes them build
   # native. Each arch is its own job so it exposes a clean per-arch tar_sha256
   # output that the macOS render step seds into the SINGLE onboard.sh — that is
   # why the macOS job `needs` both. Gated like the macOS lane: placeholder
   # discovery on tokenless dry-runs, real pinned checkout on tag/publish.
   #
-  # NOTE: untested in CI as of this commit — validate with a workflow_dispatch
-  # dry-run (publish=false) before relying on it for a tag release. linux-arm64
-  # requires GitHub-hosted arm64 runners to be enabled for the org.
+  # Both jobs are continue-on-error: a Linux build failure (or an unavailable
+  # arm64 runner) must NEVER block the proven macOS release. A failed/skipped
+  # arch yields an empty sha -> its onboard.sh token renders empty -> that arch
+  # fails preflight cleanly ("no published runtime") while macOS + the other
+  # arch ship normally.
+  #
+  # NOTE: the Linux lane is still unproven — validate with a workflow_dispatch
+  # dry-run (publish=false) before relying on it. linux-arm64 needs GitHub-
+  # hosted arm64 runners enabled for the org (else it just errors out under
+  # continue-on-error and arm64 stays unpublished).
   linux-amd64:
     runs-on: ubuntu-24.04
     environment: release
     timeout-minutes: 60
+    continue-on-error: true   # never block the macOS release on the Linux lane
     outputs:
       tar_sha256: ${{ steps.build.outputs.sha256 }}
     steps:
@@ -101,6 +109,7 @@ jobs:
     runs-on: ubuntu-24.04-arm
     environment: release
     timeout-minutes: 60
+    continue-on-error: true   # never block the macOS release on the Linux lane
     outputs:
       tar_sha256: ${{ steps.build.outputs.sha256 }}
     steps:
@@ -596,9 +605,12 @@ jobs:
           # `! grep` would NOT fail the step under set -e (bash ignores
           # errexit for ! pipelines) — use an explicit if so an unrendered
           # @TOKEN@ really blocks the release.
-          if grep -q '@[A-Z_]*@' out/onboard.sh; then
+          # [A-Z0-9_] (not [A-Z_]) so digit-bearing tokens like
+          # @LINUX_AMD64_SHA256@ / @PKG_SHA256@ are also caught if a sed line
+          # is ever dropped.
+          if grep -q '@[A-Z0-9_]*@' out/onboard.sh; then
             echo "::error::unrendered placeholder left in onboard.sh"
-            grep -n '@[A-Z_]*@' out/onboard.sh
+            grep -n '@[A-Z0-9_]*@' out/onboard.sh
             exit 1
           fi
           echo "$pkg_sha256" > "out/$PKG_NAME.sha256"
@@ -657,8 +669,10 @@ jobs:
                   --if-none-match '*' 2>&1 >/dev/null)"; then
               echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
             else
-              if echo "$err" | grep -qiE 'PreconditionFailed|412|AccessDenied'; then
+              if echo "$err" | grep -qiE 'PreconditionFailed|412'; then
                 echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — runtime-v$VERSION has been published before. Published artifacts are immutable: bump the version and cut a new tag; do NOT retry or delete."
+              elif echo "$err" | grep -qi 'AccessDenied'; then
+                echo "::error::S3 AccessDenied for $key — EITHER the object already exists on a deny-overwrite bucket (version already published -> bump the version) OR the ARTIFACTS_AWS creds lack PutObject / are expired. Verify credentials before assuming an immutability collision."
               else
                 echo "::error::S3 upload failed for $key: $err"
               fi

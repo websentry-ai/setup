@@ -70,14 +70,18 @@ runs:
         fi
         discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
         lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
+        lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
         [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]] \
           || { echo "::error::SOURCE_SHA is not a 40-char SHA: '$discovery_sha'"; exit 1; }
+        [[ -n "$lock_pyinstaller" && -n "$lock_python" ]] \
+          || { echo "::error::PYINSTALLER_VERSION/PYTHON_VERSION missing from packaging/discovery.lock"; exit 1; }
         {
           echo "version=$version"
           echo "publish=$publish"
           echo "discovery_token=$HAS_DISCOVERY_TOKEN"
           echo "discovery_sha=$discovery_sha"
           echo "lock_pyinstaller=$lock_pyinstaller"
+          echo "lock_python=$lock_python"
         } >> "$GITHUB_OUTPUT"
 
     - name: Checkout coding-discovery-tool at pinned SHA
@@ -98,13 +102,21 @@ runs:
       shell: bash
       env:
         LOCK_PYINSTALLER: ${{ steps.cfg.outputs.lock_pyinstaller }}
+        LOCK_PYTHON: ${{ steps.cfg.outputs.lock_python }}
       run: |
         set -euo pipefail
-        # ubuntu-24.04 ships CPython 3.12 as python3; require the minor line
-        # (exact patch isn't reproducibility-critical on Linux the way the
-        # universal2 build is on macOS — warn, don't fail, on a patch drift).
-        py_mm="$(python3 -c 'import sys;print("%d.%d"%sys.version_info[:2])')"
-        [[ "$py_mm" == "3.12" ]] || { echo "::error::need python 3.12, have $py_mm"; exit 1; }
+        # ubuntu-24.04 ships CPython 3.12 as python3; the minor line is required.
+        py_full="$(python3 -c 'import platform;print(platform.python_version())')"
+        [[ "${py_full%.*}" == "3.12" ]] || { echo "::error::need python 3.12, have $py_full"; exit 1; }
+        # Reproducibility record: macOS pins the interpreter EXACTLY via
+        # install-python.sh; the Linux runner provides its own patch, so we
+        # can't hard-assert without pinning. Warn (don't fail) on drift so a
+        # silent runner-image bump still leaves a trace in the build log.
+        # TODO: pin the exact CPython patch on Linux for full reproducibility.
+        if [[ "$py_full" != "$LOCK_PYTHON" ]]; then
+          echo "::warning::Linux build interpreter $py_full != discovery.lock PYTHON_VERSION $LOCK_PYTHON (runner-provided, not pinned)"
+        fi
+        echo "Linux build interpreter: $py_full (discovery.lock: $LOCK_PYTHON)"
         python3 -m venv .build-venv
         ./.build-venv/bin/pip install --require-hashes --no-deps \
           -r packaging/requirements-build-linux.txt
@@ -112,6 +124,10 @@ runs:
         [[ "$actual_pi" == "$LOCK_PYINSTALLER" ]] \
           || { echo "::error::installed PyInstaller $actual_pi != lock $LOCK_PYINSTALLER"; exit 1; }
 
+    # Linux analog of build-pkg.sh (which makes the macOS .pkg): build both
+    # bundles native via the shared specs, tar them with the SAME layout the
+    # pkg installs (unbound-hook/ + unbound-discovery/), and emit the sha256.
+    # onboard.sh extracts the tarball to /opt/unbound/<version>/ at runtime.
     - name: Build tarball
       id: build
       shell: bash
@@ -121,10 +137,28 @@ runs:
         ARCH: ${{ inputs.arch }}
       run: |
         set -euo pipefail
-        [[ "$HAS_DISCOVERY_SRC" == "true" ]] && export UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src"
-        PYINSTALLER="$GITHUB_WORKSPACE/.build-venv/bin/pyinstaller" \
-          ./packaging/scripts/build-linux.sh "$VERSION" "$ARCH" out
-        sha="$(awk '{print $1}' "out/unbound-runtime-$VERSION-linux-$ARCH.tar.gz.sha256")"
+        PYI="$GITHUB_WORKSPACE/.build-venv/bin/pyinstaller"
+        # Native single-arch on Linux: "" -> None in the specs (vs universal2).
+        export UNBOUND_TARGET_ARCH=""
+        # Hook bundle: the same single-source-of-truth spec the macOS lane builds.
+        "$PYI" --noconfirm --distpath dist --workpath build binary/unbound-hook.spec
+        # Discovery bundle: canonical spec from the pinned checkout, else the
+        # placeholder (tokenless dry-run only — tag releases require the real one).
+        if [[ "$HAS_DISCOVERY_SRC" == "true" ]]; then
+          UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src" \
+            "$PYI" --noconfirm --distpath dist --workpath build packaging/unbound-discovery.spec
+        else
+          echo "::warning::building PLACEHOLDER unbound-discovery (no discovery checkout) — dry-run only"
+          "$PYI" --noconfirm --distpath dist --workpath build packaging/specs/unbound-discovery.spec
+        fi
+        for b in unbound-hook unbound-discovery; do
+          [[ -x "dist/$b/$b" ]] || { echo "::error::missing bundle dist/$b/$b"; exit 1; }
+          echo "smoke: $b --version -> $("dist/$b/$b" --version)"
+        done
+        tar="unbound-runtime-$VERSION-linux-$ARCH.tar.gz"
+        mkdir -p out
+        tar -czf "out/$tar" -C dist unbound-hook unbound-discovery
+        sha="$(cd out && sha256sum "$tar" | tee "$tar.sha256" | awk '{print $1}')"
         echo "sha256=$sha" >> "$GITHUB_OUTPUT"
 
     - name: Upload build artifact (always, incl. dry-runs)
@@ -156,8 +190,10 @@ runs:
                 --key "$key" --body "out/$name" --if-none-match '*' 2>&1 >/dev/null)"; then
             echo "uploaded s3://$ARTIFACTS_BUCKET/$key"
           else
-            if echo "$err" | grep -qiE 'PreconditionFailed|412|AccessDenied'; then
+            if echo "$err" | grep -qiE 'PreconditionFailed|412'; then
               echo "::error::s3://$ARTIFACTS_BUCKET/$key already exists — bump the version; published artifacts are immutable."
+            elif echo "$err" | grep -qi 'AccessDenied'; then
+              echo "::error::S3 AccessDenied for $key — EITHER the object already exists on a deny-overwrite bucket (bump the version) OR the ARTIFACTS_AWS creds lack PutObject / are expired. Verify credentials before assuming a collision."
             else
               echo "::error::S3 upload failed for $key: $err"
             fi

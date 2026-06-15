@@ -8,6 +8,8 @@
 # target_arch are the pipeline contract — see unbound-hook.spec for the
 # rationale on onedir / no-MERGE / universal2 / no in-spec signing.
 
+import os
+
 a = Analysis(
     ["../placeholder/unbound_discovery_main.py"],
     pathex=[],
@@ -34,7 +36,10 @@ exe = EXE(
     console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch="universal2",
+    # Defaults to universal2 (macOS); the Linux dry-run lane sets
+    # UNBOUND_TARGET_ARCH="" -> None to build native (matches the two real
+    # specs). Without this the tokenless Linux dry-run can't build.
+    target_arch=os.environ.get("UNBOUND_TARGET_ARCH", "universal2") or None,
     codesign_identity=None,
     entitlements_file=None,
 )

@@ -97,7 +97,7 @@ json_escape() { printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e 's/[[:
 os_version() {
   case "$OS" in
     macos) sw_vers -productVersion 2>/dev/null ;;
-    linux) ( . /etc/os-release 2>/dev/null; printf '%s %s' "${ID:-linux}" "${VERSION_ID:-$(uname -r)}" ) ;;
+    linux) ( . /etc/os-release 2>/dev/null || true; printf '%s %s' "${ID:-linux}" "${VERSION_ID:-$(uname -r)}" ) ;;
   esac
 }
 
@@ -256,10 +256,12 @@ install_artifact() {  # $1=artifact path
       # bootstrap -> GC; the script just runs the installer.
       installer -pkg "$1" -target / ;;
     linux)
-      # No pkg manager assumed: extract to a staging dir, stamp VERSION, then
-      # swap into place and flip `current`. Daemon registration (systemd vs
-      # launchd) is owned by the binary — `unbound-hook install-daemon` — so
-      # that divergence lives in the runtime, not here.
+      # No pkg manager assumed: extract to a staging dir, stamp VERSION, swap
+      # into place, PRE-WARM both binaries, and only THEN flip `current` — the
+      # same "never make a broken build current" guarantee the macOS pkg
+      # postinstall provides. Daemon registration (systemd vs launchd) is owned
+      # by the binary (`unbound-hook install-daemon`).
+      local b current_target kept_other dir
       mkdir -p "$PREFIX"
       local staging="$PREFIX/.staging.$VERSION.$$"
       rm -rf "$staging"; mkdir -p "$staging"
@@ -267,8 +269,29 @@ install_artifact() {  # $1=artifact path
       printf '%s\n' "$VERSION" > "$staging/VERSION"
       rm -rf "$PREFIX/$VERSION"
       mv "$staging" "$PREFIX/$VERSION"
+      # Pre-warm BOTH binaries BEFORE flipping current: a build that can't even
+      # print --version must never become the live version (the previous
+      # `current` stays put as rollback, matching the macOS postinstall).
+      for b in unbound-hook unbound-discovery; do
+        run_with_timeout 120 "$PREFIX/$VERSION/$b/$b" --version >/dev/null \
+          || { echo "pre-warm failed for $b; not flipping current" >&2; return 1; }
+      done
       ln -sfn "$PREFIX/$VERSION" "$PREFIX/current"
-      run_with_timeout 120 "$PREFIX/current/unbound-hook/unbound-hook" install-daemon ;;
+      # Keep-2 GC (mirror the macOS postinstall): keep the live version + the
+      # newest other; reap older trees so /opt/unbound can't grow unbounded.
+      current_target="$(readlink "$PREFIX/current" 2>/dev/null || true)"
+      kept_other=""
+      while IFS= read -r dir; do
+        [[ -n "$dir" ]] || continue
+        [[ "$PREFIX/$dir" == "$current_target" || "$dir" == "$VERSION" ]] && continue
+        if [[ -z "$kept_other" ]]; then kept_other="$dir"; continue; fi
+        rm -rf "${PREFIX:?}/$dir"
+      done < <(find "$PREFIX" -mindepth 1 -maxdepth 1 -type d -name '[0-9]*' -exec basename {} \; | sort -rV)
+      # Daemon registration is BEST-EFFORT: a systemctl hiccup (or no systemd)
+      # must not abort onboarding — the hooks + setup-time scan are the critical
+      # path, the periodic timer is not.
+      run_with_timeout 120 "$PREFIX/current/unbound-hook/unbound-hook" install-daemon \
+        || echo "WARNING: discovery daemon registration failed; periodic scan disabled, continuing" >&2 ;;
   esac
 }
 
@@ -327,7 +350,7 @@ if [[ $CLEAR -eq 1 ]]; then
         systemctl disable --now "$unit" 2>/dev/null || true
         rm -f "/etc/systemd/system/$unit"
       done
-      rm -f /etc/logrotate.d/unbound          # newsyslog analog written by install-daemon
+      rm -f /etc/logrotate.d/unbound          # legacy logrotate conf (pre-journald builds)
       systemctl daemon-reload 2>/dev/null || true ;;
   esac
   rm -rf "$PREFIX"
