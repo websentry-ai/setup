@@ -79,6 +79,13 @@ POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
 
+# Per-entry flag set on a generation's stop audit-log entry once that
+# generation's exchange has been shipped to the proxy. If a generation_id ever
+# receives more than one stop event, this flag lets the later stop skip the
+# resend instead of re-counting the same tool_uses, while the entries stay in
+# the log so the user-prompt lookback keeps working.
+SHIPPED_FLAG = 'unbound_shipped'
+
 # Ensure log directory exists
 try:
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1154,28 +1161,52 @@ def cleanup_old_logs():
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
+def _persist_generation_shipped(generation_id):
+    """Re-read the audit log and stamp SHIPPED_FLAG on this generation's stop
+    entries, then rewrite it. Re-reading (instead of saving a stale in-memory
+    copy) avoids clobbering entries a concurrent hook appended after we loaded
+    the log."""
+    fresh_logs = load_existing_logs()
+    changed = False
+    for log in fresh_logs:
+        event = log.get('event', {})
+        if (event.get('generation_id') == generation_id
+                and event.get('hook_event_name') == 'stop'
+                and not log.get(SHIPPED_FLAG)):
+            log[SHIPPED_FLAG] = True
+            changed = True
+    if changed:
+        save_logs(fresh_logs)
+
+
 def process_stop_event(generation_id, api_key=None):
     """Process stop event: convert to LLM format and send to API."""
     logs = load_existing_logs()
-    
+
     # Group events
     grouped = group_events_by_generation(logs)
-    
+
     # Find and process the generation with stop event
     for conversation_id, generations in grouped.items():
         if generation_id in generations:
             events = generations[generation_id]
-            
+
             # Check if this generation has a stop event
-            has_stop = any(
-                log.get('event', {}).get('hook_event_name') == 'stop'
-                for log in events
-            )
-            
-            if has_stop:
+            stop_logs = [
+                log for log in events
+                if log.get('event', {}).get('hook_event_name') == 'stop'
+            ]
+
+            if stop_logs:
+                # Idempotency guard: if this generation was already shipped by an
+                # earlier stop, re-sending would re-count the same tool_uses
+                # (root cause of inflated policy-match counts). Skip it.
+                if any(log.get(SHIPPED_FLAG) for log in stop_logs):
+                    break
+
                 exchange = build_llm_exchange(events, api_key)
-                if exchange:
-                    send_to_api(exchange, api_key)
+                if exchange and send_to_api(exchange, api_key):
+                    _persist_generation_shipped(generation_id)
                 break
 
 

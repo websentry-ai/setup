@@ -32,6 +32,14 @@ POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
 
+# Per-entry flag set on the turn's UserPromptSubmit audit-log entry once that
+# turn's exchange has been shipped to the proxy on a Stop event. Codex fires
+# multiple Stop events per turn and rebuilds the tool_uses from the transcript
+# each time; this flag lets a later Stop skip an already-shipped turn instead
+# of re-sending the same tool_uses, while the entry stays in the log so the
+# user-prompt lookback keeps working.
+SHIPPED_FLAG = 'unbound_shipped'
+
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
@@ -1067,6 +1075,34 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
     }
 
 
+def _log_identity(log: Dict) -> tuple:
+    """Stable identity for an audit-log entry, used to re-find the entry this
+    Stop shipped after a fresh re-read (a concurrent Stop may have appended new
+    lines since we loaded the log)."""
+    event = log.get('event', {}) if 'event' in log else log
+    return (
+        log.get('timestamp'),
+        log.get('session_id') or event.get('session_id'),
+        event.get('hook_event_name'),
+    )
+
+
+def _persist_shipped_flag(prompt_log: Dict) -> None:
+    """Re-read the audit log and stamp SHIPPED_FLAG on the turn's
+    UserPromptSubmit entry, then rewrite it. Re-reading (instead of saving a
+    stale in-memory copy) avoids clobbering entries a concurrent hook appended
+    after we loaded the log."""
+    target_id = _log_identity(prompt_log)
+    fresh_logs = load_existing_logs()
+    changed = False
+    for log in fresh_logs:
+        if not log.get(SHIPPED_FLAG) and _log_identity(log) == target_id:
+            log[SHIPPED_FLAG] = True
+            changed = True
+    if changed:
+        save_logs(fresh_logs)
+
+
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
@@ -1074,10 +1110,11 @@ def process_stop_event(event: Dict, api_key: str):
 
     logs = load_existing_logs()
 
-    # Find the UserPromptSubmit for this session
+    # Find the UserPromptSubmit for this session (latest wins)
     user_prompt = None
     user_prompt_timestamp = None
     permission_mode = None
+    prompt_log = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -1090,8 +1127,16 @@ def process_stop_event(event: Dict, api_key: str):
                 user_prompt = log_event.get('prompt')
                 user_prompt_timestamp = log.get('timestamp')
                 permission_mode = log_event.get('permission_mode', 'default')
+                prompt_log = log
 
     if not user_prompt:
+        return
+
+    # Idempotency guard: Codex fires a Stop per agent turn, so a single user
+    # turn produces several Stop events. Once this turn's exchange has shipped,
+    # re-sending would re-count the same tool_uses (root cause of inflated
+    # policy-match counts), so skip it.
+    if prompt_log is not None and prompt_log.get(SHIPPED_FLAG):
         return
 
     messages = [{'role': 'user', 'content': user_prompt}]
@@ -1118,7 +1163,11 @@ def process_stop_event(event: Dict, api_key: str):
     if usage:
         exchange['usage'] = usage
 
-    send_to_api(exchange, api_key)
+    if send_to_api(exchange, api_key) and prompt_log is not None:
+        # Persist the shipped marker so later Stops in this turn skip the send.
+        # The entry stays in the log for the user-prompt lookback.
+        prompt_log[SHIPPED_FLAG] = True
+        _persist_shipped_flag(prompt_log)
 
 
 _GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')

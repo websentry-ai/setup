@@ -31,6 +31,13 @@ POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
 
+# Per-entry flag set on PostToolUse audit-log entries once their tool_use has
+# been shipped to the proxy on a Stop event. Claude Code fires multiple Stop
+# events per turn; this flag lets a later Stop skip already-shipped tool_uses
+# instead of re-sending them, while the entries stay in the log so the
+# user-prompt lookback (get_recent_user_prompts_for_session) keeps working.
+SHIPPED_FLAG = 'unbound_shipped'
+
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
@@ -1126,29 +1133,85 @@ def cleanup_old_logs():
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
+def _event_name_of(log: Dict) -> Optional[str]:
+    if 'event' in log:
+        return log.get('event', {}).get('hook_event_name')
+    return log.get('hook_event_name')
+
+
+def _log_identity(log: Dict) -> tuple:
+    """Stable identity for an audit-log entry, used to re-find the entries this
+    Stop shipped after a fresh re-read (a concurrent Stop may have appended new
+    lines since we loaded the log)."""
+    event = log.get('event', {}) if 'event' in log else log
+    return (
+        log.get('timestamp'),
+        log.get('session_id') or event.get('session_id'),
+        event.get('hook_event_name'),
+        event.get('tool_name'),
+    )
+
+
+def _persist_shipped_flags(session_id: Optional[str], shipped_logs: List[Dict]) -> None:
+    """Re-read the audit log and stamp SHIPPED_FLAG on the entries that were
+    just shipped, then rewrite it. Re-reading (instead of saving our stale
+    in-memory copy) avoids clobbering entries a concurrent hook appended after
+    we loaded the log."""
+    if not shipped_logs:
+        return
+    shipped_ids = {_log_identity(log) for log in shipped_logs}
+    fresh_logs = load_existing_logs()
+    changed = False
+    for log in fresh_logs:
+        if log.get(SHIPPED_FLAG):
+            continue
+        if _log_identity(log) in shipped_ids:
+            log[SHIPPED_FLAG] = True
+            changed = True
+    if changed:
+        save_logs(fresh_logs)
+
+
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
     last_assistant_message = event.get('last_assistant_message')
 
     logs = load_existing_logs()
-    
+
     session_events = []
+    # PostToolUse entries (the same dict objects held in `logs`) that this Stop
+    # is about to ship. Marked shipped only after send_to_api succeeds.
+    pending_tool_logs = []
+    # The current turn's UserPromptSubmit entry. Doubles as the per-turn shipped
+    # anchor so a no-tool conversation turn ships exactly once, not once per Stop.
+    prompt_log = None
     current_conversation_started = False
     user_prompt_timestamp = None
-    
+
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
-        
+
         if log_session_id == session_id:
-            event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
-            
+            event_name = _event_name_of(log)
+
             if event_name == 'UserPromptSubmit':
+                # Reset the window on each new prompt. The anchor entries
+                # (UserPromptSubmit, SessionStart) stay in the log untouched so
+                # the user-prompt lookback keeps finding prior prompts.
                 session_events = [log]
+                pending_tool_logs = []
+                prompt_log = log
                 current_conversation_started = True
                 user_prompt_timestamp = log.get('timestamp')
             elif current_conversation_started:
+                # Skip PostToolUse entries already shipped by an earlier Stop in
+                # this same turn — re-shipping them is the duplicate-count bug.
+                if event_name == 'PostToolUse' and log.get(SHIPPED_FLAG):
+                    continue
                 session_events.append(log)
+                if event_name == 'PostToolUse':
+                    pending_tool_logs.append(log)
 
     transcript_assistant_messages = []
     transcript_usage = None
@@ -1166,6 +1229,15 @@ def process_stop_event(event: Dict, api_key: str):
     # the cached session model is wrong). Fall back to the audit log otherwise.
     session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
+    # Idempotency guard: Claude Code fires a Stop per agent turn, so a single
+    # user turn produces several Stop events. Re-sending already-shipped
+    # tool_uses is the root cause of inflated policy-match counts. Send only
+    # when this Stop has something new: an unshipped PostToolUse, or — for a
+    # tool-free conversation turn — a turn whose prompt anchor hasn't shipped yet.
+    turn_already_shipped = prompt_log is not None and prompt_log.get(SHIPPED_FLAG)
+    if not pending_tool_logs and turn_already_shipped:
+        return
+
     exchange = build_llm_exchange(
         session_events,
         stop_assistant_message=last_assistant_message,
@@ -1174,8 +1246,14 @@ def process_stop_event(event: Dict, api_key: str):
         usage=transcript_usage,
     )
 
-    if exchange:
-        send_to_api(exchange, api_key)
+    if exchange and send_to_api(exchange, api_key):
+        # Persist the shipped markers so later Stops in this turn skip what was
+        # already sent. The entries stay in the log for the user-prompt lookback.
+        for log in pending_tool_logs:
+            log[SHIPPED_FLAG] = True
+        if prompt_log is not None:
+            prompt_log[SHIPPED_FLAG] = True
+        _persist_shipped_flags(session_id, pending_tool_logs + ([prompt_log] if prompt_log else []))
 
 
 def get_api_key():
