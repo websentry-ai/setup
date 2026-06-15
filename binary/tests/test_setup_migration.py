@@ -6,7 +6,9 @@ against sandboxed paths.
 """
 
 import getpass
+import io
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -165,6 +167,33 @@ def test_setup_backfill_flag_runs_backfill_for_supporting_tools(env):
 
 def test_setup_requires_api_key(env, capsys):
     assert setup_cmd.run([]) == 2
+
+
+def test_setup_survives_ascii_stdout(env, monkeypatch):
+    """Regression: Jamf's recurring check-in runs onboarding from a launchd
+    context with no LANG/LC_*, so Python picks the ASCII codec for stdout.
+    Before the fix, the first diagnostic print containing a non-ASCII char
+    (the migration banner) raised UnicodeEncodeError and aborted `setup` on
+    every check-in — it crashed Salesloft's fleet while interactive
+    `sudo jamf policy` runs (UTF-8 locale) passed. main() must reconfigure the
+    streams to UTF-8 so diagnostic output is best-effort, never fatal."""
+    from unbound_hook.main import main
+
+    ascii_out = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    ascii_err = io.TextIOWrapper(io.BytesIO(), encoding="ascii")
+    monkeypatch.setattr(sys, "stdout", ascii_out)
+    monkeypatch.setattr(sys, "stderr", ascii_err)
+
+    # Routed through main() (the outermost entry every install hits), this
+    # raised UnicodeEncodeError before the fix; now it completes cleanly.
+    rc = main(["setup", "--api-key", "admin-key"])
+    assert rc == 0
+    # streams were reconfigured off the crashing ASCII codec
+    assert ascii_out.encoding == "utf-8"
+    assert ascii_err.encoding == "utf-8"
+    # the banner actually reached the (now non-fatal) log
+    ascii_out.flush()
+    assert "migration" in ascii_out.buffer.getvalue().decode("utf-8")
 
 
 def test_setup_is_idempotent(env):

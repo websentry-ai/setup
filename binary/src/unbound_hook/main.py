@@ -13,6 +13,35 @@ import sys
 
 from . import __version__
 
+
+def _force_utf8_io() -> None:
+    """Make stdout/stderr never raise on non-ASCII output.
+
+    Under an interactive shell the inherited locale is UTF-8, so Python
+    selects a UTF-8 codec for stdout. But Jamf's recurring check-in runs the
+    onboarding policy from a launchd context with no LANG/LC_* set, where
+    Python falls back to the ASCII codec. A single non-ASCII character in any
+    line we print — the migration banner's arrow, a unicode username, a tool
+    path — then raises UnicodeEncodeError and aborts the entire run, even
+    though the output itself is purely diagnostic. (This crashed Salesloft's
+    fleet at `setup` on every Jamf check-in while interactive `sudo jamf
+    policy` runs passed.)
+
+    Reconfiguring to UTF-8 with errors='replace' makes output best-effort: a
+    cosmetic print can never kill the real work (settings writes, discovery).
+    It is also correct for the `hook` path, whose stdout carries UTF-8 JSON.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            # Detached/closed stream — nothing we can do, and not worth
+            # crashing onboarding over.
+            pass
+
 USAGE = """unbound-hook %s
 
 Usage:
@@ -25,6 +54,7 @@ Usage:
 
 
 def main(argv=None) -> int:
+    _force_utf8_io()
     args = list(sys.argv[1:] if argv is None else argv)
 
     if args and args[0] in ("--version", "-V", "version"):

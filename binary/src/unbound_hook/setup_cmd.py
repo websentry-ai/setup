@@ -599,7 +599,7 @@ def run(argv) -> int:
 
     statuses = {}
 
-    print(f"\n{'=' * 60}\n[migration] python→binary sweep\n{'=' * 60}")
+    print(f"\n{'=' * 60}\n[migration] python->binary sweep\n{'=' * 60}")
     statuses["migration"] = migration.run_sweep(tools=opts["tools"])
 
     for tool in opts["tools"]:
