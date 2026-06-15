@@ -6,8 +6,6 @@ import platform
 import shutil
 import subprocess
 import urllib.parse
-import urllib.request
-import urllib.error
 import time
 import webbrowser
 from pathlib import Path
@@ -653,19 +651,32 @@ def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, s
 
 
 def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    # curl subprocess, not urllib: the frozen binary ships no CA bundle, so
+    # Python's ssl fails CERTIFICATE_VERIFY_FAILED; curl uses the system trust
+    # store (the corporate-CA/Zscaler contract every other call here relies on).
+    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}"]
+    for header_name, header_value in headers.items():
+        cmd += ["-H", f"{header_name}: {header_value}"]
+    if body is not None:
+        cmd += ["--data-binary", "@-"]
+    cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode(), resp.read()
-    except urllib.error.HTTPError as e:
-        try:
-            error_body = e.read()
-        except Exception:
-            error_body = b''
-        return e.code, error_body
-    except (urllib.error.URLError, OSError) as e:
+        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    out = result.stdout or b''
+    # curl appended "\n<http_code>" after the response body; split it off.
+    sep = out.rfind(b'\n')
+    if sep == -1:
+        debug_print(f"HTTP request failed: curl exit {result.returncode}")
+        return 0, b''
+    try:
+        code = int(out[sep + 1:].strip() or b'0')
+    except ValueError:
+        debug_print(f"HTTP request failed: curl exit {result.returncode}")
+        return 0, b''
+    return code, out[:sep]
 
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import stat
 import shutil
 import sys
 import time
@@ -8,8 +9,6 @@ import platform
 import subprocess
 import json
 import tempfile
-import urllib.request
-import urllib.error
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 try:
@@ -366,6 +365,7 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
                 debug_print(f"Failed to update {rc_file}: {e}")
         return _success, _changed
 
+    _repair_user_ownership(username, rc_files)
     result = _run_as_user(username, _do)
     if result is None:
         debug_print(f"Could not set env var for {username}")
@@ -542,16 +542,62 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
     return "failed"
 
 
+def _repair_user_ownership(username: str, paths: List[Path]) -> None:
+    """Root-context best-effort: reclaim ownership of any of `paths` that exist
+    as a real, user-home file/dir owned by another user, so the upcoming
+    privilege-dropped write can touch it. A prior root-context run can leave
+    ~/.unbound or a shell rc file root-owned, which the dropped user then can't
+    write (EACCES).
+
+    Runs as root on user-controlled paths, so it is hardened against a local
+    escalation: open with O_NOFOLLOW (a symlink fails ELOOP) and fchown the
+    resulting fd, so the inode inspected is the inode chowned — no path TOCTOU.
+    Refuse any regular file with extra hard links (st_nlink != 1): a hardlink to
+    a sensitive root-owned file (e.g. /etc/shadow) would otherwise be handed to
+    the user. Directories can't be hard-linked and a non-root user can't create
+    a root-owned dir, so they're safe to reclaim. No-op on Windows / without
+    pwd; only fires on the abnormal uid-mismatch case; never raises."""
+    if platform.system().lower() == "windows" or pwd is None:
+        return
+    try:
+        info = pwd.getpwnam(username)
+    except KeyError:
+        return
+    uid, gid = info.pw_uid, info.pw_gid
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    for path in paths:
+        try:
+            fd = os.open(str(path), flags)
+        except OSError:
+            continue  # missing, a symlink (O_NOFOLLOW -> ELOOP), or no access
+        try:
+            st = os.fstat(fd)
+            safe = stat.S_ISDIR(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
+            if safe and st.st_uid != uid:
+                os.fchown(fd, uid, gid)
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
+
+
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, urls: dict = None) -> None:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
     config_file = config_dir / "config.json"
 
+    # A prior root-context run may have left these root-owned; repair ownership
+    # (symlink-guarded) before dropping so the write below doesn't fail EACCES.
+    _repair_user_ownership(username, [config_dir, config_file])
+
     def _write():
         config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if platform.system().lower() != "windows":
-            os.chmod(config_dir, 0o700)
+            try:
+                os.chmod(config_dir, 0o700)
+            except OSError:
+                pass
         config = {}
         if config_file.exists():
             try:
@@ -850,19 +896,32 @@ def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, s
 
 
 def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
-    req = urllib.request.Request(url, data=body, method=method, headers=headers)
+    # curl subprocess, not urllib: the frozen binary ships no CA bundle, so
+    # Python's ssl fails CERTIFICATE_VERIFY_FAILED; curl uses the system trust
+    # store (the corporate-CA/Zscaler contract every other call here relies on).
+    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}"]
+    for header_name, header_value in headers.items():
+        cmd += ["-H", f"{header_name}: {header_value}"]
+    if body is not None:
+        cmd += ["--data-binary", "@-"]
+    cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.getcode(), resp.read()
-    except urllib.error.HTTPError as e:
-        try:
-            error_body = e.read()
-        except Exception:
-            error_body = b''
-        return e.code, error_body
-    except (urllib.error.URLError, OSError) as e:
+        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError) as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    out = result.stdout or b''
+    # curl appended "\n<http_code>" after the response body; split it off.
+    sep = out.rfind(b'\n')
+    if sep == -1:
+        debug_print(f"HTTP request failed: curl exit {result.returncode}")
+        return 0, b''
+    try:
+        code = int(out[sep + 1:].strip() or b'0')
+    except ValueError:
+        debug_print(f"HTTP request failed: curl exit {result.returncode}")
+        return 0, b''
+    return code, out[:sep]
 
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:

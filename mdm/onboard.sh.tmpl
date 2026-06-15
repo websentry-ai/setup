@@ -24,6 +24,16 @@ REQUIRED_MB=300
 
 set -euo pipefail
 
+# macOS-only: the runtime is a Mach-O .pkg and this script uses sw_vers /
+# pkgutil / installer / launchctl, none present on Linux. Refuse on any other
+# OS BEFORE the EXIT trap is installed, so a non-Mac run fails with one clear
+# line instead of a cascade of "sw_vers: command not found" and a malformed
+# install-report POST (empty OS field -> backend 400).
+if [[ "$(uname -s)" != "Darwin" ]]; then
+  echo "Unbound runtime installer is macOS-only (detected $(uname -s)). No changes made." >&2
+  exit 1
+fi
+
 API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
 GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
 CURRENT_STEP="init"
