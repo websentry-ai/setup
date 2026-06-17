@@ -1107,6 +1107,8 @@ def process_stop_event(event: Dict, api_key: str):
         assistant_msg['tool_use'] = assistant_tool_uses
     messages.append(assistant_msg)
 
+    request_completed = datetime.utcnow().isoformat() + 'Z'
+
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
@@ -1117,6 +1119,11 @@ def process_stop_event(event: Dict, api_key: str):
     usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
     if usage:
         exchange['usage'] = usage
+
+    if user_prompt_timestamp:
+        exchange['requestInitialized'] = user_prompt_timestamp
+    if request_completed:
+        exchange['requestCompleted'] = request_completed
 
     send_to_api(exchange, api_key)
 

@@ -986,7 +986,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
@@ -1066,6 +1066,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
     if usage:
         exchange['usage'] = usage
+
+    if request_initialized:
+        exchange['requestInitialized'] = request_initialized
+    if request_completed:
+        exchange['requestCompleted'] = request_completed
 
     return exchange
 
@@ -1166,12 +1171,16 @@ def process_stop_event(event: Dict, api_key: str):
     # the cached session model is wrong). Fall back to the audit log otherwise.
     session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
+    request_completed = datetime.utcnow().isoformat() + 'Z'
+
     exchange = build_llm_exchange(
         session_events,
         stop_assistant_message=last_assistant_message,
         transcript_assistant_messages=transcript_assistant_messages,
         model=session_model,
         usage=transcript_usage,
+        request_initialized=user_prompt_timestamp,
+        request_completed=request_completed,
     )
 
     if exchange:
