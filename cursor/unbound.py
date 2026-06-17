@@ -323,8 +323,18 @@ def send_to_hook_api(request_body, api_key):
                 timeout=20
             )
 
-            if result.returncode == 0 and result.stdout:
-                return json.loads(result.stdout.decode('utf-8'))
+            # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
+            # server accepted the request. Do NOT retry on success — a retry
+            # would re-deliver the same pre-tool event (duplicate). Parse the
+            # body if present, otherwise return {} (an empty 2xx is still a
+            # successful, non-blocking allow).
+            if result.returncode == 0:
+                if result.stdout:
+                    try:
+                        return json.loads(result.stdout.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        return {}
+                return {}
         except Exception as e:
             log_error(f"Hook API error: {str(e)}", 'api_call')
 
