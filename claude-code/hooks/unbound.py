@@ -502,6 +502,11 @@ def extract_command_for_pretool(event: Dict) -> str:
     # Glob: pattern
     if tool_name == 'Glob' and 'pattern' in tool_input:
         return tool_input['pattern']
+    # LS: path (fall back to cwd) so the command — and therefore the approval
+    # key — stays path-specific instead of collapsing to the literal "LS" for
+    # every directory listing.
+    if tool_name == 'LS':
+        return tool_input.get('path') or event.get('cwd') or tool_name
     # WebFetch: url
     if tool_name == 'WebFetch' and 'url' in tool_input:
         return tool_input['url']
@@ -513,6 +518,32 @@ def extract_command_for_pretool(event: Dict) -> str:
         return tool_input['prompt']
     # Default: tool name
     return tool_name
+
+
+def _derive_read_equivalent_path(
+    tool_name: str, tool_input: Dict, event: Dict
+) -> Optional[str]:
+    """Resolve a concrete path for a read-equivalent tool (Grep/Glob/LS).
+
+    Path-scoped policies need a path to match against:
+      - an explicit ``path`` argument always wins;
+      - Glob's ``pattern`` (itself a path-like glob, e.g. ``**/*.env``) is kept
+        as a fallback so a filename/glob policy still matches;
+      - otherwise fall back to the session ``cwd``, because Grep/Glob/LS with no
+        ``path`` scan the WHOLE working tree — the broadest (and most dangerous)
+        case must not forward an empty path and silently bypass policy.
+
+    Returns ``None`` only when no path, no Glob pattern, and no cwd are present;
+    the caller then forwards no ``file_path`` (the gateway fails open). Uses
+    ``.get()`` throughout, so a malformed event never raises.
+    """
+    if tool_name == 'Glob':
+        return (
+            tool_input.get('path')
+            or tool_input.get('pattern')
+            or event.get('cwd')
+        )
+    return tool_input.get('path') or event.get('cwd')
 
 
 def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
@@ -868,15 +899,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
     elif tool_name in READ_EQUIVALENT_FILE_TOOLS:
-        # Grep/LS carry an optional `path`; Glob carries a `pattern` (itself a
-        # glob like `**/*.env`, which IS path-like). Only fall back to `pattern`
-        # for Glob — Grep's `pattern` is a regex (e.g. `SECRET_KEY.*=`), not a
-        # path, so forwarding it as file_path would make the gateway evaluate a
-        # regex as a filesystem path.
-        if tool_name == 'Glob':
-            derived_path = tool_input.get('path') or tool_input.get('pattern')
-        else:
-            derived_path = tool_input.get('path')
+        # Grep/Glob/LS expose file contents or enumerate paths; resolve a
+        # concrete path (incl. a cwd fallback for the no-`path` whole-tree scan)
+        # so path-scoped policies can evaluate them. See helper for the rules.
+        derived_path = _derive_read_equivalent_path(tool_name, tool_input, event)
         if derived_path:
             metadata['file_path'] = derived_path
 
