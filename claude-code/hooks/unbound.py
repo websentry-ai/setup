@@ -868,10 +868,15 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
     elif tool_name in READ_EQUIVALENT_FILE_TOOLS:
-        # Grep/LS carry a `path`; Glob carries a `pattern` (itself a glob like
-        # `**/*.env`). Forward the most specific available so the gateway can
-        # evaluate read/secret policies against it.
-        derived_path = tool_input.get('path') or tool_input.get('pattern')
+        # Grep/LS carry an optional `path`; Glob carries a `pattern` (itself a
+        # glob like `**/*.env`, which IS path-like). Only fall back to `pattern`
+        # for Glob — Grep's `pattern` is a regex (e.g. `SECRET_KEY.*=`), not a
+        # path, so forwarding it as file_path would make the gateway evaluate a
+        # regex as a filesystem path.
+        if tool_name == 'Glob':
+            derived_path = tool_input.get('path') or tool_input.get('pattern')
+        else:
+            derived_path = tool_input.get('path')
         if derived_path:
             metadata['file_path'] = derived_path
 
