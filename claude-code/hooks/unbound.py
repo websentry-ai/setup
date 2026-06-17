@@ -20,8 +20,12 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
-NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+# Grep/Glob/LS are read-equivalent: they expose file CONTENTS (Grep) or
+# enumerate paths (Glob/LS), so they could leak/discover a secret file that the
+# equivalent `cat`/`ls` is blocked from. The gateway maps them to `read_file`.
+READ_EQUIVALENT_FILE_TOOLS = {'Grep', 'Glob', 'LS'}
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'LS']  # MCP tools (mcp__*) are always checked separately
+NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'} | READ_EQUIVALENT_FILE_TOOLS
 MCP_TOOL_PREFIX = 'mcp__'
 CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
@@ -863,6 +867,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_input = event.get('tool_input') or {}
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
+    elif tool_name in READ_EQUIVALENT_FILE_TOOLS:
+        # Grep/LS carry a `path`; Glob carries a `pattern` (itself a glob like
+        # `**/*.env`). Forward the most specific available so the gateway can
+        # evaluate read/secret policies against it.
+        derived_path = tool_input.get('path') or tool_input.get('pattern')
+        if derived_path:
+            metadata['file_path'] = derived_path
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
