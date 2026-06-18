@@ -370,6 +370,29 @@ def get_session_start_model(session_id):
     return found
 
 
+def get_last_user_prompt_timestamp_for_session(session_id):
+    """Return the audit-log timestamp of the most recent UserPromptSubmit for a
+    session — the real turn START. The copilot hook builds its exchange from the
+    transcript at Stop time and otherwise sends no turn boundaries, so the
+    gateway stamps ingest time for both ends and the longest-handoff metric
+    collapses to ~0. Sourcing the start from the prompt-submit event (and the end
+    from the Stop event) mirrors the claude-code/codex hooks. Latest entry wins
+    (most recent turn). WEB-4850."""
+    if not session_id:
+        return None
+    found = None
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != 'UserPromptSubmit':
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        ts = log.get('timestamp')
+        if ts:
+            found = ts
+    return found
+
+
 def _build_user_prompt_payload(recent_user_prompts):
     last = recent_user_prompts[-1] if recent_user_prompts else None
     return {
@@ -1317,6 +1340,16 @@ def main():
                 session_start_model=get_session_start_model(session_id),
             )
             if exchange:
+                # Turn boundaries from event-fire times (UserPromptSubmit start /
+                # Stop end) so the gateway's longest-handoff metric reflects real
+                # autonomous-run duration instead of collapsing to ~0. `timestamp`
+                # is this Stop event's own logged time. Mirrors the claude-code/
+                # codex hooks; omit start if absent so the gateway falls back to
+                # ingest time rather than sending a bad value. WEB-4850.
+                request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
+                if request_initialized:
+                    exchange['requestInitialized'] = request_initialized
+                exchange['requestCompleted'] = timestamp
                 send_to_api(exchange, api_key)
             cleanup_old_logs()
 
