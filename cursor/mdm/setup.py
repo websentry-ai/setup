@@ -84,6 +84,11 @@ def _run_as_user(username, fn, *args, **kwargs):
             os.setgroups([])
             os.setgid(gid)
             os.setuid(uid)
+            # setuid alone leaves $HOME pointing at root, so a Path.home() /
+            # expanduser('~') inside fn would resolve to root's home, not the
+            # user's. Callers pass explicit home_dir today; this hardens against
+            # a future slip and keeps the env consistent with the dropped uid.
+            os.environ['HOME'] = info.pw_dir
             result = fn(*args, **kwargs)
             import pickle
             os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
