@@ -381,6 +381,13 @@ def _build_user_prompt_payload(recent_user_prompts):
 def canonical_tool_name(raw):
     """Translate a Copilot tool name to the canonical gateway vocabulary.
     Returns '' when the tool is not security-relevant."""
+    # The Copilot CLI emits Claude-style canonical names directly (Read / Write
+    # / Edit / Bash); only the VS Code agent uses the lowercase vocabulary in
+    # the sets below. Pass canonical names through, otherwise every CLI
+    # native-file tool call resolves to '' and is silently skipped — which
+    # disabled all native-file (read/write/edit) policy enforcement for the CLI.
+    if raw in ALLOWED_NON_MCP_HOOK_NAMES:
+        return raw
     if raw in SHELL_TOOLS:
         return 'Bash'
     if raw in READ_TOOLS:
@@ -554,7 +561,13 @@ def transform_response_for_copilot(api_response):
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # Emit BOTH shapes so the decision is honored regardless of which the
+    # running Copilot surface reads: the top-level form documented in the
+    # Copilot CLI hooks reference, AND the nested hookSpecificOutput form
+    # (Claude-compatible, used by the VS Code agent). Same values, no conflict.
     return {
+        'permissionDecision': decision,
+        'permissionDecisionReason': reason,
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': decision,
