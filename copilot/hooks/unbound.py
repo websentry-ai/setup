@@ -381,6 +381,8 @@ def _build_user_prompt_payload(recent_user_prompts):
 def canonical_tool_name(raw):
     """Translate a Copilot tool name to the canonical gateway vocabulary.
     Returns '' when the tool is not security-relevant."""
+    if raw in ALLOWED_NON_MCP_HOOK_NAMES:
+        return raw
     if raw in SHELL_TOOLS:
         return 'Bash'
     if raw in READ_TOOLS:
@@ -536,6 +538,8 @@ def transform_response_for_copilot(api_response):
     additional_context = api_response.get('additionalContext', '')
 
     return {
+        'permissionDecision': decision,
+        'permissionDecisionReason': reason,
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': decision,
