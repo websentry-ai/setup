@@ -12,6 +12,10 @@ sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/set
 
 Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`).
 
+### Tool policy skill
+
+The `unbound-tool-policy` Claude Code skill steers Claude toward the AI-assisted policy creation endpoint rather than hand-authoring policy flags. It is installed per-user at `~/.claude/skills/unbound-tool-policy/SKILL.md` for every enumerated end user on the device. Installed during `setup.py`, removed during `setup.py --clear`. The skill is re-fetched from `main` on every run so content updates propagate without re-imaging. Source-of-truth lives at `claude-code/skills/unbound-tool-policy/SKILL.md` in this repo.
+
 ### Clearing Setup
 
 ```bash

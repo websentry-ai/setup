@@ -17,6 +17,7 @@ except ImportError:
 
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
+SKILL_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/skills/unbound-tool-policy/SKILL.md"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
@@ -724,6 +725,52 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     _run_as_user(username, _clean)
 
 
+def setup_tool_policy_skill_for_user(username: str, home_dir: Path) -> bool:
+    """Install the unbound-tool-policy Claude Code skill into a specific
+    user's home. Runs the file ops AS that user via _run_as_user so a
+    malicious symlink under ~/.claude can't redirect a root write.
+    Best-effort: failure for one user must not abort the device rollout."""
+    def _do():
+        skill_dir = home_dir / ".claude" / "skills" / "unbound-tool-policy"
+        try:
+            skill_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            debug_print(f"Tool policy skill: mkdir failed for {username}: {e}")
+            return False
+        dest = skill_dir / "SKILL.md"
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-o", str(dest), SKILL_URL],
+                capture_output=True,
+                timeout=30,
+            )
+        except Exception as e:
+            debug_print(f"Tool policy skill: curl exception for {username}: {e}")
+            return False
+        if result.returncode != 0:
+            err = result.stderr.decode(errors='replace').strip()[:500]
+            debug_print(f"Tool policy skill: curl exited {result.returncode} for {username}: {err}")
+        return result.returncode == 0
+    return bool(_run_as_user(username, _do))
+
+
+def clear_tool_policy_skill_for_user(username: str, home_dir: Path) -> str:
+    """Remove the unbound-tool-policy skill from a specific user's home.
+    Returns 'cleared' / 'not_found' / 'failed' to match the contract used
+    by the other per-user clear helpers."""
+    def _do():
+        skill_dir = home_dir / ".claude" / "skills" / "unbound-tool-policy"
+        if not skill_dir.exists():
+            return "not_found"
+        try:
+            shutil.rmtree(skill_dir)
+            return "cleared"
+        except Exception as e:
+            debug_print(f"Tool policy skill: clear failed for {username}: {e}")
+            return "failed"
+    return _run_as_user(username, _do) or "failed"
+
+
 def get_managed_settings_dir() -> Path:
     """Get the system-wide managed settings directory for Claude Code."""
     system = platform.system().lower()
@@ -1053,6 +1100,28 @@ def clear_setup():
             print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
         if failed:
             print(f"Failed to clear API_KEY for {failed} user(s)")
+
+    print("\nClearing tool policy skill...")
+    if not user_homes:
+        print("   No user home directories found")
+    else:
+        skill_cleared = 0
+        skill_not_found = 0
+        skill_failed = 0
+        for username, home_dir in user_homes:
+            status = clear_tool_policy_skill_for_user(username, home_dir)
+            if status == "cleared":
+                skill_cleared += 1
+            elif status == "not_found":
+                skill_not_found += 1
+            else:
+                skill_failed += 1
+        if skill_cleared:
+            print(f"Cleared tool policy skill for {skill_cleared} user(s)")
+        if skill_not_found:
+            print(f"Tool policy skill not installed for {skill_not_found} user(s)")
+        if skill_failed:
+            print(f"Failed to clear tool policy skill for {skill_failed} user(s)")
 
     print("\nClearing managed hooks...")
     status = clear_managed_hooks()
@@ -1598,6 +1667,26 @@ def main():
         remove_gateway_artifacts_for_user(username, home_dir)
         remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
+
+    # Per-user skill install. Best-effort: each user is independent; one
+    # failure logs (in debug mode) and the rollout continues.
+    print("\nInstalling tool policy skill...")
+    skill_user_homes = get_all_user_homes()
+    if not skill_user_homes:
+        print("   No user home directories found")
+    else:
+        skill_ok = 0
+        skill_fail = 0
+        for username, home_dir in skill_user_homes:
+            if setup_tool_policy_skill_for_user(username, home_dir):
+                skill_ok += 1
+            else:
+                skill_fail += 1
+                print(f"Failed to install tool policy skill for {username}")
+        if skill_ok:
+            print(f"Installed tool policy skill for {skill_ok} user(s)")
+        if skill_fail:
+            print(f"Failed to install tool policy skill for {skill_fail} user(s)")
 
     state = detect_install_state()
 
