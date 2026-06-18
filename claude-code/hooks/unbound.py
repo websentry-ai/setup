@@ -1141,19 +1141,22 @@ def process_stop_event(event: Dict, api_key: str):
     session_events = []
     current_conversation_started = False
     user_prompt_timestamp = None
-    
+    stop_timestamp = None
+
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
-        
+
         if log_session_id == session_id:
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
-            
+
             if event_name == 'UserPromptSubmit':
                 session_events = [log]
                 current_conversation_started = True
                 user_prompt_timestamp = log.get('timestamp')
             elif current_conversation_started:
                 session_events.append(log)
+                if event_name == 'Stop':
+                    stop_timestamp = log.get('timestamp')
 
     transcript_assistant_messages = []
     transcript_usage = None
@@ -1171,7 +1174,12 @@ def process_stop_event(event: Dict, api_key: str):
     # the cached session model is wrong). Fall back to the audit log otherwise.
     session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
-    request_completed = datetime.utcnow().isoformat() + 'Z'
+    # Use the Stop event's own logged time (recorded when the hook received the
+    # event, before transcript parsing) rather than now(), so the duration isn't
+    # inflated by hook processing latency — mirrors request_initialized, which
+    # comes from the UserPromptSubmit log entry, and the cursor hook. Fall back
+    # to now() only if the Stop entry isn't in the audit log. WEB-4850.
+    request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     exchange = build_llm_exchange(
         session_events,

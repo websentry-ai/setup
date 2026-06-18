@@ -1078,6 +1078,7 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt = None
     user_prompt_timestamp = None
     permission_mode = None
+    stop_timestamp = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -1090,6 +1091,8 @@ def process_stop_event(event: Dict, api_key: str):
                 user_prompt = log_event.get('prompt')
                 user_prompt_timestamp = log.get('timestamp')
                 permission_mode = log_event.get('permission_mode', 'default')
+            elif event_name == 'Stop':
+                stop_timestamp = log.get('timestamp')
 
     if not user_prompt:
         return
@@ -1107,7 +1110,11 @@ def process_stop_event(event: Dict, api_key: str):
         assistant_msg['tool_use'] = assistant_tool_uses
     messages.append(assistant_msg)
 
-    request_completed = datetime.utcnow().isoformat() + 'Z'
+    # Use the Stop event's own logged time rather than now(), so the duration
+    # isn't inflated by hook processing latency — mirrors request_initialized
+    # and the cursor hook. Fall back to now() only if the Stop entry isn't in
+    # the audit log. WEB-4850.
+    request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     exchange = {
         'conversation_id': session_id or 'unknown',
@@ -1122,8 +1129,8 @@ def process_stop_event(event: Dict, api_key: str):
 
     if user_prompt_timestamp:
         exchange['requestInitialized'] = user_prompt_timestamp
-    if request_completed:
-        exchange['requestCompleted'] = request_completed
+    # request_completed is always set (stop_timestamp or now()-fallback above).
+    exchange['requestCompleted'] = request_completed
 
     send_to_api(exchange, api_key)
 
