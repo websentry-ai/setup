@@ -117,8 +117,7 @@ Examples:
 
 ### When MCP AI-assist fails
 
-The MCP endpoint uses Claude Haiku and has **no deterministic fallback**.
-If it returns `AI assist could not match any tools to your description`:
+If the MCP endpoint returns `AI assist could not match any tools to your description`:
 
 - The user's intent didn't map onto the catalog (either the service isn't
   connected, or no tools matched the action class).
