@@ -5,6 +5,7 @@ Claude Code - Environment Setup Script
 
 import os
 import platform
+import shutil
 import subprocess
 import urllib.request
 import urllib.error
@@ -21,6 +22,9 @@ import webbrowser
 
 
 DEBUG = False
+
+SKILL_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/skills/unbound-tool-policy/SKILL.md"
+SKILL_DIR = Path.home() / ".claude" / "skills" / "unbound-tool-policy"
 
 
 def debug_print(message: str) -> None:
@@ -413,6 +417,37 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
 
 
 
+def setup_tool_policy_skill() -> bool:
+    """Install the unbound-tool-policy Claude Code skill. Best-effort: skill
+    failure must not break the rest of the claude-code install."""
+    try:
+        SKILL_DIR.mkdir(parents=True, exist_ok=True)
+        dest = SKILL_DIR / "SKILL.md"
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", str(dest), SKILL_URL],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception as e:
+        debug_print(f"Tool policy skill install failed: {e}")
+        return False
+
+
+def clear_tool_policy_skill() -> str:
+    """Remove the unbound-tool-policy skill directory. Returns 'cleared',
+    'not_found', or 'failed' to match _clear_path's contract."""
+    if not SKILL_DIR.exists():
+        return "not_found"
+    try:
+        shutil.rmtree(SKILL_DIR)
+        debug_print(f"Removed {SKILL_DIR}")
+        return "cleared"
+    except Exception as e:
+        print(f"Failed to clear unbound-tool-policy skill: {e}")
+        return "failed"
+
+
 def _clear_path(path: Path, label: str) -> str:
     if not path.exists():
         return "not_found"
@@ -466,6 +501,12 @@ def clear_setup() -> None:
             any_failed = True
 
     _r = _clear_path(Path.home() / ".claude" / "anthropic_key.sh", "Claude anthropic_key.sh")
+    if _r == "cleared":
+        any_cleared = True
+    elif _r == "failed":
+        any_failed = True
+
+    _r = clear_tool_policy_skill()
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
@@ -744,7 +785,12 @@ def main():
     debug_print("Setting up Claude key helper...")
     setup_claude_key_helper()
     debug_print("Claude key helper configured")
-    
+
+    # Best-effort: install the Claude Code skill that steers Claude to prefer
+    # `unbound policy tool create-terminal --prompt` over hand-authoring flags.
+    # Skill failure does not block the rest of the install.
+    setup_tool_policy_skill()
+
     # Final instructions
     print("\n" + "=" * 60)
     print("Setup Complete!")

@@ -20,6 +20,8 @@ import json
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
+SKILL_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/skills/unbound-tool-policy/SKILL.md"
+SKILL_DIR = Path.home() / ".claude" / "skills" / "unbound-tool-policy"
 
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
@@ -350,6 +352,30 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         debug_print(f"Could not rewrite gateway URL in {path}: {e}")
 
 
+def setup_tool_policy_skill() -> bool:
+    """Install the unbound-tool-policy Claude Code skill. Best-effort: skill
+    failure must not break the rest of the claude-code install."""
+    try:
+        return download_file(SKILL_URL, SKILL_DIR / "SKILL.md")
+    except Exception as e:
+        debug_print(f"Tool policy skill install failed: {e}")
+        return False
+
+
+def clear_tool_policy_skill() -> str:
+    """Remove the unbound-tool-policy skill directory. Returns 'cleared',
+    'not_found', or 'failed' to match _clear_path's contract."""
+    if not SKILL_DIR.exists():
+        return "not_found"
+    try:
+        shutil.rmtree(SKILL_DIR)
+        debug_print(f"Removed {SKILL_DIR}")
+        return "cleared"
+    except Exception as e:
+        print(f"Failed to clear unbound-tool-policy skill: {e}")
+        return "failed"
+
+
 def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     hooks_dir = Path.home() / ".claude" / "hooks"
     script_path = hooks_dir / "unbound.py"
@@ -608,6 +634,12 @@ def clear_setup() -> None:
         any_failed = True
 
     _r = _clear_path(Path.home() / ".claude" / "hooks" / "unbound.py", "Claude unbound.py hook")
+    if _r == "cleared":
+        any_cleared = True
+    elif _r == "failed":
+        any_failed = True
+
+    _r = clear_tool_policy_skill()
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
@@ -1273,6 +1305,11 @@ def main():
         print("❌ Failed to configure Claude settings")
         return
     debug_print("Claude settings configured successfully")
+
+    # Best-effort: install the Claude Code skill that steers Claude to prefer
+    # `unbound policy tool create-terminal --prompt` over hand-authoring flags.
+    # Skill failure does not block the rest of the install.
+    setup_tool_policy_skill()
 
     print("✅ API key verified and added")
     print("✅ Setup complete")
