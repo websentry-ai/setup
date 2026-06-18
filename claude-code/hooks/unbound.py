@@ -1174,11 +1174,7 @@ def process_stop_event(event: Dict, api_key: str):
     # the cached session model is wrong). Fall back to the audit log otherwise.
     session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
-    # Use the Stop event's own logged time (recorded when the hook received the
-    # event, before transcript parsing) rather than now(), so the duration isn't
-    # inflated by hook processing latency — mirrors request_initialized, which
-    # comes from the UserPromptSubmit log entry, and the cursor hook. Fall back
-    # to now() only if the Stop entry isn't in the audit log. WEB-4850.
+    # Stop event's logged time, not processing time
     request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     exchange = build_llm_exchange(

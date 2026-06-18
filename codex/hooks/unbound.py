@@ -1110,10 +1110,7 @@ def process_stop_event(event: Dict, api_key: str):
         assistant_msg['tool_use'] = assistant_tool_uses
     messages.append(assistant_msg)
 
-    # Use the Stop event's own logged time rather than now(), so the duration
-    # isn't inflated by hook processing latency — mirrors request_initialized
-    # and the cursor hook. Fall back to now() only if the Stop entry isn't in
-    # the audit log. WEB-4850.
+    # Stop event's logged time, not processing time
     request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
 
     exchange = {
@@ -1129,7 +1126,7 @@ def process_stop_event(event: Dict, api_key: str):
 
     if user_prompt_timestamp:
         exchange['requestInitialized'] = user_prompt_timestamp
-    # request_completed is always set (stop_timestamp or now()-fallback above).
+    # always set (stop_timestamp or now-fallback)
     exchange['requestCompleted'] = request_completed
 
     send_to_api(exchange, api_key)

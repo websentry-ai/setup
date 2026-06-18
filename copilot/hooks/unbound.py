@@ -371,13 +371,7 @@ def get_session_start_model(session_id):
 
 
 def get_last_user_prompt_timestamp_for_session(session_id):
-    """Return the audit-log timestamp of the most recent UserPromptSubmit for a
-    session — the real turn START. The copilot hook builds its exchange from the
-    transcript at Stop time and otherwise sends no turn boundaries, so the
-    gateway stamps ingest time for both ends and the longest-handoff metric
-    collapses to ~0. Sourcing the start from the prompt-submit event (and the end
-    from the Stop event) mirrors the claude-code/codex hooks. Latest entry wins
-    (most recent turn). WEB-4850."""
+    """Latest UserPromptSubmit audit-log timestamp; turn start."""
     if not session_id:
         return None
     found = None
@@ -1340,12 +1334,7 @@ def main():
                 session_start_model=get_session_start_model(session_id),
             )
             if exchange:
-                # Turn boundaries from event-fire times (UserPromptSubmit start /
-                # Stop end) so the gateway's longest-handoff metric reflects real
-                # autonomous-run duration instead of collapsing to ~0. `timestamp`
-                # is this Stop event's own logged time. Mirrors the claude-code/
-                # codex hooks; omit start if absent so the gateway falls back to
-                # ingest time rather than sending a bad value. WEB-4850.
+                # Turn boundaries from event-fire times
                 request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
