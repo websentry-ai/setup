@@ -428,6 +428,8 @@ def setup_tool_policy_skill() -> bool:
             capture_output=True,
             timeout=30,
         )
+        if result.returncode != 0:
+            debug_print(f"curl exited {result.returncode} downloading skill from {SKILL_URL}")
         return result.returncode == 0
     except Exception as e:
         debug_print(f"Tool policy skill install failed: {e}")

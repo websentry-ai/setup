@@ -332,6 +332,8 @@ def download_file(url: str, dest_path: Path) -> bool:
         )
         if result.returncode == 0:
             debug_print(f"File downloaded successfully: {dest_path}")
+        else:
+            debug_print(f"curl exited {result.returncode} downloading {url}; dest={dest_path}")
         return result.returncode == 0
     except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         print(f"❌ Failed to download {url}: {e}")
