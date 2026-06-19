@@ -483,13 +483,6 @@ def _parse_jsonc(text):
         return None
 
 
-_SECRET_ARG_RE = re.compile(
-    r'(api[-_]?key|token|secret|password|passwd|credential|auth|\bkey\b)',
-    re.IGNORECASE,
-)
-_BEARER_RE = re.compile(r'(?i)(bearer\s+)\S+')
-# Well-known provider token shapes — low false-positive, so safe to redact even
-# as a bare positional arg (sk-…, GitHub PATs, Slack, AWS access keys, Google).
 _TOKEN_RE = re.compile(
     r'sk-[A-Za-z0-9_\-]{6,}'
     r'|gh[opsur]_[A-Za-z0-9]{20,}'
@@ -501,60 +494,10 @@ _TOKEN_RE = re.compile(
 _REDACTED = '***'
 
 
-def _is_url(s):
-    return s.startswith('http://') or s.startswith('https://')
-
-
-# Redact secrets inside one string arg: URL-shaped args get userinfo/query
-# stripped like the url field; `key=value` / header-style `key: value` with a
-# secret-looking key (or URL value) is masked; bearer and known provider tokens
-# anywhere in the value are replaced.
-def _redact_arg(arg):
-    if _is_url(arg):
-        return _redact_mcp_url(arg)
-    for sep in ('=', ':'):
-        if sep in arg:
-            key, _, val = arg.partition(sep)
-            if not val.strip():
-                continue
-            if _SECRET_ARG_RE.search(key):
-                return f"{key}{sep}{_REDACTED}"
-            if _is_url(val):
-                return f"{key}{sep}{_redact_mcp_url(val)}"
-    arg = _BEARER_RE.sub(r'\1' + _REDACTED, arg)
-    arg = _TOKEN_RE.sub(_REDACTED, arg)
-    return arg
-
-
-# Mask secret-bearing CLI args before they leave the machine. Structure (and
-# fingerprint-relevant urls/packages) is preserved; only secret values are
-# replaced — covers `--api-key=sk-…`, `--api-key sk-…`, and secrets that sit
-# behind a benign flag (e.g. `--header "Authorization: Bearer sk-…"`).
-def _redact_mcp_args(args):
-    if not isinstance(args, list):
-        return args
-    out = []
-    mask_next = False
-    for arg in args:
-        if mask_next:
-            out.append(_REDACTED)
-            mask_next = False
-            continue
-        if not isinstance(arg, str):
-            out.append(arg)
-            continue
-        if arg.startswith('-') and '=' not in arg and _SECRET_ARG_RE.search(arg):
-            out.append(arg)
-            mask_next = True
-            continue
-        out.append(_redact_arg(arg))
-    return out
-
-
-# Forward only scheme://host[:port]/path — exactly what the gateway fingerprints.
-# Drops userinfo and the query/fragment, any of which can carry credentials
-# (https://user:pass@host, ?token=sk-…), so they never leave the machine.
-def _redact_mcp_url(url):
+# Reduce any url to scheme://host[:port]/path — the only part the gateway
+# fingerprints. Userinfo and query/fragment (which carry credentials, any
+# scheme) are dropped; known token shapes in the path are masked.
+def _redact_url(url):
     if not isinstance(url, str):
         return url
     try:
@@ -565,20 +508,35 @@ def _redact_mcp_url(url):
     if not parts.scheme or not host:
         return _REDACTED
     netloc = f"{host}:{parts.port}" if parts.port else host
-    return urlunsplit((parts.scheme, netloc, parts.path, '', ''))
+    return urlunsplit((parts.scheme, netloc, _TOKEN_RE.sub(_REDACTED, parts.path), '', ''))
+
+
+# Allowlist: forward only fingerprint-relevant args (urls, @npm packages); drop
+# everything else so no secret can ride along. Urls are credential-stripped.
+def _redact_args(args):
+    if not isinstance(args, list):
+        return args
+    kept = []
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        if '://' in arg:
+            kept.append(_redact_url(arg))
+        elif arg.startswith('@'):
+            kept.append(arg)
+    return kept
 
 
 def _sanitize_mcp_server_fields(server):
-    """Keep only fingerprinting fields (url/command/args/type); never secrets."""
     if not isinstance(server, dict):
         return None
     result = {}
     if server.get('url'):
-        result['url'] = _redact_mcp_url(server['url'])
+        result['url'] = _redact_url(server['url'])
     if server.get('command'):
         result['command'] = server['command']
     if server.get('args'):
-        result['args'] = _redact_mcp_args(server['args'])
+        result['args'] = _redact_args(server['args'])
     if server.get('type'):
         result['type'] = server['type']
     return result if result else None
