@@ -448,15 +448,29 @@ def _copilot_mcp_config_paths(cwd=None):
 
     return workspace + trusted
 
-_JSONC_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n\r]*|/\*.*?\*/', re.DOTALL)
+_JSONC_COMMENT_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|//[^\n\r]*'         # line comment (dropped)
+    r'|/\*.*?\*/',         # block comment (dropped)
+    re.DOTALL,
+)
+_JSONC_TRAILING_COMMA_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|,(?=\s*[}\]])',     # trailing comma (dropped; brace left via lookahead)
+    re.DOTALL,
+)
 
 
 def _strip_jsonc(text):
-    def replace(match):
+    # Two string-aware passes: both match string literals first so commas/comment
+    # markers inside a quoted value are preserved verbatim. Pass 1 drops comments;
+    # pass 2 drops trailing commas (now that any comment between a comma and its
+    # brace is gone) via a lookahead that leaves the brace in place.
+    def keep_strings(match):
         token = match.group(0)
         return token if token.startswith('"') else ''
-    no_comments = _JSONC_TOKEN_RE.sub(replace, text)
-    return re.sub(r',(\s*[}\]])', r'\1', no_comments)
+    no_comments = _JSONC_COMMENT_RE.sub(keep_strings, text)
+    return _JSONC_TRAILING_COMMA_RE.sub(keep_strings, no_comments)
 
 def _parse_jsonc(text):
     try:
@@ -474,20 +488,41 @@ _SECRET_ARG_RE = re.compile(
     re.IGNORECASE,
 )
 _BEARER_RE = re.compile(r'(?i)(bearer\s+)\S+')
-_SK_TOKEN_RE = re.compile(r'sk-[A-Za-z0-9_\-]{6,}')
+# Well-known provider token shapes — low false-positive, so safe to redact even
+# as a bare positional arg (sk-…, GitHub PATs, Slack, AWS access keys, Google).
+_TOKEN_RE = re.compile(
+    r'sk-[A-Za-z0-9_\-]{6,}'
+    r'|gh[opsur]_[A-Za-z0-9]{20,}'
+    r'|github_pat_[A-Za-z0-9_]{20,}'
+    r'|xox[baprs]-[A-Za-z0-9-]{10,}'
+    r'|AKIA[0-9A-Z]{16}'
+    r'|AIza[0-9A-Za-z_\-]{20,}'
+)
 _REDACTED = '***'
 
 
-# Redact secrets inside one string arg: `key=value` / header-style `key: value`
-# with a secret-looking key, plus bearer and sk- tokens anywhere in the value.
+def _is_url(s):
+    return s.startswith('http://') or s.startswith('https://')
+
+
+# Redact secrets inside one string arg: URL-shaped args get userinfo/query
+# stripped like the url field; `key=value` / header-style `key: value` with a
+# secret-looking key (or URL value) is masked; bearer and known provider tokens
+# anywhere in the value are replaced.
 def _redact_arg(arg):
+    if _is_url(arg):
+        return _redact_mcp_url(arg)
     for sep in ('=', ':'):
         if sep in arg:
             key, _, val = arg.partition(sep)
-            if val.strip() and _SECRET_ARG_RE.search(key):
+            if not val.strip():
+                continue
+            if _SECRET_ARG_RE.search(key):
                 return f"{key}{sep}{_REDACTED}"
+            if _is_url(val):
+                return f"{key}{sep}{_redact_mcp_url(val)}"
     arg = _BEARER_RE.sub(r'\1' + _REDACTED, arg)
-    arg = _SK_TOKEN_RE.sub(_REDACTED, arg)
+    arg = _TOKEN_RE.sub(_REDACTED, arg)
     return arg
 
 
@@ -588,9 +623,19 @@ def _sanitize_copilot_server_name(name):
     return re.sub(r'[^a-zA-Z0-9_-]', '-', name.replace('@', '-'))
 
 
-_MCP_NAME_SEPARATORS = ('__', '-', '_', '/', '.')
+# Only the delimiters Copilot actually emits: '-' (sanitized serverName-toolName)
+# and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
+# false-positive relabels of unrelated tools sharing a server's prefix.
+_MCP_NAME_SEPARATORS = ('__', '-')
+# A server name must be at least this long to anchor a bare-name match, so a
+# one-char config entry can't swallow arbitrary tool names.
+_MIN_MCP_SERVER_NAME = 2
 
 
+# Resolve (server, tool, config) from a Copilot tool name. The mcp__ form is
+# self-delimiting; the bare form is matched against configured server names.
+# Matching is case-insensitive (Copilot lowercases nothing, configs vary case)
+# and the longest server match wins; ties resolve to config/iteration order.
 def detect_mcp_call(raw_tool, mcp_servers):
     if not raw_tool:
         return (None, None, None)
@@ -599,17 +644,18 @@ def detect_mcp_call(raw_tool, mcp_servers):
         parts = raw_tool[len('mcp__'):].split('__', 1)
         server = parts[0]
         mcp_tool = parts[1] if len(parts) >= 2 else ''
-        config = mcp_servers.get(server)
-        return (server, mcp_tool, config)
+        return (server, mcp_tool, mcp_servers.get(server))
 
+    raw_lower = raw_tool.lower()
     best = None  # (matched_len, server_name, mcp_tool)
     for server_name in mcp_servers:
         for candidate in {server_name, _sanitize_copilot_server_name(server_name)}:
-            if not candidate:
+            if len(candidate) < _MIN_MCP_SERVER_NAME:
                 continue
-            if raw_tool == candidate:
+            cand_lower = candidate.lower()
+            if raw_lower == cand_lower:
                 mcp_tool = ''
-            elif raw_tool.startswith(candidate):
+            elif raw_lower.startswith(cand_lower):
                 remainder = raw_tool[len(candidate):]
                 sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
                 if sep is None:
@@ -834,11 +880,19 @@ def process_pre_tool_use(event, api_key):
         mcp_servers = read_copilot_mcp_servers(cwd)
         mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
         if mcp_server is None:
-            # Self-validation: record the raw name (never args) so we can confirm
-            # the real MCP tool-name format from a live run without reshipping.
-            # Skip known-benign native tools so the log isn't noisy.
+            # A bare (non-mcp__) tool can only be resolved against the MCP config.
+            # If no config was readable, a genuine MCP call can't be identified
+            # and would slip the allow-list — surface that distinctly so the
+            # potential bypass is observable rather than silent. Skip known-benign
+            # native tools so the log isn't noisy.
             if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
-                log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+                if not mcp_servers and not raw_tool.startswith('mcp__'):
+                    log_error(
+                        f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
+                        'mcp_config',
+                    )
+                else:
+                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
             return {}
         is_mcp = True
         canonical = f"mcp__{mcp_server}__{mcp_tool}"
