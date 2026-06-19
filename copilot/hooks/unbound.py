@@ -48,6 +48,10 @@ LOG_DIR = Path.home() / ".copilot" / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+# Resolution telemetry has its OWN throttle budget (separate file) so routine
+# copilot_mcp_resolved/unresolved telemetry can never consume the error/bypass
+# budget guarded by LAST_REPORT_FILE and suppress a genuine error report.
+LAST_RESOLUTION_REPORT_FILE = LOG_DIR / ".last_resolution_report"
 
 SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
@@ -119,6 +123,58 @@ INTERNAL_TOOLS = {
 }
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+
+# Additional VS Code agent-mode built-ins that carry no security-relevant action
+# of their own (read-only search/fetch, test running, notebook editing, terminal
+# meta) and are NOT in the scoring sets above. Listed here ONLY so the
+# fail-secure deny never false-blocks them when the kill-switch is flipped ON;
+# they are not mapped/scored as analytics (canonical_tool_name still returns ''
+# for them, exactly as before).
+#
+# This set is INTENTIONALLY CONSERVATIVE — it lists known-benign built-ins by
+# name rather than allow-by-default. Flipping UNBOUND_COPILOT_MCP_DENY_UNRESOLVED
+# ON is gated on telemetry showing `copilot_mcp_unresolved_with_config` ~= 0:
+# the soak surfaces any built-in we missed (as an unresolved-with-config event)
+# so this set can be topped up before the deny is ever enabled in prod.
+VSCODE_AGENT_BUILTINS = {
+    # read-only search / context retrieval / web fetch
+    'fetch', 'fetch_webpage', 'fetchWebPage',
+    'semantic_search', 'semanticSearch',
+    'codebase', 'usages',
+    # test discovery / execution
+    'findTestFiles', 'find_test_files',
+    'runTests', 'run_tests',
+    'get_errors', 'getErrors',
+    'test_search', 'testSearch',
+    'test_failure', 'testFailure',
+    # repo / task / command meta
+    'githubRepo', 'github_repo',
+    'runTasks', 'run_tasks',
+    'runCommands', 'run_commands',
+    'run_in_terminal', 'runInTerminal',
+    'open_simple_browser', 'openSimpleBrowser',
+    # notebook editing / execution
+    'editNotebook', 'edit_notebook',
+    'runNotebookCell', 'run_notebook_cell',
+}
+
+# Every Copilot tool name we recognize as a non-MCP built-in (both surfaces).
+# Used only by the fail-secure deny: a genuinely-unknown tool on an
+# MCP-configured machine is the false-block-risk surface; anything in this union
+# is a known built-in and is never denied. TERMINAL_LIKE_TOOLS contributes its
+# keys (the values are lambdas).
+KNOWN_NON_MCP_BUILTINS = (
+    SHELL_TOOLS | READ_TOOLS | WRITE_TOOLS | EDIT_TOOLS
+    | ALLOWED_NON_MCP_HOOK_NAMES | INTERNAL_TOOLS
+    | VSCODE_AGENT_BUILTINS
+    | set(TERMINAL_LIKE_TOOLS)
+)
+
+# Fail-secure kill-switch (default OFF). When OFF, an unresolved bare tool on an
+# MCP-configured machine still ALLOWs (return {}) exactly as before. When ON, it
+# is DENIED as a potential unidentified MCP call. Read once at module load.
+DENY_UNRESOLVED_MCP = os.environ.get('UNBOUND_COPILOT_MCP_DENY_UNRESOLVED', '').strip().lower() in ('1', 'true', 'yes', 'on')
+
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -136,6 +192,7 @@ except Exception:
     AUDIT_LOG = LOG_DIR / "agent-audit.log"
     ERROR_LOG = LOG_DIR / "error.log"
     LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
+    LAST_RESOLUTION_REPORT_FILE = LOG_DIR / ".last_resolution_report"
     POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 
 
@@ -143,25 +200,27 @@ _cached_api_key = None
 _reporting_error = False
 
 
-def _should_report():
-    """Rate limit: max 1 remote error report per 60 seconds. Fails closed."""
+def _should_report(throttle_file=None):
+    """Rate limit: max 1 remote report per 60 seconds for the given throttle
+    file. Fails closed. Defaults to the error-report budget (LAST_REPORT_FILE);
+    resolution telemetry passes its own file so the two budgets never collide."""
+    if throttle_file is None:
+        throttle_file = LAST_REPORT_FILE
     try:
-        if LAST_REPORT_FILE.exists():
-            mtime = LAST_REPORT_FILE.stat().st_mtime
+        if throttle_file.exists():
+            mtime = throttle_file.stat().st_mtime
             if (datetime.now().timestamp() - mtime) < 60:
                 return False
-        LAST_REPORT_FILE.touch()
+        throttle_file.touch()
         return True
     except Exception:
         return False
 
 
-def report_error_to_gateway(message, category='general', api_key=None):
-    """Fire-and-forget error report to gateway. Never blocks, never raises."""
-    global _reporting_error
-    if _reporting_error or not api_key or not _should_report():
-        return
-    _reporting_error = True
+def _post_error_payload(message, category, api_key):
+    """Fire-and-forget POST of a single message to /v1/hooks/errors. No
+    throttling or reentrancy gating here — callers own their own budget. Never
+    blocks, never raises."""
     try:
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
@@ -180,6 +239,19 @@ def report_error_to_gateway(message, category='general', api_key=None):
         proc.stdin.close()
     except Exception:
         pass
+
+
+def report_error_to_gateway(message, category='general', api_key=None, throttle_file=None):
+    """Fire-and-forget error report to gateway. Never blocks, never raises.
+    Throttled by the shared error budget (LAST_REPORT_FILE) unless a distinct
+    throttle_file is supplied — MCP-resolution telemetry passes its own file so
+    routine telemetry can never consume the error/bypass budget."""
+    global _reporting_error
+    if _reporting_error or not api_key or not _should_report(throttle_file):
+        return
+    _reporting_error = True
+    try:
+        _post_error_payload(message, category, api_key)
     finally:
         _reporting_error = False
 
@@ -333,7 +405,21 @@ def cleanup_old_logs():
         ]
         save_logs(kept_logs)
     elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        # Single session, tail-trim to the last AUDIT_LOG_TOTAL_LIMIT entries —
+        # but preserve any SessionStart record that would fall outside the tail
+        # window, so the cwd/model fallback (get_session_start_cwd /
+        # get_session_start_model) survives a very long single session.
+        tail = logs[-AUDIT_LOG_TOTAL_LIMIT:]
+        if not any(
+            log.get('event', {}).get('hook_event_name') == 'SessionStart'
+            for log in tail
+        ):
+            session_starts = [
+                log for log in logs[:-AUDIT_LOG_TOTAL_LIMIT]
+                if log.get('event', {}).get('hook_event_name') == 'SessionStart'
+            ]
+            tail = session_starts + tail
+        save_logs(tail)
 
 
 def get_recent_user_prompts_for_session(session_id, n):
@@ -369,6 +455,28 @@ def get_session_start_model(session_id):
         model = event.get('model')
         if model:
             found = model
+    return found
+
+
+def get_session_start_cwd(session_id):
+    """Return the cwd from the audit-logged SessionStart event for a session.
+    Copilot includes `cwd` on SessionStart but may omit it on PreToolUse; this
+    recovers it so MCP workspace configs can still be located. Latest entry wins.
+    Best-effort: cleanup_old_logs preserves the current session's SessionStart,
+    but the record can still be absent if the log was rotated/truncated out of
+    band — callers must tolerate None."""
+    if not session_id:
+        return None
+    found = None
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != 'SessionStart':
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        cwd = event.get('cwd')
+        if cwd:
+            found = cwd
     return found
 
 
@@ -421,6 +529,20 @@ def _vscode_user_dirs():
     return [base / "Code" / "User", base / "Code - Insiders" / "User"]
 
 
+# Resolve the Copilot CLI config dir, honoring COPILOT_HOME (which — per GitHub's
+# docs — replaces the entire ~/.copilot path). Mirrors discovery's
+# _resolve_copilot_dir: COPILOT_HOME read from the process env only validly
+# applies to the running user. Never raises.
+def _copilot_cli_config_dir():
+    try:
+        override = (os.environ.get("COPILOT_HOME") or "").strip()
+        if override:
+            return Path(os.path.expanduser(os.path.expandvars(override)))
+    except Exception:
+        pass
+    return Path.home() / ".copilot"
+
+
 # All Copilot MCP config locations. Untrusted workspace files (from cwd) come
 # first; trusted user/global/CLI configs last so they win the last-wins merge in
 # read_copilot_mcp_servers.
@@ -444,7 +566,7 @@ def _copilot_mcp_config_paths(cwd=None):
         except OSError:
             pass
     trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
-    trusted.append(home / ".copilot" / "mcp-config.json")
+    trusted.append(_copilot_cli_config_dir() / "mcp-config.json")
 
     return workspace + trusted
 
@@ -544,6 +666,11 @@ def _sanitize_mcp_server_fields(server):
 
 _MCP_CONFIG_MAX_BYTES = 1_000_000
 
+# Top-level keys that are config metadata, never MCP servers. Excluded from the
+# flat top-level server-form fallback so a metadata block carrying a `command`/
+# `url` (e.g. VS Code's `inputs`) can't be misread as a phantom server.
+_FLAT_FORM_NON_SERVER_KEYS = {'inputs', 'version', '$schema'}
+
 
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
@@ -564,6 +691,21 @@ def read_copilot_mcp_servers(cwd=None):
                 nested = config.get('mcp')
                 raw = nested.get('servers') if isinstance(nested, dict) else None
             if not isinstance(raw, dict):
+                # Flat top-level form (Claude-style, accepted by the GitHub CLI):
+                # treat each top-level entry whose value is a dict carrying a
+                # `command` or `url` as a server. Mirrors discovery's
+                # _extract_servers_obj fallback; ignores scalar metadata and
+                # known non-server top-level blocks (e.g. a VS Code `inputs`
+                # block that itself carries a `command` key) so they can't mint
+                # a phantom server.
+                raw = {
+                    name: value
+                    for name, value in config.items()
+                    if name not in _FLAT_FORM_NON_SERVER_KEYS
+                    and isinstance(value, dict)
+                    and ('command' in value or 'url' in value)
+                }
+            if not isinstance(raw, dict) or not raw:
                 continue
             for name, server in raw.items():
                 fields = _sanitize_mcp_server_fields(server)
@@ -576,7 +718,9 @@ def read_copilot_mcp_servers(cwd=None):
     return servers
 
 
-# Mirror Copilot's server-name sanitization for tool-name prefixes.
+# Mirror Copilot's server-name sanitization for tool-name prefixes. NOTE: parity
+# with Copilot's real derivation is unverified — the fail-secure deny (gated by
+# DENY_UNRESOLVED_MCP) is the safety net for any case this heuristic misses.
 def _sanitize_copilot_server_name(name):
     return re.sub(r'[^a-zA-Z0-9_-]', '-', name.replace('@', '-'))
 
@@ -822,6 +966,34 @@ def transform_response_for_copilot_prompt(api_response):
     return {}
 
 
+def _copilot_surface(event):
+    """`cli` (snake_case keys) vs `vscode` (camelCase keys). Best-effort: keyed
+    off which casing the event carries; defaults to cli. This is a telemetry
+    LABELING heuristic only — never authoritative for control flow."""
+    if 'toolName' in event or 'hookEventName' in event or 'sessionId' in event:
+        return 'vscode'
+    return 'cli'
+
+
+def _report_mcp_resolution(category, raw_tool, event, api_key):
+    """Fire-and-forget telemetry for the MCP-resolution outcome. NAMES ONLY —
+    never args or config. Computes a rate, not just a count, by emitting on the
+    resolved path too. Reuses the report_error_to_gateway plumbing (which never
+    raises) but on its OWN throttle budget (LAST_RESOLUTION_REPORT_FILE), so this
+    routine telemetry can never suppress a genuine error/bypass report sharing
+    the LAST_REPORT_FILE budget."""
+    try:
+        surface = _copilot_surface(event)
+        report_error_to_gateway(
+            f"{category} surface={surface} tool={raw_tool}",
+            category=category,
+            api_key=api_key,
+            throttle_file=LAST_RESOLUTION_REPORT_FILE,
+        )
+    except Exception:
+        pass
+
+
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
@@ -834,23 +1006,58 @@ def process_pre_tool_use(event, api_key):
     mcp_server = mcp_tool = mcp_server_config = None
 
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
-        cwd = event.get('cwd')
+        # cwd locates workspace MCP configs. Copilot sends it on SessionStart but
+        # may omit it on PreToolUse, so fall back to the session's logged cwd.
+        cwd = event.get('cwd') or get_session_start_cwd(session_id)
+
         mcp_servers = read_copilot_mcp_servers(cwd)
-        mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
+
+        # Forward-compat (DEAD today): if Copilot ever emits a structured server
+        # field, trust it and skip the heuristic. Confirmed: today's Copilot
+        # PreToolUse emits NEITHER of these — this is future-proofing, not the
+        # active fix.
+        structured_server = event.get('mcp_server') or event.get('serverName') or event.get('server')
+        if structured_server:
+            mcp_server = structured_server
+            mcp_tool = event.get('mcp_tool') or event.get('toolName') or event.get('tool_name') or ''
+            mcp_server_config = mcp_servers.get(structured_server)
+        else:
+            mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
         if mcp_server is None:
-            # A bare (non-mcp__) tool can only be resolved against the MCP config.
-            # If no config was readable, a genuine MCP call can't be identified
-            # and would slip the allow-list — surface that distinctly so the
-            # potential bypass is observable rather than silent. Skip known-benign
-            # native tools so the log isn't noisy.
-            if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
-                if not mcp_servers and not raw_tool.startswith('mcp__'):
+            # A bare (non-mcp__) tool couldn't be resolved to a configured MCP
+            # server. Two mutually-exclusive cases, surfaced distinctly so the
+            # false-block-risk RATE (configured-but-unmatched / resolved) is
+            # observable. Known built-ins are benign and never noisy/blocked.
+            is_known_builtin = raw_tool in KNOWN_NON_MCP_BUILTINS
+            if raw_tool and not is_known_builtin:
+                if mcp_servers:
+                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+                    _report_mcp_resolution('copilot_mcp_unresolved_with_config', raw_tool, event, api_key)
+                else:
                     log_error(
                         f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
                         'mcp_config',
                     )
-                else:
-                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+                    _report_mcp_resolution('copilot_mcp_unresolved_no_config', raw_tool, event, api_key)
+
+            # Fail-secure (gated, default OFF). When MCP IS configured and this is
+            # a genuinely-unknown tool (not a known built-in), an unidentified MCP
+            # call would otherwise slip the allow-list. DENY it — but only when
+            # the kill-switch is ON; until then behavior is identical to before
+            # (return {}). This is an IDENTITY/policy deny, distinct from the
+            # gateway-unreachable infra fail-open below.
+            if (
+                DENY_UNRESOLVED_MCP
+                and mcp_servers
+                and raw_tool
+                and not is_known_builtin
+            ):
+                _report_mcp_resolution('copilot_mcp_denied_unresolved', raw_tool, event, api_key)
+                return transform_response_for_copilot({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy. This tool could not be verified against the configured MCP servers — it may be an unsanctioned MCP tool or an unrecognized tool on an MCP-enabled machine.',
+                    'additionalContext': 'This action was blocked by an organization security policy because the tool could not be identified against the configured MCP servers (it may be an unsanctioned MCP tool, or an unrecognized tool on this MCP-enabled machine). Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                })
             return {}
         is_mcp = True
         canonical = f"mcp__{mcp_server}__{mcp_tool}"
@@ -861,6 +1068,7 @@ def process_pre_tool_use(event, api_key):
             f"config={'yes' if mcp_server_config else 'no'}",
             'mcp_match',
         )
+        _report_mcp_resolution('copilot_mcp_resolved', raw_tool, event, api_key)
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -1592,6 +1800,18 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
+            # Persist a normalized record (snake_case keys, both surfaces) so
+            # get_session_start_model / get_session_start_cwd can recover the
+            # session's model + cwd on later PreToolUse events that omit them.
+            append_to_audit_log({
+                'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                'event': {
+                    'hook_event_name': 'SessionStart',
+                    'session_id': event.get('session_id') or event.get('sessionId'),
+                    'cwd': event.get('cwd'),
+                    'model': event.get('model'),
+                },
+            })
             _check_self_update()
             _dispatch_discovery()
             print("{}")
