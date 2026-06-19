@@ -15,6 +15,7 @@ import tempfile
 import time
 import hashlib
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -472,12 +473,28 @@ _SECRET_ARG_RE = re.compile(
     r'(api[-_]?key|token|secret|password|passwd|credential|auth|\bkey\b)',
     re.IGNORECASE,
 )
+_BEARER_RE = re.compile(r'(?i)(bearer\s+)\S+')
+_SK_TOKEN_RE = re.compile(r'sk-[A-Za-z0-9_\-]{6,}')
 _REDACTED = '***'
 
 
+# Redact secrets inside one string arg: `key=value` / header-style `key: value`
+# with a secret-looking key, plus bearer and sk- tokens anywhere in the value.
+def _redact_arg(arg):
+    for sep in ('=', ':'):
+        if sep in arg:
+            key, _, val = arg.partition(sep)
+            if val.strip() and _SECRET_ARG_RE.search(key):
+                return f"{key}{sep}{_REDACTED}"
+    arg = _BEARER_RE.sub(r'\1' + _REDACTED, arg)
+    arg = _SK_TOKEN_RE.sub(_REDACTED, arg)
+    return arg
+
+
 # Mask secret-bearing CLI args before they leave the machine. Structure (and
-# fingerprint-relevant urls/packages) is preserved; only the secret value is
-# replaced — handles both `--api-key=sk-…` and `--api-key sk-…` forms.
+# fingerprint-relevant urls/packages) is preserved; only secret values are
+# replaced — covers `--api-key=sk-…`, `--api-key sk-…`, and secrets that sit
+# behind a benign flag (e.g. `--header "Authorization: Bearer sk-…"`).
 def _redact_mcp_args(args):
     if not isinstance(args, list):
         return args
@@ -491,17 +508,29 @@ def _redact_mcp_args(args):
         if not isinstance(arg, str):
             out.append(arg)
             continue
-        if '=' in arg:
-            key, _, _val = arg.partition('=')
-            if _SECRET_ARG_RE.search(key):
-                out.append(f"{key}={_REDACTED}")
-                continue
-        elif arg.startswith('-') and _SECRET_ARG_RE.search(arg):
+        if arg.startswith('-') and '=' not in arg and _SECRET_ARG_RE.search(arg):
             out.append(arg)
             mask_next = True
             continue
-        out.append(arg)
+        out.append(_redact_arg(arg))
     return out
+
+
+# Forward only scheme://host[:port]/path — exactly what the gateway fingerprints.
+# Drops userinfo and the query/fragment, any of which can carry credentials
+# (https://user:pass@host, ?token=sk-…), so they never leave the machine.
+def _redact_mcp_url(url):
+    if not isinstance(url, str):
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _REDACTED
+    host = parts.hostname
+    if not parts.scheme or not host:
+        return _REDACTED
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme, netloc, parts.path, '', ''))
 
 
 def _sanitize_mcp_server_fields(server):
@@ -510,7 +539,7 @@ def _sanitize_mcp_server_fields(server):
         return None
     result = {}
     if server.get('url'):
-        result['url'] = server['url']
+        result['url'] = _redact_mcp_url(server['url'])
     if server.get('command'):
         result['command'] = server['command']
     if server.get('args'):
