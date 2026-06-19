@@ -126,16 +126,15 @@ NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 
 # Additional VS Code agent-mode built-ins that carry no security-relevant action
 # of their own (read-only search/fetch, test running, notebook editing, terminal
-# meta) and are NOT in the scoring sets above. Listed here ONLY so the
-# fail-secure deny never false-blocks them when the kill-switch is flipped ON;
+# meta) and are NOT in the scoring sets above. Listed here ONLY to keep these
+# known-benign built-ins out of the unresolved-MCP telemetry (noise reduction);
 # they are not mapped/scored as analytics (canonical_tool_name still returns ''
 # for them, exactly as before).
 #
 # This set is INTENTIONALLY CONSERVATIVE — it lists known-benign built-ins by
-# name rather than allow-by-default. Flipping UNBOUND_COPILOT_MCP_DENY_UNRESOLVED
-# ON is gated on telemetry showing `copilot_mcp_unresolved_with_config` ~= 0:
-# the soak surfaces any built-in we missed (as an unresolved-with-config event)
-# so this set can be topped up before the deny is ever enabled in prod.
+# name rather than allow-by-default. The unresolved-with-config telemetry soak
+# surfaces any built-in we missed (as an unresolved-with-config event) so this
+# set can be topped up.
 VSCODE_AGENT_BUILTINS = {
     # read-only search / context retrieval / web fetch
     'fetch', 'fetch_webpage', 'fetchWebPage',
@@ -159,21 +158,17 @@ VSCODE_AGENT_BUILTINS = {
 }
 
 # Every Copilot tool name we recognize as a non-MCP built-in (both surfaces).
-# Used only by the fail-secure deny: a genuinely-unknown tool on an
-# MCP-configured machine is the false-block-risk surface; anything in this union
-# is a known built-in and is never denied. TERMINAL_LIKE_TOOLS contributes its
-# keys (the values are lambdas).
+# Used only to keep known-benign tools OUT of the unresolved-MCP telemetry: a
+# genuinely-unknown tool on an MCP-configured machine is the signal worth
+# surfacing, so anything in this union is treated as a known built-in and never
+# emits unresolved telemetry. TERMINAL_LIKE_TOOLS contributes its keys (the
+# values are lambdas).
 KNOWN_NON_MCP_BUILTINS = (
     SHELL_TOOLS | READ_TOOLS | WRITE_TOOLS | EDIT_TOOLS
     | ALLOWED_NON_MCP_HOOK_NAMES | INTERNAL_TOOLS
     | VSCODE_AGENT_BUILTINS
     | set(TERMINAL_LIKE_TOOLS)
 )
-
-# Fail-secure kill-switch (default OFF). When OFF, an unresolved bare tool on an
-# MCP-configured machine still ALLOWs (return {}) exactly as before. When ON, it
-# is DENIED as a potential unidentified MCP call. Read once at module load.
-DENY_UNRESOLVED_MCP = os.environ.get('UNBOUND_COPILOT_MCP_DENY_UNRESOLVED', '').strip().lower() in ('1', 'true', 'yes', 'on')
 
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
@@ -537,7 +532,7 @@ def _copilot_cli_config_dir():
     try:
         override = (os.environ.get("COPILOT_HOME") or "").strip()
         if override:
-            return Path(os.path.expanduser(os.path.expandvars(override)))
+            return Path(os.path.expanduser(override))
     except Exception:
         pass
     return Path.home() / ".copilot"
@@ -719,8 +714,9 @@ def read_copilot_mcp_servers(cwd=None):
 
 
 # Mirror Copilot's server-name sanitization for tool-name prefixes. NOTE: parity
-# with Copilot's real derivation is unverified — the fail-secure deny (gated by
-# DENY_UNRESOLVED_MCP) is the safety net for any case this heuristic misses.
+# with Copilot's real derivation is unverified — a case this heuristic misses
+# falls through as unresolved (allowed, with unresolved-MCP telemetry), exactly
+# as a bare tool did before this change.
 def _sanitize_copilot_server_name(name):
     return re.sub(r'[^a-zA-Z0-9_-]', '-', name.replace('@', '-'))
 
@@ -1026,8 +1022,9 @@ def process_pre_tool_use(event, api_key):
         if mcp_server is None:
             # A bare (non-mcp__) tool couldn't be resolved to a configured MCP
             # server. Two mutually-exclusive cases, surfaced distinctly so the
-            # false-block-risk RATE (configured-but-unmatched / resolved) is
-            # observable. Known built-ins are benign and never noisy/blocked.
+            # unresolved RATE (configured-but-unmatched vs. resolved) is
+            # observable. Known built-ins are benign and kept out of the
+            # telemetry so it isn't noisy.
             is_known_builtin = raw_tool in KNOWN_NON_MCP_BUILTINS
             if raw_tool and not is_known_builtin:
                 if mcp_servers:
@@ -1040,24 +1037,11 @@ def process_pre_tool_use(event, api_key):
                     )
                     _report_mcp_resolution('copilot_mcp_unresolved_no_config', raw_tool, event, api_key)
 
-            # Fail-secure (gated, default OFF). When MCP IS configured and this is
-            # a genuinely-unknown tool (not a known built-in), an unidentified MCP
-            # call would otherwise slip the allow-list. DENY it — but only when
-            # the kill-switch is ON; until then behavior is identical to before
-            # (return {}). This is an IDENTITY/policy deny, distinct from the
-            # gateway-unreachable infra fail-open below.
-            if (
-                DENY_UNRESOLVED_MCP
-                and mcp_servers
-                and raw_tool
-                and not is_known_builtin
-            ):
-                _report_mcp_resolution('copilot_mcp_denied_unresolved', raw_tool, event, api_key)
-                return transform_response_for_copilot({
-                    'decision': 'deny',
-                    'reason': 'Blocked by organization policy. This tool could not be verified against the configured MCP servers — it may be an unsanctioned MCP tool or an unrecognized tool on an MCP-enabled machine.',
-                    'additionalContext': 'This action was blocked by an organization security policy because the tool could not be identified against the configured MCP servers (it may be an unsanctioned MCP tool, or an unrecognized tool on this MCP-enabled machine). Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
-                })
+            # A bare tool that couldn't be resolved to a configured MCP server is
+            # ALLOWED (return {}) — identical to pre-PR behavior. Identification +
+            # telemetry above are observe-only; no deny is issued here. (The
+            # gateway-unreachable infra fail-open for RESOLVED calls is separate,
+            # handled below.)
             return {}
         is_mcp = True
         canonical = f"mcp__{mcp_server}__{mcp_tool}"

@@ -1,5 +1,5 @@
 """
-Integration tests for Copilot PreToolUse MCP identification + fail-secure.
+Integration tests for Copilot PreToolUse MCP identification + telemetry.
 
 Driven through process_pre_tool_use / main() (the outermost layer) — assertions
 are on the RETURNED dict, never on internal helpers. No network: send_to_hook_api
@@ -12,10 +12,10 @@ Covers:
   - cwd resolution via event cwd AND via the SessionStart-cwd fallback
   - COPILOT_HOME override
   - flat top-level server form
-  - fail-secure matrix (flag ON) + inert-when-OFF
-  - infra fail-open (resolved call, gateway {}) stays distinct from identity deny
+  - unresolved bare tool is allowed (return {}) while still emitting telemetry
+  - infra fail-open (resolved call, gateway {}) honors policy_check_failure_action
   - never-crash on garbage/oversized/missing input
-  - telemetry categories on each path
+  - telemetry categories on each path + resolution-budget isolation
 """
 
 import json
@@ -268,72 +268,45 @@ class TestFlatTopLevelForm(_Base):
         self.assertEqual(sent['pre_tool_use_data']['tool_name'], 'mcp__github__create_issue')
 
 
-class TestFailSecureFlagOn(_Base):
-    """Fail-secure matrix with UNBOUND_COPILOT_MCP_DENY_UNRESOLVED ON."""
-
-    def setUp(self):
-        super().setUp()
-        self._deny = patch.object(unbound, "DENY_UNRESOLVED_MCP", True)
-        self._deny.start()
-        self.addCleanup(self._deny.stop)
+class TestUnresolvedIsAllowed(_Base):
+    """An unresolved bare tool is ALLOWED (return {}) — identical to pre-PR
+    behavior. Identification + telemetry are observe-only; no deny is issued.
+    Known built-ins stay out of the unresolved telemetry (noise reduction)."""
 
     def _run(self, event, config):
-        self._write_mcp(config) if config is not None else None
+        if config is not None:
+            self._write_mcp(config)
         paths = (self.mcp_config,) if config is not None else ()
         with self._point_config_paths_at(*paths), \
-             patch.object(unbound, "send_to_hook_api", return_value={}):
-            return unbound.process_pre_tool_use(event, "k")
+             patch.object(unbound, "send_to_hook_api", return_value={}) as api:
+            return unbound.process_pre_tool_use(event, "k"), api
 
-    def test_unresolved_with_config_nonnative_denies(self):
-        result = self._run(
+    def test_unresolved_with_config_allows(self):
+        # A genuinely-unknown tool on an MCP-configured machine is NOT denied.
+        result, api = self._run(
             {"tool_name": "totally-unknown-mcp-tool", "session_id": "s1"},
             {"servers": {"github": {"command": "c"}}},
         )
-        self.assertEqual(result.get('permissionDecision'), 'deny')
-        self.assertEqual(
-            result['hookSpecificOutput']['permissionDecision'], 'deny'
-        )
-
-    def test_unresolved_with_config_emits_denied_telemetry(self):
-        self.mock_telemetry.reset_mock()
-        self._run(
-            {"tool_name": "totally-unknown-mcp-tool", "session_id": "s1"},
-            {"servers": {"github": {"command": "c"}}},
-        )
-        self.assertIn('copilot_mcp_denied_unresolved', self._telemetry_categories())
+        self.assertEqual(result, {})
+        self.assertFalse(api.called)  # unresolved → no gateway call
 
     def test_unresolved_no_config_allows(self):
         # No MCP configured at all → cannot be an MCP call → allow.
-        result = self._run({"tool_name": "weird-thing", "session_id": "s1"}, None)
+        result, _ = self._run({"tool_name": "weird-thing", "session_id": "s1"}, None)
         self.assertEqual(result, {})
 
-    def test_known_builtin_never_blocked_even_with_config(self):
-        # `read_file` is a known built-in; never denied even when MCP configured.
-        result = self._run(
+    def test_known_builtin_allows_with_config(self):
+        # `read_file` is a known built-in; allowed even when MCP configured.
+        result, _ = self._run(
             {"tool_name": "read_file", "session_id": "s1", "tool_input": {"filePath": "/x"}},
             {"servers": {"github": {"command": "c"}}},
         )
         self.assertEqual(result, {})
 
-    def test_internal_tool_never_blocked(self):
-        result = self._run(
-            {"tool_name": "manage_todo_list", "session_id": "s1"},
-            {"servers": {"github": {"command": "c"}}},
-        )
-        self.assertEqual(result, {})
-
-    def test_terminal_like_tool_never_blocked(self):
-        result = self._run(
-            {"tool_name": "grep_search", "session_id": "s1", "tool_input": {"query": "x"}},
-            {"servers": {"github": {"command": "c"}}},
-        )
-        self.assertEqual(result, {})
-
-    def test_vscode_agent_builtins_never_blocked_even_with_config(self):
-        # The expanded VS Code agent-mode built-in allow-set (read-only search,
-        # test running, notebook editing, repo/task meta — both camel & snake
-        # variants) must never be denied when the deny flag is ON, so flipping
-        # it on can't false-block routine agent built-ins.
+    def test_vscode_agent_builtins_allow_with_config(self):
+        # The expanded VS Code agent-mode built-in set (read-only search, test
+        # running, notebook editing, repo/task meta — both camel & snake
+        # variants) is allowed when MCP is configured.
         builtins = [
             "fetch", "fetch_webpage", "semantic_search", "codebase", "usages",
             "findTestFiles", "runTests", "run_tests", "get_errors",
@@ -342,72 +315,36 @@ class TestFailSecureFlagOn(_Base):
             "runNotebookCell", "edit_notebook", "run_notebook_cell",
         ]
         for tool in builtins:
-            result = self._run(
+            result, _ = self._run(
                 {"tool_name": tool, "session_id": "s1"},
                 {"servers": {"github": {"command": "c"}}},
             )
-            self.assertEqual(result, {}, f"{tool} should never be blocked")
+            self.assertEqual(result, {}, f"{tool} should be allowed")
 
-    def test_vscode_agent_builtin_emits_no_denied_telemetry(self):
-        # A known built-in must not even register as denied/unresolved-with-config.
+    def test_known_builtin_emits_no_unresolved_telemetry(self):
+        # A known built-in must not register as unresolved-with-config (noise).
         self.mock_telemetry.reset_mock()
         self._run(
             {"tool_name": "semantic_search", "session_id": "s1"},
             {"servers": {"github": {"command": "c"}}},
         )
-        cats = self._telemetry_categories()
-        self.assertNotIn('copilot_mcp_denied_unresolved', cats)
-        self.assertNotIn('copilot_mcp_unresolved_with_config', cats)
+        self.assertNotIn('copilot_mcp_unresolved_with_config', self._telemetry_categories())
 
-    def test_native_tools_unaffected(self):
-        # Native Read/Write/Edit/Bash go through the normal path (not the MCP
-        # branch) → resolved call to the gateway, which returns {} → allow.
-        for tool, payload in [
-            ("Read", {"file_path": "/a"}),
-            ("Write", {"file_path": "/a"}),
-            ("Edit", {"file_path": "/a"}),
-            ("Bash", {"command": "ls"}),
-        ]:
-            event = {"tool_name": tool, "session_id": "s1", "tool_input": payload}
-            with self._point_config_paths_at(self.mcp_config), \
-                 patch.object(unbound, "send_to_hook_api", return_value={}) as api:
-                self._write_mcp({"servers": {"github": {"command": "c"}}})
-                result = unbound.process_pre_tool_use(event, "k")
-            self.assertEqual(result, {}, f"{tool} should be allowed")
-            self.assertTrue(api.called, f"{tool} should reach the gateway")
-
-
-class TestFailSecureFlagOffIsInert(_Base):
-    """Default (flag OFF): the deny case from the ON matrix returns {} — proving
-    the change is inert until the kill-switch is flipped."""
-
-    def test_unresolved_with_config_allows_when_flag_off(self):
-        self.assertFalse(unbound.DENY_UNRESOLVED_MCP)  # default
-        self._write_mcp({"servers": {"github": {"command": "c"}}})
-        with self._point_config_paths_at(self.mcp_config), \
-             patch.object(unbound, "send_to_hook_api", return_value={}):
-            result = unbound.process_pre_tool_use(
-                {"tool_name": "totally-unknown-mcp-tool", "session_id": "s1"}, "k"
-            )
-        self.assertEqual(result, {})
-
-    def test_unresolved_with_config_telemetry_still_emitted_when_flag_off(self):
-        # Observability ships with component 1 regardless of the deny gate.
+    def test_unresolved_with_config_still_emits_telemetry(self):
+        # Identification telemetry ships regardless: the unresolved (allowed)
+        # case still emits copilot_mcp_unresolved_with_config for the soak.
         self.mock_telemetry.reset_mock()
-        self._write_mcp({"servers": {"github": {"command": "c"}}})
-        with self._point_config_paths_at(self.mcp_config), \
-             patch.object(unbound, "send_to_hook_api", return_value={}):
-            unbound.process_pre_tool_use(
-                {"tool_name": "totally-unknown-mcp-tool", "session_id": "s1"}, "k"
-            )
-        cats = self._telemetry_categories()
-        self.assertIn('copilot_mcp_unresolved_with_config', cats)
-        self.assertNotIn('copilot_mcp_denied_unresolved', cats)
+        self._run(
+            {"tool_name": "totally-unknown-mcp-tool", "session_id": "s1"},
+            {"servers": {"github": {"command": "c"}}},
+        )
+        self.assertIn('copilot_mcp_unresolved_with_config', self._telemetry_categories())
 
 
 class TestInfraVsIdentity(_Base):
     """A RESOLVED MCP call where the gateway is unreachable ({}) must honor
-    policy_check_failure_action — distinct from the identity deny."""
+    policy_check_failure_action — the infra fail-open/closed path, distinct from
+    the identification path (an unresolved tool, which simply allows)."""
 
     def setUp(self):
         super().setUp()
