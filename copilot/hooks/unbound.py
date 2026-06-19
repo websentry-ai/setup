@@ -468,6 +468,42 @@ def _parse_jsonc(text):
         return None
 
 
+_SECRET_ARG_RE = re.compile(
+    r'(api[-_]?key|token|secret|password|passwd|credential|auth|\bkey\b)',
+    re.IGNORECASE,
+)
+_REDACTED = '***'
+
+
+# Mask secret-bearing CLI args before they leave the machine. Structure (and
+# fingerprint-relevant urls/packages) is preserved; only the secret value is
+# replaced — handles both `--api-key=sk-…` and `--api-key sk-…` forms.
+def _redact_mcp_args(args):
+    if not isinstance(args, list):
+        return args
+    out = []
+    mask_next = False
+    for arg in args:
+        if mask_next:
+            out.append(_REDACTED)
+            mask_next = False
+            continue
+        if not isinstance(arg, str):
+            out.append(arg)
+            continue
+        if '=' in arg:
+            key, _, _val = arg.partition('=')
+            if _SECRET_ARG_RE.search(key):
+                out.append(f"{key}={_REDACTED}")
+                continue
+        elif arg.startswith('-') and _SECRET_ARG_RE.search(arg):
+            out.append(arg)
+            mask_next = True
+            continue
+        out.append(arg)
+    return out
+
+
 def _sanitize_mcp_server_fields(server):
     """Keep only fingerprinting fields (url/command/args/type); never secrets."""
     if not isinstance(server, dict):
@@ -478,7 +514,7 @@ def _sanitize_mcp_server_fields(server):
     if server.get('command'):
         result['command'] = server['command']
     if server.get('args'):
-        result['args'] = server['args']
+        result['args'] = _redact_mcp_args(server['args'])
     if server.get('type'):
         result['type'] = server['type']
     return result if result else None
@@ -510,7 +546,10 @@ def read_copilot_mcp_servers(cwd=None):
             for name, server in raw.items():
                 fields = _sanitize_mcp_server_fields(server)
                 servers[name] = fields or {}
-        except Exception:
+        except Exception as e:
+            # Missing files are skipped above without raising; this only fires on
+            # a genuine read failure, so it's worth surfacing for diagnosis.
+            log_error(f"copilot mcp config read failed path={config_path} err={e}", 'mcp_config')
             continue
     return servers
 
@@ -774,6 +813,13 @@ def process_pre_tool_use(event, api_key):
             return {}
         is_mcp = True
         canonical = f"mcp__{mcp_server}__{mcp_tool}"
+        # Names only — never args/config (those can carry secrets).
+        log_error(
+            f"copilot mcp detected session={session_id} tool={raw_tool} "
+            f"server={mcp_server} mcp_tool={mcp_tool} "
+            f"config={'yes' if mcp_server_config else 'no'}",
+            'mcp_match',
+        )
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
