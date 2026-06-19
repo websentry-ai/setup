@@ -7,6 +7,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import json
 import os
+import platform
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
@@ -402,6 +403,160 @@ def canonical_tool_name(raw):
     return ''
 
 
+# VS Code stable + Insiders "Code/User" dirs for the current OS. Uses
+# platform.system() rather than sys.platform/os.name so static checkers do not
+# narrow it to one OS and flag the other branches as unreachable.
+def _vscode_user_dirs():
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return []
+        base = Path(appdata)
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path.home() / ".config"
+    return [base / "Code" / "User", base / "Code - Insiders" / "User"]
+
+
+# All Copilot MCP config locations. Untrusted workspace files (from cwd) come
+# first; trusted user/global/CLI configs last so they win the last-wins merge in
+# read_copilot_mcp_servers.
+def _copilot_mcp_config_paths(cwd=None):
+    home = Path.home()
+
+    workspace = []
+    if cwd:
+        workspace.append(Path(cwd) / ".vscode" / "mcp.json")
+        workspace.append(Path(cwd) / ".mcp.json")
+
+    trusted = []
+    for user_dir in _vscode_user_dirs():
+        trusted.append(user_dir / "mcp.json")
+        trusted.append(user_dir / "settings.json")
+        profiles = user_dir / "profiles"
+        try:
+            if profiles.is_dir():
+                for profile in sorted(profiles.iterdir()):
+                    trusted.append(profile / "mcp.json")
+        except OSError:
+            pass
+    trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
+    trusted.append(home / ".copilot" / "mcp-config.json")
+
+    return workspace + trusted
+
+_JSONC_TOKEN_RE = re.compile(r'"(?:\\.|[^"\\])*"|//[^\n\r]*|/\*.*?\*/', re.DOTALL)
+
+
+def _strip_jsonc(text):
+    def replace(match):
+        token = match.group(0)
+        return token if token.startswith('"') else ''
+    no_comments = _JSONC_TOKEN_RE.sub(replace, text)
+    return re.sub(r',(\s*[}\]])', r'\1', no_comments)
+
+def _parse_jsonc(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_jsonc(text))
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _sanitize_mcp_server_fields(server):
+    """Keep only fingerprinting fields (url/command/args/type); never secrets."""
+    if not isinstance(server, dict):
+        return None
+    result = {}
+    if server.get('url'):
+        result['url'] = server['url']
+    if server.get('command'):
+        result['command'] = server['command']
+    if server.get('args'):
+        result['args'] = server['args']
+    if server.get('type'):
+        result['type'] = server['type']
+    return result if result else None
+
+
+_MCP_CONFIG_MAX_BYTES = 1_000_000
+
+
+def read_copilot_mcp_servers(cwd=None):
+    servers = {}
+    for config_path in _copilot_mcp_config_paths(cwd):
+        try:
+            if not config_path.exists():
+                continue
+            if config_path.stat().st_size > _MCP_CONFIG_MAX_BYTES:
+                continue
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = _parse_jsonc(f.read())
+            if not isinstance(config, dict):
+                continue
+            raw = config.get('servers')
+            if not isinstance(raw, dict):
+                raw = config.get('mcpServers')
+            if not isinstance(raw, dict):
+                nested = config.get('mcp')
+                raw = nested.get('servers') if isinstance(nested, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            for name, server in raw.items():
+                fields = _sanitize_mcp_server_fields(server)
+                servers[name] = fields or {}
+        except Exception:
+            continue
+    return servers
+
+
+# Mirror Copilot's server-name sanitization for tool-name prefixes.
+def _sanitize_copilot_server_name(name):
+    return re.sub(r'[^a-zA-Z0-9_-]', '-', name.replace('@', '-'))
+
+
+_MCP_NAME_SEPARATORS = ('__', '-', '_', '/', '.')
+
+
+def detect_mcp_call(raw_tool, mcp_servers):
+    if not raw_tool:
+        return (None, None, None)
+
+    if raw_tool.startswith('mcp__'):
+        parts = raw_tool[len('mcp__'):].split('__', 1)
+        server = parts[0]
+        mcp_tool = parts[1] if len(parts) >= 2 else ''
+        config = mcp_servers.get(server)
+        return (server, mcp_tool, config)
+
+    best = None  # (matched_len, server_name, mcp_tool)
+    for server_name in mcp_servers:
+        for candidate in {server_name, _sanitize_copilot_server_name(server_name)}:
+            if not candidate:
+                continue
+            if raw_tool == candidate:
+                mcp_tool = ''
+            elif raw_tool.startswith(candidate):
+                remainder = raw_tool[len(candidate):]
+                sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
+                if sep is None:
+                    continue
+                mcp_tool = remainder[len(sep):]
+            else:
+                continue
+            if best is None or len(candidate) > best[0]:
+                best = (len(candidate), server_name, mcp_tool)
+
+    if best is None:
+        return (None, None, None)
+    return (best[1], best[2], mcp_servers.get(best[1]))
+
+
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
@@ -597,15 +752,28 @@ def transform_response_for_copilot_prompt(api_response):
 
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
-    raw_tool = event.get('tool_name', '')
-    tool_input = event.get('tool_input') or {}
-    session_id = event.get('session_id')
+    raw_tool = event.get('tool_name') or event.get('toolName') or ''
+    tool_input = event.get('tool_input') or event.get('toolArgs') or {}
+    session_id = event.get('session_id') or event.get('sessionId')
 
     # Translate the Copilot tool name to the canonical gateway vocabulary.
     canonical = canonical_tool_name(raw_tool)
     is_mcp = canonical.startswith('mcp')
+    mcp_server = mcp_tool = mcp_server_config = None
+
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
-        return {}
+        cwd = event.get('cwd')
+        mcp_servers = read_copilot_mcp_servers(cwd)
+        mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
+        if mcp_server is None:
+            # Self-validation: record the raw name (never args) so we can confirm
+            # the real MCP tool-name format from a live run without reshipping.
+            # Skip known-benign native tools so the log isn't noisy.
+            if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
+                log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+            return {}
+        is_mcp = True
+        canonical = f"mcp__{mcp_server}__{mcp_tool}"
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -630,6 +798,12 @@ def process_pre_tool_use(event, api_key):
     file_path = tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path')
     if file_path:
         metadata['file_path'] = file_path
+
+    if mcp_server is not None:
+        metadata['mcp_server'] = mcp_server
+        metadata['mcp_tool'] = mcp_tool
+        if mcp_server_config:
+            metadata['mcp_server_config'] = mcp_server_config
 
     approval_key = f"{canonical}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -1326,7 +1500,7 @@ def main():
             print("{}")
             return
 
-        event_name = event.get('hook_event_name')
+        event_name = event.get('hook_event_name') or event.get('hookEventName')
 
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
@@ -1336,7 +1510,7 @@ def main():
             print("{}")
             return
 
-        if event_name == 'PreToolUse':
+        if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
             return
