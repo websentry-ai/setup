@@ -642,16 +642,31 @@ def _vscode_server_aliases(server_name):
     return {a for a in aliases if len(a) >= _MIN_MCP_SERVER_NAME}
 
 
+def _vscode_fingerprint_key(config):
+    """Coarse identity used to decide if two configured servers are really the same
+    one (mirrors the gateway's url-first / command+args fingerprint priority).
+    Returns None when identity can't be established."""
+    if not config:
+        return None
+    if config.get('url'):
+        return ('url', config['url'])
+    if config.get('command'):
+        return ('cmd', config['command'], tuple(config.get('args') or []))
+    return None
+
+
 def _resolve_vscode_mcp(raw_tool, mcp_servers):
     """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
-    tolerating truncation; exact alias match wins ties; ambiguous -> unresolved."""
+    tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
+    If a *different* server also matches and can't be proven to be the same server
+    (identical fingerprint config), the token is ambiguous -> unresolved (don't
+    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
     if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
         return (None, None, None)
     body = raw_tool[len('mcp_'):]
     body_lower = body.lower()
     segments = body.split('_')
-    best = None  # (server_portion_len, exact_flag, server_name, tool)
-    ambiguous = False
+    candidates = []  # (server_portion_len, exact_flag, server_name, tool)
     for server_name in mcp_servers:
         for alias in _vscode_server_aliases(server_name):
             if body_lower.startswith(alias + '_'):
@@ -663,16 +678,18 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
                     if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
                         cand = (len(left), 0, server_name, '_'.join(segments[k:]))
                         break
-            if cand is None or not cand[3]:
-                continue
-            if best is None or cand[:2] > best[:2]:
-                best = cand
-                ambiguous = False
-            elif cand[:2] == best[:2] and cand[2] != best[2]:
-                ambiguous = True
-    # Ambiguous (equal-rank match across different servers) -> unresolved, don't guess.
-    if best is None or ambiguous:
+            if cand is not None and cand[3]:
+                candidates.append(cand)
+    if not candidates:
         return (None, None, None)
+    best = max(candidates, key=lambda c: c[:2])
+    best_key = _vscode_fingerprint_key(mcp_servers.get(best[2]))
+    for cand in candidates:
+        if cand[2] == best[2]:
+            continue
+        other_key = _vscode_fingerprint_key(mcp_servers.get(cand[2]))
+        if best_key is None or other_key is None or other_key != best_key:
+            return (None, None, None)
     return (best[2], best[3], mcp_servers.get(best[2]))
 
 

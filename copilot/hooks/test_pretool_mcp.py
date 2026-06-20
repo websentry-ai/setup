@@ -98,6 +98,26 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(srv, "supabase")
         self.assertEqual(tool, "run_query")
 
+    def test_overlapping_sibling_different_config_is_unresolved(self):
+        # `linear` (exact) vs `linear_create_safe` (longer fuzzy) with DIFFERENT
+        # configs: the longer fuzzy match for the wrong server must NOT out-rank the
+        # exact match for the right one -> ambiguous -> unresolved (no mis-attribution,
+        # so no sanction bypass and no false deny).
+        servers = {"linear": {"url": "https://danger/mcp"},
+                   "linear_create_safe": {"url": "https://safe/mcp"}}
+        self.assertEqual(
+            unbound._resolve_vscode_mcp("mcp_linear_create_issue", servers),
+            (None, None, None))
+
+    def test_same_config_overlap_still_resolves(self):
+        # Two keys for the SAME underlying server (identical config) must NOT be
+        # treated as ambiguous — resolution still works (github + hosted github).
+        servers = {"github": {"url": "https://api.githubcopilot.com/mcp"},
+                   "io.github.github/github-mcp-server": {"url": "https://api.githubcopilot.com/mcp"}}
+        srv, tool, _cfg = unbound._resolve_vscode_mcp("mcp_github_mcp_se_search_repos", servers)
+        self.assertEqual(srv, "io.github.github/github-mcp-server")
+        self.assertEqual(tool, "search_repos")
+
     def test_non_mcp_and_unknown_return_none(self):
         self.assertEqual(
             unbound._resolve_vscode_mcp("run_in_terminal", self.servers),
