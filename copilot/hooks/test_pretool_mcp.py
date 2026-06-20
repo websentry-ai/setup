@@ -135,7 +135,11 @@ def _gateway(sanctioned_groups):
                     break
         if srv and tool:
             cfg = md.get("mcp_server_config") or {}
-            grp = cfg.get("url") or cfg.get("command") or srv
+            cmd = cfg.get("command")
+            # group by full config identity (command + args), not bare command,
+            # so e.g. `npx @playwright/mcp` and `npx @upstash/context7-mcp` don't
+            # collapse into one `npx` group.
+            grp = cfg.get("url") or (cmd and " ".join([cmd, *(cfg.get("args") or [])])) or srv
             applies = len(sanctioned_groups) > 0
             if applies and grp not in sanctioned_groups:
                 return {"decision": "deny", "reason": "not sanctioned", "additionalContext": "x"}
@@ -239,14 +243,35 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertFalse(self.is_block(ret))
 
 
-class TestUnresolvedFailSecure(ProcessPreToolUseBase):
-    def test_unresolved_mcp_fails_open_by_default(self):
-        ret = self.run_tool("mcp_unknownserver_do_thing", {GH_GROUP}, failure_action="allow")
-        self.assertFalse(self.is_block(ret))
+class TestUnresolvedForwarding(ProcessPreToolUseBase):
+    def test_unresolved_mcp_is_forwarded_to_gateway_not_short_circuited(self):
+        # Regression guard (Greptile P1 / consensus #1): an unmappable mcp_ call
+        # must still reach the gateway so its other policies / logging / metering
+        # run — it must NOT return {} early. No server is resolved, so mcp_server
+        # is not forwarded.
+        called = {}
 
-    def test_unresolved_mcp_fails_secure_in_strict_org(self):
-        ret = self.run_tool("mcp_unknownserver_do_thing", {GH_GROUP}, failure_action="block")
-        self.assertTrue(self.is_block(ret))
+        def capturing_gw(request_body, api_key):
+            called["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_unknownserver_do_thing",
+            "tool_input": {"q": "x"}, "cwd": self.cwd, "session_id": "s",
+        }
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+        self.assertIn("body", called)  # gateway WAS called (not short-circuited)
+        md = called["body"]["pre_tool_use_data"]["metadata"]
+        self.assertNotIn("mcp_server", md)  # nothing resolved to forward
+
+    def test_unresolved_mcp_not_sanction_blocked(self):
+        # With no resolved server the gateway can't evaluate the MCP allow-list,
+        # so sanctioning is fail-open for unresolved tokens (documented intent);
+        # the call is still delegated to the gateway for its other policies.
+        ret = self.run_tool("mcp_unknownserver_do_thing", {GH_GROUP})
+        self.assertFalse(self.is_block(ret))
 
 
 if __name__ == "__main__":

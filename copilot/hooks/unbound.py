@@ -912,19 +912,16 @@ def process_pre_tool_use(event, api_key):
                 'mcp_match',
             )
         else:
-            # A clear MCP call whose server couldn't be mapped to a configured
-            # server. Fail OPEN by default so a naming mismatch never blocks
-            # legitimate work, but honor strict mode: when the org has set
-            # policy_check_failure_action == 'block', deny so an unidentifiable MCP
-            # call can't slip a deny-by-default sanction list.
-            log_error(f"copilot vscode mcp UNRESOLVED tool={raw_tool}", 'mcp_match')
-            if get_policy_check_failure_action() == 'block':
-                return transform_response_for_copilot({
-                    'decision': 'deny',
-                    'reason': 'Blocked by organization policy: this MCP server could not be verified against the sanctioned list.',
-                    'additionalContext': 'This MCP server could not be identified for policy evaluation and the organization requires unverified MCP calls to be denied. Tell the user the MCP server is not verifiable and stop; do not retry through alternative tools.',
-                })
-            return {}
+            # Couldn't map the sanitized VS Code server name to a configured server.
+            # Do NOT short-circuit here — fall through to the normal send path with
+            # mcp_server unset (still None), so the gateway continues to receive the
+            # call and run its other policies (guardrails / content checks), log it,
+            # and meter it, exactly as it did before this change. With no resolved
+            # server the MCP allow-list isn't evaluated (fail-open for sanctioning) —
+            # the documented intent for unresolved tokens. Genuine infra failures
+            # (gateway unreachable) remain governed by policy_check_failure_action on
+            # the send path below.
+            log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
 
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         cwd = event.get('cwd')
