@@ -629,6 +629,67 @@ def detect_mcp_call(raw_tool, mcp_servers):
     return (best[1], best[2], mcp_servers.get(best[1]))
 
 
+# VS Code Copilot exposes MCP tools to the model as `mcp_<server>_<tool>` with a
+# SINGLE underscore (e.g. `mcp_github_mcp_se_search_repositories`), where <server>
+# is the server's runtime name lowercased with non-alphanumerics replaced by `_`
+# and then truncated / collision-suffixed by VS Code. This differs from the
+# Copilot CLI (Claude-style `mcp__server__tool`) and from the gateway, which only
+# parses the `mcp__` double-underscore form. We reverse-map the sanitized/
+# truncated server token back to a configured server so its config can be
+# forwarded for gateway fingerprinting (the same canonical-group resolution used
+# for Claude Code and Cursor).
+def _vscode_sanitize(name):
+    return re.sub(r'[^a-z0-9]', '_', name.lower())
+
+
+def _vscode_server_aliases(server_name):
+    """Candidate VS Code prefixes for a configured server: the sanitized full key
+    and the sanitized last path segment (registry keys such as
+    'io.github.github/github-mcp-server' surface to the model as
+    'github-mcp-server')."""
+    aliases = {_vscode_sanitize(server_name), _vscode_sanitize(server_name.rsplit('/', 1)[-1])}
+    return {a for a in aliases if len(a) >= _MIN_MCP_SERVER_NAME}
+
+
+def _resolve_vscode_mcp(raw_tool, mcp_servers):
+    """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name.
+    Tolerates VS Code's server-name truncation by matching the longest
+    underscore-delimited server prefix that a configured alias starts with; an
+    exact alias match wins ties so a short server name can't shadow a longer one."""
+    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
+        return (None, None, None)
+    body = raw_tool[len('mcp_'):]
+    body_lower = body.lower()
+    segments = body.split('_')
+    best = None  # (server_portion_len, exact_flag, server_name, tool)
+    ambiguous = False
+    for server_name in mcp_servers:
+        for alias in _vscode_server_aliases(server_name):
+            if body_lower.startswith(alias + '_'):
+                cand = (len(alias), 1, server_name, body[len(alias) + 1:])
+            else:
+                cand = None
+                for k in range(len(segments) - 1, 0, -1):
+                    left = '_'.join(segments[:k])
+                    if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
+                        cand = (len(left), 0, server_name, '_'.join(segments[k:]))
+                        break
+            if cand is None or not cand[3]:
+                continue
+            if best is None or cand[:2] > best[:2]:
+                best = cand
+                ambiguous = False
+            elif cand[:2] == best[:2] and cand[2] != best[2]:
+                ambiguous = True
+    # An equally-ranked match against a different configured server means the
+    # truncated token is ambiguous; treat it as unresolved so the call takes the
+    # deliberate fail-open/fail-secure path rather than a silent wrong guess that
+    # could apply the wrong server's sanction decision.
+    if best is None or ambiguous:
+        return (None, None, None)
+    return (best[2], best[3], mcp_servers.get(best[2]))
+
+
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
@@ -832,6 +893,38 @@ def process_pre_tool_use(event, api_key):
     canonical = canonical_tool_name(raw_tool)
     is_mcp = canonical.startswith('mcp')
     mcp_server = mcp_tool = mcp_server_config = None
+
+    # VS Code Copilot emits MCP tools as `mcp_<server>_<tool>` (single underscore).
+    # canonical_tool_name() treats the leading `mcp` as already-resolved, so the
+    # bare-tool detection below is skipped, and the gateway only parses the
+    # Claude-style `mcp__` form — so without resolving the server here and
+    # forwarding its config, the gateway can't fingerprint it and MCP sanctioning
+    # is silently bypassed on the VS Code surface.
+    if is_mcp and raw_tool.startswith('mcp_') and not raw_tool.startswith('mcp__'):
+        mcp_servers = read_copilot_mcp_servers(event.get('cwd'))
+        mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(raw_tool, mcp_servers)
+        if mcp_server is not None:
+            canonical = f"mcp__{mcp_server}__{mcp_tool}"
+            log_error(
+                f"copilot vscode mcp detected session={session_id} tool={raw_tool} "
+                f"server={mcp_server} mcp_tool={mcp_tool} "
+                f"config={'yes' if mcp_server_config else 'no'}",
+                'mcp_match',
+            )
+        else:
+            # A clear MCP call whose server couldn't be mapped to a configured
+            # server. Fail OPEN by default so a naming mismatch never blocks
+            # legitimate work, but honor strict mode: when the org has set
+            # policy_check_failure_action == 'block', deny so an unidentifiable MCP
+            # call can't slip a deny-by-default sanction list.
+            log_error(f"copilot vscode mcp UNRESOLVED tool={raw_tool}", 'mcp_match')
+            if get_policy_check_failure_action() == 'block':
+                return transform_response_for_copilot({
+                    'decision': 'deny',
+                    'reason': 'Blocked by organization policy: this MCP server could not be verified against the sanctioned list.',
+                    'additionalContext': 'This MCP server could not be identified for policy evaluation and the organization requires unverified MCP calls to be denied. Tell the user the MCP server is not verifiable and stop; do not retry through alternative tools.',
+                })
+            return {}
 
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         cwd = event.get('cwd')
