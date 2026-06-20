@@ -1,18 +1,7 @@
 """
-Tests for VS Code Copilot MCP-server resolution + sanctioning in
-copilot/hooks/unbound.py.
-
-VS Code Copilot emits MCP tools as `mcp_<server>_<tool>` (single underscore),
-which canonical_tool_name() treats as already-resolved and the gateway (which
-only parses the Claude-style `mcp__` form) cannot decode — so without the
-resolver the server is never identified and sanctioning is silently bypassed.
-
-Covers:
-  - _resolve_vscode_mcp           (reverse-map sanitized/truncated server token)
-  - process_pre_tool_use          (end-to-end: resolve -> forward config -> deny)
-
-Tool names below are the real ones harvested from VS Code Copilot chat
-transcripts; server keys mirror a real VS Code mcp.json (registry-style keys).
+Tests for VS Code Copilot `mcp_<server>_<tool>` resolution + sanctioning in
+copilot/hooks/unbound.py. Tool names are real ones from VS Code chat transcripts;
+server keys mirror a real VS Code mcp.json.
 """
 
 import json
@@ -119,8 +108,8 @@ class TestResolveVscodeMcp(unittest.TestCase):
 
 
 def _gateway(sanctioned_groups):
-    """Mirror preToolUseHandler: read mcp_server/mcp_tool (+ config fingerprint),
-    apply the org allow-list. group == forwarded config url/command."""
+    """Mirror preToolUseHandler: read mcp_server/mcp_tool, fingerprint the forwarded
+    config (url or command+args), apply the org allow-list."""
     def gw(request_body, api_key):
         ptd = request_body.get("pre_tool_use_data", {}) or {}
         md = ptd.get("metadata", {}) or {}
@@ -136,9 +125,7 @@ def _gateway(sanctioned_groups):
         if srv and tool:
             cfg = md.get("mcp_server_config") or {}
             cmd = cfg.get("command")
-            # group by full config identity (command + args), not bare command,
-            # so e.g. `npx @playwright/mcp` and `npx @upstash/context7-mcp` don't
-            # collapse into one `npx` group.
+            # group by command + args (not bare command) so npx servers don't collapse
             grp = cfg.get("url") or (cmd and " ".join([cmd, *(cfg.get("args") or [])])) or srv
             applies = len(sanctioned_groups) > 0
             if applies and grp not in sanctioned_groups:
@@ -245,10 +232,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
 
 class TestUnresolvedForwarding(ProcessPreToolUseBase):
     def test_unresolved_mcp_is_forwarded_to_gateway_not_short_circuited(self):
-        # Regression guard (Greptile P1 / consensus #1): an unmappable mcp_ call
-        # must still reach the gateway so its other policies / logging / metering
-        # run — it must NOT return {} early. No server is resolved, so mcp_server
-        # is not forwarded.
+        # An unmappable mcp_ call must still reach the gateway, not return {} early.
         called = {}
 
         def capturing_gw(request_body, api_key):
@@ -267,9 +251,7 @@ class TestUnresolvedForwarding(ProcessPreToolUseBase):
         self.assertNotIn("mcp_server", md)  # nothing resolved to forward
 
     def test_unresolved_mcp_not_sanction_blocked(self):
-        # With no resolved server the gateway can't evaluate the MCP allow-list,
-        # so sanctioning is fail-open for unresolved tokens (documented intent);
-        # the call is still delegated to the gateway for its other policies.
+        # No resolved server -> allow-list not evaluated (fail-open) for unresolved.
         ret = self.run_tool("mcp_unknownserver_do_thing", {GH_GROUP})
         self.assertFalse(self.is_block(ret))
 
