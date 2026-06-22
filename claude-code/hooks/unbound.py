@@ -633,7 +633,8 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
     if decision == 'deny':
         return {
             'decision': 'block',
-            'reason': reason
+            'reason': reason,
+            'suppressOriginalPrompt': True,
         }
 
     return {}
