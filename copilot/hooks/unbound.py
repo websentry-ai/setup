@@ -788,6 +788,13 @@ def transform_response_for_copilot(api_response):
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # On 'allow', emit no decision ({}) so Copilot falls through to the user's
+    # local config/rules instead of force-allowing over them. Copilot preToolUse
+    # precedence: an explicit 'allow' overrides a local deny; '{}' defers to it.
+    # We only force an explicit decision to deny/ask.
+    if decision == 'allow':
+        return {}
+
     # Emit BOTH shapes so the decision is honored regardless of which the
     # running Copilot surface reads: the top-level form documented in the
     # Copilot CLI hooks reference, AND the nested hookSpecificOutput form
