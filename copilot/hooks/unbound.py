@@ -629,6 +629,70 @@ def detect_mcp_call(raw_tool, mcp_servers):
     return (best[1], best[2], mcp_servers.get(best[1]))
 
 
+# VS Code Copilot names MCP tools `mcp_<server>_<tool>` (single underscore,
+# sanitized + truncated server) — unlike the Claude-style `mcp__server__tool` the
+# gateway parses. Reverse-map the token to a configured server to forward its config.
+def _vscode_sanitize(name):
+    return re.sub(r'[^a-z0-9]', '_', name.lower())
+
+
+def _vscode_server_aliases(server_name):
+    """Sanitized full key + last path segment (e.g. 'io.github.github/github-mcp-server' -> 'github-mcp-server')."""
+    aliases = {_vscode_sanitize(server_name), _vscode_sanitize(server_name.rsplit('/', 1)[-1])}
+    return {a for a in aliases if len(a) >= _MIN_MCP_SERVER_NAME}
+
+
+def _vscode_fingerprint_key(config):
+    """Coarse identity used to decide if two configured servers are really the same
+    one (mirrors the gateway's url-first / command+args fingerprint priority).
+    Returns None when identity can't be established."""
+    if not config:
+        return None
+    if config.get('url'):
+        return ('url', config['url'])
+    if config.get('command'):
+        return ('cmd', config['command'], tuple(config.get('args') or []))
+    return None
+
+
+def _resolve_vscode_mcp(raw_tool, mcp_servers):
+    """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
+    tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
+    If a *different* server also matches and can't be proven to be the same server
+    (identical fingerprint config), the token is ambiguous -> unresolved (don't
+    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
+    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
+        return (None, None, None)
+    body = raw_tool[len('mcp_'):]
+    body_lower = body.lower()
+    segments = body.split('_')
+    candidates = []  # (server_portion_len, exact_flag, server_name, tool)
+    for server_name in mcp_servers:
+        for alias in _vscode_server_aliases(server_name):
+            if body_lower.startswith(alias + '_'):
+                cand = (len(alias), 1, server_name, body[len(alias) + 1:])
+            else:
+                cand = None
+                for k in range(len(segments) - 1, 0, -1):
+                    left = '_'.join(segments[:k])
+                    if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
+                        cand = (len(left), 0, server_name, '_'.join(segments[k:]))
+                        break
+            if cand is not None and cand[3]:
+                candidates.append(cand)
+    if not candidates:
+        return (None, None, None)
+    best = max(candidates, key=lambda c: c[:2])
+    best_key = _vscode_fingerprint_key(mcp_servers.get(best[2]))
+    for cand in candidates:
+        if cand[2] == best[2]:
+            continue
+        other_key = _vscode_fingerprint_key(mcp_servers.get(cand[2]))
+        if best_key is None or other_key is None or other_key != best_key:
+            return (None, None, None)
+    return (best[2], best[3], mcp_servers.get(best[2]))
+
+
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
@@ -839,6 +903,26 @@ def process_pre_tool_use(event, api_key):
     canonical = canonical_tool_name(raw_tool)
     is_mcp = canonical.startswith('mcp')
     mcp_server = mcp_tool = mcp_server_config = None
+
+    # VS Code's `mcp_<server>_<tool>` form: canonical_tool_name() leaves the `mcp`
+    # prefix as-is so the bare-tool detection below is skipped; resolve the server
+    # here and forward its config so the gateway can fingerprint it.
+    if is_mcp and raw_tool.startswith('mcp_') and not raw_tool.startswith('mcp__'):
+        mcp_servers = read_copilot_mcp_servers(event.get('cwd'))
+        mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(raw_tool, mcp_servers)
+        if mcp_server is not None:
+            canonical = f"mcp__{mcp_server}__{mcp_tool}"
+            log_error(
+                f"copilot vscode mcp detected session={session_id} tool={raw_tool} "
+                f"server={mcp_server} mcp_tool={mcp_tool} "
+                f"config={'yes' if mcp_server_config else 'no'}",
+                'mcp_match',
+            )
+        else:
+            # Unmappable server: fall through to the gateway with mcp_server unset
+            # (not a short-circuit) so its other policies/logging/metering still run;
+            # the allow-list isn't evaluated without a resolved server (fail-open).
+            log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
 
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         cwd = event.get('cwd')
