@@ -17,15 +17,16 @@ import platform
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-_CONFIG_DIR = Path(__file__).resolve().parents[1]
-_config_dir_is_default = _CONFIG_DIR == (Path.home() / ".claude").resolve()
+_env_config_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+_config_dir_is_default = not _env_config_dir
+_CONFIG_DIR = Path(_env_config_dir or (Path.home() / ".claude")).expanduser().resolve()
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
-CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json" if _config_dir_is_default else _CONFIG_DIR / ".claude.json"
+CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if (not _config_dir_is_default and (_CONFIG_DIR / ".claude.json").exists()) else (Path.home() / ".claude.json")
 POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
