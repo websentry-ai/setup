@@ -1067,8 +1067,7 @@ def build_llm_exchange(events, api_key=None):
         'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
 
-    # The gateway only honors these when its handler sets useBodyTimestamps;
-    # omit when unknown so it falls back to ingest time. WEB-4850.
+    # Omit when unknown; gateway falls back
     if request_initialized:
         exchange['requestInitialized'] = request_initialized
     if request_completed:
