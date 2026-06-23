@@ -62,13 +62,12 @@ def normalize_url(domain: str) -> str:
 
 
 def _resolve_claude_config_dir(argv) -> Path:
-    value = None
-    for i, arg in enumerate(argv):
-        if arg == "--config-dir" and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-            value = argv[i + 1].strip() or None
-            break
+    value = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
     if not value:
-        value = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
+        for i, arg in enumerate(argv):
+            if arg == "--config-dir" and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                value = argv[i + 1].strip() or None
+                break
     if not value:
         return Path.home() / ".claude"
     return Path(value).expanduser().resolve()

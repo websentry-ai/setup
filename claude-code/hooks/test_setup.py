@@ -373,11 +373,18 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
 
 
 class TestResolveClaudeConfigDir(unittest.TestCase):
-    """WEB-4882: --config-dir arg > CLAUDE_CONFIG_DIR env > ~/.claude."""
+    """WEB-4882: CLAUDE_CONFIG_DIR env > --config-dir arg > ~/.claude."""
 
-    def test_arg_beats_env_and_home(self):
+    def test_env_beats_arg_and_home(self):
         import setup
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
+        self.assertEqual(result, Path("/env/cc").resolve())
+
+    def test_arg_used_when_no_env(self):
+        import setup
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
             result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
         self.assertEqual(result, Path("/arg/cc").resolve())
 
