@@ -17,6 +17,7 @@ import http.server
 import socketserver
 import socket
 import json
+import shlex
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
@@ -382,6 +383,21 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     return True
 
 
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        candidate = token.strip().strip('"').strip("'")
+        if candidate and os.path.normcase(os.path.normpath(candidate)) == normalized_target:
+            return True
+    return normalized_target in os.path.normcase(command)
+
+
 def configure_codex_hooks() -> bool:
     hooks_path = Path.home() / ".codex" / "hooks.json"
 
@@ -478,9 +494,7 @@ def configure_codex_hooks() -> bool:
                         existing_hooks = existing_item.get("hooks", [])
                         for hook in existing_hooks:
                             existing_cmd = hook.get("command", "")
-                            # Exact match handles every OS; on Windows also
-                            # match the "py -3 ..." launcher form.
-                            if existing_cmd == hook_command or (is_windows and str(script_path) in existing_cmd):
+                            if _command_targets_hook(existing_cmd, script_path):
                                 our_hook_exists = True
                                 break
 
@@ -509,15 +523,13 @@ def remove_hooks_from_config() -> str:
     Returns "cleared", "not_found", or "failed".
     """
     hooks_path = Path.home() / ".codex" / "hooks.json"
-    hook_command = str(Path.home() / ".codex" / "hooks" / "unbound.py")
-    is_windows = platform.system().lower() == "windows"
+    script_path = Path.home() / ".codex" / "hooks" / "unbound.py"
 
     if not hooks_path.exists():
         return "not_found"
 
     def _is_unbound(cmd: str) -> bool:
-        # Exact match on every OS; on Windows also match the "py -3 ..." form.
-        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+        return _command_targets_hook(cmd, script_path)
 
     try:
         with open(hooks_path, 'r', encoding='utf-8') as f:

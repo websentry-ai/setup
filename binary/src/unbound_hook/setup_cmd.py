@@ -21,6 +21,7 @@ but never aborts the remaining components.
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -300,6 +301,21 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     return bool(m._run_as_user(username, _install))
 
 
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        candidate = token.strip().strip('"').strip("'")
+        if candidate and os.path.normcase(os.path.normpath(candidate)) == normalized_target:
+            return True
+    return normalized_target in os.path.normcase(command)
+
+
 def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
     """Idempotent merge of the codex hook events into hooks.json, mirroring the
     python configure_codex_hooks merge: re-runs don't duplicate our entry and
@@ -321,7 +337,7 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             for existing_item in existing_config:
                 if isinstance(existing_item, dict):
                     for hook in existing_item.get("hooks", []):
-                        if hook.get("command", "") == hook_command:
+                        if _command_targets_hook(hook.get("command", ""), HOOK_BINARY):
                             our_hook_exists = True
                             break
             if not our_hook_exists:

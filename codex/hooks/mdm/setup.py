@@ -9,6 +9,7 @@ import time
 import platform
 import subprocess
 import json
+import shlex
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 try:
@@ -657,6 +658,21 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Removed openai_base_url from {config_path}")
 
 
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        tokens = command.split()
+    for token in tokens:
+        candidate = token.strip().strip('"').strip("'")
+        if candidate and os.path.normcase(os.path.normpath(candidate)) == normalized_target:
+            return True
+    return normalized_target in os.path.normcase(command)
+
+
 def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     """Strip Unbound's hook entries from ~/.codex/hooks.json and delete
     ~/.codex/hooks/unbound.py for a given user. Without this, MDM-managed
@@ -666,11 +682,9 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     alone — MDM still relies on it. Privilege-drops to the target user."""
     hooks_path = home_dir / ".codex" / "hooks.json"
     script_path = home_dir / ".codex" / "hooks" / "unbound.py"
-    hook_command = str(script_path)
-    is_windows = platform.system().lower() == "windows"
 
     def _is_unbound(cmd: str) -> bool:
-        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+        return _command_targets_hook(cmd, script_path)
 
     def _clean():
         # safe_to_unlink stays True only if the JSON no longer references
@@ -1012,7 +1026,7 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
                     if isinstance(existing_item, dict):
                         for hook in existing_item.get("hooks", []):
                             existing_cmd = hook.get("command", "")
-                            if existing_cmd == hook_command or (is_windows and str(script_path) in existing_cmd):
+                            if _command_targets_hook(existing_cmd, script_path):
                                 our_hook_exists = True
                                 break
                 if not our_hook_exists:
