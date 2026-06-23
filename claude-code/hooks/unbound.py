@@ -1006,7 +1006,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
@@ -1087,6 +1087,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     if usage:
         exchange['usage'] = usage
 
+    if request_initialized:
+        exchange['requestInitialized'] = request_initialized
+    if request_completed:
+        exchange['requestCompleted'] = request_completed
+
     return exchange
 
 
@@ -1160,19 +1165,22 @@ def process_stop_event(event: Dict, api_key: str):
     session_events = []
     current_conversation_started = False
     user_prompt_timestamp = None
-    
+    stop_timestamp = None
+
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
-        
+
         if log_session_id == session_id:
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
-            
+
             if event_name == 'UserPromptSubmit':
                 session_events = [log]
                 current_conversation_started = True
                 user_prompt_timestamp = log.get('timestamp')
             elif current_conversation_started:
                 session_events.append(log)
+                if event_name == 'Stop':
+                    stop_timestamp = log.get('timestamp')
 
     transcript_assistant_messages = []
     transcript_usage = None
@@ -1190,12 +1198,17 @@ def process_stop_event(event: Dict, api_key: str):
     # the cached session model is wrong). Fall back to the audit log otherwise.
     session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
+    # Stop event's logged time, not processing time
+    request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
     exchange = build_llm_exchange(
         session_events,
         stop_assistant_message=last_assistant_message,
         transcript_assistant_messages=transcript_assistant_messages,
         model=session_model,
         usage=transcript_usage,
+        request_initialized=user_prompt_timestamp,
+        request_completed=request_completed,
     )
 
     if exchange:

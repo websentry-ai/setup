@@ -372,6 +372,23 @@ def get_session_start_model(session_id):
     return found
 
 
+def get_last_user_prompt_timestamp_for_session(session_id):
+    """Latest UserPromptSubmit audit-log timestamp; turn start."""
+    if not session_id:
+        return None
+    found = None
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != 'UserPromptSubmit':
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        ts = log.get('timestamp')
+        if ts:
+            found = ts
+    return found
+
+
 def _build_user_prompt_payload(recent_user_prompts):
     last = recent_user_prompts[-1] if recent_user_prompts else None
     return {
@@ -1718,6 +1735,11 @@ def main():
                 session_start_model=get_session_start_model(session_id),
             )
             if exchange:
+                # Turn boundaries from event-fire times
+                request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
+                if request_initialized:
+                    exchange['requestInitialized'] = request_initialized
+                exchange['requestCompleted'] = timestamp
                 send_to_api(exchange, api_key)
             cleanup_old_logs()
 
