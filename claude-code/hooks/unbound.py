@@ -17,8 +17,8 @@ import platform
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-_config_dir_is_default = not (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
-_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")).expanduser().resolve()
+_CONFIG_DIR = Path(__file__).resolve().parents[1]
+_config_dir_is_default = _CONFIG_DIR == (Path.home() / ".claude").resolve()
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
