@@ -146,12 +146,13 @@ class TestBackfillCutoffCache(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
+        self.config_dir = self.home / ".claude"
         self.addCleanup(self._tmp.cleanup)
 
     def test_read_cutoff_defaults_to_max_age_when_no_file(self):
         """No cache file -> fall back to BACKFILL_MAX_AGE_DAYS ago (first run)."""
         import setup
-        cutoff = setup._backfill_read_cutoff(self.home)
+        cutoff = setup._backfill_read_cutoff(self.config_dir)
         expected = time.time() - (setup.BACKFILL_MAX_AGE_DAYS * 86400)
         self.assertAlmostEqual(cutoff, expected, delta=5)
 
@@ -159,25 +160,25 @@ class TestBackfillCutoffCache(unittest.TestCase):
         """A persisted timestamp is read back as the cutoff on the next run."""
         import setup
         ts = time.time() - 3600
-        setup._backfill_write_cutoff(self.home, ts)
-        self.assertTrue(setup._backfill_state_path(self.home).exists())
-        self.assertAlmostEqual(setup._backfill_read_cutoff(self.home), ts, delta=0.01)
+        setup._backfill_write_cutoff(self.config_dir, ts)
+        self.assertTrue(setup._backfill_state_path(self.config_dir).exists())
+        self.assertAlmostEqual(setup._backfill_read_cutoff(self.config_dir), ts, delta=0.01)
 
     def test_read_cutoff_ignores_corrupt_value(self):
         """A non-numeric cache file falls back to the default window."""
         import setup
-        path = setup._backfill_state_path(self.home)
+        path = setup._backfill_state_path(self.config_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("not-a-number")
         expected = time.time() - (setup.BACKFILL_MAX_AGE_DAYS * 86400)
-        self.assertAlmostEqual(setup._backfill_read_cutoff(self.home), expected, delta=5)
+        self.assertAlmostEqual(setup._backfill_read_cutoff(self.config_dir), expected, delta=5)
 
     def test_read_cutoff_ignores_future_timestamp(self):
         """A future timestamp (clock skew) is rejected for the default window."""
         import setup
-        setup._backfill_write_cutoff(self.home, time.time() + 10000)
+        setup._backfill_write_cutoff(self.config_dir, time.time() + 10000)
         expected = time.time() - (setup.BACKFILL_MAX_AGE_DAYS * 86400)
-        self.assertAlmostEqual(setup._backfill_read_cutoff(self.home), expected, delta=5)
+        self.assertAlmostEqual(setup._backfill_read_cutoff(self.config_dir), expected, delta=5)
 
     def test_iter_transcripts_respects_cutoff(self):
         """Only transcripts modified at/after the cutoff are yielded."""
@@ -199,8 +200,8 @@ class TestBackfillCutoffCache(unittest.TestCase):
     def test_write_is_atomic_and_leaves_no_temp(self):
         """The atomic write produces the final file and no leftover .tmp."""
         import setup
-        setup._backfill_write_cutoff(self.home, 123.0)
-        path = setup._backfill_state_path(self.home)
+        setup._backfill_write_cutoff(self.config_dir, 123.0)
+        path = setup._backfill_state_path(self.config_dir)
         self.assertEqual(path.read_text(), "123.0")
         self.assertEqual(list(path.parent.glob("*.tmp")), [])
 
@@ -208,15 +209,27 @@ class TestBackfillCutoffCache(unittest.TestCase):
         """When the per-run session cap is hit, the cutoff must NOT advance, or
         the unprocessed older files would be skipped forever next run."""
         import setup
-        root = self.home / ".claude" / "projects"
+        root = self.config_dir / "projects"
         root.mkdir(parents=True)
         for i in range(3):
             (root / f"s{i}.jsonl").write_text('{"sessionId":"x%d"}\n' % i)
         with patch.object(setup, "BACKFILL_MAX_SESSIONS_PER_RUN", 2), \
-             patch.object(setup, "_backfill_upload_chunk", return_value=True), \
-             patch.object(Path, "home", return_value=self.home):
-            setup.run_backfill("key", "https://backend")
-        self.assertFalse(setup._backfill_state_path(self.home).exists())
+             patch.object(setup, "_backfill_upload_chunk", return_value=True):
+            setup.run_backfill("key", "https://backend", self.config_dir)
+        self.assertFalse(setup._backfill_state_path(self.config_dir).exists())
+
+    def test_run_backfill_reads_custom_config_dir_projects(self):
+        """With a custom config_dir, backfill walks config_dir/projects and writes
+        the cutoff there — not under ~/.claude."""
+        import setup
+        custom = self.home / "custom-cc"
+        root = custom / "projects"
+        root.mkdir(parents=True)
+        (root / "s.jsonl").write_text('{"sessionId":"x"}\n')
+        with patch.object(setup, "_backfill_upload_chunk", return_value=True):
+            setup.run_backfill("key", "https://backend", custom)
+        self.assertTrue(setup._backfill_state_path(custom).exists())
+        self.assertFalse(setup._backfill_state_path(self.config_dir).exists())
 
 
 class TestMdmBackfillCutoff(unittest.TestCase):
@@ -357,6 +370,79 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
                     any("Could not write config" in m for m in logs),
                     f"{name}: success path falsely logged a failure: {logs}",
                 )
+
+
+class TestResolveClaudeConfigDir(unittest.TestCase):
+    """WEB-4882: --config-dir arg > CLAUDE_CONFIG_DIR env > ~/.claude."""
+
+    def test_arg_beats_env_and_home(self):
+        import setup
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
+        self.assertEqual(result, Path("/arg/cc").resolve())
+
+    def test_env_used_when_no_arg(self):
+        import setup
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path("/env/cc").resolve())
+
+    def test_home_default_when_arg_and_env_absent(self):
+        import setup
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path.home() / ".claude")
+
+    def test_relative_value_is_absolutized(self):
+        import setup
+        result = setup._resolve_claude_config_dir(["x", "--config-dir", "rel/cc"])
+        self.assertEqual(result, Path("rel/cc").resolve())
+
+
+class TestInstallUnderResolvedDir(unittest.TestCase):
+    """Hooks + settings + baked command must land under the resolved config dir."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp) / "home"
+        self.home.mkdir(parents=True)
+        self.config_dir = Path(self.tmp) / "custom-cc"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_settings_and_hook_command_under_config_dir(self):
+        import setup
+        with patch.object(Path, "home", staticmethod(lambda: self.home)), \
+             patch.object(setup, "download_file", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+            self.assertTrue(setup.setup_hooks(config_dir=self.config_dir))
+            self.assertTrue(setup.configure_claude_settings(config_dir=self.config_dir))
+
+        hook_path = self.config_dir / "hooks" / "unbound.py"
+        settings_path = self.config_dir / "settings.json"
+        self.assertTrue(hook_path.exists())
+        self.assertTrue(settings_path.exists())
+        settings = json.loads(settings_path.read_text())
+        cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, str(hook_path))
+        self.assertNotIn(str(self.home / ".claude"), cmd)
+
+    def test_backward_compat_no_env_uses_home_claude(self):
+        import setup
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(Path, "home", staticmethod(lambda: self.home)), \
+             patch.object(setup, "download_file", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+            config_dir = setup._resolve_claude_config_dir(["x"])
+            self.assertTrue(setup.setup_hooks(config_dir=config_dir))
+            self.assertTrue(setup.configure_claude_settings(config_dir=config_dir))
+
+        hook_path = self.home / ".claude" / "hooks" / "unbound.py"
+        self.assertTrue(hook_path.exists())
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, str(hook_path))
 
 
 if __name__ == "__main__":

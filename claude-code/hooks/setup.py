@@ -61,6 +61,19 @@ def normalize_url(domain: str) -> str:
     return url.rstrip('/')
 
 
+def _resolve_claude_config_dir(argv) -> Path:
+    value = None
+    for i, arg in enumerate(argv):
+        if arg == "--config-dir" and i + 1 < len(argv):
+            value = argv[i + 1]
+            break
+    if not value:
+        value = os.environ.get("CLAUDE_CONFIG_DIR")
+    if not value:
+        return Path.home() / ".claude"
+    return Path(value).expanduser().resolve()
+
+
 def get_shell_rc_file() -> Path:
     system = platform.system().lower()
     shell = os.environ.get("SHELL", "").lower()
@@ -308,9 +321,10 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
         return False
 
 
-def remove_gateway_artifacts() -> None:
-    """Remove ~/.claude/anthropic_key.sh if present (leftover from gateway setup)."""
-    key_helper_path = Path.home() / ".claude" / "anthropic_key.sh"
+def remove_gateway_artifacts(config_dir: Path = None) -> None:
+    """Remove anthropic_key.sh if present (leftover from gateway setup)."""
+    config_dir = config_dir or (Path.home() / ".claude")
+    key_helper_path = config_dir / "anthropic_key.sh"
     if key_helper_path.exists():
         try:
             key_helper_path.unlink()
@@ -350,8 +364,9 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         debug_print(f"Could not rewrite gateway URL in {path}: {e}")
 
 
-def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
-    hooks_dir = Path.home() / ".claude" / "hooks"
+def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, config_dir: Path = None):
+    config_dir = config_dir or (Path.home() / ".claude")
+    hooks_dir = config_dir / "hooks"
     script_path = hooks_dir / "unbound.py"
 
     # print("\n📥 Downloading unbound.py script...")
@@ -371,9 +386,10 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     return True
 
 
-def configure_claude_settings() -> bool:
-    settings_path = Path.home() / ".claude" / "settings.json"
-    
+def configure_claude_settings(config_dir: Path = None) -> bool:
+    config_dir = config_dir or (Path.home() / ".claude")
+    settings_path = config_dir / "settings.json"
+
     try:
         if settings_path.exists():
             with open(settings_path, 'r', encoding='utf-8') as f:
@@ -386,7 +402,7 @@ def configure_claude_settings() -> bool:
         if "apiKeyHelper" in settings:
             del settings["apiKeyHelper"]
         
-        script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
+        script_path = config_dir / "hooks" / "unbound.py"
 
         # On Windows, invoke via the launcher and quote the path (handles spaces
         # like C:\Users\Jane Doe\ or C:\Program Files\). Use `py -3` if present,
@@ -520,13 +536,14 @@ def configure_claude_settings() -> bool:
         return False
 
 
-def remove_hooks_from_settings() -> str:
+def remove_hooks_from_settings(config_dir: Path = None) -> str:
     """Remove the unbound hooks from settings.json.
 
     Returns "cleared", "not_found", or "failed".
     """
-    settings_path = Path.home() / ".claude" / "settings.json"
-    hook_command = str(Path.home() / ".claude" / "hooks" / "unbound.py")
+    config_dir = config_dir or (Path.home() / ".claude")
+    settings_path = config_dir / "settings.json"
+    hook_command = str(config_dir / "hooks" / "unbound.py")
     is_windows = platform.system().lower() == "windows"
 
     if not settings_path.exists():
@@ -591,8 +608,9 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
-def clear_setup() -> None:
+def clear_setup(config_dir: Path = None) -> None:
     """Undo all changes made by the setup script."""
+    config_dir = config_dir or (Path.home() / ".claude")
     print("=" * 60)
     print("Claude Code Hooks - Clearing Setup")
     print("=" * 60)
@@ -607,15 +625,15 @@ def clear_setup() -> None:
         print("Failed to clear API_KEY")
         any_failed = True
 
-    _r = _clear_path(Path.home() / ".claude" / "hooks" / "unbound.py", "Claude unbound.py hook")
+    _r = _clear_path(config_dir / "hooks" / "unbound.py", "Claude unbound.py hook")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
         any_failed = True
 
     for extra in (
-        Path.home() / ".claude" / "hooks" / "unbound-setup.py",
-        Path.home() / ".claude" / "hooks" / ".last_updated",
+        config_dir / "hooks" / "unbound-setup.py",
+        config_dir / "hooks" / ".last_updated",
     ):
         _r = _clear_path(extra, str(extra))
         if _r == "cleared":
@@ -623,7 +641,7 @@ def clear_setup() -> None:
         elif _r == "failed":
             any_failed = True
 
-    settings_status = remove_hooks_from_settings()
+    settings_status = remove_hooks_from_settings(config_dir)
     if settings_status == "cleared":
         any_cleared = True
     elif settings_status == "failed":
@@ -740,12 +758,13 @@ def get_device_identifier() -> Optional[str]:
         return None
 
 
-def detect_install_state() -> str:
+def detect_install_state(config_dir: Path = None) -> str:
     """User-level install state (informational): 'persisted' if this tool's
     Unbound setup already exists on this device, else 'fresh'. User-level setups
     are never tamper-eligible, so 'tampered' is never reported."""
+    config_dir = config_dir or (Path.home() / ".claude")
     try:
-        return "persisted" if (Path.home() / ".claude" / "hooks" / "unbound.py").exists() else "fresh"
+        return "persisted" if (config_dir / "hooks" / "unbound.py").exists() else "fresh"
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return "fresh"
@@ -943,16 +962,16 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict])
     return True
 
 
-def _backfill_state_path(home: Path) -> Path:
-    return home / '.claude' / 'hooks' / BACKFILL_STATE_FILE
+def _backfill_state_path(config_dir: Path) -> Path:
+    return config_dir / 'hooks' / BACKFILL_STATE_FILE
 
 
-def _backfill_read_cutoff(home: Path) -> float:
+def _backfill_read_cutoff(config_dir: Path) -> float:
     """mtime cutoff for transcript selection: the last successful backfill when
     cached (so cron reruns only seed sessions touched since), else 30 days ago."""
     default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
     try:
-        last = float(_backfill_state_path(home).read_text().strip())
+        last = float(_backfill_state_path(config_dir).read_text().strip())
     except (OSError, ValueError):
         return default_cutoff
     # Ignore corrupt or future timestamps (clock skew).
@@ -961,11 +980,11 @@ def _backfill_read_cutoff(home: Path) -> float:
     return last
 
 
-def _backfill_write_cutoff(home: Path, ts: float) -> None:
+def _backfill_write_cutoff(config_dir: Path, ts: float) -> None:
     # Write via temp + atomic replace so an overlapping cron run never reads a
     # half-written timestamp.
     try:
-        path = _backfill_state_path(home)
+        path = _backfill_state_path(config_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
         tmp.write_text(str(ts))
@@ -1085,17 +1104,18 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
         start_idx = last_fit_end
 
 
-def run_backfill(api_key: str, backend_url: str) -> None:
-    """Walk ~/.claude/projects and seed historical sessions. Never raises."""
+def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> None:
+    """Walk config_dir/projects and seed historical sessions. Never raises."""
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
 
     try:
-        home = Path.home()
+        if config_dir is None:
+            config_dir = Path.home() / '.claude'
         started_at = time.time()
-        cutoff_mtime = _backfill_read_cutoff(home)
-        projects_root = home / '.claude' / 'projects'
+        cutoff_mtime = _backfill_read_cutoff(config_dir)
+        projects_root = config_dir / 'projects'
         sessions: List[Dict] = []
         capped = False
         if projects_root.exists():
@@ -1110,7 +1130,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
                 if session:
                     sessions.append(session)
         if not sessions:
-            _backfill_write_cutoff(home, started_at)
+            _backfill_write_cutoff(config_dir, started_at)
             print("[backfill] No past sessions found.")
             return
 
@@ -1157,7 +1177,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
             print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
         else:
             if not capped:
-                _backfill_write_cutoff(home, started_at)
+                _backfill_write_cutoff(config_dir, started_at)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
@@ -1175,8 +1195,10 @@ def main():
         DEBUG = True
         debug_print("Debug mode enabled")
 
+    config_dir = _resolve_claude_config_dir(sys.argv)
+
     if clear_mode:
-        clear_setup()
+        clear_setup(config_dir)
         return
 
     if check_enterprise_hooks_conflict():
@@ -1248,7 +1270,7 @@ def main():
             remove_env_var(var_name)
         except Exception:
             pass
-    remove_gateway_artifacts()
+    remove_gateway_artifacts(config_dir)
 
     debug_print("Setting UNBOUND_CLAUDE_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_CLAUDE_API_KEY", api_key)
@@ -1257,19 +1279,19 @@ def main():
         return
     debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
 
-    _install_state = detect_install_state()
+    _install_state = detect_install_state(config_dir)
     _device_id = get_device_identifier()
 
     write_unbound_config(api_key, urls={"base_url": backend_url, "gateway_url": gateway_url, "frontend_url": normalize_url(domain) if domain else None})
 
     debug_print("Setting up hooks...")
-    if not setup_hooks(gateway_url=gateway_url):
+    if not setup_hooks(gateway_url=gateway_url, config_dir=config_dir):
         print("❌ Failed to setup hooks")
         return
     debug_print("Hooks downloaded successfully")
 
     debug_print("Configuring Claude settings...")
-    if not configure_claude_settings():
+    if not configure_claude_settings(config_dir=config_dir):
         print("❌ Failed to configure Claude settings")
         return
     debug_print("Claude settings configured successfully")
@@ -1281,7 +1303,7 @@ def main():
     notify_setup_complete(api_key, "claude-code", backend_url=backend_url, install_state=_install_state, serial_number=_device_id)
 
     if backfill_mode:
-        run_backfill(api_key, backend_url)
+        run_backfill(api_key, backend_url, config_dir)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:

@@ -17,14 +17,16 @@ import platform
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
-ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
-LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
+_config_dir_is_default = not (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+_CONFIG_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude")).expanduser().resolve()
+AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
+ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
+LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
-CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
-POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
+CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json" if _config_dir_is_default else _CONFIG_DIR / ".claude.json"
+POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
@@ -53,7 +55,7 @@ SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/hea
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
 SELF_UPDATE_LOCK_TTL_SECONDS = 30
 SELF_UPDATE_CURL_TIMEOUT = 10
-SELF_SCRIPT_PATH = Path.home() / ".claude" / "hooks" / "unbound.py"
+SELF_SCRIPT_PATH = _CONFIG_DIR / "hooks" / "unbound.py"
 SELF_UPDATE_STATE_PATH = SELF_SCRIPT_PATH.parent / ".self_update_check"
 SELF_UPDATE_LOCK_PATH = SELF_SCRIPT_PATH.parent / ".self_update.lock"
 
@@ -238,7 +240,7 @@ def append_to_audit_log(event_data: Dict):
         pass
 
 
-_APPROVAL_MARKER_FILE = Path.home() / ".claude" / "hooks" / ".approval_pending"
+_APPROVAL_MARKER_FILE = _CONFIG_DIR / "hooks" / ".approval_pending"
 
 
 def _is_approval_retry(command: str) -> bool:
