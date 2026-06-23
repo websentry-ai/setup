@@ -156,12 +156,20 @@ def _should_report():
         return False
 
 
+def redact_secrets(text, key=None):
+    text = re.sub(r'(?i)\bBearer\s+\S+', 'Bearer [REDACTED]', str(text))
+    if key and len(key) >= 8:
+        text = text.replace(key, '[REDACTED]')
+    return text
+
+
 def report_error_to_gateway(message, category='general', api_key=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
     if _reporting_error or not api_key or not _should_report():
         return
     _reporting_error = True
+    message = redact_secrets(message, api_key)
     try:
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
@@ -186,6 +194,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
 
 def log_error(message, category='general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
+    message = redact_secrets(message, _cached_api_key)
     timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
     error_entry = f"{timestamp}: {message}\n"
 
