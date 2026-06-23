@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import sys
+import base64
 import json
 import os
 import subprocess
@@ -655,6 +656,108 @@ def _extract_mcp_server_fields(server: Dict) -> Optional[Dict]:
     return result if result else None
 
 
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+
+
+def _hook_command_basename(command: str) -> str:
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value: str) -> bool:
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    if '${' in v or '/' in v or '\\' in v:
+        return True
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_candidate_script(command: Optional[str], args: Optional[List]) -> Optional[str]:
+    """The local script this config runs: the file arg under a runtime, or the
+    command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        for a in (args or []):
+            if not isinstance(a, str) or a.startswith('-'):
+                continue
+            t = a.strip().strip('"\'')
+            if t in _HOOK_RUNNER_SUBTOKENS:
+                continue
+            if _hook_looks_like_path(t):
+                return t
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Optional[str]) -> Optional[str]:
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint."""
+    try:
+        cand = _hook_candidate_script(command, args)
+        if not cand:
+            return None
+        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+        if '${' in path:  # an env var we couldn't expand -> can't resolve
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.sha256()
+        with open(path, 'rb') as f:
+            for chunk in iter(lambda: f.read(65536), b''):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _augment_script_hash(result: Optional[Dict], cwd: Optional[str]) -> Optional[Dict]:
+    """Add scriptHash to an MCP server config when it runs a local script, so the
+    gateway can fingerprint it as `script:<hash>`."""
+    if result and result.get('command'):
+        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
+        if script_hash:
+            result['scriptHash'] = script_hash
+    return result
+
+
+_HOOK_MAX_SCRIPT_BYTES = 1_000_000
+
+
+def _read_script_body_b64(command, args, cwd):
+    """base64 of the local script's raw bytes (the scan body), or None. The
+    backend recomputes sha256 over these exact bytes, so this must read the same
+    file _compute_script_hash hashed. Capped to avoid shipping huge files."""
+    try:
+        cand = _hook_candidate_script(command, args)
+        if not cand:
+            return None
+        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+        if '${' in path:
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        with open(path, 'rb') as f:
+            data = f.read(_HOOK_MAX_SCRIPT_BYTES + 1)
+        if len(data) > _HOOK_MAX_SCRIPT_BYTES:
+            return None
+        return base64.b64encode(data).decode('ascii')
+    except Exception:
+        return None
+
+
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
     try:
         if not config_path.exists():
@@ -674,7 +777,7 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
                         if isinstance(proj_servers, dict) and server_name in proj_servers:
                             result = _extract_mcp_server_fields(proj_servers[server_name])
                             if result:
-                                return result
+                                return _augment_script_hash(result, cwd)
                     parent = os.path.dirname(cwd_path)
                     if parent == cwd_path:
                         break
@@ -684,7 +787,7 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
         if isinstance(top_servers, dict) and server_name in top_servers:
             result = _extract_mcp_server_fields(top_servers[server_name])
             if result:
-                return result
+                return _augment_script_hash(result, cwd)
 
         return None
     except Exception:
@@ -982,7 +1085,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if is_mcp and api_response.get('unknown_mcp_server'):
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
-            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg)
+            _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
 
     return transform_response_for_claude(api_response)
 
@@ -1440,7 +1543,7 @@ def _install_sh_is_stale() -> bool:
         return True
 
 
-def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
+def _dispatch_mcp_server_scan(server_name: str, server_config: Dict, cwd: Optional[str] = None) -> None:
     """Report ONE unknown MCP server out-of-band.
 
     Detached so the blocking PreToolUse hook returns immediately. Secrets
@@ -1449,6 +1552,14 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
     if not server_name:
         log_error("mcp scan dispatch: empty server name, skipping", 'mcp_server')
         return
+    try:
+        if (isinstance(server_config, dict) and server_config.get('command')
+                and not server_config.get('script_content')):
+            body = _read_script_body_b64(server_config.get('command'), server_config.get('args'), cwd)
+            if body:
+                server_config = {**server_config, 'script_content': body}
+    except Exception:
+        pass
     try:
         try:
             with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
