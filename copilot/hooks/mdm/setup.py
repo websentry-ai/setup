@@ -657,6 +657,9 @@ def _fetch_hook_script(gateway_url: str) -> Optional[str]:
         if not download_file(SCRIPT_URL, source_script):
             return None
         return _apply_gateway_url(source_script.read_text(encoding="utf-8"), gateway_url)
+    except Exception as e:
+        debug_print(f"Could not read downloaded unbound.py: {e}")
+        return None
     finally:
         shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -664,7 +667,12 @@ def _fetch_hook_script(gateway_url: str) -> Optional[str]:
 def _write_file(path: Path, data: str, mode: int) -> None:
     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
     fd = os.open(str(path), flags, mode)
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    try:
+        f = os.fdopen(fd, 'w', encoding='utf-8')
+    except Exception:
+        os.close(fd)
+        raise
+    with f:
         if os.name == "posix":
             os.fchmod(f.fileno(), mode)
         f.write(data)
@@ -710,10 +718,14 @@ def install_hooks_for_user(username: str, home_dir: Path, script_text: str) -> b
     script_mode = 0o755 if platform.system().lower() in ("darwin", "linux") else 0o644
 
     def _install():
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        _write_file(script_path, script_text, script_mode)
-        _write_file(hooks_json, json.dumps(_copilot_hooks_config(script_path), indent=2), 0o644)
-        return True
+        try:
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            _write_file(script_path, script_text, script_mode)
+            _write_file(hooks_json, json.dumps(_copilot_hooks_config(script_path), indent=2), 0o644)
+            return True
+        except Exception as e:
+            debug_print(f"install for {username} failed: {e}")
+            raise
 
     ok = bool(_run_as_user(username, _install))
     debug_print(f"{'Installed' if ok else 'Failed to install'} Copilot hooks for {username}")
