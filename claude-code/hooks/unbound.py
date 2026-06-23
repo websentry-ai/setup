@@ -516,26 +516,40 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
     if not api_key:
         return {}
 
-    try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
-        data = json.dumps(request_body)
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
+    data = json.dumps(request_body)
 
-        result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True,
-            timeout=20
-        )
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=data.encode(),
+                capture_output=True,
+                timeout=20
+            )
 
-        if result.returncode == 0 and result.stdout:
-            return json.loads(result.stdout.decode('utf-8'))
-        return {}
-    except Exception as e:
-        log_error(f"Hook API error: {str(e)}", 'api_call')
-        return {}
+            # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
+            # server accepted the request. Do NOT retry on success — a retry
+            # would re-deliver the same pre-tool event (duplicate). Parse the
+            # body if present, otherwise return {} (an empty 2xx is still a
+            # successful, non-blocking allow).
+            if result.returncode == 0:
+                if result.stdout:
+                    try:
+                        return json.loads(result.stdout.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        return {}
+                return {}
+        except Exception as e:
+            log_error(f"Hook API error: {str(e)}", 'api_call')
+
+        if attempt < 2:
+            time.sleep(0.5)
+
+    return {}
 
 
 def _next_poll_interval(elapsed: float) -> int:
@@ -560,25 +574,30 @@ def poll_approval_status(api_key: str, policy_ids: list, application_id: str, re
 
     while time.monotonic() < deadline:
         time.sleep(_next_poll_interval(time.monotonic() - start))
-        try:
-            result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
-                 "-H", f"Authorization: Bearer {api_key}",
-                 "-H", "Content-Type: application/json",
-                 "--data-binary", "@-", url],
-                input=body.encode(),
-                capture_output=True,
-                timeout=10
-            )
-            if result.returncode == 0 and result.stdout:
-                resp = json.loads(result.stdout.decode('utf-8'))
-                decision = resp.get('decision', 'pending')
-                if decision == 'allow':
-                    return 'approved'
-                if decision == 'deny':
-                    return 'deny'
-        except Exception as e:
-            log_error(f"Approval poll error: {str(e)}")
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    ["curl", "-fsSL", "-X", "POST",
+                     "-H", f"Authorization: Bearer {api_key}",
+                     "-H", "Content-Type: application/json",
+                     "--data-binary", "@-", url],
+                    input=body.encode(),
+                    capture_output=True,
+                    timeout=10
+                )
+                if result.returncode == 0 and result.stdout:
+                    resp = json.loads(result.stdout.decode('utf-8'))
+                    decision = resp.get('decision', 'pending')
+                    if decision == 'allow':
+                        return 'approved'
+                    if decision == 'deny':
+                        return 'deny'
+                    break
+            except Exception as e:
+                log_error(f"Approval poll error: {str(e)}")
+
+            if attempt < 2:
+                time.sleep(0.5)
 
     return 'timeout'
 
@@ -614,7 +633,8 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
     if decision == 'deny':
         return {
             'decision': 'block',
-            'reason': reason
+            'reason': reason,
+            'suppressOriginalPrompt': True,
         }
 
     return {}
@@ -1081,28 +1101,32 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
         log_error("No API key present in send_to_api function", 'config')
         return False
     
-    try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/claude"
-        data = json.dumps(exchange)
-        
-        result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True,
-            timeout=10
-        )
-        
-        if result.returncode != 0:
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/claude"
+    data = json.dumps(exchange)
+
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=data.encode(),
+                capture_output=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                return True
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
             log_error(f"API request failed: {error_msg}", 'api_call')
-            return False
-        return True
-    except Exception as e:
-        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
-        return False
+        except Exception as e:
+            log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
+
+        if attempt < 2:
+            time.sleep(0.5)
+
+    return False
 
 
 def cleanup_old_logs():

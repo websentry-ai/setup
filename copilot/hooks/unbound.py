@@ -7,6 +7,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import json
 import os
+import platform
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ import tempfile
 import time
 import hashlib
 import re
+from urllib.parse import urlsplit, urlunsplit
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -381,6 +383,13 @@ def _build_user_prompt_payload(recent_user_prompts):
 def canonical_tool_name(raw):
     """Translate a Copilot tool name to the canonical gateway vocabulary.
     Returns '' when the tool is not security-relevant."""
+    # The Copilot CLI emits Claude-style canonical names directly (Read / Write
+    # / Edit / Bash); only the VS Code agent uses the lowercase vocabulary in
+    # the sets below. Pass canonical names through, otherwise every CLI
+    # native-file tool call resolves to '' and is silently skipped — which
+    # disabled all native-file (read/write/edit) policy enforcement for the CLI.
+    if raw in ALLOWED_NON_MCP_HOOK_NAMES:
+        return raw
     if raw in SHELL_TOOLS:
         return 'Bash'
     if raw in READ_TOOLS:
@@ -393,6 +402,295 @@ def canonical_tool_name(raw):
         # MCP tools pass through unchanged — the gateway matches on the raw name.
         return raw
     return ''
+
+
+# VS Code stable + Insiders "Code/User" dirs for the current OS. Uses
+# platform.system() rather than sys.platform/os.name so static checkers do not
+# narrow it to one OS and flag the other branches as unreachable.
+def _vscode_user_dirs():
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return []
+        base = Path(appdata)
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path.home() / ".config"
+    return [base / "Code" / "User", base / "Code - Insiders" / "User"]
+
+
+# All Copilot MCP config locations. Untrusted workspace files (from cwd) come
+# first; trusted user/global/CLI configs last so they win the last-wins merge in
+# read_copilot_mcp_servers.
+def _copilot_mcp_config_paths(cwd=None):
+    home = Path.home()
+
+    workspace = []
+    if cwd:
+        workspace.append(Path(cwd) / ".vscode" / "mcp.json")
+        workspace.append(Path(cwd) / ".mcp.json")
+
+    trusted = []
+    for user_dir in _vscode_user_dirs():
+        trusted.append(user_dir / "mcp.json")
+        trusted.append(user_dir / "settings.json")
+        profiles = user_dir / "profiles"
+        try:
+            if profiles.is_dir():
+                for profile in sorted(profiles.iterdir()):
+                    trusted.append(profile / "mcp.json")
+        except OSError:
+            pass
+    trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
+    trusted.append(home / ".copilot" / "mcp-config.json")
+
+    return workspace + trusted
+
+_JSONC_COMMENT_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|//[^\n\r]*'         # line comment (dropped)
+    r'|/\*.*?\*/',         # block comment (dropped)
+    re.DOTALL,
+)
+_JSONC_TRAILING_COMMA_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|,(?=\s*[}\]])',     # trailing comma (dropped; brace left via lookahead)
+    re.DOTALL,
+)
+
+
+def _strip_jsonc(text):
+    # Two string-aware passes: both match string literals first so commas/comment
+    # markers inside a quoted value are preserved verbatim. Pass 1 drops comments;
+    # pass 2 drops trailing commas (now that any comment between a comma and its
+    # brace is gone) via a lookahead that leaves the brace in place.
+    def keep_strings(match):
+        token = match.group(0)
+        return token if token.startswith('"') else ''
+    no_comments = _JSONC_COMMENT_RE.sub(keep_strings, text)
+    return _JSONC_TRAILING_COMMA_RE.sub(keep_strings, no_comments)
+
+def _parse_jsonc(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_jsonc(text))
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+_TOKEN_RE = re.compile(
+    r'sk-[A-Za-z0-9_\-]{6,}'
+    r'|gh[opsur]_[A-Za-z0-9]{20,}'
+    r'|github_pat_[A-Za-z0-9_]{20,}'
+    r'|xox[baprs]-[A-Za-z0-9-]{10,}'
+    r'|AKIA[0-9A-Z]{16}'
+    r'|AIza[0-9A-Za-z_\-]{20,}'
+)
+_REDACTED = '***'
+
+
+# Reduce any url to scheme://host[:port]/path — the only part the gateway
+# fingerprints. Userinfo and query/fragment (which carry credentials, any
+# scheme) are dropped; known token shapes in the path are masked.
+def _redact_url(url):
+    if not isinstance(url, str):
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _REDACTED
+    host = parts.hostname
+    if not parts.scheme or not host:
+        return _REDACTED
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme, netloc, _TOKEN_RE.sub(_REDACTED, parts.path), '', ''))
+
+
+# Allowlist: forward only fingerprint-relevant args (urls, @npm packages); drop
+# everything else so no secret can ride along. Urls are credential-stripped.
+def _redact_args(args):
+    if not isinstance(args, list):
+        return args
+    kept = []
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        if '://' in arg:
+            kept.append(_redact_url(arg))
+        elif arg.startswith('@'):
+            kept.append(arg)
+    return kept
+
+
+def _sanitize_mcp_server_fields(server):
+    if not isinstance(server, dict):
+        return None
+    result = {}
+    if server.get('url'):
+        result['url'] = _redact_url(server['url'])
+    if server.get('command'):
+        result['command'] = server['command']
+    if server.get('args'):
+        result['args'] = _redact_args(server['args'])
+    if server.get('type'):
+        result['type'] = server['type']
+    return result if result else None
+
+
+_MCP_CONFIG_MAX_BYTES = 1_000_000
+
+
+def read_copilot_mcp_servers(cwd=None):
+    servers = {}
+    for config_path in _copilot_mcp_config_paths(cwd):
+        try:
+            if not config_path.exists():
+                continue
+            if config_path.stat().st_size > _MCP_CONFIG_MAX_BYTES:
+                continue
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = _parse_jsonc(f.read())
+            if not isinstance(config, dict):
+                continue
+            raw = config.get('servers')
+            if not isinstance(raw, dict):
+                raw = config.get('mcpServers')
+            if not isinstance(raw, dict):
+                nested = config.get('mcp')
+                raw = nested.get('servers') if isinstance(nested, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            for name, server in raw.items():
+                fields = _sanitize_mcp_server_fields(server)
+                servers[name] = fields or {}
+        except Exception as e:
+            # Missing files are skipped above without raising; this only fires on
+            # a genuine read failure, so it's worth surfacing for diagnosis.
+            log_error(f"copilot mcp config read failed path={config_path} err={e}", 'mcp_config')
+            continue
+    return servers
+
+
+# Mirror Copilot's server-name sanitization for tool-name prefixes.
+def _sanitize_copilot_server_name(name):
+    return re.sub(r'[^a-zA-Z0-9_-]', '-', name.replace('@', '-'))
+
+
+# Only the delimiters Copilot actually emits: '-' (sanitized serverName-toolName)
+# and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
+# false-positive relabels of unrelated tools sharing a server's prefix.
+_MCP_NAME_SEPARATORS = ('__', '-')
+# A server name must be at least this long to anchor a bare-name match, so a
+# one-char config entry can't swallow arbitrary tool names.
+_MIN_MCP_SERVER_NAME = 2
+
+
+# Resolve (server, tool, config) from a Copilot tool name. The mcp__ form is
+# self-delimiting; the bare form is matched against configured server names.
+# Matching is case-insensitive (Copilot lowercases nothing, configs vary case)
+# and the longest server match wins; ties resolve to config/iteration order.
+def detect_mcp_call(raw_tool, mcp_servers):
+    if not raw_tool:
+        return (None, None, None)
+
+    if raw_tool.startswith('mcp__'):
+        parts = raw_tool[len('mcp__'):].split('__', 1)
+        server = parts[0]
+        mcp_tool = parts[1] if len(parts) >= 2 else ''
+        return (server, mcp_tool, mcp_servers.get(server))
+
+    raw_lower = raw_tool.lower()
+    best = None  # (matched_len, server_name, mcp_tool)
+    for server_name in mcp_servers:
+        for candidate in {server_name, _sanitize_copilot_server_name(server_name)}:
+            if len(candidate) < _MIN_MCP_SERVER_NAME:
+                continue
+            cand_lower = candidate.lower()
+            if raw_lower == cand_lower:
+                mcp_tool = ''
+            elif raw_lower.startswith(cand_lower):
+                remainder = raw_tool[len(candidate):]
+                sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
+                if sep is None:
+                    continue
+                mcp_tool = remainder[len(sep):]
+            else:
+                continue
+            if best is None or len(candidate) > best[0]:
+                best = (len(candidate), server_name, mcp_tool)
+
+    if best is None:
+        return (None, None, None)
+    return (best[1], best[2], mcp_servers.get(best[1]))
+
+
+# VS Code Copilot names MCP tools `mcp_<server>_<tool>` (single underscore,
+# sanitized + truncated server) — unlike the Claude-style `mcp__server__tool` the
+# gateway parses. Reverse-map the token to a configured server to forward its config.
+def _vscode_sanitize(name):
+    return re.sub(r'[^a-z0-9]', '_', name.lower())
+
+
+def _vscode_server_aliases(server_name):
+    """Sanitized full key + last path segment (e.g. 'io.github.github/github-mcp-server' -> 'github-mcp-server')."""
+    aliases = {_vscode_sanitize(server_name), _vscode_sanitize(server_name.rsplit('/', 1)[-1])}
+    return {a for a in aliases if len(a) >= _MIN_MCP_SERVER_NAME}
+
+
+def _vscode_fingerprint_key(config):
+    """Coarse identity used to decide if two configured servers are really the same
+    one (mirrors the gateway's url-first / command+args fingerprint priority).
+    Returns None when identity can't be established."""
+    if not config:
+        return None
+    if config.get('url'):
+        return ('url', config['url'])
+    if config.get('command'):
+        return ('cmd', config['command'], tuple(config.get('args') or []))
+    return None
+
+
+def _resolve_vscode_mcp(raw_tool, mcp_servers):
+    """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
+    tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
+    If a *different* server also matches and can't be proven to be the same server
+    (identical fingerprint config), the token is ambiguous -> unresolved (don't
+    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
+    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
+        return (None, None, None)
+    body = raw_tool[len('mcp_'):]
+    body_lower = body.lower()
+    segments = body.split('_')
+    candidates = []  # (server_portion_len, exact_flag, server_name, tool)
+    for server_name in mcp_servers:
+        for alias in _vscode_server_aliases(server_name):
+            if body_lower.startswith(alias + '_'):
+                cand = (len(alias), 1, server_name, body[len(alias) + 1:])
+            else:
+                cand = None
+                for k in range(len(segments) - 1, 0, -1):
+                    left = '_'.join(segments[:k])
+                    if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
+                        cand = (len(left), 0, server_name, '_'.join(segments[k:]))
+                        break
+            if cand is not None and cand[3]:
+                candidates.append(cand)
+    if not candidates:
+        return (None, None, None)
+    best = max(candidates, key=lambda c: c[:2])
+    best_key = _vscode_fingerprint_key(mcp_servers.get(best[2]))
+    for cand in candidates:
+        if cand[2] == best[2]:
+            continue
+        other_key = _vscode_fingerprint_key(mcp_servers.get(cand[2]))
+        if best_key is None or other_key is None or other_key != best_key:
+            return (None, None, None)
+    return (best[2], best[3], mcp_servers.get(best[2]))
 
 
 def extract_command_for_pretool(canonical, tool_input):
@@ -415,26 +713,40 @@ def send_to_hook_api(request_body, api_key):
     if not api_key:
         return {}
 
-    try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
-        data = json.dumps(request_body)
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
+    data = json.dumps(request_body)
 
-        result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True,
-            timeout=20
-        )
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=data.encode(),
+                capture_output=True,
+                timeout=20
+            )
 
-        if result.returncode == 0 and result.stdout:
-            return json.loads(result.stdout.decode('utf-8'))
-        return {}
-    except Exception as e:
-        log_error(f"Hook API error: {str(e)}", 'api_call')
-        return {}
+            # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
+            # server accepted the request. Do NOT retry on success — a retry
+            # would re-deliver the same pre-tool event (duplicate). Parse the
+            # body if present, otherwise return {} (an empty 2xx is still a
+            # successful, non-blocking allow).
+            if result.returncode == 0:
+                if result.stdout:
+                    try:
+                        return json.loads(result.stdout.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        return {}
+                return {}
+        except Exception as e:
+            log_error(f"Hook API error: {str(e)}", 'api_call')
+
+        if attempt < 2:
+            time.sleep(0.5)
+
+    return {}
 
 
 _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
@@ -503,25 +815,30 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
 
     while time.monotonic() < deadline:
         time.sleep(_next_poll_interval(time.monotonic() - start))
-        try:
-            result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
-                 "-H", f"Authorization: Bearer {api_key}",
-                 "-H", "Content-Type: application/json",
-                 "--data-binary", "@-", url],
-                input=body.encode(),
-                capture_output=True,
-                timeout=10
-            )
-            if result.returncode == 0 and result.stdout:
-                resp = json.loads(result.stdout.decode('utf-8'))
-                decision = resp.get('decision', 'pending')
-                if decision == 'allow':
-                    return 'approved'
-                if decision == 'deny':
-                    return 'deny'
-        except Exception as e:
-            log_error(f"Approval poll error: {str(e)}", 'api_call')
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    ["curl", "-fsSL", "-X", "POST",
+                     "-H", f"Authorization: Bearer {api_key}",
+                     "-H", "Content-Type: application/json",
+                     "--data-binary", "@-", url],
+                    input=body.encode(),
+                    capture_output=True,
+                    timeout=10
+                )
+                if result.returncode == 0 and result.stdout:
+                    resp = json.loads(result.stdout.decode('utf-8'))
+                    decision = resp.get('decision', 'pending')
+                    if decision == 'allow':
+                        return 'approved'
+                    if decision == 'deny':
+                        return 'deny'
+                    break
+            except Exception as e:
+                log_error(f"Approval poll error: {str(e)}", 'api_call')
+
+            if attempt < 2:
+                time.sleep(0.5)
 
     return 'timeout'
 
@@ -535,7 +852,20 @@ def transform_response_for_copilot(api_response):
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # On 'allow', emit no decision ({}) so Copilot falls through to the user's
+    # local config/rules instead of force-allowing over them. Copilot preToolUse
+    # precedence: an explicit 'allow' overrides a local deny; '{}' defers to it.
+    # We only force an explicit decision to deny/ask.
+    if decision == 'allow':
+        return {}
+
+    # Emit BOTH shapes so the decision is honored regardless of which the
+    # running Copilot surface reads: the top-level form documented in the
+    # Copilot CLI hooks reference, AND the nested hookSpecificOutput form
+    # (Claude-compatible, used by the VS Code agent). Same values, no conflict.
     return {
+        'permissionDecision': decision,
+        'permissionDecisionReason': reason,
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
             'permissionDecision': decision,
@@ -565,15 +895,63 @@ def transform_response_for_copilot_prompt(api_response):
 
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
-    raw_tool = event.get('tool_name', '')
-    tool_input = event.get('tool_input') or {}
-    session_id = event.get('session_id')
+    raw_tool = event.get('tool_name') or event.get('toolName') or ''
+    tool_input = event.get('tool_input') or event.get('toolArgs') or {}
+    session_id = event.get('session_id') or event.get('sessionId')
 
     # Translate the Copilot tool name to the canonical gateway vocabulary.
     canonical = canonical_tool_name(raw_tool)
     is_mcp = canonical.startswith('mcp')
+    mcp_server = mcp_tool = mcp_server_config = None
+
+    # VS Code's `mcp_<server>_<tool>` form: canonical_tool_name() leaves the `mcp`
+    # prefix as-is so the bare-tool detection below is skipped; resolve the server
+    # here and forward its config so the gateway can fingerprint it.
+    if is_mcp and raw_tool.startswith('mcp_') and not raw_tool.startswith('mcp__'):
+        mcp_servers = read_copilot_mcp_servers(event.get('cwd'))
+        mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(raw_tool, mcp_servers)
+        if mcp_server is not None:
+            canonical = f"mcp__{mcp_server}__{mcp_tool}"
+            log_error(
+                f"copilot vscode mcp detected session={session_id} tool={raw_tool} "
+                f"server={mcp_server} mcp_tool={mcp_tool} "
+                f"config={'yes' if mcp_server_config else 'no'}",
+                'mcp_match',
+            )
+        else:
+            # Unmappable server: fall through to the gateway with mcp_server unset
+            # (not a short-circuit) so its other policies/logging/metering still run;
+            # the allow-list isn't evaluated without a resolved server (fail-open).
+            log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
+
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
-        return {}
+        cwd = event.get('cwd')
+        mcp_servers = read_copilot_mcp_servers(cwd)
+        mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
+        if mcp_server is None:
+            # A bare (non-mcp__) tool can only be resolved against the MCP config.
+            # If no config was readable, a genuine MCP call can't be identified
+            # and would slip the allow-list — surface that distinctly so the
+            # potential bypass is observable rather than silent. Skip known-benign
+            # native tools so the log isn't noisy.
+            if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
+                if not mcp_servers and not raw_tool.startswith('mcp__'):
+                    log_error(
+                        f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
+                        'mcp_config',
+                    )
+                else:
+                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+            return {}
+        is_mcp = True
+        canonical = f"mcp__{mcp_server}__{mcp_tool}"
+        # Names only — never args/config (those can carry secrets).
+        log_error(
+            f"copilot mcp detected session={session_id} tool={raw_tool} "
+            f"server={mcp_server} mcp_tool={mcp_tool} "
+            f"config={'yes' if mcp_server_config else 'no'}",
+            'mcp_match',
+        )
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -598,6 +976,12 @@ def process_pre_tool_use(event, api_key):
     file_path = tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path')
     if file_path:
         metadata['file_path'] = file_path
+
+    if mcp_server is not None:
+        metadata['mcp_server'] = mcp_server
+        metadata['mcp_tool'] = mcp_tool
+        if mcp_server_config:
+            metadata['mcp_server_config'] = mcp_server_config
 
     approval_key = f"{canonical}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -911,28 +1295,32 @@ def send_to_api(exchange, api_key):
         log_error("No API key present in send_to_api function", 'config')
         return False
 
-    try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/copilot"
-        data = json.dumps(exchange)
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/copilot"
+    data = json.dumps(exchange)
 
-        result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True,
-            timeout=10
-        )
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=data.encode(),
+                capture_output=True,
+                timeout=10
+            )
 
-        if result.returncode != 0:
+            if result.returncode == 0:
+                return True
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
             log_error(f"API request failed: {error_msg}", 'api_call')
-            return False
-        return True
-    except Exception as e:
-        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
-        return False
+        except Exception as e:
+            log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
+
+        if attempt < 2:
+            time.sleep(0.5)
+
+    return False
 
 
 def get_api_key():
@@ -1030,6 +1418,19 @@ def _replace_self(new_bytes: bytes) -> None:
 def _check_self_update() -> None:
     if RUNNING_FROZEN:
         # Binary deployments are updated by the MDM package, never in place.
+        return
+    # Only self-update when we are actually running the user-level script we
+    # would overwrite. If the hook is ever invoked from a managed/alternate path
+    # (MDM-managed location, symlink), SELF_SCRIPT_PATH is not the executing file
+    # and updating it would only write a dead copy. Matches the guard the other
+    # tools' hooks use.
+    try:
+        running = os.path.normcase(str(Path(__file__).resolve()))
+        target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
+    except Exception as e:
+        log_error(f"self_update skipped: could not resolve script path: {e}", 'self_update')
+        return
+    if running != target:
         return
     # refresh hook from main, throttled per interval
     try:
@@ -1277,7 +1678,7 @@ def main():
             print("{}")
             return
 
-        event_name = event.get('hook_event_name')
+        event_name = event.get('hook_event_name') or event.get('hookEventName')
 
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
@@ -1287,7 +1688,7 @@ def main():
             print("{}")
             return
 
-        if event_name == 'PreToolUse':
+        if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
             return

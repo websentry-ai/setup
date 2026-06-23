@@ -308,26 +308,40 @@ def send_to_hook_api(request_body, api_key):
     if not api_key:
         return {}
 
-    try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
-        data = json.dumps(request_body)
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
+    data = json.dumps(request_body)
 
-        result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True,
-            timeout=20
-        )
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=data.encode(),
+                capture_output=True,
+                timeout=20
+            )
 
-        if result.returncode == 0 and result.stdout:
-            return json.loads(result.stdout.decode('utf-8'))
-        return {}
-    except Exception as e:
-        log_error(f"Hook API error: {str(e)}", 'api_call')
-        return {}
+            # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
+            # server accepted the request. Do NOT retry on success — a retry
+            # would re-deliver the same pre-tool event (duplicate). Parse the
+            # body if present, otherwise return {} (an empty 2xx is still a
+            # successful, non-blocking allow).
+            if result.returncode == 0:
+                if result.stdout:
+                    try:
+                        return json.loads(result.stdout.decode('utf-8'))
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        return {}
+                return {}
+        except Exception as e:
+            log_error(f"Hook API error: {str(e)}", 'api_call')
+
+        if attempt < 2:
+            time.sleep(0.5)
+
+    return {}
 
 
 _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
@@ -396,25 +410,30 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
 
     while time.monotonic() < deadline:
         time.sleep(_next_poll_interval(time.monotonic() - start))
-        try:
-            result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
-                 "-H", f"Authorization: Bearer {api_key}",
-                 "-H", "Content-Type: application/json",
-                 "--data-binary", "@-", url],
-                input=body.encode(),
-                capture_output=True,
-                timeout=10
-            )
-            if result.returncode == 0 and result.stdout:
-                resp = json.loads(result.stdout.decode('utf-8'))
-                decision = resp.get('decision', 'pending')
-                if decision == 'allow':
-                    return 'approved'
-                if decision == 'deny':
-                    return 'deny'
-        except Exception as e:
-            log_error(f"Approval poll error: {str(e)}", 'api_call')
+        for attempt in range(3):
+            try:
+                result = subprocess.run(
+                    ["curl", "-fsSL", "-X", "POST",
+                     "-H", f"Authorization: Bearer {api_key}",
+                     "-H", "Content-Type: application/json",
+                     "--data-binary", "@-", url],
+                    input=body.encode(),
+                    capture_output=True,
+                    timeout=10
+                )
+                if result.returncode == 0 and result.stdout:
+                    resp = json.loads(result.stdout.decode('utf-8'))
+                    decision = resp.get('decision', 'pending')
+                    if decision == 'allow':
+                        return 'approved'
+                    if decision == 'deny':
+                        return 'deny'
+                    break
+            except Exception as e:
+                log_error(f"Approval poll error: {str(e)}", 'api_call')
+
+            if attempt < 2:
+                time.sleep(0.5)
 
     return 'timeout'
 
@@ -1064,28 +1083,32 @@ def send_to_api(exchange, api_key):
         log_error("No API key present in send_to_api function", 'config')
         return False
     
-    try:
-        url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/cursor"
-        data = json.dumps(exchange)
-        
-        result = subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
-             "-H", "Content-Type: application/json",
-             "--data-binary", "@-", url],
-            input=data.encode(),
-            capture_output=True,
-            timeout=10
-        )
-        
-        if result.returncode != 0:
+    url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/cursor"
+    data = json.dumps(exchange)
+
+    for attempt in range(3):
+        try:
+            result = subprocess.run(
+                ["curl", "-fsSL", "-X", "POST",
+                 "-H", f"Authorization: Bearer {api_key}",
+                 "-H", "Content-Type: application/json",
+                 "--data-binary", "@-", url],
+                input=data.encode(),
+                capture_output=True,
+                timeout=10
+            )
+
+            if result.returncode == 0:
+                return True
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
             log_error(f"API request failed: {error_msg}", 'api_call')
-            return False
-        return True
-    except Exception as e:
-        log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
-        return False
+        except Exception as e:
+            log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
+
+        if attempt < 2:
+            time.sleep(0.5)
+
+    return False
 
 
 def cleanup_interrupted_requests(logs, current_conversation_id, current_generation_id):
