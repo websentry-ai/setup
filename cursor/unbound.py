@@ -1736,7 +1736,7 @@ def main():
         # Log errors but still output {} to not break Cursor
         log_error(f"Exception in main: {str(e)}", 'general')
         print("{}", file=sys.stderr)
-        print(f"Error: {redact_secrets(str(e))}", file=sys.stderr)
+        print(f"Error: {redact_secrets(str(e), _cached_api_key)}", file=sys.stderr)
         print("{}")
 
 
