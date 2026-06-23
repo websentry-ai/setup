@@ -711,10 +711,9 @@ def _select_plugin_version_dir(plugin_dir: Path) -> Optional[Path]:
     version_dirs = [d for d in plugin_dir.iterdir() if d.is_dir()]
     if not version_dirs:
         return None
-    for d in version_dirs:
-        if (d / ".in_use").exists():
-            return d
-    return max(version_dirs, key=lambda d: d.stat().st_mtime)
+    in_use = [d for d in version_dirs if (d / ".in_use").exists()]
+    candidates = in_use or version_dirs
+    return max(candidates, key=lambda d: (d.stat().st_mtime, d.name))
 
 
 def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:

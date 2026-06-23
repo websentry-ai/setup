@@ -73,6 +73,24 @@ class TestResolvePluginMcpConfig(unittest.TestCase):
         cfg = unbound._resolve_plugin_mcp_config("plugin_vercel_vercel", cache_dir=self.cache)
         self.assertEqual(cfg, {"url": "https://mcp.vercel.com"})
 
+    def test_multiple_in_use_picks_newest_deterministically(self):
+        import os
+        _make_plugin(
+            self.cache, "mkt", "demo", "1.0.0",
+            {".mcp.json": {"mcpServers": {"demo": {"url": "https://old.example/mcp", "type": "http"}}}},
+            in_use=True,
+        )
+        _make_plugin(
+            self.cache, "mkt", "demo", "2.0.0",
+            {".mcp.json": {"mcpServers": {"demo": {"url": "https://new.example/mcp", "type": "http"}}}},
+            in_use=True,
+        )
+        base = self.cache / "mkt" / "demo"
+        os.utime(base / "1.0.0", (1000, 1000))
+        os.utime(base / "2.0.0", (2000, 2000))
+        cfg = unbound._resolve_plugin_mcp_config("plugin_demo_demo", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://new.example/mcp", "type": "http"})
+
     def test_string_form_within_version_dir_hit(self):
         # A relative path that stays inside the version dir resolves normally.
         _make_plugin(
