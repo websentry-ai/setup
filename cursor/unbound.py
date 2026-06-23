@@ -982,6 +982,8 @@ def build_llm_exchange(events, api_key=None):
     conversation_id = None
     model = None
     user_email = None
+    request_initialized = None
+    request_completed = None
 
     for log_entry in events:
         event = log_entry.get('event', {})
@@ -995,10 +997,14 @@ def build_llm_exchange(events, api_key=None):
 
         if not user_email:
             user_email = event.get('user_email')
-        
+
         if hook_event_name == 'beforeSubmitPrompt':
             user_prompt = event.get('prompt')
-        
+            request_initialized = log_entry.get('timestamp')
+
+        elif hook_event_name == 'stop':
+            request_completed = log_entry.get('timestamp')
+
         elif hook_event_name == 'beforeReadFile':
             assistant_tool_uses.append({
                 'type': hook_event_name,
@@ -1069,6 +1075,12 @@ def build_llm_exchange(events, api_key=None):
         'messages': messages,
         'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
+
+    # Omit when unknown; gateway falls back
+    if request_initialized:
+        exchange['requestInitialized'] = request_initialized
+    if request_completed:
+        exchange['requestCompleted'] = request_completed
 
     return exchange
 
