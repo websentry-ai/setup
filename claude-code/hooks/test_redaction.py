@@ -25,6 +25,11 @@ class TestRedactSecrets(unittest.TestCase):
         self.assertEqual(redact_secrets("hello world", key=""), "hello world")
         self.assertEqual(redact_secrets("hello world", key=None), "hello world")
 
+    def test_bare_literal_not_scrubbed_without_key(self):
+        key = "sk-ant-fakekey1234567890"
+        out = redact_secrets(f"connect failed with {key} oops")
+        self.assertIn(key, out)
+
     def test_case_insensitive_bearer(self):
         out = redact_secrets("auth: bearer sk-ant-fakekey1234567890")
         self.assertNotIn("sk-ant-fakekey1234567890", out)
