@@ -92,8 +92,12 @@ def test_setup_full_run_configures_everything(env):
 
     # codex hooks.json — codex 0.125 discovers hooks from ~/.codex/hooks.json
     # (the user layer), so every event registers the BARE wrapper PATH (no
-    # quotes, no " hook codex" args), and a sh wrapper that execs the binary
-    # lives at ~/.codex/hooks/unbound.py.
+    # quotes, no " hook codex" args leaking into the registered command), and a
+    # python shim that execs the binary lives at ~/.codex/hooks/unbound.py.
+    # Codex runs that file as a PYTHON program (its native hook contract — the
+    # python-era file is `#!/usr/bin/env python3`), so a `#!/bin/sh` wrapper at
+    # a `.py` path is invalid python and codex silently drops it (the bug this
+    # replaces).
     codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
     codex_cmd = str(codex_wrapper)
     codex = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
@@ -105,10 +109,13 @@ def test_setup_full_run_configures_everything(env):
     for ev in codex["hooks"]:
         c = codex["hooks"][ev][0]["hooks"][0]["command"]
         assert c == codex_cmd and " hook codex" not in c
-    # the wrapper is a real executable that execs the binary — no python needed
+    # the wrapper is an executable python shim that execs the binary
     assert codex_wrapper.exists() and (codex_wrapper.stat().st_mode & 0o111)
     body = codex_wrapper.read_text()
-    assert body.startswith("#!/bin/sh") and f'exec "{BIN}" hook codex' in body
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
+    compile(body, "unbound.py", "exec")  # must be valid python — codex runs it as one
+    assert "os.execv" in body and BIN in body and '"codex"' in body
     # the dead managed hooks.json location is NOT written
     assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
 
@@ -219,6 +226,49 @@ def test_setup_codex_user_hooks_idempotent(env):
         # exactly one item, one hook entry per event — no duplication
         assert len(second["hooks"][ev]) == 1
         assert len(second["hooks"][ev][0]["hooks"]) == 1
+
+
+def test_codex_wrapper_is_valid_python_execing_the_binary():
+    """WEB-4850 root-cause lock-in. Codex runs ~/.codex/hooks/unbound.py as a
+    PYTHON program (its native hook contract). The pre-fix binary installer wrote
+    a `#!/bin/sh` wrapper there — not valid python — so codex silently dropped it
+    (fail-open) and was ungoverned while the shell-executed tools worked. The
+    wrapper MUST be valid python that execs the binary with `hook codex`."""
+    body = setup_cmd._codex_wrapper_source()
+
+    # (a) valid python — the exact failure mode of the sh wrapper was a parse error
+    compile(body, "unbound.py", "exec")
+    # (c) NOT a /bin/sh script (the regression)
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
+    # (b) execs the binary with `hook codex` via os.execv (event read from stdin)
+    assert "os.execv" in body
+    assert BIN in body
+    assert '"hook"' in body and '"codex"' in body
+    # no stray shell-isms leaked from the old wrapper
+    assert "exec " not in body  # the sh builtin; os.execv is the python call
+
+
+def test_codex_wrapper_written_to_disk_is_valid_python(env):
+    """End-to-end: the file setup_cmd.run(...) actually writes at
+    ~/.codex/hooks/unbound.py is valid python execing the binary — not a sh
+    wrapper, executable, registered by bare path in hooks.json."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    body = wrapper.read_text()
+    compile(body, "unbound.py", "exec")
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
+    assert "os.execv" in body and BIN in body and '"codex"' in body
+    assert wrapper.stat().st_mode & 0o111  # executable
+
+    # the registered command is the bare wrapper path — no " hook codex" args
+    hooks = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
+    for ev in hooks["hooks"]:
+        cmd = hooks["hooks"][ev][0]["hooks"][0]["command"]
+        assert cmd == str(wrapper)
+        assert " hook codex" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -333,7 +383,9 @@ def test_sweep_runs_inside_setup(env):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
     codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
     assert codex_wrapper.exists()
-    assert 'exec "%s" hook codex' % BIN in codex_wrapper.read_text()
+    wrapper_body = codex_wrapper.read_text()
+    compile(wrapper_body, "unbound.py", "exec")  # codex runs it as a python program
+    assert "os.execv" in wrapper_body and BIN in wrapper_body and '"codex"' in wrapper_body
     assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
     # python-era copilot registration replaced by a binary-era one, and the
     # now-unreferenced python script removed by the adapter (B2)
