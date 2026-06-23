@@ -1,7 +1,7 @@
 import json
 
 from unbound_hook import setup_cmd
-from unbound_hook._resources import HOOK_BINARY, hook_command_for_event
+from unbound_hook._resources import HOOK_BINARY
 
 
 def test_matcher_handles_quoted_bare_and_launcher_forms():
@@ -18,15 +18,16 @@ def test_matcher_handles_quoted_bare_and_launcher_forms():
 
 def test_merge_does_not_duplicate_quoted_entry(tmp_path):
     hooks_path = tmp_path / "hooks.json"
-    canonical = hook_command_for_event("codex", "PreToolUse")
-    config = setup_cmd._codex_hooks_config(canonical)
+    wrapper = tmp_path / ".codex" / "hooks" / "unbound.py"
+    hook_command = str(wrapper)
+    config = setup_cmd._codex_hooks_config(hook_command)
     for event, items in config.items():
         for item in items:
             for hook in item["hooks"]:
-                hook["command"] = f'"{HOOK_BINARY}" hook codex {event}'
+                hook["command"] = f'"{wrapper}"'
     hooks_path.write_text(json.dumps({"hooks": config}))
 
-    setup_cmd._merge_codex_hooks_json(hooks_path, canonical)
+    setup_cmd._merge_codex_hooks_json(hooks_path, hook_command)
 
     result = json.loads(hooks_path.read_text())
     for event, items in result["hooks"].items():

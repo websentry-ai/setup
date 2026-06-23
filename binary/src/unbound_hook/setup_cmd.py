@@ -167,9 +167,9 @@ def _claude_hooks_config():
 
 
 def _codex_hooks_config(hook_command):
-    # Codex execs the command as a single on-disk program (its python path
-    # registers a bare script, not a shell line), so every event shares one
-    # wrapper command; the event is read from stdin.
+    # Codex runs the command as a single on-disk python program (its python
+    # path registers a bare script, not a shell line), so every event shares
+    # one wrapper command; the event is read from stdin.
     cmd = lambda ev: hook_command
     return {
         "PreToolUse": [{"matcher": "*", "hooks": [
@@ -278,11 +278,16 @@ def _write_claude_managed_settings(m) -> bool:
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
     actually discovers them from), mirroring the python user-level
-    configure_codex_hooks exactly. Codex execs the hooks.json command as a
-    single on-disk program, so a tiny sh wrapper at ~/.codex/hooks/unbound.py
-    execs the binary (no python3 needed; the event is read from stdin) and the
-    registered command is that bare wrapper PATH. Privilege-dropped; merge is
-    idempotent (match-by-command) and preserves other tools' hooks."""
+    configure_codex_hooks exactly. Codex runs the registered ~/.codex/hooks/
+    unbound.py as a PYTHON program (its native hook contract — the real
+    python-era file is `#!/usr/bin/env python3`, and the python installer's
+    Windows branch invokes it as `py -3 "<path>"`). A `#!/bin/sh` wrapper at a
+    `.py` path is therefore NOT valid python and codex silently drops it (the
+    bug this replaces). So the wrapper is a tiny python shim that execs the
+    binary (the event is read from stdin) — valid whether codex honors the
+    shebang OR runs it through a python interpreter by extension. The registered
+    command is that bare wrapper PATH. Privilege-dropped; merge is idempotent
+    (match-by-command) and preserves other tools' hooks."""
     hooks_dir = home_dir / ".codex" / "hooks"
     wrapper = hooks_dir / "unbound.py"
     hooks_path = home_dir / ".codex" / "hooks.json"
@@ -293,7 +298,7 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(str(wrapper), flags, 0o755)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write('#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY)
+            f.write(_codex_wrapper_source())
         os.chmod(wrapper, 0o755)
         _merge_codex_hooks_json(hooks_path, hook_command)
         return True
@@ -322,6 +327,19 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
 
 
+def _codex_wrapper_source() -> str:
+    """Python shim written to ~/.codex/hooks/unbound.py. Must be valid python
+    (codex runs it as a python program) AND exec the binary with no python
+    dependency beyond the interpreter that launches it. os.execv replaces the
+    process so stdin/stdout/stderr (the hook payload + response) pass straight
+    through. repr() safely embeds the binary path as a python string literal."""
+    return (
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        'os.execv(%s, ["unbound-hook", "hook", "codex"])\n' % repr(str(HOOK_BINARY))
+    )
+
+
 def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
     """Idempotent merge of the codex hook events into hooks.json, mirroring the
     python configure_codex_hooks merge: re-runs don't duplicate our entry and
@@ -343,7 +361,7 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             for existing_item in existing_config:
                 if isinstance(existing_item, dict):
                     for hook in existing_item.get("hooks", []):
-                        if _command_targets_hook(hook.get("command", ""), HOOK_BINARY):
+                        if _command_targets_hook(hook.get("command", ""), Path(hook_command)):
                             our_hook_exists = True
                             break
             if not our_hook_exists:
