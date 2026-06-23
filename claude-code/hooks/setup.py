@@ -375,16 +375,22 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not command:
         return False
-    normalized_target = os.path.normcase(os.path.normpath(str(target)))
     try:
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
-        tokens = command.split()
-    for token in tokens:
-        candidate = token.strip().strip('"').strip("'")
-        if candidate and os.path.normcase(os.path.normpath(candidate)) == normalized_target:
-            return True
-    return normalized_target in os.path.normcase(command)
+        return False
+    tokens = [t.strip().strip('"').strip("'") for t in tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    if os.path.basename(tokens[0]).lower() in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
 
 
 def configure_claude_settings() -> bool:

@@ -387,6 +387,13 @@ class TestCommandTargetsHook(unittest.TestCase):
         self.assertFalse(self.match("/opt/other/hook.py", self.target))
         self.assertFalse(self.match('echo "hello world"', self.target))
 
+    def test_target_as_argument_does_not_match(self):
+        self.assertFalse(self.match(f'/opt/other/hook.py --config "{self.target}"', self.target))
+
+    def test_sibling_path_does_not_match(self):
+        self.assertFalse(self.match(f"{self.target}.backup", self.target))
+        self.assertFalse(self.match(f"/opt/mirror{self.target}", self.target))
+
     def test_empty_command_does_not_match(self):
         self.assertFalse(self.match("", self.target))
 
@@ -463,7 +470,7 @@ class TestRemoveHooksFromSettings(unittest.TestCase):
 
 
 class TestMatcherParityAcrossTrees(unittest.TestCase):
-    SENTINEL = "return normalized_target in os.path.normcase(command)"
+    SENTINEL = "return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target"
 
     def _extract(self, path):
         captured = []
