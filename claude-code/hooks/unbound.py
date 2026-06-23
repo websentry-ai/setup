@@ -24,6 +24,7 @@ ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
 CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
+CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -664,6 +665,112 @@ def _extract_mcp_server_fields(server: Dict) -> Optional[Dict]:
     return result if result else None
 
 
+def _mangle_mcp_token(s: Optional[str]) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]', '_', s or '')
+
+
+def _plugin_mcp_server_map(version_dir: Path) -> Dict:
+    servers = {}
+    sources = [version_dir / ".mcp.json", version_dir / ".claude-plugin" / "plugin.json"]
+    for source in sources:
+        if not source.is_file():
+            continue
+        with open(source, 'r', encoding='utf-8') as f:
+            data = json.loads(f.read())
+        if not isinstance(data, dict):
+            continue
+        mcp_servers = data.get('mcpServers')
+        if isinstance(mcp_servers, str):
+            # Contain the path to the version dir: reject absolute paths and
+            # ../ traversal (and symlink escapes via resolve()).
+            candidate = (version_dir / mcp_servers).resolve()
+            try:
+                candidate.relative_to(version_dir.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file():
+                with open(candidate, 'r', encoding='utf-8') as f:
+                    rel_data = json.loads(f.read())
+                if isinstance(rel_data, dict):
+                    mcp_servers = rel_data.get('mcpServers')
+        if isinstance(mcp_servers, dict):
+            for key, entry in mcp_servers.items():
+                servers.setdefault(key, entry)
+    return servers
+
+
+def _select_plugin_version_dir(plugin_dir: Path) -> Optional[Path]:
+    version_dirs = [d for d in plugin_dir.iterdir() if d.is_dir()]
+    if not version_dirs:
+        return None
+    for d in version_dirs:
+        if (d / ".in_use").exists():
+            return d
+    return max(version_dirs, key=lambda d: d.stat().st_mtime)
+
+
+def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:
+    if not server_name.startswith('plugin_'):
+        return None
+    try:
+        if not cache_dir.is_dir():
+            log_error(f"mcp plugin resolve miss: {server_name}", 'mcp_plugin')
+            return None
+        matches = []
+        for marketplace in cache_dir.iterdir():
+            if not marketplace.is_dir():
+                continue
+            for plugin_dir in marketplace.iterdir():
+                if not plugin_dir.is_dir():
+                    continue
+                version_dir = _select_plugin_version_dir(plugin_dir)
+                if version_dir is None:
+                    continue
+                server_map = _plugin_mcp_server_map(version_dir)
+                for server_key, entry in server_map.items():
+                    candidate = "plugin_%s_%s" % (
+                        _mangle_mcp_token(plugin_dir.name),
+                        _mangle_mcp_token(server_key),
+                    )
+                    if candidate == server_name:
+                        fields = _extract_mcp_server_fields(entry)
+                        if fields is not None:
+                            matches.append(fields)
+        distinct = []
+        for cfg in matches:
+            if cfg not in distinct:
+                distinct.append(cfg)
+        if len(distinct) == 1:
+            return distinct[0]
+        if not distinct:
+            log_error(f"mcp plugin resolve miss: {server_name}", 'mcp_plugin')
+            return None
+        log_error(f"mcp plugin resolve ambiguous: {server_name}", 'mcp_plugin')
+        return None
+    except Exception:
+        return None
+
+
+def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH) -> Optional[tuple]:
+    if not server_name.startswith('claude_ai_'):
+        return None
+    try:
+        if not config_path.exists():
+            log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.loads(f.read())
+        ever_connected = config.get('claudeAiMcpEverConnected', [])
+        if isinstance(ever_connected, list):
+            for display in ever_connected:
+                if isinstance(display, str) and _mangle_mcp_token(display) == server_name:
+                    return (display, {"additional_data": {"scope": "claudeai"}})
+        log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
+        return None
+    except Exception:
+        return None
+
+
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
     try:
         if not config_path.exists():
@@ -907,6 +1014,17 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             )
             if server_cfg:
                 metadata['mcp_server_config'] = server_cfg
+
+            if not server_cfg:
+                connector = _resolve_claude_ai_connector(mcp_server_name)
+                if connector:
+                    display_name, connector_cfg = connector
+                    metadata['mcp_server'] = display_name
+                    metadata['mcp_server_config'] = connector_cfg
+                else:
+                    plugin_cfg = _resolve_plugin_mcp_config(mcp_server_name)
+                    if plugin_cfg:
+                        metadata['mcp_server_config'] = plugin_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
