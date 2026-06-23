@@ -216,6 +216,20 @@ def log_error(message, category='general'):
     report_error_to_gateway(message, category, _cached_api_key)
 
 
+def _emit(text):
+    """Write a hook response line to stdout, treating a closed reader pipe as
+    a benign no-op. The host may close the read end (timeout, cancel, session
+    end, blocked approval-poll) before we flush — that is not a hook error."""
+    try:
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
+
+
 def _read_policy_cache_raw():
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
     try:
@@ -1695,13 +1709,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print("{}")
+            _emit("{}")
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print("{}")
+            _emit("{}")
             return
 
         event_name = event.get('hook_event_name') or event.get('hookEventName')
@@ -1711,12 +1725,12 @@ def main():
         if event_name == 'SessionStart':
             _check_self_update()
             _dispatch_discovery()
-            print("{}")
+            _emit("{}")
             return
 
         if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             return
 
         if event_name == 'UserPromptSubmit':
@@ -1726,7 +1740,7 @@ def main():
                     'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
                     'event': event,
                 })
-                print(json.dumps(response), flush=True)
+                _emit(json.dumps(response))
                 return
 
         # Create log entry with timestamp; the event already carries hook_event_name
@@ -1753,12 +1767,19 @@ def main():
             cleanup_old_logs()
 
         # Output required by Copilot hooks
-        print("{}")
+        _emit("{}")
 
+    except BrokenPipeError:
+        # Host closed the read end of our stdout pipe (timeout / cancel /
+        # session end / blocked approval-poll). Benign — do not self-report.
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
     except Exception as e:
         # Log errors but still output {} to not break Copilot
         log_error(f"Exception in main: {str(e)}", 'general')
-        print("{}")
+        _emit("{}")
 
 
 if __name__ == '__main__':
