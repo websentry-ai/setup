@@ -209,6 +209,21 @@ class TestResolvePluginMcpConfig(unittest.TestCase):
         self.assertIsNone(
             unbound._resolve_plugin_mcp_config("plugin_other_other", cache_dir=self.cache))
 
+    def test_corrupt_sibling_plugin_does_not_abort_scan(self):
+        # A plugin with a corrupt .mcp.json must not deny every plugin call:
+        # the valid sibling still resolves, and the corrupt plugin's own name
+        # misses (returns None) without raising.
+        corrupt_dir = _make_plugin(self.cache, "mkt", "broken", "1.0.0", {})
+        (corrupt_dir / ".mcp.json").write_text("{ broken")
+        _make_plugin(
+            self.cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://mcp.slack.com/mcp", "type": "http"})
+        self.assertIsNone(
+            unbound._resolve_plugin_mcp_config("plugin_broken_broken", cache_dir=self.cache))
+
 
 class TestResolveClaudeAiConnector(unittest.TestCase):
     def setUp(self):
@@ -255,6 +270,20 @@ class TestResolveClaudeAiConnector(unittest.TestCase):
         })
         result = unbound._resolve_claude_ai_connector("claude_ai_Slack", config_path=self.cfg_path)
         self.assertEqual(result[1], {"additional_data": {"scope": "claudeai"}})
+
+    def test_ambiguous_distinct_displays_returns_none(self):
+        # Two distinct display names mangle to the same server_name -> fail-secure
+        # (no guessing which dotted identity to inject).
+        _write_json(self.cfg_path, {
+            "claudeAiMcpEverConnected": ["claude.ai monday.com", "claude.ai monday_com"]})
+        self.assertIsNone(
+            unbound._resolve_claude_ai_connector("claude_ai_monday_com", config_path=self.cfg_path))
+
+    def test_single_match_resolves(self):
+        # Control: a single matching display resolves to its dotted identity.
+        _write_json(self.cfg_path, {"claudeAiMcpEverConnected": ["claude.ai monday.com"]})
+        result = unbound._resolve_claude_ai_connector("claude_ai_monday_com", config_path=self.cfg_path)
+        self.assertEqual(result, ("claude.ai monday.com", {"additional_data": {"scope": "claudeai"}}))
 
 
 class ProcessPreToolUseBase(unittest.TestCase):

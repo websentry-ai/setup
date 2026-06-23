@@ -675,8 +675,12 @@ def _plugin_mcp_server_map(version_dir: Path) -> Dict:
     for source in sources:
         if not source.is_file():
             continue
-        with open(source, 'r', encoding='utf-8') as f:
-            data = json.loads(f.read())
+        try:
+            with open(source, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read())
+        except Exception as exc:
+            log_error(f"mcp plugin source unreadable: {source}: {exc}", 'mcp_plugin')
+            continue
         if not isinstance(data, dict):
             continue
         mcp_servers = data.get('mcpServers')
@@ -689,8 +693,12 @@ def _plugin_mcp_server_map(version_dir: Path) -> Dict:
             except ValueError:
                 continue
             if candidate.is_file():
-                with open(candidate, 'r', encoding='utf-8') as f:
-                    rel_data = json.loads(f.read())
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        rel_data = json.loads(f.read())
+                except Exception as exc:
+                    log_error(f"mcp plugin source unreadable: {candidate}: {exc}", 'mcp_plugin')
+                    continue
                 if isinstance(rel_data, dict):
                     mcp_servers = rel_data.get('mcpServers')
         if isinstance(mcp_servers, dict):
@@ -723,19 +731,23 @@ def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN
             for plugin_dir in marketplace.iterdir():
                 if not plugin_dir.is_dir():
                     continue
-                version_dir = _select_plugin_version_dir(plugin_dir)
-                if version_dir is None:
+                try:
+                    version_dir = _select_plugin_version_dir(plugin_dir)
+                    if version_dir is None:
+                        continue
+                    server_map = _plugin_mcp_server_map(version_dir)
+                    for server_key, entry in server_map.items():
+                        candidate = "plugin_%s_%s" % (
+                            _mangle_mcp_token(plugin_dir.name),
+                            _mangle_mcp_token(server_key),
+                        )
+                        if candidate == server_name:
+                            fields = _extract_mcp_server_fields(entry)
+                            if fields is not None:
+                                matches.append(fields)
+                except Exception as exc:
+                    log_error(f"mcp plugin dir error: {plugin_dir.name}: {exc}", 'mcp_plugin')
                     continue
-                server_map = _plugin_mcp_server_map(version_dir)
-                for server_key, entry in server_map.items():
-                    candidate = "plugin_%s_%s" % (
-                        _mangle_mcp_token(plugin_dir.name),
-                        _mangle_mcp_token(server_key),
-                    )
-                    if candidate == server_name:
-                        fields = _extract_mcp_server_fields(entry)
-                        if fields is not None:
-                            matches.append(fields)
         distinct = []
         for cfg in matches:
             if cfg not in distinct:
@@ -747,7 +759,8 @@ def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN
             return None
         log_error(f"mcp plugin resolve ambiguous: {server_name}", 'mcp_plugin')
         return None
-    except Exception:
+    except Exception as exc:
+        log_error(f"mcp plugin resolve error: {server_name}: {exc}", 'mcp_plugin')
         return None
 
 
@@ -761,13 +774,21 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
         with open(config_path, 'r', encoding='utf-8') as f:
             config = json.loads(f.read())
         ever_connected = config.get('claudeAiMcpEverConnected', [])
+        distinct = []
         if isinstance(ever_connected, list):
             for display in ever_connected:
                 if isinstance(display, str) and _mangle_mcp_token(display) == server_name:
-                    return (display, {"additional_data": {"scope": "claudeai"}})
-        log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
+                    if display not in distinct:
+                        distinct.append(display)
+        if len(distinct) == 1:
+            return (distinct[0], {"additional_data": {"scope": "claudeai"}})
+        if not distinct:
+            log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
+            return None
+        log_error(f"mcp connector resolve ambiguous: {server_name}", 'mcp_connector')
         return None
-    except Exception:
+    except Exception as exc:
+        log_error(f"mcp connector resolve error: {server_name}: {exc}", 'mcp_connector')
         return None
 
 
