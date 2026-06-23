@@ -238,13 +238,13 @@ def test_codex_wrapper_is_valid_python_execing_the_binary():
 
     # (a) valid python — the exact failure mode of the sh wrapper was a parse error
     compile(body, "unbound.py", "exec")
-    # (c) NOT a /bin/sh script (the regression)
-    assert body.startswith("#!/usr/bin/env python3")
-    assert not body.startswith("#!/bin/sh")
     # (b) execs the binary with `hook codex` via os.execv (event read from stdin)
     assert "os.execv" in body
     assert BIN in body
     assert '"hook"' in body and '"codex"' in body
+    # (c) NOT a /bin/sh script (the regression)
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
     # no stray shell-isms leaked from the old wrapper
     assert "exec " not in body  # the sh builtin; os.execv is the python call
 
