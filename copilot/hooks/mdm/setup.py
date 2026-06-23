@@ -1389,7 +1389,8 @@ def main():
     print("Setup Complete!" if success else "Setup Failed")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
+    if success:
+        notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, user_homes)
