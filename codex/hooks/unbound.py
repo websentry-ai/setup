@@ -790,6 +790,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = event.get('tool_use_id')
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -1032,7 +1036,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
-                'tool_response': tool_response
+                'tool_response': tool_response,
+                'tool_use_id': call_id
             })
 
     except Exception:

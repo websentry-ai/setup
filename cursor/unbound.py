@@ -696,6 +696,10 @@ def process_pre_tool_use(event, api_key):
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = event.get('tool_use_id')
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -1011,7 +1015,8 @@ def build_llm_exchange(events, api_key=None):
                 'tool_name': tool_name,
                 'tool_input': event.get('tool_input'),
                 'tool_output': tool_output,
-                'duration': event.get('duration')
+                'duration': event.get('duration'),
+                'tool_use_id': event.get('tool_use_id')
             })
         
         elif hook_event_name == 'afterFileEdit':
