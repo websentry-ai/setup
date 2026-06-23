@@ -3,6 +3,7 @@
 import sys
 import json
 import os
+import glob
 import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
@@ -415,6 +416,21 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                             'content': text_content,
                                             'timestamp': entry_timestamp
                                         })
+                                # Skill/agent invocations (transcript is the reliable source, not PostToolUse).
+                                elif (isinstance(content_item, dict)
+                                        and content_item.get('type') == 'tool_use'
+                                        and content_item.get('name') in ('Skill', 'Task', 'Agent')
+                                        and content_item.get('id')):  # need an id to dedup
+                                    conversation_data['tool_uses'].append({
+                                        'type': 'PostToolUse',
+                                        'tool_name': content_item.get('name'),
+                                        'tool_input': content_item.get('input', {}),
+                                        'tool_response': {},
+                                        'timestamp': entry_timestamp,
+                                        'tool_use_id': content_item.get('id'),
+                                        'cwd': entry.get('cwd'),
+                                        'git_branch': entry.get('gitBranch'),
+                                    })
 
                             # Model is captured unconditionally so it survives even on usage-less assistant entries.
                             turn_model = turn_model or message.get('model')
@@ -1006,7 +1022,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, transcript_tool_uses: Optional[List[Dict]] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
@@ -1028,23 +1044,57 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             prompt = event.get('prompt')
             if prompt:
                 user_prompt = prompt
-        
+
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
+            # Skills/agents come from the transcript (stable id); skip the id-less PostToolUse duplicate.
+            if tool_name in ('Skill', 'Task', 'Agent'):
+                continue
             tool_input = event.get('tool_input', {})
             tool_response = event.get('tool_response', {})
-            
+
             if 'content' in tool_response and 'content' in tool_input:
                 if tool_response['content'] == tool_input['content']:
                     tool_response = {k: v for k, v in tool_response.items() if k != 'content'}
-            
+
             assistant_tool_uses.append({
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response
             })
-    
+
+    # Transcript-sourced skill/agent invocations: tag trigger (user vs agent) + is_subagent.
+    for tu in (transcript_tool_uses or []):
+        if tu.get('is_subagent'):
+            trigger = 'agent'
+        else:
+            skill_name = (tu.get('tool_input') or {}).get('skill') or ''
+            up = (user_prompt or '').strip()
+            trigger = 'agent'
+            if skill_name and up.startswith('/'):
+                typed_cmd = up[1:].split(None, 1)[0]
+                # Match full or bare-vs-namespaced name (not a pure suffix match,
+                # so ns1:deploy vs ns2:deploy isn't mislabelled user-typed).
+                if typed_cmd and (
+                    typed_cmd == skill_name
+                    or typed_cmd.split(':')[-1] == skill_name
+                    or typed_cmd == skill_name.split(':')[-1]
+                ):
+                    trigger = 'user'
+        assistant_tool_uses.append({
+            'type': tu.get('type', 'PostToolUse'),
+            'tool_name': tu.get('tool_name'),
+            'tool_input': tu.get('tool_input', {}),
+            'tool_response': tu.get('tool_response', {}),
+            'tool_use_id': tu.get('tool_use_id'),
+            'timestamp': tu.get('timestamp'),
+            'cwd': tu.get('cwd'),
+            'git_branch': tu.get('git_branch'),
+            'trigger': trigger,
+            'is_subagent': bool(tu.get('is_subagent')),
+        })
+
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
@@ -1150,6 +1200,59 @@ def cleanup_old_logs():
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
+def collect_subagent_skill_tool_uses(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> List[Dict]:
+    """Collect Skill/agent tool_use blocks from subagent transcripts.
+
+    Subagents write to <session>/subagents/agent-*.jsonl (separate from the parent
+    transcript), so their skills/agents are missed otherwise. Flagged is_subagent.
+    """
+    tool_uses: List[Dict] = []
+    try:
+        if not transcript_path or not transcript_path.endswith('.jsonl'):
+            return tool_uses
+        subagents_dir = os.path.join(transcript_path[:-len('.jsonl')], 'subagents')
+        if not os.path.isdir(subagents_dir):
+            return tool_uses
+        for sub_file in glob.glob(os.path.join(subagents_dir, '*.jsonl')):
+            try:
+                with open(sub_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or ('"Skill"' not in line and '"Task"' not in line and '"Agent"' not in line):
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if entry.get('type') != 'assistant':
+                            continue
+                        entry_timestamp = entry.get('timestamp')
+                        if user_prompt_timestamp and entry_timestamp and entry_timestamp <= user_prompt_timestamp:
+                            continue
+                        message = entry.get('message', {})
+                        for content_item in message.get('content', []) or []:
+                            if (isinstance(content_item, dict)
+                                    and content_item.get('type') == 'tool_use'
+                                    and content_item.get('name') in ('Skill', 'Task', 'Agent')
+                                    and content_item.get('id')):  # need an id to dedup
+                                tool_uses.append({
+                                    'type': 'PostToolUse',
+                                    'tool_name': content_item.get('name'),
+                                    'tool_input': content_item.get('input', {}),
+                                    'tool_response': {},
+                                    'timestamp': entry_timestamp,
+                                    'tool_use_id': content_item.get('id'),
+                                    'cwd': entry.get('cwd'),
+                                    'git_branch': entry.get('gitBranch'),
+                                    'is_subagent': True,
+                                })
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return tool_uses
+
+
 def process_stop_event(event: Dict, api_key: str):
     session_id = event.get('session_id')
     transcript_path = event.get('transcript_path')
@@ -1177,6 +1280,7 @@ def process_stop_event(event: Dict, api_key: str):
     transcript_assistant_messages = []
     transcript_usage = None
     transcript_model = None
+    transcript_tool_uses = []
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
         transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
         transcript_assistant_messages = [
@@ -1185,6 +1289,11 @@ def process_stop_event(event: Dict, api_key: str):
         ]
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
+        transcript_tool_uses = list(transcript_data.get('tool_uses', []))
+        # Subagents write to separate transcripts the parent Stop never reads — sweep them too.
+        transcript_tool_uses.extend(
+            collect_subagent_skill_tool_uses(transcript_path, user_prompt_timestamp)
+        )
 
     # Prefer the dominant model from the transcript (covers sub-agent turns where
     # the cached session model is wrong). Fall back to the audit log otherwise.
@@ -1196,6 +1305,7 @@ def process_stop_event(event: Dict, api_key: str):
         transcript_assistant_messages=transcript_assistant_messages,
         model=session_model,
         usage=transcript_usage,
+        transcript_tool_uses=transcript_tool_uses,
     )
 
     if exchange:
