@@ -548,8 +548,7 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
     Codex PreToolUse hooks:
     - allow: return empty {}
     - deny: return hookSpecificOutput with permissionDecision:deny
-    - ask: return hookSpecificOutput with permissionDecision:deny + reason
-           (ask is parsed but not yet supported by Codex, so we deny with reason)
+    - ask: return hookSpecificOutput with permissionDecision:ask + reason
     """
     if not api_response:
         return {}
@@ -563,7 +562,7 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
 
     hook_output = {
         'hookEventName': 'PreToolUse',
-        'permissionDecision': 'deny',
+        'permissionDecision': decision,
         'permissionDecisionReason': reason,
     }
     if additional_context:
