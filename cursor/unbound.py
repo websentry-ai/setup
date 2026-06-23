@@ -1038,12 +1038,28 @@ def build_llm_exchange(events, api_key=None):
         
         elif hook_event_name == 'afterAgentResponse':
             assistant_response = event.get('text')
-    
+
+        elif hook_event_name == 'subagentStop':
+            assistant_tool_uses.append({
+                'type': 'subagentStop',
+                'tool_name': 'Task',
+                'tool_input': {
+                    'subagent_type': event.get('subagent_type'),
+                    'task': event.get('task'),
+                },
+                'tool_response': {
+                    'status': event.get('status'),
+                    'summary': event.get('summary'),
+                    'duration_ms': event.get('duration_ms'),
+                    'tool_call_count': event.get('tool_call_count'),
+                },
+            })
+
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
-    
-    if assistant_response:
-        assistant_msg = {'role': 'assistant', 'content': assistant_response}
+
+    if assistant_response or assistant_tool_uses:
+        assistant_msg = {'role': 'assistant', 'content': assistant_response or ''}
         if assistant_tool_uses:
             assistant_msg['tool_use'] = assistant_tool_uses
         messages.append(assistant_msg)
@@ -1196,7 +1212,16 @@ def process_stop_event(generation_id, api_key=None):
             )
             
             if has_stop:
-                exchange = build_llm_exchange(events, api_key)
+                turn_start = min((l.get('timestamp', '') for l in events), default='')
+                subagent_events = [
+                    log
+                    for gen_events in generations.values()
+                    for log in gen_events
+                    if log.get('event', {}).get('hook_event_name')
+                    in ('subagentStart', 'subagentStop')
+                    and (not turn_start or log.get('timestamp', '') >= turn_start)
+                ]
+                exchange = build_llm_exchange(events + subagent_events, api_key)
                 if exchange:
                     send_to_api(exchange, api_key)
                 break

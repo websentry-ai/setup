@@ -54,6 +54,16 @@
         "command": "./hooks/unbound.py"
       }
     ],
+    "subagentStart": [
+      {
+        "command": "./hooks/unbound.py"
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "./hooks/unbound.py"
+      }
+    ],
     "stop": [
       {
         "command": "./hooks/unbound.py"
