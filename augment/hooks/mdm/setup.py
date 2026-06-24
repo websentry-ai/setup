@@ -9,6 +9,7 @@ import platform
 import subprocess
 import json
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 try:
@@ -522,9 +523,12 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
 
 
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
-    params = f"serial_number={device_id}&app_type=augment"
+    # URL-encode params: device_id (a serial number) and app_name can contain
+    # '&', ' ', '=', etc., which would otherwise inject/truncate query params.
+    query = [("serial_number", device_id), ("app_type", "augment")]
     if app_name:
-        params = f"app_name={app_name}&{params}"
+        query.insert(0, ("app_name", app_name))
+    params = urllib.parse.urlencode(query)
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
 
     debug_print(f"Fetching API key from: {url}")
@@ -997,6 +1001,33 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         return False
 
 
+def verify_managed_hooks_installed() -> bool:
+    """True only if the managed hooks are actually present on disk: the managed
+    script /etc/augment/hooks/unbound.py exists AND our hook command (which
+    embeds that script path) appears in /etc/augment/settings.json's hooks.
+
+    Gate for the install ordering: user-level hooks must not be stripped until
+    managed hooks are confirmed in place, otherwise a silent managed-write failure
+    leaves the user with NO functional hooks. Returns False (do not strip) on any
+    read/parse error."""
+    try:
+        managed_dir = get_managed_settings_dir()
+        script_path = managed_dir / "hooks" / "unbound.py"
+        settings_path = managed_dir / "settings.json"
+        if not script_path.exists() or not settings_path.exists():
+            return False
+        with open(settings_path, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+        hooks_block = settings.get("hooks") if isinstance(settings, dict) else None
+        if not isinstance(hooks_block, dict):
+            return False
+        # Our managed hook command always embeds the managed script path.
+        return str(script_path) in json.dumps(hooks_block)
+    except Exception as e:
+        debug_print(f"verify_managed_hooks_installed failed: {e}")
+        return False
+
+
 def clear_managed_hooks() -> str:
     """Strip ONLY our hook entries and toolPermissions rules from the managed
     Augment config, preserving foreign content.
@@ -1315,11 +1346,38 @@ def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, s
     return headers
 
 
+# Header names whose values are secrets and must be kept OFF the curl argv
+# (/proc/<pid>/cmdline + `ps` are world-readable on a shared host). Lower-cased
+# for case-insensitive matching against caller-supplied header dicts.
+_BACKFILL_SECRET_HEADERS = frozenset({'authorization', 'x-api-key'})
+
+
 def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
     cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}",
            "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+    # Secret auth headers (Authorization/X-API-KEY) must not appear on the argv;
+    # write them to a 0600 temp file and pass via -H @<file>. Non-secret headers
+    # (UA, ops, Content-Type, presigned S3 PUT with no auth) stay inline.
+    secret_headers = []
     for header_name, header_value in headers.items():
-        cmd += ["-H", f"{header_name}: {header_value}"]
+        if header_name.lower() in _BACKFILL_SECRET_HEADERS:
+            secret_headers.append(f"{header_name}: {header_value}")
+        else:
+            cmd += ["-H", f"{header_name}: {header_value}"]
+    secret_hdr_path = None
+    if secret_headers:
+        fd, secret_hdr_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(secret_headers) + "\n")
+        except OSError as e:
+            try:
+                os.unlink(secret_hdr_path)
+            except OSError:
+                pass
+            debug_print(f"HTTP request failed: could not write auth header file: {e}")
+            return 0, b''
+        cmd += ["-H", f"@{secret_hdr_path}"]
     if body is not None:
         cmd += ["--data-binary", "@-"]
     cmd += ["--", url]
@@ -1328,6 +1386,12 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     except (subprocess.TimeoutExpired, OSError) as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    finally:
+        if secret_hdr_path is not None:
+            try:
+                os.unlink(secret_hdr_path)
+            except OSError:
+                pass
     if result.returncode != 0:
         debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
     out = result.stdout or b''
@@ -1609,21 +1673,32 @@ def main():
         return
     debug_print("UNBOUND_AUGMENT_API_KEY set successfully")
 
-    # Strip leftover user-level Unbound hooks (so managed hooks don't fire twice)
-    # and write unbound config per user.
-    for username, home_dir in get_all_user_homes():
-        remove_user_level_hooks_for_user(username, home_dir)
+    # Write the per-user unbound config now (needed by the managed hook; harmless
+    # before the managed write). User-level hook REMOVAL is deferred until the
+    # managed hooks are confirmed in place — see below.
+    user_homes = get_all_user_homes()
+    for username, home_dir in user_homes:
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
 
     state = detect_install_state()
 
     print("\nConfiguring Augment managed hooks...")
-    if setup_managed_hooks(gateway_url=gateway_url):
-        managed_dir = get_managed_settings_dir()
-        print(f"Created managed hooks in {managed_dir}")
-    else:
+    if not setup_managed_hooks(gateway_url=gateway_url):
         print("Failed to configure managed hooks")
         return
+    managed_dir = get_managed_settings_dir()
+    print(f"Created managed hooks in {managed_dir}")
+
+    # Only NOW strip leftover user-level Unbound hooks (so managed hooks don't
+    # fire twice). Verify the managed hooks are actually present first: if the
+    # managed write silently produced nothing usable, removing user-level hooks
+    # would leave the user with NO functional hooks. On failed verification, keep
+    # the user-level hooks so the user stays covered.
+    if verify_managed_hooks_installed():
+        for username, home_dir in user_homes:
+            remove_user_level_hooks_for_user(username, home_dir)
+    else:
+        print("Managed hooks could not be verified; leaving user-level hooks in place.")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")

@@ -821,23 +821,49 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
+def _managed_settings_has_our_hook(managed_dir: Path) -> bool:
+    """True if /etc/augment/settings.json contains a hook command pointing at OUR
+    managed script (managed_dir/hooks/unbound.py). Distinguishes an Unbound MDM
+    install from the org's OWN Augment managed config (a foreign settings.json
+    without our marker). Raises on read/parse failure so the caller fails closed."""
+    settings_path = managed_dir / "settings.json"
+    if not settings_path.exists():
+        return False
+    our_script = str(managed_dir / "hooks" / "unbound.py")
+    # Our managed hook command always embeds the managed script path (bare or
+    # launcher-wrapped). A substring check over the serialized hooks block is
+    # marker-specific and immune to the exact command form. Let exceptions
+    # (read/JSON errors) propagate so check_enterprise_hooks_conflict fails closed.
+    with open(settings_path, "r", encoding="utf-8") as f:
+        settings = json.load(f)
+    hooks_block = settings.get("hooks") if isinstance(settings, dict) else None
+    if not isinstance(hooks_block, dict):
+        return False
+    return our_script in json.dumps(hooks_block)
+
+
 def check_enterprise_hooks_conflict() -> bool:
     """True if an Unbound MDM (managed) setup already exists for Augment on this
     device. User-level setup must not run alongside it — the managed config
     already enforces Unbound for every user, so a second user-level install would
     make every hook fire twice. Read-only.
 
-    Fails CLOSED: on a stat/exception we cannot prove the box is unmanaged, so we
-    assume managed (return True). On a shared host a false 'unmanaged' would let
-    managed + user hooks both fire (double-deny / double-audit); the per-user
-    main() then raises SystemExit(3) and skips, which is the safe outcome."""
+    Detects OUR marker specifically: the managed hook script
+    /etc/augment/hooks/unbound.py exists, OR our hook command appears in
+    /etc/augment/settings.json's hooks. A FOREIGN /etc/augment/settings.json (the
+    org's own Augment managed config, without our marker) is NOT a conflict — the
+    user-level install must proceed there.
+
+    Fails CLOSED: on a stat/read/parse exception we cannot prove the box is
+    unmanaged, so we assume managed (return True). On a shared host a false
+    'unmanaged' would let managed + user hooks both fire (double-deny /
+    double-audit); the per-user main() then raises SystemExit(3) and skips, which
+    is the safe outcome."""
     try:
         managed_dir = get_managed_settings_dir()
-        markers = [
-            managed_dir / "hooks" / "unbound.py",
-            managed_dir / "settings.json",
-        ]
-        return any(marker.exists() for marker in markers)
+        if (managed_dir / "hooks" / "unbound.py").exists():
+            return True
+        return _managed_settings_has_our_hook(managed_dir)
     except Exception as e:
         print(f"Warning: could not check for an MDM install ({e!r}); assuming managed and skipping user-level setup.")
         return True
@@ -911,14 +937,41 @@ def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, s
     return headers
 
 
+# Header names whose values are secrets and must be kept OFF the curl argv
+# (/proc/<pid>/cmdline + `ps` are world-readable on a shared host). Lower-cased
+# for case-insensitive matching against caller-supplied header dicts.
+_BACKFILL_SECRET_HEADERS = frozenset({'authorization', 'x-api-key'})
+
+
 def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
     # curl subprocess, not urllib: the frozen binary ships no CA bundle, so
     # Python's ssl fails CERTIFICATE_VERIFY_FAILED; curl uses the system trust
     # store (the corporate-CA/Zscaler contract every other call here relies on).
     cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}",
            "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
+    # Secret auth headers (Authorization/X-API-KEY) must not appear on the argv;
+    # write them to a 0600 temp file and pass via -H @<file>. Non-secret headers
+    # (UA, ops, Content-Type, presigned S3 PUT with no auth) stay inline.
+    secret_headers = []
     for header_name, header_value in headers.items():
-        cmd += ["-H", f"{header_name}: {header_value}"]
+        if header_name.lower() in _BACKFILL_SECRET_HEADERS:
+            secret_headers.append(f"{header_name}: {header_value}")
+        else:
+            cmd += ["-H", f"{header_name}: {header_value}"]
+    secret_hdr_path = None
+    if secret_headers:
+        fd, secret_hdr_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(secret_headers) + "\n")
+        except OSError as e:
+            try:
+                os.unlink(secret_hdr_path)
+            except OSError:
+                pass
+            debug_print(f"HTTP request failed: could not write auth header file: {e}")
+            return 0, b''
+        cmd += ["-H", f"@{secret_hdr_path}"]
     if body is not None:
         cmd += ["--data-binary", "@-"]
     cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
@@ -927,6 +980,12 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     except (subprocess.TimeoutExpired, OSError) as e:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
+    finally:
+        if secret_hdr_path is not None:
+            try:
+                os.unlink(secret_hdr_path)
+            except OSError:
+                pass
     if result.returncode != 0:
         debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
     out = result.stdout or b''

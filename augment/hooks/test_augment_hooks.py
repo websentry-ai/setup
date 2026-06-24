@@ -665,6 +665,96 @@ class TestSetupAuthHeaderOffArgv(unittest.TestCase):
             lambda: mdm.fetch_api_key_from_mdm("https://b", None, self.SECRET, "dev-1"),
         )
 
+    def test_mdm_fetch_api_key_url_encodes_query_params(self):
+        """FIX C: device_id / app_name with reserved chars ('&', ' ', '=') must
+        be percent-encoded in the query string, never injected raw."""
+        mdm = _load_mdm()
+        captured = {"url": None}
+
+        def fake_run(cmd, **kw):
+            # The request URL is the curl arg immediately before the `-H @<file>`
+            # auth header that curl_with_auth appends last.
+            for i, a in enumerate(cmd):
+                if isinstance(a, str) and a.startswith("http"):
+                    captured["url"] = a
+
+            class R:
+                returncode = 0
+                stdout = "{}\n200"
+                stderr = ""
+            return R()
+
+        with patch.object(mdm.subprocess, "run", side_effect=fake_run):
+            mdm.fetch_api_key_from_mdm("https://b", "App & Co", self.SECRET, "dev=1 &2")
+
+        url = captured["url"]
+        self.assertIsNotNone(url, "curl was never invoked with a URL")
+        # Raw reserved chars from the inputs must NOT appear in the query.
+        query = url.split("?", 1)[1]
+        self.assertNotIn("dev=1 &2", query)
+        self.assertNotIn("App & Co", query)
+        # Properly encoded forms are present instead.
+        self.assertIn("serial_number=dev%3D1+%262", query)
+        self.assertIn("app_name=App+%26+Co", query)
+        self.assertIn("app_type=augment", query)
+
+    def test_setup_backfill_http_request_bearer_off_argv(self):
+        """FIX A: the backfill HTTP path (setup.py _backfill_http_request) must
+        route the Authorization: Bearer <key> header off-argv via the 0600 temp
+        header file — never on the curl argv."""
+        headers = {
+            'User-Agent': 'Unbound-Setup/test-backfill',
+            'X-Unbound-Operation': 'backfill',
+            'Authorization': f'Bearer {self.SECRET}',
+            'Content-Type': 'application/json',
+        }
+        self._assert_off_argv(
+            setup,
+            lambda: setup._backfill_http_request("https://b/upload-url/", "POST",
+                                                 headers, body=b"{}"),
+        )
+
+    def test_mdm_backfill_http_request_bearer_off_argv(self):
+        """FIX A: mdm/setup.py _backfill_http_request (the privileged backfill
+        path) must also keep the Bearer key off the curl argv."""
+        mdm = _load_mdm()
+        headers = {
+            'User-Agent': 'Unbound-Setup/test-backfill',
+            'X-Unbound-Operation': 'backfill',
+            'Authorization': f'Bearer {self.SECRET}',
+            'Content-Type': 'application/json',
+        }
+        self._assert_off_argv(
+            mdm,
+            lambda: mdm._backfill_http_request("https://b/upload-url/", "POST",
+                                               headers, body=b"{}"),
+        )
+
+    def test_backfill_s3_put_no_auth_header_file(self):
+        """FIX A (guardrail): a presigned S3 PUT carries NO auth header, so no
+        temp header file is created and no Authorization lands on the argv."""
+        captured = {"argv": None, "header_file_seen": False}
+
+        def fake_run(cmd, **kw):
+            captured["argv"] = list(cmd)
+            for i, a in enumerate(cmd):
+                if isinstance(a, str) and a.startswith("@") and i > 0 and cmd[i - 1] == "-H":
+                    captured["header_file_seen"] = True
+
+            class R:
+                returncode = 0
+                stdout = b""
+                stderr = b""
+            return R()
+
+        with patch.object(setup.subprocess, "run", side_effect=fake_run):
+            setup._backfill_http_request(
+                "https://s3.example.com/presigned", "PUT",
+                {'Content-Type': 'application/json'}, body=b"{}")
+        for a in captured["argv"]:
+            self.assertNotIn("Authorization", str(a))
+        self.assertFalse(captured["header_file_seen"])
+
 
 # --------------------------------------------------------------------------- #
 # MDM managed settings + per-user gating                                       #
@@ -887,6 +977,60 @@ class TestMdmRemoveUserLevelHooks(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# FIX D: MDM install ordering — never strip user-level hooks before managed    #
+# hooks are written AND verified present                                       #
+# --------------------------------------------------------------------------- #
+class TestMdmInstallOrdering(unittest.TestCase):
+    def setUp(self):
+        self.mdm = _load_mdm()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _run_main(self, managed_ok: bool, verify_ok: bool):
+        """Drive mdm.main() far enough to reach the install ordering, recording
+        whether remove_user_level_hooks_for_user is called. managed_ok controls
+        setup_managed_hooks; verify_ok controls verify_managed_hooks_installed."""
+        removed = []
+        with patch.object(self.mdm, "check_admin_privileges", return_value=True), \
+             patch.object(self.mdm.platform, "system", return_value="Linux"), \
+             patch("sys.argv", ["setup.py", "--api-key", "admin-key"]), \
+             patch.object(self.mdm, "get_device_identifier", return_value="dev-1"), \
+             patch.object(self.mdm, "fetch_api_key_from_mdm", return_value="app-key"), \
+             patch.object(self.mdm, "set_env_var_system_wide", return_value=(True, False)), \
+             patch.object(self.mdm, "get_all_user_homes", return_value=[("u", self.home)]), \
+             patch.object(self.mdm, "write_unbound_config_for_user"), \
+             patch.object(self.mdm, "detect_install_state", return_value="fresh"), \
+             patch.object(self.mdm, "notify_setup_complete"), \
+             patch.object(self.mdm, "setup_managed_hooks", return_value=managed_ok), \
+             patch.object(self.mdm, "verify_managed_hooks_installed", return_value=verify_ok), \
+             patch.object(self.mdm, "remove_user_level_hooks_for_user",
+                          side_effect=lambda u, h: removed.append(u)):
+            self.mdm.main()
+        return removed
+
+    def test_managed_write_failure_does_not_remove_user_hooks(self):
+        """FIX D: if the managed hook write FAILS, user-level hooks must NOT be
+        stripped — the user stays covered by their existing hooks."""
+        removed = self._run_main(managed_ok=False, verify_ok=False)
+        self.assertEqual(removed, [],
+                         "user-level hooks were stripped despite managed write failure")
+
+    def test_managed_verify_failure_does_not_remove_user_hooks(self):
+        """FIX D: even if setup_managed_hooks returns True, an unverifiable
+        managed install (verify False) must NOT strip user-level hooks."""
+        removed = self._run_main(managed_ok=True, verify_ok=False)
+        self.assertEqual(removed, [],
+                         "user-level hooks were stripped despite unverified managed install")
+
+    def test_managed_written_and_verified_strips_user_hooks(self):
+        """FIX D (happy path): managed hooks written AND verified present → only
+        THEN are user-level hooks removed."""
+        removed = self._run_main(managed_ok=True, verify_ok=True)
+        self.assertEqual(removed, ["u"])
+
+
+# --------------------------------------------------------------------------- #
 # user-level MDM conflict gate (SystemExit(3))                                 #
 # --------------------------------------------------------------------------- #
 class TestUserLevelMdmGate(_HomeTmp):
@@ -902,11 +1046,62 @@ class TestUserLevelMdmGate(_HomeTmp):
                 setup.main()
         self.assertEqual(cm.exception.code, 3)
 
-    def test_check_conflict_true_when_managed_settings_present(self):
+    def test_foreign_settings_without_our_marker_not_a_conflict(self):
+        """FIX B: a machine carrying the org's OWN Augment managed config
+        (a /etc/augment/settings.json that does NOT reference our unbound.py)
+        must NOT be treated as an Unbound MDM install — the user-level install
+        proceeds."""
+        managed = self.home / "etc-augment"
+        managed.mkdir(parents=True, exist_ok=True)
+        # Foreign config: real hooks block, but no Unbound marker anywhere.
+        (managed / "settings.json").write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [
+                {"type": "command", "command": "/opt/acme/their-hook.sh"}
+            ]}]}
+        }))
+        with patch.object(setup, "get_managed_settings_dir", return_value=managed):
+            self.assertFalse(setup.check_enterprise_hooks_conflict())
+
+    def test_our_marker_in_settings_is_a_conflict(self):
+        """FIX B: when our hook command (referencing the managed unbound.py)
+        appears in /etc/augment/settings.json, that IS our MDM install → skip."""
+        managed = self.home / "etc-augment"
+        managed.mkdir(parents=True, exist_ok=True)
+        our_script = str(managed / "hooks" / "unbound.py")
+        (managed / "settings.json").write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [
+                {"type": "command", "command": f'"{our_script}"'}
+            ]}]}
+        }))
+        with patch.object(setup, "get_managed_settings_dir", return_value=managed):
+            self.assertTrue(setup.check_enterprise_hooks_conflict())
+
+    def test_managed_script_file_alone_is_a_conflict(self):
+        """FIX B: the managed hook script existing on disk is our marker too —
+        conflict even before settings.json is consulted."""
+        managed = self.home / "etc-augment"
+        (managed / "hooks").mkdir(parents=True, exist_ok=True)
+        (managed / "hooks" / "unbound.py").write_text("x")
+        with patch.object(setup, "get_managed_settings_dir", return_value=managed):
+            self.assertTrue(setup.check_enterprise_hooks_conflict())
+
+    def test_conflict_gate_fails_closed_on_settings_read_error(self):
+        """FIX B: a read/parse EXCEPTION on settings.json fails CLOSED (assume
+        managed → skip), preserving the earlier hardening."""
         managed = self.home / "etc-augment"
         managed.mkdir(parents=True, exist_ok=True)
         (managed / "settings.json").write_text("{}")
-        with patch.object(setup, "get_managed_settings_dir", return_value=managed):
+        # No managed script file, so the gate falls through to reading
+        # settings.json; force that read to raise.
+        real_open = open
+
+        def _boom(path, *a, **k):
+            if str(path).endswith("settings.json"):
+                raise OSError("read boom")
+            return real_open(path, *a, **k)
+
+        with patch.object(setup, "get_managed_settings_dir", return_value=managed), \
+             patch("builtins.open", side_effect=_boom):
             self.assertTrue(setup.check_enterprise_hooks_conflict())
 
     def test_conflict_gate_fails_closed_on_stat_error(self):
@@ -1062,6 +1257,44 @@ class TestCacheStalenessTzAware(_HomeTmp):
         cache = {"last_synced": naive_now, "tools_to_check": []}
         # Fresh legacy stamp -> not stale, and crucially does not raise.
         self.assertFalse(unbound.is_cache_stale(cache))
+
+    # --- FIX E: timestamps must emit a clean '...Z', never '...+00:00Z' --- #
+    def test_last_synced_has_no_double_tz_designator_and_round_trips(self):
+        """FIX E: save_policy_cache must write a clean ISO timestamp with a single
+        'Z' (no malformed '+00:00Z' double designator), and is_cache_stale must
+        parse the value it wrote (fresh write -> not stale)."""
+        unbound.save_policy_cache(tools_to_check=["launch-process"])
+        on_disk = json.loads(unbound.POLICY_CACHE_FILE.read_text())
+        last_synced = on_disk["last_synced"]
+        self.assertNotIn("+00:00", last_synced)
+        self.assertTrue(last_synced.endswith("Z"))
+        # Round-trips through the parser used in production.
+        self.assertFalse(unbound.is_cache_stale({"last_synced": last_synced,
+                                                  "tools_to_check": []}))
+
+    def test_utc_now_z_helper_format(self):
+        """FIX E: the shared helper emits a single 'Z' and no '+00:00'."""
+        stamp = unbound._utc_now_z()
+        self.assertNotIn("+00:00", stamp)
+        self.assertTrue(stamp.endswith("Z"))
+
+    def test_error_log_timestamp_has_no_double_tz_designator(self):
+        """FIX E: log_error writes a clean '...Z' timestamp to error.log."""
+        with patch.object(unbound, "report_error_to_gateway"):
+            unbound.log_error("boom", category="general")
+        line = unbound.ERROR_LOG.read_text().strip().splitlines()[-1]
+        timestamp = line.split(": ", 1)[0]
+        self.assertNotIn("+00:00", timestamp)
+        self.assertTrue(timestamp.endswith("Z"))
+
+    def test_legacy_malformed_timestamp_still_parses(self):
+        """FIX E (back-compat): a legacy on-disk '...+00:00Z' (the old malformed
+        form) must still parse — is_cache_stale tolerates it, no TypeError."""
+        from datetime import datetime, timezone
+        malformed = datetime.now(timezone.utc).isoformat() + "Z"  # '...+00:00Z'
+        self.assertIn("+00:00Z", malformed)
+        self.assertFalse(unbound.is_cache_stale({"last_synced": malformed,
+                                                 "tools_to_check": []}))
 
 
 # --------------------------------------------------------------------------- #

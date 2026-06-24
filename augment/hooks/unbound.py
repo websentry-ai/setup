@@ -95,6 +95,17 @@ _cached_api_key = None
 _reporting_error = False
 
 
+def _utc_now_z() -> str:
+    """UTC timestamp as an ISO-8601 string with a single 'Z' designator.
+
+    datetime.now(timezone.utc).isoformat() emits a '+00:00' offset; appending a
+    literal 'Z' to that produced a malformed double designator ('...+00:00Z',
+    e.g. '2026-06-24T23:22:10.527627+00:00Z'). Replacing the offset with 'Z'
+    yields a clean '...Z' (e.g. '2026-06-24T23:22:10.527627Z'). is_cache_stale
+    parses this (and the legacy malformed/naive forms) via rstrip('Z')."""
+    return datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
+
 def _should_report():
     """Rate limit: max 1 remote error report per 60 seconds. Fails closed."""
     try:
@@ -159,7 +170,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
     message = redact_secrets(message, api_key)
     try:
         payload = json.dumps({
-            'errors': [{'message': message, 'timestamp': datetime.now(timezone.utc).isoformat() + 'Z', 'category': category}],
+            'errors': [{'message': message, 'timestamp': _utc_now_z(), 'category': category}],
             'hook_source': 'augment',
         })
         # Auth header off-argv via the 0600 temp file; body off-argv via stdin.
@@ -183,7 +194,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
 def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     message = redact_secrets(message, _cached_api_key)
-    timestamp = datetime.now(timezone.utc).isoformat() + 'Z'
+    timestamp = _utc_now_z()
     error_entry = f"{timestamp}: {message}\n"
 
     try:
@@ -252,7 +263,7 @@ def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_f
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
         cache = {
-            'last_synced': datetime.now(timezone.utc).isoformat() + 'Z',
+            'last_synced': _utc_now_z(),
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
         }
@@ -1703,7 +1714,7 @@ def main():
             print(json.dumps(response), flush=True)
             return
 
-        timestamp = datetime.now(timezone.utc).isoformat() + 'Z'
+        timestamp = _utc_now_z()
         log_entry = {
             'timestamp': timestamp,
             'session_id': event.get('session_id'),
