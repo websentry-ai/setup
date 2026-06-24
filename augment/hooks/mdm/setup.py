@@ -8,6 +8,7 @@ import time
 import platform
 import subprocess
 import json
+import tempfile
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
 try:
@@ -75,11 +76,34 @@ def build_tool_permissions_block() -> List[Dict]:
             "permission": {"type": "ask-user"},
         },
         {
+            # DEFER (schema TBC): the "mcp:.*" toolName pattern is unverified
+            # against a live Augment instance — confirm before relying on it.
+            # Gateway deny remains authoritative regardless.
             "toolName": "mcp:.*",
             "eventType": "tool-call",
             "permission": {"type": "ask-user"},
         },
     ]
+
+
+def _tool_permission_identity(rule: Dict) -> Tuple:
+    """Identity tuple used to dedupe / match our rules on merge and clear.
+    Mirrors augment/hooks/setup.py."""
+    if not isinstance(rule, dict):
+        return (None, None)
+    return (rule.get("toolName"), rule.get("shellInputRegex"))
+
+
+_OUR_TOOL_PERMISSION_IDENTITIES = {
+    _tool_permission_identity(r) for r in build_tool_permissions_block()
+}
+
+
+def _hook_command_matches(existing_cmd: str, hook_command: str, script_path: Path, is_windows: bool) -> bool:
+    """An existing hook entry is ours if its command matches exactly, or (on
+    Windows, where it's wrapped in a `py -3 "..."` launcher) references our
+    script path. Mirrors augment/hooks/setup.py."""
+    return existing_cmd == hook_command or (is_windows and bool(existing_cmd) and str(script_path) in existing_cmd)
 
 
 def normalize_url(value: str) -> str:
@@ -94,6 +118,38 @@ def normalize_url(value: str) -> str:
 def debug_print(message: str) -> None:
     if DEBUG:
         print(f"[DEBUG] {message}")
+
+
+def curl_with_auth(auth_headers: List[str], curl_args: List[str], *,
+                   input=None, text: bool = False, timeout: int = 30):
+    """Run curl with secret auth header(s) kept OFF the argv.
+
+    On an MDM/multi-user host the curl argv is world-readable via
+    /proc/<pid>/cmdline and `ps`, so passing `Authorization: Bearer <key>` /
+    `X-API-KEY: <key>` as `-H "<header>"` would leak the secret — including the
+    PRIVILEGED admin key used by fetch_api_key_from_mdm. Write the auth header
+    line(s) to a 0600 temp file and pass `-H @<tmpfile>` instead; the temp file
+    is deleted in a finally. `curl_args` is everything except the auth header
+    (flags + URL). Returns the CompletedProcess, or None if the header file
+    could not be written."""
+    fd, tmp_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(auth_headers) + "\n")
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
+        cmd = ["curl", *curl_args, "-H", f"@{tmp_path}"]
+        return subprocess.run(cmd, input=input, capture_output=True, text=text, timeout=timeout)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _run_as_user(username, fn, *args, **kwargs):
@@ -474,14 +530,18 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
     debug_print(f"Fetching API key from: {url}")
 
     try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "-w", "\n%{http_code}",
+        # The privileged admin key goes off-argv via a 0600 temp header file.
+        result = curl_with_auth(
+            [f"Authorization: Bearer {auth_api_key}"],
+            ["-fsSL", "-w", "\n%{http_code}",
              "--max-time", "30", "--retry", "3", "--retry-delay", "2", "--retry-connrefused",
-             "-H", f"Authorization: Bearer {auth_api_key}", url],
-            capture_output=True,
+             url],
             text=True,
-            timeout=140
+            timeout=140,
         )
+        if result is None:
+            print("Failed to fetch API key")
+            return None
 
         output_lines = result.stdout.strip().split('\n')
         if len(output_lines) < 2:
@@ -612,9 +672,15 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
     resulting fd, so the inode inspected is the inode chowned — no path TOCTOU.
     Refuse any regular file with extra hard links (st_nlink != 1): a hardlink to
     a sensitive root-owned file (e.g. /etc/shadow) would otherwise be handed to
-    the user. Directories can't be hard-linked and a non-root user can't create
-    a root-owned dir, so they're safe to reclaim. No-op on Windows / without
-    pwd; only fires on the abnormal uid-mismatch case; never raises."""
+    the user.
+
+    Directories are opened with O_DIRECTORY (so a non-dir can never satisfy the
+    dir branch) and reclaimed ONLY when root- or self-owned (st_uid in {0, uid})
+    — that is the only case this function exists for (a prior root-context run
+    left ~/.unbound root-owned). A directory owned by some OTHER non-root user is
+    NOT reclaimed: handing another user's dir to this user would be an
+    over-reach. No-op on Windows / without pwd; only fires on the abnormal
+    uid-mismatch case; never raises."""
     if platform.system().lower() == "windows" or pwd is None:
         return
     try:
@@ -625,17 +691,29 @@ def _repair_user_ownership(username: str, paths: List[Path]) -> None:
     o_nofollow = getattr(os, "O_NOFOLLOW", None)
     if o_nofollow is None:
         return  # can't open safely without the symlink guard — skip, don't degrade it
-    flags = os.O_RDONLY | o_nofollow | getattr(os, "O_NONBLOCK", 0)
+    o_directory = getattr(os, "O_DIRECTORY", 0)
+    base_flags = os.O_RDONLY | o_nofollow | getattr(os, "O_NONBLOCK", 0)
     for path in paths:
+        # Try the directory open first (O_DIRECTORY succeeds only for real dirs,
+        # symlink-guarded by O_NOFOLLOW). On ENOTDIR fall back to the file open
+        # with the unchanged file-branch flags.
         try:
-            fd = os.open(str(path), flags)
+            fd = os.open(str(path), base_flags | o_directory)
         except OSError:
-            continue  # missing, a symlink (O_NOFOLLOW -> ELOOP), or no access
+            try:
+                fd = os.open(str(path), base_flags)
+            except OSError:
+                continue  # missing, a symlink (O_NOFOLLOW -> ELOOP), or no access
         try:
             st = os.fstat(fd)
-            safe = stat.S_ISDIR(st.st_mode) or (stat.S_ISREG(st.st_mode) and st.st_nlink == 1)
-            if safe and st.st_uid != uid:
-                os.fchown(fd, uid, gid)
+            if stat.S_ISDIR(st.st_mode):
+                # Only reclaim the root-leftover (or already-self-owned) case;
+                # never grab a dir owned by another non-root user.
+                if st.st_uid != uid and st.st_uid in (0, uid):
+                    os.fchown(fd, uid, gid)
+            elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+                if st.st_uid != uid:
+                    os.fchown(fd, uid, gid)
         except OSError as e:
             debug_print(f"_repair_user_ownership: could not chown {path}: {e}")
         finally:
@@ -816,9 +894,13 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
 def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
     """
     Set up system-wide managed hooks for Augment.
-    Downloads unbound.py and configures /etc/augment/settings.json with the
-    hooks + toolPermissions blocks. REPLACES the whole `hooks` block and writes
-    our `toolPermissions`, preserving other top-level managed keys.
+    Downloads unbound.py and MERGES our hook entries + toolPermissions rules into
+    /etc/augment/settings.json. /etc/augment/settings.json is SHARED with the
+    org's own Augment config, so this must never clobber foreign hooks /
+    permissions: append our hook entry per event only if our command isn't
+    already present, append our toolPermissions rules only if our identity tuple
+    isn't present, and preserve all foreign entries, rules, and other top-level
+    keys. Mirrors the per-user configure_augment_settings discipline.
     """
     system = platform.system().lower()
     try:
@@ -866,10 +948,36 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             hook_command = f'"{script_path}"'
             extra = None
 
-        # REPLACE the whole hooks block (managed semantics), and write our
-        # toolPermissions seed. Other top-level managed keys are preserved.
-        settings["hooks"] = build_hooks_block(hook_command, extra=extra)
-        settings["toolPermissions"] = build_tool_permissions_block()
+        # MERGE per-entry (settings.json is shared with the org's own config):
+        # append our hook entry per event only if our command isn't already
+        # present; preserve every foreign entry and other top-level key.
+        hooks_config = build_hooks_block(hook_command, extra=extra)
+        if not isinstance(settings.get("hooks"), dict):
+            settings["hooks"] = {}
+        for event, new_config in hooks_config.items():
+            existing_config = settings["hooks"].get(event)
+            if isinstance(existing_config, list):
+                our_hook_exists = any(
+                    _hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
+                    for item in existing_config if isinstance(item, dict)
+                    for hook in item.get("hooks", [])
+                )
+                if not our_hook_exists:
+                    existing_config.extend(new_config)
+            else:
+                settings["hooks"][event] = new_config
+
+        # Merge toolPermissions, preserving foreign rules. Match on our identity
+        # (toolName + shellInputRegex) so re-running never duplicates.
+        existing_perms = settings.get("toolPermissions")
+        if not isinstance(existing_perms, list):
+            existing_perms = []
+        existing_identities = {_tool_permission_identity(r) for r in existing_perms if isinstance(r, dict)}
+        for rule in build_tool_permissions_block():
+            if _tool_permission_identity(rule) not in existing_identities:
+                existing_perms.append(rule)
+                existing_identities.add(_tool_permission_identity(rule))
+        settings["toolPermissions"] = existing_perms
 
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
@@ -890,8 +998,16 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
 
 
 def clear_managed_hooks() -> str:
-    """Remove the hooks script and the hooks/toolPermissions settings from the
-    managed Augment config.
+    """Strip ONLY our hook entries and toolPermissions rules from the managed
+    Augment config, preserving foreign content.
+
+    /etc/augment/settings.json is SHARED with the org's own Augment config, so
+    this removes only hook entries whose command matches our managed script_path
+    and only toolPermissions rules in our identity set; foreign hooks, foreign
+    rules, and other top-level keys are preserved; now-empty event arrays/blocks
+    are dropped. The settings.json file is unlinked ONLY when it is left empty
+    (no foreign top-level key and no foreign hook/permission remains) — never
+    when any foreign content survives.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -900,6 +1016,12 @@ def clear_managed_hooks() -> str:
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
         settings_path = managed_dir / "settings.json"
+        is_windows = platform.system().lower() == "windows"
+        # Our managed install writes the quoted-path command form.
+        hook_command = f'"{script_path}"'
+
+        def _is_unbound(cmd: str) -> bool:
+            return _hook_command_matches(cmd, hook_command, script_path, is_windows)
 
         cleared_any = False
         had_error = False
@@ -925,22 +1047,60 @@ def clear_managed_hooks() -> str:
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                touched = False
+                modified = False
                 if isinstance(settings, dict):
-                    if "hooks" in settings:
-                        del settings["hooks"]
-                        touched = True
-                    if "toolPermissions" in settings:
-                        del settings["toolPermissions"]
-                        touched = True
-                if touched:
+                    # Strip our hook entries, preserving foreign entries; drop
+                    # now-empty event arrays and the whole block if it empties.
+                    hooks_block = settings.get("hooks")
+                    if isinstance(hooks_block, dict):
+                        for event in list(hooks_block.keys()):
+                            event_config = hooks_block[event]
+                            if not isinstance(event_config, list):
+                                continue
+                            new_config = []
+                            for item in event_config:
+                                if isinstance(item, dict):
+                                    hooks = item.get("hooks", [])
+                                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
+                                    if new_hooks != hooks:
+                                        modified = True
+                                    if new_hooks:
+                                        item["hooks"] = new_hooks
+                                        new_config.append(item)
+                                else:
+                                    new_config.append(item)
+                            if new_config:
+                                hooks_block[event] = new_config
+                            else:
+                                del hooks_block[event]
+                                modified = True
+                        if not hooks_block:
+                            del settings["hooks"]
+
+                    # Strip our toolPermissions rules, preserving foreign ones.
+                    perms = settings.get("toolPermissions")
+                    if isinstance(perms, list):
+                        new_perms = [
+                            r for r in perms
+                            if not (isinstance(r, dict) and _tool_permission_identity(r) in _OUR_TOOL_PERMISSION_IDENTITIES)
+                        ]
+                        if len(new_perms) != len(perms):
+                            modified = True
+                        if new_perms:
+                            settings["toolPermissions"] = new_perms
+                        else:
+                            settings.pop("toolPermissions", None)
+
+                if modified:
+                    # Unlink only if NOTHING foreign remains (no other top-level
+                    # key, no foreign hook/permission). Otherwise rewrite in place.
                     if isinstance(settings, dict) and not settings:
                         settings_path.unlink()
                         debug_print(f"Removed empty settings {settings_path}")
                     else:
                         with open(settings_path, "w", encoding="utf-8") as f:
                             json.dump(settings, f, indent=2)
-                        debug_print(f"Removed hooks/toolPermissions from {settings_path}")
+                        debug_print(f"Stripped our hooks/toolPermissions from {settings_path}")
                     cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to update {settings_path}: {e}")
@@ -1349,13 +1509,13 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         if serial_number is not None:
             body["serial_number"] = serial_number
         data = json.dumps(body)
-        subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"X-API-KEY: {api_key}",
+        # X-API-KEY off-argv via 0600 temp header file; body off-argv via stdin.
+        curl_with_auth(
+            [f"X-API-KEY: {api_key}"],
+            ["-fsSL", "-X", "POST",
              "-H", "Content-Type: application/json",
              "--data-binary", "@-", url],
             input=data.encode(),
-            capture_output=True,
             timeout=10,
         )
         debug_print("Setup completion notification sent")

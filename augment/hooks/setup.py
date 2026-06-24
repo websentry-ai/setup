@@ -17,6 +17,7 @@ import http.server
 import socketserver
 import socket
 import json
+import tempfile
 
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/augment/hooks/unbound.py"
@@ -101,6 +102,9 @@ def build_tool_permissions_block() -> List[Dict]:
             "permission": {"type": "ask-user"},
         },
         {
+            # DEFER (schema TBC): the "mcp:.*" toolName pattern is unverified
+            # against a live Augment instance — confirm before relying on it.
+            # Gateway deny remains authoritative regardless.
             "toolName": "mcp:.*",
             "eventType": "tool-call",
             "permission": {"type": "ask-user"},
@@ -124,6 +128,36 @@ def debug_print(message: str) -> None:
     """Print message only if DEBUG mode is enabled."""
     if DEBUG:
         print(f"[DEBUG] {message}")
+
+
+def curl_with_auth(auth_headers: List[str], curl_args: List[str], *,
+                   input=None, timeout: int = 10):
+    """Run curl with secret auth header(s) kept OFF the argv.
+
+    The curl argv is world-readable via /proc/<pid>/cmdline and `ps`, so passing
+    `X-API-KEY: <key>` / `Authorization: Bearer <key>` as `-H "<header>"` would
+    leak the secret on a shared host. Write the auth header line(s) to a 0600
+    temp file and pass `-H @<tmpfile>` instead; delete it in a finally.
+    `curl_args` is everything except the auth header (flags + URL). Returns the
+    CompletedProcess, or None if the header file could not be written."""
+    fd, tmp_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(auth_headers) + "\n")
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
+        cmd = ["curl", *curl_args, "-H", f"@{tmp_path}"]
+        return subprocess.run(cmd, input=input, capture_output=True, timeout=timeout)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def install_macos_certificates():
@@ -791,7 +825,12 @@ def check_enterprise_hooks_conflict() -> bool:
     """True if an Unbound MDM (managed) setup already exists for Augment on this
     device. User-level setup must not run alongside it — the managed config
     already enforces Unbound for every user, so a second user-level install would
-    make every hook fire twice. Read-only; fails open (False) on any error."""
+    make every hook fire twice. Read-only.
+
+    Fails CLOSED: on a stat/exception we cannot prove the box is unmanaged, so we
+    assume managed (return True). On a shared host a false 'unmanaged' would let
+    managed + user hooks both fire (double-deny / double-audit); the per-user
+    main() then raises SystemExit(3) and skips, which is the safe outcome."""
     try:
         managed_dir = get_managed_settings_dir()
         markers = [
@@ -800,8 +839,8 @@ def check_enterprise_hooks_conflict() -> bool:
         ]
         return any(marker.exists() for marker in markers)
     except Exception as e:
-        print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
-        return False
+        print(f"Warning: could not check for an MDM install ({e!r}); assuming managed and skipping user-level setup.")
+        return True
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
@@ -814,13 +853,13 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         if serial_number is not None:
             body["serial_number"] = serial_number
         data = json.dumps(body)
-        subprocess.run(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"X-API-KEY: {api_key}",
+        # X-API-KEY off-argv via 0600 temp header file; body off-argv via stdin.
+        curl_with_auth(
+            [f"X-API-KEY: {api_key}"],
+            ["-fsSL", "-X", "POST",
              "-H", "Content-Type: application/json",
              "--data-binary", "@-", url],
             input=data.encode(),
-            capture_output=True,
             timeout=10,
         )
         debug_print("Setup completion notification sent")

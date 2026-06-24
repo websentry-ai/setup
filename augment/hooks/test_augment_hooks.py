@@ -356,7 +356,14 @@ class TestStopExchange(_HomeTmp):
         captured = {}
 
         def fake_run(cmd, **kw):
-            captured["url"] = cmd[-1]
+            # The auth header is now passed off-argv as `-H @<tmpfile>`, so the
+            # URL is no longer guaranteed to be the last argv element. Find the
+            # gateway URL among the args by prefix instead of by position.
+            captured["cmd"] = cmd
+            captured["url"] = next(
+                a for a in cmd
+                if isinstance(a, str) and a.startswith("http")
+            )
 
             class R:
                 returncode = 0
@@ -604,6 +611,62 @@ class TestSetupMetrics(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# FIX 3 (security): setup.py / mdm/setup.py keep keys OFF the curl argv        #
+# --------------------------------------------------------------------------- #
+class TestSetupAuthHeaderOffArgv(unittest.TestCase):
+    SECRET = "sk-setup-secret-key-0987654321"
+
+    def _assert_off_argv(self, module, run_call):
+        captured = {"argv": None, "mode": None, "contents": None}
+
+        def fake_run(cmd, **kw):
+            captured["argv"] = list(cmd)
+            for i, a in enumerate(cmd):
+                if isinstance(a, str) and a.startswith("@") and i > 0 and cmd[i - 1] == "-H":
+                    p = a[1:]
+                    captured["mode"] = oct(os.stat(p).st_mode & 0o777)
+                    captured["contents"] = Path(p).read_text()
+
+            class R:
+                returncode = 0
+                stdout = "{}\n200" if kw.get("text") else b""
+                stderr = "" if kw.get("text") else b""
+            return R()
+
+        with patch.object(module.subprocess, "run", side_effect=fake_run):
+            run_call()
+
+        for a in captured["argv"]:
+            self.assertNotIn("Authorization", str(a))
+            self.assertNotIn("X-API-KEY", str(a))
+            self.assertNotIn(self.SECRET, str(a))
+        self.assertEqual(captured["mode"], oct(0o600))
+        self.assertIn(self.SECRET, captured["contents"])
+
+    def test_setup_notify_complete_key_off_argv(self):
+        self._assert_off_argv(
+            setup,
+            lambda: setup.notify_setup_complete(self.SECRET, "augment", backend_url="https://b"),
+        )
+
+    def test_mdm_notify_complete_key_off_argv(self):
+        mdm = _load_mdm()
+        self._assert_off_argv(
+            mdm,
+            lambda: mdm.notify_setup_complete(self.SECRET, "augment", backend_url="https://b"),
+        )
+
+    def test_mdm_fetch_api_key_privileged_key_off_argv(self):
+        """The privileged admin key passed to fetch_api_key_from_mdm must never
+        appear on the curl argv."""
+        mdm = _load_mdm()
+        self._assert_off_argv(
+            mdm,
+            lambda: mdm.fetch_api_key_from_mdm("https://b", None, self.SECRET, "dev-1"),
+        )
+
+
+# --------------------------------------------------------------------------- #
 # MDM managed settings + per-user gating                                       #
 # --------------------------------------------------------------------------- #
 class TestMdmManagedSettings(unittest.TestCase):
@@ -639,10 +702,13 @@ class TestMdmManagedSettings(unittest.TestCase):
         names = {r["toolName"] for r in data["toolPermissions"]}
         self.assertEqual(names, {"launch-process", "mcp:.*"})
 
-    def test_managed_replaces_hooks_preserves_other_keys(self):
+    def test_managed_merges_hooks_preserves_foreign(self):
+        """FIX 1: settings.json is shared with the org's own Augment config, so
+        setup MERGES per-entry — a foreign PreToolUse hook is preserved and ours
+        is appended once alongside it; other top-level keys survive."""
         self.managed.mkdir(parents=True, exist_ok=True)
         (self.managed / "settings.json").write_text(json.dumps({
-            "hooks": {"PreToolUse": [{"matcher": "x", "hooks": [{"command": "stale"}]}]},
+            "hooks": {"PreToolUse": [{"matcher": "x", "hooks": [{"command": "/usr/bin/foreign-hook"}]}]},
             "foreignKey": 7,
         }))
         with patch.object(self.mdm, "download_file", return_value=True):
@@ -650,9 +716,12 @@ class TestMdmManagedSettings(unittest.TestCase):
             (self.managed / "hooks" / "unbound.py").write_text("# stub")
             self.assertTrue(self.mdm.setup_managed_hooks())
         data = self._settings()
-        # Whole hooks block replaced (no 'stale').
         cmds = [h.get("command") for item in data["hooks"]["PreToolUse"] for h in item["hooks"]]
-        self.assertNotIn("stale", cmds)
+        # Foreign hook preserved (NOT clobbered).
+        self.assertIn("/usr/bin/foreign-hook", cmds)
+        # Ours added alongside it.
+        ours = f'"{self.managed / "hooks" / "unbound.py"}"'
+        self.assertIn(ours, cmds)
         # Other top-level key preserved.
         self.assertEqual(data["foreignKey"], 7)
 
@@ -694,6 +763,76 @@ class TestMdmManagedSettings(unittest.TestCase):
         self.assertNotIn("hooks", data)
         self.assertNotIn("toolPermissions", data)
         self.assertEqual(data["foreign"], 1)
+
+    def _seed_foreign_settings(self):
+        """Write a settings.json carrying foreign content of all three kinds:
+        a foreign PreToolUse hook, a foreign toolPermissions rule, and a foreign
+        top-level key."""
+        self.managed.mkdir(parents=True, exist_ok=True)
+        (self.managed / "settings.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": ".*", "hooks": [{"type": "command", "command": "/usr/bin/foreign-hook"}]}
+                ]
+            },
+            "toolPermissions": [
+                {"toolName": "foreign-tool", "eventType": "tool-call", "permission": {"type": "allow"}}
+            ],
+            "foreignTopLevel": {"keep": True},
+        }))
+
+    def test_install_onto_foreign_config_preserves_all_three(self):
+        """FIX 1 (critical): MDM install onto a shared settings.json with a
+        foreign PreToolUse hook + foreign toolPermissions rule + foreign
+        top-level key preserves all three; ours is added exactly once."""
+        self._seed_foreign_settings()
+        ours_cmd = f'"{self.managed / "hooks" / "unbound.py"}"'
+        with patch.object(self.mdm, "download_file", return_value=True):
+            (self.managed / "hooks").mkdir(parents=True, exist_ok=True)
+            (self.managed / "hooks" / "unbound.py").write_text("# stub")
+            # Run twice to also prove the merge is idempotent (ours once).
+            self.assertTrue(self.mdm.setup_managed_hooks())
+            self.assertTrue(self.mdm.setup_managed_hooks())
+        data = self._settings()
+
+        pre_cmds = [h.get("command") for item in data["hooks"]["PreToolUse"] for h in item["hooks"]]
+        self.assertIn("/usr/bin/foreign-hook", pre_cmds)          # foreign hook preserved
+        self.assertEqual(pre_cmds.count(ours_cmd), 1)             # ours added exactly once
+
+        perm_names = [r["toolName"] for r in data["toolPermissions"]]
+        self.assertIn("foreign-tool", perm_names)                 # foreign rule preserved
+        self.assertEqual(perm_names.count("launch-process"), 1)   # ours added once
+        self.assertEqual(perm_names.count("mcp:.*"), 1)
+
+        self.assertEqual(data["foreignTopLevel"], {"keep": True})  # foreign top-level preserved
+
+    def test_clear_strips_ours_preserves_foreign_does_not_unlink(self):
+        """FIX 1 (critical): MDM --clear removes only our hook/permission, leaves
+        every foreign item, and does NOT unlink settings.json while foreign
+        content remains."""
+        self._seed_foreign_settings()
+        ours_cmd = f'"{self.managed / "hooks" / "unbound.py"}"'
+        with patch.object(self.mdm, "download_file", return_value=True):
+            (self.managed / "hooks").mkdir(parents=True, exist_ok=True)
+            (self.managed / "hooks" / "unbound.py").write_text("# stub")
+            self.assertTrue(self.mdm.setup_managed_hooks())
+
+        self.assertEqual(self.mdm.clear_managed_hooks(), "cleared")
+
+        # File still exists (foreign content remained) — NOT unlinked.
+        self.assertTrue((self.managed / "settings.json").exists())
+        data = self._settings()
+
+        pre_cmds = [h.get("command") for item in data.get("hooks", {}).get("PreToolUse", []) for h in item["hooks"]]
+        self.assertNotIn(ours_cmd, pre_cmds)                       # ours gone
+        self.assertIn("/usr/bin/foreign-hook", pre_cmds)          # foreign hook survives
+
+        perm_names = {r["toolName"] for r in data.get("toolPermissions", [])}
+        self.assertNotIn("launch-process", perm_names)            # ours gone
+        self.assertNotIn("mcp:.*", perm_names)
+        self.assertIn("foreign-tool", perm_names)                 # foreign rule survives
+
+        self.assertEqual(data["foreignTopLevel"], {"keep": True})  # foreign top-level survives
 
 
 class TestMdmRemoveUserLevelHooks(unittest.TestCase):
@@ -769,6 +908,216 @@ class TestUserLevelMdmGate(_HomeTmp):
         (managed / "settings.json").write_text("{}")
         with patch.object(setup, "get_managed_settings_dir", return_value=managed):
             self.assertTrue(setup.check_enterprise_hooks_conflict())
+
+    def test_conflict_gate_fails_closed_on_stat_error(self):
+        """FIX 4 (INFO-2): when the managed-path stat raises, the gate fails
+        CLOSED (returns True) so the per-user install skips — never risks
+        managed + user hooks both firing on a shared box."""
+        managed = self.home / "etc-augment"
+        (managed / "hooks").mkdir(parents=True, exist_ok=True)
+        boom = (managed / "hooks" / "unbound.py")
+        boom.write_text("x")
+        with patch.object(setup, "get_managed_settings_dir", return_value=managed), \
+             patch.object(setup.Path, "exists", side_effect=OSError("stat boom")):
+            self.assertTrue(setup.check_enterprise_hooks_conflict())
+
+    def test_conflict_gate_normal_path_false_when_unmanaged(self):
+        """FIX 4: normal-path behavior is unchanged — a truly unmanaged box
+        (no markers) still returns False so per-user setup proceeds."""
+        managed = self.home / "etc-augment-empty"
+        managed.mkdir(parents=True, exist_ok=True)  # exists but no markers inside
+        with patch.object(setup, "get_managed_settings_dir", return_value=managed):
+            self.assertFalse(setup.check_enterprise_hooks_conflict())
+
+
+# --------------------------------------------------------------------------- #
+# FIX 2 (W1): remove-files is always policy-evaluated (no cache fast-path)     #
+# --------------------------------------------------------------------------- #
+class TestRemoveFilesAlwaysEvaluated(_HomeTmp):
+    def _run(self, tool_name):
+        """Run process_pre_tool_use against a FRESH cache whose tools_to_check is
+        empty, and report whether send_to_hook_api was reached."""
+        event = {
+            "hook_event_name": "PreToolUse", "session_id": "c",
+            "tool_name": tool_name, "tool_input": {"path": "/tmp/x"},
+            "is_mcp_tool": False,
+        }
+        # Fresh cache (not stale) with an EMPTY tools_to_check, so need_pull is
+        # False and only the fast-path gate decides whether we reach the gateway.
+        unbound.save_policy_cache(tools_to_check=[], policy_check_failure_action="allow")
+        called = {"hit": False}
+
+        def _capture(body, key):
+            called["hit"] = True
+            return {"decision": "allow"}
+
+        with patch.object(unbound, "send_to_hook_api", side_effect=_capture), \
+             patch.object(unbound, "report_error_to_gateway"):
+            unbound.process_pre_tool_use(event, "sk-test")
+        return called["hit"]
+
+    def test_remove_files_reaches_gateway_despite_empty_cache(self):
+        """remove-files (destructive) is NOT in NATIVE_FILE_TOOLS, so the fast
+        path never suppresses it — it always reaches the gateway."""
+        self.assertNotIn("remove-files", unbound.NATIVE_FILE_TOOLS)
+        self.assertIn("remove-files", unbound.ALLOWED_NON_MCP_HOOK_NAMES)
+        self.assertTrue(self._run("remove-files"))
+
+    def test_view_is_suppressed_by_fast_path(self):
+        """view (read-only) stays in NATIVE_FILE_TOOLS, so an empty fresh cache
+        suppresses it (gateway not called) — contrast with remove-files."""
+        self.assertIn("view", unbound.NATIVE_FILE_TOOLS)
+        self.assertFalse(self._run("view"))
+
+
+# --------------------------------------------------------------------------- #
+# FIX 3 (security): API keys / bearer tokens stay OFF the curl argv            #
+# --------------------------------------------------------------------------- #
+class TestAuthHeaderOffArgv(_HomeTmp):
+    SECRET = "sk-super-secret-key-1234567890"
+
+    def _capture_argv(self, call):
+        """Run `call`, capturing the curl argv passed to subprocess.run and the
+        contents of the 0600 temp header file at invocation time."""
+        captured = {"argv": None, "header_file": None, "header_mode": None}
+
+        real_run = subprocess.run
+
+        def fake_run(cmd, **kw):
+            captured["argv"] = list(cmd)
+            # Find the `-H @<tmpfile>` and read it back before the finally unlinks.
+            for i, a in enumerate(cmd):
+                if isinstance(a, str) and a.startswith("@") and i > 0 and cmd[i - 1] == "-H":
+                    p = a[1:]
+                    captured["header_file"] = p
+                    try:
+                        captured["header_mode"] = oct(os.stat(p).st_mode & 0o777)
+                        captured["header_contents"] = Path(p).read_text()
+                    except OSError:
+                        pass
+
+            class R:
+                returncode = 0
+                stdout = b"{}"
+                stderr = b""
+            return R()
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            call()
+        return captured
+
+    def _assert_secret_off_argv(self, captured):
+        argv = captured["argv"]
+        self.assertIsNotNone(argv, "curl was never invoked")
+        for a in argv:
+            self.assertNotIn("Authorization", str(a))
+            self.assertNotIn("X-API-KEY", str(a))
+            self.assertNotIn(self.SECRET, str(a))
+        # The secret lives only in the 0600 temp header file.
+        self.assertIsNotNone(captured["header_file"])
+        self.assertEqual(captured.get("header_mode"), oct(0o600))
+        self.assertIn(self.SECRET, captured.get("header_contents", ""))
+
+    def test_send_to_hook_api_keeps_key_off_argv(self):
+        captured = self._capture_argv(
+            lambda: unbound.send_to_hook_api({"x": 1}, self.SECRET)
+        )
+        self._assert_secret_off_argv(captured)
+
+    def test_send_to_api_keeps_key_off_argv(self):
+        captured = self._capture_argv(
+            lambda: unbound.send_to_api({"conversation_id": "c", "messages": []}, self.SECRET)
+        )
+        self._assert_secret_off_argv(captured)
+
+    def test_helper_deletes_temp_file_after_call(self):
+        """curl_with_auth removes the 0600 temp file in its finally."""
+        captured = self._capture_argv(
+            lambda: unbound.send_to_hook_api({"x": 1}, self.SECRET)
+        )
+        self.assertFalse(Path(captured["header_file"]).exists())
+
+
+# --------------------------------------------------------------------------- #
+# FIX 5 (W2): tz-aware datetimes keep cache-staleness math correct             #
+# --------------------------------------------------------------------------- #
+class TestCacheStalenessTzAware(_HomeTmp):
+    def test_fresh_cache_not_stale(self):
+        unbound.save_policy_cache(tools_to_check=["launch-process"])
+        cache = unbound.load_policy_cache()
+        self.assertIsNotNone(cache)
+        self.assertFalse(unbound.is_cache_stale(cache))
+
+    def test_old_cache_is_stale(self):
+        from datetime import datetime, timezone, timedelta
+        old = (datetime.now(timezone.utc) - timedelta(seconds=unbound.CACHE_TTL_SECONDS + 60))
+        cache = {"last_synced": old.isoformat() + "Z", "tools_to_check": []}
+        self.assertTrue(unbound.is_cache_stale(cache))
+
+    def test_legacy_naive_timestamp_does_not_raise(self):
+        """A legacy naive on-disk timestamp (no offset) must still compare cleanly
+        against the now-aware datetime.now(timezone.utc) — no TypeError."""
+        from datetime import datetime, timezone
+        naive_now = datetime.now(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+        cache = {"last_synced": naive_now, "tools_to_check": []}
+        # Fresh legacy stamp -> not stale, and crucially does not raise.
+        self.assertFalse(unbound.is_cache_stale(cache))
+
+
+# --------------------------------------------------------------------------- #
+# FIX 6 (W3): empty-string command is forwarded as-is                          #
+# --------------------------------------------------------------------------- #
+class TestEmptyCommandGuard(unittest.TestCase):
+    def test_empty_command_forwarded_not_dumped(self):
+        """launch-process with command:"" forwards "" (not a tool_input dump)."""
+        ev = {"tool_name": "launch-process", "tool_input": {"command": ""}}
+        self.assertEqual(unbound.extract_command_for_pretool(ev), "")
+
+    def test_missing_command_still_falls_back(self):
+        """No command key at all -> the json dump fallback still applies."""
+        ev = {"tool_name": "launch-process", "tool_input": {"other": "x"}}
+        self.assertEqual(
+            unbound.extract_command_for_pretool(ev), json.dumps({"other": "x"})
+        )
+
+
+# --------------------------------------------------------------------------- #
+# FIX 8 (WARNING-3): no SILENT analytics drop                                  #
+# --------------------------------------------------------------------------- #
+class TestNoSilentDrop(_HomeTmp):
+    def test_stop_with_posttool_but_no_prompt_emits_drop_signal(self):
+        """A Stop that had PostToolUse records but no userPrompt (exchange None)
+        emits a visible drop signal instead of silently doing nothing."""
+        unbound.append_to_audit_log({
+            "timestamp": "2026-01-01T00:00:00Z", "session_id": "drop-1",
+            "event": {
+                "hook_event_name": "PostToolUse", "session_id": "drop-1",
+                "tool_name": "launch-process", "tool_input": {"command": "ls"},
+                "tool_output": "x",
+            },
+        })
+        stop_event = {"hook_event_name": "Stop", "session_id": "drop-1",
+                      "conversation": {}}  # no userPrompt, no assistant text
+
+        with patch.object(unbound, "log_error") as log_err, \
+             patch.object(unbound, "send_to_api") as send:
+            unbound.process_stop_event(stop_event, "sk-test")
+            send.assert_not_called()                       # exchange was None
+            log_err.assert_called_once()                   # visible drop signal
+        msg, category = log_err.call_args[0][0], log_err.call_args[0][1]
+        self.assertEqual(category, "dropped_turn")
+        self.assertIn("drop-1", msg)
+
+    def test_stop_with_no_records_and_no_prompt_stays_silent(self):
+        """No PostToolUse records AND no exchange -> genuinely nothing to send,
+        so no drop signal (we only warn when records existed)."""
+        stop_event = {"hook_event_name": "Stop", "session_id": "empty-1",
+                      "conversation": {}}
+        with patch.object(unbound, "log_error") as log_err, \
+             patch.object(unbound, "send_to_api") as send:
+            unbound.process_stop_event(stop_event, "sk-test")
+            send.assert_not_called()
+            log_err.assert_not_called()
 
 
 if __name__ == "__main__":

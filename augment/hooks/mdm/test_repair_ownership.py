@@ -59,13 +59,48 @@ class TestRepairUserOwnership(unittest.TestCase):
             mdm._repair_user_ownership("whoever", [f])
             fchown.assert_called_once()
 
-    def test_directory_is_chowned_on_mismatch(self):
+    def _fstat_with_uid(self, fake_uid):
+        """Return an os.fstat replacement that overrides st_uid on the real
+        stat result (so we can simulate root-owned / other-user-owned dirs
+        without actually being root)."""
+        real_fstat = os.fstat
+
+        def _fake(fd):
+            real = real_fstat(fd)
+
+            class _St:
+                st_mode = real.st_mode
+                st_nlink = real.st_nlink
+                st_uid = fake_uid
+
+            return _St()
+
+        return _fake
+
+    def test_root_owned_directory_is_reclaimed(self):
+        """A root-owned (st_uid == 0) dir IS reclaimed — the root-leftover case
+        this function exists for."""
         d = self.dir / "sub"
         d.mkdir()
         with mock.patch.object(mdm.pwd, "getpwnam", _fake_pwd(99999)), \
+                mock.patch("os.fstat", side_effect=self._fstat_with_uid(0)), \
                 mock.patch("os.fchown") as fchown:
             mdm._repair_user_ownership("whoever", [d])
             fchown.assert_called_once()
+
+    def test_other_user_directory_is_not_reclaimed(self):
+        """A dir owned by some OTHER non-root uid is NOT reclaimed — handing
+        another user's dir to this user would be an over-reach (FIX 7)."""
+        d = self.dir / "sub"
+        d.mkdir()
+        real_uid = mdm.pwd.getpwnam(self.me).pw_uid
+        # Target uid is real_uid + 99999; the dir is owned by yet another
+        # non-root uid (real_uid + 12345), so st_uid is neither 0 nor the target.
+        with mock.patch.object(mdm.pwd, "getpwnam", _fake_pwd(99999)), \
+                mock.patch("os.fstat", side_effect=self._fstat_with_uid(real_uid + 12345)), \
+                mock.patch("os.fchown") as fchown:
+            mdm._repair_user_ownership("whoever", [d])
+            fchown.assert_not_called()
 
     def test_symlink_is_refused(self):
         target = self.dir / "target"

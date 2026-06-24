@@ -36,8 +36,10 @@ AUGMENT_TOOL_FAMILY = {
 }
 # Native (non-MCP) Augment tools whose family is a file operation — used to gate
 # the policy-cache "tools_to_check" fast path, mirroring claude-code's
-# NATIVE_FILE_TOOLS. Expressed in Augment vocab.
-NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files'}
+# NATIVE_FILE_TOOLS. Expressed in Augment vocab. remove-files is deliberately
+# EXCLUDED: it is a destructive delete that must always reach the gateway, so it
+# lives only in ALLOWED_NON_MCP_HOOK_NAMES (never eligible for the fast path).
+NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
 # Non-MCP Augment tools we always evaluate (the rest fall through to the cache
 # fast path). MCP tools are detected via the is_mcp_tool flag, not a name prefix.
 ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files']
@@ -113,6 +115,41 @@ def redact_secrets(text, key=None):
     return text
 
 
+def curl_with_auth(auth_headers: List[str], curl_args: List[str], *,
+                   input: Optional[bytes] = None, timeout: int = 20):
+    """Run curl with secret auth header(s) kept OFF the argv.
+
+    On a shared / multi-user / MDM host the curl argv is world-readable via
+    /proc/<pid>/cmdline and `ps`, so an `Authorization: Bearer <key>` or
+    `X-API-KEY: <key>` passed as `-H "<header>"` would leak the secret. Instead
+    write the auth header line(s) to a 0600 temp file and pass `-H @<tmpfile>`
+    (curl reads headers from the file); the request body stays off-argv too via
+    the caller's `--data-binary @-` on stdin. The temp file is deleted in a
+    finally. `curl_args` is everything except the auth header (flags + the URL).
+
+    Returns the subprocess.CompletedProcess, or None if the header file could
+    not be written (caller treats that like a failed request → fail-open)."""
+    fd, tmp_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                # One header per line; curl strips the trailing newline.
+                f.write("\n".join(auth_headers) + "\n")
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
+        cmd = ["curl", *curl_args, "-H", f"@{tmp_path}"]
+        return subprocess.run(cmd, input=input, capture_output=True, timeout=timeout)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+
 def report_error_to_gateway(message, category='general', api_key=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
@@ -122,20 +159,21 @@ def report_error_to_gateway(message, category='general', api_key=None):
     message = redact_secrets(message, api_key)
     try:
         payload = json.dumps({
-            'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
+            'errors': [{'message': message, 'timestamp': datetime.now(timezone.utc).isoformat() + 'Z', 'category': category}],
             'hook_source': 'augment',
         })
-        proc = subprocess.Popen(
-            ["curl", "-fsSL", "-X", "POST",
-             "-H", f"Authorization: Bearer {api_key}",
+        # Auth header off-argv via the 0600 temp file; body off-argv via stdin.
+        # Rate-limited (1/60s) + reentrancy-guarded, so a short blocking curl
+        # here is acceptable and keeps the Bearer key out of /proc/<pid>/cmdline.
+        curl_with_auth(
+            [f"Authorization: Bearer {api_key}"],
+            ["-fsSL", "-X", "POST",
              "-H", "Content-Type: application/json",
              "--data-binary", "@-",
              f"{UNBOUND_GATEWAY_URL}/v1/hooks/errors"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            input=payload.encode(),
+            timeout=10,
         )
-        proc.stdin.write(payload.encode())
-        proc.stdin.close()
     except Exception:
         pass
     finally:
@@ -145,7 +183,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
 def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     message = redact_secrets(message, _cached_api_key)
-    timestamp = datetime.utcnow().isoformat() + 'Z'
+    timestamp = datetime.now(timezone.utc).isoformat() + 'Z'
     error_entry = f"{timestamp}: {message}\n"
 
     try:
@@ -190,7 +228,13 @@ def load_policy_cache() -> Optional[Dict]:
 
 
 def get_policy_check_failure_action() -> str:
-    """Read failure-action from cache, defaulting to 'allow'. Ignores TTL."""
+    """Read failure-action from cache, defaulting to 'allow'. Ignores TTL.
+
+    DEFER (known limitation): a stale cached failure-action of 'block' is
+    intentionally honored offline with no TTL — fail-closed is the safe default
+    when the gateway is unreachable. If reverting block->allow on an offline
+    fleet ever becomes a problem, revisit adding a TTL here.
+    """
     cache = _read_policy_cache_raw()
     if cache is None:
         return POLICY_CHECK_FAILURE_DEFAULT
@@ -208,7 +252,7 @@ def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_f
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
         cache = {
-            'last_synced': datetime.utcnow().isoformat() + 'Z',
+            'last_synced': datetime.now(timezone.utc).isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
         }
@@ -219,10 +263,17 @@ def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_f
 
 
 def is_cache_stale(cache: Dict) -> bool:
-    """Check if cached data is older than CACHE_TTL_SECONDS."""
+    """Check if cached data is older than CACHE_TTL_SECONDS.
+
+    Compares aware-with-aware: parse last_synced and, if it came back naive
+    (legacy on-disk values written before the tz-aware change), pin it to UTC
+    so the subtraction against datetime.now(timezone.utc) never mixes
+    aware/naive (which would raise TypeError and wrongly report 'stale')."""
     try:
         synced = datetime.fromisoformat(cache['last_synced'].rstrip('Z'))
-        age = (datetime.utcnow() - synced).total_seconds()
+        if synced.tzinfo is None:
+            synced = synced.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - synced).total_seconds()
         return age > CACHE_TTL_SECONDS
     except (ValueError, KeyError):
         return True
@@ -410,11 +461,17 @@ def extract_command_for_pretool(event: Dict) -> str:
 
     family = AUGMENT_TOOL_FAMILY.get(tool_name)
 
-    # Shell/terminal family (launch-process): the command line.
+    # Shell/terminal family (launch-process): the command line. Use
+    # `value is not None` (not truthiness) so an explicit empty-string command is
+    # forwarded as-is rather than dumping the whole tool_input — an empty command
+    # is a meaningful, policy-evaluable input.
     if family == 'Bash' or tool_name == 'launch-process':
+        # DEFER (schema TBC): the 'commandLine' fallback key is unverified against
+        # a live Augment instance — confirm before relying on it. Gateway deny
+        # remains authoritative regardless of which key is read.
         for key in ('command', 'commandLine'):
             value = tool_input.get(key)
-            if value:
+            if value is not None:
                 return value if isinstance(value, str) else json.dumps(value)
         return json.dumps(tool_input)
 
@@ -442,15 +499,17 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
 
     for attempt in range(3):
         try:
-            result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
-                 "-H", f"Authorization: Bearer {api_key}",
+            # Auth header off-argv (0600 temp file); body off-argv (stdin).
+            result = curl_with_auth(
+                [f"Authorization: Bearer {api_key}"],
+                ["-fsSL", "-X", "POST",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
                 input=data.encode(),
-                capture_output=True,
-                timeout=20
+                timeout=20,
             )
+            if result is None:
+                return {}
 
             # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
             # server accepted the request. Do NOT retry on success — a retry
@@ -497,16 +556,16 @@ def poll_approval_status(api_key: str, policy_ids: list, application_id: str, re
         time.sleep(_next_poll_interval(time.monotonic() - start))
         for attempt in range(3):
             try:
-                result = subprocess.run(
-                    ["curl", "-fsSL", "-X", "POST",
-                     "-H", f"Authorization: Bearer {api_key}",
+                # Auth header off-argv (0600 temp file); body off-argv (stdin).
+                result = curl_with_auth(
+                    [f"Authorization: Bearer {api_key}"],
+                    ["-fsSL", "-X", "POST",
                      "-H", "Content-Type: application/json",
                      "--data-binary", "@-", url],
                     input=body.encode(),
-                    capture_output=True,
-                    timeout=10
+                    timeout=10,
                 )
-                if result.returncode == 0 and result.stdout:
+                if result is not None and result.returncode == 0 and result.stdout:
                     resp = json.loads(result.stdout.decode('utf-8'))
                     decision = resp.get('decision', 'pending')
                     if decision == 'allow':
@@ -1038,6 +1097,11 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             assistant_msg['tool_use'] = assistant_tool_uses
         messages.append(assistant_msg)
 
+    # Phase-2 decision (pending the /v1/hooks/augment contract): whether to relax
+    # this >= 2 gate so a tool-only exchange (PostToolUse records but no
+    # userPrompt) can still be sent as a turn. Until that contract is settled the
+    # gate stays; process_stop_event emits a visible drop signal so such turns are
+    # never lost silently.
     if len(messages) < 2:
         return None
 
@@ -1067,20 +1131,22 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
 
     for attempt in range(3):
         try:
-            result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
-                 "-H", f"Authorization: Bearer {api_key}",
+            # Auth header off-argv (0600 temp file); body off-argv (stdin).
+            result = curl_with_auth(
+                [f"Authorization: Bearer {api_key}"],
+                ["-fsSL", "-X", "POST",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
                 input=data.encode(),
-                capture_output=True,
-                timeout=10
+                timeout=10,
             )
-
-            if result.returncode == 0:
+            if result is None:
+                log_error("API request failed: could not write auth header file", 'api_call')
+            elif result.returncode == 0:
                 return True
-            error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
-            log_error(f"API request failed: {error_msg}", 'api_call')
+            else:
+                error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
+                log_error(f"API request failed: {error_msg}", 'api_call')
         except Exception as e:
             log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
 
@@ -1141,6 +1207,17 @@ def process_stop_event(event: Dict, api_key: str):
 
     if exchange:
         send_to_api(exchange, api_key)
+    elif session_events:
+        # The turn had PostToolUse records but build_llm_exchange returned None
+        # (e.g. Stop omitted conversation.userPrompt, so messages < 2). Do NOT
+        # drop it silently — emit a visible local log line and a best-effort,
+        # fire-and-forget gateway report (fail-open: never raises, never blocks).
+        log_error(
+            f"Dropped Stop turn for session={session_id}: "
+            f"{len(session_events)} PostToolUse record(s) but no usable exchange "
+            f"(missing userPrompt/assistant content)",
+            'dropped_turn',
+        )
 
 
 def get_api_key():
@@ -1343,14 +1420,13 @@ def _hook_discovery_enabled_for_org() -> bool:
         return bool(flag.get("enabled", False))
     url = f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"
     try:
-        r = subprocess.run(
-            ["curl", "-fsSL",
-             "-H", f"Authorization: Bearer {api_key}",
-             "--max-time", "5",
-             url],
-            capture_output=True, timeout=8,
+        # Auth header off-argv (0600 temp file) — GET, no body.
+        r = curl_with_auth(
+            [f"Authorization: Bearer {api_key}"],
+            ["-fsSL", "--max-time", "5", url],
+            timeout=8,
         )
-        if r.returncode != 0:
+        if r is None or r.returncode != 0:
             return bool(flag.get("enabled", False))
         body = r.stdout.decode("utf-8", errors="replace")
         enabled = bool(json.loads(body).get("enabled", False))
@@ -1627,7 +1703,7 @@ def main():
             print(json.dumps(response), flush=True)
             return
 
-        timestamp = datetime.utcnow().isoformat() + 'Z'
+        timestamp = datetime.now(timezone.utc).isoformat() + 'Z'
         log_entry = {
             'timestamp': timestamp,
             'session_id': event.get('session_id'),
