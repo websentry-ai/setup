@@ -753,11 +753,30 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
     return None
 
 
+def _config_email() -> Optional[str]:
+    """The signed-in user's email from ~/.unbound/config.json, which the installer
+    writes. Fully fail-safe: any read/parse error -> None, never raises."""
+    try:
+        with open(UNBOUND_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            cfg = json.loads(f.read())
+        if isinstance(cfg, dict):
+            return (cfg.get('email') or '').strip() or None
+    except Exception:
+        pass
+    return None
+
+
 def read_account_identity(event: Optional[Dict] = None) -> Dict:
-    """Augment injects the signed-in user's email as context.userEmail on hooks
-    whose matcher enables includeUserContext. There is no on-disk account record
-    (no ~/.claude.json equivalent), so org/plan/auth_mode are always None and the
-    email is read off the event's injected context."""
+    """Resolve the signed-in user's email.
+
+    Auggie 0.30.0 does NOT deliver context.userEmail (the includeUserContext
+    metadata flag that would gate it is intentionally not seeded — see setup.py),
+    so the event's injected context is absent on every real event today. We still
+    read context.userEmail when present for forward-compat with a future Auggie
+    that delivers it; otherwise we fall back to the `email` field the installer
+    writes into ~/.unbound/config.json. There is no on-disk account record beyond
+    that, so org/plan/auth_mode are always None (the gateway resolves the org from
+    the API key). Fully fail-safe: any read error -> None, never raises."""
     email = None
     try:
         if isinstance(event, dict):
@@ -766,6 +785,8 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
                 email = (context.get('userEmail') or '').strip() or None
     except Exception:
         pass
+    if email is None:
+        email = _config_email()
     return {
         'org_id': None,
         'plan': None,

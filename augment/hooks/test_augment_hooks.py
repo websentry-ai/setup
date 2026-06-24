@@ -251,6 +251,40 @@ class TestPreToolDecisionMapping(_HomeTmp):
         self.assertEqual(captured["body"]["pre_tool_use_data"]["command"],
                          json.dumps({"q": 1}))
 
+    def test_mcp_without_mcp_metadata_still_sent_to_gateway(self):
+        """Auggie 0.30.0 ships NO mcp_metadata (the includeMCPMetadata flag is
+        intentionally unseeded). An MCP tool (is_mcp_tool: true) with no
+        mcp_metadata is STILL evaluated by the gateway — sent with is_mcp_tool +
+        the raw tool_name, just without server/tool resolution. Must not crash."""
+        captured = {}
+
+        def _capture(body, key):
+            captured["body"] = body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse", "session_id": "c",
+            "tool_name": "some-mcp-call", "tool_input": {"q": 1},
+            "is_mcp_tool": True,
+            # no mcp_metadata key at all
+        }
+        with patch.object(unbound, "send_to_hook_api", side_effect=_capture):
+            out = unbound.process_pre_tool_use(event, "sk-test")  # must not raise
+        # The gateway WAS called (the request body was captured).
+        self.assertIn("body", captured)
+        pre = captured["body"]["pre_tool_use_data"]
+        # Raw tool_name forwarded; is_mcp_tool flag preserved in metadata.
+        self.assertEqual(pre["tool_name"], "some-mcp-call")
+        self.assertTrue(pre["metadata"]["is_mcp_tool"])
+        # No server/tool resolution happened (no mcp_metadata to read).
+        self.assertNotIn("mcp_server", pre["metadata"])
+        self.assertNotIn("mcp_tool", pre["metadata"])
+        # Command is still the stringified tool_input.
+        self.assertEqual(pre["command"], json.dumps({"q": 1}))
+        # Allow decision -> empty hook output (fail-open / non-blocking).
+        self.assertEqual(out, {})
+        self.assertEqual(captured["body"]["unbound_app_label"], "augment")
+
     def test_corrupted_stdin_is_noop(self):
         """A non-JSON stdin must not blow up main(); it prints suppressOutput."""
         with patch("sys.stdin") as stdin, \
@@ -403,6 +437,33 @@ class TestStopExchange(_HomeTmp):
             unbound.process_stop_event(stop_event, "sk-test")
             send.assert_not_called()
 
+    def test_stop_with_no_conversation_emits_dropped_turn_signal(self):
+        """Auggie 0.30.0 ships NO `conversation` on Stop (the includeConversationData
+        metadata flag is intentionally unseeded). With accumulated PostToolUse
+        records but no conversation, build_llm_exchange returns None (messages < 2),
+        so the audit is a no-op AND the visible `dropped_turn` signal fires — the
+        turn is never silently lost. Must not crash."""
+        unbound.append_to_audit_log({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "no-conv",
+            "event": {
+                "hook_event_name": "PostToolUse",
+                "session_id": "no-conv",
+                "tool_name": "launch-process",
+                "tool_input": {"command": "ls"},
+                "tool_output": "out",
+            },
+        })
+        stop_event = {"hook_event_name": "Stop", "session_id": "no-conv"}  # no conversation
+        with patch.object(unbound, "send_to_api") as send, \
+             patch.object(unbound, "log_error") as log_err:
+            unbound.process_stop_event(stop_event, "sk-test")  # must not raise
+            send.assert_not_called()
+        # The dropped_turn signal fired with the right category.
+        self.assertTrue(log_err.called)
+        category = log_err.call_args[0][1] if len(log_err.call_args[0]) > 1 else log_err.call_args[1].get("category")
+        self.assertEqual(category, "dropped_turn")
+
 
 # --------------------------------------------------------------------------- #
 # main() dispatch (session_id alias, no UserPromptSubmit)                      #
@@ -470,12 +531,28 @@ class TestSettingsMerge(_HomeTmp):
             {"PreToolUse", "PostToolUse", "Stop", "SessionStart", "SessionEnd"},
         )
         self.assertNotIn("UserPromptSubmit", data["hooks"])
-        # Pre/Post carry per-matcher metadata flags.
+        # No per-hook metadata is seeded — Auggie 0.30.0 warns on any metadata
+        # flag and the data is unused until Phase 2 (deferral note in setup.py).
         pre = data["hooks"]["PreToolUse"][0]["hooks"][0]
         self.assertEqual(pre["timeout"], 15000)
-        self.assertEqual(pre["metadata"], {"includeMCPMetadata": True, "includeUserContext": True})
-        stop = data["hooks"]["Stop"][0]["hooks"][0]
-        self.assertEqual(stop["metadata"], {"includeConversationData": True, "includeUserContext": True})
+        self.assertNotIn("metadata", pre)
+        # Every seeded hook entry (all five events) is metadata-free and matches
+        # the minimal {type, command, timeout} shape.
+        for event, items in data["hooks"].items():
+            for item in items:
+                for hook in item["hooks"]:
+                    self.assertNotIn("metadata", hook, f"{event} hook carries metadata")
+                    self.assertEqual(
+                        set(hook.keys()), {"type", "command", "timeout"},
+                        f"{event} hook has unexpected keys: {hook}",
+                    )
+        # PreToolUse/PostToolUse keep their ".*" matcher; Stop/SessionStart/
+        # SessionEnd carry no matcher.
+        self.assertEqual(data["hooks"]["PreToolUse"][0]["matcher"], ".*")
+        self.assertEqual(data["hooks"]["PostToolUse"][0]["matcher"], ".*")
+        self.assertNotIn("matcher", data["hooks"]["Stop"][0])
+        self.assertNotIn("matcher", data["hooks"]["SessionStart"][0])
+        self.assertNotIn("matcher", data["hooks"]["SessionEnd"][0])
         # toolPermissions seeded.
         names = {r["toolName"] for r in data["toolPermissions"]}
         self.assertEqual(names, {"launch-process", "mcp:.*"})
@@ -789,6 +866,20 @@ class TestMdmManagedSettings(unittest.TestCase):
         # Managed command quotes the /etc/augment path.
         cmd = data["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         self.assertIn(str(self.managed / "hooks" / "unbound.py"), cmd)
+        # No per-hook metadata is seeded (Auggie 0.30.0 warns on any flag;
+        # deferred to Phase 2). Every entry is just {type, command, timeout}.
+        for event, items in data["hooks"].items():
+            for item in items:
+                for hook in item["hooks"]:
+                    self.assertNotIn("metadata", hook, f"{event} hook carries metadata")
+                    self.assertEqual(
+                        set(hook.keys()), {"type", "command", "timeout"},
+                        f"{event} hook has unexpected keys: {hook}",
+                    )
+        # PreToolUse/PostToolUse keep ".*"; Stop/SessionStart/SessionEnd have none.
+        self.assertEqual(data["hooks"]["PreToolUse"][0]["matcher"], ".*")
+        self.assertEqual(data["hooks"]["PostToolUse"][0]["matcher"], ".*")
+        self.assertNotIn("matcher", data["hooks"]["Stop"][0])
         names = {r["toolName"] for r in data["toolPermissions"]}
         self.assertEqual(names, {"launch-process", "mcp:.*"})
 

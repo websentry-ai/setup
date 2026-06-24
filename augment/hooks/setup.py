@@ -42,28 +42,37 @@ DEBUG = False
 # <CMD>). They are kept as builder functions so the per-hook command can be
 # swapped for the MDM path / Windows launcher without duplicating the schema.
 
-# Per-matcher metadata flags Augment honors (it only injects the extra context
-# when the matcher opts in).
-_PRE_POST_METADATA = {"includeMCPMetadata": True, "includeUserContext": True}
-_STOP_METADATA = {"includeConversationData": True, "includeUserContext": True}
+# Per-hook `metadata` flags (includeUserContext / includeMCPMetadata /
+# includeConversationData) are INTENTIONALLY DEFERRED to Phase 2 — we seed NO
+# metadata on any hook entry. Two reasons, verified empirically against Auggie
+# 0.30.0:
+#   (a) Auggie 0.30.0 prints "Some plugin hooks use unsupported configuration"
+#       on EVERY run when ANY per-hook metadata flag is present (confirmed by
+#       toggling: any one flag -> warning; zero metadata -> clean).
+#   (b) The data those flags gate is unused in Phase 1: the `conversation` body
+#       for audit lands at /v1/hooks/augment (404 until Phase 2), and
+#       `mcp_metadata` for MCP server/tool resolution isn't enforced until
+#       Phase 2 either. So the flags buy a user-visible warning for zero
+#       current benefit.
+# Phase 2 re-introduces the metadata flags once the gateway endpoints consume
+# the data AND Auggie's metadata-validation behavior is re-verified.
 
 
 def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
     """The Augment `hooks` block. Augment has no UserPromptSubmit event, so it is
     absent. Timeouts are in milliseconds. `extra` (e.g. {"shell": "powershell"})
-    is merged into every hook entry for the Windows launcher."""
-    def _hook(timeout: int, metadata: Optional[Dict] = None) -> Dict:
+    is merged into every hook entry for the Windows launcher. No per-hook
+    metadata is emitted — see the deferral note above."""
+    def _hook(timeout: int) -> Dict:
         entry = {"type": "command", "command": hook_command, "timeout": timeout}
-        if metadata is not None:
-            entry["metadata"] = metadata
         if extra:
             entry = {**entry, **extra}
         return entry
 
     return {
-        "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000, _PRE_POST_METADATA)]}],
-        "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000, _PRE_POST_METADATA)]}],
-        "Stop": [{"hooks": [_hook(10000, _STOP_METADATA)]}],
+        "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000)]}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000)]}],
+        "Stop": [{"hooks": [_hook(10000)]}],
         "SessionStart": [{"hooks": [_hook(60000)]}],
         "SessionEnd": [{"hooks": [_hook(10000)]}],
     }
