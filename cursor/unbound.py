@@ -109,12 +109,20 @@ def _should_report():
         return False
 
 
+def redact_secrets(text, key=None):
+    text = re.sub(r'(?i)\bBearer\s+\S+', 'Bearer [REDACTED]', str(text))
+    if key and len(key) >= 8:
+        text = text.replace(key, '[REDACTED]')
+    return text
+
+
 def report_error_to_gateway(message, category='general', api_key=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
     if _reporting_error or not api_key or not _should_report():
         return
     _reporting_error = True
+    message = redact_secrets(message, api_key)
     try:
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
@@ -139,6 +147,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
 
 def log_error(message, category='general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
+    message = redact_secrets(message, _cached_api_key)
     timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
     error_entry = f"{timestamp}: {message}\n"
 
@@ -443,11 +452,12 @@ def format_hook_response(api_response):
     if not api_response:
         return {}
     decision = api_response.get('decision', 'allow')
-    # Normalise gateway values to Cursor's two-state permission field
-    permission = 'deny' if decision in ('deny', 'block') else 'allow'
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
-    response = {'permission': permission}
+    # On 'allow', emit no permission so Cursor uses its normal flow instead of the hook force-approving (keep any advisory context).
+    if decision not in ('deny', 'block'):
+        return {'agent_message': additional_context} if additional_context else {}
+    response = {'permission': 'deny'}
     if reason:
         response['user_message'] = reason
     if additional_context:
@@ -696,6 +706,10 @@ def process_pre_tool_use(event, api_key):
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = event.get('tool_use_id')
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -709,7 +723,7 @@ def process_pre_tool_use(event, api_key):
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
             if result == 'approved':
-                return {'permission': 'allow'}
+                return {}
             elif result == 'deny':
                 return {
                     'permission': 'deny',
@@ -942,7 +956,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
             if result == 'approved':
-                return {'permission': 'allow'}
+                return {}
             elif result == 'deny':
                 return {
                     'permission': 'deny',
@@ -1048,6 +1062,8 @@ def build_llm_exchange(events, api_key=None):
     conversation_id = None
     model = None
     user_email = None
+    request_initialized = None
+    request_completed = None
 
     for log_entry in events:
         event = log_entry.get('event', {})
@@ -1061,10 +1077,14 @@ def build_llm_exchange(events, api_key=None):
 
         if not user_email:
             user_email = event.get('user_email')
-        
+
         if hook_event_name == 'beforeSubmitPrompt':
             user_prompt = event.get('prompt')
-        
+            request_initialized = log_entry.get('timestamp')
+
+        elif hook_event_name == 'stop':
+            request_completed = log_entry.get('timestamp')
+
         elif hook_event_name == 'beforeReadFile':
             assistant_tool_uses.append({
                 'type': hook_event_name,
@@ -1086,7 +1106,8 @@ def build_llm_exchange(events, api_key=None):
                 'tool_name': tool_name,
                 'tool_input': event.get('tool_input'),
                 'tool_output': tool_output,
-                'duration': event.get('duration')
+                'duration': event.get('duration'),
+                'tool_use_id': event.get('tool_use_id')
             })
         
         elif hook_event_name == 'afterFileEdit':
@@ -1135,6 +1156,12 @@ def build_llm_exchange(events, api_key=None):
         'messages': messages,
         'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
+
+    # Omit when unknown; gateway falls back
+    if request_initialized:
+        exchange['requestInitialized'] = request_initialized
+    if request_completed:
+        exchange['requestCompleted'] = request_completed
 
     return exchange
 
@@ -1802,7 +1829,7 @@ def main():
         # Log errors but still output {} to not break Cursor
         log_error(f"Exception in main: {str(e)}", 'general')
         print("{}", file=sys.stderr)
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"Error: {redact_secrets(str(e), _cached_api_key)}", file=sys.stderr)
         print("{}")
 
 
