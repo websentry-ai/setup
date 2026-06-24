@@ -839,10 +839,12 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
             except Exception:
                 continue
             for entry in (data.get('remoteMcpServersConfig') or []):
-                if isinstance(entry, dict) and entry.get('uuid') == server_uuid:
+                if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
                     name = entry.get('name')
                     if not name:
-                        return None
+                        # UUID matched but this record has no display name; keep
+                        # scanning — another session file may carry a named one.
+                        continue
                     cfg = {"additional_data": {"scope": "claude-connector"}}
                     url = entry.get('url')
                     if url:
