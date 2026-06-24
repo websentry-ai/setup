@@ -616,16 +616,6 @@ def _compute_script_hash(command, args, cwd):
         return None
 
 
-def _augment_script_hash(result, cwd):
-    """Add scriptHash to an MCP server config when it runs a local script, so the
-    gateway can fingerprint it as `script:<hash>`."""
-    if result and result.get('command'):
-        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
-        if script_hash:
-            result['scriptHash'] = script_hash
-    return result
-
-
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
     for config_path in _copilot_mcp_config_paths(cwd):

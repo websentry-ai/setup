@@ -712,10 +712,21 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
             path = os.path.join(cwd, path)
         if not os.path.isfile(path):
             return None
+        file_size = os.path.getsize(path)
+        if file_size > _HOOK_MAX_SCRIPT_BYTES:
+            log_error(
+                f"mcp script hash: file too large ({file_size} bytes), hashing first {_HOOK_MAX_SCRIPT_BYTES} bytes: {path}",
+                'mcp_server',
+            )
         h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
         with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
                 h.update(chunk)
+                remaining -= len(chunk)
         return h.hexdigest()
     except Exception:
         return None
@@ -789,6 +800,64 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
             if result:
                 return _augment_script_hash(result, cwd)
 
+        return None
+    except Exception:
+        return None
+
+
+_MCP_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
+)
+
+
+def _looks_like_mcp_uuid(name: str) -> bool:
+    return bool(name) and bool(_MCP_UUID_RE.match(name))
+
+
+def _agent_mode_sessions_dir() -> Optional[Path]:
+    """Where Claude desktop (agent-mode / Cowork's 'Code') stores per-session
+    remote MCP connector configs. Platform-specific; None if unknown."""
+    try:
+        home = Path.home()
+        if sys.platform == 'darwin':
+            return home / 'Library' / 'Application Support' / 'Claude' / 'local-agent-mode-sessions'
+        if sys.platform.startswith('win'):
+            appdata = os.environ.get('APPDATA')
+            return Path(appdata) / 'Claude' / 'local-agent-mode-sessions' if appdata else None
+        return home / '.config' / 'Claude' / 'local-agent-mode-sessions'
+    except Exception:
+        return None
+
+
+def _resolve_remote_mcp_connector(server_uuid: str, session_id: Optional[str] = None) -> Optional[Dict]:
+    """Remote OAuth MCP connectors are named by a per-registration UUID at
+    runtime, while the real config ({name, url, tools}) lives in the local
+    agent-mode session file's `remoteMcpServersConfig`. Recover the url by UUID
+    so the gateway can fingerprint it. Best-effort; returns None on any failure.
+    """
+    try:
+        base = _agent_mode_sessions_dir()
+        if not base or not base.exists():
+            return None
+        candidates = list(base.glob(f'**/local_{session_id}.json')) if session_id else []
+        if not candidates:
+            try:
+                candidates = sorted(
+                    base.glob('**/local_*.json'),
+                    key=lambda p: p.stat().st_mtime, reverse=True,
+                )[:20]
+            except Exception:
+                candidates = list(base.glob('**/local_*.json'))[:20]
+        for f in candidates:
+            try:
+                data = json.loads(f.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            for entry in (data.get('remoteMcpServersConfig') or []):
+                if isinstance(entry, dict) and entry.get('uuid') == server_uuid:
+                    url = entry.get('url')
+                    if url:
+                        return {'type': 'http', 'url': url}
         return None
     except Exception:
         return None
@@ -999,6 +1068,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             server_cfg = _read_mcp_server_config(
                 mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
             )
+            if not server_cfg and _looks_like_mcp_uuid(mcp_server_name):
+                # Remote OAuth connectors arrive named by a UUID (not in
+                # ~/.claude.json); recover the real url from the desktop
+                # agent-mode session config so the gateway can fingerprint it.
+                server_cfg = _resolve_remote_mcp_connector(
+                    mcp_server_name, session_id=session_id
+                )
             if server_cfg:
                 metadata['mcp_server_config'] = server_cfg
 
@@ -1558,8 +1634,8 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict, cwd: Option
             body = _read_script_body_b64(server_config.get('command'), server_config.get('args'), cwd)
             if body:
                 server_config = {**server_config, 'script_content': body}
-    except Exception:
-        pass
+    except Exception as e:
+        log_error(f"mcp scan dispatch: could not read script body for {server_name}: {e}", 'mcp_server')
     try:
         try:
             with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
