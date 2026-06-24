@@ -797,6 +797,66 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
         return None
 
 
+_MCP_UUID_RE = re.compile(
+    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
+)
+
+
+def _is_uuid(name: str) -> bool:
+    return bool(name) and bool(_MCP_UUID_RE.match(name))
+
+
+def _claude_code_sessions_dir() -> Optional[Path]:
+    try:
+        home = Path.home()
+        if sys.platform == 'darwin':
+            return home / 'Library' / 'Application Support' / 'Claude' / 'claude-code-sessions'
+        if sys.platform.startswith('win'):
+            appdata = os.environ.get('APPDATA')
+            return Path(appdata) / 'Claude' / 'claude-code-sessions' if appdata else None
+        return home / '.config' / 'Claude' / 'claude-code-sessions'
+    except Exception:
+        return None
+
+
+def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
+    if not _is_uuid(server_uuid):
+        return None
+    try:
+        base = _claude_code_sessions_dir()
+        if not base or not base.exists():
+            return None
+        try:
+            files = sorted(
+                base.glob('**/local_*.json'),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )[:20]
+        except Exception:
+            files = list(base.glob('**/local_*.json'))[:20]
+        for f in files:
+            try:
+                data = json.loads(f.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            for entry in (data.get('remoteMcpServersConfig') or []):
+                if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
+                    name = entry.get('name')
+                    if not name:
+                        # UUID matched but this record has no display name; keep
+                        # scanning — another session file may carry a named one.
+                        continue
+                    cfg = {"additional_data": {"scope": "claude-connector"}}
+                    url = entry.get('url')
+                    if url:
+                        cfg["url"] = url
+                        cfg["type"] = "http"
+                    return (name, cfg)
+        return None
+    except Exception as exc:
+        log_error(f"mcp cc-session resolve error: {server_uuid}: {exc}", 'mcp_connector')
+        return None
+
+
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
     try:
         if not config_path.exists():
@@ -1051,6 +1111,12 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                     plugin_cfg = _resolve_plugin_mcp_config(mcp_server_name)
                     if plugin_cfg:
                         metadata['mcp_server_config'] = plugin_cfg
+                    else:
+                        session_connector = _resolve_claude_code_session_connector(mcp_server_name)
+                        if session_connector:
+                            display_name, connector_cfg = session_connector
+                            metadata['mcp_server'] = display_name
+                            metadata['mcp_server_config'] = connector_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
