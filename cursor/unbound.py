@@ -452,11 +452,11 @@ def format_hook_response(api_response):
     if not api_response:
         return {}
     decision = api_response.get('decision', 'allow')
-    # On 'allow', emit no permission so Cursor uses its normal flow instead of the hook force-approving.
-    if decision not in ('deny', 'block'):
-        return {}
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
+    # On 'allow', emit no permission so Cursor uses its normal flow instead of the hook force-approving (keep any advisory context).
+    if decision not in ('deny', 'block'):
+        return {'agent_message': additional_context} if additional_context else {}
     response = {'permission': 'deny'}
     if reason:
         response['user_message'] = reason
