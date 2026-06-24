@@ -621,6 +621,12 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # On 'allow', emit no permissionDecision so Claude runs its normal permission flow (e.g. default-mode ask for un-allowlisted commands) instead of the hook force-approving.
+    if decision == 'allow':
+        if additional_context:
+            return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': additional_context}}
+        return {}
+
     return {
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
