@@ -616,6 +616,32 @@ _MCP_NAME_SEPARATORS = ('__', '-')
 _MIN_MCP_SERVER_NAME = 2
 
 
+# Built-in MCP servers provisioned at runtime by the host (never in on-disk config).
+# CLI url != VS Code url (per-surface). gateway-data must classify these urls into
+# the GitHub canonical group for the CLI built-in to match GitHub sanctions.
+COPILOT_CLI_BUILTIN_MCP = {
+    "github-mcp-server": {
+        "url": "https://api.individual.githubcopilot.com/mcp/readonly",
+        "type": "http",
+    }
+}
+
+COPILOT_VSCODE_BUILTIN_MCP = {
+    "github-mcp-server": {
+        "url": "https://api.githubcopilot.com/mcp",
+        "type": "http",
+    }
+}
+
+
+# Copy built-in registry literals so callers can't mutate the shared dicts.
+def _copy_if_builtin(cfg):
+    if cfg is COPILOT_CLI_BUILTIN_MCP.get('github-mcp-server') or \
+            cfg is COPILOT_VSCODE_BUILTIN_MCP.get('github-mcp-server'):
+        return dict(cfg)
+    return cfg
+
+
 # Resolve (server, tool, config) from a Copilot tool name. The mcp__ form is
 # self-delimiting; the bare form is matched against configured server names.
 # Matching is case-insensitive (Copilot lowercases nothing, configs vary case)
@@ -624,15 +650,18 @@ def detect_mcp_call(raw_tool, mcp_servers):
     if not raw_tool:
         return (None, None, None)
 
+    # Fold built-ins into the candidate set; a configured server of the same name wins.
+    merged = {**COPILOT_CLI_BUILTIN_MCP, **mcp_servers}
+
     if raw_tool.startswith('mcp__'):
         parts = raw_tool[len('mcp__'):].split('__', 1)
         server = parts[0]
         mcp_tool = parts[1] if len(parts) >= 2 else ''
-        return (server, mcp_tool, mcp_servers.get(server))
+        return (server, mcp_tool, _copy_if_builtin(merged.get(server)))
 
     raw_lower = raw_tool.lower()
     best = None  # (matched_len, server_name, mcp_tool)
-    for server_name in mcp_servers:
+    for server_name in merged:
         for candidate in {server_name, _sanitize_copilot_server_name(server_name)}:
             if len(candidate) < _MIN_MCP_SERVER_NAME:
                 continue
@@ -652,7 +681,7 @@ def detect_mcp_call(raw_tool, mcp_servers):
 
     if best is None:
         return (None, None, None)
-    return (best[1], best[2], mcp_servers.get(best[1]))
+    return (best[1], best[2], _copy_if_builtin(merged.get(best[1])))
 
 
 # VS Code Copilot names MCP tools `mcp_<server>_<tool>` (single underscore,
@@ -681,19 +710,12 @@ def _vscode_fingerprint_key(config):
     return None
 
 
-def _resolve_vscode_mcp(raw_tool, mcp_servers):
-    """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
-    tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
-    If a *different* server also matches and can't be proven to be the same server
-    (identical fingerprint config), the token is ambiguous -> unresolved (don't
-    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
-    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
-        return (None, None, None)
-    body = raw_tool[len('mcp_'):]
-    body_lower = body.lower()
-    segments = body.split('_')
-    candidates = []  # (server_portion_len, exact_flag, server_name, tool)
-    for server_name in mcp_servers:
+def _vscode_match_servers(server_names, body, body_lower, segments):
+    """Collect `(server_portion_len, exact_flag, server_name, tool)` candidates by
+    matching each server's sanitized aliases against the tool body, tolerating
+    truncation. Candidates resolving to an empty tool portion are dropped."""
+    candidates = []
+    for server_name in server_names:
         for alias in _vscode_server_aliases(server_name):
             if body_lower.startswith(alias + '_'):
                 cand = (len(alias), 1, server_name, body[len(alias) + 1:])
@@ -706,8 +728,29 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
                         break
             if cand is not None and cand[3]:
                 candidates.append(cand)
-    if not candidates:
+    return candidates
+
+
+def _resolve_vscode_mcp(raw_tool, mcp_servers):
+    """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
+    tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
+    If a *different* server also matches and can't be proven to be the same server
+    (identical fingerprint config), the token is ambiguous -> unresolved (don't
+    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
+    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
         return (None, None, None)
+    body = raw_tool[len('mcp_'):]
+    body_lower = body.lower()
+    segments = body.split('_')
+    candidates = _vscode_match_servers(mcp_servers, body, body_lower, segments)
+    if not candidates:
+        # Fall back to built-ins only when no configured server matched (configured wins).
+        builtin_candidates = _vscode_match_servers(
+            COPILOT_VSCODE_BUILTIN_MCP, body, body_lower, segments)
+        if len(builtin_candidates) != 1:
+            return (None, None, None)
+        bc = builtin_candidates[0]
+        return (bc[2], bc[3], _copy_if_builtin(COPILOT_VSCODE_BUILTIN_MCP[bc[2]]))
     best = max(candidates, key=lambda c: c[:2])
     best_key = _vscode_fingerprint_key(mcp_servers.get(best[2]))
     for cand in candidates:
@@ -945,9 +988,14 @@ def process_pre_tool_use(event, api_key):
                 'mcp_match',
             )
         else:
-            # Unmappable server: fall through to the gateway with mcp_server unset
-            # (not a short-circuit) so its other policies/logging/metering still run;
-            # the allow-list isn't evaluated without a resolved server (fail-open).
+            # Unresolved mcp_ tool: forward a best-effort identity so deny-by-default
+            # applies (fail-secure), but only with a non-empty tool segment — degenerate
+            # mcp_ tokens (empty tool) are left as-is.
+            body = raw_tool[len('mcp_'):]
+            parsed_server, _, parsed_tool = body.partition('_')
+            if parsed_server and parsed_tool:
+                mcp_server, mcp_tool = parsed_server, parsed_tool
+                canonical = f"mcp__{mcp_server}__{mcp_tool}"
             log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
 
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
@@ -968,6 +1016,8 @@ def process_pre_tool_use(event, api_key):
                     )
                 else:
                     log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+            # Deferred: bare unconfigured CLI MCP servers stay fail-open (no delimiter
+            # to split safely; blind-forwarding would over-block native tools).
             return {}
         is_mcp = True
         canonical = f"mcp__{mcp_server}__{mcp_tool}"

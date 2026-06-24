@@ -36,9 +36,82 @@ def _read_fixture_servers():
     return out
 
 
+CLI_BUILTIN_READONLY = "https://api.individual.githubcopilot.com/mcp/readonly"
+VSCODE_BUILTIN_URL = "https://api.githubcopilot.com/mcp"
+
+
+class TestDetectMcpCallBuiltin(unittest.TestCase):
+    """CLI bare-name resolution of the runtime-provisioned `github-mcp-server`
+    built-in (never in any config file). The built-in is folded into the candidate
+    set so its full name (len 17) out-ranks a coincidental `github` config (len 6)."""
+
+    def test_builtin_outranks_coincidental_github(self):
+        # A `github` server is configured, but the call is to the built-in
+        # github-mcp-server. The longer built-in name must win (no garbled tool,
+        # correct readonly url) instead of being mis-attributed to `github`.
+        srv, tool, cfg = unbound.detect_mcp_call(
+            "github-mcp-server-list_issues", {"github": {"url": "https://api.githubcopilot.com/mcp/"}})
+        self.assertEqual(srv, "github-mcp-server")
+        self.assertEqual(tool, "list_issues")
+        self.assertEqual(cfg.get("url"), CLI_BUILTIN_READONLY)
+
+    def test_builtin_resolves_with_no_config(self):
+        # No on-disk servers at all -> built-in still resolves (not None).
+        srv, tool, cfg = unbound.detect_mcp_call("github-mcp-server-list_issues", {})
+        self.assertEqual(srv, "github-mcp-server")
+        self.assertEqual(tool, "list_issues")
+        self.assertEqual(cfg.get("url"), CLI_BUILTIN_READONLY)
+
+    def test_configured_server_wins_over_builtin(self):
+        # A user-configured github-mcp-server (custom url) takes precedence over the
+        # built-in registry entry (config last in the merge).
+        custom = "https://internal.example/mcp"
+        srv, tool, cfg = unbound.detect_mcp_call(
+            "github-mcp-server-list_issues", {"github-mcp-server": {"url": custom}})
+        self.assertEqual(srv, "github-mcp-server")
+        self.assertEqual(tool, "list_issues")
+        self.assertEqual(cfg.get("url"), custom)
+
+    def test_unrelated_bare_tool_still_unresolved(self):
+        # The built-in must not broaden matching: an unrelated bare tool name with
+        # no configured server stays (None, None, None).
+        self.assertEqual(
+            unbound.detect_mcp_call("some_native_tool", {}),
+            (None, None, None))
+
+
 class TestResolveVscodeMcp(unittest.TestCase):
     def setUp(self):
         self.servers = _read_fixture_servers()
+
+    def test_builtin_fallback_resolves_when_unconfigured(self):
+        # No `github`/github-mcp-server configured at all. A built-in hosted call
+        # must fall back to the VS Code built-in registry url.
+        servers = {"playwright": {"command": "npx", "args": ["@playwright/mcp@latest"]}}
+        srv, tool, cfg = unbound._resolve_vscode_mcp(
+            "mcp_github_mcp_se_list_commits", servers)
+        self.assertEqual(srv, "github-mcp-server")
+        self.assertEqual(tool, "list_commits")
+        self.assertEqual(cfg.get("url"), VSCODE_BUILTIN_URL)
+
+    def test_configured_server_wins_over_builtin_fallback(self):
+        # setup#168 preserved: a configured server that matches resolves to ITS
+        # config; the built-in fallback never fires (early candidates non-empty).
+        srv, tool, cfg = unbound._resolve_vscode_mcp(
+            "mcp_github_mcp_se_search_repositories", self.servers)
+        self.assertEqual(srv, "io.github.github/github-mcp-server")
+        self.assertEqual(tool, "search_repositories")
+        self.assertEqual(cfg.get("url"), GH_GROUP)
+
+    def test_builtin_fallback_does_not_override_configured_ambiguity(self):
+        # Two configured servers overlap and are genuinely ambiguous -> unresolved.
+        # The built-in fallback must NOT rescue this: it only fires when the
+        # configured candidate set is empty, not when it's ambiguous.
+        servers = {"linear": {"url": "https://danger/mcp"},
+                   "linear_create_safe": {"url": "https://safe/mcp"}}
+        self.assertEqual(
+            unbound._resolve_vscode_mcp("mcp_linear_create_issue", servers),
+            (None, None, None))
 
     def test_truncated_server_name_resolves(self):
         # io.github.github/github-mcp-server surfaces as the truncated
@@ -250,6 +323,54 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertFalse(self.is_block(ret))
 
 
+class TestProcessPreToolUseVscodeBuiltin(unittest.TestCase):
+    """E2E for the VS Code built-in fallback: no `github` is configured, so the
+    hosted github-mcp-server resolves via the built-in registry url and the org
+    sanction list applies to it."""
+
+    BUILTIN_URL = "https://api.githubcopilot.com/mcp"
+    # Config that deliberately omits any github server so the fallback fires.
+    NO_GITHUB_CONFIG = {"servers": {"playwright": {"command": "npx", "args": ["@playwright/mcp@latest"]}}}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        cfg_path = Path(self._tmp.name) / ".vscode" / "mcp.json"
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(self.NO_GITHUB_CONFIG))
+        self._patchers = [
+            patch.object(unbound, "_copilot_mcp_config_paths", lambda cwd=None: [cfg_path]),
+            patch.object(unbound, "load_policy_cache", lambda: None),
+            patch.object(unbound, "get_recent_user_prompts_for_session", lambda *a, **k: []),
+            patch.object(unbound, "get_session_start_model", lambda *a, **k: "auto"),
+            patch.object(unbound, "_is_approval_retry", lambda *a, **k: False),
+            patch.object(unbound, "report_error_to_gateway", lambda *a, **k: None),
+        ]
+        for p in self._patchers:
+            p.start()
+        self.cwd = self._tmp.name
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        self._tmp.cleanup()
+
+    def _run(self, raw_tool, sanctioned_groups):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": raw_tool,
+            "tool_input": {"q": "x"}, "cwd": self.cwd, "session_id": "s",
+        }
+        with patch.object(unbound, "send_to_hook_api", _gateway(sanctioned_groups)), \
+             patch.object(unbound, "_read_policy_cache_raw",
+                          lambda: {"policy_check_failure_action": "allow"}):
+            return unbound.process_pre_tool_use(event, "K")
+
+    def test_sanctioned_builtin_hosted_github_is_allowed(self):
+        # Built-in hosted github call, its url sanctioned -> allowed.
+        ret = self._run("mcp_github_mcp_se_list_commits", {self.BUILTIN_URL})
+        self.assertFalse(ProcessPreToolUseBase.is_block(ret))
+
+
 class TestUnresolvedForwarding(ProcessPreToolUseBase):
     def test_unresolved_mcp_is_forwarded_to_gateway_not_short_circuited(self):
         # An unmappable mcp_ call must still reach the gateway, not return {} early.
@@ -268,11 +389,52 @@ class TestUnresolvedForwarding(ProcessPreToolUseBase):
             unbound.process_pre_tool_use(event, "K")
         self.assertIn("body", called)  # gateway WAS called (not short-circuited)
         md = called["body"]["pre_tool_use_data"]["metadata"]
-        self.assertNotIn("mcp_server", md)  # nothing resolved to forward
+        # CHANGED (VS Code Fix B): an unresolved `mcp_<server>_<tool>` now forwards a
+        # best-effort server token (mcp_server present, no config) so deny-by-default
+        # can apply, instead of leaving mcp_server unset and slipping the allow-list.
+        self.assertEqual(md.get("mcp_server"), "unknownserver")
+        self.assertEqual(md.get("mcp_tool"), "do_thing")
+        self.assertNotIn("mcp_server_config", md)  # nothing resolved -> no config forwarded
 
-    def test_unresolved_mcp_not_sanction_blocked(self):
-        # No resolved server -> allow-list not evaluated (fail-open) for unresolved.
+    def test_unresolved_mcp_is_sanction_blocked_fail_secure(self):
+        # CHANGED behavior (VS Code Fix B): an unresolved `mcp_<server>_<tool>` no
+        # longer fails open. The `mcp_` prefix is a reliable MCP signal, so a
+        # best-effort server token is forwarded (mcp_server present) and the active
+        # sanction list now BLOCKS the unrecognized server (deny-by-default).
         ret = self.run_tool("mcp_unknownserver_do_thing", {GH_GROUP})
+        self.assertTrue(self.is_block(ret))
+
+    def test_degenerate_empty_tool_token_is_not_forwarded(self):
+        # Fix 1: a degenerate `mcp_`-prefixed token with NO tool segment (e.g.
+        # `mcp_x` -> body `x` -> partition yields empty tool) must NOT forward a
+        # malformed `mcp__x__` identity. Forwarding mcp_server with an empty tool
+        # over-promises fail-secure: the gateway's `if srv and tool` guard treats
+        # the empty tool as "not MCP" and fails OPEN. So we leave it as-is —
+        # mcp_server/mcp_tool stay unset (the pre-existing behavior, no regression).
+        called = {}
+
+        def capturing_gw(request_body, api_key):
+            called["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_x",
+            "tool_input": {"q": "x"}, "cwd": self.cwd, "session_id": "s",
+        }
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+        md = called["body"]["pre_tool_use_data"]["metadata"]
+        self.assertNotIn("mcp_server", md)  # no malformed identity forwarded
+        self.assertNotIn("mcp_tool", md)
+        self.assertNotIn("mcp_server_config", md)
+
+    def test_degenerate_empty_tool_token_is_not_falsely_blocked(self):
+        # Fix 1 (the fail-secure correction): because no mcp_server is forwarded for
+        # a degenerate token, an active sanction list must NOT block it. The old
+        # behavior would have claimed fail-secure while actually failing open at the
+        # gateway; here it is honestly left as a non-MCP no-op (allow), not blocked.
+        ret = self.run_tool("mcp_x", {GH_GROUP})
         self.assertFalse(self.is_block(ret))
 
 
