@@ -1008,13 +1008,8 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
         return None
 
 
-_MCP_UUID_RE = re.compile(
-    r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE
-)
-
-
-def _looks_like_mcp_uuid(name: str) -> bool:
-    return bool(name) and bool(_MCP_UUID_RE.match(name))
+# Bound how much of a session JSON we read while resolving a remote connector.
+_MCP_SESSION_MAX_BYTES = 10_000_000
 
 
 def _agent_mode_sessions_dir() -> Optional[Path]:
@@ -1038,33 +1033,42 @@ def _resolve_remote_mcp_connector(server_uuid: str, session_id: Optional[str] = 
     agent-mode session file's `remoteMcpServersConfig`. Recover the url by UUID
     so the gateway can fingerprint it. Best-effort; returns None on any failure.
     """
+    def _match_in(path):
+        try:
+            if path.stat().st_size > _MCP_SESSION_MAX_BYTES:
+                return None
+            data = json.loads(path.read_text(encoding='utf-8'))
+        except Exception:
+            return None
+        for entry in (data.get('remoteMcpServersConfig') or []):
+            if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
+                url = entry.get('url')
+                if url:
+                    return {'type': 'http', 'url': url}
+        return None
+
     try:
         base = _agent_mode_sessions_dir()
         if not base or not base.exists():
             return None
-        candidates = list(base.glob(f'**/local_{session_id}.json')) if session_id else []
-        # Always append recent sessions as a fallback: a present-but-non-matching
-        # session_id file must not block discovery in other session files.
+        # Fast path: the session's own file. Only fall back to scanning recent
+        # sessions if it's absent or doesn't carry this UUID — a present-but-wrong
+        # session file must not block discovery, but we don't scan 20 files when
+        # the direct lookup already answers.
+        if session_id:
+            for f in base.glob(f'**/local_{session_id}.json'):
+                hit = _match_in(f)
+                if hit:
+                    return hit
         try:
-            recent = sorted(
-                base.glob('**/local_*.json'),
-                key=lambda p: p.stat().st_mtime, reverse=True,
-            )[:20]
+            recent = sorted(base.glob('**/local_*.json'),
+                            key=lambda p: p.stat().st_mtime, reverse=True)[:20]
         except Exception:
             recent = list(base.glob('**/local_*.json'))[:20]
         for f in recent:
-            if f not in candidates:
-                candidates.append(f)
-        for f in candidates:
-            try:
-                data = json.loads(f.read_text(encoding='utf-8'))
-            except Exception:
-                continue
-            for entry in (data.get('remoteMcpServersConfig') or []):
-                if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
-                    url = entry.get('url')
-                    if url:
-                        return {'type': 'http', 'url': url}
+            hit = _match_in(f)
+            if hit:
+                return hit
         return None
     except Exception:
         return None
@@ -1275,7 +1279,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             server_cfg = _read_mcp_server_config(
                 mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
             )
-            if not server_cfg and _looks_like_mcp_uuid(mcp_server_name):
+            if not server_cfg and _is_uuid(mcp_server_name):
                 # Remote OAuth connectors arrive named by a UUID (not in
                 # ~/.claude.json); recover the real url from the desktop
                 # agent-mode session config so the gateway can fingerprint it.
