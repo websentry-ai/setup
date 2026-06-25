@@ -1056,7 +1056,7 @@ def _resolve_remote_mcp_connector(server_uuid: str, session_id: Optional[str] = 
             except Exception:
                 continue
             for entry in (data.get('remoteMcpServersConfig') or []):
-                if isinstance(entry, dict) and entry.get('uuid') == server_uuid:
+                if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
                     url = entry.get('url')
                     if url:
                         return {'type': 'http', 'url': url}

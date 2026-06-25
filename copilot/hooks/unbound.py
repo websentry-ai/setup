@@ -618,10 +618,14 @@ def _hook_candidate_script(command, args):
     return None
 
 
+_HOOK_MAX_SCRIPT_BYTES = 1_000_000
+
+
 def _compute_script_hash(command, args, cwd):
     """sha256 of the local script's contents, or None when it isn't a resolvable
     local script. Matches what the backend recomputes from the uploaded body, so
-    the gateway's `script:<hash>` lookup lines up with the stored fingerprint."""
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped at 1MB so all clients agree on the hash for large scripts."""
     try:
         cand = _hook_candidate_script(command, args)
         if not cand:
@@ -633,10 +637,21 @@ def _compute_script_hash(command, args, cwd):
             path = os.path.join(cwd, path)
         if not os.path.isfile(path):
             return None
+        file_size = os.path.getsize(path)
+        if file_size > _HOOK_MAX_SCRIPT_BYTES:
+            log_error(
+                f"mcp script hash: file too large ({file_size} bytes), hashing first {_HOOK_MAX_SCRIPT_BYTES} bytes: {path}",
+                'mcp_server',
+            )
         h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
         with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
                 h.update(chunk)
+                remaining -= len(chunk)
         return h.hexdigest()
     except Exception:
         return None
