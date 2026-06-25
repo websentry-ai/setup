@@ -22,7 +22,7 @@ SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/ma
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
-BACKFILL_TOOL_TYPE = "augment"
+BACKFILL_TOOL_TYPE = "augment_code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
@@ -31,27 +31,20 @@ BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 
 # --- Augment settings blocks (mirrors augment/hooks/setup.py) ----------------
-# Per-hook `metadata` flags (includeUserContext / includeMCPMetadata /
-# includeConversationData) are INTENTIONALLY DEFERRED to Phase 2 — we seed NO
-# metadata on any hook entry. Two reasons, verified empirically against Auggie
-# 0.30.0:
-#   (a) Auggie 0.30.0 prints "Some plugin hooks use unsupported configuration"
-#       on EVERY run when ANY per-hook metadata flag is present (confirmed by
-#       toggling: any one flag -> warning; zero metadata -> clean).
-#   (b) The data those flags gate is unused in Phase 1: the `conversation` body
-#       for audit lands at /v1/hooks/augment (404 until Phase 2), and
-#       `mcp_metadata` for MCP server/tool resolution isn't enforced until
-#       Phase 2 either. So the flags buy a user-visible warning for zero
-#       current benefit.
-# Phase 2 re-introduces the metadata flags once the gateway endpoints consume
-# the data AND Auggie's metadata-validation behavior is re-verified.
+# No per-hook `metadata` is seeded. Auggie rejects a `metadata` property on a
+# hook entry ("Unknown property metadata ... will be ignored") and shows a
+# "Some plugin hooks use unsupported configuration" warning on every run. It is
+# also unnecessary: Auggie delivers the turn conversation by DEFAULT on the Stop
+# event (event._exchange.exchange.{request_message, response_text}) — which is
+# what the end-of-turn analytics read.
 
 
 def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
     """The Augment `hooks` block. No UserPromptSubmit (Augment has no such event).
     Timeouts are in milliseconds. `extra` (e.g. {"shell": "powershell"}) is merged
     into every hook entry for the Windows launcher. No per-hook metadata is
-    emitted — see the deferral note above."""
+    emitted — Auggie rejects it and the turn conversation arrives by default on
+    Stop (see the note above)."""
     def _hook(timeout: int) -> Dict:
         entry = {"type": "command", "command": hook_command, "timeout": timeout}
         if extra:
@@ -536,7 +529,7 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
     # URL-encode params: device_id (a serial number) and app_name can contain
     # '&', ' ', '=', etc., which would otherwise inject/truncate query params.
-    query = [("serial_number", device_id), ("app_type", "augment")]
+    query = [("serial_number", device_id), ("app_type", "augment_code")]
     if app_name:
         query.insert(0, ("app_name", app_name))
     params = urllib.parse.urlencode(query)
@@ -979,8 +972,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
                 )
                 if not our_hook_exists:
                     existing_config.extend(new_config)
-            else:
+            elif existing_config is None:
                 settings["hooks"][event] = new_config
+            # A foreign non-list hooks[event] is left untouched — never clobber an
+            # org's own Augment config in the shared settings file.
 
         # Merge toolPermissions, preserving foreign rules. Match on our identity
         # (toolName + shellInputRegex) so re-running never duplicates.
@@ -1715,7 +1710,7 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "augment", backend_url=base_url, install_state=state, serial_number=device_id)
+    notify_setup_complete(api_key, "augment_code", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())

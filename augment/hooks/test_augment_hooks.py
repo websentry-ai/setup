@@ -151,10 +151,10 @@ class TestPreToolDecisionMapping(_HomeTmp):
         unbound.save_policy_cache(tools_to_check=["launch-process"])
         with patch.object(unbound, "send_to_hook_api", side_effect=_capture):
             unbound.process_pre_tool_use(event, "sk-test")
-        self.assertEqual(captured["body"]["unbound_app_label"], "augment")
+        self.assertEqual(captured["body"]["unbound_app_label"], "augment_code")
         # byte-exact
         self.assertEqual(
-            json.dumps(captured["body"]["unbound_app_label"]), '"augment"'
+            json.dumps(captured["body"]["unbound_app_label"]), '"augment_code"'
         )
 
     def test_model_from_context_model_name(self):
@@ -283,7 +283,7 @@ class TestPreToolDecisionMapping(_HomeTmp):
         self.assertEqual(pre["command"], json.dumps({"q": 1}))
         # Allow decision -> empty hook output (fail-open / non-blocking).
         self.assertEqual(out, {})
-        self.assertEqual(captured["body"]["unbound_app_label"], "augment")
+        self.assertEqual(captured["body"]["unbound_app_label"], "augment_code")
 
     def test_corrupted_stdin_is_noop(self):
         """A non-JSON stdin must not blow up main(); it prints suppressOutput."""
@@ -346,8 +346,10 @@ class TestExtractCommand(unittest.TestCase):
 # Stop audit exchange                                                         #
 # --------------------------------------------------------------------------- #
 class TestStopExchange(_HomeTmp):
-    def test_build_exchange_from_conversation_and_post_log(self):
-        # Seed one PostToolUse entry in the audit log for the session.
+    def test_build_exchange_from_exchange_and_post_log(self):
+        # Augment delivers the turn under event._exchange.exchange (the primary
+        # path when includeConversationData is set); PostToolUse calls are
+        # reconstructed from the audit log and canonicalized to claude-code shape.
         unbound.append_to_audit_log({
             "timestamp": "2026-01-01T00:00:00Z",
             "session_id": "conv-9",
@@ -365,11 +367,10 @@ class TestStopExchange(_HomeTmp):
         stop_event = {
             "hook_event_name": "Stop",
             "session_id": "conv-9",
-            "conversation": {
-                "userPrompt": "list files",
-                "agentTextResponse": "Here are the files.",
-                "agentCodeResponse": ["print('done')"],
-            },
+            "_exchange": {"exchange": {
+                "request_message": "list files",
+                "response_text": "Here are the files.",
+            }},
         }
         captured = {}
         with patch.object(unbound, "send_to_api", side_effect=lambda ex, key: captured.update(ex) or True):
@@ -380,11 +381,70 @@ class TestStopExchange(_HomeTmp):
         assistant = captured["messages"][1]
         self.assertEqual(assistant["role"], "assistant")
         self.assertIn("Here are the files.", assistant["content"])
-        self.assertIn("print('done')", assistant["content"])
         tu = assistant["tool_use"][0]
-        self.assertEqual(tu["tool_name"], "launch-process")
-        self.assertEqual(tu["tool_output"], "file1\nfile2")
+        # launch-process canonicalizes to Bash; output rides tool_response.stdout.
+        self.assertEqual(tu["tool_name"], "Bash")
+        self.assertEqual(tu["tool_input"], {"command": "ls"})
+        self.assertEqual(tu["tool_response"], {"stdout": "file1\nfile2"})
         self.assertEqual(tu["tool_use_id"], "tuid-9")
+
+    def test_posttooluse_canonicalization(self):
+        # view -> Read (output in tool_response.content); save-file -> Write
+        # (content in tool_input); MCP -> mcp__<server>__<tool>.
+        read = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "view", "tool_input": {"path": "/a.py"},
+            "tool_output": "print(1)", "tool_use_id": "t1",
+        })
+        self.assertEqual(read["tool_name"], "Read")
+        self.assertEqual(read["tool_input"], {"file_path": "/a.py"})
+        self.assertEqual(read["tool_response"], {"content": "print(1)"})
+
+        write = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "save-file",
+            "tool_input": {"path": "/b.py", "content": "x=1"},
+            "tool_use_id": "t2",
+        })
+        self.assertEqual(write["tool_name"], "Write")
+        self.assertEqual(write["tool_input"], {"file_path": "/b.py", "content": "x=1"})
+
+        mcp = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "x", "is_mcp_tool": True,
+            "mcp_metadata": {"mcpExecutedToolServerName": "github",
+                             "mcpExecutedToolName": "create_issue"},
+            "tool_input": {"title": "hi"}, "tool_use_id": "t3",
+        })
+        self.assertEqual(mcp["tool_name"], "mcp__github__create_issue")
+
+        # No mcp_metadata (this Auggie build omits it) -> unknown server/tool.
+        mcp2 = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "", "is_mcp_tool": True, "tool_input": {}, "tool_use_id": "t4",
+        })
+        self.assertEqual(mcp2["tool_name"], "mcp__unknown__unknown")
+
+    def test_multi_turn_does_not_cross_attach_tool_calls(self):
+        # Two turns in one session: turn 1 (PostToolUse + Stop), then turn 2
+        # (PostToolUse). The turn-2 Stop exchange must include ONLY turn 2's call.
+        for ev in (
+            {"hook_event_name": "PostToolUse", "session_id": "s1",
+             "tool_name": "launch-process", "tool_input": {"command": "ls"},
+             "tool_output": "out1", "tool_use_id": "old"},
+            {"hook_event_name": "Stop", "session_id": "s1"},
+            {"hook_event_name": "PostToolUse", "session_id": "s1",
+             "tool_name": "launch-process", "tool_input": {"command": "pwd"},
+             "tool_output": "out2", "tool_use_id": "new"},
+        ):
+            unbound.append_to_audit_log({"session_id": "s1", "event": ev})
+
+        stop2 = {"hook_event_name": "Stop", "session_id": "s1",
+                 "_exchange": {"exchange": {"request_message": "pwd?",
+                                            "response_text": "ok"}}}
+        captured = {}
+        with patch.object(unbound, "send_to_api", side_effect=lambda ex, key: captured.update(ex) or True):
+            unbound.process_stop_event(stop2, "sk-test")
+
+        tool_uses = captured["messages"][1]["tool_use"]
+        self.assertEqual([t["tool_use_id"] for t in tool_uses], ["new"])
+        self.assertEqual(tool_uses[0]["tool_input"], {"command": "pwd"})
 
     def test_audit_endpoint_is_augment(self):
         captured = {}
