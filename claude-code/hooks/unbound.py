@@ -689,8 +689,9 @@ def _hook_looks_like_path(value: str) -> bool:
     v = (value or '').strip().strip('"\'')
     if v.startswith(('http://', 'https://', '@', 'git+')):
         return False
-    if '${' in v or '/' in v or '\\' in v:
-        return True
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
     return bool(_HOOK_SCRIPT_EXT_RE.search(v))
 
 
@@ -1042,14 +1043,18 @@ def _resolve_remote_mcp_connector(server_uuid: str, session_id: Optional[str] = 
         if not base or not base.exists():
             return None
         candidates = list(base.glob(f'**/local_{session_id}.json')) if session_id else []
-        if not candidates:
-            try:
-                candidates = sorted(
-                    base.glob('**/local_*.json'),
-                    key=lambda p: p.stat().st_mtime, reverse=True,
-                )[:20]
-            except Exception:
-                candidates = list(base.glob('**/local_*.json'))[:20]
+        # Always append recent sessions as a fallback: a present-but-non-matching
+        # session_id file must not block discovery in other session files.
+        try:
+            recent = sorted(
+                base.glob('**/local_*.json'),
+                key=lambda p: p.stat().st_mtime, reverse=True,
+            )[:20]
+        except Exception:
+            recent = list(base.glob('**/local_*.json'))[:20]
+        for f in recent:
+            if f not in candidates:
+                candidates.append(f)
         for f in candidates:
             try:
                 data = json.loads(f.read_text(encoding='utf-8'))
@@ -1289,7 +1294,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                 else:
                     plugin_cfg = _resolve_plugin_mcp_config(mcp_server_name)
                     if plugin_cfg:
-                        metadata['mcp_server_config'] = plugin_cfg
+                        # Plugin servers can run a local script too — attach
+                        # scriptHash like the regular config path does.
+                        metadata['mcp_server_config'] = _augment_script_hash(plugin_cfg, cwd)
                     else:
                         session_connector = _resolve_claude_code_session_connector(mcp_server_name)
                         if session_connector:

@@ -594,8 +594,9 @@ def _hook_looks_like_path(value):
     v = (value or '').strip().strip('"\'')
     if v.startswith(('http://', 'https://', '@', 'git+')):
         return False
-    if '${' in v or '/' in v or '\\' in v:
-        return True
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
     return bool(_HOOK_SCRIPT_EXT_RE.search(v))
 
 
