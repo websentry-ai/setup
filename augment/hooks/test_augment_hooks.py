@@ -1444,5 +1444,103 @@ class TestNoSilentDrop(_HomeTmp):
             log_err.assert_not_called()
 
 
+# --------------------------------------------------------------------------- #
+# Bugbot FIX 1: pretool network budget fits under the 15000ms PreToolUse       #
+# timeout                                                                      #
+# --------------------------------------------------------------------------- #
+class TestPretoolNetworkBudget(_HomeTmp):
+    PRETOOL_HOOK_TIMEOUT_MS = 15000  # build_hooks_block PreToolUse timeout
+
+    def test_pretool_curl_uses_reduced_per_attempt_timeout(self):
+        """send_to_hook_api passes the reduced PRETOOL_CURL_TIMEOUT (not 20s) to
+        curl, so a slow gateway cannot blow the 15000ms hook budget."""
+        seen = {"timeouts": []}
+
+        def fake_run(cmd, **kw):
+            seen["timeouts"].append(kw.get("timeout"))
+
+            class R:
+                returncode = 0
+                stdout = b"{}"
+                stderr = b""
+            return R()
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            unbound.send_to_hook_api({"x": 1}, "sk-test")
+
+        self.assertTrue(seen["timeouts"], "curl was never invoked")
+        for t in seen["timeouts"]:
+            self.assertEqual(t, unbound.PRETOOL_CURL_TIMEOUT)
+        # Guard against silent regression back to the old 20s value.
+        self.assertEqual(unbound.PRETOOL_CURL_TIMEOUT, 4)
+
+    def test_worst_case_budget_is_under_pretool_hook_timeout(self):
+        """attempts x per-attempt curl timeout + inter-attempt backoffs must be
+        comfortably under the installed 15000ms PreToolUse hook timeout, or
+        Augment kills the hook mid-request instead of letting it fail open."""
+        attempts = 3            # for attempt in range(3)
+        backoff_s = 0.5         # time.sleep(0.5) between attempts (attempts - 1)
+        worst_case_ms = (
+            attempts * unbound.PRETOOL_CURL_TIMEOUT * 1000
+            + (attempts - 1) * backoff_s * 1000
+        )
+        self.assertLess(worst_case_ms, self.PRETOOL_HOOK_TIMEOUT_MS)
+
+    def test_reduced_budget_does_not_break_fail_open(self):
+        """A gateway returning nothing (empty result) still yields {} (allow) —
+        the reduced timeout must not change fail-open behavior."""
+        def fake_run(cmd, **kw):
+            class R:
+                returncode = 28      # curl timeout exit code
+                stdout = b""
+                stderr = b"timed out"
+            return R()
+
+        with patch.object(subprocess, "run", side_effect=fake_run):
+            out = unbound.send_to_hook_api({"x": 1}, "sk-test")
+        self.assertEqual(out, {})
+
+
+# --------------------------------------------------------------------------- #
+# Bugbot FIX 2: deny must merge additionalContext into                         #
+# permissionDecisionReason (Augment renders only the reason on deny)           #
+# --------------------------------------------------------------------------- #
+class TestDenyMergesAdditionalContext(unittest.TestCase):
+    def test_deny_with_reason_and_additional_context_merges_both(self):
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked by policy",
+            "additionalContext": "do not attempt workarounds",
+        })
+        decision_reason = out["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn("blocked by policy", decision_reason)
+        self.assertIn("do not attempt workarounds", decision_reason)
+        self.assertEqual(
+            decision_reason, "blocked by policy\n\ndo not attempt workarounds"
+        )
+
+    def test_deny_with_only_reason_is_unchanged(self):
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "reason": "blocked by policy",
+        })
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "blocked by policy",
+        )
+
+    def test_deny_with_only_additional_context_uses_it(self):
+        """No reason, only additionalContext -> the agent-facing context still
+        reaches the deny output (no stray leading separator)."""
+        out = unbound.transform_response_for_claude({
+            "decision": "deny",
+            "additionalContext": "do not attempt workarounds",
+        })
+        self.assertEqual(
+            out["hookSpecificOutput"]["permissionDecisionReason"],
+            "do not attempt workarounds",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

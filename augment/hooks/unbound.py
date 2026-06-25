@@ -52,6 +52,16 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
+# Per-attempt curl timeout (seconds) for the PreToolUse policy-check path
+# (send_to_hook_api). The installed PreToolUse hook timeout is 15000ms (see
+# build_hooks_block in setup.py / mdm/setup.py), so the WORST-CASE network
+# budget for this path must stay comfortably under 15s or Augment kills the
+# hook mid-request instead of letting it fail open. Budget: 3 attempts x 4s
+# curl + 2 x 0.5s backoff = ~13s worst case < 15s. Keep a retry for transient
+# blips. Only this pretool path uses the reduced timeout — the approval-poll
+# and audit/error curls are unchanged.
+PRETOOL_CURL_TIMEOUT = 4
+
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
 DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
 DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
@@ -517,7 +527,9 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
                 input=data.encode(),
-                timeout=20,
+                # Reduced from 20s so 3 attempts x PRETOOL_CURL_TIMEOUT + backoffs
+                # stays under the 15000ms PreToolUse hook timeout (see constant).
+                timeout=PRETOOL_CURL_TIMEOUT,
             )
             if result is None:
                 return {}
@@ -552,7 +564,17 @@ def _next_poll_interval(elapsed: float) -> int:
 
 def poll_approval_status(api_key: str, policy_ids: list, application_id: str, request_id: str = '', timeout: int = APPROVAL_TIMEOUT) -> str:
     """Poll the approval-status endpoint until approved, denied, or timeout.
-    Returns 'approved', 'deny', or 'timeout'."""
+    Returns 'approved', 'deny', or 'timeout'.
+
+    FLAG (Phase 2): this inline poll can run up to APPROVAL_TIMEOUT (~4h via
+    APPROVAL_POLL_PHASES), which vastly exceeds Augment's 15000ms PreToolUse
+    hook timeout — on Augment the hook would be killed before an approval ever
+    resolves. This path is NOT exercised in Phase 1: the gateway never returns
+    decision == 'approval_required' for unbound_app_label='augment' until
+    Phase 2. When the Augment approval contract goes live, Phase 2 must make
+    this poll bounded/re-entrant within the hook timeout: poll briefly per
+    invocation, persist state via the existing _APPROVAL_MARKER_FILE, and return
+    promptly so the next tool call resumes the wait."""
 
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool/approval-status"
     payload = {"policyIds": policy_ids, "applicationId": application_id}
@@ -619,11 +641,22 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
     # Everything else (allow, warn, ask, approval_required, unexpected) returns
     # empty and is left to the native toolPermissions ask-user layer.
     if decision == 'deny':
+        # Augment renders ONLY permissionDecisionReason on a PreToolUse deny, so
+        # merge any additionalContext (our deny/block-failure responses put
+        # agent-facing instructions there, e.g. "do not attempt workarounds")
+        # into the reason or it would be dropped. Trim/skip when either side is
+        # empty so we never emit a stray leading/trailing separator.
+        additional_context = (api_response.get('additionalContext') or '').strip()
+        reason_text = (reason or '').strip()
+        if additional_context and reason_text:
+            decision_reason = reason_text + '\n\n' + additional_context
+        else:
+            decision_reason = reason_text or additional_context
         return {
             'hookSpecificOutput': {
                 'hookEventName': 'PreToolUse',
                 'permissionDecision': 'deny',
-                'permissionDecisionReason': reason,
+                'permissionDecisionReason': decision_reason,
             }
         }
 
@@ -1068,6 +1101,11 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
 
     if api_response.get('decision') == 'approval_required':
+        # FLAG (Phase 2): inert in Phase 1 — the gateway never returns
+        # 'approval_required' for unbound_app_label='augment' yet. When it does,
+        # the inline poll_approval_status wait (up to ~4h) exceeds Augment's
+        # 15000ms PreToolUse timeout and would be killed; see the bounded/
+        # re-entrant note on poll_approval_status.
         return _handle_approval_required_response(api_response, approval_key)
 
     if is_mcp and api_response.get('unknown_mcp_server'):
@@ -1221,6 +1259,15 @@ def process_stop_event(event: Dict, api_key: str):
 
     # Accumulate this session's PostToolUse entries (everything logged since the
     # session's most recent SessionStart) to reconstruct the turn's tool calls.
+    #
+    # FLAG (Phase 2): accumulation is bounded by SessionStart, NOT the prior
+    # Stop. In a multi-turn single-session conversation a later Stop can attach
+    # earlier turns' tool calls to the current turn's exchange. This audit path
+    # is INERT in Phase 1: Augment sends no `conversation` data (metadata flags
+    # deferred — see build_hooks_block) and /v1/hooks/augment 404s, so nothing
+    # is emitted. When the audit endpoint + includeConversationData are
+    # re-enabled, Phase 2 must bound accumulation to the current turn (entries
+    # since the prior Stop, not since SessionStart).
     session_events = []
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
