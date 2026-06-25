@@ -616,8 +616,9 @@ def _hook_looks_like_path(value):
     v = (value or '').strip().strip('"\'')
     if v.startswith(('http://', 'https://', '@', 'git+')):
         return False
-    if '${' in v or '/' in v or '\\' in v:
-        return True
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
     return bool(_HOOK_SCRIPT_EXT_RE.search(v))
 
 
@@ -640,10 +641,14 @@ def _hook_candidate_script(command, args):
     return None
 
 
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
 def _compute_script_hash(command, args, cwd):
     """sha256 of the local script's contents, or None when it isn't a resolvable
     local script. Matches what the backend recomputes from the uploaded body, so
-    the gateway's `script:<hash>` lookup lines up with the stored fingerprint."""
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
     try:
         cand = _hook_candidate_script(command, args)
         if not cand:
@@ -656,9 +661,14 @@ def _compute_script_hash(command, args, cwd):
         if not os.path.isfile(path):
             return None
         h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
         with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
                 h.update(chunk)
+                remaining -= len(chunk)
         return h.hexdigest()
     except Exception:
         return None

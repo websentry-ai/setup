@@ -837,8 +837,9 @@ def _hook_looks_like_path(value: str) -> bool:
     v = (value or '').strip().strip('"\'')
     if v.startswith(('http://', 'https://', '@', 'git+')):
         return False
-    if '${' in v or '/' in v or '\\' in v:
-        return True
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
     return bool(_HOOK_SCRIPT_EXT_RE.search(v))
 
 
@@ -876,10 +877,17 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
             path = os.path.join(cwd, path)
         if not os.path.isfile(path):
             return None
+        # Hash at most _HOOK_MAX_SCRIPT_BYTES so the gateway's scriptHash matches
+        # the bytes the backend re-hashes from the (same-capped) uploaded body.
         h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
         with open(path, 'rb') as f:
-            for chunk in iter(lambda: f.read(65536), b''):
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
                 h.update(chunk)
+                remaining -= len(chunk)
         return h.hexdigest()
     except Exception:
         return None
@@ -933,13 +941,14 @@ def _augment_script_hash(result: Optional[Dict], cwd: Optional[str]) -> Optional
     return result
 
 
-_HOOK_MAX_SCRIPT_BYTES = 1_000_000
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
 
 
 def _read_script_body_b64(command, args, cwd):
-    """base64 of the local script's raw bytes (the scan body), or None. The
-    backend recomputes sha256 over these exact bytes, so this must read the same
-    file _compute_script_hash hashed. Capped to avoid shipping huge files."""
+    """base64 of the local script's first _HOOK_MAX_SCRIPT_BYTES bytes (the scan
+    body), or None. The backend re-hashes these exact bytes, so this must read the
+    same prefix _compute_script_hash hashed. Capped (and truncated, not skipped)
+    so the body stays consistent with the hash and the payload stays small."""
     try:
         cand = _hook_candidate_script(command, args)
         if not cand:
@@ -952,9 +961,7 @@ def _read_script_body_b64(command, args, cwd):
         if not os.path.isfile(path):
             return None
         with open(path, 'rb') as f:
-            data = f.read(_HOOK_MAX_SCRIPT_BYTES + 1)
-        if len(data) > _HOOK_MAX_SCRIPT_BYTES:
-            return None
+            data = f.read(_HOOK_MAX_SCRIPT_BYTES)
         return base64.b64encode(data).decode('ascii')
     except Exception:
         return None
