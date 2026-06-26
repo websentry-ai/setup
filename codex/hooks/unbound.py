@@ -92,12 +92,20 @@ def _should_report():
         return False
 
 
+def redact_secrets(text, key=None):
+    text = re.sub(r'(?i)\bBearer\s+\S+', 'Bearer [REDACTED]', str(text))
+    if key and len(key) >= 8:
+        text = text.replace(key, '[REDACTED]')
+    return text
+
+
 def report_error_to_gateway(message, category='general', api_key=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
     if _reporting_error or not api_key or not _should_report():
         return
     _reporting_error = True
+    message = redact_secrets(message, api_key)
     try:
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
@@ -122,6 +130,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
 
 def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
+    message = redact_secrets(message, _cached_api_key)
     timestamp = datetime.utcnow().isoformat() + 'Z'
     error_entry = f"{timestamp}: {message}\n"
 
@@ -790,6 +799,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = event.get('tool_use_id')
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -1032,7 +1045,8 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
-                'tool_response': tool_response
+                'tool_response': tool_response,
+                'tool_use_id': call_id
             })
 
     except Exception:
@@ -1101,6 +1115,7 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt = None
     user_prompt_timestamp = None
     permission_mode = None
+    stop_timestamp = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -1113,6 +1128,8 @@ def process_stop_event(event: Dict, api_key: str):
                 user_prompt = log_event.get('prompt')
                 user_prompt_timestamp = log.get('timestamp')
                 permission_mode = log_event.get('permission_mode', 'default')
+            elif event_name == 'Stop':
+                stop_timestamp = log.get('timestamp')
 
     if not user_prompt:
         return
@@ -1130,6 +1147,9 @@ def process_stop_event(event: Dict, api_key: str):
         assistant_msg['tool_use'] = assistant_tool_uses
     messages.append(assistant_msg)
 
+    # Stop event's logged time, not processing time
+    request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
     exchange = {
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
@@ -1140,6 +1160,11 @@ def process_stop_event(event: Dict, api_key: str):
     usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
     if usage:
         exchange['usage'] = usage
+
+    if user_prompt_timestamp:
+        exchange['requestInitialized'] = user_prompt_timestamp
+    # always set (stop_timestamp or now-fallback)
+    exchange['requestCompleted'] = request_completed
 
     send_to_api(exchange, api_key)
 

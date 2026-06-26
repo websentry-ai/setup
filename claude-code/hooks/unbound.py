@@ -27,6 +27,7 @@ ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
 CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if (not _config_dir_is_default and (_CONFIG_DIR / ".claude.json").exists()) else (Path.home() / ".claude.json")
+CLAUDE_PLUGIN_CACHE_DIR = _CONFIG_DIR / "plugins" / "cache"
 POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -92,12 +93,20 @@ def _should_report():
         return False
 
 
+def redact_secrets(text, key=None):
+    text = re.sub(r'(?i)\bBearer\s+\S+', 'Bearer [REDACTED]', str(text))
+    if key and len(key) >= 8:
+        text = text.replace(key, '[REDACTED]')
+    return text
+
+
 def report_error_to_gateway(message, category='general', api_key=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
     if _reporting_error or not api_key or not _should_report():
         return
     _reporting_error = True
+    message = redact_secrets(message, api_key)
     try:
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
@@ -122,6 +131,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
 
 def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
+    message = redact_secrets(message, _cached_api_key)
     timestamp = datetime.utcnow().isoformat() + 'Z'
     error_entry = f"{timestamp}: {message}\n"
     
@@ -614,6 +624,12 @@ def transform_response_for_claude(api_response: Dict) -> Dict:
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # On 'allow', emit no permissionDecision so Claude runs its normal permission flow (e.g. default-mode ask for un-allowlisted commands) instead of the hook force-approving.
+    if decision == 'allow':
+        if additional_context:
+            return {'hookSpecificOutput': {'hookEventName': 'PreToolUse', 'additionalContext': additional_context}}
+        return {}
+
     return {
         'hookSpecificOutput': {
             'hookEventName': 'PreToolUse',
@@ -656,6 +672,132 @@ def _extract_mcp_server_fields(server: Dict) -> Optional[Dict]:
     if server.get('type'):
         result['type'] = server['type']
     return result if result else None
+
+
+def _mangle_mcp_token(s: Optional[str]) -> str:
+    return re.sub(r'[^A-Za-z0-9_-]', '_', s or '')
+
+
+def _plugin_mcp_server_map(version_dir: Path) -> Dict:
+    servers = {}
+    sources = [version_dir / ".mcp.json", version_dir / ".claude-plugin" / "plugin.json"]
+    for source in sources:
+        if not source.is_file():
+            continue
+        try:
+            with open(source, 'r', encoding='utf-8') as f:
+                data = json.loads(f.read())
+        except Exception as exc:
+            log_error(f"mcp plugin source unreadable: {source}: {exc}", 'mcp_plugin')
+            continue
+        if not isinstance(data, dict):
+            continue
+        mcp_servers = data.get('mcpServers')
+        if isinstance(mcp_servers, str):
+            # Contain the path to the version dir: reject absolute paths and
+            # ../ traversal (and symlink escapes via resolve()).
+            candidate = (version_dir / mcp_servers).resolve()
+            try:
+                candidate.relative_to(version_dir.resolve())
+            except ValueError:
+                continue
+            if candidate.is_file():
+                try:
+                    with open(candidate, 'r', encoding='utf-8') as f:
+                        rel_data = json.loads(f.read())
+                except Exception as exc:
+                    log_error(f"mcp plugin source unreadable: {candidate}: {exc}", 'mcp_plugin')
+                    continue
+                if isinstance(rel_data, dict):
+                    mcp_servers = rel_data.get('mcpServers')
+        if isinstance(mcp_servers, dict):
+            for key, entry in mcp_servers.items():
+                servers.setdefault(key, entry)
+    return servers
+
+
+def _select_plugin_version_dir(plugin_dir: Path) -> Optional[Path]:
+    version_dirs = [d for d in plugin_dir.iterdir() if d.is_dir()]
+    if not version_dirs:
+        return None
+    in_use = [d for d in version_dirs if (d / ".in_use").exists()]
+    candidates = in_use or version_dirs
+    return max(candidates, key=lambda d: (d.stat().st_mtime, d.name))
+
+
+def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:
+    if not server_name.startswith('plugin_'):
+        return None
+    try:
+        if not cache_dir.is_dir():
+            log_error(f"mcp plugin resolve miss: {server_name}", 'mcp_plugin')
+            return None
+        matches = []
+        for marketplace in cache_dir.iterdir():
+            if not marketplace.is_dir():
+                continue
+            for plugin_dir in marketplace.iterdir():
+                if not plugin_dir.is_dir():
+                    continue
+                try:
+                    version_dir = _select_plugin_version_dir(plugin_dir)
+                    if version_dir is None:
+                        continue
+                    server_map = _plugin_mcp_server_map(version_dir)
+                    for server_key, entry in server_map.items():
+                        candidate = "plugin_%s_%s" % (
+                            _mangle_mcp_token(plugin_dir.name),
+                            _mangle_mcp_token(server_key),
+                        )
+                        if candidate == server_name:
+                            fields = _extract_mcp_server_fields(entry)
+                            if fields is not None:
+                                matches.append(fields)
+                except Exception as exc:
+                    log_error(f"mcp plugin dir error: {plugin_dir.name}: {exc}", 'mcp_plugin')
+                    continue
+        distinct = []
+        for cfg in matches:
+            if cfg not in distinct:
+                distinct.append(cfg)
+        if len(distinct) == 1:
+            return distinct[0]
+        if not distinct:
+            log_error(f"mcp plugin resolve miss: {server_name}", 'mcp_plugin')
+            return None
+        log_error(f"mcp plugin resolve ambiguous: {server_name}", 'mcp_plugin')
+        return None
+    except Exception as exc:
+        log_error(f"mcp plugin resolve error: {server_name}: {exc}", 'mcp_plugin')
+        return None
+
+
+def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH) -> Optional[tuple]:
+    if not server_name.startswith('claude_ai_'):
+        return None
+    try:
+        if not config_path.exists():
+            log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            config = json.loads(f.read())
+        ever_connected = config.get('claudeAiMcpEverConnected', [])
+        distinct = []
+        if isinstance(ever_connected, list):
+            for display in ever_connected:
+                if isinstance(display, str) and _mangle_mcp_token(display) == server_name:
+                    if display not in distinct:
+                        distinct.append(display)
+        if len(distinct) == 1:
+            return (distinct[0], {"additional_data": {"scope": "claudeai"}})
+        if not distinct:
+            log_error(f"mcp connector resolve miss: {server_name}", 'mcp_connector')
+            return None
+        log_error(f"mcp connector resolve ambiguous: {server_name}", 'mcp_connector')
+        return None
+    except Exception as exc:
+        log_error(f"mcp connector resolve error: {server_name}: {exc}", 'mcp_connector')
+        return None
 
 
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
@@ -902,6 +1044,17 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             if server_cfg:
                 metadata['mcp_server_config'] = server_cfg
 
+            if not server_cfg:
+                connector = _resolve_claude_ai_connector(mcp_server_name)
+                if connector:
+                    display_name, connector_cfg = connector
+                    metadata['mcp_server'] = display_name
+                    metadata['mcp_server_config'] = connector_cfg
+                else:
+                    plugin_cfg = _resolve_plugin_mcp_config(mcp_server_name)
+                    if plugin_cfg:
+                        metadata['mcp_server_config'] = plugin_cfg
+
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
@@ -918,6 +1071,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'account_identity': build_account_identity(),
         **_build_user_prompt_payload(recent_user_prompts),
     }
+
+    _tuid = event.get('tool_use_id')
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -1009,7 +1166,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude_prompt(api_response)
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
@@ -1045,7 +1202,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
-                'tool_response': tool_response
+                'tool_response': tool_response,
+                'tool_use_id': event.get('tool_use_id')
             })
     
     if user_prompt:
@@ -1089,6 +1247,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
     if usage:
         exchange['usage'] = usage
+
+    if request_initialized:
+        exchange['requestInitialized'] = request_initialized
+    if request_completed:
+        exchange['requestCompleted'] = request_completed
 
     return exchange
 
@@ -1163,19 +1326,22 @@ def process_stop_event(event: Dict, api_key: str):
     session_events = []
     current_conversation_started = False
     user_prompt_timestamp = None
-    
+    stop_timestamp = None
+
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
-        
+
         if log_session_id == session_id:
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
-            
+
             if event_name == 'UserPromptSubmit':
                 session_events = [log]
                 current_conversation_started = True
                 user_prompt_timestamp = log.get('timestamp')
             elif current_conversation_started:
                 session_events.append(log)
+                if event_name == 'Stop':
+                    stop_timestamp = log.get('timestamp')
 
     transcript_assistant_messages = []
     transcript_usage = None
@@ -1193,12 +1359,17 @@ def process_stop_event(event: Dict, api_key: str):
     # the cached session model is wrong). Fall back to the audit log otherwise.
     session_model = transcript_model or _extract_session_model(logs, session_id) or 'auto'
 
+    # Stop event's logged time, not processing time
+    request_completed = stop_timestamp or datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+
     exchange = build_llm_exchange(
         session_events,
         stop_assistant_message=last_assistant_message,
         transcript_assistant_messages=transcript_assistant_messages,
         model=session_model,
         usage=transcript_usage,
+        request_initialized=user_prompt_timestamp,
+        request_completed=request_completed,
     )
 
     if exchange:
