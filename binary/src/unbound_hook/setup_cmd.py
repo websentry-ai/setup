@@ -33,7 +33,7 @@ from . import migration
 DISCOVERY_TIMEOUT_SECONDS = 5400
 DISCOVERY_KILL_GRACE_SECONDS = 120
 
-SETUP_TOOLS = ("claude-code", "cursor", "codex", "copilot")
+SETUP_TOOLS = ("claude-code", "cursor", "codex", "copilot", "augment")
 
 USAGE = (
     "Usage: unbound-hook setup --api-key <admin_key> [--discovery-key <key>]\n"
@@ -204,6 +204,26 @@ def _cursor_hooks_json():
     return {"version": 1, "hooks": hooks}
 
 
+def _augment_hooks_config():
+    """The Augment hooks block with binary commands. Structure + per-event
+    timeouts (ms) copied verbatim from augment build_hooks_block; no per-hook
+    metadata (Auggie rejects it) and no UserPromptSubmit (Augment has no such
+    event). No Windows `shell` key — the binary path is macOS-only."""
+    cmd = lambda ev: hook_command_for_event("augment", ev)
+    return {
+        "PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": cmd("PreToolUse"), "timeout": 15000}]}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": cmd("PostToolUse"), "timeout": 10000}]}],
+        "Stop": [{"hooks": [
+            {"type": "command", "command": cmd("Stop"), "timeout": 10000}]}],
+        "SessionStart": [{"hooks": [
+            {"type": "command", "command": cmd("SessionStart"), "timeout": 60000}]}],
+        "SessionEnd": [{"hooks": [
+            {"type": "command", "command": cmd("SessionEnd"), "timeout": 10000}]}],
+    }
+
+
 def _copilot_hooks_config():
     """Port of _copilot_hooks_config with the binary command. Copilot is
     invoked per-user; field pairs (command/bash/powershell, timeout/
@@ -271,6 +291,74 @@ def _write_claude_managed_settings(m) -> bool:
         return True
     except Exception as e:
         print(f"Failed to write managed settings: {e}")
+        return False
+
+
+def _write_augment_managed_settings(m) -> bool:
+    """Binary variant of augment setup_managed_hooks(): same /etc/augment/
+    settings.json, no script download. /etc/augment/settings.json is SHARED
+    with the org's own Augment config, so this MERGES per-event (append our
+    hook entry only if our command isn't already present) and merges
+    toolPermissions on identity, preserving every foreign entry, rule, and
+    other top-level key — never clobbering the org's config."""
+    try:
+        managed_dir = m.get_managed_settings_dir()
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        settings_path = managed_dir / "settings.json"
+
+        settings = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f) or {}
+            except Exception:
+                settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+
+        # MERGE per-event (settings.json is shared with the org's own config):
+        # append our hook entry per event only if our command isn't already
+        # present; preserve every foreign entry and other top-level key.
+        hooks_config = _augment_hooks_config()
+        if not isinstance(settings.get("hooks"), dict):
+            settings["hooks"] = {}
+        for event, new_config in hooks_config.items():
+            our_command = new_config[0]["hooks"][0]["command"]
+            existing_config = settings["hooks"].get(event)
+            if isinstance(existing_config, list):
+                our_hook_exists = any(
+                    hook.get("command", "") == our_command
+                    for item in existing_config if isinstance(item, dict)
+                    for hook in item.get("hooks", [])
+                )
+                if not our_hook_exists:
+                    existing_config.extend(new_config)
+            elif existing_config is None:
+                settings["hooks"][event] = new_config
+            # A foreign non-list hooks[event] is left untouched.
+
+        # Merge toolPermissions, preserving foreign rules. Match on our identity
+        # (toolName + shellInputRegex) so re-running never duplicates.
+        existing_perms = settings.get("toolPermissions")
+        if not isinstance(existing_perms, list):
+            existing_perms = []
+        existing_identities = {
+            m._tool_permission_identity(r) for r in existing_perms if isinstance(r, dict)
+        }
+        for rule in m.build_tool_permissions_block():
+            if m._tool_permission_identity(rule) not in existing_identities:
+                existing_perms.append(rule)
+                existing_identities.add(m._tool_permission_identity(rule))
+        settings["toolPermissions"] = existing_perms
+
+        _atomic_write_text(settings_path, json.dumps(settings, indent=2))
+
+        if platform.system().lower() in ("darwin", "linux"):
+            os.chmod(managed_dir, 0o755)
+            os.chmod(settings_path, 0o644)
+        return True
+    except Exception as e:
+        print(f"Failed to write augment managed settings: {e}")
         return False
 
 
@@ -438,6 +526,54 @@ def _setup_claude_code(opts):
                             install_state=state, serial_number=device_id)
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
+    return ("configured", None)
+
+
+def _setup_augment(opts):
+    """Mirrors augment mdm/setup.py main() step-for-step, minus downloads.
+    Augment uses system-managed /etc/augment (get_managed_settings_dir), like
+    claude-code; the notify tool_type is 'augment_code' and the env var is
+    UNBOUND_AUGMENT_API_KEY (both verbatim from augment's setup.py). Augment
+    does NOT support backfill. One substitution from main(): user-level hook
+    removal is gated on the managed write returning True rather than on
+    verify_managed_hooks_installed() — the latter checks for the downloaded
+    /etc/augment/hooks/unbound.py the binary path never writes."""
+    m = _module("augment")
+    base, gateway = _normalized_urls(m, opts)
+    if opts["backfill"]:
+        print("[backfill] Augment backfill is not supported.")
+    device_id = m.get_device_identifier()
+    if not device_id:
+        return ("deferred", "could not read device identifier")
+    api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
+    if not api_key:
+        return ("deferred", "MDM api key fetch failed")
+
+    success, _ = m.set_env_var_system_wide("UNBOUND_AUGMENT_API_KEY", api_key)
+    if not success:
+        return ("deferred", "failed to set UNBOUND_AUGMENT_API_KEY")
+
+    # Write the per-user unbound config now (needed by the managed hook). User
+    # hook removal is deferred until the managed write succeeds (parity with
+    # augment main()'s ordering).
+    user_homes = m.get_all_user_homes()
+    for username, home_dir in user_homes:
+        m.write_unbound_config_for_user(
+            username, home_dir, api_key,
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+
+    state = _detect_state(m.get_managed_settings_dir() / "settings.json")
+    if not _write_augment_managed_settings(m):
+        return ("deferred", "managed settings write failed")
+    _remove_stale_managed_script(m.get_managed_settings_dir())
+
+    # Strip leftover user-level Unbound hooks only after the managed write
+    # succeeded, so managed hooks don't fire twice.
+    for username, home_dir in user_homes:
+        m.remove_user_level_hooks_for_user(username, home_dir)
+
+    m.notify_setup_complete(api_key, "augment_code", backend_url=base,
+                            install_state=state, serial_number=device_id)
     return ("configured", None)
 
 
@@ -644,6 +780,7 @@ _ADAPTERS = {
     "cursor": _setup_cursor,
     "codex": _setup_codex,
     "copilot": _setup_copilot,
+    "augment": _setup_augment,
 }
 
 

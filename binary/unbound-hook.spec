@@ -25,10 +25,12 @@ VENDORED = [
     ("../cursor/unbound.py", "vendored/cursor"),
     ("../copilot/hooks/unbound.py", "vendored/copilot/hooks"),
     ("../codex/hooks/unbound.py", "vendored/codex/hooks"),
+    ("../augment/hooks/unbound.py", "vendored/augment/hooks"),
     ("../claude-code/hooks/mdm/setup.py", "vendored/claude-code/hooks/mdm"),
     ("../cursor/mdm/setup.py", "vendored/cursor/mdm"),
     ("../copilot/hooks/mdm/setup.py", "vendored/copilot/hooks/mdm"),
     ("../codex/hooks/mdm/setup.py", "vendored/codex/hooks/mdm"),
+    ("../augment/hooks/mdm/setup.py", "vendored/augment/hooks/mdm"),
 ]
 
 # Union of stdlib imports across the vendored modules (mac/linux relevant;
@@ -36,7 +38,7 @@ VENDORED = [
 HIDDEN = [
     "base64", "collections", "ctypes", "datetime", "hashlib", "json",
     "pathlib", "pickle", "platform", "pwd", "re", "shutil", "socket",
-    "sqlite3", "subprocess", "tempfile", "time", "tomllib", "typing",
+    "sqlite3", "stat", "subprocess", "tempfile", "time", "tomllib", "typing",
     "urllib", "urllib.request", "urllib.error", "importlib.util",
 ]
 

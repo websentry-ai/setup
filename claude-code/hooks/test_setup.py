@@ -307,7 +307,7 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
     closure returned None on success, ``_run_as_user`` relayed that None, and
     the caller misreported every successful write as
     ``Could not write config for <user>``. The same closure ships verbatim in
-    claude-code, codex and copilot, so all three are checked here.
+    claude-code, codex, copilot and augment, so all four are checked here.
     """
 
     _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -315,6 +315,7 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
         "claude-code": _REPO_ROOT / "claude-code" / "hooks" / "mdm" / "setup.py",
         "codex": _REPO_ROOT / "codex" / "hooks" / "mdm" / "setup.py",
         "copilot": _REPO_ROOT / "copilot" / "hooks" / "mdm" / "setup.py",
+        "augment": _REPO_ROOT / "augment" / "hooks" / "mdm" / "setup.py",
     }
 
     @staticmethod
