@@ -835,63 +835,6 @@ class TestSetupAuthHeaderOffArgv(unittest.TestCase):
         self.assertIn("app_name=App+%26+Co", query)
         self.assertIn("app_type=augment", query)
 
-    def test_setup_backfill_http_request_bearer_off_argv(self):
-        """FIX A: the backfill HTTP path (setup.py _backfill_http_request) must
-        route the Authorization: Bearer <key> header off-argv via the 0600 temp
-        header file — never on the curl argv."""
-        headers = {
-            'User-Agent': 'Unbound-Setup/test-backfill',
-            'X-Unbound-Operation': 'backfill',
-            'Authorization': f'Bearer {self.SECRET}',
-            'Content-Type': 'application/json',
-        }
-        self._assert_off_argv(
-            setup,
-            lambda: setup._backfill_http_request("https://b/upload-url/", "POST",
-                                                 headers, body=b"{}"),
-        )
-
-    def test_mdm_backfill_http_request_bearer_off_argv(self):
-        """FIX A: mdm/setup.py _backfill_http_request (the privileged backfill
-        path) must also keep the Bearer key off the curl argv."""
-        mdm = _load_mdm()
-        headers = {
-            'User-Agent': 'Unbound-Setup/test-backfill',
-            'X-Unbound-Operation': 'backfill',
-            'Authorization': f'Bearer {self.SECRET}',
-            'Content-Type': 'application/json',
-        }
-        self._assert_off_argv(
-            mdm,
-            lambda: mdm._backfill_http_request("https://b/upload-url/", "POST",
-                                               headers, body=b"{}"),
-        )
-
-    def test_backfill_s3_put_no_auth_header_file(self):
-        """FIX A (guardrail): a presigned S3 PUT carries NO auth header, so no
-        temp header file is created and no Authorization lands on the argv."""
-        captured = {"argv": None, "header_file_seen": False}
-
-        def fake_run(cmd, **kw):
-            captured["argv"] = list(cmd)
-            for i, a in enumerate(cmd):
-                if isinstance(a, str) and a.startswith("@") and i > 0 and cmd[i - 1] == "-H":
-                    captured["header_file_seen"] = True
-
-            class R:
-                returncode = 0
-                stdout = b""
-                stderr = b""
-            return R()
-
-        with patch.object(setup.subprocess, "run", side_effect=fake_run):
-            setup._backfill_http_request(
-                "https://s3.example.com/presigned", "PUT",
-                {'Content-Type': 'application/json'}, body=b"{}")
-        for a in captured["argv"]:
-            self.assertNotIn("Authorization", str(a))
-        self.assertFalse(captured["header_file_seen"])
-
 
 # --------------------------------------------------------------------------- #
 # MDM managed settings + per-user gating                                       #

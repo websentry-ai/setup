@@ -5,7 +5,6 @@ import os
 import re
 import shutil
 import sys
-import time
 import platform
 import subprocess
 import urllib.parse
@@ -23,14 +22,6 @@ import tempfile
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/augment/hooks/unbound.py"
 
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
-
-BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
-BACKFILL_TOOL_TYPE = "augment_code"
-BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
-BACKFILL_MAX_LINES_PER_FILE = 50000
-BACKFILL_MAX_SESSIONS_PER_RUN = 5000
-BACKFILL_MAX_AGE_DAYS = 30
-BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 DEBUG = False
 
@@ -897,346 +888,19 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
-    """Read a transcript and return {session_id, entries} for server-side parsing.
-    The client only JSON-decodes lines and pulls a session id — all semantic
-    parsing happens server-side."""
-    entries = []
-    session_id = None
-    try:
-        with open(transcript_path, 'r', encoding='utf-8') as f:
-            for lineno, line in enumerate(f):
-                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
-                    break
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                entries.append(entry)
-                if not session_id:
-                    sid = entry.get('sessionId') or entry.get('session_id')
-                    if sid:
-                        session_id = sid
-    except (OSError, UnicodeDecodeError):
-        return None
-    except Exception:
-        return None
-
-    if not session_id or not entries:
-        return None
-    return {'session_id': session_id, 'entries': entries}
-
-
-def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
-    # Stable, identifiable UA + ops headers so SOC tooling can whitelist by signature.
-    headers = {
-        'User-Agent': f'Unbound-Setup/{BACKFILL_TOOL_TYPE}-backfill ({platform.platform()})',
-        'X-Unbound-Operation': 'backfill',
-        'X-Unbound-Tool': BACKFILL_TOOL_TYPE,
-    }
-    if extra:
-        headers.update(extra)
-    return headers
-
-
-# Header names whose values are secrets and must be kept OFF the curl argv
-# (/proc/<pid>/cmdline + `ps` are world-readable on a shared host). Lower-cased
-# for case-insensitive matching against caller-supplied header dicts.
-_BACKFILL_SECRET_HEADERS = frozenset({'authorization', 'x-api-key'})
-
-
-def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body: Optional[bytes] = None, timeout: int = 30) -> Tuple[int, bytes]:
-    # curl subprocess, not urllib: the frozen binary ships no CA bundle, so
-    # Python's ssl fails CERTIFICATE_VERIFY_FAILED; curl uses the system trust
-    # store (the corporate-CA/Zscaler contract every other call here relies on).
-    cmd = ["curl", "-sS", "-X", method, "-w", "\n%{http_code}",
-           "--max-time", str(timeout), "--retry", "3", "--retry-delay", "2", "--retry-connrefused"]
-    # Secret auth headers (Authorization/X-API-KEY) must not appear on the argv;
-    # write them to a 0600 temp file and pass via -H @<file>. Non-secret headers
-    # (UA, ops, Content-Type, presigned S3 PUT with no auth) stay inline.
-    secret_headers = []
-    for header_name, header_value in headers.items():
-        if header_name.lower() in _BACKFILL_SECRET_HEADERS:
-            secret_headers.append(f"{header_name}: {header_value}")
-        else:
-            cmd += ["-H", f"{header_name}: {header_value}"]
-    secret_hdr_path = None
-    if secret_headers:
-        fd, secret_hdr_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write("\n".join(secret_headers) + "\n")
-        except OSError as e:
-            try:
-                os.unlink(secret_hdr_path)
-            except OSError:
-                pass
-            debug_print(f"HTTP request failed: could not write auth header file: {e}")
-            return 0, b''
-        cmd += ["-H", f"@{secret_hdr_path}"]
-    if body is not None:
-        cmd += ["--data-binary", "@-"]
-    cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
-    try:
-        result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout * 4 + 20)
-    except (subprocess.TimeoutExpired, OSError) as e:
-        debug_print(f"HTTP request failed: {e}")
-        return 0, b''
-    finally:
-        if secret_hdr_path is not None:
-            try:
-                os.unlink(secret_hdr_path)
-            except OSError:
-                pass
-    if result.returncode != 0:
-        debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
-    out = result.stdout or b''
-    sep = out.rfind(b'\n')
-    if sep == -1:
-        debug_print(f"HTTP request failed: curl exit {result.returncode}")
-        return 0, b''
-    try:
-        code = int(out[sep + 1:].strip() or b'0')
-    except ValueError:
-        debug_print(f"HTTP request failed: curl exit {result.returncode}")
-        return 0, b''
-    return code, out[:sep]
-
-
-def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
-    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
-
-    auth_headers = _backfill_edr_headers({
-        'Authorization': f'Bearer {api_key}',
-        'Content-Type': 'application/json',
-    })
-
-    code, body = _backfill_http_request(
-        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
-        method='POST',
-        headers=auth_headers,
-        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
-        debug_print(f"upload-url request failed: HTTP {code}")
-        return False
-    try:
-        url_resp = json.loads(body.decode('utf-8'))
-    except (ValueError, UnicodeDecodeError):
-        debug_print("upload-url response was not JSON")
-        return False
-
-    upload_url = url_resp.get('upload_url')
-    object_key = url_resp.get('object_key')
-    if not upload_url or not object_key:
-        debug_print("upload-url response missing fields")
-        return False
-
-    code, _ = _backfill_http_request(
-        upload_url,
-        method='PUT',
-        headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
-        body=payload_bytes,
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
-        debug_print(f"S3 PUT failed: HTTP {code}")
-        return False
-
-    code, _ = _backfill_http_request(
-        f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/from-s3/",
-        method='POST',
-        headers=auth_headers,
-        body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
-        timeout=30,
-    )
-    if code < 200 or code >= 300:
-        debug_print(f"from-s3 request failed: HTTP {code}")
-        return False
-
-    return True
-
-
-def _backfill_state_path(home: Path) -> Path:
-    return home / '.augment' / 'hooks' / BACKFILL_STATE_FILE
-
-
-def _backfill_read_cutoff(home: Path) -> float:
-    """mtime cutoff for transcript selection: the last successful backfill when
-    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
-    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
-    try:
-        last = float(_backfill_state_path(home).read_text().strip())
-    except (OSError, ValueError):
-        return default_cutoff
-    # Ignore corrupt or future timestamps (clock skew).
-    if last <= 0 or last > time.time():
-        return default_cutoff
-    return last
-
-
-def _backfill_write_cutoff(home: Path, ts: float) -> None:
-    # Write via temp + atomic replace so an overlapping cron run never reads a
-    # half-written timestamp.
-    try:
-        path = _backfill_state_path(home)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
-        tmp.write_text(str(ts))
-        os.replace(tmp, path)
-    except OSError as e:
-        debug_print(f"failed to persist backfill timestamp: {e}")
-
-
-def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
-    # Skip hidden, symlinked, oversized (50MB cap), or files older than cutoff.
-    for p in root.rglob('*.jsonl'):
-        if p.name.startswith('.'):
-            continue
-        if not p.is_file() or p.is_symlink():
-            continue
-        try:
-            st = p.stat()
-            if st.st_size > BACKFILL_MAX_FILE_BYTES:
-                continue
-            if st.st_mtime < cutoff_mtime:
-                continue
-        except OSError:
-            continue
-        yield p
-
-
-def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
-    """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
-    yielded as-is; oversized ones are split into fixed-size entry runs each
-    carrying a record_index_base = cumulative entry count of earlier slices."""
-    session_id = session.get('session_id')
-    entries = session.get('entries') or []
-    try:
-        if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
-            yield session
-            return
-        entry_sizes = [len(json.dumps(e).encode('utf-8')) + 2 for e in entries]
-    except (TypeError, ValueError):
-        debug_print(f"skipping unserializable session {session_id}")
-        return
-
-    n = len(entries)
-    record_index_base = 0
-    start_idx = 0
-    while start_idx < n:
-        wrap = len(json.dumps({
-            'session_id': session_id,
-            'record_index_base': record_index_base,
-            'entries': [],
-        }).encode('utf-8'))
-        cum = wrap
-        end_idx = start_idx
-        while end_idx < n and (cum + entry_sizes[end_idx] - 2) <= max_chunk_bytes:
-            cum += entry_sizes[end_idx]
-            end_idx += 1
-        if end_idx == start_idx:
-            debug_print(f"skipped session {session_id}: entry exceeds {max_chunk_bytes} bytes")
-            return
-        yield {
-            'session_id': session_id,
-            'record_index_base': record_index_base,
-            'entries': entries[start_idx:end_idx],
-        }
-        record_index_base += (end_idx - start_idx)
-        start_idx = end_idx
-
-
-def run_backfill(api_key: str, backend_url: str) -> None:
-    """Walk ~/.augment/projects and seed historical sessions. Never raises."""
-    if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
-        debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
-        return
-
-    try:
-        home = Path.home()
-        started_at = time.time()
-        cutoff_mtime = _backfill_read_cutoff(home)
-        projects_root = home / '.augment' / 'projects'
-        sessions: List[Dict] = []
-        capped = False
-        if projects_root.exists():
-            for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
-                if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
-                    capped = True
-                    debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
-                    break
-                session = _backfill_collect_session(transcript_path)
-                if session:
-                    sessions.append(session)
-        if not sessions:
-            _backfill_write_cutoff(home, started_at)
-            print("[backfill] No past sessions found.")
-            return
-
-        print(f"[backfill] Found {len(sessions)} past sessions. Uploading (this may take a few minutes)...")
-
-        chunks_total = 0
-        chunks_sent = 0
-        sessions_sent_ids: set = set()
-        current_chunk: List[Dict] = []
-        current_size = 2  # outer `[]`
-
-        def _flush():
-            nonlocal current_chunk, current_size, chunks_total, chunks_sent
-            if not current_chunk:
-                return
-            chunks_total += 1
-            if _backfill_upload_chunk(api_key, backend_url, current_chunk):
-                chunks_sent += 1
-                for s in current_chunk:
-                    sessions_sent_ids.add(s.get('session_id'))
-            current_chunk = []
-            current_size = 2
-
-        for session in sessions:
-            for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
-                try:
-                    slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
-                except (TypeError, ValueError):
-                    continue
-                if slice_bytes > BACKFILL_CHUNK_BYTES:
-                    continue
-                if current_chunk and current_size + slice_bytes + 1 > BACKFILL_CHUNK_BYTES:
-                    _flush()
-                current_chunk.append(slice_session)
-                current_size += slice_bytes + 1
-
-        _flush()
-
-        failed = chunks_total - chunks_sent
-        sessions_sent = len(sessions_sent_ids)
-        if sessions_sent == 0:
-            print(f"[backfill] No sessions queued (all {chunks_total} uploads failed).")
-        elif failed:
-            print(f"[backfill] Done — queued {sessions_sent} past sessions ({failed} chunks failed).")
-        else:
-            if not capped:
-                _backfill_write_cutoff(home, started_at)
-            print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
-    except Exception as e:
-        print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
-
-
 def main():
     global DEBUG
 
     # Parse arguments
     clear_mode = "--clear" in sys.argv
     debug_mode = "--debug" in sys.argv
-    backfill_mode = "--backfill" in sys.argv
 
     if debug_mode:
         DEBUG = True
         debug_print("Debug mode enabled")
+
+    if "--backfill" in sys.argv:
+        print("[backfill] Augment backfill is not supported.")
 
     if clear_mode:
         clear_setup()
@@ -1334,9 +998,6 @@ def main():
     print("=" * 60)
 
     notify_setup_complete(api_key, "augment_code", backend_url=backend_url, install_state=_install_state, serial_number=_device_id)
-
-    if backfill_mode:
-        run_backfill(api_key, backend_url)
 
     rc_path = get_shell_rc_file()
     if rc_path is not None:

@@ -12,6 +12,7 @@ import hashlib
 import re
 import tempfile
 import platform
+from urllib.parse import urlsplit, urlunsplit
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -687,10 +688,10 @@ def _mangle_mcp_token(s: Optional[str]) -> str:
 # and the VS Code extension sends mcp_metadata=null, so an MCP call arrives as a
 # raw tool_name of `<tool>_<userServerName>` (single underscores, user-chosen
 # name) that can't be split reliably. We instead read Augment's own MCP config
-# (the copilot model) across every surface — Auggie CLI, VS Code (+ forks),
-# JetBrains — recover the real server + its command/url by matching the raw
-# name's server suffix, and forward mcp_server / mcp_tool / mcp_server_config so
-# the gateway can fingerprint it -> canonical group -> policy match + analytics.
+# (the copilot model) across every surface — Auggie CLI, VS Code (+ forks) —
+# recover the real server + its command/url by matching the raw name's server
+# suffix, and forward mcp_server / mcp_tool / mcp_server_config so the gateway
+# can fingerprint it -> canonical group -> policy match + analytics.
 _MCP_CONFIG_MAX_BYTES = 1_000_000
 _MIN_MCP_SERVER_NAME = 2
 
@@ -708,22 +709,6 @@ def _vscode_user_dirs() -> List[Path]:
     return [base / n / 'User' for n in ('Code', 'Code - Insiders', 'VSCodium', 'Cursor', 'Windsurf')]
 
 
-def _jetbrains_config_dirs() -> List[Path]:
-    home = Path.home()
-    if sys.platform == 'darwin':
-        base = home / 'Library' / 'Application Support' / 'JetBrains'
-    elif os.name == 'nt':
-        appdata = os.environ.get('APPDATA')
-        base = (Path(appdata) if appdata else home / 'AppData' / 'Roaming') / 'JetBrains'
-    else:
-        cfg = os.environ.get('XDG_CONFIG_HOME')
-        base = (Path(cfg) if cfg else home / '.config') / 'JetBrains'
-    try:
-        return [d for d in base.iterdir() if d.is_dir()]
-    except OSError:
-        return []
-
-
 def _augment_workspace_roots(event: Dict) -> List[Path]:
     roots = []
     for r in (event.get('workspace_roots') or []):
@@ -737,7 +722,7 @@ def _augment_workspace_roots(event: Dict) -> List[Path]:
 
 def _augment_mcp_config_sources(event: Dict) -> List[tuple]:
     """(path, format) for every Augment MCP config surface; format in
-    {'cli', 'vscode', 'jetbrains'}."""
+    {'cli', 'vscode'}."""
     home = Path.home()
     sources = [(home / '.augment' / 'settings.json', 'cli')]
     for root in _augment_workspace_roots(event):
@@ -747,29 +732,19 @@ def _augment_mcp_config_sources(event: Dict) -> List[tuple]:
         sources.append((
             user_dir / 'globalStorage' / 'augment.vscode-augment'
             / 'augment-global-state' / 'mcpServers.json', 'vscode'))
-    for ide_dir in _jetbrains_config_dirs():
-        sources.append((ide_dir / 'options' / 'llm.mcpServers.xml', 'jetbrains'))
     return sources
 
 
 def _split_command_string(cmd: str):
     """VS Code packs the whole command line into one string; split into
-    (command, args). shlex handles quotes; fall back to whitespace split."""
+    (command, args) on whitespace."""
     if not isinstance(cmd, str) or not cmd.strip():
         return None, []
-    try:
-        import shlex
-        parts = shlex.split(cmd)
-    except Exception:
-        parts = cmd.split()
+    parts = cmd.split()
     return (parts[0], parts[1:]) if parts else (None, [])
 
 
-# Secret redaction for MCP config forwarded to the gateway — only fingerprint-
-# relevant fields leave the device, with credentials stripped (mirrors copilot's
-# _redact_url / _redact_args). An MCP config routinely carries secrets (tokens in
-# a url, api keys in args/env/headers); env + headers are never forwarded.
-_MCP_TOKEN_RE = re.compile(
+_TOKEN_RE = re.compile(
     r'sk-[A-Za-z0-9_\-]{6,}'
     r'|gh[opsur]_[A-Za-z0-9]{20,}'
     r'|github_pat_[A-Za-z0-9_]{20,}'
@@ -777,30 +752,29 @@ _MCP_TOKEN_RE = re.compile(
     r'|AKIA[0-9A-Z]{16}'
     r'|AIza[0-9A-Za-z_\-]{20,}'
 )
-_MCP_REDACTED = '***'
+_REDACTED = '***'
 
 
-def _redact_mcp_url(url):
-    """Reduce a url to scheme://host[:port]/path (the only part the gateway
-    fingerprints): drop userinfo + query/fragment (credentials, any scheme) and
-    mask token shapes in the path."""
+# Reduce any url to scheme://host[:port]/path — the only part the gateway
+# fingerprints. Userinfo and query/fragment (which carry credentials, any
+# scheme) are dropped; known token shapes in the path are masked.
+def _redact_url(url):
     if not isinstance(url, str):
         return url
     try:
-        from urllib.parse import urlsplit, urlunsplit
         parts = urlsplit(url)
-    except Exception:
-        return _MCP_REDACTED
+    except ValueError:
+        return _REDACTED
     host = parts.hostname
     if not parts.scheme or not host:
-        return _MCP_REDACTED
+        return _REDACTED
     netloc = f"{host}:{parts.port}" if parts.port else host
-    return urlunsplit((parts.scheme, netloc, _MCP_TOKEN_RE.sub(_MCP_REDACTED, parts.path), '', ''))
+    return urlunsplit((parts.scheme, netloc, _TOKEN_RE.sub(_REDACTED, parts.path), '', ''))
 
 
-def _redact_mcp_args(args):
-    """Allowlist: forward only fingerprint-relevant args (urls, @npm packages);
-    drop everything else so no secret can ride along. Urls are credential-stripped."""
+# Allowlist: forward only fingerprint-relevant args (urls, @npm packages); drop
+# everything else so no secret can ride along. Urls are credential-stripped.
+def _redact_args(args):
     if not isinstance(args, list):
         return args
     kept = []
@@ -808,7 +782,7 @@ def _redact_mcp_args(args):
         if not isinstance(arg, str):
             continue
         if '://' in arg:
-            kept.append(_redact_mcp_url(arg))
+            kept.append(_redact_url(arg))
         elif arg.startswith('@'):
             kept.append(arg)
     return kept
@@ -824,7 +798,7 @@ def _normalize_mcp_entry(entry: Dict) -> Optional[Dict]:
     if entry.get('type'):
         out['type'] = entry['type']
     if entry.get('url'):
-        out['url'] = _redact_mcp_url(entry['url'])
+        out['url'] = _redact_url(entry['url'])
     cmd = entry.get('command')
     args = entry.get('args')
     if isinstance(args, str):
@@ -832,41 +806,17 @@ def _normalize_mcp_entry(entry: Dict) -> Optional[Dict]:
     if isinstance(cmd, str) and ' ' in cmd.strip() and not args:
         c, a = _split_command_string(cmd)
         if c:
-            out['command'], out['args'] = c, _redact_mcp_args(a)
+            out['command'], out['args'] = c, _redact_args(a)
     elif cmd:
         out['command'] = cmd
         if isinstance(args, list):
-            out['args'] = _redact_mcp_args(args)
+            out['args'] = _redact_args(args)
     elif isinstance(args, list) and args:
-        out['args'] = _redact_mcp_args(args)
+        out['args'] = _redact_args(args)
     extra = entry.get('arguments')
     if 'args' not in out and isinstance(extra, str) and extra.strip():
-        out['args'] = _redact_mcp_args(extra.split())
+        out['args'] = _redact_args(extra.split())
     return out or None
-
-
-def _parse_jetbrains_mcp_xml(path: Path) -> Dict:
-    """Best-effort extraction of {name -> config} from JetBrains' XML. Tolerant —
-    returns {} on any parse issue (fail-open). Schema varies; verify per IDE."""
-    servers = {}
-    try:
-        import xml.etree.ElementTree as ET
-        root = ET.fromstring(path.read_text(encoding='utf-8'))
-        for el in root.iter():
-            a = el.attrib
-            name = a.get('name') or a.get('key')
-            entry = {}
-            if a.get('command'):
-                entry['command'] = a['command']
-            if a.get('url'):
-                entry['url'] = a['url']
-            if name and entry:
-                norm = _normalize_mcp_entry(entry)
-                if norm:
-                    servers.setdefault(name, norm)
-    except Exception as exc:
-        log_error(f"augment jetbrains mcp xml parse failed {path}: {exc}", 'mcp_config')
-    return servers
 
 
 def read_augment_mcp_servers(event: Dict) -> Dict:
@@ -876,10 +826,6 @@ def read_augment_mcp_servers(event: Dict) -> Dict:
     for path, fmt in _augment_mcp_config_sources(event):
         try:
             if not path.exists() or path.stat().st_size > _MCP_CONFIG_MAX_BYTES:
-                continue
-            if fmt == 'jetbrains':
-                for name, cfg in _parse_jetbrains_mcp_xml(path).items():
-                    servers.setdefault(name, cfg)
                 continue
             data = json.loads(path.read_text(encoding='utf-8'))
             entries = []
@@ -1258,7 +1204,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         # mcp_metadata is set only when the matcher has includeMCPMetadata AND the
         # surface populates it (the VS Code extension sends null). Prefer it; else
         # recover the real server + tool by matching the raw tool_name's server
-        # suffix against Augment's own MCP config across CLI/VS Code/JetBrains.
+        # suffix against Augment's own MCP config across CLI/VS Code.
         servers = read_augment_mcp_servers(event)
         mcp_server_name = mcp_tool_name = ''
         mcp_cfg = None
