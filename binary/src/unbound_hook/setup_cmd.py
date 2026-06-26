@@ -21,6 +21,7 @@ but never aborts the remaining components.
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -305,6 +306,30 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     return bool(m._run_as_user(username, _install))
 
 
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
+        return False
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t.strip().strip('"').strip("'") for t in tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
+
+
 def _codex_wrapper_source() -> str:
     """Python shim written to ~/.codex/hooks/unbound.py. Must be valid python
     (codex runs it as a python program) AND exec the binary with no python
@@ -339,7 +364,7 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             for existing_item in existing_config:
                 if isinstance(existing_item, dict):
                     for hook in existing_item.get("hooks", []):
-                        if hook.get("command", "") == hook_command:
+                        if _command_targets_hook(hook.get("command", ""), Path(hook_command)):
                             our_hook_exists = True
                             break
             if not our_hook_exists:
