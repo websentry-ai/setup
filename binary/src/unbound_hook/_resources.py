@@ -20,6 +20,7 @@ TOOL_HOOK_SOURCES = {
     "cursor": "cursor/unbound.py",
     "copilot": "copilot/hooks/unbound.py",
     "codex": "codex/hooks/unbound.py",
+    "augment": "augment/hooks/unbound.py",
 }
 
 # repo-relative source for each tool's MDM setup module (setup/backfill/clear)
@@ -28,6 +29,7 @@ TOOL_MDM_SETUP_SOURCES = {
     "cursor": "cursor/mdm/setup.py",
     "copilot": "copilot/hooks/mdm/setup.py",
     "codex": "codex/hooks/mdm/setup.py",
+    "augment": "augment/hooks/mdm/setup.py",
 }
 
 TOOLS = tuple(TOOL_HOOK_SOURCES)
@@ -42,6 +44,8 @@ TOOL_EVENTS = {
               "SessionStart"),
     "copilot": ("SessionStart", "UserPromptSubmit", "PreToolUse",
                 "PostToolUse", "Stop"),
+    "augment": ("PreToolUse", "PostToolUse", "Stop", "SessionStart",
+                "SessionEnd"),
     "cursor": ("preToolUse", "postToolUse", "beforeShellExecution",
                "beforeMCPExecution", "afterShellExecution",
                "afterMCPExecution", "afterFileEdit", "beforeReadFile",
