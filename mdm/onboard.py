@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-Unbound MDM onboarding — runs all five steps in one shot:
+Unbound MDM onboarding — runs all six steps in one shot:
 
   1. Claude Code MDM setup (with --backfill of historical transcripts)
   2. Cursor MDM setup
   3. Codex MDM setup (with --backfill of historical transcripts)
   4. GitHub Copilot MDM setup
-  5. Coding-discovery scan
+  5. Augment MDM setup
+  6. Coding-discovery scan
 
-Steps 1-4 use --api-key (admin MDM key). Step 5 uses --discovery-key (a
+Steps 1-5 use --api-key (admin MDM key). Step 6 uses --discovery-key (a
 separate discovery-specific key). The two are different credentials and the
 backend distinguishes them; passing one in place of the other will be rejected.
 
@@ -16,8 +17,8 @@ Backfill must be explicitly enabled via --backfill flag (typically passed from
 PowerShell's -Backfill parameter). When enabled, it seeds Claude Code and Codex
 historical transcripts into analytics so the dashboard isn't empty until live
 activity accumulates. Backfill is idempotent (Task-row gate + deterministic
-uuid5 per record prevents duplication), so re-runs are safe. Cursor and GitHub
-Copilot have no historical transcript store to backfill.
+uuid5 per record prevents duplication), so re-runs are safe. Cursor, GitHub
+Copilot, and Augment have no historical transcript store to backfill.
 
 Usage:
 
@@ -87,6 +88,7 @@ TOOLS = [
     ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False),
     ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True),
     ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True),
+    ("Augment",        f"{_RAW_SETUP}/augment/hooks/mdm/setup.py",     False),
 ]
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"

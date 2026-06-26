@@ -16,7 +16,7 @@ import sys
 from ._loader import load_mdm_setup_module
 from . import migration
 
-CLEAR_TOOLS = ("claude-code", "cursor", "codex", "copilot")
+CLEAR_TOOLS = ("claude-code", "cursor", "codex", "copilot", "augment")
 
 
 def run(argv) -> int:

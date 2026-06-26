@@ -45,6 +45,7 @@ TOOL_USER_HOOKS_DIR = {
     "cursor": ".cursor/hooks",
     "copilot": ".copilot/hooks",
     "codex": ".codex/hooks",
+    "augment": ".augment/hooks",
 }
 STALE_HOOK_FILES = ("unbound.py", ".self_update_check", ".self_update.lock")
 # Copilot's serving path (unbound.py, referenced by unbound.json) is replaced
@@ -111,6 +112,7 @@ def run_sweep(tools=TOOLS, log=print) -> tuple:
             "claude-code": m.remove_user_level_hooks_for_user,
             "cursor": load_mdm_setup_module("cursor").remove_user_level_hooks,
             "codex": load_mdm_setup_module("codex").remove_user_level_hooks_for_user,
+            "augment": load_mdm_setup_module("augment").remove_user_level_hooks_for_user,
             # copilot has no separate user-mode registration store beyond
             # unbound.json, handled inside _sweep_user_home
         }
