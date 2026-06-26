@@ -378,6 +378,11 @@ class TestCommandTargetsHook(unittest.TestCase):
         self.assertTrue(self.match(f'py -3 "{self.target}"', self.target))
         self.assertTrue(self.match(f'python "{self.target}"', self.target))
 
+    def test_exe_launcher_prefixed_matches(self):
+        self.assertTrue(self.match(f'py.exe -3 "{self.target}"', self.target))
+        self.assertTrue(self.match(f'python.exe "{self.target}"', self.target))
+        self.assertTrue(self.match(f'python3.exe "{self.target}"', self.target))
+
     def test_path_with_spaces_matches(self):
         target = Path("/Users/Jane Doe/.claude/hooks/unbound.py")
         self.assertTrue(self.match(f'"{target}"', target))

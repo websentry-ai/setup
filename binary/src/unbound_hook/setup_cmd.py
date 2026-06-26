@@ -317,7 +317,10 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     tokens = [t for t in tokens if t]
     if not tokens:
         return False
-    if os.path.basename(tokens[0]).lower() in ("py", "python", "python2", "python3"):
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
         tokens = tokens[1:]
         while tokens and tokens[0].startswith("-"):
             tokens = tokens[1:]
