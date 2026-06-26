@@ -452,11 +452,12 @@ def format_hook_response(api_response):
     if not api_response:
         return {}
     decision = api_response.get('decision', 'allow')
-    # Normalise gateway values to Cursor's two-state permission field
-    permission = 'deny' if decision in ('deny', 'block') else 'allow'
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
-    response = {'permission': permission}
+    # On 'allow', emit no permission so Cursor uses its normal flow instead of the hook force-approving (keep any advisory context).
+    if decision not in ('deny', 'block'):
+        return {'agent_message': additional_context} if additional_context else {}
+    response = {'permission': 'deny'}
     if reason:
         response['user_message'] = reason
     if additional_context:
@@ -705,6 +706,10 @@ def process_pre_tool_use(event, api_key):
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = event.get('tool_use_id')
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -718,7 +723,7 @@ def process_pre_tool_use(event, api_key):
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
             if result == 'approved':
-                return {'permission': 'allow'}
+                return {}
             elif result == 'deny':
                 return {
                     'permission': 'deny',
@@ -876,7 +881,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
             if result == 'approved':
-                return {'permission': 'allow'}
+                return {}
             elif result == 'deny':
                 return {
                     'permission': 'deny',
@@ -1026,7 +1031,8 @@ def build_llm_exchange(events, api_key=None):
                 'tool_name': tool_name,
                 'tool_input': event.get('tool_input'),
                 'tool_output': tool_output,
-                'duration': event.get('duration')
+                'duration': event.get('duration'),
+                'tool_use_id': event.get('tool_use_id')
             })
         
         elif hook_event_name == 'afterFileEdit':
