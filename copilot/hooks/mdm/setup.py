@@ -740,6 +740,17 @@ def clear_hooks_for_user(username: str, home_dir: Path) -> str:
             except Exception as e:
                 debug_print(f"Failed to remove {path}: {e}")
                 had_error = True
+        # Remove the hook's own logs too — they exist only because of us, so a
+        # clear/nuke takes them. Kept out of the status tally above so a user
+        # with only stale logs still reports "not_found".
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (hooks_dir / _log).unlink()
+                debug_print(f"Removed {hooks_dir / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {hooks_dir / _log}: {e}")
         if cleared:
             return "cleared"
         if had_error or any_existed:
