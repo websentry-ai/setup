@@ -868,7 +868,7 @@ def main():
 
     if clear_mode:
         clear_setup()
-        return
+        return True
 
     print("=" * 60)
     print("Codex - MDM Setup")
@@ -882,7 +882,7 @@ def main():
             )
         print("❌ This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
     base_url = "https://backend.getunbound.ai"
     gateway_url = DEFAULT_GATEWAY_URL
@@ -913,13 +913,13 @@ def main():
         print("\n❌ Missing required argument: --api-key")
         print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
-        return
+        return False
 
     print("\n🔍 Getting device identifier...")
     device_id = get_device_identifier()
     if not device_id:
         print("❌ Failed to get device identifier")
-        return
+        return False
     debug_print(f"Device identifier: {device_id}")
     print("✅ Device identifier retrieved")
 
@@ -929,7 +929,7 @@ def main():
     print("\n🔑 Fetching API key from MDM...")
     codex_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
     if not codex_api_key:
-        return
+        return False
     print("✅ API key received")
 
     # Remove leftover hooks setup env var
@@ -940,14 +940,14 @@ def main():
     success, env_changed = set_env_var_system_wide("OPENAI_API_KEY", codex_api_key)
     if not success:
         print(f"❌ Failed to set OPENAI_API_KEY")
-        return
+        return False
     debug_print("OPENAI_API_KEY set successfully")
 
     print("\n📝 Configuring all users...")
     user_homes = get_all_user_homes()
     if not user_homes:
         print("❌ No user home directories found")
-        return
+        return False
     config_count = 0
     for username, home_dir in user_homes:
         if write_codex_config_for_user(username, home_dir, f"{gateway_url.rstrip('/')}/v1"):
@@ -958,7 +958,7 @@ def main():
 
     if config_count == 0:
         print("❌ Failed to configure codex for any users")
-        return
+        return False
 
     print(f"✅ Configured {config_count} user(s)")
 
@@ -971,12 +971,16 @@ def main():
 
     notify_setup_complete(codex_api_key, "unbound-codex", backend_url=base_url, install_state=install_state, serial_number=device_id)
 
+    return True
+
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled by user.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ An error occurred: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
