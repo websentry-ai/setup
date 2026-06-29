@@ -940,8 +940,22 @@ def _get_device_serial() -> Optional[str]:
 _GIT_CONTEXT_CACHE: Dict = {}
 
 
-def _strip_git_credentials(url: str) -> str:
-    return re.sub(r'(://)[^/@]+@', r'\1', url, count=1)
+def _strip_git_credentials(url):
+    try:
+        if not url or '@' not in url:
+            return url
+        scheme = re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url)
+        prefix = scheme.group(0) if scheme else ''
+        rest = url[len(prefix):]
+        slash = rest.find('/')
+        authority = rest if slash == -1 else rest[:slash]
+        tail = '' if slash == -1 else rest[slash:]
+        at = authority.rfind('@')
+        if at == -1:
+            return url
+        return prefix + authority[at + 1:] + tail
+    except Exception:
+        return url
 
 
 def _get_git_context(session_id: Optional[str], cwd: Optional[str]) -> Optional[str]:

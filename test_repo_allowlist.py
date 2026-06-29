@@ -147,5 +147,48 @@ class TestPayloadParity(unittest.TestCase):
                 self.assertIsNone(body["git_remote_url"])
 
 
+class TestStripGitCredentials(unittest.TestCase):
+    def _both(self):
+        return [("claude-code", cc), ("copilot", co)]
+
+    def _check(self, url, expected):
+        for label, mod in self._both():
+            with self.subTest(hook=label, url=url):
+                out = mod._strip_git_credentials(url)
+                self.assertEqual(out, expected)
+                self.assertNotIn("@", out)
+
+    def test_scheme_with_token(self):
+        self._check("https://user:token@github.com/org/repo.git",
+                    "https://github.com/org/repo.git")
+
+    def test_scp_form_with_token(self):
+        self._check("user:token@github.com:org/repo.git",
+                    "github.com:org/repo.git")
+
+    def test_scp_form_plain_user(self):
+        self._check("git@github.com:org/repo.git",
+                    "github.com:org/repo.git")
+
+    def test_password_with_at_scheme(self):
+        self._check("https://user:p@ss@w@rd@github.com/org/repo",
+                    "https://github.com/org/repo")
+
+    def test_password_with_at_scp(self):
+        self._check("user:p@ss@github.com:org/repo",
+                    "github.com:org/repo")
+
+    def test_ssh_scheme_with_port(self):
+        self._check("ssh://git@github.com:22/org/repo",
+                    "ssh://github.com:22/org/repo")
+
+    def test_no_userinfo_unchanged(self):
+        for url in ("https://github.com/org/repo.git",
+                    "github.com:org/repo.git", "", "/local/path/repo"):
+            for label, mod in self._both():
+                with self.subTest(hook=label, url=url):
+                    self.assertEqual(mod._strip_git_credentials(url), url)
+
+
 if __name__ == "__main__":
     unittest.main()
