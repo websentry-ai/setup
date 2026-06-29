@@ -148,7 +148,7 @@ def set_env_var_on_unix(var_name: str, value: str) -> bool:
 
     try:
         return export_line in rc_file.read_text(encoding="utf-8")
-    except OSError:
+    except Exception:
         return False
 
 
@@ -294,7 +294,7 @@ def remove_hooks_unbound_script() -> None:
             debug_print(f"Failed to remove {script_path}: {e}")
 
 
-def setup_claude_key_helper() -> None:
+def setup_claude_key_helper() -> bool:
     """
     Create ~/.claude/anthropic_key.sh that echoes UNBOUND_API_KEY and
     update ~/.claude/settings.json with apiKeyHelper pointing to that script.
@@ -330,8 +330,10 @@ def setup_claude_key_helper() -> None:
         settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
 
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+        return True
     except Exception as e:
-        print(f"⚠️  Failed to configure Claude Code key helper: {e}")
+        print(f"❌ Failed to configure Claude Code key helper: {e}")
+        return False
 
 
 def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
@@ -747,7 +749,8 @@ def main():
 
     # Configure Claude Code helper files
     debug_print("Setting up Claude key helper...")
-    setup_claude_key_helper()
+    if not setup_claude_key_helper():
+        return False
     debug_print("Claude key helper configured")
     
     # Final instructions

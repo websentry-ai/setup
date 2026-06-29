@@ -148,7 +148,7 @@ def set_env_var_on_unix(var_name: str, value: str) -> bool:
 
     try:
         return export_line in rc_file.read_text(encoding="utf-8")
-    except OSError:
+    except Exception:
         return False
 
 
