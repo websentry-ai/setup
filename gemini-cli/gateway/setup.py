@@ -365,7 +365,7 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
 
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("Gemini CLI - Clearing Setup")
@@ -390,6 +390,8 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+
+    return not any_failed
 
 
 def get_device_identifier() -> Optional[str]:
@@ -549,8 +551,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if args.clear:
-        clear_setup()
-        return True
+        return clear_setup()
 
     print("=" * 60)
     print("Gemini CLI - Environment Setup")
@@ -589,6 +590,9 @@ def main():
 
     debug_print("Setting GOOGLE_GEMINI_BASE_URL environment variable...")
     success, message = set_env_var("GOOGLE_GEMINI_BASE_URL", f"{args.gateway_url.rstrip('/')}/v1")
+    if not success:
+        print(f"❌ Failed to configure GOOGLE_GEMINI_BASE_URL: {message}")
+        return False
     debug_print("GOOGLE_GEMINI_BASE_URL set successfully")
 
     _install_state = detect_install_state()

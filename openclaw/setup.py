@@ -371,7 +371,7 @@ def _report_status(status: str, label: str) -> bool:
         return False
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("OpenClaw Unbound Plugin - Clearing Setup")
@@ -463,6 +463,7 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not any_failed
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai"):
@@ -495,8 +496,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     install_macos_certificates()
 

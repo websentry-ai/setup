@@ -449,7 +449,7 @@ def remove_api_key_helper_setting() -> str:
         return "failed"
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("Claude Code - Clearing Setup")
@@ -487,6 +487,8 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+
+    return not any_failed
 
 
 def get_device_identifier() -> Optional[str]:
@@ -676,8 +678,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if args.clear:
-        clear_setup()
-        return True
+        return clear_setup()
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Claude Code is managed by your organization (MDM).")
@@ -734,6 +735,9 @@ def main():
 
     debug_print("Setting ANTHROPIC_BASE_URL environment variable...")
     success, message = set_env_var("ANTHROPIC_BASE_URL", args.gateway_url)
+    if not success:
+        print(f"❌ Failed to configure ANTHROPIC_BASE_URL: {message}")
+        return False
     debug_print("ANTHROPIC_BASE_URL set successfully")
 
     _install_state = detect_install_state()

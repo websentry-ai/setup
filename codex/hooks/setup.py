@@ -618,7 +618,7 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("Codex Hooks - Clearing Setup")
@@ -672,6 +672,7 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not any_failed
 
 
 def enable_codex_hooks_feature() -> bool:
@@ -1287,8 +1288,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Codex is managed by your organization (MDM).")
@@ -1381,7 +1381,9 @@ def main():
     debug_print("Codex hooks configured successfully")
 
     debug_print("Enabling codex_hooks feature flag...")
-    enable_codex_hooks_feature()
+    if not enable_codex_hooks_feature():
+        print("Failed to enable codex_hooks feature flag")
+        return False
 
     print("API key verified and added")
     print("Setup complete")

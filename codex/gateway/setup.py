@@ -457,7 +457,7 @@ def remove_codex_config_base_url() -> str:
 
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     global DEBUG
     print("=" * 60)
@@ -490,6 +490,7 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not any_failed
 
 
 def remove_hooks_unbound_script() -> None:
@@ -729,8 +730,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if args.clear:
-        clear_setup()
-        return True
+        return clear_setup()
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Codex is managed by your organization (MDM).")

@@ -612,7 +612,7 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("Claude Code Hooks - Clearing Setup")
@@ -659,6 +659,7 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not any_failed
 
 
 def get_device_identifier() -> Optional[str]:
@@ -1197,8 +1198,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Claude Code is managed by your organization (MDM).")
