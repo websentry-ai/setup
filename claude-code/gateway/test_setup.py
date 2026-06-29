@@ -6,8 +6,6 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
-# Load gateway/setup.py under a unique module name so it can't collide with the
-# hooks-mode setup.py when both test suites run in one pytest session.
 _SPEC = importlib.util.spec_from_file_location(
     "gateway_setup", os.path.join(os.path.dirname(__file__), "setup.py")
 )
@@ -16,7 +14,6 @@ _SPEC.loader.exec_module(gw)
 
 
 class TestResolveClaudeConfigDir(unittest.TestCase):
-    """WEB-4882: gateway mode honors CLAUDE_CONFIG_DIR like the hooks installer."""
 
     def test_env_wins(self):
         with tempfile.TemporaryDirectory() as d:
@@ -50,7 +47,6 @@ class TestKeyHelperUnderConfigDir(unittest.TestCase):
             gw.setup_claude_key_helper(cc)
             self.assertTrue((cc / "anthropic_key.sh").exists())
             settings = json.loads((cc / "settings.json").read_text())
-            # Relocated dir → absolute helper path so Claude resolves it under the active dir.
             self.assertEqual(settings["apiKeyHelper"], str(cc / "anthropic_key.sh"))
 
     def test_default_dir_keeps_portable_helper(self):

@@ -374,7 +374,7 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
 
 
 class TestResolveClaudeConfigDir(unittest.TestCase):
-    """WEB-4882: CLAUDE_CONFIG_DIR env > --config-dir arg > ~/.claude."""
+    """CLAUDE_CONFIG_DIR env > --config-dir arg > ~/.claude."""
 
     def test_env_beats_arg_and_home(self):
         import setup

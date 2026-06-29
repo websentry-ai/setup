@@ -284,8 +284,7 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
 
 def _resolve_claude_config_dir(config_dir_arg: Optional[str] = None) -> Path:
     """Resolve Claude Code's config dir: $CLAUDE_CONFIG_DIR (env wins), else the
-    --config-dir arg the CLI forwards, else the default ~/.claude. Mirrors the
-    hooks installer so gateway mode honors a relocated config dir too (WEB-4882)."""
+    --config-dir arg the CLI forwards, else the default ~/.claude."""
     value = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
     if not value and config_dir_arg:
         value = config_dir_arg.strip() or None
@@ -338,9 +337,6 @@ def setup_claude_key_helper(config_dir: Path = None) -> None:
         if "hooks" in settings:
             del settings["hooks"]
 
-        # Update apiKeyHelper. Keep the portable ~/.claude form for the default dir
-        # (unchanged for existing installs); use the absolute path when the config
-        # dir is relocated so Claude resolves the helper under the active dir.
         if claude_dir == (Path.home() / ".claude"):
             settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
         else:
