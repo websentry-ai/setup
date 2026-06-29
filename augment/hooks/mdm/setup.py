@@ -853,21 +853,32 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                 debug_print(f"Removed {script_path}")
             except Exception as e:
                 debug_print(f"Failed to remove {script_path}: {e}")
-
-        # Remove the hook's own logs — they exist only because of us, so a
-        # clear/nuke takes them too. unlink() drops the dir entry (the symlink
-        # itself, never its target); runs privilege-dropped as the user.
-        for _log in ("agent-audit.log", "error.log"):
-            try:
-                (script_path.parent / _log).unlink()
-                debug_print(f"Removed {script_path.parent / _log}")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                debug_print(f"Failed to remove {script_path.parent / _log}: {e}")
         return True
 
     _run_as_user(username, _clean)
+
+
+def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
+    """Remove the hook's own logs (agent-audit.log, error.log) from a user's
+    ~/.augment/hooks on CLEAR/nuke — they exist only because of us. Kept separate
+    from remove_user_level_hooks_for_user (which also runs at setup) so logs are
+    dropped ONLY on clear. Privilege-drops to the user; unlink() removes the dir
+    entry (a symlink, never its target)."""
+    if home_dir is None:
+        return  # Windows machine-wide placeholder — no per-user dir to clean
+    hooks_dir = home_dir / ".augment" / "hooks"
+
+    def _clear():
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (hooks_dir / _log).unlink()
+                debug_print(f"Removed {hooks_dir / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {hooks_dir / _log}: {e}")
+
+    _run_as_user(username, _clear)
 
 
 def get_managed_settings_dir() -> Path:
@@ -1196,6 +1207,7 @@ def clear_setup():
         failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_AUGMENT_API_KEY")
+            remove_hook_logs_for_user(username, home_dir)
             if status == "cleared":
                 cleared += 1
             elif status == "not_found":

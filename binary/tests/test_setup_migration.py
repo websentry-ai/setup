@@ -563,23 +563,17 @@ def test_clear_matcher_recognizes_both_forms_not_foreign(env):
 
 
 def test_clear_removes_hook_logs(env):
-    """Clear deletes the per-user agent-audit.log + error.log. claude/codex use
-    the dedicated clear-only remove_hook_logs_for_user; augment via its clear-only
-    remove_user_level_hooks_for_user."""
-    for tool, sub in (("claude-code", ".claude"), ("codex", ".codex")):
+    """Clear deletes the per-user agent-audit.log + error.log via the clear-only
+    remove_hook_logs_for_user helper, for every tool that has one."""
+    for tool, sub in (("claude-code", ".claude"), ("codex", ".codex"),
+                      ("augment", ".augment"), ("cursor", ".cursor")):
         m = env["modules"][tool]
         hooks_dir = env["home"] / sub / "hooks"
         hooks_dir.mkdir(parents=True, exist_ok=True)
         (hooks_dir / "agent-audit.log").write_text("audit\n")
         (hooks_dir / "error.log").write_text("err\n")
         m.remove_hook_logs_for_user(ME, env["home"])
-        assert not (hooks_dir / "agent-audit.log").exists()
-        assert not (hooks_dir / "error.log").exists()
-    m = env["modules"]["augment"]
-    hooks_dir = env["home"] / ".augment" / "hooks"
-    hooks_dir.mkdir(parents=True, exist_ok=True)
-    (hooks_dir / "agent-audit.log").write_text("audit\n")
-    (hooks_dir / "error.log").write_text("err\n")
-    m.remove_user_level_hooks_for_user(ME, env["home"])
-    assert not (hooks_dir / "agent-audit.log").exists()
-    assert not (hooks_dir / "error.log").exists()
+        assert not (hooks_dir / "agent-audit.log").exists(), tool
+        assert not (hooks_dir / "error.log").exists(), tool
+    # The Windows machine-wide placeholder (None home) must be a safe no-op.
+    env["modules"]["claude-code"].remove_hook_logs_for_user(None, None)

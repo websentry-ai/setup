@@ -441,6 +441,8 @@ def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
     ~/.cursor/hooks. They exist only because of us, so a clear/nuke takes them.
     Privilege-drops to the user; unlink() drops the dir entry (a symlink, never
     its target)."""
+    if home_dir is None:
+        return  # Windows machine-wide placeholder — no per-user dir to clean
     hooks_dir = home_dir / ".cursor" / "hooks"
 
     def _clear():
@@ -922,7 +924,6 @@ def clear_setup():
             failed = 0
             for username, home_dir in user_homes:
                 status = remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY")
-                remove_hook_logs_for_user(username, home_dir)
                 if status == "cleared":
                     cleared += 1
                 elif status == "not_found":
@@ -936,6 +937,12 @@ def clear_setup():
                 print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
             if failed:
                 print(f"Failed to clear API_KEY for {failed} user(s)")
+
+    # Per-user hook logs live in ~/.cursor/hooks on every platform; remove them
+    # regardless of how env vars were cleared above (the Windows branch is
+    # machine-wide and has no per-user loop).
+    for username, home_dir in (get_all_user_homes() or []):
+        remove_hook_logs_for_user(username, home_dir)
 
     print("\n" + "=" * 60)
     print("Clear Complete!")

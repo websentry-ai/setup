@@ -771,6 +771,8 @@ def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
     from remove_user_level_hooks_for_user (which also runs at setup) so logs are
     dropped ONLY on clear. Privilege-drops to the user; unlink() removes the dir
     entry (a symlink, never its target)."""
+    if home_dir is None:
+        return  # Windows machine-wide placeholder — no per-user dir to clean
     hooks_dir = home_dir / ".codex" / "hooks"
 
     def _clear():
