@@ -337,7 +337,7 @@ def setup_claude_key_helper(config_dir: Path = None) -> None:
         if "hooks" in settings:
             del settings["hooks"]
 
-        if claude_dir == (Path.home() / ".claude"):
+        if claude_dir.resolve() == (Path.home() / ".claude").resolve():
             settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
         else:
             settings["apiKeyHelper"] = str(key_helper_path)
@@ -493,6 +493,16 @@ def clear_setup(config_dir: Path = None) -> None:
     elif settings_status == "failed":
         print("Failed to clear apiKeyHelper in settings.json")
         any_failed = True
+
+    # When the config dir was relocated, also strip enforcement left behind in the
+    # default ~/.claude so clearing leaves nothing that fires if Claude later runs
+    # without CLAUDE_CONFIG_DIR set.
+    default_dir = Path.home() / ".claude"
+    if config_dir.resolve() != default_dir.resolve():
+        if _clear_path(default_dir / "anthropic_key.sh", "Claude anthropic_key.sh (~/.claude)") == "cleared":
+            any_cleared = True
+        if remove_api_key_helper_setting(default_dir) == "cleared":
+            any_cleared = True
 
     if any_cleared:
         print("Cleared")

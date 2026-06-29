@@ -668,6 +668,16 @@ def clear_setup(config_dir: Path = None) -> None:
         print("Failed to clear Unbound hooks in settings.json")
         any_failed = True
 
+    # When the config dir was relocated, also strip enforcement left behind in the
+    # default ~/.claude so clearing leaves nothing that fires if Claude later runs
+    # without CLAUDE_CONFIG_DIR set.
+    default_dir = Path.home() / ".claude"
+    if config_dir.resolve() != default_dir.resolve():
+        if _clear_path(default_dir / "hooks" / "unbound.py", "Claude unbound.py hook (~/.claude)") == "cleared":
+            any_cleared = True
+        if remove_hooks_from_settings(default_dir) == "cleared":
+            any_cleared = True
+
     if any_cleared:
         print("Cleared")
     elif not any_failed:

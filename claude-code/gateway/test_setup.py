@@ -64,6 +64,42 @@ class TestKeyHelperUnderConfigDir(unittest.TestCase):
             gw.setup_claude_key_helper(cc)
             self.assertEqual(gw.detect_install_state(cc), "persisted")
 
+    def test_apikeyhelper_portable_when_dir_equals_default_via_realpath(self):
+        # Passing the default dir (even pre-resolution) must still yield the
+        # portable ~/.claude form, not an absolute realpath.
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.object(gw.Path, "home", staticmethod(lambda: Path(home))):
+                gw.setup_claude_key_helper(Path(home) / ".claude")
+                settings = json.loads((Path(home) / ".claude" / "settings.json").read_text())
+                self.assertEqual(settings["apiKeyHelper"], "~/.claude/anthropic_key.sh")
+
+
+class TestClearSweepsLegacyDir(unittest.TestCase):
+    def test_clear_relocated_also_clears_default_claude(self):
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            with mock.patch.object(gw.Path, "home", staticmethod(lambda: home)):
+                legacy = home / ".claude"
+                legacy.mkdir(parents=True)
+                (legacy / "anthropic_key.sh").write_text("echo x")
+                (legacy / "settings.json").write_text(json.dumps({"apiKeyHelper": "~/.claude/anthropic_key.sh"}))
+                cc = home / "cc"
+                gw.setup_claude_key_helper(cc)
+                gw.clear_setup(cc)
+                # active dir cleared
+                self.assertFalse((cc / "anthropic_key.sh").exists())
+                # legacy ~/.claude swept too
+                self.assertFalse((legacy / "anthropic_key.sh").exists())
+                self.assertNotIn("apiKeyHelper", json.loads((legacy / "settings.json").read_text()))
+
+    def test_clear_default_dir_does_not_double_sweep(self):
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            with mock.patch.object(gw.Path, "home", staticmethod(lambda: home)):
+                gw.setup_claude_key_helper(home / ".claude")
+                gw.clear_setup(home / ".claude")
+                self.assertFalse((home / ".claude" / "anthropic_key.sh").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

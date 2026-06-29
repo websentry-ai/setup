@@ -26,8 +26,19 @@ LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
-CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if (not _config_dir_is_default and (_CONFIG_DIR / ".claude.json").exists()) else (Path.home() / ".claude.json")
-CLAUDE_PLUGIN_CACHE_DIR = _CONFIG_DIR / "plugins" / "cache"
+
+
+def _relocated_or_legacy(relocated: Path, legacy: Path) -> Path:
+    # Whether Claude relocates .claude.json / plugins under CLAUDE_CONFIG_DIR is
+    # version-dependent, so read from the relocated dir when it actually has the
+    # artifact, else the default ~/.claude location. Keeps both paths consistent.
+    if not _config_dir_is_default and relocated.exists():
+        return relocated
+    return legacy
+
+
+CLAUDE_MCP_CONFIG_PATH = _relocated_or_legacy(_CONFIG_DIR / ".claude.json", Path.home() / ".claude.json")
+CLAUDE_PLUGIN_CACHE_DIR = _relocated_or_legacy(_CONFIG_DIR / "plugins" / "cache", Path.home() / ".claude" / "plugins" / "cache")
 POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
