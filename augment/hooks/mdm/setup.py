@@ -96,10 +96,18 @@ _OUR_TOOL_PERMISSION_IDENTITIES = {
 
 
 def _hook_command_matches(existing_cmd: str, hook_command: str, script_path: Path, is_windows: bool) -> bool:
-    """An existing hook entry is ours if its command matches exactly, or (on
-    Windows, where it's wrapped in a `py -3 "..."` launcher) references our
-    script path. Mirrors augment/hooks/setup.py."""
-    return existing_cmd == hook_command or (is_windows and bool(existing_cmd) and str(script_path) in existing_cmd)
+    """An existing hook entry is ours if its command matches our python hook
+    (exactly, or — on Windows, where it's wrapped in a `py -3 "..."` launcher —
+    by script path) OR references the /opt/unbound hook binary. Without the binary
+    case a binary-install hook is never recognized, so clear leaves it behind and
+    orphans the managed config. Mirrors augment/hooks/setup.py."""
+    if not existing_cmd:
+        return False
+    if existing_cmd == hook_command:
+        return True
+    if "/opt/unbound/" in existing_cmd and "unbound-hook" in existing_cmd:
+        return True
+    return is_windows and str(script_path) in existing_cmd
 
 
 def normalize_url(value: str) -> str:
@@ -771,7 +779,9 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     our_identities = {(r.get("toolName"), r.get("shellInputRegex")) for r in build_tool_permissions_block()}
 
     def _is_unbound(cmd: str) -> bool:
-        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+        return (cmd == hook_command
+                or (is_windows and bool(cmd) and hook_command in cmd)
+                or ("/opt/unbound/" in cmd and "unbound-hook" in cmd))
 
     def _clean():
         # safe_to_unlink stays True only if the JSON no longer references
@@ -846,6 +856,29 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
         return True
 
     _run_as_user(username, _clean)
+
+
+def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
+    """Remove the hook's own logs (agent-audit.log, error.log) from a user's
+    ~/.augment/hooks on CLEAR/nuke — they exist only because of us. Kept separate
+    from remove_user_level_hooks_for_user (which also runs at setup) so logs are
+    dropped ONLY on clear. Privilege-drops to the user; unlink() removes the dir
+    entry (a symlink, never its target)."""
+    if home_dir is None:
+        return  # Windows machine-wide placeholder — no per-user dir to clean
+    hooks_dir = home_dir / ".augment" / "hooks"
+
+    def _clear():
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (hooks_dir / _log).unlink()
+                debug_print(f"Removed {hooks_dir / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {hooks_dir / _log}: {e}")
+
+    _run_as_user(username, _clear)
 
 
 def get_managed_settings_dir() -> Path:
@@ -1087,13 +1120,19 @@ def clear_managed_hooks() -> str:
                                 continue
                             new_config = []
                             for item in event_config:
-                                if isinstance(item, dict):
-                                    hooks = item.get("hooks", [])
-                                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
-                                    if new_hooks != hooks:
+                                # Only touch items with a real list of hooks;
+                                # preserve everything else (foreign items, dicts
+                                # with no/"null" hooks). Drop an item only when
+                                # every hook in it was ours.
+                                if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                                    hooks_list = item["hooks"]
+                                    new_hooks = [h for h in hooks_list if not (isinstance(h, dict) and _is_unbound(h.get("command", "")))]
+                                    if len(new_hooks) != len(hooks_list):
                                         modified = True
-                                    if new_hooks:
-                                        item["hooks"] = new_hooks
+                                        if new_hooks:
+                                            item["hooks"] = new_hooks
+                                            new_config.append(item)
+                                    else:
                                         new_config.append(item)
                                 else:
                                     new_config.append(item)
@@ -1168,6 +1207,7 @@ def clear_setup():
         failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_AUGMENT_API_KEY")
+            remove_hook_logs_for_user(username, home_dir)
             if status == "cleared":
                 cleared += 1
             elif status == "not_found":
