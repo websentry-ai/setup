@@ -96,10 +96,18 @@ _OUR_TOOL_PERMISSION_IDENTITIES = {
 
 
 def _hook_command_matches(existing_cmd: str, hook_command: str, script_path: Path, is_windows: bool) -> bool:
-    """An existing hook entry is ours if its command matches exactly, or (on
-    Windows, where it's wrapped in a `py -3 "..."` launcher) references our
-    script path. Mirrors augment/hooks/setup.py."""
-    return existing_cmd == hook_command or (is_windows and bool(existing_cmd) and str(script_path) in existing_cmd)
+    """An existing hook entry is ours if its command matches our python hook
+    (exactly, or — on Windows, where it's wrapped in a `py -3 "..."` launcher —
+    by script path) OR references the /opt/unbound hook binary. Without the binary
+    case a binary-install hook is never recognized, so clear leaves it behind and
+    orphans the managed config. Mirrors augment/hooks/setup.py."""
+    if not existing_cmd:
+        return False
+    if existing_cmd == hook_command:
+        return True
+    if "/opt/unbound/" in existing_cmd and "unbound-hook" in existing_cmd:
+        return True
+    return is_windows and str(script_path) in existing_cmd
 
 
 def normalize_url(value: str) -> str:
@@ -771,7 +779,9 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     our_identities = {(r.get("toolName"), r.get("shellInputRegex")) for r in build_tool_permissions_block()}
 
     def _is_unbound(cmd: str) -> bool:
-        return cmd == hook_command or (is_windows and bool(cmd) and hook_command in cmd)
+        return (cmd == hook_command
+                or (is_windows and bool(cmd) and hook_command in cmd)
+                or ("/opt/unbound/" in cmd and "unbound-hook" in cmd))
 
     def _clean():
         # safe_to_unlink stays True only if the JSON no longer references
@@ -843,6 +853,18 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                 debug_print(f"Removed {script_path}")
             except Exception as e:
                 debug_print(f"Failed to remove {script_path}: {e}")
+
+        # Remove the hook's own logs — they exist only because of us, so a
+        # clear/nuke takes them too. unlink() drops the dir entry (the symlink
+        # itself, never its target); runs privilege-dropped as the user.
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (script_path.parent / _log).unlink()
+                debug_print(f"Removed {script_path.parent / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {script_path.parent / _log}: {e}")
         return True
 
     _run_as_user(username, _clean)

@@ -508,3 +508,65 @@ def test_sweep_keeps_binary_era_copilot_registration(env):
     status, _ = migration.run_sweep(log=lambda *_: None)
     assert status == "configured"
     assert (hooks_dir / "unbound.json").read_text() == binary_json
+
+
+# --- WEB-4975: clear strips our hooks (python + binary) surgically + drops logs ---
+
+def test_clear_strips_binary_hook_preserves_foreign(env):
+    """Managed clear strips our hook in BINARY form but preserves foreign hooks
+    and other top-level keys in a shared/Enterprise managed-settings.json."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    settings_path = managed / "managed-settings.json"
+    foreign_cmd = "/usr/local/bin/org-audit-hook"
+    settings_path.write_text(json.dumps({
+        "permissions": {"allow": ["Bash"]},
+        "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": _cmd("claude-code", "PreToolUse")},
+            {"type": "command", "command": foreign_cmd},
+        ]}]},
+    }))
+    assert m.clear_managed_hooks() == "cleared"
+    result = json.loads(settings_path.read_text())
+    assert result.get("permissions") == {"allow": ["Bash"]}, "foreign top-level key dropped"
+    cmds = [h["command"] for grp in result.get("hooks", {}).get("PreToolUse", [])
+            for h in grp.get("hooks", [])]
+    assert foreign_cmd in cmds, "foreign hook was stripped"
+    assert all("/opt/unbound" not in c for c in cmds), "our binary hook survived the clear"
+
+
+def test_clear_removes_managed_file_when_only_ours(env):
+    """A managed config holding only our hooks is removed entirely (codex)."""
+    m = env["modules"]["codex"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    settings_path = managed / "hooks.json"
+    settings_path.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"hooks": [{"type": "command", "command": _cmd("codex", "PreToolUse")}]}]}}))
+    assert m.clear_managed_hooks() == "cleared"
+    assert not settings_path.exists(), "config left empty of our hooks should be removed"
+
+
+def test_clear_matcher_recognizes_both_forms_not_foreign(env):
+    """_is_unbound_hook_command matches python + binary, but not a foreign hook
+    that merely mentions /opt/unbound/ without the binary itself."""
+    m = env["modules"]["claude-code"]
+    assert m._is_unbound_hook_command(_cmd("claude-code", "Stop"))            # binary
+    assert m._is_unbound_hook_command('"/Users/x/.claude/hooks/unbound.py"')  # python
+    assert not m._is_unbound_hook_command("/opt/unbound/etc/logs/foreign.sh") # prefix only
+    assert not m._is_unbound_hook_command("/usr/local/bin/org-hook")
+    assert not m._is_unbound_hook_command("")
+
+
+def test_clear_removes_hook_logs(env):
+    """remove_user_level_hooks_for_user deletes the per-user agent-audit.log +
+    error.log (they exist only because of us)."""
+    m = env["modules"]["augment"]
+    hooks_dir = env["home"] / ".augment" / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    (hooks_dir / "agent-audit.log").write_text("audit\n")
+    (hooks_dir / "error.log").write_text("err\n")
+    m.remove_user_level_hooks_for_user(ME, env["home"])
+    assert not (hooks_dir / "agent-audit.log").exists()
+    assert not (hooks_dir / "error.log").exists()

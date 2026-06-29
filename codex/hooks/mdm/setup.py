@@ -661,6 +661,11 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not command:
         return False
+    # Binary install: command invokes the /opt/unbound hook binary (require both
+    # the prefix and the binary name so a foreign hook merely mentioning the path
+    # isn't matched). Mirrors the managed _is_unbound_hook_command matcher.
+    if "/opt/unbound/" in command and "unbound-hook" in command:
+        return True
     try:
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
@@ -755,6 +760,18 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                 debug_print(f"Removed {script_path}")
             except Exception as e:
                 debug_print(f"Failed to remove {script_path}: {e}")
+
+        # Remove the hook's own logs — they exist only because of us, so a
+        # clear/nuke takes them too. unlink() drops the dir entry (the symlink
+        # itself, never its target); runs privilege-dropped as the user.
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (script_path.parent / _log).unlink()
+                debug_print(f"Removed {script_path.parent / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {script_path.parent / _log}: {e}")
         return True
 
     _run_as_user(username, _clean)
@@ -1052,8 +1069,19 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
     return bool(_run_as_user(username, _install))
 
 
+def _is_unbound_hook_command(cmd: str) -> bool:
+    """A hook command is ours if it runs our python hook (unbound.py) or the
+    /opt/unbound hook binary. Both forms must be recognized so a binary-install
+    hook is stripped on clear instead of being orphaned (left pointing at a
+    deleted binary). The binary branch requires BOTH the install prefix and the
+    binary name so a foreign hook that merely mentions /opt/unbound/ isn't
+    stripped from a shared/Enterprise config."""
+    return bool(cmd) and ("unbound.py" in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd))
+
+
 def clear_managed_hooks() -> str:
-    """Remove the hooks script and hooks setting from managed Codex config.
+    """Strip ONLY our hook entries from the managed Codex config (hooks.json),
+    preserving any foreign content.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -1087,11 +1115,43 @@ def clear_managed_hooks() -> str:
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                if "hooks" in settings:
-                    del settings["hooks"]
-                    with open(settings_path, "w", encoding="utf-8") as f:
-                        json.dump(settings, f, indent=2)
-                    debug_print("Removed hooks from hooks.json")
+                modified = False
+                hooks_block = settings.get("hooks") if isinstance(settings, dict) else None
+                if isinstance(hooks_block, dict):
+                    for event in list(hooks_block.keys()):
+                        event_config = hooks_block[event]
+                        if not isinstance(event_config, list):
+                            continue
+                        new_config = []
+                        for item in event_config:
+                            if isinstance(item, dict):
+                                hooks = item.get("hooks", [])
+                                new_hooks = [
+                                    h for h in hooks
+                                    if not (isinstance(h, dict) and _is_unbound_hook_command(h.get("command", "")))
+                                ]
+                                if new_hooks != hooks:
+                                    modified = True
+                                if new_hooks:
+                                    item["hooks"] = new_hooks
+                                    new_config.append(item)
+                            else:
+                                new_config.append(item)
+                        if new_config:
+                            hooks_block[event] = new_config
+                        else:
+                            del hooks_block[event]
+                            modified = True
+                    if not hooks_block:
+                        del settings["hooks"]
+                if modified:
+                    if isinstance(settings, dict) and not settings:
+                        settings_path.unlink()
+                        debug_print(f"Removed empty {settings_path}")
+                    else:
+                        with open(settings_path, "w", encoding="utf-8") as f:
+                            json.dump(settings, f, indent=2)
+                        debug_print("Stripped our hooks from hooks.json")
                     cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to update hooks.json: {e}")

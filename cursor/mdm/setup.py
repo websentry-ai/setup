@@ -436,6 +436,26 @@ def remove_user_level_hooks(username: str, home_dir: Path) -> bool:
     return removed
 
 
+def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
+    """Remove the hook's own logs (agent-audit.log, error.log) from a user's
+    ~/.cursor/hooks. They exist only because of us, so a clear/nuke takes them.
+    Privilege-drops to the user; unlink() drops the dir entry (a symlink, never
+    its target)."""
+    hooks_dir = home_dir / ".cursor" / "hooks"
+
+    def _clear():
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (hooks_dir / _log).unlink()
+                debug_print(f"Removed {hooks_dir / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {hooks_dir / _log}: {e}")
+
+    _run_as_user(username, _clear)
+
+
 def set_env_var_windows(var_name: str, value: str) -> bool:
     # MDM setup runs elevated and provisions every user on the device, so
     # write machine-wide (HKLM) with /M — matches every other MDM script.
@@ -902,6 +922,7 @@ def clear_setup():
             failed = 0
             for username, home_dir in user_homes:
                 status = remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY")
+                remove_hook_logs_for_user(username, home_dir)
                 if status == "cleared":
                     cleared += 1
                 elif status == "not_found":
