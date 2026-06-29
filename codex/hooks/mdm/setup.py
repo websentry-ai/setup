@@ -760,21 +760,30 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                 debug_print(f"Removed {script_path}")
             except Exception as e:
                 debug_print(f"Failed to remove {script_path}: {e}")
-
-        # Remove the hook's own logs — they exist only because of us, so a
-        # clear/nuke takes them too. unlink() drops the dir entry (the symlink
-        # itself, never its target); runs privilege-dropped as the user.
-        for _log in ("agent-audit.log", "error.log"):
-            try:
-                (script_path.parent / _log).unlink()
-                debug_print(f"Removed {script_path.parent / _log}")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                debug_print(f"Failed to remove {script_path.parent / _log}: {e}")
         return True
 
     _run_as_user(username, _clean)
+
+
+def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
+    """Remove the hook's own logs (agent-audit.log, error.log) from a user's
+    ~/.codex/hooks on CLEAR/nuke — they exist only because of us. Kept separate
+    from remove_user_level_hooks_for_user (which also runs at setup) so logs are
+    dropped ONLY on clear. Privilege-drops to the user; unlink() removes the dir
+    entry (a symlink, never its target)."""
+    hooks_dir = home_dir / ".codex" / "hooks"
+
+    def _clear():
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (hooks_dir / _log).unlink()
+                debug_print(f"Removed {hooks_dir / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {hooks_dir / _log}: {e}")
+
+    _run_as_user(username, _clear)
 
 
 def get_managed_settings_dir() -> Path:
@@ -1069,14 +1078,17 @@ def configure_codex_hooks_for_user(username: str, home_dir: Path, gateway_url: s
     return bool(_run_as_user(username, _install))
 
 
-def _is_unbound_hook_command(cmd: str) -> bool:
-    """A hook command is ours if it runs our python hook (unbound.py) or the
-    /opt/unbound hook binary. Both forms must be recognized so a binary-install
-    hook is stripped on clear instead of being orphaned (left pointing at a
-    deleted binary). The binary branch requires BOTH the install prefix and the
-    binary name so a foreign hook that merely mentions /opt/unbound/ isn't
-    stripped from a shared/Enterprise config."""
-    return bool(cmd) and ("unbound.py" in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd))
+def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
+    """A hook command is ours if it points at OUR managed python hook
+    (script_path) or the /opt/unbound hook binary. Both forms are recognized so a
+    binary-install hook is stripped on clear instead of being orphaned. Matches the
+    specific script path (NOT a bare 'unbound.py' substring) and requires both the
+    install prefix and the binary name, so a foreign hook in a shared/Enterprise
+    config that merely references some other unbound.py / mentions /opt/unbound/
+    isn't stripped."""
+    if not cmd:
+        return False
+    return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
 
 def clear_managed_hooks() -> str:
@@ -1124,16 +1136,22 @@ def clear_managed_hooks() -> str:
                             continue
                         new_config = []
                         for item in event_config:
-                            if isinstance(item, dict):
-                                hooks = item.get("hooks", [])
+                            # Only touch items with a real list of hooks; preserve
+                            # everything else untouched (foreign items, dicts with
+                            # no/"null" hooks). Drop an item only when every hook in
+                            # it was ours.
+                            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                                hooks = item["hooks"]
                                 new_hooks = [
                                     h for h in hooks
-                                    if not (isinstance(h, dict) and _is_unbound_hook_command(h.get("command", "")))
+                                    if not (isinstance(h, dict) and _is_unbound_hook_command(h.get("command", ""), script_path))
                                 ]
-                                if new_hooks != hooks:
+                                if len(new_hooks) != len(hooks):
                                     modified = True
-                                if new_hooks:
-                                    item["hooks"] = new_hooks
+                                    if new_hooks:
+                                        item["hooks"] = new_hooks
+                                        new_config.append(item)
+                                else:
                                     new_config.append(item)
                             else:
                                 new_config.append(item)
@@ -1251,6 +1269,7 @@ def clear_setup():
         failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_CODEX_API_KEY")
+            remove_hook_logs_for_user(username, home_dir)
             if status == "cleared":
                 cleared += 1
             elif status == "not_found":

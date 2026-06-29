@@ -549,19 +549,32 @@ def test_clear_removes_managed_file_when_only_ours(env):
 
 
 def test_clear_matcher_recognizes_both_forms_not_foreign(env):
-    """_is_unbound_hook_command matches python + binary, but not a foreign hook
-    that merely mentions /opt/unbound/ without the binary itself."""
+    """_is_unbound_hook_command matches our managed python script path + the
+    binary, but NOT a foreign hook pointing at some other unbound.py or merely
+    mentioning /opt/unbound/ (the path-specific tightening)."""
     m = env["modules"]["claude-code"]
-    assert m._is_unbound_hook_command(_cmd("claude-code", "Stop"))            # binary
-    assert m._is_unbound_hook_command('"/Users/x/.claude/hooks/unbound.py"')  # python
-    assert not m._is_unbound_hook_command("/opt/unbound/etc/logs/foreign.sh") # prefix only
-    assert not m._is_unbound_hook_command("/usr/local/bin/org-hook")
-    assert not m._is_unbound_hook_command("")
+    sp = m.get_managed_settings_dir() / "hooks" / "unbound.py"
+    assert m._is_unbound_hook_command(_cmd("claude-code", "Stop"), sp)             # binary
+    assert m._is_unbound_hook_command(f'"{sp}"', sp)                               # our managed python
+    assert not m._is_unbound_hook_command('"/some/other/unbound.py"', sp)          # foreign unbound.py
+    assert not m._is_unbound_hook_command("/opt/unbound/etc/logs/foreign.sh", sp)  # prefix only, no binary
+    assert not m._is_unbound_hook_command("/usr/local/bin/org-hook", sp)
+    assert not m._is_unbound_hook_command("", sp)
 
 
 def test_clear_removes_hook_logs(env):
-    """remove_user_level_hooks_for_user deletes the per-user agent-audit.log +
-    error.log (they exist only because of us)."""
+    """Clear deletes the per-user agent-audit.log + error.log. claude/codex use
+    the dedicated clear-only remove_hook_logs_for_user; augment via its clear-only
+    remove_user_level_hooks_for_user."""
+    for tool, sub in (("claude-code", ".claude"), ("codex", ".codex")):
+        m = env["modules"][tool]
+        hooks_dir = env["home"] / sub / "hooks"
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+        (hooks_dir / "agent-audit.log").write_text("audit\n")
+        (hooks_dir / "error.log").write_text("err\n")
+        m.remove_hook_logs_for_user(ME, env["home"])
+        assert not (hooks_dir / "agent-audit.log").exists()
+        assert not (hooks_dir / "error.log").exists()
     m = env["modules"]["augment"]
     hooks_dir = env["home"] / ".augment" / "hooks"
     hooks_dir.mkdir(parents=True, exist_ok=True)

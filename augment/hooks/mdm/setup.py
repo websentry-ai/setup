@@ -1109,13 +1109,19 @@ def clear_managed_hooks() -> str:
                                 continue
                             new_config = []
                             for item in event_config:
-                                if isinstance(item, dict):
-                                    hooks = item.get("hooks", [])
-                                    new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
-                                    if new_hooks != hooks:
+                                # Only touch items with a real list of hooks;
+                                # preserve everything else (foreign items, dicts
+                                # with no/"null" hooks). Drop an item only when
+                                # every hook in it was ours.
+                                if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                                    hooks_list = item["hooks"]
+                                    new_hooks = [h for h in hooks_list if not (isinstance(h, dict) and _is_unbound(h.get("command", "")))]
+                                    if len(new_hooks) != len(hooks_list):
                                         modified = True
-                                    if new_hooks:
-                                        item["hooks"] = new_hooks
+                                        if new_hooks:
+                                            item["hooks"] = new_hooks
+                                            new_config.append(item)
+                                    else:
                                         new_config.append(item)
                                 else:
                                     new_config.append(item)
