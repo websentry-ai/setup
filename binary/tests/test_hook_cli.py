@@ -48,6 +48,16 @@ EVENT_PAYLOADS = {
         "SessionStart": {**S, "hook_event_name": "SessionStart"},
         "SessionEnd": {**S, "hook_event_name": "SessionEnd"},
     },
+    "augment": {
+        "PreToolUse": {**S, "hook_event_name": "PreToolUse", "tool_name": "launch-process",
+                       "tool_input": {"command": "git status"}},
+        "PostToolUse": {**S, "hook_event_name": "PostToolUse", "tool_name": "launch-process",
+                        "tool_input": {"command": "git status"},
+                        "tool_output": "clean"},
+        "Stop": {**S, "hook_event_name": "Stop"},
+        "SessionStart": {**S, "hook_event_name": "SessionStart"},
+        "SessionEnd": {**S, "hook_event_name": "SessionEnd"},
+    },
     "cursor": {
         "preToolUse": {**S, "hook_event_name": "preToolUse", "tool_name": "Read",
                        "tool_input": {"file_path": "/tmp/x"}},

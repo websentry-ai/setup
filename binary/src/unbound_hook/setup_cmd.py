@@ -21,6 +21,7 @@ but never aborts the remaining components.
 import json
 import os
 import platform
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -33,7 +34,7 @@ from . import migration
 DISCOVERY_TIMEOUT_SECONDS = 5400
 DISCOVERY_KILL_GRACE_SECONDS = 120
 
-SETUP_TOOLS = ("claude-code", "cursor", "codex", "copilot")
+SETUP_TOOLS = ("claude-code", "cursor", "codex", "copilot", "augment")
 
 USAGE = (
     "Usage: unbound-hook setup --api-key <admin_key> [--discovery-key <key>]\n"
@@ -166,9 +167,9 @@ def _claude_hooks_config():
 
 
 def _codex_hooks_config(hook_command):
-    # Codex execs the command as a single on-disk program (its python path
-    # registers a bare script, not a shell line), so every event shares one
-    # wrapper command; the event is read from stdin.
+    # Codex runs the command as a single on-disk python program (its python
+    # path registers a bare script, not a shell line), so every event shares
+    # one wrapper command; the event is read from stdin.
     cmd = lambda ev: hook_command
     return {
         "PreToolUse": [{"matcher": "*", "hooks": [
@@ -202,6 +203,26 @@ def _cursor_hooks_json():
         "sessionStart": [{"command": cmd("sessionStart")}],
     }
     return {"version": 1, "hooks": hooks}
+
+
+def _augment_hooks_config():
+    """The Augment hooks block with binary commands. Structure + per-event
+    timeouts (ms) copied verbatim from augment build_hooks_block; no per-hook
+    metadata (Auggie rejects it) and no UserPromptSubmit (Augment has no such
+    event). No Windows `shell` key — the binary path is macOS-only."""
+    cmd = lambda ev: hook_command_for_event("augment", ev)
+    return {
+        "PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": cmd("PreToolUse"), "timeout": 15000}]}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": cmd("PostToolUse"), "timeout": 10000}]}],
+        "Stop": [{"hooks": [
+            {"type": "command", "command": cmd("Stop"), "timeout": 10000}]}],
+        "SessionStart": [{"hooks": [
+            {"type": "command", "command": cmd("SessionStart"), "timeout": 60000}]}],
+        "SessionEnd": [{"hooks": [
+            {"type": "command", "command": cmd("SessionEnd"), "timeout": 10000}]}],
+    }
 
 
 def _copilot_hooks_config():
@@ -274,14 +295,87 @@ def _write_claude_managed_settings(m) -> bool:
         return False
 
 
+def _write_augment_managed_settings(m) -> bool:
+    """Binary variant of augment setup_managed_hooks(): same /etc/augment/
+    settings.json, no script download. /etc/augment/settings.json is SHARED
+    with the org's own Augment config, so this MERGES per-event (append our
+    hook entry only if our command isn't already present) and merges
+    toolPermissions on identity, preserving every foreign entry, rule, and
+    other top-level key — never clobbering the org's config."""
+    try:
+        managed_dir = m.get_managed_settings_dir()
+        managed_dir.mkdir(parents=True, exist_ok=True)
+        settings_path = managed_dir / "settings.json"
+
+        settings = {}
+        if settings_path.exists():
+            try:
+                with open(settings_path, "r", encoding="utf-8") as f:
+                    settings = json.load(f) or {}
+            except Exception:
+                settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+
+        # MERGE per-event (settings.json is shared with the org's own config):
+        # append our hook entry per event only if our command isn't already
+        # present; preserve every foreign entry and other top-level key.
+        hooks_config = _augment_hooks_config()
+        if not isinstance(settings.get("hooks"), dict):
+            settings["hooks"] = {}
+        for event, new_config in hooks_config.items():
+            our_command = new_config[0]["hooks"][0]["command"]
+            existing_config = settings["hooks"].get(event)
+            if isinstance(existing_config, list):
+                our_hook_exists = any(
+                    hook.get("command", "") == our_command
+                    for item in existing_config if isinstance(item, dict)
+                    for hook in item.get("hooks", [])
+                )
+                if not our_hook_exists:
+                    existing_config.extend(new_config)
+            elif existing_config is None:
+                settings["hooks"][event] = new_config
+            # A foreign non-list hooks[event] is left untouched.
+
+        # Merge toolPermissions, preserving foreign rules. Match on our identity
+        # (toolName + shellInputRegex) so re-running never duplicates.
+        existing_perms = settings.get("toolPermissions")
+        if not isinstance(existing_perms, list):
+            existing_perms = []
+        existing_identities = {
+            m._tool_permission_identity(r) for r in existing_perms if isinstance(r, dict)
+        }
+        for rule in m.build_tool_permissions_block():
+            if m._tool_permission_identity(rule) not in existing_identities:
+                existing_perms.append(rule)
+                existing_identities.add(m._tool_permission_identity(rule))
+        settings["toolPermissions"] = existing_perms
+
+        _atomic_write_text(settings_path, json.dumps(settings, indent=2))
+
+        if platform.system().lower() in ("darwin", "linux"):
+            os.chmod(managed_dir, 0o755)
+            os.chmod(settings_path, 0o644)
+        return True
+    except Exception as e:
+        print(f"Failed to write augment managed settings: {e}")
+        return False
+
+
 def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
     """Register codex hooks per-user in ~/.codex/hooks.json (the layer codex
     actually discovers them from), mirroring the python user-level
-    configure_codex_hooks exactly. Codex execs the hooks.json command as a
-    single on-disk program, so a tiny sh wrapper at ~/.codex/hooks/unbound.py
-    execs the binary (no python3 needed; the event is read from stdin) and the
-    registered command is that bare wrapper PATH. Privilege-dropped; merge is
-    idempotent (match-by-command) and preserves other tools' hooks."""
+    configure_codex_hooks exactly. Codex runs the registered ~/.codex/hooks/
+    unbound.py as a PYTHON program (its native hook contract — the real
+    python-era file is `#!/usr/bin/env python3`, and the python installer's
+    Windows branch invokes it as `py -3 "<path>"`). A `#!/bin/sh` wrapper at a
+    `.py` path is therefore NOT valid python and codex silently drops it (the
+    bug this replaces). So the wrapper is a tiny python shim that execs the
+    binary (the event is read from stdin) — valid whether codex honors the
+    shebang OR runs it through a python interpreter by extension. The registered
+    command is that bare wrapper PATH. Privilege-dropped; merge is idempotent
+    (match-by-command) and preserves other tools' hooks."""
     hooks_dir = home_dir / ".codex" / "hooks"
     wrapper = hooks_dir / "unbound.py"
     hooks_path = home_dir / ".codex" / "hooks.json"
@@ -292,12 +386,49 @@ def _install_codex_hooks_for_user(m, username, home_dir) -> bool:
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(str(wrapper), flags, 0o755)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write('#!/bin/sh\nexec "%s" hook codex\n' % HOOK_BINARY)
+            f.write(_codex_wrapper_source())
         os.chmod(wrapper, 0o755)
         _merge_codex_hooks_json(hooks_path, hook_command)
         return True
 
     return bool(m._run_as_user(username, _install))
+
+
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
+        return False
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t.strip().strip('"').strip("'") for t in tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
+
+
+def _codex_wrapper_source() -> str:
+    """Python shim written to ~/.codex/hooks/unbound.py. Must be valid python
+    (codex runs it as a python program) AND exec the binary with no python
+    dependency beyond the interpreter that launches it. os.execv replaces the
+    process so stdin/stdout/stderr (the hook payload + response) pass straight
+    through. repr() safely embeds the binary path as a python string literal."""
+    return (
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        'os.execv(%s, ["unbound-hook", "hook", "codex"])\n' % repr(str(HOOK_BINARY))
+    )
 
 
 def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
@@ -321,7 +452,7 @@ def _merge_codex_hooks_json(hooks_path: Path, hook_command: str) -> None:
             for existing_item in existing_config:
                 if isinstance(existing_item, dict):
                     for hook in existing_item.get("hooks", []):
-                        if hook.get("command", "") == hook_command:
+                        if _command_targets_hook(hook.get("command", ""), Path(hook_command)):
                             our_hook_exists = True
                             break
             if not our_hook_exists:
@@ -420,6 +551,54 @@ def _setup_claude_code(opts):
                             install_state=state, serial_number=device_id)
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
+    return ("configured", None)
+
+
+def _setup_augment(opts):
+    """Mirrors augment mdm/setup.py main() step-for-step, minus downloads.
+    Augment uses system-managed /etc/augment (get_managed_settings_dir), like
+    claude-code; the notify tool_type is 'augment_code' and the env var is
+    UNBOUND_AUGMENT_API_KEY (both verbatim from augment's setup.py). Augment
+    does NOT support backfill. One substitution from main(): user-level hook
+    removal is gated on the managed write returning True rather than on
+    verify_managed_hooks_installed() — the latter checks for the downloaded
+    /etc/augment/hooks/unbound.py the binary path never writes."""
+    m = _module("augment")
+    base, gateway = _normalized_urls(m, opts)
+    if opts["backfill"]:
+        print("[backfill] Augment backfill is not supported.")
+    device_id = m.get_device_identifier()
+    if not device_id:
+        return ("deferred", "could not read device identifier")
+    api_key = m.fetch_api_key_from_mdm(base, opts["app_name"], opts["api_key"], device_id)
+    if not api_key:
+        return ("deferred", "MDM api key fetch failed")
+
+    success, _ = m.set_env_var_system_wide("UNBOUND_AUGMENT_API_KEY", api_key)
+    if not success:
+        return ("deferred", "failed to set UNBOUND_AUGMENT_API_KEY")
+
+    # Write the per-user unbound config now (needed by the managed hook). User
+    # hook removal is deferred until the managed write succeeds (parity with
+    # augment main()'s ordering).
+    user_homes = m.get_all_user_homes()
+    for username, home_dir in user_homes:
+        m.write_unbound_config_for_user(
+            username, home_dir, api_key,
+            urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
+
+    state = _detect_state(m.get_managed_settings_dir() / "settings.json")
+    if not _write_augment_managed_settings(m):
+        return ("deferred", "managed settings write failed")
+    _remove_stale_managed_script(m.get_managed_settings_dir())
+
+    # Strip leftover user-level Unbound hooks only after the managed write
+    # succeeded, so managed hooks don't fire twice.
+    for username, home_dir in user_homes:
+        m.remove_user_level_hooks_for_user(username, home_dir)
+
+    m.notify_setup_complete(api_key, "augment_code", backend_url=base,
+                            install_state=state, serial_number=device_id)
     return ("configured", None)
 
 
@@ -626,6 +805,7 @@ _ADAPTERS = {
     "cursor": _setup_cursor,
     "codex": _setup_codex,
     "copilot": _setup_copilot,
+    "augment": _setup_augment,
 }
 
 

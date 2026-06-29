@@ -45,7 +45,7 @@ def _force_utf8_io() -> None:
 USAGE = """unbound-hook %s
 
 Usage:
-  unbound-hook hook <tool> [<event>]      tools: claude-code|cursor|copilot|codex
+  unbound-hook hook <tool> [<event>]      tools: claude-code|cursor|copilot|codex|augment
   unbound-hook setup --api-key <key> [--discovery-key <key>] [options]
   unbound-hook backfill (--all | --user <name>) [--dry-run] [options]
   unbound-hook clear

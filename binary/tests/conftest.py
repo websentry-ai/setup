@@ -20,6 +20,7 @@ TOOL_PY = {
     "cursor": REPO / "cursor" / "unbound.py",
     "copilot": REPO / "copilot" / "hooks" / "unbound.py",
     "codex": REPO / "codex" / "hooks" / "unbound.py",
+    "augment": REPO / "augment" / "hooks" / "unbound.py",
 }
 
 
@@ -33,6 +34,7 @@ def _run(cmd, payload, home, extra_env=None, stdin_close=False):
     env.pop("UNBOUND_CURSOR_API_KEY", None)
     env.pop("UNBOUND_COPILOT_API_KEY", None)
     env.pop("UNBOUND_CODEX_API_KEY", None)
+    env.pop("UNBOUND_AUGMENT_API_KEY", None)
     if extra_env:
         env.update(extra_env)
     return subprocess.run(

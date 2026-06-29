@@ -307,7 +307,7 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
     closure returned None on success, ``_run_as_user`` relayed that None, and
     the caller misreported every successful write as
     ``Could not write config for <user>``. The same closure ships verbatim in
-    claude-code, codex and copilot, so all three are checked here.
+    claude-code, codex, copilot and augment, so all four are checked here.
     """
 
     _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -315,6 +315,7 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
         "claude-code": _REPO_ROOT / "claude-code" / "hooks" / "mdm" / "setup.py",
         "codex": _REPO_ROOT / "codex" / "hooks" / "mdm" / "setup.py",
         "copilot": _REPO_ROOT / "copilot" / "hooks" / "mdm" / "setup.py",
+        "augment": _REPO_ROOT / "augment" / "hooks" / "mdm" / "setup.py",
     }
 
     @staticmethod
@@ -357,6 +358,151 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
                     any("Could not write config" in m for m in logs),
                     f"{name}: success path falsely logged a failure: {logs}",
                 )
+
+
+class TestCommandTargetsHook(unittest.TestCase):
+    def setUp(self):
+        from setup import _command_targets_hook
+        self.match = _command_targets_hook
+        self.target = Path("/Users/jane/.claude/hooks/unbound.py")
+
+    def test_bare_path_matches(self):
+        self.assertTrue(self.match(str(self.target), self.target))
+
+    def test_double_quoted_matches(self):
+        self.assertTrue(self.match(f'"{self.target}"', self.target))
+
+    def test_single_quoted_matches(self):
+        self.assertTrue(self.match(f"'{self.target}'", self.target))
+
+    def test_launcher_prefixed_matches(self):
+        self.assertTrue(self.match(f'py -3 "{self.target}"', self.target))
+        self.assertTrue(self.match(f'python "{self.target}"', self.target))
+
+    def test_exe_launcher_prefixed_matches(self):
+        self.assertTrue(self.match(f'py.exe -3 "{self.target}"', self.target))
+        self.assertTrue(self.match(f'python.exe "{self.target}"', self.target))
+        self.assertTrue(self.match(f'python3.exe "{self.target}"', self.target))
+
+    def test_path_with_spaces_matches(self):
+        target = Path("/Users/Jane Doe/.claude/hooks/unbound.py")
+        self.assertTrue(self.match(f'"{target}"', target))
+        self.assertTrue(self.match(f'py -3 "{target}"', target))
+
+    def test_foreign_command_does_not_match(self):
+        self.assertFalse(self.match("/opt/other/hook.py", self.target))
+        self.assertFalse(self.match('echo "hello world"', self.target))
+
+    def test_target_as_argument_does_not_match(self):
+        self.assertFalse(self.match(f'/opt/other/hook.py --config "{self.target}"', self.target))
+
+    def test_sibling_path_does_not_match(self):
+        self.assertFalse(self.match(f"{self.target}.backup", self.target))
+        self.assertFalse(self.match(f"/opt/mirror{self.target}", self.target))
+
+    def test_empty_command_does_not_match(self):
+        self.assertFalse(self.match("", self.target))
+
+
+class TestRemoveHooksFromSettings(unittest.TestCase):
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        patcher = patch("setup.Path.home", return_value=self.home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.settings_path = self.home / ".claude" / "settings.json"
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.script = str(self.home / ".claude" / "hooks" / "unbound.py")
+
+    def _write(self, settings):
+        self.settings_path.write_text(json.dumps(settings))
+
+    def _read(self):
+        return json.loads(self.settings_path.read_text())
+
+    def test_removes_quoted_bare_and_launcher_forms_preserving_foreign(self):
+        from setup import remove_hooks_from_settings
+        self._write({"hooks": {
+            "PreToolUse": [
+                {"matcher": "*", "hooks": [
+                    {"type": "command", "command": f'"{self.script}"'},
+                    {"type": "command", "command": "/opt/other/hook.py"},
+                ]},
+            ],
+            "Stop": [
+                {"hooks": [{"type": "command", "command": self.script}]},
+            ],
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": f'py -3 "{self.script}"'}]},
+            ],
+        }})
+        self.assertEqual(remove_hooks_from_settings(), "cleared")
+        result = self._read()
+        self.assertEqual(
+            result["hooks"]["PreToolUse"][0]["hooks"],
+            [{"type": "command", "command": "/opt/other/hook.py"}],
+        )
+        self.assertNotIn("Stop", result["hooks"])
+        self.assertNotIn("SessionStart", result["hooks"])
+
+    def test_mixed_quoted_and_bare_both_removed(self):
+        from setup import remove_hooks_from_settings
+        self._write({"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": f'"{self.script}"'},
+                {"type": "command", "command": self.script},
+            ]},
+        ]}})
+        self.assertEqual(remove_hooks_from_settings(), "cleared")
+        self.assertNotIn("hooks", self._read())
+
+    def test_install_dedup_skips_when_quoted_entry_exists(self):
+        from setup import configure_claude_settings
+        self._write({"hooks": {"PreToolUse": [
+            {"matcher": "*", "hooks": [
+                {"type": "command", "command": f'"{self.script}"', "timeout": 15000},
+            ]},
+        ]}})
+        self.assertTrue(configure_claude_settings())
+        result = self._read()
+        commands = [
+            h["command"]
+            for item in result["hooks"]["PreToolUse"]
+            for h in item["hooks"]
+        ]
+        self.assertEqual(commands.count(f'"{self.script}"'), 1)
+        self.assertNotIn(self.script, commands)
+
+
+class TestMatcherParityAcrossTrees(unittest.TestCase):
+    SENTINEL = "return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target"
+
+    def _extract(self, path):
+        captured = []
+        capturing = False
+        for line in path.read_text().splitlines():
+            if line.startswith("def _command_targets_hook"):
+                capturing = True
+            if capturing:
+                captured.append(line)
+                if line.strip() == self.SENTINEL:
+                    break
+        return "\n".join(captured)
+
+    def test_helper_is_byte_identical_across_trees(self):
+        root = Path(__file__).resolve().parents[2]
+        files = [
+            root / "claude-code" / "hooks" / "setup.py",
+            root / "claude-code" / "hooks" / "mdm" / "setup.py",
+            root / "codex" / "hooks" / "setup.py",
+            root / "codex" / "hooks" / "mdm" / "setup.py",
+            root / "binary" / "src" / "unbound_hook" / "setup_cmd.py",
+        ]
+        bodies = [self._extract(f) for f in files]
+        for path, body in zip(files, bodies):
+            self.assertTrue(body.strip(), f"{path}: matcher not found")
+        self.assertEqual(len(set(bodies)), 1, "matcher drifted across trees")
 
 
 if __name__ == "__main__":

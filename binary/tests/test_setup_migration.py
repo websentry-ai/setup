@@ -29,7 +29,7 @@ def env(tmp_path, monkeypatch):
     notified = []
     backfilled = []
     modules = {}
-    for tool in ("claude-code", "cursor", "codex", "copilot"):
+    for tool in ("claude-code", "cursor", "codex", "copilot", "augment"):
         m = load_mdm_setup_module(tool)
         modules[tool] = m
         monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a, **k: fn(*a, **k))
@@ -55,6 +55,8 @@ def env(tmp_path, monkeypatch):
                         lambda: tmp_path / "managed-codex")
     monkeypatch.setattr(modules["cursor"], "get_enterprise_hooks_dir",
                         lambda: tmp_path / "enterprise-cursor")
+    monkeypatch.setattr(modules["augment"], "get_managed_settings_dir",
+                        lambda: tmp_path / "managed-augment")
     # NEVER run real launchctl from tests — the dev machine may have live
     # agents under these labels. Record the bootout calls instead.
     bootouts = []
@@ -92,8 +94,12 @@ def test_setup_full_run_configures_everything(env):
 
     # codex hooks.json — codex 0.125 discovers hooks from ~/.codex/hooks.json
     # (the user layer), so every event registers the BARE wrapper PATH (no
-    # quotes, no " hook codex" args), and a sh wrapper that execs the binary
-    # lives at ~/.codex/hooks/unbound.py.
+    # quotes, no " hook codex" args leaking into the registered command), and a
+    # python shim that execs the binary lives at ~/.codex/hooks/unbound.py.
+    # Codex runs that file as a PYTHON program (its native hook contract — the
+    # python-era file is `#!/usr/bin/env python3`), so a `#!/bin/sh` wrapper at
+    # a `.py` path is invalid python and codex silently drops it (the bug this
+    # replaces).
     codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
     codex_cmd = str(codex_wrapper)
     codex = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
@@ -105,10 +111,13 @@ def test_setup_full_run_configures_everything(env):
     for ev in codex["hooks"]:
         c = codex["hooks"][ev][0]["hooks"][0]["command"]
         assert c == codex_cmd and " hook codex" not in c
-    # the wrapper is a real executable that execs the binary — no python needed
+    # the wrapper is an executable python shim that execs the binary
     assert codex_wrapper.exists() and (codex_wrapper.stat().st_mode & 0o111)
     body = codex_wrapper.read_text()
-    assert body.startswith("#!/bin/sh") and f'exec "{BIN}" hook codex' in body
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
+    compile(body, "unbound.py", "exec")  # must be valid python — codex runs it as one
+    assert "os.execv" in body and BIN in body and '"codex"' in body
     # the dead managed hooks.json location is NOT written
     assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
 
@@ -134,17 +143,37 @@ def test_setup_full_run_configures_everything(env):
         assert entry == {"type": "command", "command": _cmd("copilot", ev),
                          "bash": _cmd("copilot", ev), "powershell": _cmd("copilot", ev),
                          "timeout": t, "timeoutSec": t}
+    # augment managed /etc/augment settings.json — hooks block (verbatim
+    # timeouts: PreToolUse 15000, SessionStart 60000, rest 10000) + the seeded
+    # toolPermissions rules. No UserPromptSubmit (Augment has no such event).
+    augment = json.loads((env["tmp"] / "managed-augment" / "settings.json").read_text())
+    assert augment["hooks"] == {
+        "PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": _cmd("augment", "PreToolUse"), "timeout": 15000}]}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": _cmd("augment", "PostToolUse"), "timeout": 10000}]}],
+        "Stop": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "Stop"), "timeout": 10000}]}],
+        "SessionStart": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "SessionStart"), "timeout": 60000}]}],
+        "SessionEnd": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "SessionEnd"), "timeout": 10000}]}],
+    }
+    aug_mod = env["modules"]["augment"]
+    assert augment["toolPermissions"] == aug_mod.build_tool_permissions_block()
+
     # no python script is installed anywhere
     assert not (env["home"] / ".copilot" / "hooks" / "unbound.py").exists()
     assert not (env["tmp"] / "managed-claude" / "hooks" / "unbound.py").exists()
+    assert not (env["tmp"] / "managed-augment" / "hooks" / "unbound.py").exists()
 
     # per-user config written for every tool (same device key)
     cfg = json.loads((env["home"] / ".unbound" / "config.json").read_text())
     assert cfg["api_key"] == "per-device-key"
     assert cfg["base_url"] == "https://backend.getunbound.ai"
 
-    # completion notify fired once per tool
-    assert len(env["notified"]) == 4
+    # completion notify fired once per tool (5: claude, cursor, codex, copilot, augment)
+    assert len(env["notified"]) == 5
     # backfill NOT run without --backfill
     assert env["backfilled"] == []
 
@@ -221,6 +250,49 @@ def test_setup_codex_user_hooks_idempotent(env):
         assert len(second["hooks"][ev][0]["hooks"]) == 1
 
 
+def test_codex_wrapper_is_valid_python_execing_the_binary():
+    """WEB-4850 root-cause lock-in. Codex runs ~/.codex/hooks/unbound.py as a
+    PYTHON program (its native hook contract). The pre-fix binary installer wrote
+    a `#!/bin/sh` wrapper there — not valid python — so codex silently dropped it
+    (fail-open) and was ungoverned while the shell-executed tools worked. The
+    wrapper MUST be valid python that execs the binary with `hook codex`."""
+    body = setup_cmd._codex_wrapper_source()
+
+    # (a) valid python — the exact failure mode of the sh wrapper was a parse error
+    compile(body, "unbound.py", "exec")
+    # (b) execs the binary with `hook codex` via os.execv (event read from stdin)
+    assert "os.execv" in body
+    assert BIN in body
+    assert '"hook"' in body and '"codex"' in body
+    # (c) NOT a /bin/sh script (the regression)
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
+    # no stray shell-isms leaked from the old wrapper
+    assert "exec " not in body  # the sh builtin; os.execv is the python call
+
+
+def test_codex_wrapper_written_to_disk_is_valid_python(env):
+    """End-to-end: the file setup_cmd.run(...) actually writes at
+    ~/.codex/hooks/unbound.py is valid python execing the binary — not a sh
+    wrapper, executable, registered by bare path in hooks.json."""
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+
+    wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
+    body = wrapper.read_text()
+    compile(body, "unbound.py", "exec")
+    assert body.startswith("#!/usr/bin/env python3")
+    assert not body.startswith("#!/bin/sh")
+    assert "os.execv" in body and BIN in body and '"codex"' in body
+    assert wrapper.stat().st_mode & 0o111  # executable
+
+    # the registered command is the bare wrapper path — no " hook codex" args
+    hooks = json.loads((env["home"] / ".codex" / "hooks.json").read_text())
+    for ev in hooks["hooks"]:
+        cmd = hooks["hooks"][ev][0]["hooks"][0]["command"]
+        assert cmd == str(wrapper)
+        assert " hook codex" not in cmd
+
+
 # ---------------------------------------------------------------------------
 # WEB-4788 migration sweep fixtures: clean, half-installed, previously-binary
 # ---------------------------------------------------------------------------
@@ -233,7 +305,7 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
     (home / ".local" / "share" / "unbound").mkdir(parents=True)
     (home / ".local" / "share" / "unbound" / "install.sh").write_text("#!/bin/bash")
     (home / ".local" / "share" / "unbound" / "run-scheduled.sh").write_text("#!/bin/bash")
-    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         p = home / d
         p.mkdir(parents=True)
         (p / "unbound.py").write_text("# stale hook")
@@ -247,7 +319,7 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
             {"command": f'"{home}/.copilot/hooks/unbound.py"'}]}}))
     # stale managed scripts — removed by the setup adapters AFTER their
     # settings rewrite succeeds (never by the sweep; see F1 in review)
-    for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
+    for tool in ("managed-claude", "managed-codex", "enterprise-cursor", "managed-augment"):
         (tmp / tool / "hooks").mkdir(parents=True, exist_ok=True)
         (tmp / tool / "hooks" / "unbound.py").write_text("# stale managed hook")
     # user-level claude hook registration pointing at the python script
@@ -256,6 +328,13 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
             {"type": "command", "command": str(home / ".claude" / "hooks" / "unbound.py")}]}]},
         "model": "opus",
     }))
+    # user-level augment hook registration pointing at the python script (the
+    # augment stripper matches on the bare script path, not a quoted command)
+    (home / ".augment" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": str(home / ".augment" / "hooks" / "unbound.py")}]}]},
+        "editorSetting": "keep",
+    }))
 
 
 def _assert_swept(home: Path, tmp: Path):
@@ -263,9 +342,9 @@ def _assert_swept(home: Path, tmp: Path):
     assert not (home / "Library" / "LaunchAgents" / "ai.getunbound.discovery.plist").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".local" / "share" / "unbound" / "run-scheduled.sh").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / "unbound.py").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
     # copilot's SERVING files are not the sweep's job: unbound.json is the
@@ -274,12 +353,16 @@ def _assert_swept(home: Path, tmp: Path):
     assert (home / ".copilot" / "hooks" / "unbound.json").exists()
     assert (home / ".copilot" / "hooks" / "unbound.py").exists()
     # managed scripts are NOT the sweep's job (adapters remove them post-write)
-    for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
+    for tool in ("managed-claude", "managed-codex", "enterprise-cursor", "managed-augment"):
         assert (tmp / tool / "hooks" / "unbound.py").exists()
     # the user-authored part of settings.json survives, unbound entries don't
     settings = json.loads((home / ".claude" / "settings.json").read_text())
     assert settings.get("model") == "opus"
     assert "hooks" not in settings
+    # augment: foreign top-level key survives, the unbound hook entry is stripped
+    aug_settings = json.loads((home / ".augment" / "settings.json").read_text())
+    assert aug_settings.get("editorSetting") == "keep"
+    assert "hooks" not in aug_settings
     # config.json preserved byte-for-byte
     assert json.loads((home / ".unbound" / "config.json").read_text()) == {"api_key": "KEEP-ME"}
 
@@ -333,7 +416,9 @@ def test_sweep_runs_inside_setup(env):
         assert not (env["tmp"] / tool / "hooks" / "unbound.py").exists()
     codex_wrapper = env["home"] / ".codex" / "hooks" / "unbound.py"
     assert codex_wrapper.exists()
-    assert 'exec "%s" hook codex' % BIN in codex_wrapper.read_text()
+    wrapper_body = codex_wrapper.read_text()
+    compile(wrapper_body, "unbound.py", "exec")  # codex runs it as a python program
+    assert "os.execv" in wrapper_body and BIN in wrapper_body and '"codex"' in wrapper_body
     assert not (env["tmp"] / "managed-codex" / "hooks.json").exists()
     # python-era copilot registration replaced by a binary-era one, and the
     # now-unreferenced python script removed by the adapter (B2)
