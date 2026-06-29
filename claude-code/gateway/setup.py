@@ -4,6 +4,7 @@ Claude Code - Environment Setup Script
 """
 
 import os
+import sys
 import platform
 import subprocess
 import urllib.request
@@ -676,7 +677,7 @@ def main():
 
     if args.clear:
         clear_setup()
-        return
+        return True
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Claude Code is managed by your organization (MDM).")
@@ -704,13 +705,13 @@ def main():
     if not api_key:
         if not args.domain:
             print("\n❌ Missing required argument: --domain or --api-key")
-            return
+            return False
 
         auth_url = normalize_url(args.domain)
         cb_response = run_one_shot_callback_server(auth_url)
         if cb_response is None:
             print("\n❌ Failed to receive callback response. Exiting.")
-            return
+            return False
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -719,7 +720,7 @@ def main():
 
         if not api_key:
             print("\n❌ No api_key found in callback. Exiting.")
-            return
+            return False
 
     print("API Key Verified ✅")
     debug_print("API key verification successful")
@@ -728,7 +729,7 @@ def main():
     success, message = set_env_var("UNBOUND_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to configure UNBOUND_API_KEY: {message}")
-        return
+        return False
     debug_print("UNBOUND_API_KEY set successfully")
 
     debug_print("Setting ANTHROPIC_BASE_URL environment variable...")
@@ -756,11 +757,15 @@ def main():
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
+    return True
+
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled by user.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ An error occurred: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)

@@ -496,7 +496,7 @@ def main():
 
     if clear_mode:
         clear_setup()
-        return
+        return True
 
     install_macos_certificates()
 
@@ -532,14 +532,14 @@ def main():
     if not api_key:
         if not domain:
             print("❌ Missing required argument: --domain or --api-key")
-            return
+            return False
 
         auth_url = normalize_url(domain)
 
         api_key = run_callback_server(auth_url)
         if not api_key:
             print("❌ No API key received. Exiting.")
-            return
+            return False
 
     debug_print("API key received from callback")
 
@@ -548,13 +548,13 @@ def main():
     success, message = set_env_var(ENV_VAR_NAME, api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
-        return
+        return False
 
     # Configure OpenClaw
     debug_print("Configuring OpenClaw...")
     if not configure_openclaw(gateway_url, setup_plugin=setup_plugin, setup_provider=setup_provider, model=model):
         print("❌ Failed to configure OpenClaw")
-        return
+        return False
 
     print("✅ API key verified and added")
     if setup_plugin:
@@ -575,12 +575,16 @@ def main():
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
+    return True
+
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)

@@ -988,7 +988,7 @@ def main():
 
     if clear_mode:
         clear_setup()
-        return
+        return True
 
     install_macos_certificates()
 
@@ -1024,14 +1024,14 @@ def main():
     if not api_key:
         if not domain:
             print("\n❌ Missing required argument: --domain or --api-key")
-            return
+            return False
 
         auth_url = normalize_url(domain)
 
         cb_response = run_callback_server(auth_url)
         if cb_response is None:
             print("\n❌ Failed to receive callback. Exiting.")
-            return
+            return False
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -1040,7 +1040,7 @@ def main():
 
         if not api_key:
             print("\n❌ No API key received. Exiting.")
-            return
+            return False
 
     print("✅ API key received")
     debug_print("API key received from callback")
@@ -1055,7 +1055,7 @@ def main():
     success, message = set_env_var("UNBOUND_COPILOT_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
-        return
+        return False
 
     print(f"✅ Environment variable set")
     debug_print("UNBOUND_COPILOT_API_KEY set successfully")
@@ -1063,13 +1063,13 @@ def main():
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):
         print("\n❌ Failed to setup hooks")
-        return
+        return False
     debug_print("Hooks setup complete")
 
     debug_print("Configuring Copilot hooks...")
     if not configure_copilot_hooks():
         print("\n❌ Failed to configure Copilot hooks")
-        return
+        return False
     debug_print("Copilot hooks configured")
 
     print("\n" + "=" * 60)
@@ -1085,12 +1085,16 @@ def main():
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
 
+    return True
+
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)

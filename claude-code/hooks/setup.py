@@ -1198,7 +1198,7 @@ def main():
 
     if clear_mode:
         clear_setup()
-        return
+        return True
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Claude Code is managed by your organization (MDM).")
@@ -1238,14 +1238,14 @@ def main():
     if not api_key:
         if not domain:
             print("❌ Missing required argument: --domain or --api-key")
-            return
+            return False
 
         auth_url = normalize_url(domain)
 
         cb_response = run_callback_server(auth_url)
         if cb_response is None:
             print("❌ Failed to receive callback. Exiting.")
-            return
+            return False
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -1259,7 +1259,7 @@ def main():
                 print(f"❌ Setup failed: {safe_error}")
             else:
                 print("❌ No API key received. Exiting.")
-            return
+            return False
 
     debug_print("API key received from callback")
 
@@ -1275,7 +1275,7 @@ def main():
     success, message = set_env_var("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
-        return
+        return False
     debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
 
     _install_state = detect_install_state()
@@ -1286,13 +1286,13 @@ def main():
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):
         print("❌ Failed to setup hooks")
-        return
+        return False
     debug_print("Hooks downloaded successfully")
 
     debug_print("Configuring Claude settings...")
     if not configure_claude_settings():
         print("❌ Failed to configure Claude settings")
-        return
+        return False
     debug_print("Claude settings configured successfully")
 
     print("✅ API key verified and added")
@@ -1307,13 +1307,16 @@ def main():
     rc_path = get_shell_rc_file()
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+    return True
 
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
