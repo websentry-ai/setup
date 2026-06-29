@@ -937,6 +937,36 @@ def _get_device_serial() -> Optional[str]:
     return None
 
 
+_GIT_CONTEXT_CACHE: Dict = {}
+
+
+def _strip_git_credentials(url: str) -> str:
+    return re.sub(r'(://)[^/@]+@', r'\1', url, count=1)
+
+
+def _get_git_context(session_id: Optional[str], cwd: Optional[str]) -> Optional[str]:
+    """Credential-stripped origin remote URL for cwd, or None. Cached per
+    (session_id, cwd); never raises."""
+    key = (session_id, cwd)
+    if key in _GIT_CONTEXT_CACHE:
+        return _GIT_CONTEXT_CACHE[key]
+    result = None
+    if cwd:
+        try:
+            out = subprocess.run(
+                ['git', '-C', cwd, 'config', '--get', 'remote.origin.url'],
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                url = out.stdout.strip()
+                if url:
+                    result = _strip_git_credentials(url)
+        except Exception:
+            result = None
+    _GIT_CONTEXT_CACHE[key] = result
+    return result
+
+
 def _device_serial(probe: bool = True) -> Optional[str]:
     """Hardware serial, computed once and cached. Never raises and never blocks the
     hook. On the latency-critical pre-tool path callers pass probe=False to read the
@@ -1060,6 +1090,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': 'claude-code',
         'model': model,
         'event_name': 'tool_use',
+        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
@@ -1155,6 +1186,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': 'claude-code',
         'model': model,
         'event_name': 'user_prompt',
+        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }

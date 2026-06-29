@@ -919,6 +919,36 @@ def transform_response_for_copilot_prompt(api_response):
     return {}
 
 
+_GIT_CONTEXT_CACHE = {}
+
+
+def _strip_git_credentials(url):
+    return re.sub(r'(://)[^/@]+@', r'\1', url, count=1)
+
+
+def _get_git_context(session_id, cwd):
+    """Credential-stripped origin remote URL for cwd, or None. Cached per
+    (session_id, cwd); never raises."""
+    key = (session_id, cwd)
+    if key in _GIT_CONTEXT_CACHE:
+        return _GIT_CONTEXT_CACHE[key]
+    result = None
+    if cwd:
+        try:
+            out = subprocess.run(
+                ['git', '-C', cwd, 'config', '--get', 'remote.origin.url'],
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                url = out.stdout.strip()
+                if url:
+                    result = _strip_git_credentials(url)
+        except Exception:
+            result = None
+    _GIT_CONTEXT_CACHE[key] = result
+    return result
+
+
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
@@ -1017,6 +1047,7 @@ def process_pre_tool_use(event, api_key):
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'tool_use',
+        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
         'pre_tool_use_data': {
             'tool_name': canonical,
             'command': command,
@@ -1110,6 +1141,7 @@ def process_user_prompt_submit(event, api_key):
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'user_prompt',
+        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 
