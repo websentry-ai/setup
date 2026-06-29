@@ -1044,7 +1044,7 @@ def main():
     # If clear mode, run cleanup and exit
     if clear_mode:
         clear_setup()
-        return
+        return True
 
     print("=" * 60)
     print("Unbound Cursor Hooks - MDM Setup")
@@ -1060,7 +1060,7 @@ def main():
             )
         print("❌ This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
     # Parse arguments
     base_url = "https://backend.getunbound.ai"
@@ -1096,14 +1096,14 @@ def main():
         print("\n❌ Missing required argument: --api-key")
         print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
-        return
+        return False
 
     # Get device identifier
     print("\n🔍 Getting device serial number...")
     serial_number = get_device_identifier()
     if not serial_number:
         print("❌ Failed to get device serial number")
-        return
+        return False
     debug_print(f"Serial number: {serial_number}")
     print("✅ Serial number retrieved")
 
@@ -1111,7 +1111,7 @@ def main():
     print("\n🔑 Fetching API key from MDM...")
     cursor_api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, serial_number)
     if not cursor_api_key:
-        return
+        return False
     print("✅ API key received")
 
     # Set environment variable
@@ -1119,7 +1119,7 @@ def main():
     success, env_changed, message = set_env_var("UNBOUND_CURSOR_API_KEY", cursor_api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
-        return
+        return False
     print(f"✅ Environment variable set ({message})")
 
     # Write API key to ~/.unbound/config.json for each user and remove user-level hooks
@@ -1142,7 +1142,7 @@ def main():
     hooks_success, hooks_changed = setup_hooks(gateway_url=gateway_url)
     if not hooks_success:
         print("\n❌ Failed to setup hooks")
-        return
+        return False
     debug_print("Hooks setup complete")
 
     print("\n" + "=" * 60)
@@ -1160,12 +1160,16 @@ def main():
     print("=" * 60)
     print("\n")
 
+    return True
+
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
