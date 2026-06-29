@@ -29,7 +29,7 @@ def env(tmp_path, monkeypatch):
     notified = []
     backfilled = []
     modules = {}
-    for tool in ("claude-code", "cursor", "codex", "copilot"):
+    for tool in ("claude-code", "cursor", "codex", "copilot", "augment"):
         m = load_mdm_setup_module(tool)
         modules[tool] = m
         monkeypatch.setattr(m, "_run_as_user", lambda u, fn, *a, **k: fn(*a, **k))
@@ -55,6 +55,8 @@ def env(tmp_path, monkeypatch):
                         lambda: tmp_path / "managed-codex")
     monkeypatch.setattr(modules["cursor"], "get_enterprise_hooks_dir",
                         lambda: tmp_path / "enterprise-cursor")
+    monkeypatch.setattr(modules["augment"], "get_managed_settings_dir",
+                        lambda: tmp_path / "managed-augment")
     # NEVER run real launchctl from tests — the dev machine may have live
     # agents under these labels. Record the bootout calls instead.
     bootouts = []
@@ -141,17 +143,37 @@ def test_setup_full_run_configures_everything(env):
         assert entry == {"type": "command", "command": _cmd("copilot", ev),
                          "bash": _cmd("copilot", ev), "powershell": _cmd("copilot", ev),
                          "timeout": t, "timeoutSec": t}
+    # augment managed /etc/augment settings.json — hooks block (verbatim
+    # timeouts: PreToolUse 15000, SessionStart 60000, rest 10000) + the seeded
+    # toolPermissions rules. No UserPromptSubmit (Augment has no such event).
+    augment = json.loads((env["tmp"] / "managed-augment" / "settings.json").read_text())
+    assert augment["hooks"] == {
+        "PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": _cmd("augment", "PreToolUse"), "timeout": 15000}]}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": _cmd("augment", "PostToolUse"), "timeout": 10000}]}],
+        "Stop": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "Stop"), "timeout": 10000}]}],
+        "SessionStart": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "SessionStart"), "timeout": 60000}]}],
+        "SessionEnd": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "SessionEnd"), "timeout": 10000}]}],
+    }
+    aug_mod = env["modules"]["augment"]
+    assert augment["toolPermissions"] == aug_mod.build_tool_permissions_block()
+
     # no python script is installed anywhere
     assert not (env["home"] / ".copilot" / "hooks" / "unbound.py").exists()
     assert not (env["tmp"] / "managed-claude" / "hooks" / "unbound.py").exists()
+    assert not (env["tmp"] / "managed-augment" / "hooks" / "unbound.py").exists()
 
     # per-user config written for every tool (same device key)
     cfg = json.loads((env["home"] / ".unbound" / "config.json").read_text())
     assert cfg["api_key"] == "per-device-key"
     assert cfg["base_url"] == "https://backend.getunbound.ai"
 
-    # completion notify fired once per tool
-    assert len(env["notified"]) == 4
+    # completion notify fired once per tool (5: claude, cursor, codex, copilot, augment)
+    assert len(env["notified"]) == 5
     # backfill NOT run without --backfill
     assert env["backfilled"] == []
 
@@ -283,7 +305,7 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
     (home / ".local" / "share" / "unbound").mkdir(parents=True)
     (home / ".local" / "share" / "unbound" / "install.sh").write_text("#!/bin/bash")
     (home / ".local" / "share" / "unbound" / "run-scheduled.sh").write_text("#!/bin/bash")
-    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         p = home / d
         p.mkdir(parents=True)
         (p / "unbound.py").write_text("# stale hook")
@@ -297,7 +319,7 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
             {"command": f'"{home}/.copilot/hooks/unbound.py"'}]}}))
     # stale managed scripts — removed by the setup adapters AFTER their
     # settings rewrite succeeds (never by the sweep; see F1 in review)
-    for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
+    for tool in ("managed-claude", "managed-codex", "enterprise-cursor", "managed-augment"):
         (tmp / tool / "hooks").mkdir(parents=True, exist_ok=True)
         (tmp / tool / "hooks" / "unbound.py").write_text("# stale managed hook")
     # user-level claude hook registration pointing at the python script
@@ -306,6 +328,13 @@ def _plant_python_era_artifacts(home: Path, tmp: Path):
             {"type": "command", "command": str(home / ".claude" / "hooks" / "unbound.py")}]}]},
         "model": "opus",
     }))
+    # user-level augment hook registration pointing at the python script (the
+    # augment stripper matches on the bare script path, not a quoted command)
+    (home / ".augment" / "settings.json").write_text(json.dumps({
+        "hooks": {"PreToolUse": [{"matcher": ".*", "hooks": [
+            {"type": "command", "command": str(home / ".augment" / "hooks" / "unbound.py")}]}]},
+        "editorSetting": "keep",
+    }))
 
 
 def _assert_swept(home: Path, tmp: Path):
@@ -313,9 +342,9 @@ def _assert_swept(home: Path, tmp: Path):
     assert not (home / "Library" / "LaunchAgents" / "ai.getunbound.discovery.plist").exists()
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".local" / "share" / "unbound" / "run-scheduled.sh").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / "unbound.py").exists()
-    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks"):
+    for d in (".claude/hooks", ".cursor/hooks", ".copilot/hooks", ".codex/hooks", ".augment/hooks"):
         assert not (home / d / ".self_update_check").exists()
         assert not (home / d / ".self_update.lock").exists()
     # copilot's SERVING files are not the sweep's job: unbound.json is the
@@ -324,12 +353,16 @@ def _assert_swept(home: Path, tmp: Path):
     assert (home / ".copilot" / "hooks" / "unbound.json").exists()
     assert (home / ".copilot" / "hooks" / "unbound.py").exists()
     # managed scripts are NOT the sweep's job (adapters remove them post-write)
-    for tool in ("managed-claude", "managed-codex", "enterprise-cursor"):
+    for tool in ("managed-claude", "managed-codex", "enterprise-cursor", "managed-augment"):
         assert (tmp / tool / "hooks" / "unbound.py").exists()
     # the user-authored part of settings.json survives, unbound entries don't
     settings = json.loads((home / ".claude" / "settings.json").read_text())
     assert settings.get("model") == "opus"
     assert "hooks" not in settings
+    # augment: foreign top-level key survives, the unbound hook entry is stripped
+    aug_settings = json.loads((home / ".augment" / "settings.json").read_text())
+    assert aug_settings.get("editorSetting") == "keep"
+    assert "hooks" not in aug_settings
     # config.json preserved byte-for-byte
     assert json.loads((home / ".unbound" / "config.json").read_text()) == {"api_key": "KEEP-ME"}
 

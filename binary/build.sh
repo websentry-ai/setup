@@ -15,8 +15,10 @@ lipo -archs "$PYTHON" | grep -q x86_64 || { echo "ERROR: $PYTHON is not universa
 import ast, re, sys
 files = ["../claude-code/hooks/unbound.py", "../cursor/unbound.py",
          "../copilot/hooks/unbound.py", "../codex/hooks/unbound.py",
+         "../augment/hooks/unbound.py",
          "../claude-code/hooks/mdm/setup.py", "../cursor/mdm/setup.py",
-         "../copilot/hooks/mdm/setup.py", "../codex/hooks/mdm/setup.py"]
+         "../copilot/hooks/mdm/setup.py", "../codex/hooks/mdm/setup.py",
+         "../augment/hooks/mdm/setup.py"]
 need = set()
 for f in files:
     for node in ast.walk(ast.parse(open(f).read())):
