@@ -963,6 +963,23 @@ def _get_git_context(session_id, cwd):
     return result
 
 
+def _repo_context_dir(cwd, file_path):
+    """Directory whose git repo governs the operation: the nearest existing
+    ancestor of the target file for file tools, else the session cwd. The
+    ancestor walk lets a write into a not-yet-created path still resolve to its
+    enclosing repo."""
+    if isinstance(file_path, str) and file_path:
+        base = file_path if os.path.isabs(file_path) else os.path.join(cwd or '', file_path)
+        d = os.path.dirname(base) or cwd
+        while d and not os.path.isdir(d):
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return d or cwd
+    return cwd
+
+
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
@@ -1061,7 +1078,9 @@ def process_pre_tool_use(event, api_key):
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'tool_use',
-        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
+        'git_remote_url': _get_git_context(
+            session_id, _repo_context_dir(event.get('cwd'), file_path)
+        ),
         'pre_tool_use_data': {
             'tool_name': canonical,
             'command': command,
@@ -1155,7 +1174,6 @@ def process_user_prompt_submit(event, api_key):
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'user_prompt',
-        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 

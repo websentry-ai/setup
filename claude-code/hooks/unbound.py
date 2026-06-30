@@ -981,6 +981,23 @@ def _get_git_context(session_id: Optional[str], cwd: Optional[str]) -> Optional[
     return result
 
 
+def _repo_context_dir(cwd: Optional[str], file_path) -> Optional[str]:
+    """Directory whose git repo governs the operation: the nearest existing
+    ancestor of the target file for file tools, else the session cwd. The
+    ancestor walk lets a write into a not-yet-created path still resolve to its
+    enclosing repo."""
+    if isinstance(file_path, str) and file_path:
+        base = file_path if os.path.isabs(file_path) else os.path.join(cwd or '', file_path)
+        d = os.path.dirname(base) or cwd
+        while d and not os.path.isdir(d):
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return d or cwd
+    return cwd
+
+
 def _device_serial(probe: bool = True) -> Optional[str]:
     """Hardware serial, computed once and cached. Never raises and never blocks the
     hook. On the latency-critical pre-tool path callers pass probe=False to read the
@@ -1104,7 +1121,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': 'claude-code',
         'model': model,
         'event_name': 'tool_use',
-        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
+        'git_remote_url': _get_git_context(
+            session_id, _repo_context_dir(event.get('cwd'), tool_input.get('file_path'))
+        ),
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
@@ -1200,7 +1219,6 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': 'claude-code',
         'model': model,
         'event_name': 'user_prompt',
-        'git_remote_url': _get_git_context(session_id, event.get('cwd')),
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }

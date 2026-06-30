@@ -3,6 +3,7 @@ git_remote_url payload parity across claude-code and copilot."""
 
 import contextlib
 import importlib.util
+import os
 import subprocess
 import tempfile
 import unittest
@@ -97,54 +98,132 @@ class TestGetGitContext(unittest.TestCase):
                     self.assertEqual(spy.call_count, 1)
 
 
-class TestPayloadParity(unittest.TestCase):
-    """git_remote_url must appear with the same key/shape in both the
-    user_prompt and pre_tool_use bodies for claude-code and copilot.
+def _capture(mod, fn, event):
+    with contextlib.ExitStack() as stack:
+        send = stack.enter_context(
+            patch.object(mod, "send_to_hook_api", return_value={"decision": "allow"}))
+        if hasattr(mod, "build_account_identity"):
+            stack.enter_context(
+                patch.object(mod, "build_account_identity", return_value={}))
+        if hasattr(mod, "load_policy_cache"):
+            stack.enter_context(patch.object(mod, "load_policy_cache", return_value=None))
+        fn(event, "key")
+        return send.call_args.args[0]
 
-    Copilot's UserPromptSubmit cwd is UNVERIFIED in-repo; the hook reads
-    event.get('cwd') defensively, so the field is present and null when cwd
-    is absent (contract-compatible) and populated when cwd is supplied."""
+
+class TestRepoContextDir(unittest.TestCase):
+    """The repo identity follows the operation target: the nearest existing
+    ancestor of the edited/read file for file tools, the session cwd otherwise."""
+
+    def test_uses_existing_target_directory(self):
+        parent = tempfile.mkdtemp()
+        sub = os.path.join(parent, "src")
+        os.makedirs(sub)
+        target = os.path.join(sub, "x.py")
+        for mod in (cc, co):
+            with self.subTest(mod=mod.__name__):
+                self.assertEqual(mod._repo_context_dir(parent, target), sub)
+
+    def test_walks_up_to_nearest_existing_dir(self):
+        parent = tempfile.mkdtemp()
+        target = os.path.join(parent, "brand", "new", "deep", "file.py")
+        for mod in (cc, co):
+            with self.subTest(mod=mod.__name__):
+                self.assertEqual(mod._repo_context_dir(parent, target), parent)
+
+    def test_falls_back_to_cwd_without_file_path(self):
+        parent = tempfile.mkdtemp()
+        for mod in (cc, co):
+            with self.subTest(mod=mod.__name__):
+                self.assertEqual(mod._repo_context_dir(parent, None), parent)
+
+
+class TestTargetDirResolution(unittest.TestCase):
+    """A file tool launched from a non-git parent resolves to the subdir-repo
+    it actually edits; a file outside any repo resolves to nothing."""
+
+    def setUp(self):
+        cc._GIT_CONTEXT_CACHE.clear()
+        co._GIT_CONTEXT_CACHE.clear()
+
+    def test_file_in_subdir_repo_resolves_from_parent_cwd(self):
+        parent = tempfile.mkdtemp()
+        repo = Path(parent) / "service"
+        (repo / "src").mkdir(parents=True)
+        _git(["init", "-q"], str(repo))
+        _git(["remote", "add", "origin", "https://github.com/org/service.git"], str(repo))
+        target = str(repo / "src" / "x.py")
+
+        cc_body = _capture(cc, cc.process_pre_tool_use, {
+            "session_id": "t", "tool_name": "Edit", "cwd": parent,
+            "tool_input": {"file_path": target}})
+        co_body = _capture(co, co.process_pre_tool_use, {
+            "session_id": "t", "tool_name": "Edit", "cwd": parent,
+            "tool_input": {"filePath": target}})
+
+        for label, body in (("claude-code", cc_body), ("copilot", co_body)):
+            with self.subTest(hook=label):
+                self.assertEqual(
+                    body["git_remote_url"], "https://github.com/org/service.git")
+
+    def test_file_outside_any_repo_resolves_null(self):
+        parent = tempfile.mkdtemp()
+        target = str(Path(parent) / "notes.py")
+
+        cc_body = _capture(cc, cc.process_pre_tool_use, {
+            "session_id": "t2", "tool_name": "Edit", "cwd": parent,
+            "tool_input": {"file_path": target}})
+        co_body = _capture(co, co.process_pre_tool_use, {
+            "session_id": "t2", "tool_name": "Edit", "cwd": parent,
+            "tool_input": {"filePath": target}})
+
+        for label, body in (("claude-code", cc_body), ("copilot", co_body)):
+            with self.subTest(hook=label):
+                self.assertIsNone(body["git_remote_url"])
+
+    def test_warm_cache_still_sends_file_tool_when_listed(self):
+        repo = _make_repo("https://github.com/org/repo.git")
+        target = os.path.join(repo, "x.py")
+        for label, mod, key in (("claude-code", cc, "file_path"),
+                                ("copilot", co, "filePath")):
+            with self.subTest(hook=label), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(
+                    mod, "load_policy_cache", return_value={"tools_to_check": ["Edit"]}))
+                stack.enter_context(patch.object(mod, "is_cache_stale", return_value=False))
+                send = stack.enter_context(patch.object(
+                    mod, "send_to_hook_api", return_value={"decision": "allow"}))
+                if hasattr(mod, "build_account_identity"):
+                    stack.enter_context(patch.object(mod, "build_account_identity", return_value={}))
+                mod.process_pre_tool_use({
+                    "session_id": "w", "tool_name": "Edit", "cwd": repo,
+                    "tool_input": {key: target}}, "k")
+                self.assertTrue(send.called)
+
+
+class TestPayloadParity(unittest.TestCase):
+    """The prompt path is no longer gated, so its body omits git_remote_url;
+    the tool path carries it for both hooks."""
 
     def setUp(self):
         cc._GIT_CONTEXT_CACHE.clear()
         co._GIT_CONTEXT_CACHE.clear()
         self.repo = _make_repo("https://github.com/org/repo.git")
-        self.expected = "https://github.com/org/repo.git"
 
-    def _capture(self, mod, fn, event):
-        with contextlib.ExitStack() as stack:
-            send = stack.enter_context(
-                patch.object(mod, "send_to_hook_api", return_value={"decision": "allow"}))
-            if hasattr(mod, "build_account_identity"):
-                stack.enter_context(
-                    patch.object(mod, "build_account_identity", return_value={}))
-            fn(event, "key")
-            return send.call_args.args[0]
-
-    def test_all_four_bodies_carry_git_remote_url(self):
-        prompt_event = {"session_id": "p", "prompt": "hi", "cwd": self.repo}
+    def test_tool_bodies_carry_git_remote_url(self):
         tool_event = {"session_id": "t", "tool_name": "Bash",
                       "tool_input": {"command": "ls"}, "cwd": self.repo}
+        for label, mod in (("claude-code", cc), ("copilot", co)):
+            body = _capture(mod, mod.process_pre_tool_use, dict(tool_event))
+            with self.subTest(hook=label):
+                self.assertEqual(
+                    body["git_remote_url"], "https://github.com/org/repo.git")
 
-        bodies = {
-            "cc_prompt": self._capture(cc, cc.process_user_prompt_submit, dict(prompt_event)),
-            "cc_tool": self._capture(cc, cc.process_pre_tool_use, dict(tool_event)),
-            "co_prompt": self._capture(co, co.process_user_prompt_submit, dict(prompt_event)),
-            "co_tool": self._capture(co, co.process_pre_tool_use, dict(tool_event)),
-        }
-
-        for name, body in bodies.items():
-            with self.subTest(body=name):
-                self.assertIn("git_remote_url", body)
-                self.assertEqual(body["git_remote_url"], self.expected)
-
-    def test_field_is_null_when_no_cwd(self):
-        prompt_event = {"session_id": "n", "prompt": "hi"}
-        for mod in (cc, co):
-            body = self._capture(mod, mod.process_user_prompt_submit, dict(prompt_event))
-            with self.subTest(mod=mod.__name__):
-                self.assertIn("git_remote_url", body)
-                self.assertIsNone(body["git_remote_url"])
+    def test_prompt_bodies_omit_git_remote_url(self):
+        prompt_event = {"session_id": "p", "prompt": "hi", "cwd": self.repo}
+        for label, mod in (("claude-code", cc), ("copilot", co)):
+            body = _capture(mod, mod.process_user_prompt_submit, dict(prompt_event))
+            with self.subTest(hook=label):
+                self.assertNotIn("git_remote_url", body)
 
 
 class TestStripGitCredentials(unittest.TestCase):
