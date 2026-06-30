@@ -599,6 +599,91 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
     return {}
 
 
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+
+
+def _hook_command_basename(command):
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value):
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_candidate_script(command, args):
+    """The local script this config runs: the file arg under a runtime, or the
+    command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        for a in (args or []):
+            if not isinstance(a, str) or a.startswith('-'):
+                continue
+            t = a.strip().strip('"\'')
+            if t in _HOOK_RUNNER_SUBTOKENS:
+                continue
+            if _hook_looks_like_path(t):
+                return t
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _compute_script_hash(command, args, cwd):
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    try:
+        cand = _hook_candidate_script(command, args)
+        if not cand:
+            return None
+        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+        if '${' in path:
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
+        with open(path, 'rb') as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _augment_script_hash(result, cwd):
+    """Add scriptHash to an MCP server config when it runs a local script, so the
+    gateway can fingerprint it as `script:<hash>`."""
+    if result and result.get('command'):
+        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
+        if script_hash:
+            result['scriptHash'] = script_hash
+    return result
+
+
 def _read_mcp_server_config(server_name, config_path):
     """
     Read an MCP server's config (url, command, args, type) from the codex
@@ -780,7 +865,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         if mcp_server:
             server_cfg = _read_mcp_server_config(mcp_server, CODEX_CONFIG_PATH)
             if server_cfg:
-                metadata['mcp_server_config'] = server_cfg
+                metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd'))
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
