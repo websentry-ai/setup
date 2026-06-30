@@ -200,8 +200,10 @@ def report_error_to_gateway(message, category='general', api_key=None):
         _reporting_error = False
 
 
-def log_error(message: str, category: str = 'general'):
-    """Log error with timestamp to error.log, keeping only last 25 errors."""
+def log_error(message: str, category: str = 'general', report_to_gateway: bool = True):
+    """Log error with timestamp to error.log, keeping only last 25 errors.
+    report_to_gateway=False skips the gateway report (a rate-limited but blocking
+    curl) for latency-sensitive paths that can't afford a second network wait."""
     message = redact_secrets(message, _cached_api_key)
     timestamp = _utc_now_z()
     error_entry = f"{timestamp}: {message}\n"
@@ -221,8 +223,8 @@ def log_error(message: str, category: str = 'general'):
     except Exception:
         pass
 
-    # Report to gateway (fire-and-forget)
-    report_error_to_gateway(message, category, _cached_api_key)
+    if report_to_gateway:
+        report_error_to_gateway(message, category, _cached_api_key)
 
 
 def _read_policy_cache_raw() -> Optional[Dict]:
@@ -541,7 +543,10 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
             except (json.JSONDecodeError, UnicodeDecodeError):
                 return {}
     except Exception as e:
-        log_error(f"Hook API error: {str(e)}", 'api_call')
+        # Local log only: the gateway error-report is itself a (rate-limited)
+        # blocking curl, so a second network wait here could push past Augment's
+        # 15s PreToolUse cap and turn fail-open into a hard kill.
+        log_error(f"Hook API error: {str(e)}", 'api_call', report_to_gateway=False)
 
     return {}
 

@@ -1500,6 +1500,23 @@ class TestPretoolNetworkBudget(_HomeTmp):
             out = unbound.send_to_hook_api({"x": 1}, "sk-test")
         self.assertEqual(out, {})
 
+    def test_pretool_timeout_does_not_make_second_gateway_call(self):
+        """On a pretool curl timeout the hook logs locally but must NOT fire the
+        gateway error-report (itself a blocking curl) — a second network wait could
+        push past Augment's 15s cap and turn fail-open into a hard kill."""
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(["curl"], k.get("timeout", 12))
+
+        reports = {"n": 0}
+        def fake_report(*a, **k):
+            reports["n"] += 1
+
+        with patch.object(unbound, "curl_with_auth", side_effect=boom), \
+             patch.object(unbound, "report_error_to_gateway", side_effect=fake_report):
+            out = unbound.send_to_hook_api({"x": 1}, "sk-test")
+        self.assertEqual(out, {})            # still fail open
+        self.assertEqual(reports["n"], 0)    # no second gateway curl on this path
+
 
 # --------------------------------------------------------------------------- #
 # Bugbot FIX 2: deny must merge additionalContext into                         #
