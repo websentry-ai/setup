@@ -1062,6 +1062,37 @@ def process_user_prompt_submit(event, api_key):
     return api_response if api_response else {}
 
 
+def _cursor_usage_from_event(event):
+    """Map Cursor stop/afterAgentResponse token fields to the gateway usage shape."""
+    if not isinstance(event, dict):
+        return None
+    if not any(k in event for k in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens')):
+        return None
+
+    def _i(key):
+        try:
+            return max(int(event.get(key) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _i('input_tokens')
+    output_tokens = _i('output_tokens')
+    cache_read = _i('cache_read_tokens')
+    cache_write = _i('cache_write_tokens')
+    base_input = max(input_tokens - cache_read, 0)
+
+    if not (base_input or output_tokens or cache_read or cache_write):
+        return None
+
+    return {
+        'input_tokens': base_input,
+        'output_tokens': output_tokens,
+        'cache_read_input_tokens': cache_read,
+        'cache_creation_input_tokens': cache_write,
+        'total_tokens': base_input + output_tokens + cache_read + cache_write,
+    }
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
@@ -1074,6 +1105,7 @@ def build_llm_exchange(events, api_key=None):
     user_email = None
     request_initialized = None
     request_completed = None
+    usage = None
 
     for log_entry in events:
         event = log_entry.get('event', {})
@@ -1094,6 +1126,7 @@ def build_llm_exchange(events, api_key=None):
 
         elif hook_event_name == 'stop':
             request_completed = log_entry.get('timestamp')
+            usage = _cursor_usage_from_event(event) or usage
 
         elif hook_event_name == 'beforeReadFile':
             assistant_tool_uses.append({
@@ -1144,6 +1177,7 @@ def build_llm_exchange(events, api_key=None):
         
         elif hook_event_name == 'afterAgentResponse':
             assistant_response = event.get('text')
+            usage = _cursor_usage_from_event(event) or usage
     
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
@@ -1172,6 +1206,9 @@ def build_llm_exchange(events, api_key=None):
         exchange['requestInitialized'] = request_initialized
     if request_completed:
         exchange['requestCompleted'] = request_completed
+
+    if usage:
+        exchange['usage'] = usage
 
     return exchange
 
