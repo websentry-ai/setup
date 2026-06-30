@@ -229,6 +229,12 @@ class TestPayloadParity(unittest.TestCase):
                 self.assertNotIn("git_remote_url", body)
 
 
+class TestToolFilePath(unittest.TestCase):
+    def test_empty_or_missing_path_is_none(self):
+        self.assertIsNone(cc._tool_file_path({}))
+        self.assertIsNone(cc._tool_file_path({'file_path': ''}))
+
+
 class TestStripGitCredentials(unittest.TestCase):
     def _both(self):
         return ALL_HOOKS
