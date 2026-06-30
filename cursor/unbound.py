@@ -662,6 +662,65 @@ def build_account_identity(event=None, probe=False):
     return identity
 
 
+_GIT_CONTEXT_CACHE = {}
+
+
+def _strip_git_credentials(url):
+    try:
+        if not url or '@' not in url:
+            return url
+        scheme = re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url)
+        prefix = scheme.group(0) if scheme else ''
+        rest = url[len(prefix):]
+        slash = rest.find('/')
+        authority = rest if slash == -1 else rest[:slash]
+        tail = '' if slash == -1 else rest[slash:]
+        at = authority.rfind('@')
+        if at == -1:
+            return url
+        return prefix + authority[at + 1:] + tail
+    except Exception:
+        return url
+
+
+def _get_git_context(session_id, cwd):
+    """Credential-stripped origin remote URL for cwd, or None. Cached per
+    (session_id, cwd); never raises."""
+    key = (session_id, cwd)
+    if key in _GIT_CONTEXT_CACHE:
+        return _GIT_CONTEXT_CACHE[key]
+    result = None
+    if cwd:
+        try:
+            out = subprocess.run(
+                ['git', '-C', cwd, 'config', '--get', 'remote.origin.url'],
+                capture_output=True, text=True, timeout=2,
+            )
+            if out.returncode == 0:
+                url = out.stdout.strip()
+                if url:
+                    result = _strip_git_credentials(url)
+        except Exception:
+            result = None
+    _GIT_CONTEXT_CACHE[key] = result
+    return result
+
+
+def _repo_context_dir(cwd, file_path):
+    """Directory whose git repo governs the operation: the nearest existing
+    ancestor of the target file for file tools, else the session cwd."""
+    if isinstance(file_path, str) and file_path:
+        base = file_path if os.path.isabs(file_path) else os.path.join(cwd or '', file_path)
+        d = os.path.dirname(base) or cwd
+        while d and not os.path.isdir(d):
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return d or cwd
+    return cwd
+
+
 def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
@@ -697,6 +756,9 @@ def process_pre_tool_use(event, api_key):
         'unbound_app_label': 'cursor',
         'model': model,
         'event_name': 'tool_use',
+        'git_remote_url': _get_git_context(
+            conversation_id, _repo_context_dir(event.get('cwd'), file_path)
+        ),
         'pre_tool_use_data': {
             'tool_name': tool_name,
             'command': '',

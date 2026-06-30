@@ -22,6 +22,16 @@ def _load(name, rel):
 
 cc = _load("cc_unbound", "claude-code/hooks/unbound.py")
 co = _load("co_unbound", "copilot/hooks/unbound.py")
+cur = _load("cur_unbound", "cursor/unbound.py")
+
+ALL_HOOKS = [("claude-code", cc), ("copilot", co), ("cursor", cur)]
+
+# (label, module, native file-tool name, session-id key, file_path key)
+HOOK_TOOL_CASES = [
+    ("claude-code", cc, "Edit", "session_id", "file_path"),
+    ("copilot", co, "Edit", "session_id", "filePath"),
+    ("cursor", cur, "Write", "conversation_id", "file_path"),
+]
 
 
 def _git(args, cwd):
@@ -38,11 +48,11 @@ def _make_repo(remote_url):
 
 class TestGetGitContext(unittest.TestCase):
     def setUp(self):
-        cc._GIT_CONTEXT_CACHE.clear()
-        co._GIT_CONTEXT_CACHE.clear()
+        for _, mod in ALL_HOOKS:
+            mod._GIT_CONTEXT_CACHE.clear()
 
     def _both(self):
-        return [("claude-code", cc), ("copilot", co)]
+        return ALL_HOOKS
 
     def test_returns_origin_url(self):
         repo = _make_repo("https://github.com/org/repo.git")
@@ -120,20 +130,20 @@ class TestRepoContextDir(unittest.TestCase):
         sub = os.path.join(parent, "src")
         os.makedirs(sub)
         target = os.path.join(sub, "x.py")
-        for mod in (cc, co):
+        for mod in (cc, co, cur):
             with self.subTest(mod=mod.__name__):
                 self.assertEqual(mod._repo_context_dir(parent, target), sub)
 
     def test_walks_up_to_nearest_existing_dir(self):
         parent = tempfile.mkdtemp()
         target = os.path.join(parent, "brand", "new", "deep", "file.py")
-        for mod in (cc, co):
+        for mod in (cc, co, cur):
             with self.subTest(mod=mod.__name__):
                 self.assertEqual(mod._repo_context_dir(parent, target), parent)
 
     def test_falls_back_to_cwd_without_file_path(self):
         parent = tempfile.mkdtemp()
-        for mod in (cc, co):
+        for mod in (cc, co, cur):
             with self.subTest(mod=mod.__name__):
                 self.assertEqual(mod._repo_context_dir(parent, None), parent)
 
@@ -143,8 +153,8 @@ class TestTargetDirResolution(unittest.TestCase):
     it actually edits; a file outside any repo resolves to nothing."""
 
     def setUp(self):
-        cc._GIT_CONTEXT_CACHE.clear()
-        co._GIT_CONTEXT_CACHE.clear()
+        for _, mod in ALL_HOOKS:
+            mod._GIT_CONTEXT_CACHE.clear()
 
     def test_file_in_subdir_repo_resolves_from_parent_cwd(self):
         parent = tempfile.mkdtemp()
@@ -154,15 +164,11 @@ class TestTargetDirResolution(unittest.TestCase):
         _git(["remote", "add", "origin", "https://github.com/org/service.git"], str(repo))
         target = str(repo / "src" / "x.py")
 
-        cc_body = _capture(cc, cc.process_pre_tool_use, {
-            "session_id": "t", "tool_name": "Edit", "cwd": parent,
-            "tool_input": {"file_path": target}})
-        co_body = _capture(co, co.process_pre_tool_use, {
-            "session_id": "t", "tool_name": "Edit", "cwd": parent,
-            "tool_input": {"filePath": target}})
-
-        for label, body in (("claude-code", cc_body), ("copilot", co_body)):
+        for label, mod, tool, idk, pathk in HOOK_TOOL_CASES:
             with self.subTest(hook=label):
+                body = _capture(mod, mod.process_pre_tool_use, {
+                    idk: "t", "tool_name": tool, "cwd": parent,
+                    "tool_input": {pathk: target}})
                 self.assertEqual(
                     body["git_remote_url"], "https://github.com/org/service.git")
 
@@ -170,33 +176,28 @@ class TestTargetDirResolution(unittest.TestCase):
         parent = tempfile.mkdtemp()
         target = str(Path(parent) / "notes.py")
 
-        cc_body = _capture(cc, cc.process_pre_tool_use, {
-            "session_id": "t2", "tool_name": "Edit", "cwd": parent,
-            "tool_input": {"file_path": target}})
-        co_body = _capture(co, co.process_pre_tool_use, {
-            "session_id": "t2", "tool_name": "Edit", "cwd": parent,
-            "tool_input": {"filePath": target}})
-
-        for label, body in (("claude-code", cc_body), ("copilot", co_body)):
+        for label, mod, tool, idk, pathk in HOOK_TOOL_CASES:
             with self.subTest(hook=label):
+                body = _capture(mod, mod.process_pre_tool_use, {
+                    idk: "t2", "tool_name": tool, "cwd": parent,
+                    "tool_input": {pathk: target}})
                 self.assertIsNone(body["git_remote_url"])
 
     def test_warm_cache_still_sends_file_tool_when_listed(self):
         repo = _make_repo("https://github.com/org/repo.git")
         target = os.path.join(repo, "x.py")
-        for label, mod, key in (("claude-code", cc, "file_path"),
-                                ("copilot", co, "filePath")):
+        for label, mod, tool, idk, pathk in HOOK_TOOL_CASES:
             with self.subTest(hook=label), contextlib.ExitStack() as stack:
                 stack.enter_context(patch.object(
-                    mod, "load_policy_cache", return_value={"tools_to_check": ["Edit"]}))
+                    mod, "load_policy_cache", return_value={"tools_to_check": [tool]}))
                 stack.enter_context(patch.object(mod, "is_cache_stale", return_value=False))
                 send = stack.enter_context(patch.object(
                     mod, "send_to_hook_api", return_value={"decision": "allow"}))
                 if hasattr(mod, "build_account_identity"):
                     stack.enter_context(patch.object(mod, "build_account_identity", return_value={}))
                 mod.process_pre_tool_use({
-                    "session_id": "w", "tool_name": "Edit", "cwd": repo,
-                    "tool_input": {key: target}}, "k")
+                    idk: "w", "tool_name": tool, "cwd": repo,
+                    "tool_input": {pathk: target}}, "k")
                 self.assertTrue(send.called)
 
 
@@ -205,8 +206,8 @@ class TestPayloadParity(unittest.TestCase):
     the tool path carries it for both hooks."""
 
     def setUp(self):
-        cc._GIT_CONTEXT_CACHE.clear()
-        co._GIT_CONTEXT_CACHE.clear()
+        for _, mod in ALL_HOOKS:
+            mod._GIT_CONTEXT_CACHE.clear()
         self.repo = _make_repo("https://github.com/org/repo.git")
 
     def test_tool_bodies_carry_git_remote_url(self):
@@ -228,7 +229,7 @@ class TestPayloadParity(unittest.TestCase):
 
 class TestStripGitCredentials(unittest.TestCase):
     def _both(self):
-        return [("claude-code", cc), ("copilot", co)]
+        return ALL_HOOKS
 
     def _check(self, url, expected):
         for label, mod in self._both():
