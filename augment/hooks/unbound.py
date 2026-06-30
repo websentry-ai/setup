@@ -1293,10 +1293,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                 'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
                 'additionalContext': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
             })
-        report_error_to_gateway(
+        # Local log only (mirrors send_to_hook_api's except): the gateway report
+        # is a blocking curl, so a second network wait after the ~12s pretool call
+        # would blow Augment's 15s PreToolUse cap and turn fail-open into a kill.
+        log_error(
             f'Hook bypassed_due_to_failure: gateway unreachable for tool={tool_name}',
             category='bypassed_due_to_failure',
-            api_key=api_key,
+            report_to_gateway=False,
         )
         return {}
 

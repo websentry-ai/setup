@@ -124,6 +124,25 @@ class TestPreToolDecisionMapping(_HomeTmp):
         out = self._pre(None, failure_action="allow")
         self.assertEqual(out, {})
 
+    def test_gateway_unreachable_makes_no_blocking_gateway_report(self):
+        """On fail-open the caller must NOT make a blocking gateway error-report:
+        after a ~12s pretool wait a second network call would blow Augment's 15s
+        PreToolUse cap and turn fail-open into a hard kill."""
+        event = {
+            "hook_event_name": "PreToolUse", "session_id": "c",
+            "tool_name": "launch-process", "tool_input": {"command": "ls"},
+            "is_mcp_tool": False,
+        }
+        unbound.save_policy_cache(tools_to_check=["launch-process"],
+                                  policy_check_failure_action="allow")
+        reports = {"n": 0}
+        with patch.object(unbound, "send_to_hook_api", return_value={}), \
+             patch.object(unbound, "report_error_to_gateway",
+                          side_effect=lambda *a, **k: reports.__setitem__("n", reports["n"] + 1)):
+            out = unbound.process_pre_tool_use(event, "sk-test")
+        self.assertEqual(out, {})            # fail open
+        self.assertEqual(reports["n"], 0)    # no blocking gateway report on this path
+
     def test_gateway_unreachable_block_policy_denies(self):
         """The ONLY non-fail-open path: cached policy_check_failure_action=block."""
         out = self._pre(None, failure_action="block")
