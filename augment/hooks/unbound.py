@@ -53,15 +53,13 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
-# Per-attempt curl timeout (seconds) for the PreToolUse policy-check path
-# (send_to_hook_api). The installed PreToolUse hook timeout is 15000ms (see
-# build_hooks_block in setup.py / mdm/setup.py), so the WORST-CASE network
-# budget for this path must stay comfortably under 15s or Augment kills the
-# hook mid-request instead of letting it fail open. Budget: 3 attempts x 4s
-# curl + 2 x 0.5s backoff = ~13s worst case < 15s. Keep a retry for transient
-# blips. Only this pretool path uses the reduced timeout — the approval-poll
-# and audit/error curls are unchanged.
-PRETOOL_CURL_TIMEOUT = 4
+# Curl timeout (seconds) for the PreToolUse policy-check path (send_to_hook_api).
+# Augment hard-caps the PreToolUse hook at 15s and (unlike Claude Code) does NOT
+# fail open when it kills it, so this path must return gracefully within 15s. One
+# 12s attempt covers the gateway classifier (~8s + RTT) with margin to fail open;
+# the old 3x4s gave each attempt less time than the gateway needs, so the
+# classifier path always timed out.
+PRETOOL_CURL_TIMEOUT = 12
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
 DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
@@ -202,8 +200,10 @@ def report_error_to_gateway(message, category='general', api_key=None):
         _reporting_error = False
 
 
-def log_error(message: str, category: str = 'general'):
-    """Log error with timestamp to error.log, keeping only last 25 errors."""
+def log_error(message: str, category: str = 'general', report_to_gateway: bool = True):
+    """Log error with timestamp to error.log, keeping only last 25 errors.
+    report_to_gateway=False skips the gateway report (a rate-limited but blocking
+    curl) for latency-sensitive paths that can't afford a second network wait."""
     message = redact_secrets(message, _cached_api_key)
     timestamp = _utc_now_z()
     error_entry = f"{timestamp}: {message}\n"
@@ -223,8 +223,8 @@ def log_error(message: str, category: str = 'general'):
     except Exception:
         pass
 
-    # Report to gateway (fire-and-forget)
-    report_error_to_gateway(message, category, _cached_api_key)
+    if report_to_gateway:
+        report_error_to_gateway(message, category, _cached_api_key)
 
 
 def _read_policy_cache_raw() -> Optional[Dict]:
@@ -519,39 +519,34 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    for attempt in range(3):
-        try:
-            # Auth header off-argv (0600 temp file); body off-argv (stdin).
-            result = curl_with_auth(
-                [f"Authorization: Bearer {api_key}"],
-                ["-fsSL", "-X", "POST",
-                 "-H", "Content-Type: application/json",
-                 "--data-binary", "@-", url],
-                input=data.encode(),
-                # Reduced from 20s so 3 attempts x PRETOOL_CURL_TIMEOUT + backoffs
-                # stays under the 15000ms PreToolUse hook timeout (see constant).
-                timeout=PRETOOL_CURL_TIMEOUT,
-            )
-            if result is None:
-                return {}
+    # Single attempt: a per-call timeout that covers the gateway's ~8s classifier
+    # and retries cannot both fit under Augment's 15s hook cap, and gateway latency
+    # (not transient blips) is what fails this path. On error/timeout, fall open.
+    try:
+        # Auth header off-argv (0600 temp file); body off-argv (stdin).
+        result = curl_with_auth(
+            [f"Authorization: Bearer {api_key}"],
+            ["-fsSL", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", url],
+            input=data.encode(),
+            timeout=PRETOOL_CURL_TIMEOUT,
+        )
+        if result is None:
+            return {}
 
-            # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
-            # server accepted the request. Do NOT retry on success — a retry
-            # would re-deliver the same pre-tool event (duplicate). Parse the
-            # body if present, otherwise return {} (an empty 2xx is still a
-            # successful, non-blocking allow).
-            if result.returncode == 0:
-                if result.stdout:
-                    try:
-                        return json.loads(result.stdout.decode('utf-8'))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        return {}
+        # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx). Parse the body
+        # if present, otherwise return {} (an empty 2xx is a non-blocking allow).
+        if result.returncode == 0 and result.stdout:
+            try:
+                return json.loads(result.stdout.decode('utf-8'))
+            except (json.JSONDecodeError, UnicodeDecodeError):
                 return {}
-        except Exception as e:
-            log_error(f"Hook API error: {str(e)}", 'api_call')
-
-        if attempt < 2:
-            time.sleep(0.5)
+    except Exception as e:
+        # Local log only: the gateway error-report is itself a (rate-limited)
+        # blocking curl, so a second network wait here could push past Augment's
+        # 15s PreToolUse cap and turn fail-open into a hard kill.
+        log_error(f"Hook API error: {str(e)}", 'api_call', report_to_gateway=False)
 
     return {}
 
@@ -1298,10 +1293,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                 'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
                 'additionalContext': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
             })
-        report_error_to_gateway(
+        # Local log only (mirrors send_to_hook_api's except): the gateway report
+        # is a blocking curl, so a second network wait after the ~12s pretool call
+        # would blow Augment's 15s PreToolUse cap and turn fail-open into a kill.
+        log_error(
             f'Hook bypassed_due_to_failure: gateway unreachable for tool={tool_name}',
             category='bypassed_due_to_failure',
-            api_key=api_key,
+            report_to_gateway=False,
         )
         return {}
 
