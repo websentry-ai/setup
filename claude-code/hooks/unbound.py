@@ -20,8 +20,8 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
-NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
+NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
 MCP_TOOL_PREFIX = 'mcp__'
 CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
@@ -488,6 +488,13 @@ def _build_user_prompt_payload(recent_user_prompts: List[str]) -> Dict:
     }
 
 
+def _tool_file_path(tool_input: Dict) -> Optional[str]:
+    """Target path for a native file tool. NotebookEdit nests it under
+    notebook_path; Read/Write/Edit/MultiEdit use file_path."""
+    path = tool_input.get('file_path') or tool_input.get('notebook_path')
+    return path if isinstance(path, str) and path else None
+
+
 def extract_command_for_pretool(event: Dict) -> str:
     """Extract command from tool_input based on tool type."""
     tool_input = event.get('tool_input') or {}
@@ -499,9 +506,11 @@ def extract_command_for_pretool(event: Dict) -> str:
     # MCP tools: stringify the input
     if tool_name.startswith(MCP_TOOL_PREFIX):
         return json.dumps(tool_input)
-    # File tools: file_path
-    if tool_name in ['Write', 'Edit', 'Read'] and 'file_path' in tool_input:
-        return tool_input['file_path']
+    # File tools: file_path / notebook_path
+    if tool_name in NATIVE_FILE_TOOLS:
+        path = _tool_file_path(tool_input)
+        if path:
+            return path
     # Grep: pattern
     if tool_name == 'Grep' and 'pattern' in tool_input:
         return tool_input['pattern']
@@ -1084,8 +1093,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     # Build metadata with the raw event
     metadata = dict(event)
     tool_input = event.get('tool_input') or {}
-    if 'file_path' in tool_input:
-        metadata['file_path'] = tool_input['file_path']
+    file_path = _tool_file_path(tool_input)
+    if file_path:
+        metadata['file_path'] = file_path
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -1122,7 +1132,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'model': model,
         'event_name': 'tool_use',
         'git_remote_url': _get_git_context(
-            session_id, _repo_context_dir(event.get('cwd'), tool_input.get('file_path'))
+            session_id, _repo_context_dir(event.get('cwd'), file_path)
         ),
         'pre_tool_use_data': {
             'command': command,

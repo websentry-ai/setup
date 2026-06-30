@@ -29,6 +29,8 @@ ALL_HOOKS = [("claude-code", cc), ("copilot", co), ("cursor", cur)]
 # (label, module, native file-tool name, session-id key, file_path key)
 HOOK_TOOL_CASES = [
     ("claude-code", cc, "Edit", "session_id", "file_path"),
+    ("claude-code-multiedit", cc, "MultiEdit", "session_id", "file_path"),
+    ("claude-code-notebookedit", cc, "NotebookEdit", "session_id", "notebook_path"),
     ("copilot", co, "Edit", "session_id", "filePath"),
     ("cursor", cur, "Write", "conversation_id", "file_path"),
 ]
