@@ -277,6 +277,101 @@ class TestStripGitCredentials(unittest.TestCase):
                 with self.subTest(hook=label, url=url):
                     self.assertEqual(mod._strip_git_credentials(url), url)
 
+    def test_parse_failure_fails_closed(self):
+        for label, mod in self._both():
+            with self.subTest(hook=label):
+                with patch.object(mod.re, "match", side_effect=ValueError("boom")):
+                    out = mod._strip_git_credentials(
+                        "https://user:token@github.com/org/repo.git")
+                self.assertIsNone(out)
+
+
+class TestGitContextFailureHandling(unittest.TestCase):
+    def setUp(self):
+        for _, mod in ALL_HOOKS:
+            mod._GIT_CONTEXT_CACHE.clear()
+
+    def test_transient_failure_not_cached(self):
+        repo = _make_repo("https://github.com/org/repo.git")
+        for label, mod in ALL_HOOKS:
+            with self.subTest(hook=label):
+                mod._GIT_CONTEXT_CACHE.clear()
+                real = subprocess.run
+                state = {"n": 0}
+
+                def flaky(*a, **k):
+                    state["n"] += 1
+                    if state["n"] == 1:
+                        raise subprocess.TimeoutExpired("git", 2)
+                    return real(*a, **k)
+
+                with patch("subprocess.run", side_effect=flaky):
+                    first = mod._get_git_context("s_flaky", repo)
+                    second = mod._get_git_context("s_flaky", repo)
+                self.assertIsNone(first)
+                self.assertEqual(second, "https://github.com/org/repo.git")
+
+    def test_cache_is_bounded(self):
+        for label, mod in ALL_HOOKS:
+            with self.subTest(hook=label):
+                mod._GIT_CONTEXT_CACHE.clear()
+                cap = mod._GIT_CONTEXT_CACHE_MAX
+                for i in range(cap + 50):
+                    mod._cache_git_context(("s", i), "url")
+                self.assertLessEqual(len(mod._GIT_CONTEXT_CACHE), cap)
+
+
+class TestApprovalRetrySkipsGit(unittest.TestCase):
+    def setUp(self):
+        for _, mod in ALL_HOOKS:
+            mod._GIT_CONTEXT_CACHE.clear()
+
+    def test_retry_path_skips_git_context(self):
+        repo = _make_repo("https://github.com/org/repo.git")
+        cases = [
+            (cc, {"session_id": "r", "tool_name": "Bash",
+                  "tool_input": {"command": "ls"}, "cwd": repo}),
+            (co, {"session_id": "r", "tool_name": "Bash",
+                  "tool_input": {"command": "ls"}, "cwd": repo}),
+            (cur, {"conversation_id": "r", "tool_name": "Write",
+                   "tool_input": {"file_path": str(Path(repo) / "x.py")}, "cwd": repo}),
+        ]
+        for mod, event in cases:
+            with self.subTest(mod=mod.__name__), contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(mod, "_is_approval_retry", return_value=True))
+                stack.enter_context(patch.object(
+                    mod, "_get_approval_marker_data",
+                    return_value={"policyIds": [], "applicationId": "", "requestId": ""}))
+                stack.enter_context(patch.object(mod, "poll_approval_status", return_value="approved"))
+                stack.enter_context(patch.object(mod, "_clear_approval_marker"))
+                stack.enter_context(patch.object(mod, "load_policy_cache", return_value=None))
+                if hasattr(mod, "build_account_identity"):
+                    stack.enter_context(patch.object(mod, "build_account_identity", return_value={}))
+                git = stack.enter_context(patch.object(mod, "_get_git_context"))
+                mod.process_pre_tool_use(event, "k")
+                git.assert_not_called()
+
+
+class TestApplyPatchRepoContext(unittest.TestCase):
+    """Copilot canonicalizes apply_patch as Edit; the repo identity must come
+    from the path inside the patch payload, not the (missing) filePath arg."""
+
+    def setUp(self):
+        co._GIT_CONTEXT_CACHE.clear()
+
+    def test_apply_patch_resolves_repo_from_payload(self):
+        parent = tempfile.mkdtemp()
+        repo = Path(parent) / "svc"
+        (repo / "src").mkdir(parents=True)
+        _git(["init", "-q"], str(repo))
+        _git(["remote", "add", "origin", "https://github.com/org/svc.git"], str(repo))
+        target = str(repo / "src" / "a.py")
+        patch_text = f"*** Begin Patch\n*** Update File: {target}\n@@\n-old\n+new\n*** End Patch\n"
+        body = _capture(co, co.process_pre_tool_use, {
+            "session_id": "ap", "tool_name": "apply_patch",
+            "tool_input": {"input": patch_text}, "cwd": parent})
+        self.assertEqual(body["git_remote_url"], "https://github.com/org/svc.git")
+
 
 if __name__ == "__main__":
     unittest.main()

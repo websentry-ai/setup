@@ -663,6 +663,13 @@ def build_account_identity(event=None, probe=False):
 
 
 _GIT_CONTEXT_CACHE = {}
+_GIT_CONTEXT_CACHE_MAX = 256
+
+
+def _cache_git_context(key, value):
+    if key not in _GIT_CONTEXT_CACHE and len(_GIT_CONTEXT_CACHE) >= _GIT_CONTEXT_CACHE_MAX:
+        _GIT_CONTEXT_CACHE.pop(next(iter(_GIT_CONTEXT_CACHE)), None)
+    _GIT_CONTEXT_CACHE[key] = value
 
 
 def _strip_git_credentials(url):
@@ -680,29 +687,32 @@ def _strip_git_credentials(url):
             return url
         return prefix + authority[at + 1:] + tail
     except Exception:
-        return url
+        return None
 
 
 def _get_git_context(session_id, cwd):
-    """Credential-stripped origin remote URL for cwd, or None. Cached per
-    (session_id, cwd); never raises."""
+    """Credential-stripped origin remote URL for cwd, or None. Successful and
+    conclusive-no-repo lookups are cached per (session_id, cwd); transient
+    failures are not cached. Never raises."""
     key = (session_id, cwd)
     if key in _GIT_CONTEXT_CACHE:
         return _GIT_CONTEXT_CACHE[key]
+    if not cwd:
+        return None
+    try:
+        out = subprocess.run(
+            ['git', '-C', cwd, 'config', '--get', 'remote.origin.url'],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception as exc:
+        log_error(f"git context lookup failed session={session_id} cwd={cwd}: {exc}", 'git_context')
+        return None
     result = None
-    if cwd:
-        try:
-            out = subprocess.run(
-                ['git', '-C', cwd, 'config', '--get', 'remote.origin.url'],
-                capture_output=True, text=True, timeout=2,
-            )
-            if out.returncode == 0:
-                url = out.stdout.strip()
-                if url:
-                    result = _strip_git_credentials(url)
-        except Exception:
-            result = None
-    _GIT_CONTEXT_CACHE[key] = result
+    if out.returncode == 0:
+        url = out.stdout.strip()
+        if url:
+            result = _strip_git_credentials(url)
+    _cache_git_context(key, result)
     return result
 
 
@@ -756,9 +766,6 @@ def process_pre_tool_use(event, api_key):
         'unbound_app_label': 'cursor',
         'model': model,
         'event_name': 'tool_use',
-        'git_remote_url': _get_git_context(
-            conversation_id, _repo_context_dir(event.get('cwd'), file_path)
-        ),
         'pre_tool_use_data': {
             'tool_name': tool_name,
             'command': '',
@@ -803,6 +810,10 @@ def process_pre_tool_use(event, api_key):
                     'user_message': timeout_user_message,
                     'agent_message': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
+
+    request_body['git_remote_url'] = _get_git_context(
+        conversation_id, _repo_context_dir(event.get('cwd'), file_path)
+    )
 
     if need_pull_policies:
         request_body['pull_policies'] = True
