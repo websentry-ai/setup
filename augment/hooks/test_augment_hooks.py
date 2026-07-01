@@ -124,6 +124,25 @@ class TestPreToolDecisionMapping(_HomeTmp):
         out = self._pre(None, failure_action="allow")
         self.assertEqual(out, {})
 
+    def test_gateway_unreachable_makes_no_blocking_gateway_report(self):
+        """On fail-open the caller must NOT make a blocking gateway error-report:
+        after a ~12s pretool wait a second network call would blow Augment's 15s
+        PreToolUse cap and turn fail-open into a hard kill."""
+        event = {
+            "hook_event_name": "PreToolUse", "session_id": "c",
+            "tool_name": "launch-process", "tool_input": {"command": "ls"},
+            "is_mcp_tool": False,
+        }
+        unbound.save_policy_cache(tools_to_check=["launch-process"],
+                                  policy_check_failure_action="allow")
+        reports = {"n": 0}
+        with patch.object(unbound, "send_to_hook_api", return_value={}), \
+             patch.object(unbound, "report_error_to_gateway",
+                          side_effect=lambda *a, **k: reports.__setitem__("n", reports["n"] + 1)):
+            out = unbound.process_pre_tool_use(event, "sk-test")
+        self.assertEqual(out, {})            # fail open
+        self.assertEqual(reports["n"], 0)    # no blocking gateway report on this path
+
     def test_gateway_unreachable_block_policy_denies(self):
         """The ONLY non-fail-open path: cached policy_check_failure_action=block."""
         out = self._pre(None, failure_action="block")
@@ -1455,8 +1474,8 @@ class TestPretoolNetworkBudget(_HomeTmp):
     PRETOOL_HOOK_TIMEOUT_MS = 15000  # build_hooks_block PreToolUse timeout
 
     def test_pretool_curl_uses_reduced_per_attempt_timeout(self):
-        """send_to_hook_api passes the reduced PRETOOL_CURL_TIMEOUT (not 20s) to
-        curl, so a slow gateway cannot blow the 15000ms hook budget."""
+        """send_to_hook_api passes PRETOOL_CURL_TIMEOUT to curl (one attempt), so
+        a slow gateway cannot blow the 15000ms hook budget."""
         seen = {"timeouts": []}
 
         def fake_run(cmd, **kw):
@@ -1474,19 +1493,16 @@ class TestPretoolNetworkBudget(_HomeTmp):
         self.assertTrue(seen["timeouts"], "curl was never invoked")
         for t in seen["timeouts"]:
             self.assertEqual(t, unbound.PRETOOL_CURL_TIMEOUT)
-        # Guard against silent regression back to the old 20s value.
-        self.assertEqual(unbound.PRETOOL_CURL_TIMEOUT, 4)
+        # Guard against regression to the too-short 4s (gateway classifier needs
+        # ~8s) or an over-budget value that would blow Augment's 15s hook cap.
+        self.assertEqual(unbound.PRETOOL_CURL_TIMEOUT, 12)
 
     def test_worst_case_budget_is_under_pretool_hook_timeout(self):
-        """attempts x per-attempt curl timeout + inter-attempt backoffs must be
-        comfortably under the installed 15000ms PreToolUse hook timeout, or
-        Augment kills the hook mid-request instead of letting it fail open."""
-        attempts = 3            # for attempt in range(3)
-        backoff_s = 0.5         # time.sleep(0.5) between attempts (attempts - 1)
-        worst_case_ms = (
-            attempts * unbound.PRETOOL_CURL_TIMEOUT * 1000
-            + (attempts - 1) * backoff_s * 1000
-        )
+        """The single pretool attempt's curl timeout must stay comfortably under
+        the installed 15000ms PreToolUse hook timeout, or Augment kills the hook
+        mid-request instead of letting it fail open."""
+        attempts = 1            # single attempt, no retry
+        worst_case_ms = attempts * unbound.PRETOOL_CURL_TIMEOUT * 1000
         self.assertLess(worst_case_ms, self.PRETOOL_HOOK_TIMEOUT_MS)
 
     def test_reduced_budget_does_not_break_fail_open(self):
@@ -1502,6 +1518,23 @@ class TestPretoolNetworkBudget(_HomeTmp):
         with patch.object(subprocess, "run", side_effect=fake_run):
             out = unbound.send_to_hook_api({"x": 1}, "sk-test")
         self.assertEqual(out, {})
+
+    def test_pretool_timeout_does_not_make_second_gateway_call(self):
+        """On a pretool curl timeout the hook logs locally but must NOT fire the
+        gateway error-report (itself a blocking curl) — a second network wait could
+        push past Augment's 15s cap and turn fail-open into a hard kill."""
+        def boom(*a, **k):
+            raise subprocess.TimeoutExpired(["curl"], k.get("timeout", 12))
+
+        reports = {"n": 0}
+        def fake_report(*a, **k):
+            reports["n"] += 1
+
+        with patch.object(unbound, "curl_with_auth", side_effect=boom), \
+             patch.object(unbound, "report_error_to_gateway", side_effect=fake_report):
+            out = unbound.send_to_hook_api({"x": 1}, "sk-test")
+        self.assertEqual(out, {})            # still fail open
+        self.assertEqual(reports["n"], 0)    # no second gateway curl on this path
 
 
 # --------------------------------------------------------------------------- #
