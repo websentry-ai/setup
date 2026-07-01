@@ -147,7 +147,7 @@ def set_env_var_on_unix(var_name: str, value: str) -> bool:
     append_to_file(rc_file, export_line)
 
     try:
-        return export_line in rc_file.read_text(encoding="utf-8")
+        return any(line.strip() == export_line for line in rc_file.read_text(encoding="utf-8").splitlines())
     except Exception:
         return False
 
