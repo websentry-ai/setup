@@ -649,6 +649,11 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 def _command_targets_hook(command: str, target: Path) -> bool:
     if not command:
         return False
+    # Binary install: command invokes the /opt/unbound hook binary (require both
+    # the prefix and the binary name so a foreign hook merely mentioning the path
+    # isn't matched). Mirrors the managed _is_unbound_hook_command matcher.
+    if "/opt/unbound/" in command and "unbound-hook" in command:
+        return True
     try:
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
@@ -745,6 +750,29 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
         return True
 
     _run_as_user(username, _clean)
+
+
+def remove_hook_logs_for_user(username: str, home_dir: Path) -> None:
+    """Remove the hook's own logs (agent-audit.log, error.log) from a user's
+    ~/.claude/hooks on CLEAR/nuke — they exist only because of us. Kept separate
+    from remove_user_level_hooks_for_user (which also runs at setup) so logs are
+    dropped ONLY on clear. Privilege-drops to the user; unlink() removes the dir
+    entry (a symlink, never its target)."""
+    if home_dir is None:
+        return  # Windows machine-wide placeholder — no per-user dir to clean
+    hooks_dir = home_dir / ".claude" / "hooks"
+
+    def _clear():
+        for _log in ("agent-audit.log", "error.log"):
+            try:
+                (hooks_dir / _log).unlink()
+                debug_print(f"Removed {hooks_dir / _log}")
+            except FileNotFoundError:
+                pass
+            except Exception as e:
+                debug_print(f"Failed to remove {hooks_dir / _log}: {e}")
+
+    _run_as_user(username, _clear)
 
 
 def get_managed_settings_dir() -> Path:
@@ -972,8 +1000,22 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         return False
 
 
+def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
+    """A hook command is ours if it points at OUR managed python hook
+    (script_path) or the /opt/unbound hook binary. Both forms are recognized so a
+    binary-install hook is stripped on clear instead of being orphaned. Matches the
+    specific script path (NOT a bare 'unbound.py' substring) and requires both the
+    install prefix and the binary name, so a foreign hook in a shared/Enterprise
+    config that merely references some other unbound.py / mentions /opt/unbound/
+    isn't stripped."""
+    if not cmd:
+        return False
+    return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
+
+
 def clear_managed_hooks() -> str:
-    """Remove the hooks script and hooks setting from managed Claude config.
+    """Strip ONLY our hook entries from the managed Claude config, preserving
+    foreign content; managed-settings.json is shared with org/Enterprise policy.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -1013,17 +1055,52 @@ def clear_managed_hooks() -> str:
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
-                if "hooks" in settings:
-                    del settings["hooks"]
-                    if (settings_path.name == "unbound.json"
-                            and settings_path.parent.name == "managed-settings.d"
-                            and not settings):
+                modified = False
+                hooks_block = settings.get("hooks") if isinstance(settings, dict) else None
+                if isinstance(hooks_block, dict):
+                    for event in list(hooks_block.keys()):
+                        event_config = hooks_block[event]
+                        if not isinstance(event_config, list):
+                            continue
+                        new_config = []
+                        for item in event_config:
+                            # Only touch items with a real list of hooks; preserve
+                            # everything else untouched (foreign items, dicts with
+                            # no/"null" hooks). Drop an item only when every hook in
+                            # it was ours.
+                            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                                hooks = item["hooks"]
+                                new_hooks = [
+                                    h for h in hooks
+                                    if not (isinstance(h, dict) and _is_unbound_hook_command(h.get("command", ""), script_path))
+                                ]
+                                if len(new_hooks) != len(hooks):
+                                    modified = True
+                                    if new_hooks:
+                                        item["hooks"] = new_hooks
+                                        new_config.append(item)
+                                else:
+                                    new_config.append(item)
+                            else:
+                                new_config.append(item)
+                        if new_config:
+                            hooks_block[event] = new_config
+                        else:
+                            del hooks_block[event]
+                            modified = True
+                    if not hooks_block:
+                        del settings["hooks"]
+                if modified:
+                    # Delete the file only when nothing foreign remains (our
+                    # drop-in, or a managed-settings.json that held only our
+                    # hooks); otherwise rewrite in place so org policy survives.
+                    if isinstance(settings, dict) and not settings:
                         settings_path.unlink()
-                        debug_print(f"Removed empty drop-in {settings_path}")
+                        debug_print(f"Removed empty settings {settings_path}")
                     else:
                         with open(settings_path, "w", encoding="utf-8") as f:
                             json.dump(settings, f, indent=2)
-                        debug_print(f"Removed hooks from {settings_path}")
+                        debug_print(f"Stripped our hooks from {settings_path}")
                     cleared_any = True
             except Exception as e:
                 debug_print(f"Failed to update {settings_path}: {e}")
@@ -1063,6 +1140,7 @@ def clear_setup():
         failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_CLAUDE_API_KEY")
+            remove_hook_logs_for_user(username, home_dir)
             if status == "cleared":
                 cleared += 1
             elif status == "not_found":
