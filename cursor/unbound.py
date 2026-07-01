@@ -794,6 +794,91 @@ def process_pre_tool_use(event, api_key):
     return format_hook_response(api_response)
 
 
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+
+
+def _hook_command_basename(command):
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value):
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_candidate_script(command, args):
+    """The local script this config runs: the file arg under a runtime, or the
+    command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        for a in (args or []):
+            if not isinstance(a, str) or a.startswith('-'):
+                continue
+            t = a.strip().strip('"\'')
+            if t in _HOOK_RUNNER_SUBTOKENS:
+                continue
+            if _hook_looks_like_path(t):
+                return t
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _compute_script_hash(command, args, cwd):
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    try:
+        cand = _hook_candidate_script(command, args)
+        if not cand:
+            return None
+        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+        if '${' in path:  # an env var we couldn't expand -> can't resolve
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
+        with open(path, 'rb') as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _augment_script_hash(result, cwd):
+    """Add scriptHash to an MCP server config when it runs a local script, so the
+    gateway can fingerprint it as `script:<hash>`."""
+    if result and result.get('command'):
+        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
+        if script_hash:
+            result['scriptHash'] = script_hash
+    return result
+
+
 def _read_mcp_server_config(server_name, config_path):
     """
     Read an MCP server's config (url, command, args) from a config file.
@@ -845,7 +930,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
 
         server_cfg = _read_mcp_server_config(mcp_server, CURSOR_MCP_CONFIG_PATH)
         if server_cfg:
-            metadata['mcp_server_config'] = server_cfg
+            metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd'))
 
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
@@ -977,6 +1062,37 @@ def process_user_prompt_submit(event, api_key):
     return api_response if api_response else {}
 
 
+def _cursor_usage_from_event(event):
+    """Map Cursor stop/afterAgentResponse token fields to the gateway usage shape."""
+    if not isinstance(event, dict):
+        return None
+    if not any(k in event for k in ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens')):
+        return None
+
+    def _i(key):
+        try:
+            return max(int(event.get(key) or 0), 0)
+        except (TypeError, ValueError):
+            return 0
+
+    input_tokens = _i('input_tokens')
+    output_tokens = _i('output_tokens')
+    cache_read = _i('cache_read_tokens')
+    cache_write = _i('cache_write_tokens')
+    base_input = max(input_tokens - cache_read, 0)
+
+    if not (base_input or output_tokens or cache_read or cache_write):
+        return None
+
+    return {
+        'input_tokens': base_input,
+        'output_tokens': output_tokens,
+        'cache_read_input_tokens': cache_read,
+        'cache_creation_input_tokens': cache_write,
+        'total_tokens': base_input + output_tokens + cache_read + cache_write,
+    }
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
@@ -989,6 +1105,7 @@ def build_llm_exchange(events, api_key=None):
     user_email = None
     request_initialized = None
     request_completed = None
+    usage = None
 
     for log_entry in events:
         event = log_entry.get('event', {})
@@ -1009,6 +1126,7 @@ def build_llm_exchange(events, api_key=None):
 
         elif hook_event_name == 'stop':
             request_completed = log_entry.get('timestamp')
+            usage = _cursor_usage_from_event(event) or usage
 
         elif hook_event_name == 'beforeReadFile':
             assistant_tool_uses.append({
@@ -1059,6 +1177,7 @@ def build_llm_exchange(events, api_key=None):
         
         elif hook_event_name == 'afterAgentResponse':
             assistant_response = event.get('text')
+            usage = _cursor_usage_from_event(event) or usage
     
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
@@ -1087,6 +1206,9 @@ def build_llm_exchange(events, api_key=None):
         exchange['requestInitialized'] = request_initialized
     if request_completed:
         exchange['requestCompleted'] = request_completed
+
+    if usage:
+        exchange['usage'] = usage
 
     return exchange
 
