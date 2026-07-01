@@ -904,29 +904,36 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
     if not _is_uuid(server_uuid):
         return None
     try:
+        files = []
         for base in _claude_session_dirs():
             if not base or not base.exists():
                 continue
             try:
-                candidates = base.glob('**/local_*.json')
+                files.extend(base.glob('**/local_*.json'))
             except Exception:
                 continue
-            for f in candidates:
-                try:
-                    data = json.loads(f.read_text(encoding='utf-8'))
-                except Exception:
-                    continue
-                for entry in (data.get('remoteMcpServersConfig') or []):
-                    if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
-                        name = entry.get('name')
-                        if not name:
-                            continue
-                        cfg = {"additional_data": {"scope": "claude-connector"}}
-                        url = entry.get('url')
-                        if url:
-                            cfg["url"] = url
-                            cfg["type"] = "http"
-                        return (name, cfg)
+        if not files:
+            return None
+        try:
+            files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:20]
+        except Exception:
+            files = files[:20]
+        for f in files:
+            try:
+                data = json.loads(f.read_text(encoding='utf-8'))
+            except Exception:
+                continue
+            for entry in (data.get('remoteMcpServersConfig') or []):
+                if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
+                    name = entry.get('name')
+                    if not name:
+                        continue
+                    cfg = {"additional_data": {"scope": "claude-connector"}}
+                    url = entry.get('url')
+                    if url:
+                        cfg["url"] = url
+                        cfg["type"] = "http"
+                    return (name, cfg)
         return None
     except Exception as exc:
         log_error(f"mcp cc-session resolve error: {server_uuid}: {exc}", 'mcp_connector')
