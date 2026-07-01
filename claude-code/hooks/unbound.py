@@ -1178,6 +1178,24 @@ def build_account_identity(probe: bool = False) -> Dict:
     return identity
 
 
+def _unbound_app_label() -> str:
+    """Cowork sessions run the same CLI + hooks as Claude Code; the desktop
+    app marks the surface in the hook environment. Report them under their
+    own label so the gateway can scope policies/analytics per surface.
+    Requires gateway support for 'cowork' (ai-gateway#716) — old
+    gateways would drop the label out of their label-keyed maps."""
+    try:
+        if os.environ.get('CLAUDE_CODE_IS_COWORK') == '1':
+            return 'cowork'
+        if os.environ.get('CLAUDE_CODE_ENTRYPOINT') in (
+            'local-agent', 'local_agent', 'remote_cowork'
+        ):
+            return 'cowork'
+    except Exception:
+        pass
+    return 'claude-code'
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -1248,7 +1266,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
-        'unbound_app_label': 'claude-code',
+        'unbound_app_label': _unbound_app_label(),
         'model': model,
         'event_name': 'tool_use',
         'pre_tool_use_data': {
@@ -1343,7 +1361,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
-        'unbound_app_label': 'claude-code',
+        'unbound_app_label': _unbound_app_label(),
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
