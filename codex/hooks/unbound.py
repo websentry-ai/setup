@@ -674,6 +674,77 @@ def _compute_script_hash(command, args, cwd):
         return None
 
 
+_MAX_FILE_CONTENT_BYTES = 64 * 1024          # per-file cap
+
+
+def _cap_file_text(text):
+    """Return (text, truncated) capped to _MAX_FILE_CONTENT_BYTES of UTF-8."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= _MAX_FILE_CONTENT_BYTES:
+        return text, False
+    return encoded[:_MAX_FILE_CONTENT_BYTES].decode('utf-8', errors='ignore'), True
+
+
+def _resolve_and_read_file(file_path, cwd):
+    """Read one file as text, resolving a relative path against cwd. Returns
+    (content, truncated), or None on any problem — missing file, unresolvable
+    relative path, permission denied, a directory, binary or non-UTF8 content, or
+    any OS error. Never raises (fail-open): the caller just omits the content."""
+    try:
+        if not file_path or not isinstance(file_path, str):
+            return None
+        if not os.path.isabs(file_path):
+            if not cwd:
+                return None  # cannot form an absolute path safely -> skip
+            file_path = os.path.join(cwd, file_path)
+        if not os.path.isfile(file_path):
+            return None  # missing file or a directory
+        with open(file_path, 'rb') as f:
+            raw = f.read(_MAX_FILE_CONTENT_BYTES + 1)
+        truncated = len(raw) > _MAX_FILE_CONTENT_BYTES
+        raw = raw[:_MAX_FILE_CONTENT_BYTES]
+        if b'\x00' in raw:
+            return None  # binary file
+        if truncated:
+            return raw.decode('utf-8', errors='ignore'), True
+        try:
+            return raw.decode('utf-8'), False
+        except UnicodeDecodeError:
+            return None  # non-UTF8 / binary
+    except Exception:
+        return None  # permission denied, OS error, etc. -> skip
+
+
+def _make_file_entry(path, cwd, inline_content=None):
+    """Build one {'path', 'content', 'truncated'} entry, or None. Write-style tools
+    pass the new text as inline_content (the file may not exist on disk yet)."""
+    try:
+        if not path or not isinstance(path, str):
+            return None
+        if isinstance(inline_content, str):
+            content, truncated = _cap_file_text(inline_content)
+        else:
+            res = _resolve_and_read_file(path, cwd)
+            if res is None:
+                return None
+            content, truncated = res
+        return {'path': path, 'content': content, 'truncated': truncated}
+    except Exception:
+        return None
+
+
+def _attach_file_content(target, file_path, cwd, inline_content=None):
+    """Attach target['file_content'] (a list of {path, content, truncated}) for a
+    single-file tool (Read/Write/Edit/MCP). Uniform key + shape across all tools.
+    Best-effort: on any unreadable file the key is simply left absent."""
+    try:
+        entry = _make_file_entry(file_path, cwd, inline_content)
+        if entry is not None:
+            target['file_content'] = [entry]
+    except Exception:
+        return
+
+
 def _augment_script_hash(result, cwd):
     """Add scriptHash to an MCP server config when it runs a local script, so the
     gateway can fingerprint it as `script:<hash>`."""
@@ -854,6 +925,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     # Build metadata with the raw event
     metadata = dict(event)
+
+    tool_input = event.get('tool_input') or {}
+    if tool_input.get('file_path'):
+        _attach_file_content(metadata, tool_input.get('file_path'), event.get('cwd'), tool_input.get('content'))
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -1223,6 +1298,12 @@ def process_stop_event(event: Dict, api_key: str):
 
     # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
     assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
+
+    cwd = event.get('cwd')
+    for tool_use in assistant_tool_uses:
+        tu_input = tool_use.get('tool_input') or {}
+        if tu_input.get('file_path'):
+            _attach_file_content(tool_use, tu_input.get('file_path'), cwd, tu_input.get('content'))
 
     assistant_msg = {
         'role': 'assistant',
