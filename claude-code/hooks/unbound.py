@@ -900,6 +900,14 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
         return None
 
 
+def _session_file_created_at(path) -> float:
+    try:
+        st = path.stat()
+        return getattr(st, 'st_birthtime', None) or st.st_mtime
+    except Exception:
+        return 0.0
+
+
 def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
     if not _is_uuid(server_uuid):
         return None
@@ -914,10 +922,8 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
                 continue
         if not files:
             return None
-        try:
-            files = sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)[:20]
-        except Exception:
-            files = files[:20]
+
+        files.sort(key=_session_file_created_at, reverse=True)
         for f in files:
             try:
                 data = json.loads(f.read_text(encoding='utf-8'))
