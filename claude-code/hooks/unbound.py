@@ -807,17 +807,24 @@ def _is_uuid(name: str) -> bool:
     return bool(name) and bool(_MCP_UUID_RE.match(name))
 
 
-def _claude_code_sessions_dir() -> Optional[Path]:
+_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
+
+
+def _claude_session_dirs() -> list:
     try:
         home = Path.home()
         if sys.platform == 'darwin':
-            return home / 'Library' / 'Application Support' / 'Claude' / 'claude-code-sessions'
-        if sys.platform.startswith('win'):
+            base = home / 'Library' / 'Application Support' / 'Claude'
+        elif sys.platform.startswith('win'):
             appdata = os.environ.get('APPDATA')
-            return Path(appdata) / 'Claude' / 'claude-code-sessions' if appdata else None
-        return home / '.config' / 'Claude' / 'claude-code-sessions'
+            if not appdata:
+                return []
+            base = Path(appdata) / 'Claude'
+        else:
+            base = home / '.config' / 'Claude'
+        return [base / sub for sub in _CLAUDE_SESSION_SUBDIRS]
     except Exception:
-        return None
+        return []
 
 
 _HOOK_SCRIPT_RUNTIMES = {
@@ -897,34 +904,29 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
     if not _is_uuid(server_uuid):
         return None
     try:
-        base = _claude_code_sessions_dir()
-        if not base or not base.exists():
-            return None
-        try:
-            files = sorted(
-                base.glob('**/local_*.json'),
-                key=lambda p: p.stat().st_mtime, reverse=True,
-            )[:20]
-        except Exception:
-            files = list(base.glob('**/local_*.json'))[:20]
-        for f in files:
+        for base in _claude_session_dirs():
+            if not base or not base.exists():
+                continue
             try:
-                data = json.loads(f.read_text(encoding='utf-8'))
+                candidates = base.glob('**/local_*.json')
             except Exception:
                 continue
-            for entry in (data.get('remoteMcpServersConfig') or []):
-                if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
-                    name = entry.get('name')
-                    if not name:
-                        # UUID matched but this record has no display name; keep
-                        # scanning — another session file may carry a named one.
-                        continue
-                    cfg = {"additional_data": {"scope": "claude-connector"}}
-                    url = entry.get('url')
-                    if url:
-                        cfg["url"] = url
-                        cfg["type"] = "http"
-                    return (name, cfg)
+            for f in candidates:
+                try:
+                    data = json.loads(f.read_text(encoding='utf-8'))
+                except Exception:
+                    continue
+                for entry in (data.get('remoteMcpServersConfig') or []):
+                    if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
+                        name = entry.get('name')
+                        if not name:
+                            continue
+                        cfg = {"additional_data": {"scope": "claude-connector"}}
+                        url = entry.get('url')
+                        if url:
+                            cfg["url"] = url
+                            cfg["type"] = "http"
+                        return (name, cfg)
         return None
     except Exception as exc:
         log_error(f"mcp cc-session resolve error: {server_uuid}: {exc}", 'mcp_connector')
