@@ -807,17 +807,24 @@ def _is_uuid(name: str) -> bool:
     return bool(name) and bool(_MCP_UUID_RE.match(name))
 
 
-def _claude_code_sessions_dir() -> Optional[Path]:
+_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
+
+
+def _claude_session_dirs() -> list:
     try:
         home = Path.home()
         if sys.platform == 'darwin':
-            return home / 'Library' / 'Application Support' / 'Claude' / 'claude-code-sessions'
-        if sys.platform.startswith('win'):
+            base = home / 'Library' / 'Application Support' / 'Claude'
+        elif sys.platform.startswith('win'):
             appdata = os.environ.get('APPDATA')
-            return Path(appdata) / 'Claude' / 'claude-code-sessions' if appdata else None
-        return home / '.config' / 'Claude' / 'claude-code-sessions'
+            if not appdata:
+                return []
+            base = Path(appdata) / 'Claude'
+        else:
+            base = home / '.config' / 'Claude'
+        return [base / sub for sub in _CLAUDE_SESSION_SUBDIRS]
     except Exception:
-        return None
+        return []
 
 
 _HOOK_SCRIPT_RUNTIMES = {
@@ -893,20 +900,30 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
         return None
 
 
+def _session_file_created_at(path) -> float:
+    try:
+        st = path.stat()
+        return getattr(st, 'st_birthtime', None) or st.st_mtime
+    except Exception:
+        return 0.0
+
+
 def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
     if not _is_uuid(server_uuid):
         return None
     try:
-        base = _claude_code_sessions_dir()
-        if not base or not base.exists():
+        files = []
+        for base in _claude_session_dirs():
+            if not base or not base.exists():
+                continue
+            try:
+                files.extend(base.glob('**/local_*.json'))
+            except Exception:
+                continue
+        if not files:
             return None
-        try:
-            files = sorted(
-                base.glob('**/local_*.json'),
-                key=lambda p: p.stat().st_mtime, reverse=True,
-            )[:20]
-        except Exception:
-            files = list(base.glob('**/local_*.json'))[:20]
+
+        files.sort(key=_session_file_created_at, reverse=True)
         for f in files:
             try:
                 data = json.loads(f.read_text(encoding='utf-8'))
@@ -916,8 +933,6 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
                 if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
                     name = entry.get('name')
                     if not name:
-                        # UUID matched but this record has no display name; keep
-                        # scanning — another session file may carry a named one.
                         continue
                     cfg = {"additional_data": {"scope": "claude-connector"}}
                     url = entry.get('url')
