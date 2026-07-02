@@ -385,6 +385,21 @@ class TestDesktopSessionEmail(unittest.TestCase):
         except Exception as exc:
             self.fail(f"_desktop_session_email raised {exc!r}")
 
+    def test_glob_traversal_error_in_one_base_does_not_abort_scan(self):
+        # a base whose glob raises mid-traversal must not kill the whole scan
+        class _Raising:
+            def glob(self, pattern):
+                raise PermissionError("boom")
+
+        class _BadBase:
+            def __truediv__(self, other):
+                return _Raising()
+
+        self._session("ok", json.dumps({"oauthAccount": {"emailAddress": "ok@corp.com"}}), 2000)
+        with patch.object(unbound, "_claude_desktop_support_dirs",
+                          return_value=[_BadBase(), self.tmp]):
+            self.assertEqual(unbound._desktop_session_email(), "ok@corp.com")
+
 
 if __name__ == "__main__":
     unittest.main()

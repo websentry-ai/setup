@@ -1059,7 +1059,10 @@ def _desktop_session_email() -> Optional[str]:
         return None
     for base in bases:
         try:
-            candidates = (base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json')
+            # list() forces the lazy glob traversal to happen inside this guard —
+            # a mid-iteration traversal error (e.g. an unreadable subdir) then only
+            # skips this base instead of aborting the whole scan.
+            candidates = list((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
         except Exception:
             continue
         for path in candidates:
