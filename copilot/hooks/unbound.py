@@ -1010,6 +1010,77 @@ def transform_response_for_copilot_prompt(api_response):
     return {}
 
 
+_GIT_CONTEXT_CACHE = {}
+_GIT_CONTEXT_CACHE_MAX = 256
+
+
+def _cache_git_context(key, value):
+    if key not in _GIT_CONTEXT_CACHE and len(_GIT_CONTEXT_CACHE) >= _GIT_CONTEXT_CACHE_MAX:
+        _GIT_CONTEXT_CACHE.pop(next(iter(_GIT_CONTEXT_CACHE)), None)
+    _GIT_CONTEXT_CACHE[key] = value
+
+
+def _strip_git_credentials(url):
+    try:
+        if not url or '@' not in url:
+            return url
+        scheme = re.match(r'^[a-zA-Z][a-zA-Z0-9+.-]*://', url)
+        prefix = scheme.group(0) if scheme else ''
+        rest = url[len(prefix):]
+        slash = rest.find('/')
+        authority = rest if slash == -1 else rest[:slash]
+        tail = '' if slash == -1 else rest[slash:]
+        at = authority.rfind('@')
+        if at == -1:
+            return url
+        return prefix + authority[at + 1:] + tail
+    except Exception:
+        return None
+
+
+def _get_git_context(session_id, cwd):
+    """Credential-stripped origin remote URL for cwd, or None. Successful and
+    conclusive-no-repo lookups are cached per (session_id, cwd); transient
+    failures are not cached. Never raises."""
+    key = (session_id, cwd)
+    if key in _GIT_CONTEXT_CACHE:
+        return _GIT_CONTEXT_CACHE[key]
+    if not cwd:
+        return None
+    try:
+        out = subprocess.run(
+            ['git', '-C', cwd, 'config', '--get', 'remote.origin.url'],
+            capture_output=True, text=True, timeout=2,
+        )
+    except Exception as exc:
+        log_error(f"git context lookup failed session={session_id} cwd={cwd}: {exc}", 'git_context')
+        return None
+    result = None
+    if out.returncode == 0:
+        url = out.stdout.strip()
+        if url:
+            result = _strip_git_credentials(url)
+    _cache_git_context(key, result)
+    return result
+
+
+def _repo_context_dir(cwd, file_path):
+    """Directory whose git repo governs the operation: the nearest existing
+    ancestor of the target file for file tools, else the session cwd. The
+    ancestor walk lets a write into a not-yet-created path still resolve to its
+    enclosing repo."""
+    if isinstance(file_path, str) and file_path:
+        base = file_path if os.path.isabs(file_path) else os.path.join(cwd or '', file_path)
+        d = os.path.dirname(base) or cwd
+        while d and not os.path.isdir(d):
+            parent = os.path.dirname(d)
+            if parent == d:
+                break
+            d = parent
+        return d or cwd
+    return cwd
+
+
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
@@ -1090,7 +1161,8 @@ def process_pre_tool_use(event, api_key):
 
     # Preserve the raw event (raw tool_name + tool_input) inside metadata.
     metadata = dict(event)
-    file_path = tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path')
+    file_path = (tool_input.get('filePath') or tool_input.get('path')
+                 or tool_input.get('file_path') or _extract_patch_target_path(tool_input))
     if file_path:
         metadata['file_path'] = file_path
 
@@ -1142,6 +1214,10 @@ def process_pre_tool_use(event, api_key):
                     'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.',
                     'additionalContext': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 })
+
+    request_body['git_remote_url'] = _get_git_context(
+        session_id, _repo_context_dir(event.get('cwd'), file_path)
+    )
 
     if need_pull_policies:
         request_body['pull_policies'] = True
