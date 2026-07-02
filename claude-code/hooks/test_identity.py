@@ -49,9 +49,23 @@ class TestReadAccountIdentity(unittest.TestCase):
         self._patcher = patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", self.claude_json)
         self._patcher.start()
         self.addCleanup(self._patcher.stop)
+        # Isolate from the real Claude Desktop dir so the desktop-email fallback
+        # finds nothing unless a test explicitly populates self.tmp.
+        self._desktop_patcher = patch.object(
+            unbound, "_claude_desktop_support_dirs", return_value=[self.tmp]
+        )
+        self._desktop_patcher.start()
+        self.addCleanup(self._desktop_patcher.stop)
 
     def _write_config(self, data):
         self.claude_json.write_text(json.dumps(data), encoding="utf-8")
+
+    def _write_desktop_session(self, oauth, name="s1"):
+        session = (self.tmp / "local-agent-mode-sessions" / "acct" / "org"
+                   / f"local_{name}" / ".claude" / ".claude.json")
+        session.parent.mkdir(parents=True, exist_ok=True)
+        session.write_text(json.dumps({"oauthAccount": oauth}), encoding="utf-8")
+        return session
 
     # --- happy path: oauthAccount present ---
 
@@ -203,6 +217,28 @@ class TestReadAccountIdentity(unittest.TestCase):
         self.assertIsNone(result["org_id"])
         self.assertIsNone(result["auth_mode"])
 
+    # --- Team/SSO Claude Desktop fallback ---
+
+    def test_falls_back_to_desktop_email_when_no_oauth(self):
+        # ~/.claude.json has no oauthAccount (Team/SSO desktop case)
+        self._write_config({"someKey": True})
+        self._write_desktop_session({"emailAddress": "team@corp.com"})
+        result = unbound.read_account_identity()
+        self.assertEqual(result["user_email"], "team@corp.com")
+        self.assertEqual(result["email_domain"], "corp.com")
+
+    def test_primary_oauth_email_wins_over_desktop_fallback(self):
+        self._write_config({"oauthAccount": {"emailAddress": "primary@corp.com"}})
+        self._write_desktop_session({"emailAddress": "stale@corp.com"})
+        result = unbound.read_account_identity()
+        self.assertEqual(result["user_email"], "primary@corp.com")
+
+    def test_blank_when_no_oauth_and_no_desktop_session(self):
+        self._write_config({"someKey": True})
+        result = unbound.read_account_identity()
+        self.assertIsNone(result["user_email"])
+        self.assertIsNone(result["email_domain"])
+
 
 class TestBuildAccountIdentity(unittest.TestCase):
     """build_account_identity() returns the full identity every call."""
@@ -236,6 +272,72 @@ class TestBuildAccountIdentity(unittest.TestCase):
         self.assertEqual(
             set(result.keys()), {"org_id", "plan", "auth_mode", "email_domain"}
         )
+
+
+class TestClaudeDesktopSupportDirs(unittest.TestCase):
+    def test_darwin_path(self):
+        with patch.object(unbound.platform, "system", return_value="Darwin"):
+            dirs = unbound._claude_desktop_support_dirs()
+        self.assertEqual(
+            dirs, [Path.home() / "Library" / "Application Support" / "Claude"]
+        )
+
+    def test_linux_path(self):
+        with patch.object(unbound.platform, "system", return_value="Linux"):
+            dirs = unbound._claude_desktop_support_dirs()
+        self.assertEqual(dirs, [Path.home() / ".config" / "Claude"])
+
+
+class TestDesktopSessionEmail(unittest.TestCase):
+    """_desktop_session_email(): newest session with an email wins, fail-open."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._patcher = patch.object(
+            unbound, "_claude_desktop_support_dirs", return_value=[self.tmp]
+        )
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+
+    def _session(self, name, payload, mtime):
+        import os
+        p = (self.tmp / "local-agent-mode-sessions" / "acct" / "org"
+             / f"local_{name}" / ".claude" / ".claude.json")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(payload, encoding="utf-8")
+        os.utime(p, (mtime, mtime))
+        return p
+
+    def test_returns_none_when_no_sessions(self):
+        self.assertIsNone(unbound._desktop_session_email())
+
+    def test_missing_base_dir_returns_none(self):
+        with patch.object(unbound, "_claude_desktop_support_dirs",
+                          return_value=[self.tmp / "nope"]):
+            self.assertIsNone(unbound._desktop_session_email())
+
+    def test_newest_session_wins(self):
+        self._session("old", json.dumps({"oauthAccount": {"emailAddress": "old@corp.com"}}), 1000)
+        self._session("new", json.dumps({"oauthAccount": {"emailAddress": "new@corp.com"}}), 2000)
+        self.assertEqual(unbound._desktop_session_email(), "new@corp.com")
+
+    def test_skips_newer_sessions_without_email(self):
+        # newest two lack an email → fall through to the older one that has it
+        self._session("hasemail", json.dumps({"oauthAccount": {"emailAddress": "found@corp.com"}}), 1000)
+        self._session("noemail", json.dumps({"oauthAccount": {}}), 2000)
+        self._session("nooauth", json.dumps({"something": True}), 3000)
+        self.assertEqual(unbound._desktop_session_email(), "found@corp.com")
+
+    def test_blank_email_is_ignored(self):
+        self._session("blank", json.dumps({"oauthAccount": {"emailAddress": "  "}}), 2000)
+        self.assertIsNone(unbound._desktop_session_email())
+
+    def test_never_raises_on_malformed_json(self):
+        self._session("bad", "{not json", 2000)
+        try:
+            self.assertIsNone(unbound._desktop_session_email())
+        except Exception as exc:
+            self.fail(f"_desktop_session_email raised {exc!r}")
 
 
 if __name__ == "__main__":

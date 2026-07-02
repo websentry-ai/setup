@@ -1028,6 +1028,46 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
     return None
 
 
+def _claude_desktop_support_dirs() -> List[Path]:
+    """Claude Desktop app support dir(s) per OS. Team/SSO desktop sessions cache
+    the active account's oauthAccount under local-agent-mode-sessions/ here."""
+    system = platform.system().lower()
+    if system == 'darwin':
+        return [Path.home() / 'Library' / 'Application Support' / 'Claude']
+    if system == 'windows':
+        appdata = os.getenv('APPDATA')
+        return [Path(appdata) / 'Claude'] if appdata else []
+    return [Path.home() / '.config' / 'Claude']
+
+
+def _desktop_session_email() -> Optional[str]:
+    """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
+    oauthAccount into ~/.claude.json (anthropics/claude-code#57026) but does write
+    the active account's oauthAccount (with emailAddress) into each per-session
+    sandbox config. Return the email from the most recently modified one. Best
+    effort — never raises, returns None when nothing usable is found."""
+    files = []
+    for base in _claude_desktop_support_dirs():
+        try:
+            files.extend((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
+        except Exception:
+            continue
+    try:
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        return None
+    for path in files[:20]:
+        try:
+            oauth = json.loads(path.read_text(encoding='utf-8')).get('oauthAccount')
+            if isinstance(oauth, dict):
+                email = (oauth.get('emailAddress') or '').strip() or None
+                if email:
+                    return email
+        except Exception:
+            continue
+    return None
+
+
 def read_account_identity() -> Dict:
     org_id = None
     plan = None
@@ -1045,6 +1085,11 @@ def read_account_identity() -> Dict:
             auth_mode = 'api_key'
     except Exception:
         pass
+    if not email:
+        try:
+            email = _desktop_session_email()
+        except Exception:
+            email = None
     return {
         'org_id': org_id,
         'plan': plan,
