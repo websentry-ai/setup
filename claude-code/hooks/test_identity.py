@@ -246,6 +246,14 @@ class TestReadAccountIdentity(unittest.TestCase):
         result = unbound.read_account_identity()
         self.assertEqual(result["user_email"], "team@corp.com")
 
+    def test_auth_mode_subscription_when_oauth_omits_email(self):
+        # oauthAccount present but no emailAddress must still yield auth_mode
+        self._write_config({"oauthAccount": {"organizationUuid": "org-x"}})
+        result = unbound.read_account_identity()
+        self.assertEqual(result["auth_mode"], "subscription")
+        self.assertEqual(result["org_id"], "org-x")
+        self.assertIsNone(result["user_email"])
+
 
 class TestBuildAccountIdentity(unittest.TestCase):
     """build_account_identity() returns the full identity every call."""

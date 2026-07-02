@@ -1078,10 +1078,14 @@ def _desktop_session_email() -> Optional[str]:
         # A session that exists but can't be read (oversized, IO/parse error) is a
         # blind spot — it could belong to a different account, so we can't verify
         # agreement. Return blank rather than fall through to a possibly-stale email.
+        # Bound the read itself (read MAX+1 bytes) rather than trusting a separate
+        # stat(): a rewrite-after-stat race can't feed an unbounded file into read.
         try:
-            if path.stat().st_size > _DESKTOP_SESSION_MAX_BYTES:
+            with open(path, 'rb') as f:
+                data = f.read(_DESKTOP_SESSION_MAX_BYTES + 1)
+            if len(data) > _DESKTOP_SESSION_MAX_BYTES:
                 return None
-            oauth = json.loads(path.read_text(encoding='utf-8')).get('oauthAccount')
+            oauth = json.loads(data.decode('utf-8')).get('oauthAccount')
         except Exception:
             return None
         if not isinstance(oauth, dict):
@@ -1110,7 +1114,10 @@ def read_account_identity() -> Dict:
             org_id = oauth.get('organizationUuid') or None
             plan = oauth.get('organizationType') or None
             _raw_email = oauth.get('emailAddress')
-            email = _raw_email.strip() or None if isinstance(_raw_email, str) else None
+            if isinstance(_raw_email, str):
+                email = _raw_email.strip() or None
+            else:
+                email = None
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
