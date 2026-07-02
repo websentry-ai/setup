@@ -152,6 +152,24 @@ def log_error(message: str, category: str = 'general'):
     report_error_to_gateway(message, category, _cached_api_key)
 
 
+def _emit(payload) -> None:
+    """Write a hook response to stdout, failing open if Claude Code has already
+    closed the pipe.
+
+    Claude closes the hook's stdout as soon as it has the response it needs (or
+    when it moves on / times the hook out). A subsequent write then raises
+    BrokenPipeError. That is not an actionable error — the response is simply
+    moot — so we swallow it silently instead of logging noise. Previously these
+    writes used bare print() and the BrokenPipeError surfaced as the dominant
+    line in error.log (see WEB-4745)."""
+    try:
+        text = payload if isinstance(payload, str) else json.dumps(payload)
+        sys.stdout.write(text + "\n")
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
+
 def _read_policy_cache_raw() -> Optional[Dict]:
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
     try:
@@ -2005,15 +2023,15 @@ def main():
     
     try:
         input_data = sys.stdin.read().strip()
-        
+
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            _emit('{"suppressOutput": true}')
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            _emit('{"suppressOutput": true}')
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -2024,7 +2042,7 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
-            print("{}")
+            _emit("{}")
             return
         session_id = event.get('session_id')
 
@@ -2032,7 +2050,7 @@ def main():
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             response["suppressOutput"] = True
-            print(json.dumps(response), flush=True)
+            _emit(response)
             return
 
         # Handle UserPromptSubmit - check policy before processing
@@ -2047,7 +2065,7 @@ def main():
                     'event': event
                 })
                 response["suppressOutput"] = True
-                print(json.dumps(response), flush=True)
+                _emit(response)
                 return
 
             # If allowed, continue to log the event (output printed at end)
@@ -2066,13 +2084,34 @@ def main():
         
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
-        
+        _emit('{"suppressOutput": true}')
+
+    except BrokenPipeError:
+        # Claude Code closed our stdout before we finished — nothing to report
+        # and nothing to write. Swallow it so it doesn't become error.log noise
+        # (and so we don't re-raise by trying to write again). See WEB-4745.
+        pass
     except Exception as e:
-        # Still return empty JSON object to Claude Code to indicate completion
+        # Still return empty JSON object to Claude Code to indicate completion.
+        # _emit() is pipe-safe, so a dead pipe here won't trigger a second fault.
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        _emit('{"suppressOutput": true}')
 
 
 if __name__ == '__main__':
-    main()
+    # Fail open on a closed stdout. Claude Code may close the hook's pipe before
+    # we finish writing; _emit() already swallows BrokenPipeError on each write,
+    # but the interpreter also flushes stdout at shutdown, which would re-raise
+    # against the dead pipe and print "Exception ignored ... BrokenPipeError"
+    # plus exit non-zero. Redirect stdout to devnull so that final flush is a
+    # no-op and the hook exits cleanly. (Standard CPython SIGPIPE recipe.) See WEB-4745.
+    try:
+        main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        pass
+    finally:
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except OSError:
+            pass
