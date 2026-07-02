@@ -1214,9 +1214,7 @@ def build_llm_exchange(events, api_key=None):
     if usage:
         exchange['usage'] = usage
 
-    # Forward Cursor's per-turn generation_id so the control plane keys the row
-    # on an exact per-turn id (deterministic idempotency) instead of a content
-    # hash.
+    # Exact per-turn id for deterministic idempotency (vs a content hash).
     if generation_id:
         exchange['turn_request_id'] = generation_id
 
