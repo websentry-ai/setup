@@ -1075,12 +1075,15 @@ def _desktop_session_email() -> Optional[str]:
     found = None
     found_key = None
     for _, path in timed:
+        # A session that exists but can't be read (oversized, IO/parse error) is a
+        # blind spot — it could belong to a different account, so we can't verify
+        # agreement. Return blank rather than fall through to a possibly-stale email.
         try:
             if path.stat().st_size > _DESKTOP_SESSION_MAX_BYTES:
-                continue
+                return None
             oauth = json.loads(path.read_text(encoding='utf-8')).get('oauthAccount')
         except Exception:
-            continue
+            return None
         if not isinstance(oauth, dict):
             continue
         raw = oauth.get('emailAddress')

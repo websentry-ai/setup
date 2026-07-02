@@ -373,9 +373,23 @@ class TestDesktopSessionEmail(unittest.TestCase):
         self._session("weird", json.dumps({"oauthAccount": {"emailAddress": 12345}}), 2000)
         self.assertIsNone(unbound._desktop_session_email())
 
-    def test_oversized_session_file_is_skipped(self):
+    def test_oversized_session_forces_blank(self):
         big = "x" * (unbound._DESKTOP_SESSION_MAX_BYTES + 10)
         self._session("big", json.dumps({"oauthAccount": {"emailAddress": "big@corp.com"}, "pad": big}), 2000)
+        self.assertIsNone(unbound._desktop_session_email())
+
+    def test_oversized_newer_session_forces_blank_not_stale(self):
+        # newest session is oversized (unverifiable) -> must NOT fall through to an
+        # older readable session's possibly-stale email
+        big = "x" * (unbound._DESKTOP_SESSION_MAX_BYTES + 10)
+        self._session("old", json.dumps({"oauthAccount": {"emailAddress": "old@corp.com"}}), 1000)
+        self._session("new", json.dumps({"oauthAccount": {"emailAddress": "new@corp.com"}, "pad": big}), 2000)
+        self.assertIsNone(unbound._desktop_session_email())
+
+    def test_unreadable_newer_session_forces_blank_not_stale(self):
+        # malformed newest session is a blind spot -> blank over a stale older email
+        self._session("old", json.dumps({"oauthAccount": {"emailAddress": "old@corp.com"}}), 1000)
+        self._session("new", "{not json", 2000)
         self.assertIsNone(unbound._desktop_session_email())
 
     def test_never_raises_on_malformed_json(self):
