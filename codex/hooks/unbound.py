@@ -1251,6 +1251,12 @@ def process_stop_event(event: Dict, api_key: str):
     # always set (stop_timestamp or now-fallback)
     exchange['requestCompleted'] = request_completed
 
+    # Forward Codex's per-turn turn_id so the control plane keys the row on an
+    # exact per-turn id (deterministic idempotency) instead of a content hash.
+    turn_id = event.get('turn_id')
+    if turn_id:
+        exchange['turn_request_id'] = turn_id
+
     send_to_api(exchange, api_key)
 
 

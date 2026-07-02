@@ -1655,6 +1655,13 @@ def process_stop_event(event: Dict, api_key: str):
     )
 
     if exchange:
+        # Forward Claude Code's per-turn prompt_id (the same id Cowork emits as
+        # the OTEL prompt.id) so the control plane can de-dup a turn logged on
+        # both hooks and OTEL. Absent on Claude Code < v2.1.196 -> backend falls
+        # back to its content-hash request_id.
+        prompt_id = event.get('prompt_id')
+        if prompt_id:
+            exchange['turn_request_id'] = prompt_id
         send_to_api(exchange, api_key)
 
 

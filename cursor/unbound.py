@@ -1101,6 +1101,7 @@ def build_llm_exchange(events, api_key=None):
     user_prompt = None
     assistant_response = None
     conversation_id = None
+    generation_id = None
     model = None
     user_email = None
     request_initialized = None
@@ -1113,6 +1114,9 @@ def build_llm_exchange(events, api_key=None):
 
         if not conversation_id:
             conversation_id = event.get('conversation_id')
+
+        if not generation_id:
+            generation_id = event.get('generation_id')
 
         if not model:
             model = event.get('model')
@@ -1209,6 +1213,12 @@ def build_llm_exchange(events, api_key=None):
 
     if usage:
         exchange['usage'] = usage
+
+    # Forward Cursor's per-turn generation_id so the control plane keys the row
+    # on an exact per-turn id (deterministic idempotency) instead of a content
+    # hash.
+    if generation_id:
+        exchange['turn_request_id'] = generation_id
 
     return exchange
 
