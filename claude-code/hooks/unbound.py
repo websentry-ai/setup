@@ -24,6 +24,13 @@ LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
+
+# CoWork built-in tools that are exposed under mcp__
+COWORK_BUILTIN_MCP_SERVERS = frozenset({
+    'workspace', 'cowork', 'cowork-onboarding', 'visualize',
+    'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
+})
+
 CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
@@ -1186,6 +1193,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_name = event.get('tool_name', '')
 
     is_mcp = tool_name.startswith(MCP_TOOL_PREFIX)
+    if is_mcp:
+        builtin_seg = tool_name[len(MCP_TOOL_PREFIX):].split('__', 1)[0]
+        if builtin_seg in COWORK_BUILTIN_MCP_SERVERS:
+            return {}
     if not is_mcp and tool_name not in ALLOWED_NON_MCP_HOOK_NAMES:
         return {}
 
