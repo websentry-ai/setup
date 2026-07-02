@@ -1655,6 +1655,11 @@ def process_stop_event(event: Dict, api_key: str):
     )
 
     if exchange:
+        # prompt_id == Cowork's OTEL prompt.id; lets the backend de-dup a turn
+        # logged on both hooks and OTEL. Absent on Claude Code < v2.1.196.
+        prompt_id = event.get('prompt_id')
+        if prompt_id:
+            exchange['turn_request_id'] = prompt_id
         send_to_api(exchange, api_key)
 
 

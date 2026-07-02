@@ -1251,6 +1251,11 @@ def process_stop_event(event: Dict, api_key: str):
     # always set (stop_timestamp or now-fallback)
     exchange['requestCompleted'] = request_completed
 
+    # Exact per-turn id for deterministic idempotency (vs a content hash).
+    turn_id = event.get('turn_id')
+    if turn_id:
+        exchange['turn_request_id'] = turn_id
+
     send_to_api(exchange, api_key)
 
 
