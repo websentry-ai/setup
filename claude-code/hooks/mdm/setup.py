@@ -1612,7 +1612,7 @@ def main():
 
     if clear_mode:
         clear_setup()
-        return
+        return True
 
     print("=" * 60)
     print("Claude Code Hooks - MDM Setup")
@@ -1626,7 +1626,7 @@ def main():
             )
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
     base_url = "https://backend.getunbound.ai"
     gateway_url = DEFAULT_GATEWAY_URL
@@ -1665,20 +1665,20 @@ def main():
         print("\nMissing required argument: --api-key")
         print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug] [--backfill]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
-        return
+        return False
 
     print("\nGetting device identifier...")
     device_id = get_device_identifier()
     if not device_id:
         print("Failed to get device identifier")
-        return
+        return False
     debug_print(f"Device identifier: {device_id}")
     print("Device identifier retrieved")
 
     print("\nFetching API key from MDM...")
     api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
     if not api_key:
-        return
+        return False
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
@@ -1690,7 +1690,7 @@ def main():
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
         print("Failed to set UNBOUND_CLAUDE_API_KEY")
-        return
+        return False
     debug_print("UNBOUND_CLAUDE_API_KEY set successfully")
 
     # Remove gateway artifacts, strip leftover user-level Unbound hooks
@@ -1708,7 +1708,7 @@ def main():
         print(f"Created managed hooks in {managed_dir}")
     else:
         print("Failed to configure managed hooks")
-        return
+        return False
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
@@ -1719,12 +1719,16 @@ def main():
     if backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())
 
+    return True
+
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\nSetup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\nError: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
