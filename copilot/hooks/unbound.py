@@ -652,6 +652,77 @@ def _compute_script_hash(command, args, cwd):
         return None
 
 
+_MAX_FILE_CONTENT_BYTES = 64 * 1024          # per-file cap
+
+
+def _cap_file_text(text):
+    """Return (text, truncated) capped to _MAX_FILE_CONTENT_BYTES of UTF-8."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= _MAX_FILE_CONTENT_BYTES:
+        return text, False
+    return encoded[:_MAX_FILE_CONTENT_BYTES].decode('utf-8', errors='ignore'), True
+
+
+def _resolve_and_read_file(file_path, cwd):
+    """Read one file as text, resolving a relative path against cwd. Returns
+    (content, truncated), or None on any problem — missing file, unresolvable
+    relative path, permission denied, a directory, binary or non-UTF8 content, or
+    any OS error. Never raises (fail-open): the caller just omits the content."""
+    try:
+        if not file_path or not isinstance(file_path, str):
+            return None
+        if not os.path.isabs(file_path):
+            if not cwd:
+                return None  # cannot form an absolute path safely -> skip
+            file_path = os.path.join(cwd, file_path)
+        if not os.path.isfile(file_path):
+            return None  # missing file or a directory
+        with open(file_path, 'rb') as f:
+            raw = f.read(_MAX_FILE_CONTENT_BYTES + 1)
+        truncated = len(raw) > _MAX_FILE_CONTENT_BYTES
+        raw = raw[:_MAX_FILE_CONTENT_BYTES]
+        if b'\x00' in raw:
+            return None  # binary file
+        if truncated:
+            return raw.decode('utf-8', errors='ignore'), True
+        try:
+            return raw.decode('utf-8'), False
+        except UnicodeDecodeError:
+            return None  # non-UTF8 / binary
+    except Exception:
+        return None  # permission denied, OS error, etc. -> skip
+
+
+def _make_file_entry(path, cwd, inline_content=None):
+    """Build one {'path', 'content', 'truncated'} entry, or None. Write-style tools
+    pass the new text as inline_content (the file may not exist on disk yet)."""
+    try:
+        if not path or not isinstance(path, str):
+            return None
+        if isinstance(inline_content, str):
+            content, truncated = _cap_file_text(inline_content)
+        else:
+            res = _resolve_and_read_file(path, cwd)
+            if res is None:
+                return None
+            content, truncated = res
+        return {'path': path, 'content': content, 'truncated': truncated}
+    except Exception:
+        return None
+
+
+def _attach_file_content(target, file_path, cwd, inline_content=None):
+    """Attach target['file_content'] (a list of {path, content, truncated}) for a
+    single-file tool (Read/Write/Edit/MCP). Uniform key + shape across all tools.
+    Best-effort: on any unreadable file the key is simply left absent."""
+    try:
+        entry = _make_file_entry(file_path, cwd, inline_content)
+        if entry is not None:
+            target['file_content'] = [entry]
+    except Exception:
+        return
+
+
 def _augment_script_hash(result, cwd):
     """Add scriptHash to an MCP server config when it runs a local script, so the
     gateway can fingerprint it as `script:<hash>`."""
@@ -1093,6 +1164,7 @@ def process_pre_tool_use(event, api_key):
     file_path = tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path')
     if file_path:
         metadata['file_path'] = file_path
+        _attach_file_content(metadata, file_path, event.get('cwd'), tool_input.get('content'))
 
     if mcp_server is not None:
         metadata['mcp_server'] = mcp_server
@@ -1233,7 +1305,7 @@ def _extract_patch_target_path(args):
     return m.group(1).strip() if m else ''
 
 
-def map_copilot_tool(name, args, result_content):
+def map_copilot_tool(name, args, result_content, cwd=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal orchestration tools (intentionally not emitted).
@@ -1272,11 +1344,16 @@ def map_copilot_tool(name, args, result_content):
             'tool_input': args,
             'result_json': result_content or '',
         }
+    # Uniform file_content for file-oriented tools; reuse the content already on
+    # the entry, falling back to a disk read (relative paths resolved via cwd).
+    file_path = entry.get('file_path')
+    if file_path:
+        _attach_file_content(entry, file_path, cwd, entry.get('content') or None)
     # Drop empty-string values.
     return {k: v for k, v in entry.items() if v != ''}
 
 
-def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None):
+def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None, cwd=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
 
     Reads defensively — blank or unparseable lines are skipped, never raised."""
@@ -1381,7 +1458,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     tool_use = []
     for call_id in tool_calls:
         call = tool_data[call_id]
-        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
+        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'], cwd)
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
@@ -1833,6 +1910,7 @@ def main():
             exchange = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
+                cwd=event.get('cwd'),
             )
             if exchange:
                 # Turn boundaries from event-fire times
