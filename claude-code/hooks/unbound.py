@@ -38,6 +38,12 @@ def _relocated_or_legacy(relocated: Path, legacy: Path) -> Path:
     return legacy
 
 
+# CoWork built-in tools that are exposed under mcp__
+COWORK_BUILTIN_MCP_SERVERS = frozenset({
+    'workspace', 'cowork', 'cowork-onboarding', 'visualize',
+    'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
+})
+
 CLAUDE_MCP_CONFIG_PATH = _relocated_or_legacy(_CONFIG_DIR / ".claude.json", Path.home() / ".claude.json")
 CLAUDE_PLUGIN_CACHE_DIR = _relocated_or_legacy(_CONFIG_DIR / "plugins" / "cache", Path.home() / ".claude" / "plugins" / "cache")
 POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
@@ -821,17 +827,24 @@ def _is_uuid(name: str) -> bool:
     return bool(name) and bool(_MCP_UUID_RE.match(name))
 
 
-def _claude_code_sessions_dir() -> Optional[Path]:
+_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
+
+
+def _claude_session_dirs() -> list:
     try:
         home = Path.home()
         if sys.platform == 'darwin':
-            return home / 'Library' / 'Application Support' / 'Claude' / 'claude-code-sessions'
-        if sys.platform.startswith('win'):
+            base = home / 'Library' / 'Application Support' / 'Claude'
+        elif sys.platform.startswith('win'):
             appdata = os.environ.get('APPDATA')
-            return Path(appdata) / 'Claude' / 'claude-code-sessions' if appdata else None
-        return home / '.config' / 'Claude' / 'claude-code-sessions'
+            if not appdata:
+                return []
+            base = Path(appdata) / 'Claude'
+        else:
+            base = home / '.config' / 'Claude'
+        return [base / sub for sub in _CLAUDE_SESSION_SUBDIRS]
     except Exception:
-        return None
+        return []
 
 
 _HOOK_SCRIPT_RUNTIMES = {
@@ -907,20 +920,30 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
         return None
 
 
+def _session_file_created_at(path) -> float:
+    try:
+        st = path.stat()
+        return getattr(st, 'st_birthtime', None) or st.st_mtime
+    except Exception:
+        return 0.0
+
+
 def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
     if not _is_uuid(server_uuid):
         return None
     try:
-        base = _claude_code_sessions_dir()
-        if not base or not base.exists():
+        files = []
+        for base in _claude_session_dirs():
+            if not base or not base.exists():
+                continue
+            try:
+                files.extend(base.glob('**/local_*.json'))
+            except Exception:
+                continue
+        if not files:
             return None
-        try:
-            files = sorted(
-                base.glob('**/local_*.json'),
-                key=lambda p: p.stat().st_mtime, reverse=True,
-            )[:20]
-        except Exception:
-            files = list(base.glob('**/local_*.json'))[:20]
+
+        files.sort(key=_session_file_created_at, reverse=True)
         for f in files:
             try:
                 data = json.loads(f.read_text(encoding='utf-8'))
@@ -930,8 +953,6 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
                 if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
                     name = entry.get('name')
                     if not name:
-                        # UUID matched but this record has no display name; keep
-                        # scanning — another session file may carry a named one.
                         continue
                     cfg = {"additional_data": {"scope": "claude-connector"}}
                     url = entry.get('url')
@@ -1027,6 +1048,80 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
     return None
 
 
+def _claude_desktop_support_dirs() -> List[Path]:
+    """Claude Desktop app support dir(s) per OS. Team/SSO desktop sessions cache
+    the active account's oauthAccount under local-agent-mode-sessions/ here."""
+    system = platform.system().lower()
+    if system == 'darwin':
+        return [Path.home() / 'Library' / 'Application Support' / 'Claude']
+    if system == 'windows':
+        appdata = os.getenv('APPDATA')
+        return [Path(appdata) / 'Claude'] if appdata else []
+    return [Path.home() / '.config' / 'Claude']
+
+
+_DESKTOP_SESSION_MAX_BYTES = 512 * 1024
+
+
+def _desktop_session_email() -> Optional[str]:
+    """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
+    oauthAccount into ~/.claude.json (anthropics/claude-code#57026) but does write
+    the active account's oauthAccount (with emailAddress) into each per-session
+    sandbox config. These configs are sandbox-writable and thus untrusted, so the
+    email is returned only when every session that carries one agrees on a single
+    address; any disagreement (multiple accounts, or a forged/injected config) or
+    failure yields None, so the hook emits a blank email rather than a wrong one.
+    Best effort — never raises."""
+    timed = []
+    try:
+        bases = _claude_desktop_support_dirs()
+    except Exception:
+        return None
+    for base in bases:
+        try:
+            # list() forces the lazy glob traversal to happen inside this guard —
+            # a mid-iteration traversal error (e.g. an unreadable subdir) then only
+            # skips this base instead of aborting the whole scan.
+            candidates = list((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
+        except Exception:
+            continue
+        for path in candidates:
+            # stat per file so one unreadable/vanished entry can't poison the sort.
+            try:
+                timed.append((path.stat().st_mtime, path))
+            except Exception:
+                continue
+    timed.sort(key=lambda t: t[0], reverse=True)
+    found = None
+    found_key = None
+    for _, path in timed:
+        # A session that exists but can't be read (oversized, IO/parse error) is a
+        # blind spot — it could belong to a different account, so we can't verify
+        # agreement. Return blank rather than fall through to a possibly-stale email.
+        # Bound the read itself (read MAX+1 bytes) rather than trusting a separate
+        # stat(): a rewrite-after-stat race can't feed an unbounded file into read.
+        try:
+            with open(path, 'rb') as f:
+                data = f.read(_DESKTOP_SESSION_MAX_BYTES + 1)
+            if len(data) > _DESKTOP_SESSION_MAX_BYTES:
+                return None
+            oauth = json.loads(data.decode('utf-8')).get('oauthAccount')
+        except Exception:
+            return None
+        if not isinstance(oauth, dict):
+            continue
+        raw = oauth.get('emailAddress')
+        email = raw.strip() if isinstance(raw, str) else ''
+        if not email:
+            continue
+        key = email.lower()
+        if found_key is None:
+            found, found_key = email, key
+        elif key != found_key:
+            return None  # accounts disagree — blank over wrong
+    return found
+
+
 def read_account_identity() -> Dict:
     org_id = None
     plan = None
@@ -1038,12 +1133,21 @@ def read_account_identity() -> Dict:
         if isinstance(oauth, dict):
             org_id = oauth.get('organizationUuid') or None
             plan = oauth.get('organizationType') or None
-            email = oauth.get('emailAddress') or None
+            _raw_email = oauth.get('emailAddress')
+            if isinstance(_raw_email, str):
+                email = _raw_email.strip() or None
+            else:
+                email = None
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
     except Exception:
         pass
+    if not email:
+        try:
+            email = _desktop_session_email()
+        except Exception:
+            email = None
     return {
         'org_id': org_id,
         'plan': plan,
@@ -1185,6 +1289,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_name = event.get('tool_name', '')
 
     is_mcp = tool_name.startswith(MCP_TOOL_PREFIX)
+    if is_mcp:
+        builtin_seg = tool_name[len(MCP_TOOL_PREFIX):].split('__', 1)[0]
+        if builtin_seg in COWORK_BUILTIN_MCP_SERVERS:
+            return {}
     if not is_mcp and tool_name not in ALLOWED_NON_MCP_HOOK_NAMES:
         return {}
 
@@ -1560,6 +1668,11 @@ def process_stop_event(event: Dict, api_key: str):
     )
 
     if exchange:
+        # prompt_id == Cowork's OTEL prompt.id; lets the backend de-dup a turn
+        # logged on both hooks and OTEL. Absent on Claude Code < v2.1.196.
+        prompt_id = event.get('prompt_id')
+        if prompt_id:
+            exchange['turn_request_id'] = prompt_id
         send_to_api(exchange, api_key)
 
 
