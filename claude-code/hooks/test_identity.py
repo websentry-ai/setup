@@ -239,6 +239,13 @@ class TestReadAccountIdentity(unittest.TestCase):
         self.assertIsNone(result["user_email"])
         self.assertIsNone(result["email_domain"])
 
+    def test_whitespace_primary_email_falls_back_to_desktop(self):
+        # a whitespace-only primary email must not block the fallback
+        self._write_config({"oauthAccount": {"emailAddress": "   "}})
+        self._write_desktop_session({"emailAddress": "team@corp.com"})
+        result = unbound.read_account_identity()
+        self.assertEqual(result["user_email"], "team@corp.com")
+
 
 class TestBuildAccountIdentity(unittest.TestCase):
     """build_account_identity() returns the full identity every call."""
@@ -249,6 +256,13 @@ class TestBuildAccountIdentity(unittest.TestCase):
         self._patcher = patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", self.claude_json)
         self._patcher.start()
         self.addCleanup(self._patcher.stop)
+        # Isolate from the real machine: no desktop sessions, no device serial,
+        # so key-set assertions are deterministic across hosts.
+        for name, val in (("_claude_desktop_support_dirs", [self.tmp]),
+                          ("_device_serial", None)):
+            p = patch.object(unbound, name, return_value=val)
+            p.start()
+            self.addCleanup(p.stop)
 
     def _write_config(self, data):
         self.claude_json.write_text(json.dumps(data), encoding="utf-8")
@@ -267,10 +281,13 @@ class TestBuildAccountIdentity(unittest.TestCase):
         self.assertIsNone(result["plan"])
 
     def test_keys_limited_to_identity_fields(self):
+        # device_serial is omitted when unavailable (patched to None in setUp);
+        # user_email is always present.
         self._write_config({})
         result = unbound.build_account_identity()
         self.assertEqual(
-            set(result.keys()), {"org_id", "plan", "auth_mode", "email_domain"}
+            set(result.keys()),
+            {"org_id", "plan", "auth_mode", "user_email", "email_domain"},
         )
 
 
@@ -287,9 +304,23 @@ class TestClaudeDesktopSupportDirs(unittest.TestCase):
             dirs = unbound._claude_desktop_support_dirs()
         self.assertEqual(dirs, [Path.home() / ".config" / "Claude"])
 
+    def test_windows_path_with_appdata(self):
+        with patch.object(unbound.platform, "system", return_value="Windows"), \
+             patch.dict("os.environ", {"APPDATA": r"C:\Users\t\AppData\Roaming"}):
+            dirs = unbound._claude_desktop_support_dirs()
+        self.assertEqual([str(d) for d in dirs], [str(Path(r"C:\Users\t\AppData\Roaming") / "Claude")])
+
+    def test_windows_path_without_appdata_returns_empty(self):
+        with patch.object(unbound.platform, "system", return_value="Windows"):
+            env = {k: v for k, v in __import__("os").environ.items() if k != "APPDATA"}
+            with patch.dict("os.environ", env, clear=True):
+                dirs = unbound._claude_desktop_support_dirs()
+        self.assertEqual(dirs, [])
+
 
 class TestDesktopSessionEmail(unittest.TestCase):
-    """_desktop_session_email(): newest session with an email wins, fail-open."""
+    """_desktop_session_email(): returns the email only when all sessions agree;
+    disagreement or any failure yields None (blank over wrong). Fail-open."""
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -316,13 +347,19 @@ class TestDesktopSessionEmail(unittest.TestCase):
                           return_value=[self.tmp / "nope"]):
             self.assertIsNone(unbound._desktop_session_email())
 
-    def test_newest_session_wins(self):
+    def test_returns_email_when_all_sessions_agree(self):
+        # same address across sessions (common: one email spanning Max + Team orgs)
+        self._session("a", json.dumps({"oauthAccount": {"emailAddress": "user@corp.com"}}), 1000)
+        self._session("b", json.dumps({"oauthAccount": {"emailAddress": "User@Corp.com"}}), 2000)
+        self.assertEqual(unbound._desktop_session_email(), "User@Corp.com")
+
+    def test_returns_none_when_sessions_disagree(self):
+        # two different accounts on disk → cannot tell which is active → blank over wrong
         self._session("old", json.dumps({"oauthAccount": {"emailAddress": "old@corp.com"}}), 1000)
         self._session("new", json.dumps({"oauthAccount": {"emailAddress": "new@corp.com"}}), 2000)
-        self.assertEqual(unbound._desktop_session_email(), "new@corp.com")
+        self.assertIsNone(unbound._desktop_session_email())
 
-    def test_skips_newer_sessions_without_email(self):
-        # newest two lack an email → fall through to the older one that has it
+    def test_ignores_sessions_without_email_when_others_agree(self):
         self._session("hasemail", json.dumps({"oauthAccount": {"emailAddress": "found@corp.com"}}), 1000)
         self._session("noemail", json.dumps({"oauthAccount": {}}), 2000)
         self._session("nooauth", json.dumps({"something": True}), 3000)
@@ -330,6 +367,15 @@ class TestDesktopSessionEmail(unittest.TestCase):
 
     def test_blank_email_is_ignored(self):
         self._session("blank", json.dumps({"oauthAccount": {"emailAddress": "  "}}), 2000)
+        self.assertIsNone(unbound._desktop_session_email())
+
+    def test_non_string_email_is_ignored(self):
+        self._session("weird", json.dumps({"oauthAccount": {"emailAddress": 12345}}), 2000)
+        self.assertIsNone(unbound._desktop_session_email())
+
+    def test_oversized_session_file_is_skipped(self):
+        big = "x" * (unbound._DESKTOP_SESSION_MAX_BYTES + 10)
+        self._session("big", json.dumps({"oauthAccount": {"emailAddress": "big@corp.com"}, "pad": big}), 2000)
         self.assertIsNone(unbound._desktop_session_email())
 
     def test_never_raises_on_malformed_json(self):

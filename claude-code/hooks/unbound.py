@@ -1040,32 +1040,56 @@ def _claude_desktop_support_dirs() -> List[Path]:
     return [Path.home() / '.config' / 'Claude']
 
 
+_DESKTOP_SESSION_MAX_BYTES = 512 * 1024
+
+
 def _desktop_session_email() -> Optional[str]:
     """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
     oauthAccount into ~/.claude.json (anthropics/claude-code#57026) but does write
     the active account's oauthAccount (with emailAddress) into each per-session
-    sandbox config. Return the email from the most recently modified one. Best
-    effort — never raises, returns None when nothing usable is found."""
-    files = []
-    for base in _claude_desktop_support_dirs():
-        try:
-            files.extend((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
-        except Exception:
-            continue
+    sandbox config. These configs are sandbox-writable and thus untrusted, so the
+    email is returned only when every session that carries one agrees on a single
+    address; any disagreement (multiple accounts, or a forged/injected config) or
+    failure yields None, so the hook emits a blank email rather than a wrong one.
+    Best effort — never raises."""
+    timed = []
     try:
-        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        bases = _claude_desktop_support_dirs()
     except Exception:
         return None
-    for path in files[:20]:
+    for base in bases:
         try:
-            oauth = json.loads(path.read_text(encoding='utf-8')).get('oauthAccount')
-            if isinstance(oauth, dict):
-                email = (oauth.get('emailAddress') or '').strip() or None
-                if email:
-                    return email
+            candidates = (base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json')
         except Exception:
             continue
-    return None
+        for path in candidates:
+            # stat per file so one unreadable/vanished entry can't poison the sort.
+            try:
+                timed.append((path.stat().st_mtime, path))
+            except Exception:
+                continue
+    timed.sort(key=lambda t: t[0], reverse=True)
+    found = None
+    found_key = None
+    for _, path in timed:
+        try:
+            if path.stat().st_size > _DESKTOP_SESSION_MAX_BYTES:
+                continue
+            oauth = json.loads(path.read_text(encoding='utf-8')).get('oauthAccount')
+        except Exception:
+            continue
+        if not isinstance(oauth, dict):
+            continue
+        raw = oauth.get('emailAddress')
+        email = raw.strip() if isinstance(raw, str) else ''
+        if not email:
+            continue
+        key = email.lower()
+        if found_key is None:
+            found, found_key = email, key
+        elif key != found_key:
+            return None  # accounts disagree — blank over wrong
+    return found
 
 
 def read_account_identity() -> Dict:
@@ -1079,7 +1103,8 @@ def read_account_identity() -> Dict:
         if isinstance(oauth, dict):
             org_id = oauth.get('organizationUuid') or None
             plan = oauth.get('organizationType') or None
-            email = oauth.get('emailAddress') or None
+            _raw_email = oauth.get('emailAddress')
+            email = _raw_email.strip() or None if isinstance(_raw_email, str) else None
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
