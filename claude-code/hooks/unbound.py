@@ -2023,7 +2023,6 @@ def main():
 
         try:
             event = json.loads(input_data)
-            log_error(f"event: {event}", 'general')
         except json.JSONDecodeError:
             print('{"suppressOutput": true}', flush=True)
             return
