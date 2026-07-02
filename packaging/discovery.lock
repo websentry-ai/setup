@@ -2,7 +2,7 @@
 # The binary IS the distribution — no git clone / install.sh on target machines.
 # build-discovery.sh reads this file; bump SOURCE_SHA to rebuild from newer source.
 SOURCE_REPO=https://github.com/websentry-ai/coding-discovery-tool.git
-SOURCE_SHA=dd4c6651bb113d042e889d5a062fc54c671fe50b
+SOURCE_SHA=5ee75aab83b2458dbd8048a2269336dcd96757e1
 SOURCE_ENTRYPOINT=scripts/coding_discovery_tools/ai_tools_discovery.py
 PYTHON_VERSION=3.12.10
 PYINSTALLER_VERSION=6.14.1
