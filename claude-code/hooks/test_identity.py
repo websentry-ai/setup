@@ -233,8 +233,13 @@ class TestBuildAccountIdentity(unittest.TestCase):
     def test_keys_limited_to_identity_fields(self):
         self._write_config({})
         result = unbound.build_account_identity()
-        self.assertEqual(
-            set(result.keys()), {"org_id", "plan", "auth_mode", "email_domain"}
+        # Identity may also carry the full user_email and (env-dependent) the
+        # device_serial. Assert no key OUTSIDE the known identity fields leaks,
+        # rather than an exact set tied to optional fields.
+        self.assertLessEqual(
+            set(result.keys()),
+            {"org_id", "plan", "auth_mode", "email_domain",
+             "user_email", "device_serial"},
         )
 
 
