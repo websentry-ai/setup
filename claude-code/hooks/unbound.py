@@ -1035,6 +1035,80 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
     return None
 
 
+def _claude_desktop_support_dirs() -> List[Path]:
+    """Claude Desktop app support dir(s) per OS. Team/SSO desktop sessions cache
+    the active account's oauthAccount under local-agent-mode-sessions/ here."""
+    system = platform.system().lower()
+    if system == 'darwin':
+        return [Path.home() / 'Library' / 'Application Support' / 'Claude']
+    if system == 'windows':
+        appdata = os.getenv('APPDATA')
+        return [Path(appdata) / 'Claude'] if appdata else []
+    return [Path.home() / '.config' / 'Claude']
+
+
+_DESKTOP_SESSION_MAX_BYTES = 512 * 1024
+
+
+def _desktop_session_email() -> Optional[str]:
+    """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
+    oauthAccount into ~/.claude.json (anthropics/claude-code#57026) but does write
+    the active account's oauthAccount (with emailAddress) into each per-session
+    sandbox config. These configs are sandbox-writable and thus untrusted, so the
+    email is returned only when every session that carries one agrees on a single
+    address; any disagreement (multiple accounts, or a forged/injected config) or
+    failure yields None, so the hook emits a blank email rather than a wrong one.
+    Best effort — never raises."""
+    timed = []
+    try:
+        bases = _claude_desktop_support_dirs()
+    except Exception:
+        return None
+    for base in bases:
+        try:
+            # list() forces the lazy glob traversal to happen inside this guard —
+            # a mid-iteration traversal error (e.g. an unreadable subdir) then only
+            # skips this base instead of aborting the whole scan.
+            candidates = list((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
+        except Exception:
+            continue
+        for path in candidates:
+            # stat per file so one unreadable/vanished entry can't poison the sort.
+            try:
+                timed.append((path.stat().st_mtime, path))
+            except Exception:
+                continue
+    timed.sort(key=lambda t: t[0], reverse=True)
+    found = None
+    found_key = None
+    for _, path in timed:
+        # A session that exists but can't be read (oversized, IO/parse error) is a
+        # blind spot — it could belong to a different account, so we can't verify
+        # agreement. Return blank rather than fall through to a possibly-stale email.
+        # Bound the read itself (read MAX+1 bytes) rather than trusting a separate
+        # stat(): a rewrite-after-stat race can't feed an unbounded file into read.
+        try:
+            with open(path, 'rb') as f:
+                data = f.read(_DESKTOP_SESSION_MAX_BYTES + 1)
+            if len(data) > _DESKTOP_SESSION_MAX_BYTES:
+                return None
+            oauth = json.loads(data.decode('utf-8')).get('oauthAccount')
+        except Exception:
+            return None
+        if not isinstance(oauth, dict):
+            continue
+        raw = oauth.get('emailAddress')
+        email = raw.strip() if isinstance(raw, str) else ''
+        if not email:
+            continue
+        key = email.lower()
+        if found_key is None:
+            found, found_key = email, key
+        elif key != found_key:
+            return None  # accounts disagree — blank over wrong
+    return found
+
+
 def read_account_identity() -> Dict:
     org_id = None
     plan = None
@@ -1046,12 +1120,21 @@ def read_account_identity() -> Dict:
         if isinstance(oauth, dict):
             org_id = oauth.get('organizationUuid') or None
             plan = oauth.get('organizationType') or None
-            email = oauth.get('emailAddress') or None
+            _raw_email = oauth.get('emailAddress')
+            if isinstance(_raw_email, str):
+                email = _raw_email.strip() or None
+            else:
+                email = None
             auth_mode = 'subscription'
         elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
             auth_mode = 'api_key'
     except Exception:
         pass
+    if not email:
+        try:
+            email = _desktop_session_email()
+        except Exception:
+            email = None
     return {
         'org_id': org_id,
         'plan': plan,
