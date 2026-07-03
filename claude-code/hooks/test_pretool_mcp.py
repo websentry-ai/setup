@@ -426,6 +426,16 @@ class TestUnboundAppLabel(unittest.TestCase):
             with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
                 self.assertEqual(unbound._unbound_app_label({}), "cowork")
 
+    def test_unrecognized_entrypoint_is_claude_code(self):
+        for val in ("cli", "desktop", "vscode", ""):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+
+    def test_is_cowork_flag_non_1_is_claude_code(self):
+        for val in ("0", "true", ""):
+            with patch.dict("os.environ", {"CLAUDE_CODE_IS_COWORK": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+
     def test_cowork_path_fallback_cwd(self):
         ev = {"cwd": "/Users/x/Library/Application Support/Claude/local-agent-mode-sessions/a/b/local_c/outputs"}
         self.assertEqual(unbound._unbound_app_label(ev), "cowork")
