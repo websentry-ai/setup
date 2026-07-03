@@ -1117,7 +1117,7 @@ def clear_managed_hooks() -> str:
         return "failed"
 
 
-def clear_setup():
+def clear_setup() -> bool:
     print("=" * 60)
     print("Claude Code Hooks - Clearing MDM Setup")
     print("=" * 60)
@@ -1125,8 +1125,9 @@ def clear_setup():
     if not check_admin_privileges():
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
+    teardown_failed = False
     print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
     # placeholder so the removal runs even if C:\Users has no profiles.
@@ -1153,6 +1154,7 @@ def clear_setup():
         elif not_found:
             print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
         if failed:
+            teardown_failed = True
             print(f"Failed to clear API_KEY for {failed} user(s)")
 
     print("\nClearing managed hooks...")
@@ -1163,11 +1165,13 @@ def clear_setup():
     elif status == "not_found":
         print(f"Managed hooks not found in {managed_dir}")
     else:
+        teardown_failed = True
         print(f"Failed to clear managed hooks in {managed_dir}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not teardown_failed
 
 
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
@@ -1611,8 +1615,7 @@ def main():
     DEBUG = True
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     print("=" * 60)
     print("Claude Code Hooks - MDM Setup")

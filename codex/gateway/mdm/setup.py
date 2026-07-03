@@ -671,7 +671,7 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
     return cleared, not_found, failed
 
 
-def clear_setup():
+def clear_setup() -> bool:
     print("=" * 60)
     print("Codex - Clearing MDM Setup")
     print("=" * 60)
@@ -679,8 +679,9 @@ def clear_setup():
     if not check_admin_privileges():
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
+    teardown_failed = False
     print("\nClearing environment variables...")
     user_homes = get_all_user_homes() or ([(None, None)] if platform.system().lower() == "windows" else [])
 
@@ -694,15 +695,18 @@ def clear_setup():
         elif not (f1 or f2):
             print(f"API_KEY not set, nothing to clear for {n1} user(s)")
         if f1 or f2:
+            teardown_failed = True
             print(f"Failed to clear for {max(f1, f2)} user(s)")
         for username, home_dir in user_homes:
             if home_dir is not None:
                 if not remove_codex_config_base_url_for_user(username, home_dir):
+                    teardown_failed = True
                     debug_print(f"Could not remove openai_base_url from codex config for {username}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not teardown_failed
 
 
 def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
@@ -867,8 +871,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     print("=" * 60)
     print("Codex - MDM Setup")

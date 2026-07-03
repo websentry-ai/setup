@@ -867,7 +867,7 @@ def restart_cursor() -> bool:
         return False
 
 
-def clear_setup():
+def clear_setup() -> bool:
     """Remove hooks and environment variables set by the setup script."""
     print("=" * 60)
     print("Unbound Cursor Hooks - Clearing Setup")
@@ -877,8 +877,9 @@ def clear_setup():
     if not check_admin_privileges():
         print("❌ This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
+    teardown_failed = False
     # Remove enterprise hooks files (NOT the entire Cursor directory)
     print("\nClearing enterprise hooks...")
     enterprise_dir = get_enterprise_hooks_dir()
@@ -891,6 +892,7 @@ def clear_setup():
             hooks_json.unlink()
             print("Cleared enterprise hooks.json")
         except Exception as e:
+            teardown_failed = True
             print(f"Failed to clear hooks.json: {e}")
 
     # Remove hooks directory
@@ -900,6 +902,7 @@ def clear_setup():
             shutil.rmtree(hooks_dir)
             print("Cleared enterprise hooks directory")
         except Exception as e:
+            teardown_failed = True
             print(f"Failed to clear hooks directory: {e}")
 
     # Remove environment variable from all users
@@ -912,6 +915,7 @@ def clear_setup():
         elif status == "not_found":
             print("API_KEY not set, nothing to clear")
         else:
+            teardown_failed = True
             print("Failed to clear API_KEY")
     else:
         user_homes = get_all_user_homes()
@@ -936,6 +940,7 @@ def clear_setup():
             elif not_found:
                 print(f"API_KEY not set, nothing to clear for {not_found} user(s)")
             if failed:
+                teardown_failed = True
                 print(f"Failed to clear API_KEY for {failed} user(s)")
 
     # Per-user hook logs live in ~/.cursor/hooks on every platform; remove them
@@ -954,6 +959,7 @@ def clear_setup():
     print("=" * 60)
     print("\nNote: Restart your terminal or log out/in for env var changes to take effect")
     print("=" * 60)
+    return not teardown_failed
 
 
 def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, serial_number: str) -> str:
@@ -1071,8 +1077,7 @@ def main():
 
     # If clear mode, run cleanup and exit
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     print("=" * 60)
     print("Unbound Cursor Hooks - MDM Setup")

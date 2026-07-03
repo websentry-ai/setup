@@ -1239,7 +1239,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-def clear_setup():
+def clear_setup() -> bool:
     print("=" * 60)
     print("Copilot Hooks - Clearing MDM Setup")
     print("=" * 60)
@@ -1247,7 +1247,9 @@ def clear_setup():
     if not check_admin_privileges():
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
+
+    teardown_failed = False
 
     print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
@@ -1286,16 +1288,19 @@ def clear_setup():
         elif env_not_found:
             print(f"API_KEY not set, nothing to clear for {env_not_found} user(s)")
         if env_failed:
+            teardown_failed = True
             print(f"Failed to clear API_KEY for {env_failed} user(s)")
 
         if hooks_cleared:
             print(f"Cleared Copilot hooks for {hooks_cleared} user(s)")
         if hooks_failed:
+            teardown_failed = True
             print(f"Failed to clear Copilot hooks for {hooks_failed} user(s)")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not teardown_failed
 
 
 def main():
@@ -1307,8 +1312,7 @@ def main():
     DEBUG = True
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     print("=" * 60)
     print("Copilot Hooks - MDM Setup")

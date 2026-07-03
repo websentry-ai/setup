@@ -573,7 +573,7 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
     return cleared, not_found, failed
 
 
-def clear_setup():
+def clear_setup() -> bool:
     print("=" * 60)
     print("Gemini CLI - Clearing MDM Setup")
     print("=" * 60)
@@ -581,8 +581,9 @@ def clear_setup():
     if not check_admin_privileges():
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
+    teardown_failed = False
     print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
     # placeholder so the removal runs even if C:\Users has no profiles.
@@ -598,6 +599,7 @@ def clear_setup():
         elif not (f1 or f2):
             print(f"API_KEY not set, nothing to clear for {n1} user(s)")
         if f1 or f2:
+            teardown_failed = True
             print(f"Failed to clear for {max(f1, f2)} user(s)")
 
     if platform.system().lower() == "windows":
@@ -610,6 +612,7 @@ def clear_setup():
                     settings_path.unlink()
                     debug_print(f"Removed {settings_path}")
                 except Exception as e:
+                    teardown_failed = True
                     print(f"Failed to clear managed settings file: {e}")
             if settings_dir.exists():
                 try:
@@ -624,11 +627,13 @@ def clear_setup():
         if status == "cleared":
             print("Cleared managed settings path")
         elif status == "failed":
+            teardown_failed = True
             print("Failed to clear managed settings path")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not teardown_failed
 
 
 def detect_install_state() -> Optional[str]:
@@ -681,8 +686,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if clear_mode:
-        clear_setup()
-        return True
+        return clear_setup()
 
     print("=" * 60)
     print("Gemini CLI - MDM Setup")
