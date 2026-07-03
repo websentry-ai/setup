@@ -644,17 +644,38 @@ def download_file(url: str, dest_path: Path) -> bool:
         return False
 
 
-def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
-    """Replace the hardcoded default gateway URL inside a downloaded unbound.py."""
+def _apply_gateway_url(text: str, gateway_url: str) -> str:
     if not gateway_url or gateway_url == DEFAULT_GATEWAY_URL:
-        return
+        return text
+    return text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
+
+
+def _fetch_hook_script(gateway_url: str) -> Optional[str]:
+    staging_dir = Path(tempfile.mkdtemp(prefix="unbound-copilot-"))
+    source_script = staging_dir / "unbound.py"
     try:
-        text = path.read_text(encoding="utf-8")
-        new_text = text.replace(f'"{DEFAULT_GATEWAY_URL}"', f'"{gateway_url}"')
-        if new_text != text:
-            path.write_text(new_text, encoding="utf-8")
+        if not download_file(SCRIPT_URL, source_script):
+            return None
+        return _apply_gateway_url(source_script.read_text(encoding="utf-8"), gateway_url)
     except Exception as e:
-        debug_print(f"Could not rewrite gateway URL in {path}: {e}")
+        debug_print(f"Could not read downloaded unbound.py: {e}")
+        return None
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+
+
+def _write_file(path: Path, data: str, mode: int) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+    fd = os.open(str(path), flags, mode)
+    try:
+        f = os.fdopen(fd, 'w', encoding='utf-8')
+    except Exception:
+        os.close(fd)
+        raise
+    with f:
+        if os.name == "posix":
+            os.fchmod(f.fileno(), mode)
+        f.write(data)
 
 
 def _copilot_hooks_config(script_path: Path) -> Dict:
@@ -688,28 +709,23 @@ def _copilot_hooks_config(script_path: Path) -> Dict:
     return {"version": 1, "hooks": hooks}
 
 
-def install_hooks_for_user(username: str, home_dir: Path, gateway_url: str, source_script: Path) -> bool:
-    """Install unbound.py and unbound.json into a user's ~/.copilot/hooks.
-    Privilege-drops to the target user before any FS op — curl already ran as
-    root to fetch source_script; the per-user write happens post-drop."""
+def install_hooks_for_user(username: str, home_dir: Path, script_text: str) -> bool:
+    """Install unbound.py and unbound.json into a user's ~/.copilot/hooks, writing
+    as the target user so a symlink in their home cannot redirect a root write."""
     hooks_dir = home_dir / ".copilot" / "hooks"
     script_path = hooks_dir / "unbound.py"
     hooks_json = hooks_dir / "unbound.json"
-    system = platform.system().lower()
+    script_mode = 0o755 if platform.system().lower() in ("darwin", "linux") else 0o644
 
     def _install():
-        hooks_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(str(source_script), str(script_path))
-        if system in ["darwin", "linux"]:
-            os.chmod(script_path, 0o755)
-        rewrite_gateway_url_in_file(script_path, gateway_url)
-
-        config = _copilot_hooks_config(script_path)
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
-        fd = os.open(str(hooks_json), flags, 0o644)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(config, f, indent=2)
-        return True
+        try:
+            hooks_dir.mkdir(parents=True, exist_ok=True)
+            _write_file(script_path, script_text, script_mode)
+            _write_file(hooks_json, json.dumps(_copilot_hooks_config(script_path), indent=2), 0o644)
+            return True
+        except Exception as e:
+            debug_print(f"install for {username} failed: {e}")
+            raise
 
     ok = bool(_run_as_user(username, _install))
     debug_print(f"{'Installed' if ok else 'Failed to install'} Copilot hooks for {username}")
@@ -1223,7 +1239,7 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
-def clear_setup():
+def clear_setup() -> bool:
     print("=" * 60)
     print("Copilot Hooks - Clearing MDM Setup")
     print("=" * 60)
@@ -1231,7 +1247,9 @@ def clear_setup():
     if not check_admin_privileges():
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
+
+    teardown_failed = False
 
     print("\nClearing environment variables...")
     # Windows `reg delete HKLM\...` is machine-wide; fall through with a
@@ -1270,16 +1288,19 @@ def clear_setup():
         elif env_not_found:
             print(f"API_KEY not set, nothing to clear for {env_not_found} user(s)")
         if env_failed:
+            teardown_failed = True
             print(f"Failed to clear API_KEY for {env_failed} user(s)")
 
         if hooks_cleared:
             print(f"Cleared Copilot hooks for {hooks_cleared} user(s)")
         if hooks_failed:
+            teardown_failed = True
             print(f"Failed to clear Copilot hooks for {hooks_failed} user(s)")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not teardown_failed
 
 
 def main():
@@ -1291,8 +1312,7 @@ def main():
     DEBUG = True
 
     if clear_mode:
-        clear_setup()
-        return
+        return clear_setup()
 
     print("=" * 60)
     print("Copilot Hooks - MDM Setup")
@@ -1306,7 +1326,7 @@ def main():
             )
         print("This script requires administrator/root privileges")
         print("   Please re-run with sudo.")
-        return
+        return False
 
     base_url = "https://backend.getunbound.ai"
     gateway_url = DEFAULT_GATEWAY_URL
@@ -1345,46 +1365,34 @@ def main():
         print("\nMissing required argument: --api-key")
         print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug] [--backfill]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
-        return
+        return False
 
     print("\nGetting device identifier...")
     device_id = get_device_identifier()
     if not device_id:
         print("Failed to get device identifier")
-        return
+        return False
     debug_print(f"Device identifier: {device_id}")
     print("Device identifier retrieved")
 
     print("\nFetching API key from MDM...")
     api_key = fetch_api_key_from_mdm(base_url, app_name, auth_api_key, device_id)
     if not api_key:
-        return
+        return False
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
-    success, _ = set_env_var_system_wide("UNBOUND_COPILOT_API_KEY", api_key)
-    if not success:
+    env_ok, _ = set_env_var_system_wide("UNBOUND_COPILOT_API_KEY", api_key)
+    if not env_ok:
         print("Failed to set UNBOUND_COPILOT_API_KEY")
-        return
+        return False
     debug_print("UNBOUND_COPILOT_API_KEY set successfully")
 
-    # Download unbound.py once as root into a private root-owned temp dir.
-    # mkdtemp gives an unpredictable name so a local user cannot pre-create or
-    # symlink the path the root curl writes to. The dir is then widened to
-    # 0o711 (traverse, still no listing) and the file to 0o644 so the per-user
-    # installs — which run after privilege-drop — can read the script.
     print("\nDownloading hook script...")
-    staging_dir = Path(tempfile.mkdtemp(prefix="unbound-copilot-"))
-    source_script = staging_dir / "unbound.py"
-    if not download_file(SCRIPT_URL, source_script):
+    script_text = _fetch_hook_script(gateway_url)
+    if script_text is None:
         print("Failed to download unbound.py")
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        return
-    try:
-        os.chmod(staging_dir, 0o711)
-        os.chmod(source_script, 0o644)
-    except OSError:
-        pass
+        return False
 
     state = detect_install_state()
 
@@ -1393,33 +1401,37 @@ def main():
     installed_count = 0
     for username, home_dir in user_homes:
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
-        if install_hooks_for_user(username, home_dir, gateway_url, source_script):
+        if install_hooks_for_user(username, home_dir, script_text):
             installed_count += 1
 
-    shutil.rmtree(staging_dir, ignore_errors=True)
-
+    success = bool(user_homes) and installed_count == len(user_homes)
     if not user_homes:
         print("No user home directories found")
-    elif installed_count == len(user_homes):
+    elif success:
         print(f"Installed Copilot hooks for {installed_count} user(s)")
     else:
         print(f"Installed Copilot hooks for {installed_count} of {len(user_homes)} user(s) — {len(user_homes) - installed_count} failed")
 
     print("\n" + "=" * 60)
-    print("Setup Complete!")
+    print("Setup Complete!" if success else "Setup Failed")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
+    if success:
+        notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
-    if backfill_mode:
+    if success and backfill_mode:
         run_backfill(api_key, base_url, user_homes)
+
+    return success
 
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\nSetup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\nError: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
