@@ -1415,7 +1415,7 @@ def main():
     if success:
         notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
-    if backfill_mode:
+    if success and backfill_mode:
         run_backfill(api_key, base_url, user_homes)
 
     return success
