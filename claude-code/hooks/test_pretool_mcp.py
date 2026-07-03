@@ -395,5 +395,51 @@ class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
         self.assertEqual(md.get("mcp_server_config"), {"url": "https://configfile.example/mcp"})
 
 
+class TestUnboundAppLabel(unittest.TestCase):
+    """_unbound_app_label reports Cowork via the desktop env markers, with the
+    local-agent-mode-sessions sandbox path as a fallback; everything else is
+    claude-code. Verified against real captured events from all three surfaces."""
+
+    def setUp(self):
+        # neutralize any ambient Cowork env so path-based cases are deterministic
+        self._env = patch.dict("os.environ", {}, clear=True)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def test_claude_code_cli(self):
+        ev = {"cwd": "/Users/x/Documents/proj",
+              "transcript_path": "/Users/x/.claude/projects/-Users-x-Documents-proj/s.jsonl"}
+        self.assertEqual(unbound._unbound_app_label(ev), "claude-code")
+
+    def test_claude_code_desktop(self):
+        ev = {"cwd": "/Users/x/Downloads",
+              "transcript_path": "/Users/x/.claude/projects/-Users-x-Downloads/s.jsonl"}
+        self.assertEqual(unbound._unbound_app_label(ev), "claude-code")
+
+    def test_cowork_env_is_cowork_flag(self):
+        # env wins even when the path looks like plain Claude Code
+        with patch.dict("os.environ", {"CLAUDE_CODE_IS_COWORK": "1"}):
+            self.assertEqual(unbound._unbound_app_label({"cwd": "/Users/x/proj"}), "cowork")
+
+    def test_cowork_env_entrypoint_values(self):
+        for val in ("local-agent", "local_agent", "remote_cowork"):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "cowork")
+
+    def test_cowork_path_fallback_cwd(self):
+        ev = {"cwd": "/Users/x/Library/Application Support/Claude/local-agent-mode-sessions/a/b/local_c/outputs"}
+        self.assertEqual(unbound._unbound_app_label(ev), "cowork")
+
+    def test_cowork_path_fallback_transcript_only(self):
+        # cowork transcript lives in a tmpdir but the sanitized project name keeps the marker
+        ev = {"cwd": "/private/tmp",
+              "transcript_path": "/var/folders/x/T/claude-hostloop-plugins/h/projects/-Users-x-Library-Application-Support-Claude-local-agent-mode-sessions-a-b-local-c-outputs/s.jsonl"}
+        self.assertEqual(unbound._unbound_app_label(ev), "cowork")
+
+    def test_missing_fields_default_to_claude_code(self):
+        self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+        self.assertEqual(unbound._unbound_app_label({"cwd": None, "transcript_path": None}), "claude-code")
+
+
 if __name__ == "__main__":
     unittest.main()

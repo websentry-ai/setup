@@ -1268,6 +1268,29 @@ def build_account_identity(probe: bool = False) -> Dict:
     return identity
 
 
+def _unbound_app_label(event: Dict) -> str:
+    """This one hook script serves both Claude Code and Cowork. Report Cowork
+    under its own label so the gateway can scope policies/analytics per surface.
+    The Claude Desktop app marks Cowork in the hook environment; builds that
+    predate those env vars still get caught by the sandbox path marker
+    (cwd/transcript_path under local-agent-mode-sessions). Requires gateway
+    support for 'cowork' — old gateways drop the label from their label-keyed
+    maps."""
+    try:
+        if os.environ.get('CLAUDE_CODE_IS_COWORK') == '1':
+            return 'cowork'
+        if os.environ.get('CLAUDE_CODE_ENTRYPOINT') in (
+            'local-agent', 'local_agent', 'remote_cowork'
+        ):
+            return 'cowork'
+    except Exception:
+        pass
+    for field in ('cwd', 'transcript_path'):
+        if 'local-agent-mode-sessions' in (event.get(field) or ''):
+            return 'cowork'
+    return 'claude-code'
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -1342,7 +1365,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
-        'unbound_app_label': 'claude-code',
+        'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'tool_use',
         'pre_tool_use_data': {
@@ -1437,7 +1460,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
 
     request_body = {
         'conversation_id': session_id,
-        'unbound_app_label': 'claude-code',
+        'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
@@ -1655,6 +1678,7 @@ def process_stop_event(event: Dict, api_key: str):
     )
 
     if exchange:
+        exchange['unbound_app_label'] = _unbound_app_label(event)
         # prompt_id == Cowork's OTEL prompt.id; lets the backend de-dup a turn
         # logged on both hooks and OTEL. Absent on Claude Code < v2.1.196.
         prompt_id = event.get('prompt_id')
