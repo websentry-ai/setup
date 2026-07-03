@@ -455,7 +455,7 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     print("=" * 60)
     print("Unbound Cursor Hooks - Clearing Setup")
@@ -490,6 +490,7 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not any_failed
 
 
 def get_device_identifier() -> Optional[str]:
@@ -642,8 +643,7 @@ def main():
         print("[backfill] Cursor backfill is not supported — no historical transcript data is available on disk.")
 
     if clear_mode:
-        clear_setup()
-        return
+        return clear_setup()
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Cursor is managed by your organization (MDM).")
@@ -683,14 +683,14 @@ def main():
     if not api_key:
         if not domain:
             print("\n❌ Missing required argument: --domain or --api-key")
-            return
+            return False
 
         auth_url = normalize_url(domain)
 
         cb_response = run_callback_server(auth_url)
         if cb_response is None:
             print("\n❌ Failed to receive callback. Exiting.")
-            return
+            return False
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -699,7 +699,7 @@ def main():
 
         if not api_key:
             print("\n❌ No API key received. Exiting.")
-            return
+            return False
 
     print("✅ API key received")
     debug_print("API key received from callback")
@@ -714,7 +714,7 @@ def main():
     success, message = set_env_var("UNBOUND_CURSOR_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to set environment variable: {message}")
-        return
+        return False
 
     print(f"✅ Environment variable set")
     debug_print("UNBOUND_CURSOR_API_KEY set successfully")
@@ -722,7 +722,7 @@ def main():
     debug_print("Setting up hooks...")
     if not setup_hooks(gateway_url=gateway_url):
         print("\n❌ Failed to setup hooks")
-        return
+        return False
     debug_print("Hooks setup complete")
     
     print("\n" + "=" * 60)
@@ -736,13 +736,16 @@ def main():
     rc_path = get_shell_rc_file()
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+    return True
 
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ Error: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
