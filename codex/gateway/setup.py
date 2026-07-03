@@ -4,6 +4,7 @@ Codex CLI - Environment Setup Script
 """
 
 import os
+import sys
 import platform
 import subprocess
 import urllib.request
@@ -143,12 +144,12 @@ def set_env_var_on_unix(var_name: str, value: str) -> bool:
     debug_print(f"Writing to shell file: {rc_file}")
     export_line = f'export {var_name}="{value}"'
     
-    was_added = append_to_file(rc_file, export_line)
-    
-    if was_added:
-        return True
-    else:
-        return True
+    append_to_file(rc_file, export_line)
+
+    try:
+        return any(line.strip() == export_line for line in rc_file.read_text(encoding="utf-8").splitlines())
+    except Exception:
+        return False
 
 
 def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
@@ -456,7 +457,7 @@ def remove_codex_config_base_url() -> str:
 
 
 
-def clear_setup() -> None:
+def clear_setup() -> bool:
     """Undo all changes made by the setup script."""
     global DEBUG
     print("=" * 60)
@@ -489,6 +490,7 @@ def clear_setup() -> None:
     print("\n" + "=" * 60)
     print("Clear Complete!")
     print("=" * 60)
+    return not any_failed
 
 
 def remove_hooks_unbound_script() -> None:
@@ -728,8 +730,7 @@ def main():
         debug_print("Debug mode enabled")
 
     if args.clear:
-        clear_setup()
-        return
+        return clear_setup()
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Codex is managed by your organization (MDM).")
@@ -743,13 +744,13 @@ def main():
     if not api_key:
         if not args.domain:
             print("\n❌ Missing required argument: --domain or --api-key")
-            return
+            return False
 
         auth_url = normalize_url(args.domain)
         cb_response = run_one_shot_callback_server(auth_url)
         if cb_response is None:
             print("\n❌ Failed to receive callback response. Exiting.")
-            return
+            return False
 
         try:
             api_key = (cb_response.get("query") or {}).get("api_key")
@@ -758,7 +759,7 @@ def main():
 
         if not api_key:
             print("\n❌ No api_key found in callback. Exiting.")
-            return
+            return False
 
     print("API Key Verified ✅")
     debug_print("API key verification successful")
@@ -779,13 +780,13 @@ def main():
     success, message = set_env_var("OPENAI_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to configure OPENAI_API_KEY: {message}")
-        return
+        return False
     debug_print("OPENAI_API_KEY set successfully")
 
     debug_print("Writing openai_base_url to codex config...")
     if not write_codex_config(f"{args.gateway_url.rstrip('/')}/v1"):
         print("❌ Failed to configure openai_base_url in codex config")
-        return
+        return False
     debug_print("openai_base_url written to codex config successfully")
 
     write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
@@ -800,12 +801,15 @@ def main():
     rc_path = get_shell_rc_file()
     if rc_path is not None:
         print(f"\nTo apply changes in your current terminal, run:\n  source {rc_path}\n\nOr open a new terminal.")
+    return True
 
 if __name__ == "__main__":
     try:
-        main()
+        ok = main()
     except KeyboardInterrupt:
         print("\n\n⚠️  Setup cancelled by user.")
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ An error occurred: {e}")
-        exit(1)
+        sys.exit(1)
+    sys.exit(0 if ok else 1)
