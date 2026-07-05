@@ -698,6 +698,17 @@ def _plugin_mcp_server_map(version_dir: Path) -> Dict:
         if not isinstance(data, dict):
             continue
         mcp_servers = data.get('mcpServers')
+        # Some plugins ship an unwrapped .mcp.json (server map at the root, no
+        # "mcpServers" wrapper); accept it, trusting only real server entries.
+        if mcp_servers is None and source.name == '.mcp.json':
+            root_map = {
+                key: entry
+                for key, entry in data.items()
+                if isinstance(entry, dict)
+                and (isinstance(entry.get('command'), str) or isinstance(entry.get('url'), str))
+            }
+            if root_map:
+                mcp_servers = root_map
         if isinstance(mcp_servers, str):
             # Contain the path to the version dir: reject absolute paths and
             # ../ traversal (and symlink escapes via resolve()).
