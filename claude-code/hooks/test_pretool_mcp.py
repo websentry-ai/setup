@@ -62,6 +62,24 @@ class TestResolvePluginMcpConfig(unittest.TestCase):
         cfg = unbound._resolve_plugin_mcp_config("plugin_stripe_stripe", cache_dir=self.cache)
         self.assertEqual(cfg, {"command": "npx", "args": ["@stripe/mcp"]})
 
+    def test_unwrapped_root_map_mcp_json_hit(self):
+        # Playwright ships {"playwright": {...}} at the root, no mcpServers wrapper.
+        _make_plugin(
+            self.cache, "claude-plugins-official", "playwright", "1.0.0",
+            {".mcp.json": {"playwright": {"command": "npx", "args": ["@playwright/mcp@latest"]}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_playwright_playwright", cache_dir=self.cache)
+        self.assertEqual(cfg, {"command": "npx", "args": ["@playwright/mcp@latest"]})
+
+    def test_unwrapped_root_ignores_non_server_entries(self):
+        # A plugin.json-style root (no command/url) must not be read as servers.
+        _make_plugin(
+            self.cache, "mkt", "noserver", "1.0.0",
+            {".mcp.json": {"name": "noserver", "author": {"name": "acme"}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_noserver_name", cache_dir=self.cache)
+        self.assertIsNone(cfg)
+
     def test_string_form_relative_path_hit(self):
         _make_plugin(
             self.cache, "mkt", "vercel", "3.0.0",
