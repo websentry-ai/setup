@@ -1036,19 +1036,18 @@ def _is_excluded_path(abspath):
 
 
 def _resolve_existing_file(path, cwd):
-    """Absolute path of an existing file: try the path as given, then join cwd.
-    Returns None if neither is a real file (used to recognize a command token as a file)."""
+    """Absolute realpath of an existing file: try the path as given, then join cwd.
+    realpath dereferences symlinks so the /proc /sys guard can't be bypassed. None if not a file."""
     try:
         if not path or not isinstance(path, str):
             return None
-        direct = os.path.normpath(os.path.expanduser(path))
-        if os.path.isfile(direct):
-            abspath = os.path.abspath(direct)
-            return None if _is_excluded_path(abspath) else abspath
+        direct = os.path.realpath(os.path.expanduser(path))
+        if os.path.isfile(direct) and not _is_excluded_path(direct):
+            return direct
         if cwd:
-            joined = os.path.normpath(os.path.join(cwd, os.path.expanduser(path)))
-            if os.path.isfile(joined):
-                return None if _is_excluded_path(joined) else joined
+            joined = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
+            if os.path.isfile(joined) and not _is_excluded_path(joined):
+                return joined
         return None
     except Exception:
         return None
@@ -1105,10 +1104,11 @@ def _append_file_entry(entries, path, cwd, inline_content=None):
     try:
         if len(entries) >= _MAX_FILE_CONTENT_FILES:
             return
-        if sum(len((e.get('content') or '').encode('utf-8')) for e in entries) >= _MAX_FILE_CONTENT_TOTAL_BYTES:
-            return
         entry = _make_file_entry(path, cwd, inline_content)
         if entry is None or any(e.get('path') == entry['path'] for e in entries):
+            return
+        total = sum(len((e.get('content') or '').encode('utf-8')) for e in entries)
+        if total + len((entry.get('content') or '').encode('utf-8')) > _MAX_FILE_CONTENT_TOTAL_BYTES:
             return
         entries.append(entry)
     except Exception:
@@ -1705,7 +1705,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     tool_use_obj, tool_input.get('file_path'),
                     event.get('cwd'), _inline,
                 )
-            elif isinstance(tool_input, dict) and tool_input.get('command'):
+            elif tool_name == 'Bash' and isinstance(tool_input, dict) and tool_input.get('command'):
                 _attach_command_file_content(
                     tool_use_obj, tool_input['command'], event.get('cwd'),
                 )

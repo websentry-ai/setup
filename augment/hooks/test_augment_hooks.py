@@ -456,7 +456,7 @@ class TestStopExchange(_HomeTmp):
         })
         self.assertEqual(tu["tool_name"], "Bash")
         self.assertEqual(tu["tool_input"], {"command": f"cat {fp}"})  # file_content NOT inside
-        self.assertEqual(tu["file_content"][0]["path"], fp)           # absolute
+        self.assertEqual(tu["file_content"][0]["path"], os.path.realpath(fp))  # absolute realpath
         self.assertEqual(tu["file_content"][0]["content"], "print(1)\n")
 
     def test_bash_command_skips_binary_and_missing_files(self):
@@ -487,7 +487,7 @@ class TestStopExchange(_HomeTmp):
             "tool_input": {"command": "git add rel.txt"},
             "cwd": d, "tool_use_id": "tr",
         })
-        self.assertEqual(tu["file_path"], os.path.join(d, 'rel.txt'))
+        self.assertEqual(tu["file_path"], os.path.realpath(os.path.join(d, 'rel.txt')))
         self.assertEqual(tu["file_content"][0]["content"], "data\n")
 
     def test_bash_command_truncates_large_file(self):
@@ -511,6 +511,14 @@ class TestStopExchange(_HomeTmp):
         self.assertTrue(unbound._is_excluded_path('/proc/self/environ'))
         self.assertTrue(unbound._is_excluded_path('/sys/kernel/x'))
         self.assertFalse(unbound._is_excluded_path('/home/u/proc_notes.txt'))
+
+    def test_symlink_into_proc_is_excluded(self):
+        """A symlink pointing into /proc must not bypass the guard (realpath dereferences it)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        link = os.path.join(d, 'sneaky')
+        os.symlink('/proc/self/environ', link)
+        self.assertIsNone(unbound._resolve_existing_file(link, None))
 
     def test_multi_turn_does_not_cross_attach_tool_calls(self):
         # Two turns in one session: turn 1 (PostToolUse + Stop), then turn 2
