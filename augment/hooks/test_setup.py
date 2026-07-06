@@ -272,6 +272,35 @@ class TestConversationDataFlag(unittest.TestCase):
         self.assertEqual([h["command"] for h in block["hooks"]], ["/foreign/hook"])
         self.assertNotIn("includeConversationData", block.get("metadata", {}))
 
+    def test_mdm_user_level_clear_drops_conversation_flag(self):
+        """MDM per-user cleanup (remove_user_level_hooks_for_user) must also drop
+        the flag from a surviving shared Stop block — parity with the user-level
+        and managed clear paths."""
+        mdm = self._load_mdm()
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        our_cmd = str(home / ".augment" / "hooks" / "unbound.py")
+        (home / ".augment" / "settings.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{
+                "hooks": [
+                    {"type": "command", "command": our_cmd, "timeout": 10000},
+                    {"type": "command", "command": "/foreign/hook", "timeout": 5000},
+                ],
+                "metadata": {"includeConversationData": True},
+            }]}}
+        ))
+
+        def fake_run_as_user(username, fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
+             patch.object(mdm, "debug_print", lambda *a, **k: None):
+            mdm.remove_user_level_hooks_for_user("tester", home)
+        block = json.loads((home / ".augment" / "settings.json").read_text())["hooks"]["Stop"][0]
+        self.assertEqual([h["command"] for h in block["hooks"]], ["/foreign/hook"])
+        self.assertNotIn("includeConversationData", block.get("metadata", {}))
+
 
 if __name__ == "__main__":
     unittest.main()

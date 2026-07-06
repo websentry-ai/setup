@@ -815,6 +815,13 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                                     modified = True
                                     if new_hooks:
                                         item["hooks"] = new_hooks
+                                        # Symmetry with install: drop the flag we set
+                                        # when our hook leaves a surviving shared block.
+                                        meta = item.get("metadata")
+                                        if isinstance(meta, dict):
+                                            meta.pop("includeConversationData", None)
+                                            if not meta:
+                                                item.pop("metadata", None)
                                         new_event_config.append(item)
                             else:
                                 new_event_config.append(item)
