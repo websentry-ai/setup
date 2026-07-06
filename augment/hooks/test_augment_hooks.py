@@ -514,8 +514,8 @@ class TestStopExchange(_HomeTmp):
 
     def test_sensitive_files_are_excluded(self):
         """Well-known secret files (SSH/TLS keys, dotenv, cloud creds) are never read/shipped."""
-        for p in ('/h/proj/.env', '/h/.env.production', '/h/.ssh/id_rsa',
-                  '/h/.aws/credentials', '/etc/ssl/x.pem', '/a/tls.key', '/h/.npmrc',
+        for p in ('/h/proj/.env', '/h/.env.production', '/h/production.env', '/h/app.env.local',
+                  '/h/.ssh/id_rsa', '/h/.aws/credentials', '/etc/ssl/x.pem', '/a/tls.key', '/h/.npmrc',
                   '/h/.config/gcloud/application_default_credentials.json',
                   '/h/.kube/config', '/h/.docker/config.json', '/h/infra.tfvars'):
             self.assertTrue(unbound._is_excluded_path(p), p)
@@ -527,6 +527,23 @@ class TestStopExchange(_HomeTmp):
         self.assertIsNone(unbound._make_file_entry('/h/.ssh/id_rsa', None, inline_content='KEY'))
         self.assertIsNone(unbound._make_file_entry('/proj/.env', '/proj', inline_content='S=1'))
         self.assertIsNotNone(unbound._make_file_entry('/proj/app.py', '/proj', inline_content='x'))
+
+    def test_relative_path_uses_turn_cwd_not_process_cwd(self):
+        """A relative token resolves against the turn's cwd, never the hook's process cwd."""
+        import shutil as _sh
+        proc = tempfile.mkdtemp()
+        ws = tempfile.mkdtemp()
+        self.addCleanup(lambda: (_sh.rmtree(proc, ignore_errors=True), _sh.rmtree(ws, ignore_errors=True)))
+        with open(os.path.join(proc, 'x.txt'), 'w') as f:
+            f.write('DECOY')
+        with open(os.path.join(ws, 'x.txt'), 'w') as f:
+            f.write('REAL')
+        old = os.getcwd()
+        os.chdir(proc)
+        self.addCleanup(os.chdir, old)
+        self.assertEqual(unbound._resolve_existing_file('x.txt', ws),
+                         os.path.realpath(os.path.join(ws, 'x.txt')))
+        self.assertIsNone(unbound._resolve_existing_file('x.txt', None))
 
     def test_symlink_into_proc_is_excluded(self):
         """A symlink pointing into /proc must not bypass the guard (realpath dereferences it)."""

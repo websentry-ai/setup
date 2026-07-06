@@ -697,24 +697,28 @@ def _is_excluded_path(abspath):
     if any(seg in low for seg in _SENSITIVE_DIR_SEGMENTS):
         return True
     base = low.rsplit('/', 1)[-1]
-    if base.startswith('.env') or 'credential' in base or base in _SENSITIVE_FILE_NAMES:
+    if (base.startswith('.env') or base.endswith('.env') or '.env.' in base
+            or 'credential' in base or base in _SENSITIVE_FILE_NAMES):
         return True
     return low.endswith(_SENSITIVE_FILE_SUFFIXES)
 
 
 def _resolve_existing_file(path, cwd):
-    """Absolute realpath of an existing file: try the path as given, then join cwd.
-    realpath dereferences symlinks so the /proc /sys guard can't be bypassed. None if not a file."""
+    """Absolute realpath of an existing file. Absolute paths are used directly; a relative
+    path resolves against the tool turn's cwd only (never the hook's own process cwd)."""
     try:
         if not path or not isinstance(path, str):
             return None
-        direct = os.path.realpath(os.path.expanduser(path))
-        if os.path.isfile(direct) and not _is_excluded_path(direct):
-            return direct
-        if cwd:
-            joined = os.path.realpath(os.path.join(cwd, os.path.expanduser(path)))
-            if os.path.isfile(joined) and not _is_excluded_path(joined):
-                return joined
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded):
+            cand = expanded
+        elif cwd:
+            cand = os.path.join(cwd, expanded)
+        else:
+            return None
+        real = os.path.realpath(cand)
+        if os.path.isfile(real) and not _is_excluded_path(real):
+            return real
         return None
     except Exception:
         return None
