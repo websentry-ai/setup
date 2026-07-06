@@ -1372,8 +1372,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                             display_name, connector_cfg = session_connector
                             metadata['mcp_server'] = display_name
                             metadata['mcp_server_config'] = connector_cfg
-                            # Send the original UUID (resolved or not) so the
-                            # control plane can learn the uuid->name mapping.
                             if _is_uuid(mcp_server_name):
                                 metadata['mcp_server_uuid'] = mcp_server_name
 
