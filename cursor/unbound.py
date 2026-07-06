@@ -1106,7 +1106,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
 
-    if event.get('command'):
+    if mcp_server is None and event.get('command'):
         _attach_command_file_content(metadata, event.get('command'), event.get('cwd'))
 
     approval_key = f"{tool_name}:{command}"
@@ -1333,7 +1333,7 @@ def build_llm_exchange(events, api_key=None):
             }
             _ti = event.get('tool_input')
             if isinstance(_ti, dict) and _ti.get('file_path'):
-                _attach_file_content(tool_use, _ti.get('file_path'), event.get('cwd'), _ti.get('content'))
+                _attach_file_content(tool_use, _ti.get('file_path'), event.get('cwd'), _ti.get('content') or None)
             assistant_tool_uses.append(tool_use)
         
         elif hook_event_name == 'afterFileEdit':

@@ -1027,6 +1027,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     tool_input = event.get('tool_input') or {}
     if tool_input.get('file_path'):
+        metadata['file_path'] = tool_input.get('file_path')
         _attach_file_content(metadata, tool_input.get('file_path'), event.get('cwd'), tool_input.get('content'))
     elif tool_name == 'Bash' and tool_input.get('command'):
         _attach_command_file_content(metadata, tool_input.get('command'), event.get('cwd'))

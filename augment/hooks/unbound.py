@@ -1373,13 +1373,19 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
                 server, tool = r_server, r_tool
         server = server or 'unknown'
         tool = tool or raw_name or 'unknown'
-        return {
+        mcp_result = {
             'type': 'PostToolUse',
             'tool_name': f'mcp__{server}__{tool}',
             'tool_input': tool_input,
             'tool_response': _io_response(),
             'tool_use_id': ev.get('tool_use_id'),
         }
+        mcp_path = None
+        if isinstance(tool_input, dict):
+            mcp_path = tool_input.get('file_path') or tool_input.get('path')
+        if mcp_path:
+            _attach_file_content(mcp_result, mcp_path, ev.get('cwd'))
+        return mcp_result
 
     canonical = AUGMENT_TOOL_FAMILY.get(raw_name, raw_name)
     fc_path, fc_inline = '', None
