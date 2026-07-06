@@ -1263,7 +1263,8 @@ def process_pre_tool_use(event, api_key):
     file_path = tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path')
     if file_path:
         metadata['file_path'] = file_path
-        _attach_file_content(metadata, file_path, event.get('cwd'), tool_input.get('content'))
+        _attach_file_content(metadata, file_path, event.get('cwd'),
+                             tool_input.get('content') or tool_input.get('file_text'))
     elif canonical == 'Bash' and tool_input.get('command'):
         _attach_command_file_content(metadata, tool_input.get('command'), event.get('cwd'))
 
