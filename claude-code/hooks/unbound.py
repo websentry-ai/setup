@@ -898,19 +898,40 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
         return None
 
 
+_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
+
+
 def _session_file_from_cwd(cwd: Optional[str]) -> Optional[Path]:
     """The session config for a Claude Desktop run lives right next to the
     working dir: cwd is `.../local_<uuid>/outputs`, and the sibling
     `.../local_<uuid>.json` holds `remoteMcpServersConfig`. Strip the trailing
     `/outputs` and append `.json` to point straight at it — no dir scan needed.
-    Normalise `\\`->`/` so a Windows cwd matches too."""
+    Normalise `\\`->`/` so a Windows cwd matches too.
+
+    The derived path is accepted only when it resolves inside a trusted Claude
+    session dir. cwd rides in on the tool event, so without this a crafted
+    `.../outputs` cwd (plus a planted sibling .json) could spoof the connector
+    metadata we send to the policy engine — the same containment the prior
+    dir-scoped glob gave us."""
     if not cwd:
         return None
     normalised = cwd.replace('\\', '/').rstrip('/')
     suffix = '/outputs'
     if not normalised.endswith(suffix):
         return None
-    return Path(normalised[:-len(suffix)] + '.json')
+    candidate = Path(normalised[:-len(suffix)] + '.json')
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    for support in _claude_desktop_support_dirs():
+        for sub in _CLAUDE_SESSION_SUBDIRS:
+            try:
+                resolved.relative_to((support / sub).resolve())
+                return candidate
+            except Exception:
+                continue
+    return None
 
 
 def _resolve_claude_code_session_connector(server_uuid: str, cwd: Optional[str] = None) -> Optional[tuple]:
@@ -922,7 +943,8 @@ def _resolve_claude_code_session_connector(server_uuid: str, cwd: Optional[str] 
     try:
         try:
             data = json.loads(session_file.read_text(encoding='utf-8'))
-        except Exception:
+        except Exception as exc:
+            log_error(f"mcp cc-session resolve miss (unreadable {session_file}): {exc}", 'mcp_connector')
             return None
         for entry in (data.get('remoteMcpServersConfig') or []):
             if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
@@ -935,6 +957,7 @@ def _resolve_claude_code_session_connector(server_uuid: str, cwd: Optional[str] 
                     cfg["url"] = url
                     cfg["type"] = "http"
                 return (name, cfg)
+        log_error(f"mcp cc-session resolve miss: {server_uuid}", 'mcp_connector')
         return None
     except Exception as exc:
         log_error(f"mcp cc-session resolve error: {server_uuid}: {exc}", 'mcp_connector')
