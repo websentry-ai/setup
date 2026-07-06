@@ -1355,7 +1355,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                         metadata['mcp_server_config'] = plugin_cfg
                     else:
                         session_connector = _resolve_claude_code_session_connector(mcp_server_name, cwd)
-                        log_error(f"session_connector: {session_connector}", 'mcp')
                         if session_connector:
                             display_name, connector_cfg = session_connector
                             metadata['mcp_server'] = display_name
