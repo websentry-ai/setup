@@ -702,9 +702,26 @@ def _abspath(path, cwd):
         return None
 
 
+_SENSITIVE_FILE_NAMES = ('.npmrc', '.netrc', '.pgpass', '.git-credentials', '.pypirc',
+                         '.boto', '.databrickscfg', 'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519')
+_SENSITIVE_FILE_SUFFIXES = ('.pem', '.key', '.p12', '.pfx', '.keystore', '.tfvars', '.tfstate')
+_SENSITIVE_DIR_SEGMENTS = ('/.ssh/', '/.aws/', '/.gnupg/', '/.config/gcloud/', '/.kube/', '/.docker/')
+
+
 def _is_excluded_path(abspath):
-    """True for /proc and /sys pseudo-filesystem paths (process/kernel state, not real files)."""
-    return abspath.startswith(('/proc/', '/sys/')) or abspath in ('/proc', '/sys')
+    """True for /proc /sys pseudo-filesystems and well-known secret files (SSH/TLS keys,
+    dotenv, cloud/credential files) — never read or ship these off-device."""
+    if not isinstance(abspath, str):
+        return False
+    if abspath.startswith(('/proc/', '/sys/')) or abspath in ('/proc', '/sys'):
+        return True
+    low = abspath.lower()
+    if any(seg in low for seg in _SENSITIVE_DIR_SEGMENTS):
+        return True
+    base = low.rsplit('/', 1)[-1]
+    if base.startswith('.env') or 'credential' in base or base in _SENSITIVE_FILE_NAMES:
+        return True
+    return low.endswith(_SENSITIVE_FILE_SUFFIXES)
 
 
 def _resolve_existing_file(path, cwd):
@@ -755,7 +772,7 @@ def _make_file_entry(path, cwd, inline_content=None):
     try:
         if isinstance(inline_content, str):
             abspath = _abspath(path, cwd)
-            if abspath is None:
+            if abspath is None or _is_excluded_path(abspath) or _is_excluded_path(os.path.realpath(abspath)):
                 return None
             content, truncated = _cap_file_text(inline_content)
             return {'path': abspath, 'content': content, 'truncated': truncated}

@@ -512,6 +512,22 @@ class TestStopExchange(_HomeTmp):
         self.assertTrue(unbound._is_excluded_path('/sys/kernel/x'))
         self.assertFalse(unbound._is_excluded_path('/home/u/proc_notes.txt'))
 
+    def test_sensitive_files_are_excluded(self):
+        """Well-known secret files (SSH/TLS keys, dotenv, cloud creds) are never read/shipped."""
+        for p in ('/h/proj/.env', '/h/.env.production', '/h/.ssh/id_rsa',
+                  '/h/.aws/credentials', '/etc/ssl/x.pem', '/a/tls.key', '/h/.npmrc',
+                  '/h/.config/gcloud/application_default_credentials.json',
+                  '/h/.kube/config', '/h/.docker/config.json', '/h/infra.tfvars'):
+            self.assertTrue(unbound._is_excluded_path(p), p)
+        for p in ('/h/app.py', '/h/README.md', '/h/env.sample.txt'):
+            self.assertFalse(unbound._is_excluded_path(p), p)
+
+    def test_inline_content_for_secret_path_is_dropped(self):
+        """Read/Write inline content for a secret path is not shipped (the inline branch is guarded)."""
+        self.assertIsNone(unbound._make_file_entry('/h/.ssh/id_rsa', None, inline_content='KEY'))
+        self.assertIsNone(unbound._make_file_entry('/proj/.env', '/proj', inline_content='S=1'))
+        self.assertIsNotNone(unbound._make_file_entry('/proj/app.py', '/proj', inline_content='x'))
+
     def test_symlink_into_proc_is_excluded(self):
         """A symlink pointing into /proc must not bypass the guard (realpath dereferences it)."""
         d = tempfile.mkdtemp()
