@@ -902,17 +902,6 @@ _CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
 
 
 def _session_file_from_cwd(cwd: Optional[str]) -> Optional[Path]:
-    """The session config for a Claude Desktop run lives right next to the
-    working dir: cwd is `.../local_<uuid>/outputs`, and the sibling
-    `.../local_<uuid>.json` holds `remoteMcpServersConfig`. Strip the trailing
-    `/outputs` and append `.json` to point straight at it — no dir scan needed.
-    Normalise `\\`->`/` so a Windows cwd matches too.
-
-    The derived path is accepted only when it resolves inside a trusted Claude
-    session dir. cwd rides in on the tool event, so without this a crafted
-    `.../outputs` cwd (plus a planted sibling .json) could spoof the connector
-    metadata we send to the policy engine — the same containment the prior
-    dir-scoped glob gave us."""
     if not cwd:
         return None
     normalised = cwd.replace('\\', '/').rstrip('/')
@@ -1366,6 +1355,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                         metadata['mcp_server_config'] = plugin_cfg
                     else:
                         session_connector = _resolve_claude_code_session_connector(mcp_server_name, cwd)
+                        log_error(f"session_connector: {session_connector}", 'mcp')
                         if session_connector:
                             display_name, connector_cfg = session_connector
                             metadata['mcp_server'] = display_name
