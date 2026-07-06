@@ -512,21 +512,19 @@ class TestStopExchange(_HomeTmp):
         self.assertTrue(unbound._is_excluded_path('/sys/kernel/x'))
         self.assertFalse(unbound._is_excluded_path('/home/u/proc_notes.txt'))
 
-    def test_sensitive_files_are_excluded(self):
-        """Well-known secret files (SSH/TLS keys, dotenv, cloud creds) are never read/shipped."""
-        for p in ('/h/proj/.env', '/h/.env.production', '/h/production.env', '/h/app.env.local',
-                  '/h/.ssh/id_rsa', '/h/.aws/credentials', '/etc/ssl/x.pem', '/a/tls.key', '/h/.npmrc',
-                  '/h/.config/gcloud/application_default_credentials.json',
-                  '/h/.kube/config', '/h/.docker/config.json', '/h/infra.tfvars'):
-            self.assertTrue(unbound._is_excluded_path(p), p)
-        for p in ('/h/app.py', '/h/README.md', '/h/env.sample.txt'):
+    def test_only_proc_sys_excluded_other_files_read(self):
+        """Only /proc and /sys are excluded; every other file (including sensitive ones
+        like .env or SSH keys) is read — we scan all files to detect data leaks."""
+        for p in ('/h/proj/.env', '/h/.ssh/id_rsa', '/h/.aws/credentials',
+                  '/etc/ssl/x.pem', '/h/app.py', '/h/README.md', 'C:\\Users\\x\\.env'):
             self.assertFalse(unbound._is_excluded_path(p), p)
+        for p in ('/proc/self/environ', '/sys/kernel/x'):
+            self.assertTrue(unbound._is_excluded_path(p), p)
 
-    def test_inline_content_for_secret_path_is_dropped(self):
-        """Read/Write inline content for a secret path is not shipped (the inline branch is guarded)."""
-        self.assertIsNone(unbound._make_file_entry('/h/.ssh/id_rsa', None, inline_content='KEY'))
-        self.assertIsNone(unbound._make_file_entry('/proj/.env', '/proj', inline_content='S=1'))
+    def test_inline_content_read_for_normal_path(self):
+        """Inline content is attached for a normal path; only /proc/sys is dropped."""
         self.assertIsNotNone(unbound._make_file_entry('/proj/app.py', '/proj', inline_content='x'))
+        self.assertIsNone(unbound._make_file_entry('/proc/self/environ', None, inline_content='x'))
 
     def test_relative_path_uses_turn_cwd_not_process_cwd(self):
         """A relative token resolves against the turn's cwd, never the hook's process cwd."""
