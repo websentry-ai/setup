@@ -33,20 +33,22 @@ DEBUG = False
 # <CMD>). They are kept as builder functions so the per-hook command can be
 # swapped for the MDM path / Windows launcher without duplicating the schema.
 
-# No per-hook `metadata` is seeded. Auggie rejects a `metadata` property on a
-# hook entry ("Unknown property metadata ... will be ignored") and shows a
-# "Some plugin hooks use unsupported configuration" warning on every run. It is
-# also unnecessary: Auggie delivers the turn conversation by DEFAULT on the Stop
-# event (event._exchange.exchange.{request_message, response_text}) — which is
-# what the end-of-turn analytics read.
+# The Stop block carries block-level `metadata.includeConversationData = true` so
+# Augment attaches the turn's `conversation` (userPrompt + agentTextResponse) to
+# the Stop event — the end-of-turn analytics need it to build a usable exchange.
+# Augment has no prompt-submit hook and, per the docs, excludes conversation by
+# DEFAULT (privacy), so without this every tool-bearing turn is dropped.
+# `metadata` is a BLOCK-level property (sibling to `hooks`), NOT a hook-entry
+# property — Auggie warns "Unknown property metadata" only when it is misplaced
+# on the entry.
 
 
 def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
     """The Augment `hooks` block. Augment has no UserPromptSubmit event, so it is
     absent. Timeouts are in milliseconds. `extra` (e.g. {"shell": "powershell"})
-    is merged into every hook entry for the Windows launcher. No per-hook
-    metadata is emitted — Auggie rejects it and the turn conversation arrives by
-    default on Stop (see the note above)."""
+    is merged into every hook entry for the Windows launcher. The Stop block gets
+    block-level `metadata.includeConversationData` so Augment ships the turn
+    conversation (see the note above)."""
     def _hook(timeout: int) -> Dict:
         entry = {"type": "command", "command": hook_command, "timeout": timeout}
         if extra:
@@ -56,7 +58,7 @@ def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
     return {
         "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000)]}],
         "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000)]}],
-        "Stop": [{"hooks": [_hook(10000)]}],
+        "Stop": [{"hooks": [_hook(10000)], "metadata": {"includeConversationData": True}}],
         "SessionStart": [{"hooks": [_hook(60000)]}],
         "SessionEnd": [{"hooks": [_hook(10000)]}],
     }
@@ -528,6 +530,23 @@ def configure_augment_settings() -> bool:
                 settings["hooks"][event] = new_config
             # A foreign non-list hooks[event] is left untouched — never clobber an
             # org's own Augment config in the shared settings file.
+
+        # Ensure the Stop block carrying our hook requests conversation data.
+        # Applied even when our hook already exists so already-installed devices
+        # pick it up on re-run (the idempotency guard above would otherwise skip
+        # them). Only our own Stop block is touched.
+        stop_blocks = settings["hooks"].get("Stop")
+        if isinstance(stop_blocks, list):
+            for item in stop_blocks:
+                if not isinstance(item, dict):
+                    continue
+                if any(_hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
+                       for hook in item.get("hooks", []) if isinstance(hook, dict)):
+                    metadata = item.get("metadata")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                        item["metadata"] = metadata
+                    metadata["includeConversationData"] = True
 
         # Merge toolPermissions, preserving any foreign rules. Match on our rule
         # identity (toolName + shellInputRegex) so re-running never duplicates.

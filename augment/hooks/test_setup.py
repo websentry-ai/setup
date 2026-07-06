@@ -193,5 +193,61 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
                 )
 
 
+class TestConversationDataFlag(unittest.TestCase):
+    """The augment Stop hook must request conversation data so the end-of-turn
+    exchange has the user prompt — otherwise every tool-bearing turn is dropped
+    and the hook floods the gateway/Sentry with `dropped_turn`."""
+
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+    _MDM = _REPO_ROOT / "augment" / "hooks" / "mdm" / "setup.py"
+
+    @classmethod
+    def _load_mdm(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mdm_setup_augment_conv", str(cls._MDM))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_build_hooks_block_stop_requests_conversation_data(self):
+        import setup
+        for name, mod in (("user", setup), ("mdm", self._load_mdm())):
+            with self.subTest(variant=name):
+                stop = mod.build_hooks_block("/x/unbound.py")["Stop"]
+                self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+
+    def test_configure_writes_conversation_flag_on_fresh_install(self):
+        import setup
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        with patch("pathlib.Path.home", return_value=home):
+            self.assertTrue(setup.configure_augment_settings())
+        settings = json.loads((home / ".augment" / "settings.json").read_text())
+        stop = settings["hooks"]["Stop"]
+        self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+
+    def test_configure_upgrades_existing_stop_block_missing_flag(self):
+        """A device installed before the fix has our Stop hook but no metadata.
+        Re-running setup must inject includeConversationData in place, without
+        duplicating the hook or the block."""
+        import setup
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        our_cmd = str(home / ".augment" / "hooks" / "unbound.py")
+        (home / ".augment" / "settings.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": our_cmd, "timeout": 10000}]}]}}
+        ))
+        with patch("pathlib.Path.home", return_value=home):
+            self.assertTrue(setup.configure_augment_settings())
+        settings = json.loads((home / ".augment" / "settings.json").read_text())
+        stop = settings["hooks"]["Stop"]
+        self.assertEqual(len(stop), 1)              # no duplicate block
+        self.assertEqual(len(stop[0]["hooks"]), 1)  # no duplicate hook entry
+        self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+
+
 if __name__ == "__main__":
     unittest.main()
