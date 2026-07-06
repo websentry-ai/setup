@@ -1375,6 +1375,7 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
         }
 
     canonical = AUGMENT_TOOL_FAMILY.get(raw_name, raw_name)
+    fc_path, fc_inline = '', None
 
     if canonical == 'Bash':
         canon_input = {'command': tool_input.get('command', '')}
@@ -1387,9 +1388,8 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
         # inline_content so we don't re-read disk; fall back to disk only if absent.
         inline = (first_change.get('content') or tool_input.get('content')
                   or (tool_output if canonical == 'Read' else None))
-        if path:
-            _attach_file_content(canon_input, path, ev.get('cwd'),
-                                 inline if isinstance(inline, str) else None)
+        fc_path = path
+        fc_inline = inline if isinstance(inline, str) else None
         if canonical == 'Read':
             tool_response = {'content': tool_output} if tool_output else {}
         else:
@@ -1412,13 +1412,18 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
         canon_input = tool_input
         tool_response = _io_response()
 
-    return {
+    result = {
         'type': 'PostToolUse',
         'tool_name': canonical,
         'tool_input': canon_input,
         'tool_response': tool_response,
         'tool_use_id': ev.get('tool_use_id'),
     }
+    # file_content rides as a sibling on the tool_use object (uniform with the
+    # other tools), never inside tool_input.
+    if fc_path:
+        _attach_file_content(result, fc_path, ev.get('cwd'), fc_inline)
+    return result
 
 
 def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optional[str] = None) -> Optional[Dict]:
