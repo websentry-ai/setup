@@ -825,26 +825,6 @@ def _is_uuid(name: str) -> bool:
     return bool(name) and bool(_MCP_UUID_RE.match(name))
 
 
-_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
-
-
-def _claude_session_dirs() -> list:
-    try:
-        home = Path.home()
-        if sys.platform == 'darwin':
-            base = home / 'Library' / 'Application Support' / 'Claude'
-        elif sys.platform.startswith('win'):
-            appdata = os.environ.get('APPDATA')
-            if not appdata:
-                return []
-            base = Path(appdata) / 'Claude'
-        else:
-            base = home / '.config' / 'Claude'
-        return [base / sub for sub in _CLAUDE_SESSION_SUBDIRS]
-    except Exception:
-        return []
-
-
 _HOOK_SCRIPT_RUNTIMES = {
     'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
     'ruby', 'dart', 'php', 'perl', 'rscript',
@@ -918,35 +898,30 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
         return None
 
 
-def _session_file_created_at(path) -> float:
-    try:
-        st = path.stat()
-        return getattr(st, 'st_birthtime', None) or st.st_mtime
-    except Exception:
-        return 0.0
+def _session_file_from_cwd(cwd: Optional[str]) -> Optional[Path]:
+    """The session config for a Claude Desktop run lives right next to the
+    working dir: cwd is `.../local_<uuid>/outputs`, and the sibling
+    `.../local_<uuid>.json` holds `remoteMcpServersConfig`. Strip the trailing
+    `/outputs` and append `.json` to point straight at it — no dir scan needed.
+    Normalise `\\`->`/` so a Windows cwd matches too."""
+    if not cwd:
+        return None
+    normalised = cwd.replace('\\', '/').rstrip('/')
+    suffix = '/outputs'
+    if not normalised.endswith(suffix):
+        return None
+    return Path(normalised[:-len(suffix)] + '.json')
 
 
-def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
+def _resolve_claude_code_session_connector(server_uuid: str, cwd: Optional[str] = None) -> Optional[tuple]:
     if not _is_uuid(server_uuid):
         return None
+    session_file = _session_file_from_cwd(cwd)
+    if session_file is None:
+        return None
     try:
-        latest = None
-        latest_ts = -1.0
-        for base in _claude_session_dirs():
-            if not base or not base.exists():
-                continue
-            try:
-                candidates = base.glob('*/*/local_*.json')
-            except Exception:
-                continue
-            for f in candidates:
-                ts = _session_file_created_at(f)
-                if ts > latest_ts:
-                    latest_ts, latest = ts, f
-        if latest is None:
-            return None
         try:
-            data = json.loads(latest.read_text(encoding='utf-8'))
+            data = json.loads(session_file.read_text(encoding='utf-8'))
         except Exception:
             return None
         for entry in (data.get('remoteMcpServersConfig') or []):
@@ -1367,7 +1342,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                     if plugin_cfg:
                         metadata['mcp_server_config'] = plugin_cfg
                     else:
-                        session_connector = _resolve_claude_code_session_connector(mcp_server_name)
+                        session_connector = _resolve_claude_code_session_connector(mcp_server_name, cwd)
                         if session_connector:
                             display_name, connector_cfg = session_connector
                             metadata['mcp_server'] = display_name
