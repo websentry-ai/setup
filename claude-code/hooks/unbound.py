@@ -1372,6 +1372,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                             display_name, connector_cfg = session_connector
                             metadata['mcp_server'] = display_name
                             metadata['mcp_server_config'] = connector_cfg
+                            # Pass the original UUID alongside the resolved name so
+                            # the control plane can learn this uuid->name mapping.
+                            metadata['mcp_server_uuid'] = mcp_server_name
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
