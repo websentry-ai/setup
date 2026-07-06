@@ -248,6 +248,30 @@ class TestConversationDataFlag(unittest.TestCase):
         self.assertEqual(len(stop[0]["hooks"]), 1)  # no duplicate hook entry
         self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
 
+    def test_clear_drops_conversation_flag_from_surviving_shared_block(self):
+        """Uninstall symmetry: when our hook shared a Stop block with a foreign
+        hook, removing our hook must also drop the includeConversationData flag we
+        set — the foreign hook and block stay intact."""
+        import setup
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        our_cmd = str(home / ".augment" / "hooks" / "unbound.py")
+        (home / ".augment" / "settings.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{
+                "hooks": [
+                    {"type": "command", "command": our_cmd, "timeout": 10000},
+                    {"type": "command", "command": "/foreign/hook", "timeout": 5000},
+                ],
+                "metadata": {"includeConversationData": True},
+            }]}}
+        ))
+        with patch("pathlib.Path.home", return_value=home):
+            self.assertEqual(setup.remove_hooks_from_settings(), "cleared")
+        block = json.loads((home / ".augment" / "settings.json").read_text())["hooks"]["Stop"][0]
+        self.assertEqual([h["command"] for h in block["hooks"]], ["/foreign/hook"])
+        self.assertNotIn("includeConversationData", block.get("metadata", {}))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -610,11 +610,23 @@ def remove_hooks_from_settings() -> str:
                     if isinstance(item, dict):
                         hooks = item.get("hooks", [])
                         new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
-                        if new_hooks != hooks:
+                        removed_ours = new_hooks != hooks
+                        if removed_ours:
                             modified = True
                             debug_print(f"Removed unbound hook from {event}")
                         if new_hooks:
                             item["hooks"] = new_hooks
+                            # Symmetry with install: our install is the only thing
+                            # that sets includeConversationData on a block carrying
+                            # our hook, so drop it when we remove our hook from a
+                            # block that survives (shared with a foreign hook). An
+                            # ours-only block is dropped whole below, flag and all.
+                            if removed_ours:
+                                meta = item.get("metadata")
+                                if isinstance(meta, dict):
+                                    meta.pop("includeConversationData", None)
+                                    if not meta:
+                                        item.pop("metadata", None)
                             new_config.append(item)
                     else:
                         new_config.append(item)

@@ -1150,6 +1150,15 @@ def clear_managed_hooks() -> str:
                                         modified = True
                                         if new_hooks:
                                             item["hooks"] = new_hooks
+                                            # Symmetry with install: drop the flag we
+                                            # set when our hook is removed from a block
+                                            # that survives (shared with a foreign
+                                            # hook). An ours-only block is dropped whole.
+                                            meta = item.get("metadata")
+                                            if isinstance(meta, dict):
+                                                meta.pop("includeConversationData", None)
+                                                if not meta:
+                                                    item.pop("metadata", None)
                                             new_config.append(item)
                                     else:
                                         new_config.append(item)
