@@ -516,12 +516,49 @@ class TestStopExchange(_HomeTmp):
             unbound.process_stop_event(stop_event, "sk-test")
             send.assert_not_called()
 
+    def test_build_exchange_from_conversation_shape(self):
+        """With includeConversationData enabled, Augment ships the turn under
+        event.conversation.{userPrompt, agentTextResponse}. build_llm_exchange
+        builds a usable user+assistant exchange from that shape and does NOT
+        drop the turn."""
+        unbound.append_to_audit_log({
+            "timestamp": "2026-01-01T00:00:00Z",
+            "session_id": "conv-ok",
+            "event": {
+                "hook_event_name": "PostToolUse",
+                "session_id": "conv-ok",
+                "tool_name": "launch-process",
+                "tool_input": {"command": "ls"},
+                "tool_output": "out",
+            },
+        })
+        stop_event = {
+            "hook_event_name": "Stop", "session_id": "conv-ok",
+            "conversation": {"userPrompt": "list files",
+                             "agentTextResponse": "Here are the files."},
+        }
+        captured = {}
+
+        def fake_send(exchange, api_key):
+            captured.update(exchange)
+            return True
+
+        with patch.object(unbound, "send_to_api", side_effect=fake_send) as send, \
+             patch.object(unbound, "log_error") as log_err:
+            unbound.process_stop_event(stop_event, "sk-test")
+            send.assert_called_once()
+        self.assertEqual([m["role"] for m in captured["messages"]], ["user", "assistant"])
+        self.assertEqual(captured["messages"][0]["content"], "list files")
+        # A usable exchange must NOT emit a dropped_turn signal.
+        self.assertFalse(log_err.called)
+
     def test_stop_with_no_conversation_emits_dropped_turn_signal(self):
-        """Auggie 0.30.0 ships NO `conversation` on Stop (the includeConversationData
-        metadata flag is intentionally unseeded). With accumulated PostToolUse
-        records but no conversation, build_llm_exchange returns None (messages < 2),
-        so the audit is a no-op AND the visible `dropped_turn` signal fires — the
-        turn is never silently lost. Must not crash."""
+        """When a Stop carries no `conversation` (the user keeps Augment's
+        conversation data off for privacy, or runs a build that omits it) but
+        PostToolUse records accumulated, build_llm_exchange returns None
+        (messages < 2): the audit is a no-op and the `dropped_turn` signal is
+        logged LOCALLY ONLY (report_to_gateway=False) so it never floods the
+        gateway/Sentry. Must not crash."""
         unbound.append_to_audit_log({
             "timestamp": "2026-01-01T00:00:00Z",
             "session_id": "no-conv",
@@ -538,10 +575,11 @@ class TestStopExchange(_HomeTmp):
              patch.object(unbound, "log_error") as log_err:
             unbound.process_stop_event(stop_event, "sk-test")  # must not raise
             send.assert_not_called()
-        # The dropped_turn signal fired with the right category.
+        # The dropped_turn signal fired with the right category, LOCAL-ONLY.
         self.assertTrue(log_err.called)
         category = log_err.call_args[0][1] if len(log_err.call_args[0]) > 1 else log_err.call_args[1].get("category")
         self.assertEqual(category, "dropped_turn")
+        self.assertIs(log_err.call_args.kwargs.get("report_to_gateway"), False)
 
 
 # --------------------------------------------------------------------------- #
@@ -1453,6 +1491,7 @@ class TestNoSilentDrop(_HomeTmp):
         msg, category = log_err.call_args[0][0], log_err.call_args[0][1]
         self.assertEqual(category, "dropped_turn")
         self.assertIn("drop-1", msg)
+        self.assertIs(log_err.call_args.kwargs.get("report_to_gateway"), False)
 
     def test_stop_with_no_records_and_no_prompt_stays_silent(self):
         """No PostToolUse records AND no exchange -> genuinely nothing to send,

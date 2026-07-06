@@ -193,5 +193,114 @@ class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
                 )
 
 
+class TestConversationDataFlag(unittest.TestCase):
+    """The augment Stop hook must request conversation data so the end-of-turn
+    exchange has the user prompt — otherwise every tool-bearing turn is dropped
+    and the hook floods the gateway/Sentry with `dropped_turn`."""
+
+    _REPO_ROOT = Path(__file__).resolve().parents[2]
+    _MDM = _REPO_ROOT / "augment" / "hooks" / "mdm" / "setup.py"
+
+    @classmethod
+    def _load_mdm(cls):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("mdm_setup_augment_conv", str(cls._MDM))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_build_hooks_block_stop_requests_conversation_data(self):
+        import setup
+        for name, mod in (("user", setup), ("mdm", self._load_mdm())):
+            with self.subTest(variant=name):
+                stop = mod.build_hooks_block("/x/unbound.py")["Stop"]
+                self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+
+    def test_configure_writes_conversation_flag_on_fresh_install(self):
+        import setup
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        with patch("pathlib.Path.home", return_value=home):
+            self.assertTrue(setup.configure_augment_settings())
+        settings = json.loads((home / ".augment" / "settings.json").read_text())
+        stop = settings["hooks"]["Stop"]
+        self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+
+    def test_configure_upgrades_existing_stop_block_missing_flag(self):
+        """A device installed before the fix has our Stop hook but no metadata.
+        Re-running setup must inject includeConversationData in place, without
+        duplicating the hook or the block."""
+        import setup
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        our_cmd = str(home / ".augment" / "hooks" / "unbound.py")
+        (home / ".augment" / "settings.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": our_cmd, "timeout": 10000}]}]}}
+        ))
+        with patch("pathlib.Path.home", return_value=home):
+            self.assertTrue(setup.configure_augment_settings())
+        settings = json.loads((home / ".augment" / "settings.json").read_text())
+        stop = settings["hooks"]["Stop"]
+        self.assertEqual(len(stop), 1)              # no duplicate block
+        self.assertEqual(len(stop[0]["hooks"]), 1)  # no duplicate hook entry
+        self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+
+    def test_clear_drops_conversation_flag_from_surviving_shared_block(self):
+        """Uninstall symmetry: when our hook shared a Stop block with a foreign
+        hook, removing our hook must also drop the includeConversationData flag we
+        set — the foreign hook and block stay intact."""
+        import setup
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        our_cmd = str(home / ".augment" / "hooks" / "unbound.py")
+        (home / ".augment" / "settings.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{
+                "hooks": [
+                    {"type": "command", "command": our_cmd, "timeout": 10000},
+                    {"type": "command", "command": "/foreign/hook", "timeout": 5000},
+                ],
+                "metadata": {"includeConversationData": True},
+            }]}}
+        ))
+        with patch("pathlib.Path.home", return_value=home):
+            self.assertEqual(setup.remove_hooks_from_settings(), "cleared")
+        block = json.loads((home / ".augment" / "settings.json").read_text())["hooks"]["Stop"][0]
+        self.assertEqual([h["command"] for h in block["hooks"]], ["/foreign/hook"])
+        self.assertNotIn("includeConversationData", block.get("metadata", {}))
+
+    def test_mdm_user_level_clear_drops_conversation_flag(self):
+        """MDM per-user cleanup (remove_user_level_hooks_for_user) must also drop
+        the flag from a surviving shared Stop block — parity with the user-level
+        and managed clear paths."""
+        mdm = self._load_mdm()
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, home, ignore_errors=True)
+        (home / ".augment" / "hooks").mkdir(parents=True)
+        our_cmd = str(home / ".augment" / "hooks" / "unbound.py")
+        (home / ".augment" / "settings.json").write_text(json.dumps(
+            {"hooks": {"Stop": [{
+                "hooks": [
+                    {"type": "command", "command": our_cmd, "timeout": 10000},
+                    {"type": "command", "command": "/foreign/hook", "timeout": 5000},
+                ],
+                "metadata": {"includeConversationData": True},
+            }]}}
+        ))
+
+        def fake_run_as_user(username, fn, *args, **kwargs):
+            return fn(*args, **kwargs)
+
+        with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
+             patch.object(mdm, "debug_print", lambda *a, **k: None):
+            mdm.remove_user_level_hooks_for_user("tester", home)
+        block = json.loads((home / ".augment" / "settings.json").read_text())["hooks"]["Stop"][0]
+        self.assertEqual([h["command"] for h in block["hooks"]], ["/foreign/hook"])
+        self.assertNotIn("includeConversationData", block.get("metadata", {}))
+
+
 if __name__ == "__main__":
     unittest.main()

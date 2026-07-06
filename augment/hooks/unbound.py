@@ -1406,9 +1406,10 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
 
 def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optional[str] = None) -> Optional[Dict]:
     """Build the end-of-turn exchange for the audit endpoint from Augment's Stop
-    event. With includeConversationData set, Augment injects the turn under
-    event._exchange.exchange.{request_message, response_text}; the PostToolUse
-    tool calls are reconstructed from the accumulated audit log."""
+    event. With includeConversationData set (block-level Stop metadata), Augment
+    adds a `conversation` field carrying {userPrompt, agentTextResponse}; an older
+    `event._exchange.exchange.{request_message, response_text}` shape is also
+    accepted. The PostToolUse tool calls are reconstructed from the audit log."""
     messages = []
     assistant_tool_uses = []
 
@@ -1558,14 +1559,16 @@ def process_stop_event(event: Dict, api_key: str):
         send_to_api(exchange, api_key)
     elif session_events:
         # The turn had PostToolUse records but build_llm_exchange returned None
-        # (e.g. Stop omitted conversation.userPrompt, so messages < 2). Do NOT
-        # drop it silently — emit a visible local log line and a best-effort,
-        # fire-and-forget gateway report (fail-open: never raises, never blocks).
+        # (Stop carried no conversation.userPrompt, so messages < 2). Expected
+        # when the user keeps Augment's conversation data off (privacy) or runs a
+        # build that omits it — so log locally only and never report to the
+        # gateway/Sentry (a per-turn report floods it). Fail-open: never blocks.
         log_error(
             f"Dropped Stop turn for session={session_id}: "
             f"{len(session_events)} PostToolUse record(s) but no usable exchange "
             f"(missing userPrompt/assistant content)",
             'dropped_turn',
+            report_to_gateway=False,
         )
 
 
