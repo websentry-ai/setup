@@ -684,10 +684,6 @@ def _mangle_mcp_token(s: Optional[str]) -> str:
 
 
 def _norm_mcp_token(s: Optional[str]) -> str:
-    # Claude Code collapses separator runs when deriving a server key
-    # ("Asana (2)" -> Asana_2) while _mangle_mcp_token maps each char
-    # (-> Asana__2_). Normalising both sides makes the comparison
-    # run-length-insensitive.
     return re.sub(r'_+', '_', s or '').strip('_')
 
 
