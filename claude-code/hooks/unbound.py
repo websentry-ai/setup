@@ -683,6 +683,10 @@ def _mangle_mcp_token(s: Optional[str]) -> str:
     return re.sub(r'[^A-Za-z0-9_-]', '_', s or '')
 
 
+def _norm_mcp_token(s: Optional[str]) -> str:
+    return re.sub(r'_+', '_', s or '').strip('_')
+
+
 def _plugin_mcp_server_map(version_dir: Path) -> Dict:
     servers = {}
     sources = [version_dir / ".mcp.json", version_dir / ".claude-plugin" / "plugin.json"]
@@ -801,7 +805,7 @@ def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MC
         distinct = []
         if isinstance(ever_connected, list):
             for display in ever_connected:
-                if isinstance(display, str) and _mangle_mcp_token(display) == server_name:
+                if isinstance(display, str) and _norm_mcp_token(_mangle_mcp_token(display)) == _norm_mcp_token(server_name):
                     if display not in distinct:
                         distinct.append(display)
         if len(distinct) == 1:
