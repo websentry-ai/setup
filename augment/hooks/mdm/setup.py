@@ -22,22 +22,21 @@ DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
 
 
 # --- Augment settings blocks (mirrors augment/hooks/setup.py) ----------------
-# The Stop block carries block-level `metadata.includeConversationData = true` so
-# Augment attaches the turn's `conversation` (userPrompt + agentTextResponse) to
-# the Stop event — the end-of-turn analytics need it to build a usable exchange.
-# Augment has no prompt-submit hook and, per the docs, excludes conversation by
-# DEFAULT (privacy), so without this every tool-bearing turn is dropped.
-# `metadata` is a BLOCK-level property (sibling to `hooks`), NOT a hook-entry
-# property — Auggie warns "Unknown property metadata" only when it is misplaced
-# on the entry.
+# Block-level metadata (sibling to `hooks`, not the hook entry) we opt into; Auggie
+# excludes all of it by default. userContext=context.userEmail, MCPMetadata=accurate MCP names.
+_HOOK_METADATA = {
+    "PreToolUse": {"includeUserContext": True, "includeMCPMetadata": True},
+    "PostToolUse": {"includeUserContext": True, "includeMCPMetadata": True},
+    "Stop": {"includeConversationData": True, "includeUserContext": True},
+    "SessionStart": {"includeUserContext": True},
+}
 
 
 def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
     """The Augment `hooks` block. No UserPromptSubmit (Augment has no such event).
     Timeouts are in milliseconds. `extra` (e.g. {"shell": "powershell"}) is merged
-    into every hook entry for the Windows launcher. The Stop block gets block-level
-    `metadata.includeConversationData` so Augment ships the turn conversation
-    (see the note above)."""
+    into every hook entry for the Windows launcher. Each block gets the block-level
+    metadata flags in _HOOK_METADATA (see the note above)."""
     def _hook(timeout: int) -> Dict:
         entry = {"type": "command", "command": hook_command, "timeout": timeout}
         if extra:
@@ -45,10 +44,10 @@ def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
         return entry
 
     return {
-        "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000)]}],
-        "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000)]}],
-        "Stop": [{"hooks": [_hook(10000)], "metadata": {"includeConversationData": True}}],
-        "SessionStart": [{"hooks": [_hook(60000)]}],
+        "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000)], "metadata": dict(_HOOK_METADATA["PreToolUse"])}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000)], "metadata": dict(_HOOK_METADATA["PostToolUse"])}],
+        "Stop": [{"hooks": [_hook(10000)], "metadata": dict(_HOOK_METADATA["Stop"])}],
+        "SessionStart": [{"hooks": [_hook(60000)], "metadata": dict(_HOOK_METADATA["SessionStart"])}],
         "SessionEnd": [{"hooks": [_hook(10000)]}],
     }
 
@@ -819,7 +818,8 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
                                         # when our hook leaves a surviving shared block.
                                         meta = item.get("metadata")
                                         if isinstance(meta, dict):
-                                            meta.pop("includeConversationData", None)
+                                            for k in _HOOK_METADATA.get(event, {}):
+                                                meta.pop(k, None)
                                             if not meta:
                                                 item.pop("metadata", None)
                                         new_event_config.append(item)
@@ -1010,13 +1010,13 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
             # A foreign non-list hooks[event] is left untouched — never clobber an
             # org's own Augment config in the shared settings file.
 
-        # Ensure the Stop block carrying our hook requests conversation data.
-        # Applied even when our hook already exists so already-installed devices
-        # pick it up on re-run (the idempotency guard above would otherwise skip
-        # them). Only our own Stop block is touched.
-        stop_blocks = settings["hooks"].get("Stop")
-        if isinstance(stop_blocks, list):
-            for item in stop_blocks:
+        # Set the _HOOK_METADATA flags on our own blocks, even when the hook
+        # already exists, so already-installed devices pick them up on re-run.
+        for event, flags in _HOOK_METADATA.items():
+            blocks = settings["hooks"].get(event)
+            if not isinstance(blocks, list):
+                continue
+            for item in blocks:
                 if not isinstance(item, dict):
                     continue
                 if any(_hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
@@ -1025,7 +1025,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
                     if not isinstance(metadata, dict):
                         metadata = {}
                         item["metadata"] = metadata
-                    metadata["includeConversationData"] = True
+                    metadata.update(flags)
 
         # Merge toolPermissions, preserving foreign rules. Match on our identity
         # (toolName + shellInputRegex) so re-running never duplicates.
@@ -1163,7 +1163,8 @@ def clear_managed_hooks() -> str:
                                             # hook). An ours-only block is dropped whole.
                                             meta = item.get("metadata")
                                             if isinstance(meta, dict):
-                                                meta.pop("includeConversationData", None)
+                                                for k in _HOOK_METADATA.get(event, {}):
+                                                    meta.pop(k, None)
                                                 if not meta:
                                                     item.pop("metadata", None)
                                             new_config.append(item)
