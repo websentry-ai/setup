@@ -1259,6 +1259,31 @@ def process_stop_event(event: Dict, api_key: str):
     send_to_api(exchange, api_key)
 
 
+def get_api_key():
+    """Read API key from env, falling back to ~/.unbound/config.json.
+
+    Codex launched outside a login shell (VS Code extension host, GUI
+    launchers, terminals opened before setup ran) doesn't inherit
+    shell-profile env vars — same root cause WEB-4145 fixed for Claude
+    Code, ported here. setup.py already writes the key to
+    ~/.unbound/config.json, so use it as a tier-2 lookup.
+    """
+    key = os.getenv('UNBOUND_CODEX_API_KEY')
+    if key:
+        return key
+    try:
+        with open(UNBOUND_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return json.loads(f.read()).get('api_key')
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        log_error(f"~/.unbound/config.json is not valid JSON: {e}", 'config')
+        return None
+    except Exception as e:
+        log_error(f"Failed to read config file: {e}", 'config')
+        return None
+
+
 _GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')
 _BAKED_GATEWAY_RE = re.compile(r'os\.environ\.get\(\s*"UNBOUND_GATEWAY_URL"\s*,\s*"([^"]*)"')
 
@@ -1658,7 +1683,7 @@ def _dispatch_discovery() -> None:
 
 def main():
     global _cached_api_key
-    api_key = os.getenv('UNBOUND_CODEX_API_KEY')
+    api_key = get_api_key()
     _cached_api_key = api_key
 
     try:
