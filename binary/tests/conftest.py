@@ -61,6 +61,14 @@ def run_binary(args, payload, home, extra_env=None, stdin_close=False):
     return _run([str(BUILT_BINARY)] + args, payload, home, extra_env, stdin_close)
 
 
+def run_go_binary(args, payload, home, extra_env=None, stdin_close=False):
+    """The Go rewrite (WEB-4809); opt-in via UNBOUND_GO_BINARY, else skipped."""
+    go_binary = os.environ.get("UNBOUND_GO_BINARY")
+    if not go_binary:
+        pytest.skip("UNBOUND_GO_BINARY not set; Go parity is opt-in")
+    return _run([go_binary] + args, payload, home, extra_env, stdin_close)
+
+
 @pytest.fixture
 def sandbox_home(tmp_path):
     home = tmp_path / "home"
