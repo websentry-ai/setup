@@ -209,12 +209,17 @@ class TestConversationDataFlag(unittest.TestCase):
         spec.loader.exec_module(mod)
         return mod
 
-    def test_build_hooks_block_stop_requests_conversation_data(self):
+    def test_build_hooks_block_metadata_flags(self):
         import setup
         for name, mod in (("user", setup), ("mdm", self._load_mdm())):
             with self.subTest(variant=name):
-                stop = mod.build_hooks_block("/x/unbound.py")["Stop"]
-                self.assertIs(stop[0]["metadata"]["includeConversationData"], True)
+                block = mod.build_hooks_block("/x/unbound.py")
+                self.assertIs(block["Stop"][0]["metadata"]["includeConversationData"], True)
+                self.assertIs(block["Stop"][0]["metadata"]["includeUserContext"], True)
+                for ev in ("PreToolUse", "PostToolUse"):
+                    self.assertIs(block[ev][0]["metadata"]["includeUserContext"], True)
+                    self.assertIs(block[ev][0]["metadata"]["includeMCPMetadata"], True)
+                self.assertIs(block["SessionStart"][0]["metadata"]["includeUserContext"], True)
 
     def test_configure_writes_conversation_flag_on_fresh_install(self):
         import setup
