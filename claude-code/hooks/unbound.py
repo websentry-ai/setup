@@ -1387,6 +1387,8 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'tool_use',
+        'cwd': event.get('cwd'),
+        'project': _get_project(event.get('cwd')),
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
@@ -1471,6 +1473,85 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude(api_response)
 
 
+def _github_remote_path(remote_url: str) -> Optional[str]:
+    """The 'ORG/repo' path of a GitHub remote URL, with any trailing slash
+    stripped. Handles the SSH scp form (git@github.com:ORG/repo.git) and the
+    HTTPS/scheme form (https://github.com/ORG/repo.git). None if the URL is empty
+    or unparseable. The per-segment '.git' strip is left to the callers."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        # scheme://[user@]host/ORG/repo(.git)
+        after_scheme = url.split('://', 1)[1]
+        path = after_scheme.split('/', 1)[1] if '/' in after_scheme else ''
+    elif ':' in url:
+        # scp-like: [user@]host:ORG/repo(.git)
+        path = url.split(':', 1)[1]
+    else:
+        return None
+    path = path.strip('/')
+    return path or None
+
+
+def _strip_git_suffix(segment: str) -> str:
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _parse_github_org(remote_url: str) -> Optional[str]:
+    """Org/owner (first path segment after the host) of a GitHub remote URL.
+    Returns None if the URL is empty or unparseable."""
+    path = _github_remote_path(remote_url)
+    if not path:
+        return None
+    org = _strip_git_suffix(path.split('/', 1)[0])
+    return org or None
+
+
+def _parse_github_repo(remote_url: str) -> Optional[str]:
+    """Repo name (second path segment) of a GitHub remote URL, with a trailing
+    '.git' stripped. None if absent or unparseable."""
+    path = _github_remote_path(remote_url)
+    if not path:
+        return None
+    parts = path.split('/')
+    if len(parts) < 2:
+        return None
+    repo = _strip_git_suffix(parts[1])
+    return repo or None
+
+
+def _get_git_origin_org_repo(cwd: str) -> tuple:
+    """Lowercased (org, repo) of `cwd`'s `origin` remote, or (None, None) when
+    `cwd` is not a git repo or has no `origin` (a clean non-zero git exit). Raises
+    only when git cannot be executed at all (missing binary / timeout) so the
+    caller can tell an honest 'non-compliant' apart from an internal failure and
+    fail-open."""
+    result = subprocess.run(
+        ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return (None, None)
+    url = result.stdout.strip()
+    org = _parse_github_org(url)
+    repo = _parse_github_repo(url)
+    return (org.lower() if org else None, repo.lower() if repo else None)
+
+
+def _get_project(cwd: Optional[str]) -> Optional[str]:
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        org, repo = _get_git_origin_org_repo(cwd)
+        return f"{org}/{repo}" if org and repo else None
+    except Exception:
+        return None
+
+
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking."""
     session_id = event.get('session_id')
@@ -1482,12 +1563,15 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'user_prompt',
+        'cwd': event.get('cwd'),
+        'project': _get_project(event.get('cwd')),
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
 
     api_response = send_to_hook_api(request_body, api_key)
-    return transform_response_for_claude_prompt(api_response)
+    response = transform_response_for_claude_prompt(api_response)
+    return response
 
 
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None) -> Optional[Dict]:
@@ -1497,6 +1581,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     user_prompt = None
     session_id = None
     permission_mode = None
+    cwd = None
 
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1507,6 +1592,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if not permission_mode:
             permission_mode = event.get('permission_mode')
+
+        if not cwd:
+            cwd = event.get('cwd')
 
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
@@ -1566,6 +1654,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'model': model,
         'messages': messages,
         'permission_mode': permission_mode,
+        'cwd': cwd,
+        'project': _get_project(cwd),
         'account_identity': build_account_identity(probe=True),
     }
 
@@ -2200,16 +2290,16 @@ def main():
             'session_id': event.get('session_id'),
             'event': event
         }
-        
+
         append_to_audit_log(log_entry)
-        
+
         if hook_event_name == 'Stop' and session_id:
             process_stop_event(event, api_key)
-        
+
         cleanup_old_logs()
 
         print('{"suppressOutput": true}', flush=True)
-        
+
     except Exception as e:
         # Still return empty JSON object to Claude Code to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')
