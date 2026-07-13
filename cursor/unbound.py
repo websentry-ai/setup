@@ -42,9 +42,15 @@ DEFAULT_DISCOVERY_BRANCH = "main"
 DISCOVERY_INSTALL_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/{branch}/install.sh"
 
 
+# Only these branches are ever selectable; an out-of-allowlist override is
+# ignored. The repo is public, so without this a stray/hostile env var could make
+# the fetched install.sh clone+run an arbitrary branch.
+_ALLOWED_DISCOVERY_BRANCHES = ("main", "staging")
+
+
 def _discovery_branch(backend_url):
     override = (os.environ.get("UNBOUND_DISCOVERY_BRANCH") or "").strip()
-    if override:
+    if override in _ALLOWED_DISCOVERY_BRANCHES:
         return override
     return "staging" if "staging" in (backend_url or "").lower() else DEFAULT_DISCOVERY_BRANCH
 
