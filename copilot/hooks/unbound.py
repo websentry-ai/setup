@@ -39,6 +39,7 @@ DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 # internally, so reusing it for a staging backend would clone the wrong code.
 DEFAULT_DISCOVERY_BRANCH = "main"
 DISCOVERY_INSTALL_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/{branch}/install.sh"
+DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 
 
 # Only these branches are ever selectable; an out-of-allowlist override is
@@ -48,14 +49,30 @@ _ALLOWED_DISCOVERY_BRANCHES = ("main", "staging")
 
 
 def _discovery_branch(backend_url):
-    override = (os.environ.get("UNBOUND_DISCOVERY_BRANCH") or "").strip()
+    # Override is lowercased before the allowlist check, so a mixed-case value
+    # ("Staging") resolves the same here as in the shell/PowerShell wrappers
+    # rather than being passed verbatim to `git clone -b`.
+    override = (os.environ.get("UNBOUND_DISCOVERY_BRANCH") or "").strip().lower()
     if override in _ALLOWED_DISCOVERY_BRANCHES:
         return override
-    return "staging" if "staging" in (backend_url or "").lower() else DEFAULT_DISCOVERY_BRANCH
+    # Match "staging" in the URL HOST only (strip scheme, path/query, userinfo,
+    # port), so a "staging" fragment in the path or query of a production
+    # backend URL can't flip the branch. A staging backend always carries
+    # "staging" in its host.
+    host = (backend_url or "").split("://", 1)[-1].split("/", 1)[0]
+    host = host.split("@")[-1].split(":", 1)[0].lower()
+    return "staging" if "staging" in host else DEFAULT_DISCOVERY_BRANCH
 
 
 def _discovery_install_sh(branch):
     return DISCOVERY_INSTALL_DIR / ("install-%s.sh" % branch)
+
+
+def _install_sh_is_stale(path):
+    try:
+        return (time.time() - path.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
+    except OSError:
+        return True
 
 
 def _discovery_install_url(branch):
@@ -1763,15 +1780,26 @@ def _dispatch_discovery() -> None:
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
                 DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if not _install_sh.exists():
+                # Download to a temp file and os.replace() it into place, so an
+                # interrupted curl can never leave a truncated install.sh behind
+                # that later runs would treat as a complete cached copy.
+                if _install_sh_is_stale(_install_sh):
+                    fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
+                    os.close(fd)
+                    tmp = Path(_tmp)
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(_install_sh), _discovery_install_url(_branch)],
+                        ["curl", "-fsSL", "-o", str(tmp), _discovery_install_url(_branch)],
                         capture_output=True, timeout=30,
                     )
-                    if r.returncode != 0:
-                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                        return
-                    os.chmod(_install_sh, 0o755)
+                    if r.returncode == 0:
+                        os.chmod(tmp, 0o755)
+                        os.replace(tmp, _install_sh)
+                    else:
+                        tmp.unlink(missing_ok=True)
+                        if not _install_sh.exists():
+                            log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                            return
+                        log_error(f"discovery install.sh refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                 discovery_cmd = ["bash", str(_install_sh), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
