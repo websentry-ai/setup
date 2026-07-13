@@ -21,8 +21,12 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
 LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
-NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+# Grep/Glob/LS are read-equivalent: they expose file CONTENTS (Grep) or
+# enumerate paths (Glob/LS), so they could leak/discover a secret file that the
+# equivalent `cat`/`ls` is blocked from. The gateway maps them to `read_file`.
+READ_EQUIVALENT_FILE_TOOLS = {'Grep', 'Glob', 'LS'}
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'Grep', 'Glob', 'LS']  # MCP tools (mcp__*) are always checked separately
+NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'} | READ_EQUIVALENT_FILE_TOOLS
 MCP_TOOL_PREFIX = 'mcp__'
 
 # CoWork built-in tools that are exposed under mcp__
@@ -516,6 +520,11 @@ def extract_command_for_pretool(event: Dict) -> str:
     # Glob: pattern
     if tool_name == 'Glob' and 'pattern' in tool_input:
         return tool_input['pattern']
+    # LS: path (fall back to cwd) so the command — and therefore the approval
+    # key — stays path-specific instead of collapsing to the literal "LS" for
+    # every directory listing.
+    if tool_name == 'LS':
+        return tool_input.get('path') or event.get('cwd') or tool_name
     # WebFetch: url
     if tool_name == 'WebFetch' and 'url' in tool_input:
         return tool_input['url']
@@ -527,6 +536,32 @@ def extract_command_for_pretool(event: Dict) -> str:
         return tool_input['prompt']
     # Default: tool name
     return tool_name
+
+
+def _derive_read_equivalent_path(
+    tool_name: str, tool_input: Dict, event: Dict
+) -> Optional[str]:
+    """Resolve a concrete path for a read-equivalent tool (Grep/Glob/LS).
+
+    Path-scoped policies need a path to match against:
+      - an explicit ``path`` argument always wins;
+      - Glob's ``pattern`` (itself a path-like glob, e.g. ``**/*.env``) is kept
+        as a fallback so a filename/glob policy still matches;
+      - otherwise fall back to the session ``cwd``, because Grep/Glob/LS with no
+        ``path`` scan the WHOLE working tree — the broadest (and most dangerous)
+        case must not forward an empty path and silently bypass policy.
+
+    Returns ``None`` only when no path, no Glob pattern, and no cwd are present;
+    the caller then forwards no ``file_path`` (the gateway fails open). Uses
+    ``.get()`` throughout, so a malformed event never raises.
+    """
+    if tool_name == 'Glob':
+        return (
+            tool_input.get('path')
+            or tool_input.get('pattern')
+            or event.get('cwd')
+        )
+    return tool_input.get('path') or event.get('cwd')
 
 
 def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
@@ -1344,6 +1379,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_input = event.get('tool_input') or {}
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
+    elif tool_name in READ_EQUIVALENT_FILE_TOOLS:
+        # Grep/Glob/LS expose file contents or enumerate paths; resolve a
+        # concrete path (incl. a cwd fallback for the no-`path` whole-tree scan)
+        # so path-scoped policies can evaluate them. See helper for the rules.
+        derived_path = _derive_read_equivalent_path(tool_name, tool_input, event)
+        if derived_path:
+            metadata['file_path'] = derived_path
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
