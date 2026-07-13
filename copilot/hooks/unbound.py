@@ -32,8 +32,28 @@ DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
-DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
-DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+# The discovery CODE branch follows the backend it reports to: a staging backend
+# runs the staging branch of coding-discovery-tool, anything else runs main.
+# UNBOUND_DISCOVERY_BRANCH overrides (same convention the CLI and install.sh use).
+# install.sh is cached PER BRANCH: a cached main install.sh pins BRANCH=main
+# internally, so reusing it for a staging backend would clone the wrong code.
+DEFAULT_DISCOVERY_BRANCH = "main"
+DISCOVERY_INSTALL_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/{branch}/install.sh"
+
+
+def _discovery_branch(backend_url):
+    override = (os.environ.get("UNBOUND_DISCOVERY_BRANCH") or "").strip()
+    if override:
+        return override
+    return "staging" if "staging" in (backend_url or "").lower() else DEFAULT_DISCOVERY_BRANCH
+
+
+def _discovery_install_sh(branch):
+    return DISCOVERY_INSTALL_DIR / ("install-%s.sh" % branch)
+
+
+def _discovery_install_url(branch):
+    return DISCOVERY_INSTALL_URL_TMPL.format(branch=branch)
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 APPROVAL_POLL_PHASES = (
@@ -1725,6 +1745,9 @@ def _dispatch_discovery() -> None:
                 log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
                 return
 
+            _branch = _discovery_branch(backend_url)
+            _install_sh = _discovery_install_sh(_branch)
+
             if RUNNING_FROZEN:
                 # Frozen binary: never fetch install.sh — run the locally
                 # installed discovery binary, or skip if it isn't there.
@@ -1734,21 +1757,22 @@ def _dispatch_discovery() -> None:
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
                 DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if not DISCOVERY_INSTALL_SH.exists():
+                if not _install_sh.exists():
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+                        ["curl", "-fsSL", "-o", str(_install_sh), _discovery_install_url(_branch)],
                         capture_output=True, timeout=30,
                     )
                     if r.returncode != 0:
                         log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                         return
-                    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                    os.chmod(_install_sh, 0o755)
+                discovery_cmd = ["bash", str(_install_sh), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DISCOVERY_BRANCH": _branch}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:

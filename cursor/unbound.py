@@ -33,8 +33,28 @@ DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
-DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
-DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+# The discovery CODE branch follows the backend it reports to: a staging backend
+# runs the staging branch of coding-discovery-tool, anything else runs main.
+# UNBOUND_DISCOVERY_BRANCH overrides (same convention the CLI and install.sh use).
+# install.sh is cached PER BRANCH: a cached main install.sh pins BRANCH=main
+# internally, so reusing it for a staging backend would clone the wrong code.
+DEFAULT_DISCOVERY_BRANCH = "main"
+DISCOVERY_INSTALL_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/{branch}/install.sh"
+
+
+def _discovery_branch(backend_url):
+    override = (os.environ.get("UNBOUND_DISCOVERY_BRANCH") or "").strip()
+    if override:
+        return override
+    return "staging" if "staging" in (backend_url or "").lower() else DEFAULT_DISCOVERY_BRANCH
+
+
+def _discovery_install_sh(branch):
+    return DISCOVERY_INSTALL_DIR / ("install-%s.sh" % branch)
+
+
+def _discovery_install_url(branch):
+    return DISCOVERY_INSTALL_URL_TMPL.format(branch=branch)
 
 DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
@@ -1579,9 +1599,9 @@ def _hook_discovery_enabled_for_org() -> bool:
     return enabled
 
 
-def _install_sh_is_stale():
+def _install_sh_is_stale(path):
     try:
-        return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
+        return (time.time() - path.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
     except OSError:
         return True
 
@@ -1608,6 +1628,9 @@ def _dispatch_mcp_server_scan(server_name, server_config):
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
 
+        _branch = _discovery_branch(backend_url)
+        _install_sh = _discovery_install_sh(_branch)
+
         if RUNNING_FROZEN:
             # Frozen binary: never fetch install.sh — run the locally
             # installed discovery binary, or skip if it isn't there.
@@ -1620,9 +1643,9 @@ def _dispatch_mcp_server_scan(server_name, server_config):
             DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
             bootstrap = (
                 'set -e; '
-                f'SH="{DISCOVERY_INSTALL_SH.as_posix()}"; '
+                f'SH="{_install_sh.as_posix()}"; '
                 f'if [ ! -f "$SH" ] || [ -n "$(find "$SH" -mmin +{DISCOVERY_INSTALL_SH_TTL_SECONDS // 60} 2>/dev/null)" ]; then '
-                f'T="$(mktemp)"; curl -fsSL -o "$T" "{DISCOVERY_INSTALL_URL}" '
+                f'T="$(mktemp)"; curl -fsSL -o "$T" "{_discovery_install_url(_branch)}" '
                 '&& chmod 755 "$T" && mv -f "$T" "$SH" || rm -f "$T"; fi; '
                 'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME" --domain "$UNBOUND_MCP_DOMAIN"'
             )
@@ -1634,7 +1657,8 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                     "UNBOUND_API_KEY": api_key,
                     "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
                     "UNBOUND_MCP_SERVER_NAME": server_name,
-                    "UNBOUND_MCP_DOMAIN": backend_url},
+                    "UNBOUND_MCP_DOMAIN": backend_url,
+                    "UNBOUND_DISCOVERY_BRANCH": _branch},
         }
         if os.name == "nt":
             popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -1714,6 +1738,9 @@ def _dispatch_discovery() -> None:
                 log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
                 return
 
+            _branch = _discovery_branch(backend_url)
+            _install_sh = _discovery_install_sh(_branch)
+
             if RUNNING_FROZEN:
                 # Frozen binary: never fetch install.sh — run the locally
                 # installed discovery binary, or skip if it isn't there.
@@ -1723,29 +1750,30 @@ def _dispatch_discovery() -> None:
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
                 DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if _install_sh_is_stale():
+                if _install_sh_is_stale(_install_sh):
                     fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
                     os.close(fd)
                     tmp = Path(_tmp)
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
+                        ["curl", "-fsSL", "-o", str(tmp), _discovery_install_url(_branch)],
                         capture_output=True, timeout=30,
                     )
                     if r.returncode == 0:
                         os.chmod(tmp, 0o755)
-                        os.replace(tmp, DISCOVERY_INSTALL_SH)
+                        os.replace(tmp, _install_sh)
                     else:
                         tmp.unlink(missing_ok=True)
-                        if not DISCOVERY_INSTALL_SH.exists():
+                        if not _install_sh.exists():
                             log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                             return
                         log_error(f"discovery install.sh refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                discovery_cmd = ["bash", str(_install_sh), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DISCOVERY_BRANCH": _branch}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:
