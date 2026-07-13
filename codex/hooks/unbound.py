@@ -65,11 +65,16 @@ def _discovery_branch(backend_url):
     override = (os.environ.get("UNBOUND_DISCOVERY_BRANCH") or "").strip().lower()
     if override in _ALLOWED_DISCOVERY_BRANCHES:
         return override
-    # Match "staging" in the URL HOST only (strip scheme, path/query, userinfo,
-    # port), so a "staging" fragment in the path or query of a production
-    # backend URL can't flip the branch. A staging backend always carries
-    # "staging" in its host.
-    host = (backend_url or "").split("://", 1)[-1].split("/", 1)[0]
+    # Match "staging" in the URL HOST only, so a "staging" fragment in the path,
+    # query or fragment of a production backend URL can't flip the branch. A
+    # staging backend always carries "staging" in its host.
+    #
+    # Cut at the first of / ? # -- a query or fragment can follow the host with
+    # no path at all (https://prod.getunbound.ai?env=staging) -- and only then
+    # strip userinfo, or an "@" inside a query would eat the host.
+    host = (backend_url or "").split("://", 1)[-1]
+    for sep in ("/", "?", "#"):
+        host = host.split(sep, 1)[0]
     host = host.split("@")[-1].split(":", 1)[0].lower()
     return "staging" if "staging" in host else DEFAULT_DISCOVERY_BRANCH
 
