@@ -1382,13 +1382,16 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
+    # Use cwd captured at session start instead of per-request
+    session_cwd = _get_session_cwd(session_id)
+
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'tool_use',
-        'cwd': event.get('cwd'),
-        'project': _get_project(event.get('cwd')),
+        'cwd': session_cwd,
+        'project': _get_project(session_cwd),
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
@@ -1558,13 +1561,16 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     model = event.get('model') or _get_session_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
 
+    # Use cwd captured at session start instead of per-request
+    session_cwd = _get_session_cwd(session_id)
+
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'user_prompt',
-        'cwd': event.get('cwd'),
-        'project': _get_project(event.get('cwd')),
+        'cwd': session_cwd,
+        'project': _get_project(session_cwd),
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
@@ -1574,14 +1580,14 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return response
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, session_cwd: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
     user_prompt = None
     session_id = None
     permission_mode = None
-    cwd = None
+    cwd = session_cwd  # Use the cwd passed in from session state
 
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1592,9 +1598,6 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
 
         if not permission_mode:
             permission_mode = event.get('permission_mode')
-
-        if not cwd:
-            cwd = event.get('cwd')
 
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
@@ -1784,6 +1787,7 @@ def process_stop_event(event: Dict, api_key: str):
         usage=transcript_usage,
         request_initialized=user_prompt_timestamp,
         request_completed=request_completed,
+        session_cwd=_get_session_cwd(session_id),
     )
 
     if exchange:
@@ -2230,14 +2234,23 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
+# Session-level state: store cwd per session to avoid re-extracting on every request
+_SESSION_CWD_CACHE = {}
+
+
+def _get_session_cwd(session_id: Optional[str]) -> Optional[str]:
+    """Get the working directory captured at session start."""
+    return _SESSION_CWD_CACHE.get(session_id) if session_id else None
+
+
 def main():
     global _cached_api_key
     api_key = get_api_key()
     _cached_api_key = api_key
-    
+
     try:
         input_data = sys.stdin.read().strip()
-        
+
         if not input_data:
             print('{"suppressOutput": true}', flush=True)
             return
@@ -2249,13 +2262,16 @@ def main():
             return
 
         hook_event_name = event.get('hook_event_name')
+        session_id = event.get('session_id')
 
-        # SessionStart fires once per session — natural TTL gate for the
-        # debounced discovery scan dispatch.
+        # SessionStart fires once per session — capture cwd once here for reuse
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
+            # Capture cwd at session start and cache it for the session lifetime
+            if session_id and 'cwd' in event:
+                _SESSION_CWD_CACHE[session_id] = event.get('cwd')
             print("{}")
             return
         session_id = event.get('session_id')
