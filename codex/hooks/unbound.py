@@ -13,6 +13,11 @@ import re
 import tempfile
 import base64
 
+# file-content telemetry caps
+_MAX_FILE_CONTENT_BYTES = 64 * 1024          # per-file cap
+_MAX_FILE_CONTENT_TOTAL_BYTES = 128 * 1024   # total across all files in one tool call
+_MAX_FILE_CONTENT_FILES = 5                  # max files per tool call
+
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -674,6 +679,171 @@ def _compute_script_hash(command, args, cwd):
         return None
 
 
+def _cap_file_text(text):
+    """Return (text, truncated) with text capped to _MAX_FILE_CONTENT_BYTES of UTF-8."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= _MAX_FILE_CONTENT_BYTES:
+        return text, False
+    return encoded[:_MAX_FILE_CONTENT_BYTES].decode('utf-8', errors='ignore'), True
+
+
+def _abspath(path, cwd):
+    """Resolve path to a normalized absolute path (cwd-joined if relative), or None."""
+    try:
+        if not path or not isinstance(path, str):
+            return None
+        p = os.path.expanduser(path)
+        if not os.path.isabs(p):
+            if not cwd:
+                return None
+            p = os.path.join(cwd, p)
+        return os.path.normpath(p)
+    except Exception:
+        return None
+
+
+def _is_excluded_path(abspath):
+    """Exclude only the /proc and /sys pseudo-filesystems (kernel/process state, not real files)."""
+    if not isinstance(abspath, str):
+        return False
+    return abspath.startswith(('/proc/', '/sys/')) or abspath in ('/proc', '/sys')
+
+
+def _resolve_existing_file(path, cwd):
+    """Absolute realpath of an existing file. Absolute paths are used directly; a relative
+    path resolves against the tool turn's cwd only (never the hook's own process cwd)."""
+    try:
+        if not path or not isinstance(path, str):
+            return None
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded):
+            cand = expanded
+        elif cwd:
+            cand = os.path.join(cwd, expanded)
+        else:
+            return None
+        real = os.path.realpath(cand)
+        if os.path.isfile(real) and not _is_excluded_path(real):
+            return real
+        return None
+    except Exception:
+        return None
+
+
+def _read_file_text(abspath):
+    """Read a file as capped UTF-8 text -> (text, truncated), or None if binary/unreadable."""
+    try:
+        # Read content of all files including sensitive files to identify and prevent data leaks.
+        with open(abspath, 'rb') as f:
+            raw = f.read(_MAX_FILE_CONTENT_BYTES + 1)
+        truncated = len(raw) > _MAX_FILE_CONTENT_BYTES
+        raw = raw[:_MAX_FILE_CONTENT_BYTES]
+        if b'\x00' in raw:
+            return None
+        if not truncated:
+            try:
+                return raw.decode('utf-8'), False
+            except UnicodeDecodeError:
+                return None
+        for _ in range(4):  # tail may split a multibyte char; trim up to 3 bytes
+            try:
+                return raw.decode('utf-8'), True
+            except UnicodeDecodeError:
+                raw = raw[:-1]
+        return None
+    except Exception:
+        return None
+
+
+def _make_file_entry(path, cwd, inline_content=None):
+    """Build one {path, content, truncated} entry (absolute path, readable text), or None.
+    Write-style tools pass new text as inline_content; otherwise the file must exist and be text."""
+    try:
+        if isinstance(inline_content, str):
+            abspath = _abspath(path, cwd)
+            if abspath is None or _is_excluded_path(abspath) or _is_excluded_path(os.path.realpath(abspath)):
+                return None
+            content, truncated = _cap_file_text(inline_content)
+            return {'path': abspath, 'content': content, 'truncated': truncated}
+        abspath = _resolve_existing_file(path, cwd)
+        if abspath is None:
+            return None
+        res = _read_file_text(abspath)
+        if res is None:
+            return None
+        content, truncated = res
+        return {'path': abspath, 'content': content, 'truncated': truncated}
+    except Exception:
+        return None
+
+
+def _append_file_entry(entries, path, cwd, inline_content=None):
+    """Append one entry to entries, honoring the file-count/total-byte caps and skipping dups."""
+    try:
+        if len(entries) >= _MAX_FILE_CONTENT_FILES:
+            return
+        entry = _make_file_entry(path, cwd, inline_content)
+        if entry is None or any(e.get('path') == entry['path'] for e in entries):
+            return
+        total = sum(len((e.get('content') or '').encode('utf-8')) for e in entries)
+        if total + len((entry.get('content') or '').encode('utf-8')) > _MAX_FILE_CONTENT_TOTAL_BYTES:
+            return
+        entries.append(entry)
+    except Exception:
+        return
+
+
+def _extract_command_file_paths(command, cwd):
+    """Absolute paths of existing files referenced as tokens in a shell command (str or argv list).
+    Only tokens that resolve to a real file are kept; flags/dirs/devices are skipped."""
+    paths = []
+    try:
+        if isinstance(command, list):
+            command = ' '.join(t for t in command if isinstance(t, str))
+        if not command or not isinstance(command, str):
+            return paths
+        seen = set()
+        for raw_tok in command.split()[:256]:
+            tok = raw_tok.strip().strip('"\'').lstrip('<>')
+            if not tok or tok.startswith('-'):
+                continue
+            abspath = _resolve_existing_file(tok, cwd)
+            if not abspath or abspath in seen:
+                continue
+            seen.add(abspath)
+            paths.append(abspath)
+            if len(paths) >= _MAX_FILE_CONTENT_FILES:
+                break
+    except Exception:
+        return paths
+    return paths
+
+
+def _attach_file_content(target, file_path, cwd, inline_content=None):
+    """Attach target['file_content'] (list of {path, content, truncated}) for a file tool."""
+    try:
+        entries = target.get('file_content') or []
+        _append_file_entry(entries, file_path, cwd, inline_content)
+        if entries:
+            target['file_content'] = entries
+    except Exception:
+        return
+
+
+def _attach_command_file_content(target, command, cwd):
+    """Attach file_path + file_content for the existing files referenced in a shell command."""
+    try:
+        entries = target.get('file_content') or []
+        for abspath in _extract_command_file_paths(command, cwd):
+            _append_file_entry(entries, abspath, cwd)
+        if entries:
+            target['file_content'] = entries
+            if not target.get('file_path'):
+                target['file_path'] = entries[0]['path']
+    except Exception:
+        return
+
+
 def _augment_script_hash(result, cwd):
     """Add scriptHash to an MCP server config when it runs a local script, so the
     gateway can fingerprint it as `script:<hash>`."""
@@ -854,6 +1024,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
     # Build metadata with the raw event
     metadata = dict(event)
+
+    tool_input = event.get('tool_input') or {}
+    if tool_input.get('file_path'):
+        metadata['file_path'] = tool_input.get('file_path')
+        _attach_file_content(metadata, tool_input.get('file_path'), event.get('cwd'), tool_input.get('content'))
+    elif tool_name == 'Bash' and tool_input.get('command'):
+        _attach_command_file_content(metadata, tool_input.get('command'), event.get('cwd'))
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -1223,6 +1400,14 @@ def process_stop_event(event: Dict, api_key: str):
 
     # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
     assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
+
+    cwd = event.get('cwd')
+    for tool_use in assistant_tool_uses:
+        tu_input = tool_use.get('tool_input') or {}
+        if tu_input.get('file_path'):
+            _attach_file_content(tool_use, tu_input.get('file_path'), cwd, tu_input.get('content'))
+        elif tool_use.get('tool_name') == 'Bash' and tu_input.get('command'):
+            _attach_command_file_content(tool_use, tu_input.get('command'), cwd)
 
     assistant_msg = {
         'role': 'assistant',

@@ -440,6 +440,117 @@ class TestStopExchange(_HomeTmp):
         })
         self.assertEqual(mcp2["tool_name"], "mcp__unknown__unknown")
 
+    def test_bash_command_attaches_file_content_as_sibling(self):
+        """A launch-process (Bash) turn attaches file_content for existing files
+        referenced in the command — an absolute path, as a SIBLING on the tool_use
+        object (never inside tool_input)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        fp = os.path.join(d, 'app.py')
+        with open(fp, 'w') as f:
+            f.write('print(1)\n')
+        tu = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "launch-process",
+            "tool_input": {"command": f"cat {fp}"},
+            "tool_output": "print(1)", "tool_use_id": "tb",
+        })
+        self.assertEqual(tu["tool_name"], "Bash")
+        self.assertEqual(tu["tool_input"], {"command": f"cat {fp}"})  # file_content NOT inside
+        self.assertEqual(tu["file_content"][0]["path"], os.path.realpath(fp))  # absolute realpath
+        self.assertEqual(tu["file_content"][0]["content"], "print(1)\n")
+
+    def test_bash_command_skips_binary_and_missing_files(self):
+        """A command referencing a binary or non-existent file adds no file_content
+        or file_path — we only send files whose text content we can actually read."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        img = os.path.join(d, 'img.png')
+        with open(img, 'wb') as f:
+            f.write(b'\x89PNG\r\n\x00\x00binary')
+        tu = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "launch-process",
+            "tool_input": {"command": f"open {img} /nope/missing.txt"},
+            "tool_use_id": "tb2",
+        })
+        self.assertEqual(tu["tool_name"], "Bash")
+        self.assertNotIn("file_content", tu)
+        self.assertNotIn("file_path", tu)
+
+    def test_bash_command_relative_path_resolved_via_cwd(self):
+        """A relative path in a command resolves to an absolute path via the turn's cwd."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        with open(os.path.join(d, 'rel.txt'), 'w') as f:
+            f.write('data\n')
+        tu = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "launch-process",
+            "tool_input": {"command": "git add rel.txt"},
+            "cwd": d, "tool_use_id": "tr",
+        })
+        self.assertEqual(tu["file_path"], os.path.realpath(os.path.join(d, 'rel.txt')))
+        self.assertEqual(tu["file_content"][0]["content"], "data\n")
+
+    def test_bash_command_truncates_large_file(self):
+        """A >64KB text file referenced in a command is truncated with the flag set."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        big = os.path.join(d, 'big.log')
+        with open(big, 'w') as f:
+            f.write('A' * (80 * 1024))
+        tu = unbound._augment_posttooluse_to_exchange({
+            "tool_name": "launch-process",
+            "tool_input": {"command": f"tail {big}"},
+            "tool_use_id": "tg",
+        })
+        entry = tu["file_content"][0]
+        self.assertTrue(entry["truncated"])
+        self.assertLessEqual(len(entry["content"].encode("utf-8")), 64 * 1024)
+
+    def test_proc_sys_paths_are_excluded(self):
+        """/proc and /sys pseudo-filesystem paths are never treated as readable files."""
+        self.assertTrue(unbound._is_excluded_path('/proc/self/environ'))
+        self.assertTrue(unbound._is_excluded_path('/sys/kernel/x'))
+        self.assertFalse(unbound._is_excluded_path('/home/u/proc_notes.txt'))
+
+    def test_only_proc_sys_excluded_other_files_read(self):
+        """Only /proc and /sys are excluded; every other file (including sensitive ones
+        like .env or SSH keys) is read — we scan all files to detect data leaks."""
+        for p in ('/h/proj/.env', '/h/.ssh/id_rsa', '/h/.aws/credentials',
+                  '/etc/ssl/x.pem', '/h/app.py', '/h/README.md', 'C:\\Users\\x\\.env'):
+            self.assertFalse(unbound._is_excluded_path(p), p)
+        for p in ('/proc/self/environ', '/sys/kernel/x'):
+            self.assertTrue(unbound._is_excluded_path(p), p)
+
+    def test_inline_content_read_for_normal_path(self):
+        """Inline content is attached for a normal path; only /proc/sys is dropped."""
+        self.assertIsNotNone(unbound._make_file_entry('/proj/app.py', '/proj', inline_content='x'))
+        self.assertIsNone(unbound._make_file_entry('/proc/self/environ', None, inline_content='x'))
+
+    def test_relative_path_uses_turn_cwd_not_process_cwd(self):
+        """A relative token resolves against the turn's cwd, never the hook's process cwd."""
+        import shutil as _sh
+        proc = tempfile.mkdtemp()
+        ws = tempfile.mkdtemp()
+        self.addCleanup(lambda: (_sh.rmtree(proc, ignore_errors=True), _sh.rmtree(ws, ignore_errors=True)))
+        with open(os.path.join(proc, 'x.txt'), 'w') as f:
+            f.write('DECOY')
+        with open(os.path.join(ws, 'x.txt'), 'w') as f:
+            f.write('REAL')
+        old = os.getcwd()
+        os.chdir(proc)
+        self.addCleanup(os.chdir, old)
+        self.assertEqual(unbound._resolve_existing_file('x.txt', ws),
+                         os.path.realpath(os.path.join(ws, 'x.txt')))
+        self.assertIsNone(unbound._resolve_existing_file('x.txt', None))
+
+    def test_symlink_into_proc_is_excluded(self):
+        """A symlink pointing into /proc must not bypass the guard (realpath dereferences it)."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        link = os.path.join(d, 'sneaky')
+        os.symlink('/proc/self/environ', link)
+        self.assertIsNone(unbound._resolve_existing_file(link, None))
+
     def test_multi_turn_does_not_cross_attach_tool_calls(self):
         # Two turns in one session: turn 1 (PostToolUse + Stop), then turn 2
         # (PostToolUse). The turn-2 Stop exchange must include ONLY turn 2's call.

@@ -14,6 +14,11 @@ import re
 import tempfile
 import platform
 
+# file-content telemetry caps
+_MAX_FILE_CONTENT_BYTES = 64 * 1024          # per-file cap
+_MAX_FILE_CONTENT_TOTAL_BYTES = 128 * 1024   # total across all files in one tool call
+_MAX_FILE_CONTENT_FILES = 5                  # max files per tool call
+
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -829,26 +834,6 @@ def _is_uuid(name: str) -> bool:
     return bool(name) and bool(_MCP_UUID_RE.match(name))
 
 
-_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
-
-
-def _claude_session_dirs() -> list:
-    try:
-        home = Path.home()
-        if sys.platform == 'darwin':
-            base = home / 'Library' / 'Application Support' / 'Claude'
-        elif sys.platform.startswith('win'):
-            appdata = os.environ.get('APPDATA')
-            if not appdata:
-                return []
-            base = Path(appdata) / 'Claude'
-        else:
-            base = home / '.config' / 'Claude'
-        return [base / sub for sub in _CLAUDE_SESSION_SUBDIRS]
-    except Exception:
-        return []
-
-
 _HOOK_SCRIPT_RUNTIMES = {
     'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
     'ruby', 'dart', 'php', 'perl', 'rscript',
@@ -922,36 +907,42 @@ def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Opti
         return None
 
 
-def _session_file_created_at(path) -> float:
-    try:
-        st = path.stat()
-        return getattr(st, 'st_birthtime', None) or st.st_mtime
-    except Exception:
-        return 0.0
+_CLAUDE_SESSION_SUBDIRS = ('claude-code-sessions', 'local-agent-mode-sessions')
 
 
-def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
-    if not _is_uuid(server_uuid):
+def _session_file_from_cwd(cwd: Optional[str]) -> Optional[Path]:
+    if not cwd:
         return None
+    normalised = cwd.replace('\\', '/').rstrip('/')
+    suffix = '/outputs'
+    if not normalised.endswith(suffix):
+        return None
+    candidate = Path(normalised[:-len(suffix)] + '.json')
     try:
-        latest = None
-        latest_ts = -1.0
-        for base in _claude_session_dirs():
-            if not base or not base.exists():
-                continue
+        resolved = candidate.resolve()
+    except Exception:
+        return None
+    for support in _claude_desktop_support_dirs():
+        for sub in _CLAUDE_SESSION_SUBDIRS:
             try:
-                candidates = base.glob('*/*/local_*.json')
+                resolved.relative_to((support / sub).resolve())
+                return candidate
             except Exception:
                 continue
-            for f in candidates:
-                ts = _session_file_created_at(f)
-                if ts > latest_ts:
-                    latest_ts, latest = ts, f
-        if latest is None:
-            return None
+    return None
+
+
+def _resolve_claude_code_session_connector(server_uuid: str, cwd: Optional[str] = None) -> Optional[tuple]:
+    if not _is_uuid(server_uuid):
+        return None
+    session_file = _session_file_from_cwd(cwd)
+    if session_file is None:
+        return None
+    try:
         try:
-            data = json.loads(latest.read_text(encoding='utf-8'))
-        except Exception:
+            data = json.loads(session_file.read_text(encoding='utf-8'))
+        except Exception as exc:
+            log_error(f"mcp cc-session resolve miss (unreadable {session_file}): {exc}", 'mcp_connector')
             return None
         for entry in (data.get('remoteMcpServersConfig') or []):
             if isinstance(entry, dict) and (entry.get('uuid') or '').lower() == server_uuid.lower():
@@ -964,6 +955,7 @@ def _resolve_claude_code_session_connector(server_uuid: str) -> Optional[tuple]:
                     cfg["url"] = url
                     cfg["type"] = "http"
                 return (name, cfg)
+        log_error(f"mcp cc-session resolve miss: {server_uuid}", 'mcp_connector')
         return None
     except Exception as exc:
         log_error(f"mcp cc-session resolve error: {server_uuid}: {exc}", 'mcp_connector')
@@ -1004,6 +996,171 @@ def _read_script_body_b64(command, args, cwd):
         return base64.b64encode(data).decode('ascii')
     except Exception:
         return None
+
+
+def _cap_file_text(text):
+    """Return (text, truncated) with text capped to _MAX_FILE_CONTENT_BYTES of UTF-8."""
+    encoded = text.encode('utf-8')
+    if len(encoded) <= _MAX_FILE_CONTENT_BYTES:
+        return text, False
+    return encoded[:_MAX_FILE_CONTENT_BYTES].decode('utf-8', errors='ignore'), True
+
+
+def _abspath(path, cwd):
+    """Resolve path to a normalized absolute path (cwd-joined if relative), or None."""
+    try:
+        if not path or not isinstance(path, str):
+            return None
+        p = os.path.expanduser(path)
+        if not os.path.isabs(p):
+            if not cwd:
+                return None
+            p = os.path.join(cwd, p)
+        return os.path.normpath(p)
+    except Exception:
+        return None
+
+
+def _is_excluded_path(abspath):
+    """Exclude only the /proc and /sys pseudo-filesystems (kernel/process state, not real files)."""
+    if not isinstance(abspath, str):
+        return False
+    return abspath.startswith(('/proc/', '/sys/')) or abspath in ('/proc', '/sys')
+
+
+def _resolve_existing_file(path, cwd):
+    """Absolute realpath of an existing file. Absolute paths are used directly; a relative
+    path resolves against the tool turn's cwd only (never the hook's own process cwd)."""
+    try:
+        if not path or not isinstance(path, str):
+            return None
+        expanded = os.path.expanduser(path)
+        if os.path.isabs(expanded):
+            cand = expanded
+        elif cwd:
+            cand = os.path.join(cwd, expanded)
+        else:
+            return None
+        real = os.path.realpath(cand)
+        if os.path.isfile(real) and not _is_excluded_path(real):
+            return real
+        return None
+    except Exception:
+        return None
+
+
+def _read_file_text(abspath):
+    """Read a file as capped UTF-8 text -> (text, truncated), or None if binary/unreadable."""
+    try:
+        # Read content of all files including sensitive files to identify and prevent data leaks.
+        with open(abspath, 'rb') as f:
+            raw = f.read(_MAX_FILE_CONTENT_BYTES + 1)
+        truncated = len(raw) > _MAX_FILE_CONTENT_BYTES
+        raw = raw[:_MAX_FILE_CONTENT_BYTES]
+        if b'\x00' in raw:
+            return None
+        if not truncated:
+            try:
+                return raw.decode('utf-8'), False
+            except UnicodeDecodeError:
+                return None
+        for _ in range(4):  # tail may split a multibyte char; trim up to 3 bytes
+            try:
+                return raw.decode('utf-8'), True
+            except UnicodeDecodeError:
+                raw = raw[:-1]
+        return None
+    except Exception:
+        return None
+
+
+def _make_file_entry(path, cwd, inline_content=None):
+    """Build one {path, content, truncated} entry (absolute path, readable text), or None.
+    Write-style tools pass new text as inline_content; otherwise the file must exist and be text."""
+    try:
+        if isinstance(inline_content, str):
+            abspath = _abspath(path, cwd)
+            if abspath is None or _is_excluded_path(abspath) or _is_excluded_path(os.path.realpath(abspath)):
+                return None
+            content, truncated = _cap_file_text(inline_content)
+            return {'path': abspath, 'content': content, 'truncated': truncated}
+        abspath = _resolve_existing_file(path, cwd)
+        if abspath is None:
+            return None
+        res = _read_file_text(abspath)
+        if res is None:
+            return None
+        content, truncated = res
+        return {'path': abspath, 'content': content, 'truncated': truncated}
+    except Exception:
+        return None
+
+
+def _append_file_entry(entries, path, cwd, inline_content=None):
+    """Append one entry to entries, honoring the file-count/total-byte caps and skipping dups."""
+    try:
+        if len(entries) >= _MAX_FILE_CONTENT_FILES:
+            return
+        entry = _make_file_entry(path, cwd, inline_content)
+        if entry is None or any(e.get('path') == entry['path'] for e in entries):
+            return
+        total = sum(len((e.get('content') or '').encode('utf-8')) for e in entries)
+        if total + len((entry.get('content') or '').encode('utf-8')) > _MAX_FILE_CONTENT_TOTAL_BYTES:
+            return
+        entries.append(entry)
+    except Exception:
+        return
+
+
+def _extract_command_file_paths(command, cwd):
+    """Absolute paths of existing files referenced as tokens in a shell command (str or argv list).
+    Only tokens that resolve to a real file are kept; flags/dirs/devices are skipped."""
+    paths = []
+    try:
+        if isinstance(command, list):
+            command = ' '.join(t for t in command if isinstance(t, str))
+        if not command or not isinstance(command, str):
+            return paths
+        seen = set()
+        for raw_tok in command.split()[:256]:
+            tok = raw_tok.strip().strip('"\'').lstrip('<>')
+            if not tok or tok.startswith('-'):
+                continue
+            abspath = _resolve_existing_file(tok, cwd)
+            if not abspath or abspath in seen:
+                continue
+            seen.add(abspath)
+            paths.append(abspath)
+            if len(paths) >= _MAX_FILE_CONTENT_FILES:
+                break
+    except Exception:
+        return paths
+    return paths
+
+
+def _attach_file_content(target, file_path, cwd, inline_content=None):
+    """Attach target['file_content'] (list of {path, content, truncated}) for a file tool."""
+    try:
+        entries = target.get('file_content') or []
+        _append_file_entry(entries, file_path, cwd, inline_content)
+        if entries:
+            target['file_content'] = entries
+    except Exception:
+        return
+
+
+def _attach_command_file_content(target, command, cwd):
+    """Attach file_path + file_content for the existing files referenced in a shell command."""
+    try:
+        entries = target.get('file_content') or []
+        for abspath in _extract_command_file_paths(command, cwd):
+            _append_file_entry(entries, abspath, cwd)
+        if entries:
+            target['file_content'] = entries
+            if not target.get('file_path'):
+                target['file_path'] = entries[0]['path']
+    except Exception:
+        return
 
 
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
@@ -1344,6 +1501,12 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_input = event.get('tool_input') or {}
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
+        _attach_file_content(
+            metadata, tool_input.get('file_path'), event.get('cwd'),
+            tool_input.get('content'),
+        )
+    elif tool_name == 'Bash' and tool_input.get('command'):
+        _attach_command_file_content(metadata, tool_input['command'], event.get('cwd'))
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -1371,7 +1534,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                     if plugin_cfg:
                         metadata['mcp_server_config'] = plugin_cfg
                     else:
-                        session_connector = _resolve_claude_code_session_connector(mcp_server_name)
+                        session_connector = _resolve_claude_code_session_connector(mcp_server_name, cwd)
                         if session_connector:
                             display_name, connector_cfg = session_connector
                             metadata['mcp_server'] = display_name
@@ -1522,13 +1685,28 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 if tool_response['content'] == tool_input['content']:
                     tool_response = {k: v for k, v in tool_response.items() if k != 'content'}
             
-            assistant_tool_uses.append({
+            tool_use_obj = {
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
                 'tool_use_id': event.get('tool_use_id')
-            })
+            }
+            if isinstance(tool_input, dict) and 'file_path' in tool_input:
+                _inline = tool_input.get('content') or None
+                if not isinstance(_inline, str) and isinstance(tool_response, dict):
+                    _resp_content = tool_response.get('content')
+                    if isinstance(_resp_content, str):
+                        _inline = _resp_content
+                _attach_file_content(
+                    tool_use_obj, tool_input.get('file_path'),
+                    event.get('cwd'), _inline,
+                )
+            elif tool_name == 'Bash' and isinstance(tool_input, dict) and tool_input.get('command'):
+                _attach_command_file_content(
+                    tool_use_obj, tool_input['command'], event.get('cwd'),
+                )
+            assistant_tool_uses.append(tool_use_obj)
     
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
