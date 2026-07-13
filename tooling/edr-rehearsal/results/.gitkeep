@@ -1,0 +1,2 @@
+# Rehearsal results land here, tagged {artifact}_{allowlist}_{run-id}.
+# Captures may contain endpoint hostnames / fixture data — do not commit them.
