@@ -123,6 +123,11 @@ POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
+# Sentinel hook_event_name for the agent-audit.log rows that record which toolCallIds
+# were already forwarded, so a later Stop sends only new tool calls. Not a real Copilot
+# event: every existing reader filters by its own event name and skips it, and
+# cleanup_old_logs prunes it per-session like any other row (no new file, no new state).
+FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
 
 # Ensure log directory exists
 try:
@@ -315,32 +320,118 @@ def append_to_audit_log(event_data):
 
 
 def cleanup_old_logs():
-    """Manage log file size by keeping only the most recent session's entries
-    once the audit log exceeds AUDIT_LOG_TOTAL_LIMIT."""
+    """Manage log file size by keeping only the most recent session's entries once the
+    audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
+    handled separately: excluded from session grouping (their key is transcript-derived,
+    not the payload session_id, so they must not be mistaken for a distinct session) and
+    always retained (last few sessions' consolidated markers), so a long session's dedup
+    state is never evicted."""
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
+    def _is_marker(log):
+        return log.get('event', {}).get('hook_event_name') == FORWARDED_TOOLS_EVENT
+
+    markers = [log for log in logs if _is_marker(log)]
+    entries = [log for log in logs if not _is_marker(log)]
+
     session_order = []
     seen_sessions = set()
-
-    for log in logs:
-        event = log.get('event', {})
-        session_id = event.get('session_id')
+    for log in entries:
+        session_id = log.get('event', {}).get('session_id')
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
 
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
-        kept_logs = [
-            log for log in logs
-            if log.get('event', {}).get('session_id') == most_recent_session
-        ]
-        save_logs(kept_logs)
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        kept = [log for log in entries
+                if log.get('event', {}).get('session_id') == most_recent_session]
+    elif len(entries) > AUDIT_LOG_TOTAL_LIMIT:
+        kept = entries[-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept = entries
+    # Always keep the watermark markers (one small consolidated row per session; the
+    # active session's is always the newest), bounded to the most recent sessions.
+    save_logs(kept + markers[-20:])
+
+
+def stop_session_key(event):
+    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
+    path FIRST -- it is constant for a session and present on every Stop that builds an
+    exchange -- so the key never flips between Stops that do and don't carry session_id
+    (which would split the watermark and resend the whole history). Falls back to
+    session_id only when there is no transcript path."""
+    tp = event.get('transcript_path')
+    if tp:
+        p = Path(tp)
+        return p.parent.name if p.stem == 'events' else p.stem
+    return event.get('session_id') or event.get('sessionId')
+
+
+def get_forwarded_state(session_id):
+    """(forwarded toolCallIds, last-sent text signature) for this session, from the
+    consolidated audit-log marker. Lets each Stop send only new tool calls, and skip a
+    Stop whose text+tools are both unchanged from the last send.
+
+    This is a best-effort PAYLOAD OPTIMIZATION, not a security control: the audit log is
+    user-writable, so a local process could forge `_unbound_forwarded` rows to omit tools
+    from the exchange. That's not a new exposure -- the hook already runs as the user and
+    the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
+    the integrity backstop. Keyed on bare ids only for that reason (never trusted for
+    enforcement)."""
+    sent, last_sig = set(), None
+    if not session_id:
+        return sent, last_sig
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        ids = event.get('forwarded_tool_ids')
+        if isinstance(ids, list):
+            sent.update(ids)
+        sig = event.get('text_sig')
+        if sig:
+            last_sig = sig
+    return sent, last_sig
+
+
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
+    """Persist the forwarded toolCallIds + the last-sent text signature for this session as
+    a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
+    cumulative marker -- rather than one append per Stop -- means it survives
+    cleanup_old_logs' last-N trim in a long session, so old ids aren't forgotten and their
+    tool calls resent. Called after a successful send; a failed send simply resends next
+    Stop (the backend dedups)."""
+    if not session_id:
+        return
+    merged = set(tool_ids or ())
+    kept = []
+    for log in load_existing_logs():
+        ev = log.get('event', {})
+        if (ev.get('hook_event_name') == FORWARDED_TOOLS_EVENT
+                and ev.get('session_id') == session_id):
+            ids = ev.get('forwarded_tool_ids')
+            if isinstance(ids, list):
+                merged.update(ids)
+            if text_sig is None:
+                text_sig = ev.get('text_sig')  # carry forward the last known text sig
+            continue  # drop the old marker; a fresh consolidated one is appended below
+        kept.append(log)
+    kept.append({
+        'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+        'event': {
+            'hook_event_name': FORWARDED_TOOLS_EVENT,
+            'session_id': session_id,
+            'forwarded_tool_ids': sorted(merged),
+            'text_sig': text_sig,
+        },
+    })
+    save_logs(kept)
 
 
 def get_recent_user_prompts_for_session(session_id, n):
@@ -1281,12 +1372,22 @@ def map_copilot_tool(name, args, result_content):
     return {k: v for k, v in entry.items() if v != ''}
 
 
-def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None):
+def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None,
+                                   already_forwarded=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
 
-    Reads defensively — blank or unparseable lines are skipped, never raised."""
+    Reads defensively — blank or unparseable lines are skipped, never raised.
+
+    Copilot fires a Stop per agent turn but the transcript slice below spans every
+    turn since the last user message, so without a guard each Stop re-sends the whole
+    accumulated tool history. `already_forwarded` is the set of toolCallIds sent on
+    earlier Stops of this session (from the audit-log markers); tool calls in it are
+    skipped so only NEW ones ride each request. Returns (exchange, forwarded_now, text_sig) where forwarded_now is the set of
+    toolCallIds included this time and text_sig fingerprints the turn's text — the caller
+    records them only after a successful send, so a failed send simply retries."""
+    already_forwarded = already_forwarded or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None
+        return None, set(), None
 
     entries = []
     try:
@@ -1300,7 +1401,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None
+        return None, set(), None
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -1329,7 +1430,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             last_user_index = i
 
     if last_user_index < 0:
-        return None
+        return None, set(), None
 
     user_prompt = (entries[last_user_index].get('data') or {}).get('content')
 
@@ -1384,13 +1485,28 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call['result'] = result.get('content')
 
     tool_use = []
+    forwarded_now = set()
     for call_id in tool_calls:
+        if call_id in already_forwarded:
+            continue  # sent on an earlier Stop of this session — don't resend
         call = tool_data[call_id]
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
+        # Advance the watermark for EVERY handled call, mapped or not: an internal tool
+        # maps to None (nothing to send) but must still be recorded, else a turn of only
+        # internal tools is reparsed on every later Stop and never records progress.
+        forwarded_now.add(call_id)
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
             tool_use.append(mapped)
+
+    # Signature of the turn's user+assistant TEXT (independent of tool_use). The caller
+    # sends when there are new tools OR new text, and no-ops only when BOTH are unchanged
+    # from the last successful send. So a pure tool-replay doesn't re-post, but a Stop
+    # that appended new assistant text still sends (and is logged) even with no new tools.
+    text_sig = hashlib.sha256(
+        '\x1f'.join([user_prompt or ''] + text_parts).encode('utf-8', 'replace')
+    ).hexdigest()
 
     messages = []
     if user_prompt:
@@ -1402,13 +1518,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None
+        return None, set(), None
 
     return {
         'conversation_id': conversation_id,
         'model': model or session_start_model or 'auto',
         'messages': messages,
-    }
+    }, forwarded_now, text_sig
 
 
 def send_to_api(exchange, api_key):
@@ -1770,17 +1886,29 @@ def main():
 
         if event_name == 'Stop':
             session_id = event.get('session_id')
-            exchange = build_exchange_from_transcript(
+            # Watermark key mirrors the exchange's session fallback, so get/record stay
+            # consistent even when the Stop payload omits session_id.
+            wm_key = stop_session_key(event)
+            already_forwarded, last_text_sig = get_forwarded_state(wm_key)
+            exchange, forwarded_now, text_sig = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
+                already_forwarded=already_forwarded,
             )
-            if exchange:
+            # Send only when there is something new -- new tool calls OR new assistant
+            # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
+            # (even with no new tools) is still sent and logged.
+            if exchange and (forwarded_now or text_sig != last_text_sig):
                 # Turn boundaries from event-fire times
                 request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
-                send_to_api(exchange, api_key)
+                # Record only after the send succeeds, so a failed send retries next Stop
+                # (the backend dedups). Updates the text signature too, even with no new
+                # tools, so an unchanged later Stop becomes a no-op.
+                if send_to_api(exchange, api_key):
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
