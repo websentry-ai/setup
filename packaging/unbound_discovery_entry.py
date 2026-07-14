@@ -31,7 +31,7 @@ import sys
 # TODO(WEB-4802): hook and discovery versions must be bumped in lockstep on
 # every tag until build-time version injection lands (the workflow already
 # notes this). Keep this equal to unbound_hook.__version__ until then.
-__version__ = "0.1.11"
+__version__ = "0.1.12"
 
 
 def _missing_required_config(argv):
