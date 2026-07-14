@@ -349,24 +349,22 @@ def cleanup_old_logs():
 
 
 def stop_session_key(event):
-    """Stable per-session key for the forwarded-tool watermark. Mirrors
-    build_exchange_from_transcript's fallback so get/record agree even when the Stop
-    payload omits session_id (the CLI/extension still build+send via the transcript);
-    without this the watermark would never persist and every Stop would resend the
-    whole tool history."""
-    sid = event.get('session_id') or event.get('sessionId')
-    if sid:
-        return sid
+    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
+    path FIRST -- it is constant for a session and present on every Stop that builds an
+    exchange -- so the key never flips between Stops that do and don't carry session_id
+    (which would split the watermark and resend the whole history). Falls back to
+    session_id only when there is no transcript path."""
     tp = event.get('transcript_path')
     if tp:
         p = Path(tp)
         return p.parent.name if p.stem == 'events' else p.stem
-    return None
+    return event.get('session_id') or event.get('sessionId')
 
 
-def get_forwarded_tool_ids(session_id):
-    """toolCallIds already forwarded for this session, unioned from the audit-log
-    marker rows. Lets each Stop send only new tool calls, not the whole transcript.
+def get_forwarded_state(session_id):
+    """(forwarded toolCallIds, last-sent text signature) for this session, from the
+    consolidated audit-log marker. Lets each Stop send only new tool calls, and skip a
+    Stop whose text+tools are both unchanged from the last send.
 
     This is a best-effort PAYLOAD OPTIMIZATION, not a security control: the audit log is
     user-writable, so a local process could forge `_unbound_forwarded` rows to omit tools
@@ -374,9 +372,9 @@ def get_forwarded_tool_ids(session_id):
     the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
     the integrity backstop. Keyed on bare ids only for that reason (never trusted for
     enforcement)."""
+    sent, last_sig = set(), None
     if not session_id:
-        return set()
-    sent = set()
+        return sent, last_sig
     for log in load_existing_logs():
         event = log.get('event', {})
         if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
@@ -386,18 +384,22 @@ def get_forwarded_tool_ids(session_id):
         ids = event.get('forwarded_tool_ids')
         if isinstance(ids, list):
             sent.update(ids)
-    return sent
+        sig = event.get('text_sig')
+        if sig:
+            last_sig = sig
+    return sent, last_sig
 
 
-def record_forwarded_tool_ids(session_id, tool_ids):
-    """Persist the toolCallIds forwarded for this session as a SINGLE consolidated marker,
-    rewritten (re-appended last) on each Stop. Keeping one cumulative marker -- rather than
-    one append per Stop -- means it survives cleanup_old_logs' last-N trim in a long
-    session, so old ids aren't forgotten and their tool calls resent. Called after a
-    successful send; a failed send simply resends next Stop (the backend dedups)."""
-    if not session_id or not tool_ids:
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
+    """Persist the forwarded toolCallIds + the last-sent text signature for this session as
+    a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
+    cumulative marker -- rather than one append per Stop -- means it survives
+    cleanup_old_logs' last-N trim in a long session, so old ids aren't forgotten and their
+    tool calls resent. Called after a successful send; a failed send simply resends next
+    Stop (the backend dedups)."""
+    if not session_id:
         return
-    merged = set(tool_ids)
+    merged = set(tool_ids or ())
     kept = []
     for log in load_existing_logs():
         ev = log.get('event', {})
@@ -406,6 +408,8 @@ def record_forwarded_tool_ids(session_id, tool_ids):
             ids = ev.get('forwarded_tool_ids')
             if isinstance(ids, list):
                 merged.update(ids)
+            if text_sig is None:
+                text_sig = ev.get('text_sig')  # carry forward the last known text sig
             continue  # drop the old marker; a fresh consolidated one is appended below
         kept.append(log)
     kept.append({
@@ -414,6 +418,7 @@ def record_forwarded_tool_ids(session_id, tool_ids):
             'hook_event_name': FORWARDED_TOOLS_EVENT,
             'session_id': session_id,
             'forwarded_tool_ids': sorted(merged),
+            'text_sig': text_sig,
         },
     })
     save_logs(kept)
@@ -1367,12 +1372,12 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     turn since the last user message, so without a guard each Stop re-sends the whole
     accumulated tool history. `already_forwarded` is the set of toolCallIds sent on
     earlier Stops of this session (from the audit-log markers); tool calls in it are
-    skipped so only NEW ones ride each request. Returns (exchange, forwarded_now) where
-    forwarded_now is the set of toolCallIds actually included this time — the caller
+    skipped so only NEW ones ride each request. Returns (exchange, forwarded_now, text_sig) where forwarded_now is the set of
+    toolCallIds included this time and text_sig fingerprints the turn's text — the caller
     records them only after a successful send, so a failed send simply retries."""
     already_forwarded = already_forwarded or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None, set()
+        return None, set(), None
 
     entries = []
     try:
@@ -1386,7 +1391,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None, set()
+        return None, set(), None
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -1415,7 +1420,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             last_user_index = i
 
     if last_user_index < 0:
-        return None, set()
+        return None, set(), None
 
     user_prompt = (entries[last_user_index].get('data') or {}).get('content')
 
@@ -1485,12 +1490,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         if mapped is not None:
             tool_use.append(mapped)
 
-    # Pure tool-replay: the slice has tool calls but every one was already forwarded, so
-    # there is nothing new to report -- make it a true no-op instead of re-posting the
-    # same user/assistant exchange each Stop. A text-only turn (no tool calls at all)
-    # still falls through and sends, so the assistant response is still logged once.
-    if tool_calls and not forwarded_now:
-        return None, set()
+    # Signature of the turn's user+assistant TEXT (independent of tool_use). The caller
+    # sends when there are new tools OR new text, and no-ops only when BOTH are unchanged
+    # from the last successful send. So a pure tool-replay doesn't re-post, but a Stop
+    # that appended new assistant text still sends (and is logged) even with no new tools.
+    text_sig = hashlib.sha256(
+        '\x1f'.join([user_prompt or ''] + text_parts).encode('utf-8', 'replace')
+    ).hexdigest()
 
     messages = []
     if user_prompt:
@@ -1502,13 +1508,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None, set()
+        return None, set(), None, None
 
     return {
         'conversation_id': conversation_id,
         'model': model or session_start_model or 'auto',
         'messages': messages,
-    }, forwarded_now
+    }, forwarded_now, text_sig
 
 
 def send_to_api(exchange, api_key):
@@ -1873,22 +1879,26 @@ def main():
             # Watermark key mirrors the exchange's session fallback, so get/record stay
             # consistent even when the Stop payload omits session_id.
             wm_key = stop_session_key(event)
-            already_forwarded = get_forwarded_tool_ids(wm_key)
-            exchange, forwarded_now = build_exchange_from_transcript(
+            already_forwarded, last_text_sig = get_forwarded_state(wm_key)
+            exchange, forwarded_now, text_sig = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
                 already_forwarded=already_forwarded,
             )
-            if exchange:
+            # Send only when there is something new -- new tool calls OR new assistant
+            # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
+            # (even with no new tools) is still sent and logged.
+            if exchange and (forwarded_now or text_sig != last_text_sig):
                 # Turn boundaries from event-fire times
                 request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
-                # Mark the tool calls as forwarded only after the send succeeds, so a
-                # failed send retries them on the next Stop (the backend dedups).
-                if send_to_api(exchange, api_key) and forwarded_now:
-                    record_forwarded_tool_ids(wm_key, forwarded_now)
+                # Record only after the send succeeds, so a failed send retries next Stop
+                # (the backend dedups). Updates the text signature too, even with no new
+                # tools, so an unchanged later Stop becomes a no-op.
+                if send_to_api(exchange, api_key):
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
