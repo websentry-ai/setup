@@ -24,8 +24,6 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
@@ -815,9 +813,11 @@ def extract_command_for_pretool(canonical, tool_input):
     if canonical == 'Bash':
         # Shell tools key the payload differently: run_in_terminal/bash use
         # `command`; send_to_terminal and some variants use `input`/`text`.
+        # `value` holds an unparseable raw payload preserved by _normalize_arguments.
         # Try all so the policy check never sees an empty command for a real
         # shell execution.
-        return tool_input.get('command') or tool_input.get('input') or tool_input.get('text') or ''
+        return (tool_input.get('command') or tool_input.get('input')
+                or tool_input.get('text') or tool_input.get('value') or '')
     if canonical in ('Read', 'Write', 'Edit'):
         return tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path') or ''
     if canonical.startswith('mcp'):
@@ -1013,7 +1013,10 @@ def transform_response_for_copilot_prompt(api_response):
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
-    tool_input = event.get('tool_input') or event.get('toolArgs') or {}
+    # VS Code can hand toolArgs over as a JSON string. Every reader below calls
+    # tool_input.get(), so normalize once here — a raw str raised out of the hook, and a
+    # hook that raises fails open, so the tool ran with no policy check at all.
+    tool_input = _normalize_arguments(event.get('tool_input') or event.get('toolArgs') or {})
     session_id = event.get('session_id') or event.get('sessionId')
 
     # Translate the Copilot tool name to the canonical gateway vocabulary.
@@ -1216,7 +1219,9 @@ def _normalize_arguments(arguments):
         try:
             parsed = json.loads(arguments)
             return parsed if isinstance(parsed, dict) else {'value': arguments}
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # RecursionError (deeply nested args) is not a ValueError, and an uncaught one
+            # here fails the hook open — keep the raw payload so the policy check still sees it.
             return {'value': arguments}
     return {}
 
@@ -1594,72 +1599,7 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _hook_discovery_enabled_for_org() -> bool:
-    """Return whether SessionStart-triggered discovery is enabled for this
-    user's org. Reads ~/.unbound/discovery-cache.json first; refetches from
-    the gateway only when the cached value is missing or older than
-    DISCOVERY_HOOK_FLAG_TTL_SECONDS. Fail-closed: any error and no usable
-    cached value means False."""
-    cache = {}
-    if DISCOVERY_CACHE_PATH.exists():
-        try:
-            with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
-                cache = json.load(f) or {}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
-    if not isinstance(cache, dict):
-        cache = {}
-    _hd = cache.get("hook_discovery")
-    flag = _hd if isinstance(_hd, dict) else {}
-    last_fetched = flag.get("fetched_at")
-    if isinstance(last_fetched, str):
-        try:
-            ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-            if (time.time() - ts) < DISCOVERY_HOOK_FLAG_TTL_SECONDS:
-                return bool(flag.get("enabled", False))
-        except ValueError:
-            pass
-
-    try:
-        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
-        return bool(flag.get("enabled", False))
-    api_key = cfg.get("api_key")
-    if not api_key:
-        return bool(flag.get("enabled", False))
-    try:
-        r = subprocess.run(
-            ["curl", "-fsSL",
-             "-H", f"Authorization: Bearer {api_key}",
-             "--max-time", "5",
-             f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"],
-            capture_output=True, timeout=8,
-        )
-        if r.returncode != 0:
-            return bool(flag.get("enabled", False))
-        enabled = bool(json.loads(r.stdout.decode("utf-8", errors="replace")).get("enabled", False))
-    except Exception:
-        return bool(flag.get("enabled", False))
-
-    cache["hook_discovery"] = {
-        "enabled": enabled,
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, sort_keys=True)
-        os.replace(tmp, DISCOVERY_CACHE_PATH)
-    except OSError:
-        pass
-    return enabled
-
-
 def _dispatch_discovery() -> None:
-    if not _hook_discovery_enabled_for_org():
-        return
     try:
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
