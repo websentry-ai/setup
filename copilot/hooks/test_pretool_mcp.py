@@ -250,6 +250,43 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertFalse(self.is_block(ret))
 
 
+class TestStringToolArgs(ProcessPreToolUseBase):
+    """VS Code sends toolArgs as a JSON string. The command must still reach the policy
+    check — a hook that raises fails open, so the tool would run unchecked."""
+
+    def _command_sent(self, tool_args, raw_tool="run_in_terminal"):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["cmd"] = request_body["pre_tool_use_data"]["command"]
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": raw_tool,
+            "toolArgs": tool_args, "cwd": self.cwd, "session_id": "s",
+        }
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+        return captured.get("cmd")
+
+    def test_json_string_toolargs_command_reaches_gateway(self):
+        self.assertEqual(
+            self._command_sent('{"command": "rm -rf /tmp/x"}'), "rm -rf /tmp/x")
+
+    def test_non_json_string_toolargs_command_reaches_gateway(self):
+        # Unparseable payload is preserved verbatim, not dropped for want of a dict.
+        self.assertEqual(self._command_sent('rm -rf /tmp/x'), "rm -rf /tmp/x")
+
+    def test_deeply_nested_toolargs_does_not_fail_open(self):
+        # json.loads raises RecursionError (not a ValueError) well before 2000 levels.
+        nested = '{"command": "ls", "pad": ' + '[' * 2000 + ']' * 2000 + '}'
+        self.assertIn("ls", self._command_sent(nested))
+
+    def test_json_array_toolargs_does_not_crash(self):
+        self.assertEqual(self._command_sent('["ls", "-la"]'), '["ls", "-la"]')
+
+
 class TestUnresolvedForwarding(ProcessPreToolUseBase):
     def test_unresolved_mcp_is_forwarded_to_gateway_not_short_circuited(self):
         # An unmappable mcp_ call must still reach the gateway, not return {} early.
