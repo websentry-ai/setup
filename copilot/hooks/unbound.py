@@ -123,6 +123,11 @@ POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
+# Sentinel hook_event_name for the agent-audit.log rows that record which toolCallIds
+# were already forwarded, so a later Stop sends only new tool calls. Not a real Copilot
+# event: every existing reader filters by its own event name and skips it, and
+# cleanup_old_logs prunes it per-session like any other row (no new file, no new state).
+FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
 
 # Ensure log directory exists
 try:
@@ -341,6 +346,40 @@ def cleanup_old_logs():
         save_logs(kept_logs)
     elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+
+
+def get_forwarded_tool_ids(session_id):
+    """toolCallIds already forwarded for this session, unioned from the audit-log
+    marker rows. Lets each Stop send only new tool calls, not the whole transcript."""
+    if not session_id:
+        return set()
+    sent = set()
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        ids = event.get('forwarded_tool_ids')
+        if isinstance(ids, list):
+            sent.update(ids)
+    return sent
+
+
+def record_forwarded_tool_ids(session_id, tool_ids):
+    """Append one marker row recording the toolCallIds just forwarded (only the new
+    ids, a small append). Called after a successful send; a failed send simply
+    resends next Stop (the backend dedups)."""
+    if not session_id or not tool_ids:
+        return
+    append_to_audit_log({
+        'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+        'event': {
+            'hook_event_name': FORWARDED_TOOLS_EVENT,
+            'session_id': session_id,
+            'forwarded_tool_ids': sorted(tool_ids),
+        },
+    })
 
 
 def get_recent_user_prompts_for_session(session_id, n):
@@ -1281,12 +1320,22 @@ def map_copilot_tool(name, args, result_content):
     return {k: v for k, v in entry.items() if v != ''}
 
 
-def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None):
+def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None,
+                                   already_forwarded=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
 
-    Reads defensively — blank or unparseable lines are skipped, never raised."""
+    Reads defensively — blank or unparseable lines are skipped, never raised.
+
+    Copilot fires a Stop per agent turn but the transcript slice below spans every
+    turn since the last user message, so without a guard each Stop re-sends the whole
+    accumulated tool history. `already_forwarded` is the set of toolCallIds sent on
+    earlier Stops of this session (from the audit-log markers); tool calls in it are
+    skipped so only NEW ones ride each request. Returns (exchange, forwarded_now) where
+    forwarded_now is the set of toolCallIds actually included this time — the caller
+    records them only after a successful send, so a failed send simply retries."""
+    already_forwarded = already_forwarded or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None
+        return None, set()
 
     entries = []
     try:
@@ -1300,7 +1349,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None
+        return None, set()
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -1329,7 +1378,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             last_user_index = i
 
     if last_user_index < 0:
-        return None
+        return None, set()
 
     user_prompt = (entries[last_user_index].get('data') or {}).get('content')
 
@@ -1384,13 +1433,17 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call['result'] = result.get('content')
 
     tool_use = []
+    forwarded_now = set()
     for call_id in tool_calls:
+        if call_id in already_forwarded:
+            continue  # sent on an earlier Stop of this session — don't resend
         call = tool_data[call_id]
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
             tool_use.append(mapped)
+            forwarded_now.add(call_id)
 
     messages = []
     if user_prompt:
@@ -1402,13 +1455,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None
+        return None, set()
 
     return {
         'conversation_id': conversation_id,
         'model': model or session_start_model or 'auto',
         'messages': messages,
-    }
+    }, forwarded_now
 
 
 def send_to_api(exchange, api_key):
@@ -1770,9 +1823,11 @@ def main():
 
         if event_name == 'Stop':
             session_id = event.get('session_id')
-            exchange = build_exchange_from_transcript(
+            already_forwarded = get_forwarded_tool_ids(session_id)
+            exchange, forwarded_now = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
+                already_forwarded=already_forwarded,
             )
             if exchange:
                 # Turn boundaries from event-fire times
@@ -1780,7 +1835,10 @@ def main():
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
-                send_to_api(exchange, api_key)
+                # Mark the tool calls as forwarded only after the send succeeds, so a
+                # failed send retries them on the next Stop (the backend dedups).
+                if send_to_api(exchange, api_key) and forwarded_now:
+                    record_forwarded_tool_ids(session_id, forwarded_now)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
