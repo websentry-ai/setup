@@ -70,14 +70,9 @@ def sandbox_home(tmp_path):
 
 @pytest.fixture
 def discovery_enabled_home(sandbox_home):
-    """Sandbox home where the org discovery flag is freshly cached as enabled
-    and an api key exists — the state in which SessionStart would normally
-    dispatch a discovery run."""
-    import datetime
+    """Sandbox home with an api key and base_url present — the state in which
+    SessionStart dispatches a discovery run."""
     (sandbox_home / ".unbound").mkdir()
     (sandbox_home / ".unbound" / "config.json").write_text(json.dumps(
         {"api_key": "test-key", "base_url": "https://backend.example"}))
-    now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    (sandbox_home / ".unbound" / "discovery-cache.json").write_text(json.dumps(
-        {"hook_discovery": {"enabled": True, "fetched_at": now}}))
     return sandbox_home
