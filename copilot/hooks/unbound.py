@@ -815,9 +815,11 @@ def extract_command_for_pretool(canonical, tool_input):
     if canonical == 'Bash':
         # Shell tools key the payload differently: run_in_terminal/bash use
         # `command`; send_to_terminal and some variants use `input`/`text`.
+        # `value` holds an unparseable raw payload preserved by _normalize_arguments.
         # Try all so the policy check never sees an empty command for a real
         # shell execution.
-        return tool_input.get('command') or tool_input.get('input') or tool_input.get('text') or ''
+        return (tool_input.get('command') or tool_input.get('input')
+                or tool_input.get('text') or tool_input.get('value') or '')
     if canonical in ('Read', 'Write', 'Edit'):
         return tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path') or ''
     if canonical.startswith('mcp'):
@@ -1013,7 +1015,10 @@ def transform_response_for_copilot_prompt(api_response):
 def process_pre_tool_use(event, api_key):
     """Process PreToolUse event - check policy before tool execution."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
-    tool_input = event.get('tool_input') or event.get('toolArgs') or {}
+    # VS Code can hand toolArgs over as a JSON string. Every reader below calls
+    # tool_input.get(), so normalize once here — a raw str raised out of the hook, and a
+    # hook that raises fails open, so the tool ran with no policy check at all.
+    tool_input = _normalize_arguments(event.get('tool_input') or event.get('toolArgs') or {})
     session_id = event.get('session_id') or event.get('sessionId')
 
     # Translate the Copilot tool name to the canonical gateway vocabulary.
@@ -1216,7 +1221,9 @@ def _normalize_arguments(arguments):
         try:
             parsed = json.loads(arguments)
             return parsed if isinstance(parsed, dict) else {'value': arguments}
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # RecursionError (deeply nested args) is not a ValueError, and an uncaught one
+            # here fails the hook open — keep the raw payload so the policy check still sees it.
             return {'value': arguments}
     return {}
 
