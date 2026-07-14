@@ -320,32 +320,42 @@ def append_to_audit_log(event_data):
 
 
 def cleanup_old_logs():
-    """Manage log file size by keeping only the most recent session's entries
-    once the audit log exceeds AUDIT_LOG_TOTAL_LIMIT."""
+    """Manage log file size by keeping only the most recent session's entries once the
+    audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
+    handled separately: excluded from session grouping (their key is transcript-derived,
+    not the payload session_id, so they must not be mistaken for a distinct session) and
+    always retained (last few sessions' consolidated markers), so a long session's dedup
+    state is never evicted."""
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
+    def _is_marker(log):
+        return log.get('event', {}).get('hook_event_name') == FORWARDED_TOOLS_EVENT
+
+    markers = [log for log in logs if _is_marker(log)]
+    entries = [log for log in logs if not _is_marker(log)]
+
     session_order = []
     seen_sessions = set()
-
-    for log in logs:
-        event = log.get('event', {})
-        session_id = event.get('session_id')
+    for log in entries:
+        session_id = log.get('event', {}).get('session_id')
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
 
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
-        kept_logs = [
-            log for log in logs
-            if log.get('event', {}).get('session_id') == most_recent_session
-        ]
-        save_logs(kept_logs)
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        kept = [log for log in entries
+                if log.get('event', {}).get('session_id') == most_recent_session]
+    elif len(entries) > AUDIT_LOG_TOTAL_LIMIT:
+        kept = entries[-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept = entries
+    # Always keep the watermark markers (one small consolidated row per session; the
+    # active session's is always the newest), bounded to the most recent sessions.
+    save_logs(kept + markers[-20:])
 
 
 def stop_session_key(event):
@@ -1508,7 +1518,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None, set(), None, None
+        return None, set(), None
 
     return {
         'conversation_id': conversation_id,
