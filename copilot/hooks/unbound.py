@@ -348,9 +348,32 @@ def cleanup_old_logs():
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
+def stop_session_key(event):
+    """Stable per-session key for the forwarded-tool watermark. Mirrors
+    build_exchange_from_transcript's fallback so get/record agree even when the Stop
+    payload omits session_id (the CLI/extension still build+send via the transcript);
+    without this the watermark would never persist and every Stop would resend the
+    whole tool history."""
+    sid = event.get('session_id') or event.get('sessionId')
+    if sid:
+        return sid
+    tp = event.get('transcript_path')
+    if tp:
+        p = Path(tp)
+        return p.parent.name if p.stem == 'events' else p.stem
+    return None
+
+
 def get_forwarded_tool_ids(session_id):
     """toolCallIds already forwarded for this session, unioned from the audit-log
-    marker rows. Lets each Stop send only new tool calls, not the whole transcript."""
+    marker rows. Lets each Stop send only new tool calls, not the whole transcript.
+
+    This is a best-effort PAYLOAD OPTIMIZATION, not a security control: the audit log is
+    user-writable, so a local process could forge `_unbound_forwarded` rows to omit tools
+    from the exchange. That's not a new exposure -- the hook already runs as the user and
+    the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
+    the integrity backstop. Keyed on bare ids only for that reason (never trusted for
+    enforcement)."""
     if not session_id:
         return set()
     sent = set()
@@ -1439,11 +1462,14 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             continue  # sent on an earlier Stop of this session — don't resend
         call = tool_data[call_id]
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
+        # Advance the watermark for EVERY handled call, mapped or not: an internal tool
+        # maps to None (nothing to send) but must still be recorded, else a turn of only
+        # internal tools is reparsed on every later Stop and never records progress.
+        forwarded_now.add(call_id)
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
             tool_use.append(mapped)
-            forwarded_now.add(call_id)
 
     messages = []
     if user_prompt:
@@ -1823,7 +1849,10 @@ def main():
 
         if event_name == 'Stop':
             session_id = event.get('session_id')
-            already_forwarded = get_forwarded_tool_ids(session_id)
+            # Watermark key mirrors the exchange's session fallback, so get/record stay
+            # consistent even when the Stop payload omits session_id.
+            wm_key = stop_session_key(event)
+            already_forwarded = get_forwarded_tool_ids(wm_key)
             exchange, forwarded_now = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
@@ -1838,7 +1867,7 @@ def main():
                 # Mark the tool calls as forwarded only after the send succeeds, so a
                 # failed send retries them on the next Stop (the backend dedups).
                 if send_to_api(exchange, api_key) and forwarded_now:
-                    record_forwarded_tool_ids(session_id, forwarded_now)
+                    record_forwarded_tool_ids(wm_key, forwarded_now)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
