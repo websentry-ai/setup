@@ -390,19 +390,33 @@ def get_forwarded_tool_ids(session_id):
 
 
 def record_forwarded_tool_ids(session_id, tool_ids):
-    """Append one marker row recording the toolCallIds just forwarded (only the new
-    ids, a small append). Called after a successful send; a failed send simply
-    resends next Stop (the backend dedups)."""
+    """Persist the toolCallIds forwarded for this session as a SINGLE consolidated marker,
+    rewritten (re-appended last) on each Stop. Keeping one cumulative marker -- rather than
+    one append per Stop -- means it survives cleanup_old_logs' last-N trim in a long
+    session, so old ids aren't forgotten and their tool calls resent. Called after a
+    successful send; a failed send simply resends next Stop (the backend dedups)."""
     if not session_id or not tool_ids:
         return
-    append_to_audit_log({
+    merged = set(tool_ids)
+    kept = []
+    for log in load_existing_logs():
+        ev = log.get('event', {})
+        if (ev.get('hook_event_name') == FORWARDED_TOOLS_EVENT
+                and ev.get('session_id') == session_id):
+            ids = ev.get('forwarded_tool_ids')
+            if isinstance(ids, list):
+                merged.update(ids)
+            continue  # drop the old marker; a fresh consolidated one is appended below
+        kept.append(log)
+    kept.append({
         'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
         'event': {
             'hook_event_name': FORWARDED_TOOLS_EVENT,
             'session_id': session_id,
-            'forwarded_tool_ids': sorted(tool_ids),
+            'forwarded_tool_ids': sorted(merged),
         },
     })
+    save_logs(kept)
 
 
 def get_recent_user_prompts_for_session(session_id, n):
@@ -1470,6 +1484,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
             tool_use.append(mapped)
+
+    # Pure tool-replay: the slice has tool calls but every one was already forwarded, so
+    # there is nothing new to report -- make it a true no-op instead of re-posting the
+    # same user/assistant exchange each Stop. A text-only turn (no tool calls at all)
+    # still falls through and sends, so the assistant response is still logged once.
+    if tool_calls and not forwarded_now:
+        return None, set()
 
     messages = []
     if user_prompt:
