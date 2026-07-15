@@ -1376,7 +1376,7 @@ _FILE_TOOLS = {'Read', 'Write', 'Edit', 'Delete'}
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the shell's working directory across the turn's launch-process calls.
-_CD_TARGET_RE = re.compile(r'(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
 
 def _find_git_root(path: str) -> Optional[str]:
