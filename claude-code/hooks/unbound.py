@@ -1382,16 +1382,11 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
-    # Use cwd captured at session start instead of per-request
-    session_cwd = _get_session_cwd(session_id)
-
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'tool_use',
-        'cwd': session_cwd,
-        'project': _get_project(session_cwd),
         'pre_tool_use_data': {
             'command': command,
             'tool_name': tool_name,
@@ -1555,22 +1550,109 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
         return None
 
 
+# Per-repo observation tiers for the end-of-turn exchange. The hook reports
+# raw facts (which repos the turn touched, and how); the attribution policy
+# lives server-side where it can be tuned without redeploying hooks.
+_WRITE_TOOLS = {'Edit', 'Write', 'NotebookEdit'}
+_READ_TOOLS = {'Read', 'Grep', 'Glob'}
+
+# Any absolute path inside a Bash command (cd targets, git -C, pytest /x/…).
+# Left boundary required so the slash inside a relative token (tests/webapp/)
+# doesn't read as an absolute path.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the persistent shell's working directory across the turn's Bash calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+
+def _find_git_root(path: str) -> Optional[str]:
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
+    """Follow the last `cd` in `command` from `shell_dir`, mirroring the
+    persistent shell's directory between Bash calls. Absolute and ~-rooted
+    targets replace the dir; relative ones join onto it. Unchanged when the
+    command has no cd or on any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Optional[str]]) -> tuple:
+    """Resolve the git project ("<org>/<repo>") a single tool call worked in.
+    Writes/reads resolve from the tool's file path; Bash resolves from the
+    first absolute path in the command, else the shell's working directory
+    tracked across the turn's `cd`s. Returns (project, shell_dir) — shell_dir
+    updated when the command changed directory. `root_projects` caches the
+    origin lookup so `git remote get-url` runs at most once per distinct repo.
+    (None, shell_dir) when nothing resolves (fail-open)."""
+    try:
+        tool_input = tool_input or {}
+        candidates = []
+        if tool_name in _WRITE_TOOLS:
+            path = tool_input.get('file_path') or tool_input.get('notebook_path')
+            if isinstance(path, str) and path.startswith('/'):
+                candidates.append(os.path.dirname(path))
+        elif tool_name in _READ_TOOLS:
+            path = tool_input.get('file_path') or tool_input.get('path')
+            if isinstance(path, str) and path.startswith('/'):
+                candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
+        elif tool_name == 'Bash':
+            command = tool_input.get('command')
+            if isinstance(command, str):
+                candidates.extend(_ABS_PATH_RE.findall(command))
+                shell_dir = _next_shell_dir(command, shell_dir)
+                if not candidates and shell_dir:
+                    candidates.append(shell_dir)
+        for candidate in candidates:
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root], shell_dir
+        return None, shell_dir
+    except Exception:
+        return None, shell_dir
+
+
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking."""
     session_id = event.get('session_id')
     model = event.get('model') or _get_session_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
 
-    # Use cwd captured at session start instead of per-request
-    session_cwd = _get_session_cwd(session_id)
-
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'user_prompt',
-        'cwd': session_cwd,
-        'project': _get_project(session_cwd),
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
@@ -1580,14 +1662,17 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return response
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, session_cwd: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
     user_prompt = None
     session_id = None
     permission_mode = None
-    cwd = session_cwd  # Use the cwd passed in from session state
+    # Per-tool-use project resolution state: the persistent shell starts at
+    # the session cwd; origin lookups are cached per repo root.
+    shell_dir = cwd
+    root_projects = {}
 
     for log_entry in events:
         event = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1603,22 +1688,28 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             prompt = event.get('prompt')
             if prompt:
                 user_prompt = prompt
-        
+
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
             tool_input = event.get('tool_input', {})
             tool_response = event.get('tool_response', {})
-            
+
             if 'content' in tool_response and 'content' in tool_input:
                 if tool_response['content'] == tool_input['content']:
                     tool_response = {k: v for k, v in tool_response.items() if k != 'content'}
-            
+
+            # Attribute this tool call to the repo it worked in (file path /
+            # Bash cwd tracking); rides on the tool_use entry so the backend
+            # can store per-call project on each analytics row.
+            tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
+
             assistant_tool_uses.append({
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
-                'tool_use_id': event.get('tool_use_id')
+                'tool_use_id': event.get('tool_use_id'),
+                'project': tool_project
             })
     
     if user_prompt:
@@ -1658,6 +1749,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         'messages': messages,
         'permission_mode': permission_mode,
         'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
         'account_identity': build_account_identity(probe=True),
     }
@@ -1787,7 +1880,7 @@ def process_stop_event(event: Dict, api_key: str):
         usage=transcript_usage,
         request_initialized=user_prompt_timestamp,
         request_completed=request_completed,
-        session_cwd=_get_session_cwd(session_id),
+        cwd=event.get('cwd'),
     )
 
     if exchange:
@@ -2234,15 +2327,6 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
-# Session-level state: store cwd per session to avoid re-extracting on every request
-_SESSION_CWD_CACHE = {}
-
-
-def _get_session_cwd(session_id: Optional[str]) -> Optional[str]:
-    """Get the working directory captured at session start."""
-    return _SESSION_CWD_CACHE.get(session_id) if session_id else None
-
-
 def main():
     global _cached_api_key
     api_key = get_api_key()
@@ -2264,14 +2348,11 @@ def main():
         hook_event_name = event.get('hook_event_name')
         session_id = event.get('session_id')
 
-        # SessionStart fires once per session — capture cwd once here for reuse
+        # SessionStart fires once per session — TTL gate for discovery and housekeeping
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
-            # Capture cwd at session start and cache it for the session lifetime
-            if session_id and 'cwd' in event:
-                _SESSION_CWD_CACHE[session_id] = event.get('cwd')
             print("{}")
             return
         session_id = event.get('session_id')

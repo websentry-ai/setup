@@ -1093,6 +1093,91 @@ def _cursor_usage_from_event(event):
     }
 
 
+def _strip_git_suffix(segment):
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url):
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd):
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+def _find_git_root(path):
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+
+
+def _project_for_paths(candidates, root_projects):
+    """First project ("<org>/<repo>") resolved from `candidates` paths.
+    `root_projects` caches origin lookups so `git remote get-url` runs at
+    most once per distinct repo. None when nothing resolves (fail-open)."""
+    try:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root]
+    except Exception:
+        pass
+    return None
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
@@ -1107,10 +1192,19 @@ def build_llm_exchange(events, api_key=None):
     request_initialized = None
     request_completed = None
     usage = None
+    # Working-dir context for per-entry project attribution: every Cursor
+    # event carries workspace_roots; shell events carry an explicit cwd.
+    workspace_cwd = None
+    root_projects = {}
 
     for log_entry in events:
         event = log_entry.get('event', {})
         hook_event_name = event.get('hook_event_name')
+
+        if not workspace_cwd:
+            roots = event.get('workspace_roots')
+            if isinstance(roots, list) and roots and isinstance(roots[0], str):
+                workspace_cwd = roots[0]
 
         if not conversation_id:
             conversation_id = event.get('conversation_id')
@@ -1133,11 +1227,15 @@ def build_llm_exchange(events, api_key=None):
             usage = _cursor_usage_from_event(event) or usage
 
         elif hook_event_name == 'beforeReadFile':
+            file_path = event.get('file_path')
             assistant_tool_uses.append({
                 'type': hook_event_name,
-                'file_path': event.get('file_path'),
+                'file_path': file_path,
                 'content': event.get('content', ''),
-                'attachments': event.get('attachments', [])
+                'attachments': event.get('attachments', []),
+                'project': _project_for_paths(
+                    [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
+                    root_projects)
             })
 
         elif hook_event_name == 'postToolUse':
@@ -1145,30 +1243,57 @@ def build_llm_exchange(events, api_key=None):
 
             if tool_name not in EXCHANGE_NATIVE_TOOLS:
                 continue
-            
+
             tool_output = event.get('tool_output', '')
+
+            # Attribute the call to the repo it worked in: the event's own
+            # cwd when present, else absolute paths inside tool_input.
+            candidates = []
+            if isinstance(event.get('cwd'), str):
+                candidates.append(event['cwd'])
+            tool_input = event.get('tool_input')
+            if isinstance(tool_input, dict):
+                for value in tool_input.values():
+                    if isinstance(value, str) and value.startswith('/'):
+                        candidates.append(os.path.dirname(value))
 
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'tool_name': tool_name,
-                'tool_input': event.get('tool_input'),
+                'tool_input': tool_input,
                 'tool_output': tool_output,
                 'duration': event.get('duration'),
-                'tool_use_id': event.get('tool_use_id')
+                'tool_use_id': event.get('tool_use_id'),
+                'project': _project_for_paths(candidates or [workspace_cwd], root_projects)
             })
-        
+
         elif hook_event_name == 'afterFileEdit':
+            file_path = event.get('file_path')
             assistant_tool_uses.append({
                 'type': hook_event_name,
-                'file_path': event.get('file_path'),
-                'edits': event.get('edits', [])
+                'file_path': file_path,
+                'edits': event.get('edits', []),
+                'project': _project_for_paths(
+                    [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
+                    root_projects)
             })
-        
+
         elif hook_event_name == 'afterShellExecution':
+            command = event.get('command')
+            # The event's cwd is where the command actually ran; absolute
+            # paths in the command and the workspace root are fallbacks.
+            candidates = []
+            if isinstance(event.get('cwd'), str):
+                candidates.append(event['cwd'])
+            if isinstance(command, str):
+                candidates.extend(_ABS_PATH_RE.findall(command))
+            if not candidates and workspace_cwd:
+                candidates.append(workspace_cwd)
             assistant_tool_uses.append({
                 'type': hook_event_name,
-                'command': event.get('command'),
-                'output': event.get('output', '')
+                'command': command,
+                'output': event.get('output', ''),
+                'project': _project_for_paths(candidates, root_projects)
             })
         
         elif hook_event_name == 'afterMCPExecution':
@@ -1202,6 +1327,10 @@ def build_llm_exchange(events, api_key=None):
         'conversation_id': conversation_id,
         'model': model,
         'messages': messages,
+        'cwd': workspace_cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the workspace repo.
+        'project': _project_for_paths([workspace_cwd], root_projects),
         'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
 

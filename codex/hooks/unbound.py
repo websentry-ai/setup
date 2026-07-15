@@ -1042,14 +1042,128 @@ def cleanup_old_logs():
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
-def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> List[Dict]:
+def _strip_git_suffix(segment: str) -> str:
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url: str) -> Optional[str]:
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd: Optional[str]) -> Optional[str]:
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+def _find_git_root(path: str) -> Optional[str]:
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the shell's working directory across the turn's exec_command calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+
+def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
+    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
+    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
+    when the command has no cd or on any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Optional[str]]) -> Optional[str]:
+    """First project ("<org>/<repo>") resolved from `candidates` paths.
+    `root_projects` caches origin lookups so `git remote get-url` runs at
+    most once per distinct repo. None when nothing resolves (fail-open)."""
+    try:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root]
+    except Exception:
+        pass
+    return None
+
+
+def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None, session_cwd: Optional[str] = None) -> List[Dict]:
     """Parse Codex transcript for function_call/function_call_output pairs.
 
     Codex transcripts use response_item entries with:
     - type: 'function_call' (contains name, arguments with cmd)
     - type: 'function_call_output' (contains output)
 
-    Converts to PostToolUse format matching Claude Code hooks for backend compatibility.
+    Converts to PostToolUse format matching Claude Code hooks for backend
+    compatibility. Each entry gets a per-call `project` ("<org>/<repo>")
+    resolved from the command's workdir / absolute paths / the shell dir
+    tracked across the turn's `cd`s (seeded with `session_cwd`).
     """
     tool_uses = []
     if not transcript_path or not os.path.exists(transcript_path):
@@ -1096,7 +1210,11 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 except json.JSONDecodeError:
                     continue
 
-        # Match calls with outputs and convert to PostToolUse format
+        # Match calls with outputs and convert to PostToolUse format.
+        # shell_dir mirrors the persistent shell across the turn's commands
+        # (seeded with the session cwd); root_projects caches origin lookups.
+        shell_dir = session_cwd
+        root_projects: Dict[str, Optional[str]] = {}
         for call_id, call_data in function_calls.items():
             name = call_data.get('name', '')
             args = call_data.get('arguments', {})
@@ -1107,7 +1225,23 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
             # are handled generically as fallback for future Codex tool support.
             if name == 'exec_command':
                 tool_name = 'Bash'
-                tool_input = {'command': args.get('cmd', '')}
+                command = args.get('cmd', '')
+                if isinstance(command, list):
+                    command = ' '.join(str(c) for c in command)
+                tool_input = {'command': command}
+                # Attribute the call to the repo it ran in: explicit workdir
+                # first, then absolute paths in the command, then the tracked
+                # shell dir.
+                candidates = []
+                workdir = args.get('workdir')
+                if isinstance(workdir, str) and workdir:
+                    candidates.append(workdir)
+                if isinstance(command, str):
+                    candidates.extend(_ABS_PATH_RE.findall(command))
+                    shell_dir = _next_shell_dir(command, shell_dir)
+                if not candidates and shell_dir:
+                    candidates.append(shell_dir)
+                project = _project_for_paths(candidates, root_projects)
                 # Parse exec_command output format to extract clean stdout and exit_code
                 stdout = output
                 exit_code = 0
@@ -1125,13 +1259,20 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 tool_name = name
                 tool_input = args if isinstance(args, dict) else {'command': str(args)}
                 tool_response = {'stdout': output}
+                # Resolve from any absolute paths in the arguments (e.g.
+                # apply_patch file paths), falling back to the shell dir.
+                candidates = _ABS_PATH_RE.findall(json.dumps(tool_input))
+                if not candidates and shell_dir:
+                    candidates = [shell_dir]
+                project = _project_for_paths(candidates, root_projects)
 
             tool_uses.append({
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
-                'tool_use_id': call_id
+                'tool_use_id': call_id,
+                'project': project
             })
 
     except Exception:
@@ -1221,8 +1362,11 @@ def process_stop_event(event: Dict, api_key: str):
 
     messages = [{'role': 'user', 'content': user_prompt}]
 
-    # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
-    assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
+    # Parse tool uses from Codex transcript (function_call/function_call_output
+    # pairs); the session cwd seeds shell-dir tracking for per-call project
+    # attribution.
+    cwd = event.get('cwd')
+    assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp, session_cwd=cwd)
 
     assistant_msg = {
         'role': 'assistant',
@@ -1239,7 +1383,11 @@ def process_stop_event(event: Dict, api_key: str):
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
         'messages': messages,
-        'permission_mode': permission_mode or 'default'
+        'permission_mode': permission_mode or 'default',
+        'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
+        'project': _get_project(cwd)
     }
 
     usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)

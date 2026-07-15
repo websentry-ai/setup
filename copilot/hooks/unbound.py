@@ -1208,6 +1208,117 @@ def process_user_prompt_submit(event, api_key):
     return transform_response_for_copilot_prompt(api_response)
 
 
+def _strip_git_suffix(segment):
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url):
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd):
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+def _find_git_root(path):
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the shell's working directory across the turn's shell commands.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+
+def _next_shell_dir(command, shell_dir):
+    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
+    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
+    when the command has no cd or on any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+def _project_for_paths(candidates, root_projects):
+    """First project ("<org>/<repo>") resolved from `candidates` paths.
+    `root_projects` caches origin lookups so `git remote get-url` runs at
+    most once per distinct repo. None when nothing resolves (fail-open)."""
+    try:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root]
+    except Exception:
+        pass
+    return None
+
+
 def _normalize_arguments(arguments):
     """Copilot tool arguments may be a dict or a JSON string. Always return a dict."""
     if isinstance(arguments, dict):
@@ -1233,38 +1344,67 @@ def _extract_patch_target_path(args):
     return m.group(1).strip() if m else ''
 
 
-def map_copilot_tool(name, args, result_content):
+def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal orchestration tools (intentionally not emitted).
+
+    When `shell_state` ({'dir': <path>} tracked across the turn) and
+    `root_projects` (per-repo origin cache) are provided, each entry gets a
+    per-call `project` ("<org>/<repo>") — file entries resolve from their
+    file path (relative paths joined onto the shell dir), shell entries from
+    absolute paths in the command or the tracked shell dir.
     """
     if name in INTERNAL_TOOLS:
         return None
-    if name in SHELL_TOOLS:
+    shell_state = shell_state if shell_state is not None else {}
+    root_projects = root_projects if root_projects is not None else {}
+
+    def _abs(path):
+        if not isinstance(path, str) or not path:
+            return None
+        if path.startswith('/'):
+            return path
+        base = shell_state.get('dir')
+        return os.path.normpath(os.path.join(base, path)) if base else None
+
+    project = None
+    if name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
+        if name in SHELL_TOOLS:
+            command = args.get('command') or args.get('input') or args.get('text') or ''
+        else:
+            command = TERMINAL_LIKE_TOOLS[name](args)
         entry = {
             'type': 'afterShellExecution',
-            'command': args.get('command') or args.get('input') or args.get('text') or '',
+            'command': command,
             'output': result_content or '',
         }
-    elif name in TERMINAL_LIKE_TOOLS:
-        entry = {
-            'type': 'afterShellExecution',
-            'command': TERMINAL_LIKE_TOOLS[name](args),
-            'output': result_content or '',
-        }
+        candidates = []
+        if isinstance(command, str):
+            candidates.extend(_ABS_PATH_RE.findall(command))
+            shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
+        if not candidates and shell_state.get('dir'):
+            candidates.append(shell_state['dir'])
+        project = _project_for_paths(candidates, root_projects)
     elif name in READ_TOOLS:
+        file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {
             'type': 'beforeReadFile',
-            'file_path': args.get('filePath') or args.get('path') or args.get('file_path') or '',
+            'file_path': file_path,
             'content': result_content or '',
         }
+        abs_path = _abs(file_path)
+        project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     elif name in WRITE_TOOLS or name in EDIT_TOOLS:
+        file_path = (args.get('filePath') or args.get('path') or args.get('file_path')
+                     or _extract_patch_target_path(args) or '')
         entry = {
             'type': 'afterFileEdit',
-            'file_path': (args.get('filePath') or args.get('path') or args.get('file_path')
-                          or _extract_patch_target_path(args) or ''),
+            'file_path': file_path,
             'content': args.get('content') or args.get('file_text') or result_content or '',
         }
+        abs_path = _abs(file_path)
+        project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
         entry = {
             'type': 'afterMCPExecution',
@@ -1272,12 +1412,24 @@ def map_copilot_tool(name, args, result_content):
             'tool_input': args,
             'result_json': result_content or '',
         }
+        try:
+            candidates = _ABS_PATH_RE.findall(json.dumps(args))
+        except Exception:
+            candidates = []
+        project = _project_for_paths(candidates, root_projects)
+
     # Drop empty-string values.
-    return {k: v for k, v in entry.items() if v != ''}
+    mapped = {k: v for k, v in entry.items() if v != ''}
+    if project:
+        mapped['project'] = project
+    return mapped
 
 
-def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None):
+def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None, cwd=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
+
+    `cwd` (the hook event's working directory) seeds shell-dir tracking for
+    per-call project attribution and rides on the exchange.
 
     Reads defensively — blank or unparseable lines are skipped, never raised."""
     if not transcript_path or not os.path.exists(transcript_path):
@@ -1379,9 +1531,14 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call['result'] = result.get('content')
 
     tool_use = []
+    # Per-call project attribution state: the shell starts at the session
+    # cwd; origin lookups are cached once per repo across the turn.
+    shell_state = {'dir': cwd}
+    root_projects = {}
     for call_id in tool_calls:
         call = tool_data[call_id]
-        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
+        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
+                                  shell_state=shell_state, root_projects=root_projects)
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
@@ -1403,6 +1560,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'conversation_id': conversation_id,
         'model': model or session_start_model or 'auto',
         'messages': messages,
+        'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
+        'project': _get_project(cwd),
     }
 
 
@@ -1833,6 +1994,7 @@ def main():
             exchange = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
+                cwd=event.get('cwd'),
             )
             if exchange:
                 # Turn boundaries from event-fire times
