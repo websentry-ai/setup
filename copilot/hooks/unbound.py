@@ -1098,6 +1098,19 @@ def transform_response_for_copilot_prompt(api_response):
             'reason': reason
         }
 
+    # Allowed with injected context (e.g. the spend-limit alert-threshold
+    # warning). NOTE: per GitHub's hooks reference, the Copilot CLI does not
+    # process userPromptSubmitted output today (notification-only), so this
+    # is forward-compatible plumbing — it becomes live if/when Copilot starts
+    # honoring the SDK's additionalContext output on this surface, and it is
+    # inert until the gateway spend-enforces the 'copilot' app label.
+    additional_context = api_response.get('additionalContext', '')
+    if additional_context:
+        return {
+            'additionalContext': additional_context,
+            'systemMessage': additional_context,
+        }
+
     return {}
 
 
@@ -1869,6 +1882,18 @@ def main():
         if event_name == 'UserPromptSubmit':
             response = process_user_prompt_submit(event, api_key)
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                    'event': event,
+                })
+                print(json.dumps(response), flush=True)
+                return
+
+            # Allowed but with hook output (e.g. the spend-limit alert
+            # warning): log the event, then emit the response instead of the
+            # default empty output. Copilot CLI currently ignores
+            # userPromptSubmitted output, so this is forward-compatible.
+            if response:
                 append_to_audit_log({
                     'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
                     'event': event,

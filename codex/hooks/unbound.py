@@ -594,6 +594,20 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
             'reason': reason
         }
 
+    # Allowed with injected context (e.g. the spend-limit alert-threshold
+    # warning "you've used $X of your $Y limit"): Codex hooks are
+    # Claude-parity — additionalContext feeds the model, systemMessage shows
+    # the same text to the user.
+    additional_context = api_response.get('additionalContext', '')
+    if additional_context:
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'UserPromptSubmit',
+                'additionalContext': additional_context,
+            },
+            'systemMessage': additional_context,
+        }
+
     return {}
 
 
@@ -1631,6 +1645,20 @@ def main():
 
             # If denied (response has decision: block), log the event then return
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'session_id': event.get('session_id'),
+                    'event': event
+                })
+                response["suppressOutput"] = True
+                print(json.dumps(response), flush=True)
+                return
+
+            # Allowed but with hook output to emit (e.g. the spend-limit
+            # alert-threshold warning riding additionalContext/systemMessage):
+            # log the event, then print the response instead of the default
+            # suppressOutput so Codex surfaces the warning.
+            if response:
                 append_to_audit_log({
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'session_id': event.get('session_id'),
