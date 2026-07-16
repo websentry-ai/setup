@@ -1158,6 +1158,29 @@ def _augment_model(event: Dict, session_id: Optional[str]) -> str:
     return event.get('model') or _get_session_model(session_id) or 'auto'
 
 
+def _resolve_tool_use_id(event: Dict) -> str:
+    """Native per-call id if present, else a deterministic synthetic one.
+
+    Augment has no native tool_use_id and no turn id, so the id is derived
+    purely from replay-stable content (conversation/session id + raw tool name
+    + extracted command). The PreToolUse emit and the Stop-replayed PostToolUse
+    emit run in different processes yet compute the byte-identical id for the
+    same call — no side file, no timestamps. Native id always wins; any error
+    falls back to native-or-absent (fail-open, never crashes the hook)."""
+    native = event.get('tool_use_id')
+    if native:
+        return native
+    try:
+        key = '\x1f'.join((
+            str(event.get('session_id') or event.get('conversation_id') or ''),
+            str(event.get('tool_name') or ''),
+            str(extract_command_for_pretool(event)),
+        ))
+        return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+    except Exception:
+        return native
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -1234,9 +1257,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'user_prompts': [],
     }
 
-    _tuid = event.get('tool_use_id')
-    if _tuid:
-        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+    request_body['pre_tool_use_data']['tool_use_id'] = _resolve_tool_use_id(event)
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -1356,7 +1377,7 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
             'tool_name': f'mcp__{server}__{tool}',
             'tool_input': tool_input,
             'tool_response': _io_response(),
-            'tool_use_id': ev.get('tool_use_id'),
+            'tool_use_id': ev.get('tool_use_id') or _resolve_tool_use_id(ev),
         }
 
     canonical = AUGMENT_TOOL_FAMILY.get(raw_name, raw_name)
@@ -1395,7 +1416,7 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
         'tool_name': canonical,
         'tool_input': canon_input,
         'tool_response': tool_response,
-        'tool_use_id': ev.get('tool_use_id'),
+        'tool_use_id': ev.get('tool_use_id') or _resolve_tool_use_id(ev),
     }
 
 

@@ -1498,6 +1498,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
+            if call_id:
+                mapped['tool_use_id'] = call_id  # native transcript toolCallId — no synthetic id
             tool_use.append(mapped)
 
     # Signature of the turn's user+assistant TEXT (independent of tool_use). The caller

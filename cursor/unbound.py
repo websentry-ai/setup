@@ -660,6 +660,36 @@ def build_account_identity(event=None, probe=False):
     return identity
 
 
+def _resolve_tool_use_id(event):
+    """Stable per-call id: the native tool_use_id when Cursor supplies one, else a
+    deterministic synthetic id. The key uses ONLY fields byte-identical across the
+    before* (pre) and after* (completion) event for the same call — conversation_id,
+    generation_id, raw tool_name, and canonical content — so pre and post compute the
+    same id. MCP after* events drop the server 'command', so MCP is keyed on
+    tool_input only. Fail-open: never raises, falls back to native-or-None."""
+    try:
+        if not isinstance(event, dict):
+            return None
+        native = event.get('tool_use_id')
+        if native:
+            return native
+        hook_name = event.get('hook_event_name') or ''
+        command = event.get('command')
+        if 'MCP' in hook_name or command is None:
+            content = json.dumps(event.get('tool_input') or {}, sort_keys=True)
+        else:
+            content = str(command)
+        key = '\x1f'.join((
+            str(event.get('conversation_id') or ''),
+            str(event.get('generation_id') or ''),
+            str(event.get('tool_name') or ''),
+            content,
+        ))
+        return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+    except Exception:
+        return event.get('tool_use_id') if isinstance(event, dict) else None
+
+
 def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
@@ -704,7 +734,7 @@ def process_pre_tool_use(event, api_key):
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
+    _tuid = _resolve_tool_use_id(event)
     if _tuid:
         request_body['pre_tool_use_data']['tool_use_id'] = _tuid
 
@@ -950,6 +980,10 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = _resolve_tool_use_id(event)
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -1152,29 +1186,32 @@ def build_llm_exchange(events, api_key=None):
                 'tool_input': event.get('tool_input'),
                 'tool_output': tool_output,
                 'duration': event.get('duration'),
-                'tool_use_id': event.get('tool_use_id')
+                'tool_use_id': _resolve_tool_use_id(event)
             })
-        
+
         elif hook_event_name == 'afterFileEdit':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'file_path': event.get('file_path'),
-                'edits': event.get('edits', [])
+                'edits': event.get('edits', []),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
-        
+
         elif hook_event_name == 'afterShellExecution':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'command': event.get('command'),
-                'output': event.get('output', '')
+                'output': event.get('output', ''),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
-        
+
         elif hook_event_name == 'afterMCPExecution':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'tool_name': event.get('tool_name'),
                 'tool_input': event.get('tool_input'),
-                'result_json': event.get('result_json')
+                'result_json': event.get('result_json'),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
         
         elif hook_event_name == 'afterAgentResponse':
