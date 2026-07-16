@@ -469,5 +469,158 @@ class TestUnboundAppLabel(unittest.TestCase):
         self.assertEqual(unbound._unbound_app_label({"cwd": None, "transcript_path": None}), "claude-code")
 
 
+class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
+    """Registry-driven resolution: the hook must read a plugin's .mcp.json from
+    where Claude loads it (installed_plugins.json + known_marketplaces.json), which
+    for a `directory` marketplace is the live clone -- not the lagging cache snapshot.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.plugins_root = self.root / "plugins"
+        self.cache = self.plugins_root / "cache"
+        self.cache.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _registries(self, installed, marketplaces):
+        _write_json(self.plugins_root / "installed_plugins.json", {"version": 2, "plugins": installed})
+        _write_json(self.plugins_root / "known_marketplaces.json", marketplaces)
+
+    @staticmethod
+    def _http(url):
+        return {"type": "http", "url": url}
+
+    def test_directory_marketplace_resolves_server_absent_from_cache(self):
+        # The exact reported scenario, structurally: installPath -> a stale cache
+        # snapshot missing a server; the live source (installLocation/plugins/<plugin>)
+        # has it. Resolves via the conventional layout, no marketplace.json needed.
+        _make_plugin(
+            self.cache, "localmkt", "toolkit", "0.1.0",
+            {".mcp.json": {"mcpServers": {"alpha-mcp": self._http("https://proxy.example.com/rpc?f=alpha")}}},
+            in_use=True,
+        )
+        install_path = self.cache / "localmkt" / "toolkit" / "0.1.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "toolkit" / ".mcp.json", {"mcpServers": {
+            "alpha-mcp": self._http("https://proxy.example.com/rpc?f=alpha"),
+            "beta-mcp": self._http("https://proxy.example.com/rpc?f=beta"),
+        }})
+        self._registries(
+            {"toolkit@localmkt": [{"scope": "user", "installPath": str(install_path)}]},
+            {"localmkt": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_toolkit_beta-mcp", cache_dir=self.cache)
+        self.assertEqual(cfg, self._http("https://proxy.example.com/rpc?f=beta"))
+        # legacy cache-only path still misses it (proves the fix is what closed the gap)
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_from_cache(
+            "plugin_toolkit_beta-mcp", cache_dir=self.cache))
+
+    def test_directory_marketplace_multiple_plugins_selects_correct_one(self):
+        # Mirrors a real directory marketplace with several sibling plugins (as in
+        # the reported case). Cache snapshots are stale; the live clone is complete.
+        clone = self.root / "clone"
+        installed = {}
+        for name, servers in (("coding", {"c1-mcp": "coding/c1"}),
+                              ("toolkit", {"alpha-mcp": "toolkit/alpha"}),
+                              ("search", {"s1-mcp": "search/s1"})):
+            _make_plugin(self.cache, "localmkt", name, "0.1.0",
+                         {".mcp.json": {"mcpServers": {k: self._http("https://x/%s" % v) for k, v in servers.items()}}},
+                         in_use=True)
+            installed["%s@localmkt" % name] = [{"installPath": str(self.cache / "localmkt" / name / "0.1.0")}]
+        # live clone: toolkit gains a beta-mcp that never made it into the cache
+        _write_json(clone / "plugins" / "coding" / ".mcp.json", {"mcpServers": {"c1-mcp": self._http("https://x/coding/c1")}})
+        _write_json(clone / "plugins" / "toolkit" / ".mcp.json", {"mcpServers": {
+            "alpha-mcp": self._http("https://x/toolkit/alpha"), "beta-mcp": self._http("https://x/toolkit/beta")}})
+        _write_json(clone / "plugins" / "search" / ".mcp.json", {"mcpServers": {"s1-mcp": self._http("https://x/search/s1")}})
+        self._registries(installed,
+                         {"localmkt": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        # the cache-absent server resolves to the RIGHT plugin
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_toolkit_beta-mcp", cache_dir=self.cache),
+                         self._http("https://x/toolkit/beta"))
+        # a sibling plugin's server still resolves (no cross-contamination)
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_search_s1-mcp", cache_dir=self.cache),
+                         self._http("https://x/search/s1"))
+
+    def test_directory_marketplace_manifest_declared_path(self):
+        # Non-standard layout: plugin source is declared in marketplace.json, and
+        # there is NO conventional plugins/<plugin> dir -> the manifest path resolves.
+        clone = self.root / "clone"
+        _write_json(clone / "custom" / "loc" / ".mcp.json",
+                    {"mcpServers": {"s": self._http("https://declared.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "custom/loc"}}]})
+        self._registries({"p@mk": [{"installPath": str(self.cache / "mk" / "p" / "0.1.0")}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://declared.example/mcp"))
+
+    def test_registry_ambiguous_candidate_returns_none(self):
+        # Two (plugin, server) pairs mangle to the same candidate with DIFFERENT
+        # configs -> ambiguous -> None (never guess).
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "a_b" / ".mcp.json", {"mcpServers": {"c": self._http("https://a.example/mcp")}})
+        _write_json(clone / "plugins" / "a" / ".mcp.json", {"mcpServers": {"b_c": self._http("https://b.example/mcp")}})
+        self._registries(
+            {"a_b@mk": [{"installPath": str(self.cache / "z1")}], "a@mk": [{"installPath": str(self.cache / "z2")}]},
+            {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config("plugin_a_b_c", cache_dir=self.cache))
+
+    def test_prefers_live_source_over_stale_cache_same_key(self):
+        # No manifest -> exercises the conventional plugins/<plugin> fallback layout.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"s": self._http("https://old.example/mcp")}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json", {"mcpServers": {"s": self._http("https://new.example/mcp")}})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://new.example/mcp"))
+
+    def test_github_marketplace_reads_installpath(self):
+        _make_plugin(self.cache, "official", "ghp", "unknown",
+                     {".mcp.json": {"mcpServers": {"ghp": self._http("https://gh.example/mcp")}}})
+        install_path = self.cache / "official" / "ghp" / "unknown"
+        self._registries({"ghp@official": [{"installPath": str(install_path)}]},
+                         {"official": {"source": {"source": "github", "repo": "x/y"},
+                                       "installLocation": str(self.plugins_root / "marketplaces" / "official")}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_ghp_ghp", cache_dir=self.cache),
+                         self._http("https://gh.example/mcp"))
+
+    def test_manifest_source_path_traversal_rejected(self):
+        # marketplace.json points the plugin source outside installLocation: reject
+        # the escape and fall back to the safe installPath copy, never read evil.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"s": self._http("https://safe.example/mcp")}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        clone.mkdir(parents=True)
+        _write_json(self.root / "evil" / "plugins" / "p" / ".mcp.json",
+                    {"mcpServers": {"s": self._http("https://evil.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "../evil/plugins/p"}}]})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://safe.example/mcp"))
+
+    def test_plugin_in_cache_but_not_registry_falls_back(self):
+        _make_plugin(self.cache, "mk", "orphan", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"orphan": self._http("https://orphan.example/mcp")}}}, in_use=True)
+        self._registries({"other@mk": [{"installPath": str(self.cache / "mk" / "other" / "1.0.0")}]},
+                         {"mk": {"source": {"source": "github", "repo": "x/y"}, "installLocation": "/x"}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_orphan_orphan", cache_dir=self.cache),
+                         self._http("https://orphan.example/mcp"))
+
+    def test_registries_absent_uses_cache(self):
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"p": self._http("https://c.example/mcp")}}}, in_use=True)
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_p", cache_dir=self.cache),
+                         self._http("https://c.example/mcp"))
+
+
 if __name__ == "__main__":
     unittest.main()

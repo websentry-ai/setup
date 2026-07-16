@@ -743,7 +743,118 @@ def _select_plugin_version_dir(plugin_dir: Path) -> Optional[Path]:
     return max(candidates, key=lambda d: (d.stat().st_mtime, d.name))
 
 
+def _read_json_file(path: Path):
+    try:
+        if path.is_file():
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.loads(f.read())
+    except Exception as exc:
+        log_error(f"mcp plugin registry unreadable: {path}: {exc}", 'mcp_plugin')
+    return None
+
+
+def _installed_plugins_registry(plugins_root: Path) -> Dict:
+    data = _read_json_file(plugins_root / "installed_plugins.json")
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    return plugins if isinstance(plugins, dict) else {}
+
+
+def _marketplace_registry(plugins_root: Path) -> Dict:
+    data = _read_json_file(plugins_root / "known_marketplaces.json")
+    return data if isinstance(data, dict) else {}
+
+
+def _directory_marketplace_plugin_dir(location: Path, plugin: str) -> Optional[Path]:
+    manifest = _read_json_file(location / ".claude-plugin" / "marketplace.json")
+    if not isinstance(manifest, dict):
+        return None
+    for entry in (manifest.get("plugins") or []):
+        if not isinstance(entry, dict) or entry.get("name") != plugin:
+            continue
+        src = entry.get("source")
+        rel = src if isinstance(src, str) else (src.get("path") if isinstance(src, dict) else None)
+        if not isinstance(rel, str) or not rel:
+            return None
+        cand = (location / rel).resolve()
+        try:
+            cand.relative_to(location.resolve())
+        except ValueError:
+            return None
+        return cand
+    return None
+
+
+def _authoritative_plugin_dirs(plugin: str, mk_info: Dict, installed_entries: list) -> list:
+    dirs = []
+    source = mk_info.get("source") if isinstance(mk_info, dict) else None
+    src_type = source.get("source") if isinstance(source, dict) else None
+    install_location = mk_info.get("installLocation") if isinstance(mk_info, dict) else None
+
+    if src_type == "directory" and install_location:
+        loc = Path(install_location)
+        for d in (loc / "plugins" / plugin, loc / plugin, _directory_marketplace_plugin_dir(loc, plugin)):
+            if d is not None and d not in dirs:
+                dirs.append(d)
+
+    for e in (installed_entries or []):
+        ip = e.get("installPath") if isinstance(e, dict) else None
+        if ip:
+            p = Path(ip)
+            if p not in dirs:
+                dirs.append(p)
+    return dirs
+
+
 def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:
+    if not server_name.startswith('plugin_'):
+        return None
+    try:
+        plugins_root = cache_dir.parent
+        installed = _installed_plugins_registry(plugins_root)
+        if not installed:
+            return _resolve_plugin_mcp_config_from_cache(server_name, cache_dir)
+        marketplaces = _marketplace_registry(plugins_root)
+
+        matches = []
+        for full_name, entries in installed.items():
+            plugin, _, marketplace = full_name.partition('@')
+            if not server_name.startswith("plugin_%s_" % _mangle_mcp_token(plugin)):
+                continue
+            mk_info = marketplaces.get(marketplace) or {}
+            for plugin_dir in _authoritative_plugin_dirs(plugin, mk_info, entries):
+                try:
+                    server_map = _plugin_mcp_server_map(plugin_dir)
+                except Exception as exc:
+                    log_error(f"mcp plugin dir error: {plugin_dir}: {exc}", 'mcp_plugin')
+                    continue
+                if not server_map:
+                    continue
+                for server_key, entry in server_map.items():
+                    candidate = "plugin_%s_%s" % (
+                        _mangle_mcp_token(plugin), _mangle_mcp_token(server_key),
+                    )
+                    if candidate == server_name:
+                        fields = _extract_mcp_server_fields(entry)
+                        if fields is not None:
+                            matches.append(fields)
+                break
+
+        distinct = []
+        for cfg in matches:
+            if cfg not in distinct:
+                distinct.append(cfg)
+        if len(distinct) == 1:
+            return distinct[0]
+        if len(distinct) > 1:
+            log_error(f"mcp plugin resolve ambiguous: {server_name}", 'mcp_plugin')
+            return None
+        return _resolve_plugin_mcp_config_from_cache(server_name, cache_dir)
+    except Exception as exc:
+        log_error(f"mcp plugin resolve error: {server_name}: {exc}", 'mcp_plugin')
+        return None
+
+
+def _resolve_plugin_mcp_config_from_cache(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:
     if not server_name.startswith('plugin_'):
         return None
     try:
