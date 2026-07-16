@@ -557,6 +557,25 @@ class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
         self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
                          self._http("https://declared.example/mcp"))
 
+    def test_conventional_dir_missing_server_does_not_stop_search(self):
+        # The conventional plugins/<plugin> dir exists but holds OTHER servers, not
+        # the requested one; the manifest-declared path defines it and the cache
+        # lacks it. Resolution must not stop at the first populated dir.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"other": self._http("https://other.example/mcp")}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json",
+                    {"mcpServers": {"other": self._http("https://other.example/mcp")}})
+        _write_json(clone / "custom" / "loc" / ".mcp.json",
+                    {"mcpServers": {"wanted": self._http("https://wanted.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "custom/loc"}}]})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_wanted", cache_dir=self.cache),
+                         self._http("https://wanted.example/mcp"))
+
     def test_registry_ambiguous_candidate_returns_none(self):
         # Two (plugin, server) pairs mangle to the same candidate with DIFFERENT
         # configs -> ambiguous -> None (never guess).

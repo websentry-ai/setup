@@ -827,16 +827,18 @@ def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN
                 except Exception as exc:
                     log_error(f"mcp plugin dir error: {plugin_dir}: {exc}", 'mcp_plugin')
                     continue
-                if not server_map:
+                entry = next(
+                    (e for k, e in server_map.items()
+                     if "plugin_%s_%s" % (_mangle_mcp_token(plugin), _mangle_mcp_token(k)) == server_name),
+                    None,
+                )
+                if entry is None:
+                    # This dir doesn't define the server -> try the next candidate.
                     continue
-                for server_key, entry in server_map.items():
-                    candidate = "plugin_%s_%s" % (
-                        _mangle_mcp_token(plugin), _mangle_mcp_token(server_key),
-                    )
-                    if candidate == server_name:
-                        fields = _extract_mcp_server_fields(entry)
-                        if fields is not None:
-                            matches.append(fields)
+                fields = _extract_mcp_server_fields(entry)
+                if fields is not None:
+                    matches.append(fields)
+                # First candidate dir that defines the server wins (the live-most copy).
                 break
 
         distinct = []
