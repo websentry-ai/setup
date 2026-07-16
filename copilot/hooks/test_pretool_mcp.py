@@ -313,5 +313,60 @@ class TestUnresolvedForwarding(ProcessPreToolUseBase):
         self.assertFalse(self.is_block(ret))
 
 
+# Query string is stripped by the hook + gateway, so the fingerprint is host+path.
+_PLUGIN_TOOLCHAIN_URL = (
+    "https://toolchain-internal.frdstr.com/mcp/v1/rpc?tool_filter=gdrive*,gdocs*"
+)
+
+
+class TestAgentPluginConfigPaths(unittest.TestCase):
+    """Exercise the real agentPlugins glob (no mocking) against a temp HOME."""
+
+    def _run(self, write_user_gdrive=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            user_dir = unbound._vscode_user_dirs()[0]
+            user_dir.mkdir(parents=True, exist_ok=True)
+            plugin_dir = (
+                user_dir.parent
+                / "agentPlugins" / "github.com" / "forter" / "datastores-core"
+            )
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            (plugin_dir / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {
+                    "gdrive": {"type": "http", "url": _PLUGIN_TOOLCHAIN_URL}}})
+            )
+            if write_user_gdrive:
+                (user_dir / "mcp.json").write_text(
+                    json.dumps({"servers": {"gdrive": {"command": write_user_gdrive}}})
+                )
+            return unbound.read_copilot_mcp_servers(None)
+
+    def test_plugin_bundled_server_resolves(self):
+        servers = self._run()
+        server, tool, cfg = unbound._resolve_vscode_mcp(
+            "mcp_gdrive_gdrive-search", servers
+        )
+        self.assertEqual(server, "gdrive")
+        self.assertEqual(tool, "gdrive-search")
+        self.assertEqual(
+            cfg.get("url"), "https://toolchain-internal.frdstr.com/mcp/v1/rpc"
+        )
+
+    def test_user_mcp_json_wins_over_plugin(self):
+        # A plugin must not override the user's own same-named server.
+        servers = self._run(write_user_gdrive="/usr/local/bin/my-real-gdrive")
+        self.assertEqual(servers["gdrive"].get("command"), "/usr/local/bin/my-real-gdrive")
+        self.assertNotIn("url", servers["gdrive"])
+
+    def test_no_plugins_is_noop(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            unbound._vscode_user_dirs()[0].mkdir(parents=True, exist_ok=True)
+            self.assertEqual(unbound.read_copilot_mcp_servers(None), {})
+
+
 if __name__ == "__main__":
     unittest.main()

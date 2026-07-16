@@ -536,9 +536,12 @@ def _vscode_user_dirs():
     return [base / "Code" / "User", base / "Code - Insiders" / "User"]
 
 
-# All Copilot MCP config locations. Untrusted workspace files (from cwd) come
-# first; trusted user/global/CLI configs last so they win the last-wins merge in
-# read_copilot_mcp_servers.
+# Bounds the plugin `.mcp.json` files merged on the hot pretool path.
+_MAX_PLUGIN_CONFIGS = 100
+
+
+# All Copilot MCP config locations, ordered for the last-wins merge in
+# read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
 def _copilot_mcp_config_paths(cwd=None):
     home = Path.home()
 
@@ -561,7 +564,42 @@ def _copilot_mcp_config_paths(cwd=None):
     trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
     trusted.append(home / ".copilot" / "mcp-config.json")
 
-    return workspace + trusted
+    # VS Code Agent plugins bundle MCP servers in a `.mcp.json` at the plugin root
+    # under <UserData>/Code/agentPlugins/<marketplace>/<org>/<repo>/ and never merge
+    # them into mcp.json — so scan the bundles or the server resolves to null.
+    plugins = []
+    for user_dir in _vscode_user_dirs():
+        agent_plugins = user_dir.parent / "agentPlugins"
+        try:
+            matches = sorted(agent_plugins.glob("*/*/*/.mcp.json"))
+        except OSError:
+            matches = []
+        # agentPlugins present but nothing matched => layout likely changed; surface it.
+        if not matches:
+            try:
+                if agent_plugins.is_dir() and any(agent_plugins.iterdir()):
+                    log_error(
+                        f"copilot agentPlugins present but no .mcp.json matched: {agent_plugins}",
+                        'mcp_plugin',
+                    )
+            except OSError:
+                pass
+        plugins.extend(matches)
+    # Copilot CLI plugins live here instead.
+    try:
+        plugins.extend(
+            sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json"))
+        )
+    except OSError:
+        pass
+    if len(plugins) > _MAX_PLUGIN_CONFIGS:
+        log_error(
+            f"copilot plugin configs capped at {_MAX_PLUGIN_CONFIGS} (found {len(plugins)})",
+            'mcp_plugin',
+        )
+        plugins = plugins[:_MAX_PLUGIN_CONFIGS]
+
+    return workspace + plugins + trusted
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -751,8 +789,15 @@ def _augment_script_hash(result, cwd):
     return result
 
 
+# True for plugin-bundle paths (VS Code agentPlugins / Copilot CLI installed-plugins).
+def _is_plugin_config_path(path):
+    parts = path.parts
+    return 'agentPlugins' in parts or 'installed-plugins' in parts
+
+
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
+    plugin_names = set()
     for config_path in _copilot_mcp_config_paths(cwd):
         try:
             if not config_path.exists():
@@ -771,9 +816,18 @@ def read_copilot_mcp_servers(cwd=None):
                 raw = nested.get('servers') if isinstance(nested, dict) else None
             if not isinstance(raw, dict):
                 continue
+            is_plugin = _is_plugin_config_path(config_path)
             for name, server in raw.items():
-                fields = _sanitize_mcp_server_fields(server, cwd)
-                servers[name] = fields or {}
+                fields = _sanitize_mcp_server_fields(server, cwd) or {}
+                # Only two different plugin bundles claiming one name is ambiguous
+                # (arbitrary winner); a user config overriding a plugin is expected.
+                if is_plugin:
+                    if name in plugin_names and servers.get(name) != fields:
+                        log_error(
+                            f"copilot mcp plugin name collision: {name}", 'mcp_plugin'
+                        )
+                    plugin_names.add(name)
+                servers[name] = fields
         except Exception as e:
             # Missing files are skipped above without raising; this only fires on
             # a genuine read failure, so it's worth surfacing for diagnosis.
