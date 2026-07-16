@@ -36,6 +36,13 @@ def test_claude_native_precedence_and_pre_post_parity():
     assert m.resolve_tool_use_id(pre) == m.resolve_tool_use_id(post)
     assert m.resolve_tool_use_id(pre).startswith('unb-')
     assert m.resolve_tool_use_id(pre) == m.resolve_tool_use_id(dict(pre))  # deterministic
+    # prompt_id is NOT in the key, so a PostToolUse that omits it still matches the pre id.
+    assert m.resolve_tool_use_id(pre) == m.resolve_tool_use_id(
+        {'session_id': 'S1', 'tool_name': 'Bash', 'tool_input': {'command': 'ls -la'}})
+    # MCP input is canonicalized: key order must not diverge the id.
+    mcp_a = {'session_id': 'S1', 'tool_name': 'mcp__x__y', 'tool_input': {'q': 1, 'a': 2}}
+    mcp_b = {'session_id': 'S1', 'tool_name': 'mcp__x__y', 'tool_input': {'a': 2, 'q': 1}}
+    assert m.resolve_tool_use_id(mcp_a) == m.resolve_tool_use_id(mcp_b)
 
 
 def test_codex_synthetic_fallback_is_deterministic_and_paired():
@@ -68,6 +75,15 @@ def test_cursor_pre_post_parity_shell_and_mcp():
     assert m._resolve_tool_use_id(mcp_pre) == m._resolve_tool_use_id(mcp_post)
     assert m._resolve_tool_use_id({'tool_use_id': 'nativeX', 'command': 'y'}) == 'nativeX'
     assert m._resolve_tool_use_id(sh_pre) != m._resolve_tool_use_id({**sh_pre, 'generation_id': 'G9'})
+    # File events (afterFileEdit) carry no command/tool_input: must key on path (+edits),
+    # so distinct files get distinct ids (not all collapsing onto an empty-content hash),
+    # and the same edit replays to the same id.
+    fe1 = {'hook_event_name': 'afterFileEdit', 'conversation_id': 'C1', 'generation_id': 'G3',
+           'file_path': '/a.py', 'edits': [{'old': 'x', 'new': 'y'}]}
+    fe2 = {'hook_event_name': 'afterFileEdit', 'conversation_id': 'C1', 'generation_id': 'G3',
+           'file_path': '/b.py', 'edits': [{'old': 'x', 'new': 'y'}]}
+    assert m._resolve_tool_use_id(fe1) == m._resolve_tool_use_id(dict(fe1))  # stable on replay
+    assert m._resolve_tool_use_id(fe1) != m._resolve_tool_use_id(fe2)        # distinct files
 
 
 def test_augment_pre_post_parity_and_native_precedence():
@@ -77,6 +93,16 @@ def test_augment_pre_post_parity_and_native_precedence():
     assert m._resolve_tool_use_id(pre) == m._resolve_tool_use_id(post)
     assert m._resolve_tool_use_id({'tool_use_id': 'nativeY', 'tool_name': 'x'}) == 'nativeY'
     assert m._resolve_tool_use_id(pre).startswith('unb-')
+    # File edit: pre carries the path in tool_input; the completion may carry it only in
+    # file_changes[0].path -- both must resolve to the same id.
+    f_pre = {'session_id': 'C1', 'tool_name': 'str-replace-editor', 'tool_input': {'file_path': '/a.py'}}
+    f_post = {'session_id': 'C1', 'tool_name': 'str-replace-editor', 'tool_input': {},
+              'file_changes': [{'path': '/a.py'}]}
+    assert m._resolve_tool_use_id(f_pre) == m._resolve_tool_use_id(f_post)
+    # MCP input canonicalized: key order must not diverge the id.
+    a = {'session_id': 'C1', 'tool_name': 'srv', 'is_mcp_tool': True, 'tool_input': {'q': 1, 'a': 2}}
+    b = {'session_id': 'C1', 'tool_name': 'srv', 'is_mcp_tool': True, 'tool_input': {'a': 2, 'q': 1}}
+    assert m._resolve_tool_use_id(a) == m._resolve_tool_use_id(b)
 
 
 def test_copilot_forwards_native_id_and_mints_nothing():

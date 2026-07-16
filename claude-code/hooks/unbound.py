@@ -530,12 +530,19 @@ def extract_command_for_pretool(event: Dict) -> str:
 def _synthetic_tool_use_id(event: Dict) -> str:
     """Deterministic per-call id from replay-stable fields, so the SAME tool call
     yields the SAME id in the PreToolUse and PostToolUse emits with no shared state.
-    Prefixed 'unb-' so it can never collide with a native tool_use_id."""
+    Prefixed 'unb-' so it can never collide with a native tool_use_id. Keyed only on
+    fields guaranteed on BOTH events (session + tool + command); prompt_id is omitted
+    because it is not guaranteed on PostToolUse and would fork the id. MCP input is
+    canonicalized (sort_keys) so key-order variance can't diverge pre from post."""
+    content = extract_command_for_pretool(event)
+    try:
+        content = json.dumps(json.loads(content), sort_keys=True)
+    except (ValueError, TypeError):
+        pass
     key = '\x1f'.join((
         str(event.get('session_id') or ''),
-        str(event.get('prompt_id') or ''),
         str(event.get('tool_name') or ''),
-        str(extract_command_for_pretool(event)),
+        str(content),
     ))
     return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
 

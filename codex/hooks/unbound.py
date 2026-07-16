@@ -509,7 +509,13 @@ def extract_command_for_pretool(event: Dict) -> str:
 
 
 def _synthetic_tool_use_id(session_id, turn_id, tool_name, command) -> str:
-    """Deterministic fallback id for tools with no native id (byte-identical pre vs completion)."""
+    """Deterministic fallback id for tools with no native id (byte-identical pre vs
+    completion). MCP input is canonicalized (sort_keys) so key-order variance between
+    the pre event and the transcript-decoded completion can't diverge the id."""
+    try:
+        command = json.dumps(json.loads(command), sort_keys=True)
+    except (ValueError, TypeError):
+        pass
     key = '\x1f'.join((str(session_id or ''), str(turn_id or ''),
                        str(tool_name or ''), str(command or '')))
     return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]

@@ -674,11 +674,19 @@ def _resolve_tool_use_id(event):
         if native:
             return native
         hook_name = event.get('hook_event_name') or ''
-        command = event.get('command')
-        if 'MCP' in hook_name or command is None:
+        if 'MCP' in hook_name:
             content = json.dumps(event.get('tool_input') or {}, sort_keys=True)
+        elif event.get('command') is not None:
+            content = str(event.get('command'))
+        elif event.get('tool_input'):
+            content = json.dumps(event.get('tool_input'), sort_keys=True)
         else:
-            content = str(command)
+            # File events (afterFileEdit / beforeReadFile) carry no command/tool_input;
+            # key on the path (+edits) so each file op gets a distinct, stable id rather
+            # than all collapsing onto an empty-content hash.
+            fp = str(event.get('file_path') or '')
+            edits = event.get('edits')
+            content = fp if edits is None else fp + '\x1f' + json.dumps(edits, sort_keys=True, default=str)
         key = '\x1f'.join((
             str(event.get('conversation_id') or ''),
             str(event.get('generation_id') or ''),

@@ -495,12 +495,20 @@ def extract_command_for_pretool(event: Dict) -> str:
                 return value if isinstance(value, str) else json.dumps(value)
         return json.dumps(tool_input)
 
-    # File families (edit/write/read/delete): the path.
+    # File families (edit/write/read/delete): the path. Post-tool events may carry the
+    # path only in file_changes[0] (not tool_input), so fall back to it -- matching how
+    # _augment_posttooluse_to_exchange resolves the path -- so a pre event (tool_input
+    # path) and its completion (file_changes path) hash to the same id.
     if family in ('Edit', 'Write', 'Read', 'Delete') or tool_name in NATIVE_FILE_TOOLS:
         for key in ('path', 'file_path', 'filePath'):
             value = tool_input.get(key)
             if value:
                 return value if isinstance(value, str) else json.dumps(value)
+        file_changes = event.get('file_changes')
+        if isinstance(file_changes, list) and file_changes and isinstance(file_changes[0], dict):
+            path = file_changes[0].get('path')
+            if path:
+                return path if isinstance(path, str) else json.dumps(path)
         return json.dumps(tool_input)
 
     # Unknown tool: surface whatever input it carries so policy can still match.
@@ -1171,10 +1179,15 @@ def _resolve_tool_use_id(event: Dict) -> str:
     if native:
         return native
     try:
+        content = extract_command_for_pretool(event)
+        try:
+            content = json.dumps(json.loads(content), sort_keys=True)
+        except (ValueError, TypeError):
+            pass
         key = '\x1f'.join((
             str(event.get('session_id') or event.get('conversation_id') or ''),
             str(event.get('tool_name') or ''),
-            str(extract_command_for_pretool(event)),
+            str(content),
         ))
         return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
     except Exception:
