@@ -659,6 +659,19 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
             'suppressOriginalPrompt': True,
         }
 
+    # Allowed with injected context (e.g. the spend-limit alert-threshold
+    # warning "you've used $X of your $Y limit"): additionalContext feeds it
+    # to the model, systemMessage shows the same text to the user.
+    additional_context = api_response.get('additionalContext', '')
+    if additional_context:
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'UserPromptSubmit',
+                'additionalContext': additional_context,
+            },
+            'systemMessage': additional_context,
+        }
+
     return {}
 
 
@@ -2114,6 +2127,20 @@ def main():
 
             # If denied (response has decision: block), log the event then return
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'session_id': event.get('session_id'),
+                    'event': event
+                })
+                response["suppressOutput"] = True
+                print(json.dumps(response), flush=True)
+                return
+
+            # Allowed but with hook output to emit (e.g. the spend-limit
+            # alert-threshold warning riding additionalContext/systemMessage):
+            # log the event, then print the response instead of the default
+            # suppressOutput so Claude Code surfaces the warning.
+            if response:
                 append_to_audit_log({
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'session_id': event.get('session_id'),
