@@ -576,10 +576,10 @@ class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
         self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_wanted", cache_dir=self.cache),
                          self._http("https://wanted.example/mcp"))
 
-    def test_unusable_entry_does_not_stop_search(self):
-        # An earlier candidate defines the server key but with no usable url/command;
-        # a later candidate (manifest-declared) has a usable definition, and the cache
-        # lacks one. Resolution must keep looking, not stop on the unusable entry.
+    def test_entry_with_no_forwardable_fields_does_not_stop_search(self):
+        # An earlier candidate has the server key but nothing to forward
+        # (`_extract_mcp_server_fields` returns None). A later candidate (manifest-
+        # declared) defines it and the cache lacks it, so resolution keeps looking.
         _make_plugin(self.cache, "mk", "p", "1.0.0",
                      {".mcp.json": {"mcpServers": {"s": {"headers": {"x": "y"}}}}}, in_use=True)
         install_path = self.cache / "mk" / "p" / "1.0.0"
@@ -593,6 +593,18 @@ class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
                          {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
         self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
                          self._http("https://declared.example/mcp"))
+
+    def test_colliding_keys_in_one_dir_is_ambiguous(self):
+        # Two server keys in ONE .mcp.json mangle to the same candidate with different
+        # configs. All keys are considered (like the cache path) -> ambiguous -> None.
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json", {"mcpServers": {
+            "s.x": self._http("https://a.example/mcp"),  # -> plugin_p_s_x
+            "s_x": self._http("https://b.example/mcp"),  # -> plugin_p_s_x
+        }})
+        self._registries({"p@mk": [{"installPath": str(self.cache / "none")}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config("plugin_p_s_x", cache_dir=self.cache))
 
     def test_registry_ambiguous_candidate_returns_none(self):
         # Two (plugin, server) pairs mangle to the same candidate with DIFFERENT
