@@ -879,6 +879,121 @@ def _augment_script_hash(result, cwd):
     return result
 
 
+# KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
+
+_MCP_TOOLS_CACHE_FILENAME = 'mcp-tools-cache.json'
+_MCP_TOOLS_CACHE_MAX_BYTES = 2 * 1024 * 1024
+_MCP_CACHE_CODING_TOOL_NAMES = frozenset({'cursor', 'cursor cli'})
+_MCP_CACHE_CODING_TOOL_PREFIXES = ()
+_UNBOUND_CODING_TOOL = 'Cursor'
+
+
+def compute_mcp_cache_key(name, command, url, args):
+    subset = {}
+    clean_name = name.strip() if isinstance(name, str) else ''
+    if clean_name:
+        subset['name'] = clean_name
+    clean_url = url.strip() if isinstance(url, str) else ''
+    if clean_url:
+        subset['url'] = clean_url
+    clean_command = command.strip() if isinstance(command, str) else ''
+    if clean_command:
+        subset['command'] = clean_command
+    if args:
+        subset['args'] = args
+    if not subset:
+        return None
+    encoded = json.dumps(subset, sort_keys=True, separators=(',', ':'))
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def _unbound_state_dir_candidates():
+    candidates = [Path.home() / '.unbound']
+    if hasattr(os, 'getuid'):
+        candidates.append(Path(f'/var/tmp/unbound-{os.getuid()}'))
+    else:
+        candidates.append(Path(tempfile.gettempdir()) / 'unbound')
+    return candidates
+
+
+def _read_mcp_tools_cache():
+    try:
+        for state_dir in _unbound_state_dir_candidates():
+            path = state_dir / _MCP_TOOLS_CACHE_FILENAME
+            if not path.is_file():
+                continue
+            with open(path, 'rb') as f:
+                data = f.read(_MCP_TOOLS_CACHE_MAX_BYTES + 1)
+            if len(data) > _MCP_TOOLS_CACHE_MAX_BYTES:
+                return {}
+            parsed = json.loads(data.decode('utf-8'))
+            return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    return {}
+
+
+def _mcp_cache_entries_for_user(tools):
+    username = Path.home().name
+    entries = []
+    for key, by_user in tools.items():
+        if not isinstance(key, str) or not isinstance(by_user, dict):
+            continue
+        k = key.strip().lower()
+        if k in _MCP_CACHE_CODING_TOOL_NAMES or k.startswith(_MCP_CACHE_CODING_TOOL_PREFIXES):
+            entry = by_user.get(username)
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+_CONTENT_HASH_RE = re.compile(r'^[a-f0-9]{64}$', re.IGNORECASE)
+
+
+def _lookup_tool_content_hash(server_name, mcp_tool, server_cfg):
+    try:
+        if not server_name or not mcp_tool or not isinstance(server_cfg, dict):
+            return None
+        cache_key = compute_mcp_cache_key(
+            name=server_name,
+            command=server_cfg.get('command'),
+            url=server_cfg.get('url'),
+            args=server_cfg.get('args'),
+        )
+        if not cache_key:
+            return None
+        tools = _read_mcp_tools_cache().get('tools')
+        if not isinstance(tools, dict):
+            return None
+        for entry in _mcp_cache_entries_for_user(tools):
+            by_tool = entry.get(cache_key)
+            if not isinstance(by_tool, dict):
+                continue
+            content_hash = by_tool.get(mcp_tool)
+            if isinstance(content_hash, str) and _CONTENT_HASH_RE.match(content_hash):
+                return content_hash
+        return None
+    except Exception:
+        return None
+
+
+def _attach_tool_content_hash(metadata):
+    try:
+        server_cfg = metadata.get('mcp_server_config')
+        if not isinstance(server_cfg, dict):
+            return
+        content_hash = _lookup_tool_content_hash(
+            metadata.get('mcp_server'), metadata.get('mcp_tool'), server_cfg
+        )
+        if content_hash:
+            server_cfg['tool_content_hash'] = content_hash
+    except Exception:
+        pass
+
+
+# ───────────────────────── end MCP tool risk-scoring section ─────────────────
+
+
 def _read_mcp_server_config(server_name, config_path):
     """
     Read an MCP server's config (url, command, args) from a config file.
@@ -934,6 +1049,8 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
 
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
+
+    _attach_tool_content_hash(metadata)
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -1634,6 +1751,7 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                     "UNBOUND_API_KEY": api_key,
                     "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
                     "UNBOUND_MCP_SERVER_NAME": server_name,
+                    "UNBOUND_CODING_TOOL": _UNBOUND_CODING_TOOL,
                     "UNBOUND_MCP_DOMAIN": backend_url},
         }
         if os.name == "nt":
