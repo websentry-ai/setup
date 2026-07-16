@@ -315,7 +315,7 @@ class TestUnresolvedForwarding(ProcessPreToolUseBase):
 
 # Query string is stripped by the hook + gateway, so the fingerprint is host+path.
 _PLUGIN_TOOLCHAIN_URL = (
-    "https://toolchain-internal.frdstr.com/mcp/v1/rpc?tool_filter=gdrive*,gdocs*"
+    "https://mcp.example.com/mcp/v1/rpc?tool_filter=gdrive*,gdocs*"
 )
 
 
@@ -351,7 +351,7 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
         self.assertEqual(server, "gdrive")
         self.assertEqual(tool, "gdrive-search")
         self.assertEqual(
-            cfg.get("url"), "https://toolchain-internal.frdstr.com/mcp/v1/rpc"
+            cfg.get("url"), "https://mcp.example.com/mcp/v1/rpc"
         )
 
     def test_user_mcp_json_wins_over_plugin(self):
@@ -366,6 +366,27 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
         with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
             unbound._vscode_user_dirs()[0].mkdir(parents=True, exist_ok=True)
             self.assertEqual(unbound.read_copilot_mcp_servers(None), {})
+
+    def test_plugin_relative_command_hashes_against_bundle(self):
+        # A plugin's relative script is fingerprinted against its own bundle dir,
+        # not the workspace cwd (else null/wrong fingerprint -> sanction bypass).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            user_dir = unbound._vscode_user_dirs()[0]
+            user_dir.mkdir(parents=True, exist_ok=True)
+            plugin_dir = (
+                user_dir.parent / "agentPlugins" / "github.com" / "acme" / "local-mcp"
+            )
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            (plugin_dir / "server.py").write_text("print('hi')\n")
+            (plugin_dir / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"local": {"command": "./server.py"}}})
+            )
+            # cwd points at a dir that does NOT contain the script.
+            servers = unbound.read_copilot_mcp_servers(str(user_dir.parent))
+        self.assertIn("local", servers)
+        self.assertIsNotNone(servers["local"].get("scriptHash"))
 
 
 if __name__ == "__main__":
