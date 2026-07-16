@@ -576,6 +576,24 @@ class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
         self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_wanted", cache_dir=self.cache),
                          self._http("https://wanted.example/mcp"))
 
+    def test_unusable_entry_does_not_stop_search(self):
+        # An earlier candidate defines the server key but with no usable url/command;
+        # a later candidate (manifest-declared) has a usable definition, and the cache
+        # lacks one. Resolution must keep looking, not stop on the unusable entry.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"s": {"headers": {"x": "y"}}}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json", {"mcpServers": {"s": {"headers": {"x": "y"}}}})
+        _write_json(clone / "custom" / "loc" / ".mcp.json",
+                    {"mcpServers": {"s": self._http("https://declared.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "custom/loc"}}]})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://declared.example/mcp"))
+
     def test_registry_ambiguous_candidate_returns_none(self):
         # Two (plugin, server) pairs mangle to the same candidate with DIFFERENT
         # configs -> ambiguous -> None (never guess).

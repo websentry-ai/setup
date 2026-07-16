@@ -836,9 +836,11 @@ def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN
                     # This dir doesn't define the server -> try the next candidate.
                     continue
                 fields = _extract_mcp_server_fields(entry)
-                if fields is not None:
-                    matches.append(fields)
-                # First candidate dir that defines the server wins (the live-most copy).
+                if fields is None:
+                    # Defined here but no usable url/command -> keep looking.
+                    continue
+                matches.append(fields)
+                # First candidate dir with a usable definition wins (the live-most copy).
                 break
 
         distinct = []
