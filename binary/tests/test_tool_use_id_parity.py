@@ -75,15 +75,23 @@ def test_cursor_pre_post_parity_shell_and_mcp():
     assert m._resolve_tool_use_id(mcp_pre) == m._resolve_tool_use_id(mcp_post)
     assert m._resolve_tool_use_id({'tool_use_id': 'nativeX', 'command': 'y'}) == 'nativeX'
     assert m._resolve_tool_use_id(sh_pre) != m._resolve_tool_use_id({**sh_pre, 'generation_id': 'G9'})
-    # File events (afterFileEdit) carry no command/tool_input: must key on path (+edits),
-    # so distinct files get distinct ids (not all collapsing onto an empty-content hash),
-    # and the same edit replays to the same id.
-    fe1 = {'hook_event_name': 'afterFileEdit', 'conversation_id': 'C1', 'generation_id': 'G3',
-           'file_path': '/a.py', 'edits': [{'old': 'x', 'new': 'y'}]}
-    fe2 = {'hook_event_name': 'afterFileEdit', 'conversation_id': 'C1', 'generation_id': 'G3',
-           'file_path': '/b.py', 'edits': [{'old': 'x', 'new': 'y'}]}
-    assert m._resolve_tool_use_id(fe1) == m._resolve_tool_use_id(dict(fe1))  # stable on replay
-    assert m._resolve_tool_use_id(fe1) != m._resolve_tool_use_id(fe2)        # distinct files
+    # File ops: the pre-tool event (preToolUse Write) and its completion (afterFileEdit)
+    # for the same path must produce the SAME id despite their different shapes; distinct
+    # files stay distinct; a read of the same path is a different op (different id).
+    w_pre = {'hook_event_name': 'preToolUse', 'conversation_id': 'C1', 'generation_id': 'G3',
+             'tool_name': 'Write', 'tool_input': {'file_path': '/a.py', 'content': 'hi'}}
+    w_post = {'hook_event_name': 'afterFileEdit', 'conversation_id': 'C1', 'generation_id': 'G3',
+              'file_path': '/a.py', 'edits': [{'old': 'x', 'new': 'y'}]}
+    assert m._resolve_tool_use_id(w_pre) == m._resolve_tool_use_id(w_post)   # pre<->post match
+    assert m._resolve_tool_use_id(w_post) == m._resolve_tool_use_id(dict(w_post))  # replay stable
+    other_file = {**w_post, 'file_path': '/b.py'}
+    assert m._resolve_tool_use_id(w_post) != m._resolve_tool_use_id(other_file)   # distinct files
+    r_pre = {'hook_event_name': 'preToolUse', 'conversation_id': 'C1', 'generation_id': 'G3',
+             'tool_name': 'Read', 'tool_input': {'file_path': '/a.py'}}
+    r_post = {'hook_event_name': 'beforeReadFile', 'conversation_id': 'C1', 'generation_id': 'G3',
+              'file_path': '/a.py'}
+    assert m._resolve_tool_use_id(r_pre) == m._resolve_tool_use_id(r_post)   # read pre<->post
+    assert m._resolve_tool_use_id(r_pre) != m._resolve_tool_use_id(w_pre)    # read != write
 
 
 def test_augment_pre_post_parity_and_native_precedence():

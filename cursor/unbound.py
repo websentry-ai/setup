@@ -660,6 +660,15 @@ def build_account_identity(event=None, probe=False):
     return identity
 
 
+# Cursor surfaces file ops through several event shapes; map each to a normalized
+# operation so a pre event (preToolUse Write/Read/Delete) and its completion
+# (afterFileEdit / beforeReadFile) for the same path hash to the same synthetic id.
+_CURSOR_FILE_OP = {
+    'Write': 'write', 'Edit': 'write', 'Delete': 'delete', 'Read': 'read',
+    'afterFileEdit': 'write', 'beforeReadFile': 'read',
+}
+
+
 def _resolve_tool_use_id(event):
     """Stable per-call id: the native tool_use_id when Cursor supplies one, else a
     deterministic synthetic id. The key uses ONLY fields byte-identical across the
@@ -674,23 +683,28 @@ def _resolve_tool_use_id(event):
         if native:
             return native
         hook_name = event.get('hook_event_name') or ''
-        if 'MCP' in hook_name:
-            content = json.dumps(event.get('tool_input') or {}, sort_keys=True)
+        tool_name = event.get('tool_name') or ''
+        ti = event.get('tool_input') if isinstance(event.get('tool_input'), dict) else {}
+        # File ops arrive in several shapes (preToolUse Write/Read/Delete, afterFileEdit,
+        # beforeReadFile). Normalize them to (operation, path) so a pre event and its
+        # completion for the SAME file hash to the same id -- the differing tool_name /
+        # tool_input / edits shapes would otherwise fork the id.
+        file_op = _CURSOR_FILE_OP.get(tool_name) or _CURSOR_FILE_OP.get(hook_name)
+        file_path = event.get('file_path') or ti.get('file_path') or ti.get('path')
+        if file_op and file_path:
+            tool_disc, content = 'file', file_op + ':' + str(file_path)
+        elif 'MCP' in hook_name:
+            tool_disc, content = tool_name, json.dumps(ti, sort_keys=True)
         elif event.get('command') is not None:
-            content = str(event.get('command'))
-        elif event.get('tool_input'):
-            content = json.dumps(event.get('tool_input'), sort_keys=True)
+            tool_disc, content = tool_name, str(event.get('command'))
+        elif ti:
+            tool_disc, content = tool_name, json.dumps(ti, sort_keys=True)
         else:
-            # File events (afterFileEdit / beforeReadFile) carry no command/tool_input;
-            # key on the path (+edits) so each file op gets a distinct, stable id rather
-            # than all collapsing onto an empty-content hash.
-            fp = str(event.get('file_path') or '')
-            edits = event.get('edits')
-            content = fp if edits is None else fp + '\x1f' + json.dumps(edits, sort_keys=True, default=str)
+            tool_disc, content = tool_name, ''
         key = '\x1f'.join((
             str(event.get('conversation_id') or ''),
             str(event.get('generation_id') or ''),
-            str(event.get('tool_name') or ''),
+            tool_disc,
             content,
         ))
         return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
