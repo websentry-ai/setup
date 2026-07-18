@@ -536,18 +536,21 @@ def _vscode_user_dirs():
     return [base / "Code" / "User", base / "Code - Insiders" / "User"]
 
 
-# Bounds the plugin `.mcp.json` files merged on the hot pretool path.
-_MAX_PLUGIN_CONFIGS = 100
-
-
-# Cap one plugin source; log (never silent) if truncated so a dropped server isn't hidden.
-def _cap_plugin_configs(paths):
-    if len(paths) > _MAX_PLUGIN_CONFIGS:
-        log_error(
-            f"copilot plugin configs capped at {_MAX_PLUGIN_CONFIGS} (found {len(paths)})",
-            'mcp_plugin',
-        )
-        return paths[:_MAX_PLUGIN_CONFIGS]
+# Plugin-bundle `.mcp.json` paths: VS Code agentPlugins + Copilot CLI installed-plugins.
+# Bundles ship MCP servers here and never merge them into mcp.json, so scan them or the
+# server resolves to null. Not capped — dropping a config would leave its server
+# unresolved and silently skip the fingerprint sanction check (fail-open).
+def _plugin_mcp_config_paths(home):
+    paths = []
+    for user_dir in _vscode_user_dirs():
+        try:
+            paths.extend(sorted((user_dir.parent / "agentPlugins").glob("*/*/*/.mcp.json")))
+        except OSError:
+            pass
+    try:
+        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
+    except OSError:
+        pass
     return paths
 
 
@@ -575,27 +578,7 @@ def _copilot_mcp_config_paths(cwd=None):
     trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
     trusted.append(home / ".copilot" / "mcp-config.json")
 
-    # VS Code Agent plugins bundle MCP servers in a `.mcp.json` at the plugin root
-    # under <UserData>/Code/agentPlugins/<marketplace>/<org>/<repo>/ and never merge
-    # them into mcp.json — so scan the bundles or the server resolves to null.
-    vscode_plugins = []
-    for user_dir in _vscode_user_dirs():
-        agent_plugins = user_dir.parent / "agentPlugins"
-        try:
-            vscode_plugins.extend(sorted(agent_plugins.glob("*/*/*/.mcp.json")))
-        except OSError:
-            pass
-    # Copilot CLI plugins live here instead.
-    try:
-        cli_plugins = sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json"))
-    except OSError:
-        cli_plugins = []
-    # Cap each source independently so a large agentPlugins tree can never starve
-    # CLI plugins out of the merge (dropping them would leave those servers
-    # unresolved and skip the fingerprint sanction check).
-    plugins = _cap_plugin_configs(vscode_plugins) + _cap_plugin_configs(cli_plugins)
-
-    return workspace + plugins + trusted
+    return workspace + _plugin_mcp_config_paths(home) + trusted
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -785,15 +768,12 @@ def _augment_script_hash(result, cwd):
     return result
 
 
-# True for plugin-bundle paths (VS Code agentPlugins / Copilot CLI installed-plugins).
-def _is_plugin_config_path(path):
-    parts = path.parts
-    return 'agentPlugins' in parts or 'installed-plugins' in parts
-
-
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
     plugin_names = set()
+    # Exact set of plugin-bundle paths (not a path-substring guess, which could
+    # misclassify a workspace file living under an agentPlugins-named dir).
+    plugin_paths = set(_plugin_mcp_config_paths(Path.home()))
     for config_path in _copilot_mcp_config_paths(cwd):
         try:
             if not config_path.exists():
@@ -812,7 +792,7 @@ def read_copilot_mcp_servers(cwd=None):
                 raw = nested.get('servers') if isinstance(nested, dict) else None
             if not isinstance(raw, dict):
                 continue
-            is_plugin = _is_plugin_config_path(config_path)
+            is_plugin = config_path in plugin_paths
             # A plugin's relative command/script is relative to its own bundle,
             # not the workspace cwd — resolve script hashes against the bundle dir
             # so the fingerprint is correct (and not workspace-spoofable).
