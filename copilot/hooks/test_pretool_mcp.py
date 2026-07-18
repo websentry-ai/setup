@@ -162,7 +162,8 @@ class ProcessPreToolUseBase(unittest.TestCase):
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(CONFIG))
         self._patchers = [
-            patch.object(unbound, "_copilot_mcp_config_paths", lambda cwd=None: [cfg_path]),
+            patch.object(unbound, "_copilot_mcp_config_paths", lambda cwd=None, plugins=None: [cfg_path]),
+            patch.object(unbound, "_plugin_mcp_config_paths", lambda home=None: []),
             patch.object(unbound, "load_policy_cache", lambda: None),
             patch.object(unbound, "get_recent_user_prompts_for_session", lambda *a, **k: []),
             patch.object(unbound, "get_session_start_model", lambda *a, **k: "auto"),

@@ -536,10 +536,8 @@ def _vscode_user_dirs():
     return [base / "Code" / "User", base / "Code - Insiders" / "User"]
 
 
-# Plugin-bundle `.mcp.json` paths: VS Code agentPlugins + Copilot CLI installed-plugins.
-# Bundles ship MCP servers here and never merge them into mcp.json, so scan them or the
-# server resolves to null. Not capped — dropping a config would leave its server
-# unresolved and silently skip the fingerprint sanction check (fail-open).
+# Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
+# into mcp.json, so scan them. Not capped — a dropped config would fail open.
 def _plugin_mcp_config_paths(home):
     paths = []
     for user_dir in _vscode_user_dirs():
@@ -556,7 +554,7 @@ def _plugin_mcp_config_paths(home):
 
 # All Copilot MCP config locations, ordered for the last-wins merge in
 # read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
-def _copilot_mcp_config_paths(cwd=None):
+def _copilot_mcp_config_paths(cwd=None, plugins=None):
     home = Path.home()
 
     workspace = []
@@ -578,7 +576,9 @@ def _copilot_mcp_config_paths(cwd=None):
     trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
     trusted.append(home / ".copilot" / "mcp-config.json")
 
-    return workspace + _plugin_mcp_config_paths(home) + trusted
+    if plugins is None:
+        plugins = _plugin_mcp_config_paths(home)
+    return workspace + plugins + trusted
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -771,10 +771,10 @@ def _augment_script_hash(result, cwd):
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
     plugin_names = set()
-    # Exact set of plugin-bundle paths (not a path-substring guess, which could
-    # misclassify a workspace file living under an agentPlugins-named dir).
-    plugin_paths = set(_plugin_mcp_config_paths(Path.home()))
-    for config_path in _copilot_mcp_config_paths(cwd):
+    # Match plugin bundles by exact path (a substring check could misclassify).
+    plugin_list = _plugin_mcp_config_paths(Path.home())
+    plugin_paths = set(plugin_list)
+    for config_path in _copilot_mcp_config_paths(cwd, plugin_list):
         try:
             if not config_path.exists():
                 continue
@@ -793,14 +793,12 @@ def read_copilot_mcp_servers(cwd=None):
             if not isinstance(raw, dict):
                 continue
             is_plugin = config_path in plugin_paths
-            # A plugin's relative command/script is relative to its own bundle,
-            # not the workspace cwd — resolve script hashes against the bundle dir
-            # so the fingerprint is correct (and not workspace-spoofable).
+            # Hash a plugin's relative script against its own bundle, not cwd,
+            # so the fingerprint is correct and not workspace-spoofable.
             base = config_path.parent if is_plugin else cwd
             for name, server in raw.items():
                 fields = _sanitize_mcp_server_fields(server, base) or {}
-                # Only two different plugin bundles claiming one name is ambiguous
-                # (arbitrary winner); a user config overriding a plugin is expected.
+                # Surface only genuine plugin-vs-plugin name clashes (name only).
                 if is_plugin:
                     if name in plugin_names and servers.get(name) != fields:
                         log_error(
