@@ -685,6 +685,29 @@ def _norm_mcp_token(s: Optional[str]) -> str:
     return re.sub(r'_+', '_', s or '').strip('_')
 
 
+def _load_plugin_mcp_map(version_dir: Path, rel_path) -> Dict:
+    # Read a plugin-relative config file's `mcpServers` map. Contain the path to
+    # the version dir: reject absolute paths and ../ traversal (and symlink
+    # escapes via resolve()).
+    if not isinstance(rel_path, str):
+        return {}
+    candidate = (version_dir / rel_path).resolve()
+    try:
+        candidate.relative_to(version_dir.resolve())
+    except ValueError:
+        return {}
+    if not candidate.is_file():
+        return {}
+    try:
+        with open(candidate, 'r', encoding='utf-8') as f:
+            data = json.loads(f.read())
+    except Exception as exc:
+        log_error(f"mcp plugin source unreadable: {candidate}: {exc}", 'mcp_plugin')
+        return {}
+    servers = data.get('mcpServers') if isinstance(data, dict) else None
+    return servers if isinstance(servers, dict) else {}
+
+
 def _plugin_mcp_server_map(version_dir: Path) -> Dict:
     servers = {}
     sources = [version_dir / ".mcp.json", version_dir / ".claude-plugin" / "plugin.json"]
@@ -711,23 +734,16 @@ def _plugin_mcp_server_map(version_dir: Path) -> Dict:
             }
             if root_map:
                 mcp_servers = root_map
+        # Per the plugin spec `mcpServers` is `string | array | object`: a config
+        # path, a list of config paths, or an inline map. Resolve paths to maps.
         if isinstance(mcp_servers, str):
-            # Contain the path to the version dir: reject absolute paths and
-            # ../ traversal (and symlink escapes via resolve()).
-            candidate = (version_dir / mcp_servers).resolve()
-            try:
-                candidate.relative_to(version_dir.resolve())
-            except ValueError:
-                continue
-            if candidate.is_file():
-                try:
-                    with open(candidate, 'r', encoding='utf-8') as f:
-                        rel_data = json.loads(f.read())
-                except Exception as exc:
-                    log_error(f"mcp plugin source unreadable: {candidate}: {exc}", 'mcp_plugin')
-                    continue
-                if isinstance(rel_data, dict):
-                    mcp_servers = rel_data.get('mcpServers')
+            mcp_servers = _load_plugin_mcp_map(version_dir, mcp_servers)
+        elif isinstance(mcp_servers, list):
+            merged = {}
+            for elem in mcp_servers:
+                for key, entry in _load_plugin_mcp_map(version_dir, elem).items():
+                    merged.setdefault(key, entry)
+            mcp_servers = merged
         if isinstance(mcp_servers, dict):
             for key, entry in mcp_servers.items():
                 servers.setdefault(key, entry)

@@ -146,6 +146,51 @@ class TestResolvePluginMcpConfig(unittest.TestCase):
         cfg = unbound._resolve_plugin_mcp_config("plugin_absplug_evil", cache_dir=self.cache)
         self.assertIsNone(cfg)
 
+    def test_array_form_resolves_all_servers(self):
+        # `mcpServers` as an array of config paths must resolve every listed file.
+        _make_plugin(
+            self.cache, "mkt", "toolkit", "1.0.0",
+            {
+                ".claude-plugin/plugin.json": {"mcpServers": ["./a.json", "./b.json"]},
+                "a.json": {"mcpServers": {"alpha": {"url": "https://alpha.example/mcp"}}},
+                "b.json": {"mcpServers": {"beta": {"url": "https://beta.example/mcp"}}},
+            },
+        )
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config("plugin_toolkit_alpha", cache_dir=self.cache),
+            {"url": "https://alpha.example/mcp"},
+        )
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config("plugin_toolkit_beta", cache_dir=self.cache),
+            {"url": "https://beta.example/mcp"},
+        )
+
+    def test_array_form_traversal_escape_rejected(self):
+        # A ../ element in the array must not read a file outside the version dir.
+        ver_dir = _make_plugin(
+            self.cache, "mkt", "arrevil", "1.0.0",
+            {".claude-plugin/plugin.json": {"mcpServers": ["../../../evil.json"]}},
+        )
+        outside = ver_dir.parent.parent.parent / "evil.json"
+        _write_json(outside, {"mcpServers": {"evil": {"url": "https://evil.example/mcp"}}})
+        self.assertIsNone(
+            unbound._resolve_plugin_mcp_config("plugin_arrevil_evil", cache_dir=self.cache)
+        )
+
+    def test_array_form_drops_bad_element_keeps_valid(self):
+        # One escaping element must not poison the rest of the array.
+        _make_plugin(
+            self.cache, "mkt", "mixed", "1.0.0",
+            {
+                ".claude-plugin/plugin.json": {"mcpServers": ["./ok.json", "../../../evil.json"]},
+                "ok.json": {"mcpServers": {"good": {"url": "https://good.example/mcp"}}},
+            },
+        )
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config("plugin_mixed_good", cache_dir=self.cache),
+            {"url": "https://good.example/mcp"},
+        )
+
     def test_identical_config_collision_resolves(self):
         # Two distinct (plugin, server) pairs mangle to the same candidate AND
         # share the SAME config -> one distinct entry -> resolves (benign).
