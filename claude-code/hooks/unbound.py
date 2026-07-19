@@ -695,6 +695,7 @@ def _load_plugin_mcp_map(version_dir: Path, rel_path) -> Dict:
     try:
         candidate.relative_to(version_dir.resolve())
     except ValueError:
+        log_error(f"mcp plugin path rejected (containment): {rel_path}", 'mcp_plugin')
         return {}
     if not candidate.is_file():
         return {}
@@ -739,9 +740,14 @@ def _plugin_mcp_server_map(version_dir: Path) -> Dict:
         if isinstance(mcp_servers, str):
             mcp_servers = _load_plugin_mcp_map(version_dir, mcp_servers)
         elif isinstance(mcp_servers, list):
+            # First-wins on a duplicate key (consistent with the cross-source
+            # setdefault below); log a real conflict so a wrong-server fingerprint
+            # is diagnosable rather than silent.
             merged = {}
             for elem in mcp_servers:
                 for key, entry in _load_plugin_mcp_map(version_dir, elem).items():
+                    if key in merged and merged[key] != entry:
+                        log_error(f"mcp plugin array key collision: {key}", 'mcp_plugin')
                     merged.setdefault(key, entry)
             mcp_servers = merged
         if isinstance(mcp_servers, dict):
