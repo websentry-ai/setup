@@ -1130,6 +1130,148 @@ def _read_script_body_b64(command, args, cwd):
         return None
 
 
+def _macos_proc_argv(pid: int) -> Optional[List[str]]:
+    import ctypes
+    import struct
+
+    CTL_KERN = 1
+    KERN_ARGMAX = 8
+    KERN_PROCARGS2 = 49
+
+    libc = ctypes.CDLL(None, use_errno=True)
+
+    argmax = ctypes.c_int(0)
+    size = ctypes.c_size_t(ctypes.sizeof(argmax))
+    mib2 = (ctypes.c_int * 2)(CTL_KERN, KERN_ARGMAX)
+    if libc.sysctl(mib2, 2, ctypes.byref(argmax), ctypes.byref(size), None, 0) != 0:
+        return None
+
+    buf = ctypes.create_string_buffer(argmax.value)
+    size = ctypes.c_size_t(argmax.value)
+    mib3 = (ctypes.c_int * 3)(CTL_KERN, KERN_PROCARGS2, int(pid))
+    if libc.sysctl(mib3, 3, buf, ctypes.byref(size), None, 0) != 0:
+        return None
+
+    # KERN_PROCARGS2 layout: int argc, exec_path\0, padding\0*, then argc null-terminated args.
+    data = buf.raw[:size.value]
+    if len(data) < 4:
+        return None
+    argc = struct.unpack('i', data[:4])[0]
+    end = data.find(b'\x00', 4)
+    if end == -1:
+        return None
+    pos = end
+    while pos < len(data) and data[pos] == 0:
+        pos += 1
+    argv = []
+    for _ in range(argc):
+        end = data.find(b'\x00', pos)
+        if end == -1:
+            break
+        argv.append(data[pos:end].decode('utf-8', 'replace'))
+        pos = end + 1
+    return argv
+
+
+def _process_argv(pid: int) -> List[str]:
+    try:
+        cmdline = Path(f"/proc/{pid}/cmdline")
+        if cmdline.exists():
+            raw = cmdline.read_bytes()
+            return [a.decode('utf-8', 'replace') for a in raw.split(b'\x00') if a]
+    except Exception:
+        pass
+    if platform.system() == 'Darwin':
+        try:
+            argv = _macos_proc_argv(pid)
+            if argv:
+                return argv
+        except Exception:
+            pass
+    return []
+
+
+def _parent_pid(pid: int) -> Optional[int]:
+    try:
+        stat = Path(f"/proc/{pid}/stat")
+        if stat.exists():
+            # Fields: pid (comm) state ppid ...; comm may hold spaces/parens, so
+            # parse after the last ')': [state, ppid, ...].
+            data = stat.read_text()
+            return int(data[data.rfind(')') + 1:].split()[1])
+    except Exception:
+        pass
+    try:
+        out = subprocess.run(['ps', '-o', 'ppid=', '-p', str(pid)],
+                             capture_output=True, text=True, timeout=2)
+        s = out.stdout.strip()
+        return int(s) if s else None
+    except Exception:
+        return None
+
+
+def _launch_mcp_config_values() -> List[str]:
+    # Nearest ancestor first, so the process owning the tool wins on a name collision.
+    values = []
+    pid = os.getpid()
+    for _ in range(12):
+        values.extend(_mcp_config_values_from_argv(_process_argv(pid)))
+        ppid = _parent_pid(pid)
+        if not ppid or ppid == pid or ppid <= 1:
+            break
+        pid = ppid
+    return values
+
+
+def _mcp_config_values_from_argv(argv: List[str]) -> List[str]:
+    values = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--mcp-config' and i + 1 < len(argv):
+            values.append(argv[i + 1])
+            i += 2
+            continue
+        if a.startswith('--mcp-config='):
+            values.append(a[len('--mcp-config='):])
+        i += 1
+    return values
+
+
+def _load_mcp_config_blob(raw: str, cwd: Optional[str] = None) -> Optional[Dict]:
+    raw = (raw or '').strip()
+    if not raw:
+        return None
+    if raw[0] in '{[':
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+    try:
+        path = Path(raw).expanduser()
+        if not path.is_absolute() and cwd:
+            path = Path(cwd) / path
+        if path.is_file():
+            return json.loads(path.read_text(encoding='utf-8'))
+    except Exception:
+        return None
+    return None
+
+
+def _resolve_launch_mcp_config(server_name: str, cwd: Optional[str] = None) -> Optional[Dict]:
+    try:
+        for raw in _launch_mcp_config_values():
+            data = _load_mcp_config_blob(raw, cwd)
+            servers = data.get('mcpServers') if isinstance(data, dict) else None
+            if isinstance(servers, dict) and server_name in servers:
+                result = _extract_mcp_server_fields(servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+        return None
+    except Exception:
+        return None
+
+
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
     try:
         if not config_path.exists():
@@ -1502,6 +1644,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                             metadata['mcp_server_config'] = connector_cfg
                             if _is_uuid(mcp_server_name):
                                 metadata['mcp_server_uuid'] = mcp_server_name
+                        else:
+                            launch_cfg = _resolve_launch_mcp_config(mcp_server_name, cwd=cwd)
+                            if launch_cfg:
+                                metadata['mcp_server_config'] = launch_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
