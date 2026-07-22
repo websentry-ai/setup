@@ -338,6 +338,418 @@ def canonical_tool_name(raw):
     return ''
 
 
+# VS Code stable + Insiders "Code/User" dirs for the current OS. Uses
+# platform.system() rather than sys.platform/os.name so static checkers do not
+# narrow it to one OS and flag the other branches as unreachable.
+def _vscode_user_dirs():
+    system = platform.system()
+    if system == "Windows":
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return []
+        base = Path(appdata)
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path.home() / ".config"
+    return [base / "Code" / "User", base / "Code - Insiders" / "User"]
+
+
+# Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
+# into mcp.json, so scan them. Not capped — a dropped config would fail open.
+def _plugin_mcp_config_paths(home):
+    paths = []
+    for user_dir in _vscode_user_dirs():
+        try:
+            paths.extend(sorted((user_dir.parent / "agentPlugins").glob("*/*/*/.mcp.json")))
+        except OSError:
+            pass
+    try:
+        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
+    except OSError:
+        pass
+    return paths
+
+
+# All Copilot MCP config locations, ordered for the last-wins merge in
+# read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
+def _copilot_mcp_config_paths(cwd=None, plugins=None):
+    home = Path.home()
+
+    workspace = []
+    if cwd:
+        workspace.append(Path(cwd) / ".vscode" / "mcp.json")
+        workspace.append(Path(cwd) / ".mcp.json")
+
+    trusted = []
+    for user_dir in _vscode_user_dirs():
+        trusted.append(user_dir / "mcp.json")
+        trusted.append(user_dir / "settings.json")
+        profiles = user_dir / "profiles"
+        try:
+            if profiles.is_dir():
+                for profile in sorted(profiles.iterdir()):
+                    trusted.append(profile / "mcp.json")
+        except OSError:
+            pass
+    trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
+    trusted.append(home / ".copilot" / "mcp-config.json")
+
+    if plugins is None:
+        plugins = _plugin_mcp_config_paths(home)
+    return workspace + plugins + trusted
+
+_JSONC_COMMENT_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|//[^\n\r]*'         # line comment (dropped)
+    r'|/\*.*?\*/',         # block comment (dropped)
+    re.DOTALL,
+)
+_JSONC_TRAILING_COMMA_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|,(?=\s*[}\]])',     # trailing comma (dropped; brace left via lookahead)
+    re.DOTALL,
+)
+
+
+def _strip_jsonc(text):
+    # Two string-aware passes: both match string literals first so commas/comment
+    # markers inside a quoted value are preserved verbatim. Pass 1 drops comments;
+    # pass 2 drops trailing commas (now that any comment between a comma and its
+    # brace is gone) via a lookahead that leaves the brace in place.
+    def keep_strings(match):
+        token = match.group(0)
+        return token if token.startswith('"') else ''
+    no_comments = _JSONC_COMMENT_RE.sub(keep_strings, text)
+    return _JSONC_TRAILING_COMMA_RE.sub(keep_strings, no_comments)
+
+def _parse_jsonc(text):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_jsonc(text))
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+_TOKEN_RE = re.compile(
+    r'sk-[A-Za-z0-9_\-]{6,}'
+    r'|gh[opsur]_[A-Za-z0-9]{20,}'
+    r'|github_pat_[A-Za-z0-9_]{20,}'
+    r'|xox[baprs]-[A-Za-z0-9-]{10,}'
+    r'|AKIA[0-9A-Z]{16}'
+    r'|AIza[0-9A-Za-z_\-]{20,}'
+)
+_REDACTED = '***'
+
+
+# Reduce any url to scheme://host[:port]/path — the only part the gateway
+# fingerprints. Userinfo and query/fragment (which carry credentials, any
+# scheme) are dropped; known token shapes in the path are masked.
+def _redact_url(url):
+    if not isinstance(url, str):
+        return url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return _REDACTED
+    host = parts.hostname
+    if not parts.scheme or not host:
+        return _REDACTED
+    netloc = f"{host}:{parts.port}" if parts.port else host
+    return urlunsplit((parts.scheme, netloc, _TOKEN_RE.sub(_REDACTED, parts.path), '', ''))
+
+
+# Allowlist: forward only fingerprint-relevant args (urls, @npm packages); drop
+# everything else so no secret can ride along. Urls are credential-stripped.
+def _redact_args(args):
+    if not isinstance(args, list):
+        return args
+    kept = []
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        if '://' in arg:
+            kept.append(_redact_url(arg))
+        elif arg.startswith('@'):
+            kept.append(arg)
+    return kept
+
+
+def _sanitize_mcp_server_fields(server, cwd=None):
+    if not isinstance(server, dict):
+        return None
+    result = {}
+    if server.get('url'):
+        result['url'] = _redact_url(server['url'])
+    if server.get('command'):
+        result['command'] = server['command']
+    if server.get('args'):
+        result['args'] = _redact_args(server['args'])
+    if server.get('type'):
+        result['type'] = server['type']
+    if not result:
+        return None
+    
+    script_hash = _compute_script_hash(server.get('command'), server.get('args'), cwd)
+    if script_hash:
+        result['scriptHash'] = script_hash
+    return result
+
+
+_MCP_CONFIG_MAX_BYTES = 1_000_000
+
+
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+
+
+def _hook_command_basename(command):
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value):
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    # Only treat an arg as a local script if it has a recognised script
+    # extension. Previously any '/'-containing arg matched, which let a crafted
+    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_candidate_script(command, args):
+    """The local script this config runs: the file arg under a runtime, or the
+    command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        for a in (args or []):
+            if not isinstance(a, str) or a.startswith('-'):
+                continue
+            t = a.strip().strip('"\'')
+            if t in _HOOK_RUNNER_SUBTOKENS:
+                continue
+            if _hook_looks_like_path(t):
+                return t
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _compute_script_hash(command, args, cwd):
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    try:
+        cand = _hook_candidate_script(command, args)
+        if not cand:
+            return None
+        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+        if '${' in path:  # an env var we couldn't expand -> can't resolve
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
+        with open(path, 'rb') as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _augment_script_hash(result, cwd):
+    """Add scriptHash to an MCP server config when it runs a local script, so the
+    gateway can fingerprint it as `script:<hash>`."""
+    if result and result.get('command'):
+        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
+        if script_hash:
+            result['scriptHash'] = script_hash
+    return result
+
+
+def read_copilot_mcp_servers(cwd=None):
+    servers = {}
+    plugin_names = set()
+    # Match plugin bundles by exact path (a substring check could misclassify).
+    plugin_list = _plugin_mcp_config_paths(Path.home())
+    plugin_paths = set(plugin_list)
+    for config_path in _copilot_mcp_config_paths(cwd, plugin_list):
+        try:
+            if not config_path.exists():
+                continue
+            if config_path.stat().st_size > _MCP_CONFIG_MAX_BYTES:
+                continue
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config = _parse_jsonc(f.read())
+            if not isinstance(config, dict):
+                continue
+            raw = config.get('servers')
+            if not isinstance(raw, dict):
+                raw = config.get('mcpServers')
+            if not isinstance(raw, dict):
+                nested = config.get('mcp')
+                raw = nested.get('servers') if isinstance(nested, dict) else None
+            if not isinstance(raw, dict):
+                continue
+            is_plugin = config_path in plugin_paths
+            # Hash a plugin's relative script against its own bundle, not cwd,
+            # so the fingerprint is correct and not workspace-spoofable.
+            base = config_path.parent if is_plugin else cwd
+            for name, server in raw.items():
+                fields = _sanitize_mcp_server_fields(server, base) or {}
+                # Surface only genuine plugin-vs-plugin name clashes (name only).
+                if is_plugin:
+                    if name in plugin_names and servers.get(name) != fields:
+                        log_error(
+                            f"copilot mcp plugin name collision: {name}", 'mcp_plugin'
+                        )
+                    plugin_names.add(name)
+                servers[name] = fields
+        except Exception as e:
+            # Missing files are skipped above without raising; this only fires on
+            # a genuine read failure, so it's worth surfacing for diagnosis.
+            log_error(f"copilot mcp config read failed path={config_path} err={e}", 'mcp_config')
+            continue
+    return servers
+
+
+# Mirror Copilot's server-name sanitization for tool-name prefixes.
+def _sanitize_copilot_server_name(name):
+    return re.sub(r'[^a-zA-Z0-9_-]', '-', name.replace('@', '-'))
+
+
+# Only the delimiters Copilot actually emits: '-' (sanitized serverName-toolName)
+# and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
+# false-positive relabels of unrelated tools sharing a server's prefix.
+_MCP_NAME_SEPARATORS = ('__', '-')
+# A server name must be at least this long to anchor a bare-name match, so a
+# one-char config entry can't swallow arbitrary tool names.
+_MIN_MCP_SERVER_NAME = 2
+
+
+# Resolve (server, tool, config) from a Copilot tool name. The mcp__ form is
+# self-delimiting; the bare form is matched against configured server names.
+# Matching is case-insensitive (Copilot lowercases nothing, configs vary case)
+# and the longest server match wins; ties resolve to config/iteration order.
+def detect_mcp_call(raw_tool, mcp_servers):
+    if not raw_tool:
+        return (None, None, None)
+
+    if raw_tool.startswith('mcp__'):
+        parts = raw_tool[len('mcp__'):].split('__', 1)
+        server = parts[0]
+        mcp_tool = parts[1] if len(parts) >= 2 else ''
+        return (server, mcp_tool, mcp_servers.get(server))
+
+    raw_lower = raw_tool.lower()
+    best = None  # (matched_len, server_name, mcp_tool)
+    for server_name in mcp_servers:
+        for candidate in {server_name, _sanitize_copilot_server_name(server_name)}:
+            if len(candidate) < _MIN_MCP_SERVER_NAME:
+                continue
+            cand_lower = candidate.lower()
+            if raw_lower == cand_lower:
+                mcp_tool = ''
+            elif raw_lower.startswith(cand_lower):
+                remainder = raw_tool[len(candidate):]
+                sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
+                if sep is None:
+                    continue
+                mcp_tool = remainder[len(sep):]
+            else:
+                continue
+            if best is None or len(candidate) > best[0]:
+                best = (len(candidate), server_name, mcp_tool)
+
+    if best is None:
+        return (None, None, None)
+    return (best[1], best[2], mcp_servers.get(best[1]))
+
+
+# VS Code Copilot names MCP tools `mcp_<server>_<tool>` (single underscore,
+# sanitized + truncated server) — unlike the Claude-style `mcp__server__tool` the
+# gateway parses. Reverse-map the token to a configured server to forward its config.
+def _vscode_sanitize(name):
+    return re.sub(r'[^a-z0-9]', '_', name.lower())
+
+
+def _vscode_server_aliases(server_name):
+    """Sanitized full key + last path segment (e.g. 'io.github.github/github-mcp-server' -> 'github-mcp-server')."""
+    aliases = {_vscode_sanitize(server_name), _vscode_sanitize(server_name.rsplit('/', 1)[-1])}
+    return {a for a in aliases if len(a) >= _MIN_MCP_SERVER_NAME}
+
+
+def _vscode_fingerprint_key(config):
+    """Coarse identity used to decide if two configured servers are really the same
+    one (mirrors the gateway's url-first / command+args fingerprint priority).
+    Returns None when identity can't be established."""
+    if not config:
+        return None
+    if config.get('url'):
+        return ('url', config['url'])
+    if config.get('command'):
+        return ('cmd', config['command'], tuple(config.get('args') or []))
+    return None
+
+
+def _resolve_vscode_mcp(raw_tool, mcp_servers):
+    """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
+    tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
+    If a *different* server also matches and can't be proven to be the same server
+    (identical fingerprint config), the token is ambiguous -> unresolved (don't
+    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
+    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
+        return (None, None, None)
+    body = raw_tool[len('mcp_'):]
+    body_lower = body.lower()
+    segments = body.split('_')
+    candidates = []  # (server_portion_len, exact_flag, server_name, tool)
+    for server_name in mcp_servers:
+        for alias in _vscode_server_aliases(server_name):
+            if body_lower.startswith(alias + '_'):
+                cand = (len(alias), 1, server_name, body[len(alias) + 1:])
+            else:
+                cand = None
+                for k in range(len(segments) - 1, 0, -1):
+                    left = '_'.join(segments[:k])
+                    if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
+                        cand = (len(left), 0, server_name, '_'.join(segments[k:]))
+                        break
+            if cand is not None and cand[3]:
+                candidates.append(cand)
+    if not candidates:
+        return (None, None, None)
+    best = max(candidates, key=lambda c: c[:2])
+    best_key = _vscode_fingerprint_key(mcp_servers.get(best[2]))
+    for cand in candidates:
+        if cand[2] == best[2]:
+            continue
+        other_key = _vscode_fingerprint_key(mcp_servers.get(cand[2]))
+        if best_key is None or other_key is None or other_key != best_key:
+            return (None, None, None)
+    return (best[2], best[3], mcp_servers.get(best[2]))
+
+
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
