@@ -1270,7 +1270,9 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'user_prompts': [],
     }
 
-    request_body['pre_tool_use_data']['tool_use_id'] = _resolve_tool_use_id(event)
+    _tuid = _resolve_tool_use_id(event)
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
 
     if not is_retry:
         request_body['first_approval_check'] = True
