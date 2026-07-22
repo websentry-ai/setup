@@ -1191,7 +1191,8 @@ def build_llm_exchange(events, api_key=None):
                 'type': hook_event_name,
                 'file_path': event.get('file_path'),
                 'content': event.get('content', ''),
-                'attachments': event.get('attachments', [])
+                'attachments': event.get('attachments', []),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
 
         elif hook_event_name == 'postToolUse':

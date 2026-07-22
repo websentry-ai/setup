@@ -504,6 +504,10 @@ def extract_command_for_pretool(event: Dict) -> str:
     # Task: prompt
     if tool_name == 'Task' and 'prompt' in tool_input:
         return tool_input['prompt']
+    # apply_patch: the patch/diff content, so each patch gets a distinct synthetic
+    # id instead of every apply_patch in a turn collapsing to the tool name.
+    if tool_name == 'apply_patch' and tool_input:
+        return tool_input.get('input') or tool_input.get('patch') or tool_input.get('diff') or json.dumps(tool_input, sort_keys=True)
     # Default: tool name
     return tool_name
 
