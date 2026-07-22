@@ -1195,8 +1195,7 @@ def _parent_pid(pid: int) -> Optional[int]:
     try:
         stat = Path(f"/proc/{pid}/stat")
         if stat.exists():
-            # Fields: pid (comm) state ppid ...; comm may hold spaces/parens, so
-            # parse after the last ')': [state, ppid, ...].
+            # comm (field 2) may hold spaces/parens; ppid is the 2nd field after the last ')'.
             data = stat.read_text()
             return int(data[data.rfind(')') + 1:].split()[1])
     except Exception:
@@ -1210,32 +1209,44 @@ def _parent_pid(pid: int) -> Optional[int]:
         return None
 
 
-def _launch_mcp_config_values() -> List[str]:
-    # Nearest ancestor first, so the process owning the tool wins on a name collision.
-    values = []
+def _launch_mcp_config_value_groups() -> List[tuple]:
+    groups = []
     pid = os.getpid()
     for _ in range(12):
-        values.extend(_mcp_config_values_from_argv(_process_argv(pid)))
+        vals = _mcp_config_values_from_argv(_process_argv(pid))
+        if vals:
+            groups.append((pid, vals))
         ppid = _parent_pid(pid)
         if not ppid or ppid == pid or ppid <= 1:
             break
         pid = ppid
-    return values
+    return groups
 
 
 def _mcp_config_values_from_argv(argv: List[str]) -> List[str]:
+    # --mcp-config is variadic: it consumes every following token until the next flag.
     values = []
     i = 0
-    while i < len(argv):
+    n = len(argv)
+    while i < n:
         a = argv[i]
-        if a == '--mcp-config' and i + 1 < len(argv):
-            values.append(argv[i + 1])
-            i += 2
+        if a == '--mcp-config':
+            i += 1
+            while i < n and not argv[i].startswith('-'):
+                values.append(argv[i])
+                i += 1
             continue
         if a.startswith('--mcp-config='):
             values.append(a[len('--mcp-config='):])
         i += 1
     return values
+
+
+def _proc_cwd(pid: int) -> Optional[str]:
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except Exception:
+        return None
 
 
 def _load_mcp_config_blob(raw: str, cwd: Optional[str] = None) -> Optional[Dict]:
@@ -1260,13 +1271,18 @@ def _load_mcp_config_blob(raw: str, cwd: Optional[str] = None) -> Optional[Dict]
 
 def _resolve_launch_mcp_config(server_name: str, cwd: Optional[str] = None) -> Optional[Dict]:
     try:
-        for raw in _launch_mcp_config_values():
-            data = _load_mcp_config_blob(raw, cwd)
-            servers = data.get('mcpServers') if isinstance(data, dict) else None
-            if isinstance(servers, dict) and server_name in servers:
-                result = _extract_mcp_server_fields(servers[server_name])
-                if result:
-                    return _augment_script_hash(result, cwd)
+        for pid, values in _launch_mcp_config_value_groups():
+            base_cwd = _proc_cwd(pid) or cwd
+            match = None
+            for raw in values:
+                data = _load_mcp_config_blob(raw, base_cwd)
+                servers = data.get('mcpServers') if isinstance(data, dict) else None
+                if isinstance(servers, dict) and server_name in servers:
+                    result = _extract_mcp_server_fields(servers[server_name])
+                    if result:
+                        match = result  # Claude merges --mcp-config values last-wins per server.
+            if match is not None:
+                return _augment_script_hash(match, base_cwd)
         return None
     except Exception:
         return None
