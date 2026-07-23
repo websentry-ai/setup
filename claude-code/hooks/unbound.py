@@ -527,6 +527,33 @@ def extract_command_for_pretool(event: Dict) -> str:
     return tool_name
 
 
+def _synthetic_tool_use_id(event: Dict) -> str:
+    """Deterministic per-call id from replay-stable fields, so the SAME tool call
+    yields the SAME id in the PreToolUse and PostToolUse emits with no shared state.
+    Prefixed 'unb-' so it can never collide with a native tool_use_id. Keyed only on
+    fields guaranteed on BOTH events (session + tool + command); prompt_id is omitted
+    because it is not guaranteed on PostToolUse and would fork the id. MCP input is
+    canonicalized (sort_keys) so key-order variance can't diverge pre from post."""
+    content = extract_command_for_pretool(event)
+    try:
+        content = json.dumps(json.loads(content), sort_keys=True)
+    except (ValueError, TypeError):
+        pass
+    key = '\x1f'.join((
+        str(event.get('session_id') or ''),
+        str(event.get('tool_name') or ''),
+        str(content),
+    ))
+    return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+
+
+def resolve_tool_use_id(event: Dict) -> str:
+    """Native tool_use_id when the tool provides one, else a deterministic synthetic
+    id. Every tool call gets a stable id so the backend dedups by id; the synthetic
+    path is content-derived, so a pre command re-appearing in post gets the SAME id."""
+    return event.get('tool_use_id') or _synthetic_tool_use_id(event)
+
+
 def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
     """Send request to /v1/hooks/pretool endpoint."""
     if not api_key:
@@ -1520,9 +1547,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
-    if _tuid:
-        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+    request_body['pre_tool_use_data']['tool_use_id'] = resolve_tool_use_id(event)
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -1651,7 +1676,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
-                'tool_use_id': event.get('tool_use_id')
+                'tool_use_id': resolve_tool_use_id(event)
             })
     
     if user_prompt:

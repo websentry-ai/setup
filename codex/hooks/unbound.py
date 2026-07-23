@@ -504,8 +504,25 @@ def extract_command_for_pretool(event: Dict) -> str:
     # Task: prompt
     if tool_name == 'Task' and 'prompt' in tool_input:
         return tool_input['prompt']
+    # apply_patch: the patch/diff content, so each patch gets a distinct synthetic
+    # id instead of every apply_patch in a turn collapsing to the tool name.
+    if tool_name == 'apply_patch' and tool_input:
+        return tool_input.get('input') or tool_input.get('patch') or tool_input.get('diff') or json.dumps(tool_input, sort_keys=True)
     # Default: tool name
     return tool_name
+
+
+def _synthetic_tool_use_id(session_id, turn_id, tool_name, command) -> str:
+    """Deterministic fallback id for tools with no native id (byte-identical pre vs
+    completion). MCP input is canonicalized (sort_keys) so key-order variance between
+    the pre event and the transcript-decoded completion can't diverge the id."""
+    try:
+        command = json.dumps(json.loads(command), sort_keys=True)
+    except (ValueError, TypeError):
+        pass
+    key = '\x1f'.join((str(session_id or ''), str(turn_id or ''),
+                       str(tool_name or ''), str(command or '')))
+    return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
 
 
 def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
@@ -896,9 +913,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
-    if _tuid:
-        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+    request_body['pre_tool_use_data']['tool_use_id'] = (
+        event.get('tool_use_id')
+        or _synthetic_tool_use_id(session_id, event.get('turn_id'), tool_name, command)
+    )
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -1235,6 +1253,13 @@ def process_stop_event(event: Dict, api_key: str):
 
     # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
     assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
+
+    for item in assistant_tool_uses:
+        if not item.get('tool_use_id'):
+            item['tool_use_id'] = _synthetic_tool_use_id(
+                session_id, event.get('turn_id'), item.get('tool_name'),
+                extract_command_for_pretool({'tool_name': item.get('tool_name'),
+                                             'tool_input': item.get('tool_input') or {}}))
 
     assistant_msg = {
         'role': 'assistant',

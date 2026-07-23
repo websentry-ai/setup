@@ -660,6 +660,58 @@ def build_account_identity(event=None, probe=False):
     return identity
 
 
+# Cursor surfaces file ops through several event shapes; map each to a normalized
+# operation so a pre event (preToolUse Write/Read/Delete) and its completion
+# (afterFileEdit / beforeReadFile) for the same path hash to the same synthetic id.
+_CURSOR_FILE_OP = {
+    'Write': 'write', 'Edit': 'write', 'Delete': 'delete', 'Read': 'read',
+    'afterFileEdit': 'write', 'beforeReadFile': 'read',
+}
+
+
+def _resolve_tool_use_id(event):
+    """Stable per-call id: the native tool_use_id when Cursor supplies one, else a
+    deterministic synthetic id. The key uses ONLY fields byte-identical across the
+    before* (pre) and after* (completion) event for the same call — conversation_id,
+    generation_id, raw tool_name, and canonical content — so pre and post compute the
+    same id. MCP after* events drop the server 'command', so MCP is keyed on
+    tool_input only. Fail-open: never raises, falls back to native-or-None."""
+    try:
+        if not isinstance(event, dict):
+            return None
+        native = event.get('tool_use_id')
+        if native:
+            return native
+        hook_name = event.get('hook_event_name') or ''
+        tool_name = event.get('tool_name') or ''
+        ti = event.get('tool_input') if isinstance(event.get('tool_input'), dict) else {}
+        # File ops arrive in several shapes (preToolUse Write/Read/Delete, afterFileEdit,
+        # beforeReadFile). Normalize them to (operation, path) so a pre event and its
+        # completion for the SAME file hash to the same id -- the differing tool_name /
+        # tool_input / edits shapes would otherwise fork the id.
+        file_op = _CURSOR_FILE_OP.get(tool_name) or _CURSOR_FILE_OP.get(hook_name)
+        file_path = event.get('file_path') or ti.get('file_path') or ti.get('path')
+        if file_op and file_path:
+            tool_disc, content = 'file', file_op + ':' + str(file_path)
+        elif 'MCP' in hook_name:
+            tool_disc, content = tool_name, json.dumps(ti, sort_keys=True)
+        elif event.get('command') is not None:
+            tool_disc, content = tool_name, str(event.get('command'))
+        elif ti:
+            tool_disc, content = tool_name, json.dumps(ti, sort_keys=True)
+        else:
+            tool_disc, content = tool_name, ''
+        key = '\x1f'.join((
+            str(event.get('conversation_id') or ''),
+            str(event.get('generation_id') or ''),
+            tool_disc,
+            content,
+        ))
+        return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+    except Exception:
+        return event.get('tool_use_id') if isinstance(event, dict) else None
+
+
 def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
@@ -704,7 +756,7 @@ def process_pre_tool_use(event, api_key):
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
+    _tuid = _resolve_tool_use_id(event)
     if _tuid:
         request_body['pre_tool_use_data']['tool_use_id'] = _tuid
 
@@ -950,6 +1002,10 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = _resolve_tool_use_id(event)
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -1135,7 +1191,8 @@ def build_llm_exchange(events, api_key=None):
                 'type': hook_event_name,
                 'file_path': event.get('file_path'),
                 'content': event.get('content', ''),
-                'attachments': event.get('attachments', [])
+                'attachments': event.get('attachments', []),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
 
         elif hook_event_name == 'postToolUse':
@@ -1152,29 +1209,32 @@ def build_llm_exchange(events, api_key=None):
                 'tool_input': event.get('tool_input'),
                 'tool_output': tool_output,
                 'duration': event.get('duration'),
-                'tool_use_id': event.get('tool_use_id')
+                'tool_use_id': _resolve_tool_use_id(event)
             })
-        
+
         elif hook_event_name == 'afterFileEdit':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'file_path': event.get('file_path'),
-                'edits': event.get('edits', [])
+                'edits': event.get('edits', []),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
-        
+
         elif hook_event_name == 'afterShellExecution':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'command': event.get('command'),
-                'output': event.get('output', '')
+                'output': event.get('output', ''),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
-        
+
         elif hook_event_name == 'afterMCPExecution':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'tool_name': event.get('tool_name'),
                 'tool_input': event.get('tool_input'),
-                'result_json': event.get('result_json')
+                'result_json': event.get('result_json'),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
         
         elif hook_event_name == 'afterAgentResponse':
