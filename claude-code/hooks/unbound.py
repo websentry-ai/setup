@@ -527,6 +527,33 @@ def extract_command_for_pretool(event: Dict) -> str:
     return tool_name
 
 
+def _synthetic_tool_use_id(event: Dict) -> str:
+    """Deterministic per-call id from replay-stable fields, so the SAME tool call
+    yields the SAME id in the PreToolUse and PostToolUse emits with no shared state.
+    Prefixed 'unb-' so it can never collide with a native tool_use_id. Keyed only on
+    fields guaranteed on BOTH events (session + tool + command); prompt_id is omitted
+    because it is not guaranteed on PostToolUse and would fork the id. MCP input is
+    canonicalized (sort_keys) so key-order variance can't diverge pre from post."""
+    content = extract_command_for_pretool(event)
+    try:
+        content = json.dumps(json.loads(content), sort_keys=True)
+    except (ValueError, TypeError):
+        pass
+    key = '\x1f'.join((
+        str(event.get('session_id') or ''),
+        str(event.get('tool_name') or ''),
+        str(content),
+    ))
+    return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+
+
+def resolve_tool_use_id(event: Dict) -> str:
+    """Native tool_use_id when the tool provides one, else a deterministic synthetic
+    id. Every tool call gets a stable id so the backend dedups by id; the synthetic
+    path is content-derived, so a pre command re-appearing in post gets the SAME id."""
+    return event.get('tool_use_id') or _synthetic_tool_use_id(event)
+
+
 def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
     """Send request to /v1/hooks/pretool endpoint."""
     if not api_key:
@@ -659,6 +686,19 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
             'suppressOriginalPrompt': True,
         }
 
+    # Allowed with injected context (e.g. the spend-limit alert-threshold
+    # warning "you've used $X of your $Y limit"): additionalContext feeds it
+    # to the model, systemMessage shows the same text to the user.
+    additional_context = api_response.get('additionalContext', '')
+    if additional_context:
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'UserPromptSubmit',
+                'additionalContext': additional_context,
+            },
+            'systemMessage': additional_context,
+        }
+
     return {}
 
 
@@ -743,7 +783,120 @@ def _select_plugin_version_dir(plugin_dir: Path) -> Optional[Path]:
     return max(candidates, key=lambda d: (d.stat().st_mtime, d.name))
 
 
+def _read_json_file(path: Path):
+    try:
+        if path.is_file():
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.loads(f.read())
+    except Exception as exc:
+        log_error(f"mcp plugin registry unreadable: {path}: {exc}", 'mcp_plugin')
+    return None
+
+
+def _installed_plugins_registry(plugins_root: Path) -> Dict:
+    data = _read_json_file(plugins_root / "installed_plugins.json")
+    plugins = data.get("plugins") if isinstance(data, dict) else None
+    return plugins if isinstance(plugins, dict) else {}
+
+
+def _marketplace_registry(plugins_root: Path) -> Dict:
+    data = _read_json_file(plugins_root / "known_marketplaces.json")
+    return data if isinstance(data, dict) else {}
+
+
+def _directory_marketplace_plugin_dir(location: Path, plugin: str) -> Optional[Path]:
+    manifest = _read_json_file(location / ".claude-plugin" / "marketplace.json")
+    if not isinstance(manifest, dict):
+        return None
+    for entry in (manifest.get("plugins") or []):
+        if not isinstance(entry, dict) or entry.get("name") != plugin:
+            continue
+        src = entry.get("source")
+        rel = src if isinstance(src, str) else (src.get("path") if isinstance(src, dict) else None)
+        if not isinstance(rel, str) or not rel:
+            return None
+        cand = (location / rel).resolve()
+        try:
+            cand.relative_to(location.resolve())
+        except ValueError:
+            return None
+        return cand
+    return None
+
+
+def _authoritative_plugin_dirs(plugin: str, mk_info: Dict, installed_entries: list) -> list:
+    dirs = []
+    source = mk_info.get("source") if isinstance(mk_info, dict) else None
+    src_type = source.get("source") if isinstance(source, dict) else None
+    install_location = mk_info.get("installLocation") if isinstance(mk_info, dict) else None
+
+    if src_type == "directory" and install_location:
+        loc = Path(install_location)
+        for d in (loc / "plugins" / plugin, loc / plugin, _directory_marketplace_plugin_dir(loc, plugin)):
+            if d is not None and d not in dirs:
+                dirs.append(d)
+
+    for e in (installed_entries or []):
+        ip = e.get("installPath") if isinstance(e, dict) else None
+        if ip:
+            p = Path(ip)
+            if p not in dirs:
+                dirs.append(p)
+    return dirs
+
+
 def _resolve_plugin_mcp_config(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:
+    if not server_name.startswith('plugin_'):
+        return None
+    try:
+        plugins_root = cache_dir.parent
+        installed = _installed_plugins_registry(plugins_root)
+        if not installed:
+            return _resolve_plugin_mcp_config_from_cache(server_name, cache_dir)
+        marketplaces = _marketplace_registry(plugins_root)
+
+        matches = []
+        for full_name, entries in installed.items():
+            plugin, _, marketplace = full_name.partition('@')
+            if not server_name.startswith("plugin_%s_" % _mangle_mcp_token(plugin)):
+                continue
+            mk_info = marketplaces.get(marketplace) or {}
+            for plugin_dir in _authoritative_plugin_dirs(plugin, mk_info, entries):
+                try:
+                    server_map = _plugin_mcp_server_map(plugin_dir)
+                except Exception as exc:
+                    log_error(f"mcp plugin dir error: {plugin_dir}: {exc}", 'mcp_plugin')
+                    continue
+                dir_matches = []
+                for server_key, entry in server_map.items():
+                    if "plugin_%s_%s" % (_mangle_mcp_token(plugin), _mangle_mcp_token(server_key)) != server_name:
+                        continue
+                    fields = _extract_mcp_server_fields(entry)
+                    if fields is not None:
+                        dir_matches.append(fields)
+                if not dir_matches:
+                    # Server not defined here -> try the next candidate dir.
+                    continue
+                matches.extend(dir_matches)
+                # First candidate dir that defines the server is authoritative.
+                break
+
+        distinct = []
+        for cfg in matches:
+            if cfg not in distinct:
+                distinct.append(cfg)
+        if len(distinct) == 1:
+            return distinct[0]
+        if len(distinct) > 1:
+            log_error(f"mcp plugin resolve ambiguous: {server_name}", 'mcp_plugin')
+            return None
+        return _resolve_plugin_mcp_config_from_cache(server_name, cache_dir)
+    except Exception as exc:
+        log_error(f"mcp plugin resolve error: {server_name}: {exc}", 'mcp_plugin')
+        return None
+
+
+def _resolve_plugin_mcp_config_from_cache(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR) -> Optional[Dict]:
     if not server_name.startswith('plugin_'):
         return None
     try:
@@ -1394,9 +1547,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
-    if _tuid:
-        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+    request_body['pre_tool_use_data']['tool_use_id'] = resolve_tool_use_id(event)
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -1706,7 +1857,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
-                'tool_use_id': event.get('tool_use_id'),
+                'tool_use_id': resolve_tool_use_id(event),
                 'project': tool_project
             })
     
@@ -2301,6 +2452,20 @@ def main():
 
             # If denied (response has decision: block), log the event then return
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'session_id': event.get('session_id'),
+                    'event': event
+                })
+                response["suppressOutput"] = True
+                print(json.dumps(response), flush=True)
+                return
+
+            # Allowed but with hook output to emit (e.g. the spend-limit
+            # alert-threshold warning riding additionalContext/systemMessage):
+            # log the event, then print the response instead of the default
+            # suppressOutput so Claude Code surfaces the warning.
+            if response:
                 append_to_audit_log({
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'session_id': event.get('session_id'),

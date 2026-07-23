@@ -162,7 +162,8 @@ class ProcessPreToolUseBase(unittest.TestCase):
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(CONFIG))
         self._patchers = [
-            patch.object(unbound, "_copilot_mcp_config_paths", lambda cwd=None: [cfg_path]),
+            patch.object(unbound, "_copilot_mcp_config_paths", lambda cwd=None, plugins=None: [cfg_path]),
+            patch.object(unbound, "_plugin_mcp_config_paths", lambda home=None: []),
             patch.object(unbound, "load_policy_cache", lambda: None),
             patch.object(unbound, "get_recent_user_prompts_for_session", lambda *a, **k: []),
             patch.object(unbound, "get_session_start_model", lambda *a, **k: "auto"),
@@ -311,6 +312,82 @@ class TestUnresolvedForwarding(ProcessPreToolUseBase):
         # No resolved server -> allow-list not evaluated (fail-open) for unresolved.
         ret = self.run_tool("mcp_unknownserver_do_thing", {GH_GROUP})
         self.assertFalse(self.is_block(ret))
+
+
+# Query string is stripped by the hook + gateway, so the fingerprint is host+path.
+_PLUGIN_TOOLCHAIN_URL = (
+    "https://mcp.example.com/mcp/v1/rpc?tool_filter=gdrive*,gdocs*"
+)
+
+
+class TestAgentPluginConfigPaths(unittest.TestCase):
+    """Exercise the real agentPlugins glob (no mocking) against a temp HOME."""
+
+    def _run(self, write_user_gdrive=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            user_dir = unbound._vscode_user_dirs()[0]
+            user_dir.mkdir(parents=True, exist_ok=True)
+            plugin_dir = (
+                user_dir.parent
+                / "agentPlugins" / "github.com" / "forter" / "datastores-core"
+            )
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            (plugin_dir / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {
+                    "gdrive": {"type": "http", "url": _PLUGIN_TOOLCHAIN_URL}}})
+            )
+            if write_user_gdrive:
+                (user_dir / "mcp.json").write_text(
+                    json.dumps({"servers": {"gdrive": {"command": write_user_gdrive}}})
+                )
+            return unbound.read_copilot_mcp_servers(None)
+
+    def test_plugin_bundled_server_resolves(self):
+        servers = self._run()
+        server, tool, cfg = unbound._resolve_vscode_mcp(
+            "mcp_gdrive_gdrive-search", servers
+        )
+        self.assertEqual(server, "gdrive")
+        self.assertEqual(tool, "gdrive-search")
+        self.assertEqual(
+            cfg.get("url"), "https://mcp.example.com/mcp/v1/rpc"
+        )
+
+    def test_user_mcp_json_wins_over_plugin(self):
+        # A plugin must not override the user's own same-named server.
+        servers = self._run(write_user_gdrive="/usr/local/bin/my-real-gdrive")
+        self.assertEqual(servers["gdrive"].get("command"), "/usr/local/bin/my-real-gdrive")
+        self.assertNotIn("url", servers["gdrive"])
+
+    def test_no_plugins_is_noop(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            unbound._vscode_user_dirs()[0].mkdir(parents=True, exist_ok=True)
+            self.assertEqual(unbound.read_copilot_mcp_servers(None), {})
+
+    def test_plugin_relative_command_hashes_against_bundle(self):
+        # A plugin's relative script is fingerprinted against its own bundle dir,
+        # not the workspace cwd (else null/wrong fingerprint -> sanction bypass).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            user_dir = unbound._vscode_user_dirs()[0]
+            user_dir.mkdir(parents=True, exist_ok=True)
+            plugin_dir = (
+                user_dir.parent / "agentPlugins" / "github.com" / "acme" / "local-mcp"
+            )
+            plugin_dir.mkdir(parents=True, exist_ok=True)
+            (plugin_dir / "server.py").write_text("print('hi')\n")
+            (plugin_dir / ".mcp.json").write_text(
+                json.dumps({"mcpServers": {"local": {"command": "./server.py"}}})
+            )
+            # cwd points at a dir that does NOT contain the script.
+            servers = unbound.read_copilot_mcp_servers(str(user_dir.parent))
+        self.assertIn("local", servers)
+        self.assertIsNotNone(servers["local"].get("scriptHash"))
 
 
 if __name__ == "__main__":

@@ -536,10 +536,25 @@ def _vscode_user_dirs():
     return [base / "Code" / "User", base / "Code - Insiders" / "User"]
 
 
-# All Copilot MCP config locations. Untrusted workspace files (from cwd) come
-# first; trusted user/global/CLI configs last so they win the last-wins merge in
-# read_copilot_mcp_servers.
-def _copilot_mcp_config_paths(cwd=None):
+# Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
+# into mcp.json, so scan them. Not capped — a dropped config would fail open.
+def _plugin_mcp_config_paths(home):
+    paths = []
+    for user_dir in _vscode_user_dirs():
+        try:
+            paths.extend(sorted((user_dir.parent / "agentPlugins").glob("*/*/*/.mcp.json")))
+        except OSError:
+            pass
+    try:
+        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
+    except OSError:
+        pass
+    return paths
+
+
+# All Copilot MCP config locations, ordered for the last-wins merge in
+# read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
+def _copilot_mcp_config_paths(cwd=None, plugins=None):
     home = Path.home()
 
     workspace = []
@@ -561,7 +576,9 @@ def _copilot_mcp_config_paths(cwd=None):
     trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
     trusted.append(home / ".copilot" / "mcp-config.json")
 
-    return workspace + trusted
+    if plugins is None:
+        plugins = _plugin_mcp_config_paths(home)
+    return workspace + plugins + trusted
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -753,7 +770,11 @@ def _augment_script_hash(result, cwd):
 
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
-    for config_path in _copilot_mcp_config_paths(cwd):
+    plugin_names = set()
+    # Match plugin bundles by exact path (a substring check could misclassify).
+    plugin_list = _plugin_mcp_config_paths(Path.home())
+    plugin_paths = set(plugin_list)
+    for config_path in _copilot_mcp_config_paths(cwd, plugin_list):
         try:
             if not config_path.exists():
                 continue
@@ -771,9 +792,20 @@ def read_copilot_mcp_servers(cwd=None):
                 raw = nested.get('servers') if isinstance(nested, dict) else None
             if not isinstance(raw, dict):
                 continue
+            is_plugin = config_path in plugin_paths
+            # Hash a plugin's relative script against its own bundle, not cwd,
+            # so the fingerprint is correct and not workspace-spoofable.
+            base = config_path.parent if is_plugin else cwd
             for name, server in raw.items():
-                fields = _sanitize_mcp_server_fields(server, cwd)
-                servers[name] = fields or {}
+                fields = _sanitize_mcp_server_fields(server, base) or {}
+                # Surface only genuine plugin-vs-plugin name clashes (name only).
+                if is_plugin:
+                    if name in plugin_names and servers.get(name) != fields:
+                        log_error(
+                            f"copilot mcp plugin name collision: {name}", 'mcp_plugin'
+                        )
+                    plugin_names.add(name)
+                servers[name] = fields
         except Exception as e:
             # Missing files are skipped above without raising; this only fires on
             # a genuine read failure, so it's worth surfacing for diagnosis.
@@ -1663,6 +1695,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
+            if call_id:
+                mapped['tool_use_id'] = call_id  # native transcript toolCallId — no synthetic id
             tool_use.append(mapped)
 
     # Signature of the turn's user+assistant TEXT (independent of tool_use). The caller
