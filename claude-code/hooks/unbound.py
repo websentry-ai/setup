@@ -1209,18 +1209,23 @@ def _parent_pid(pid: int) -> Optional[int]:
         return None
 
 
-def _launch_mcp_config_value_groups() -> List[tuple]:
-    groups = []
+def _is_claude_cli(argv: List[str]) -> bool:
+    return bool(argv) and os.path.basename(argv[0]) == 'claude'
+
+
+def _claude_launch_argv() -> Optional[tuple]:
+    # Trust --mcp-config only from the Claude CLI ancestor, so an unrelated
+    # wrapper process cannot plant a spoofed server config in its own argv.
     pid = os.getpid()
     for _ in range(12):
-        vals = _mcp_config_values_from_argv(_process_argv(pid))
-        if vals:
-            groups.append((pid, vals))
+        argv = _process_argv(pid)
+        if _is_claude_cli(argv):
+            return pid, argv
         ppid = _parent_pid(pid)
         if not ppid or ppid == pid or ppid <= 1:
             break
         pid = ppid
-    return groups
+    return None
 
 
 def _mcp_config_values_from_argv(argv: List[str]) -> List[str]:
@@ -1260,30 +1265,33 @@ def _load_mcp_config_blob(raw: str, cwd: Optional[str] = None) -> Optional[Dict]
             return None
     try:
         path = Path(raw).expanduser()
-        if not path.is_absolute() and cwd:
+        if not path.is_absolute():
+            if not cwd:
+                return None
             path = Path(cwd) / path
-        if path.is_file():
+        if path.is_file() and path.stat().st_size <= 1_000_000:
             return json.loads(path.read_text(encoding='utf-8'))
     except Exception:
         return None
     return None
 
 
-def _resolve_launch_mcp_config(server_name: str, cwd: Optional[str] = None) -> Optional[Dict]:
+def _resolve_launch_mcp_config(server_name: str) -> Optional[Dict]:
     try:
-        for pid, values in _launch_mcp_config_value_groups():
-            base_cwd = _proc_cwd(pid) or cwd
-            match = None
-            for raw in values:
-                data = _load_mcp_config_blob(raw, base_cwd)
-                servers = data.get('mcpServers') if isinstance(data, dict) else None
-                if isinstance(servers, dict) and server_name in servers:
-                    result = _extract_mcp_server_fields(servers[server_name])
-                    if result:
-                        match = result  # Claude merges --mcp-config values last-wins per server.
-            if match is not None:
-                return _augment_script_hash(match, base_cwd)
-        return None
+        found = _claude_launch_argv()
+        if not found:
+            return None
+        pid, argv = found
+        cwd = _proc_cwd(pid)
+        match = None
+        for raw in _mcp_config_values_from_argv(argv):
+            data = _load_mcp_config_blob(raw, cwd)
+            servers = data.get('mcpServers') if isinstance(data, dict) else None
+            if isinstance(servers, dict) and server_name in servers:
+                result = _extract_mcp_server_fields(servers[server_name])
+                if result:
+                    match = result  # Claude merges --mcp-config values last-wins per server.
+        return _augment_script_hash(match, cwd) if match else None
     except Exception:
         return None
 
@@ -1661,7 +1669,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                             if _is_uuid(mcp_server_name):
                                 metadata['mcp_server_uuid'] = mcp_server_name
                         else:
-                            launch_cfg = _resolve_launch_mcp_config(mcp_server_name, cwd=cwd)
+                            launch_cfg = _resolve_launch_mcp_config(mcp_server_name)
                             if launch_cfg:
                                 metadata['mcp_server_config'] = launch_cfg
 
