@@ -1253,7 +1253,7 @@ def build_llm_exchange(events, api_key=None):
     if not messages:
         return None
     
-    if not model or model == 'default':
+    if not model or model == 'default' or model == 'unknown':
         model = 'auto'
 
     exchange = {
