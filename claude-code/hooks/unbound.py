@@ -1210,12 +1210,14 @@ def _parent_pid(pid: int) -> Optional[int]:
 
 
 def _is_claude_cli(argv: List[str]) -> bool:
-    return bool(argv) and os.path.basename(argv[0]) == 'claude'
+    return bool(argv) and _hook_command_basename(argv[0]) == 'claude'
 
 
 def _claude_launch_argv() -> Optional[tuple]:
-    # Trust --mcp-config only from the Claude CLI ancestor, so an unrelated
-    # wrapper process cannot plant a spoofed server config in its own argv.
+    # Prefer the Claude CLI ancestor as the --mcp-config source. argv[0] is
+    # best-effort provenance (spoofable via exec -a), but the launcher already
+    # controls its own config, so this mainly avoids reading an unrelated
+    # wrapper's argv rather than being a hard integrity guarantee.
     pid = os.getpid()
     for _ in range(12):
         argv = _process_argv(pid)
@@ -1251,7 +1253,17 @@ def _proc_cwd(pid: int) -> Optional[str]:
     try:
         return os.readlink(f"/proc/{pid}/cwd")
     except Exception:
-        return None
+        pass
+    if platform.system() == 'Darwin':
+        try:
+            out = subprocess.run(['lsof', '-a', '-p', str(pid), '-d', 'cwd', '-Fn'],
+                                 capture_output=True, text=True, timeout=2)
+            for line in out.stdout.splitlines():
+                if line.startswith('n'):
+                    return line[1:]
+        except Exception:
+            pass
+    return None
 
 
 def _load_mcp_config_blob(raw: str, cwd: Optional[str] = None) -> Optional[Dict]:
