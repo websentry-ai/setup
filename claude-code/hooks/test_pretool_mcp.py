@@ -671,5 +671,111 @@ class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
                          self._http("https://c.example/mcp"))
 
 
+class TestResolveLaunchMcpConfig(unittest.TestCase):
+    """Launch-time --mcp-config resolution: headless/SDK Claude Code passes MCP
+    servers on the CLI (inline JSON or a file path) instead of ~/.claude.json."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _resolve(self, argv, server="toolchain", cwd=None):
+        # Simulate `argv` being the Claude CLI, the hook's nearest ancestor.
+        with patch.object(unbound, "_process_argv", return_value=argv), \
+             patch.object(unbound, "_parent_pid", return_value=None), \
+             patch.object(unbound, "_proc_cwd", return_value=cwd):
+            return unbound._resolve_launch_mcp_config(server)
+
+    def test_inline_json_hit(self):
+        argv = ["claude", "--permission-mode", "dontAsk", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://cyber.example/mcp","type":"http"}}}']
+        self.assertEqual(self._resolve(argv),
+                         {"url": "https://cyber.example/mcp", "type": "http"})
+
+    def test_config_file_path_hit(self):
+        cfg = self.dir / "mcp.json"
+        _write_json(cfg, {"mcpServers": {"toolchain": {"url": "https://file.example/mcp", "type": "http"}}})
+        argv = ["claude", "--mcp-config", str(cfg)]
+        self.assertEqual(self._resolve(argv),
+                         {"url": "https://file.example/mcp", "type": "http"})
+
+    def test_relative_file_resolved_against_launcher_cwd(self):
+        _write_json(self.dir / "mcp.json",
+                    {"mcpServers": {"toolchain": {"url": "https://rel.example/mcp", "type": "http"}}})
+        argv = ["claude", "--mcp-config", "./mcp.json"]
+        self.assertEqual(self._resolve(argv, cwd=str(self.dir)),
+                         {"url": "https://rel.example/mcp", "type": "http"})
+
+    def test_relative_file_without_launcher_cwd_fails_closed(self):
+        _write_json(self.dir / "mcp.json",
+                    {"mcpServers": {"toolchain": {"url": "https://x", "type": "http"}}})
+        argv = ["claude", "--mcp-config", "./mcp.json"]
+        self.assertIsNone(self._resolve(argv, cwd=None))
+
+    def test_stdio_command_gets_script_hash(self):
+        script = self.dir / "server.py"
+        script.write_text("print('hi')\n")
+        argv = ["claude", "--mcp-config",
+                json.dumps({"mcpServers": {"toolchain": {"command": "python3", "args": [str(script)]}}})]
+        cfg = self._resolve(argv)
+        self.assertEqual(cfg["command"], "python3")
+        self.assertIn("scriptHash", cfg)
+
+    def test_variadic_values_last_wins(self):
+        argv = ["claude", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://OLD","type":"http"}}}',
+                '{"mcpServers":{"toolchain":{"url":"https://NEW","type":"http"}}}',
+                "--permission-mode", "x"]
+        self.assertEqual(self._resolve(argv), {"url": "https://NEW", "type": "http"})
+
+    def test_variadic_mixes_file_and_inline(self):
+        base = self.dir / "base.json"
+        _write_json(base, {"mcpServers": {"other": {"url": "https://other", "type": "http"}}})
+        argv = ["claude", "--mcp-config", str(base),
+                '{"mcpServers":{"toolchain":{"url":"https://inline","type":"http"}}}']
+        self.assertEqual(self._resolve(argv), {"url": "https://inline", "type": "http"})
+        self.assertEqual(self._resolve(argv, server="other"), {"url": "https://other", "type": "http"})
+
+    def test_equals_form_hit(self):
+        argv = ["claude", '--mcp-config={"mcpServers":{"toolchain":{"url":"https://eq","type":"http"}}}']
+        self.assertEqual(self._resolve(argv), {"url": "https://eq", "type": "http"})
+
+    def test_non_claude_ancestor_is_not_trusted(self):
+        # A wrapper process carrying a decoy config must never be treated as the source.
+        argv = ["python3", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://decoy","type":"http"}}}']
+        self.assertIsNone(self._resolve(argv))
+
+    def test_claude_exe_accepted(self):
+        argv = ["claude.exe", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://winsrv","type":"http"}}}']
+        self.assertEqual(self._resolve(argv), {"url": "https://winsrv", "type": "http"})
+
+    def test_no_mcp_config_flag_returns_none(self):
+        self.assertIsNone(self._resolve(["claude", "--permission-mode", "x"]))
+
+    def test_server_absent_returns_none(self):
+        argv = ["claude", "--mcp-config", '{"mcpServers":{"other":{"url":"https://o","type":"http"}}}']
+        self.assertIsNone(self._resolve(argv))
+
+    def test_malformed_inline_json_returns_none(self):
+        self.assertIsNone(self._resolve(["claude", "--mcp-config", '{"mcpServers": OOPS']))
+
+    def test_is_claude_cli(self):
+        self.assertTrue(unbound._is_claude_cli(["claude", "x"]))
+        self.assertTrue(unbound._is_claude_cli(["/usr/local/bin/claude"]))
+        self.assertTrue(unbound._is_claude_cli(["claude.exe"]))
+        self.assertFalse(unbound._is_claude_cli(["node", "cli.js"]))
+        self.assertFalse(unbound._is_claude_cli(["python3"]))
+        self.assertFalse(unbound._is_claude_cli([]))
+
+    def test_values_from_argv_variadic_and_equals(self):
+        argv = ["claude", "--mcp-config", "a.json", "b.json", "--other", "--mcp-config=c.json"]
+        self.assertEqual(unbound._mcp_config_values_from_argv(argv), ["a.json", "b.json", "c.json"])
+
+
 if __name__ == "__main__":
     unittest.main()

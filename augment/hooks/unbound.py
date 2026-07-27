@@ -1356,6 +1356,142 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude(api_response)
 
 
+def _strip_git_suffix(segment: str) -> str:
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url: Optional[str]) -> Optional[str]:
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd: Optional[str]) -> Optional[str]:
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+# Canonical (post-AUGMENT_TOOL_FAMILY) tool names whose input carries a file
+# path — used for per-tool-call project attribution on the Stop exchange.
+_FILE_TOOLS = {'Read', 'Write', 'Edit', 'Delete'}
+
+# Any absolute path inside a shell command (cd targets, git -C, pytest /x/…).
+# Left boundary required so the slash inside a relative token (tests/webapp/)
+# doesn't read as an absolute path.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the shell's working directory across the turn's launch-process calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+
+def _find_git_root(path: str) -> Optional[str]:
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
+    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
+    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
+    when the command has no cd or on any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Optional[str]]) -> tuple:
+    """Resolve the git project ("<org>/<repo>") a single tool call worked in.
+    File tools resolve from the tool's file path (Augment often sends
+    workspace-relative paths — those join onto the tracked shell dir); Bash
+    resolves from the first absolute path in the command, else the shell's
+    working directory tracked across the turn's `cd`s. Returns
+    (project, shell_dir) — shell_dir updated when the command changed
+    directory. `root_projects` caches the origin lookup so `git remote
+    get-url` runs at most once per distinct repo. (None, shell_dir) when
+    nothing resolves (fail-open)."""
+    try:
+        tool_input = tool_input or {}
+        candidates = []
+        if tool_name in _FILE_TOOLS:
+            path = tool_input.get('file_path')
+            if isinstance(path, str) and path:
+                if not path.startswith('/') and shell_dir:
+                    path = os.path.normpath(os.path.join(shell_dir, path))
+                if path.startswith('/'):
+                    candidates.append(os.path.dirname(path))
+        elif tool_name == 'Bash':
+            command = tool_input.get('command')
+            if isinstance(command, str):
+                candidates.extend(_ABS_PATH_RE.findall(command))
+                shell_dir = _next_shell_dir(command, shell_dir)
+                if not candidates and shell_dir:
+                    candidates.append(shell_dir)
+        for candidate in candidates:
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root], shell_dir
+        return None, shell_dir
+    except Exception:
+        return None, shell_dir
+
+
 def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = None) -> Optional[Dict]:
     """Map an Augment PostToolUse event to the Claude-Code-hooks tool_use shape the
     backend analyzer consumes (type / tool_name / tool_input / tool_response).
@@ -1455,6 +1591,12 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     assistant_response = (exchange.get('response_text')
                           or conversation.get('agentTextResponse') or '').strip()
 
+    # Per-tool-use project resolution state: the shell starts at the session
+    # cwd; origin lookups are cached per repo root across the turn.
+    cwd = event.get('cwd')
+    shell_dir = cwd
+    root_projects = {}
+
     mcp_servers = read_augment_mcp_servers(event)
     for log_entry in post_tool_events:
         ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1462,6 +1604,12 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             continue
         shaped = _augment_posttooluse_to_exchange(ev, mcp_servers)
         if shaped:
+            # Attribute this tool call to the repo it worked in (file path /
+            # shell cwd tracking); rides on the tool_use entry so the backend
+            # can store per-call project on each analytics row.
+            tool_project, shell_dir = _project_for_tool_use(
+                shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
+            shaped['project'] = tool_project
             assistant_tool_uses.append(shaped)
 
     if user_prompt:
@@ -1488,6 +1636,10 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
         'model': model,
         'messages': messages,
         'permission_mode': 'default',
+        'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
+        'project': _get_project(cwd),
         'account_identity': build_account_identity(event, probe=True),
     }
 
