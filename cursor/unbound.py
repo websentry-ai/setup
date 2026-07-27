@@ -1212,6 +1212,22 @@ def _find_git_root(path):
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 
+def _skill_name_from_path(file_path):
+    """Skill name when a path is a skill's SKILL.md, else None. Cursor reads
+    SKILL.md to load a skill, so the read path is the invocation signal."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.split(os.sep)
+        if len(parts) < 3 or parts[-1] != 'SKILL.md':
+            return None
+        if 'skills' not in parts[:-2]:
+            return None
+        return parts[-2]
+    except Exception:
+        return None
+
+
 def _project_for_paths(candidates, root_projects):
     """First project ("<org>/<repo>") resolved from `candidates` paths.
     `root_projects` caches origin lookups so `git remote get-url` runs at
@@ -1282,7 +1298,7 @@ def build_llm_exchange(events, api_key=None):
 
         elif hook_event_name == 'beforeReadFile':
             file_path = event.get('file_path')
-            assistant_tool_uses.append({
+            read_entry = {
                 'type': hook_event_name,
                 'file_path': file_path,
                 'content': event.get('content', ''),
@@ -1291,7 +1307,14 @@ def build_llm_exchange(events, api_key=None):
                 'project': _project_for_paths(
                     [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
                     root_projects)
-            })
+            }
+            # Cursor loads a skill by reading its SKILL.md, so this read is the
+            # only skill-invocation signal it emits.
+            skill_name = _skill_name_from_path(file_path)
+            if skill_name:
+                read_entry['skill_name'] = skill_name
+                read_entry['skill_path'] = file_path
+            assistant_tool_uses.append(read_entry)
 
         elif hook_event_name == 'postToolUse':
             tool_name = event.get('tool_name', '')
