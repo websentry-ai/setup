@@ -52,18 +52,21 @@ SELF_UPDATE_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/setup/ref
 def _setup_branch():
     # Ask the backend which branch to fetch: staging only when it replies
     # "staging", otherwise main.
-    backend_url = None
+    backend_url = api_key = None
     try:
         with open(UNBOUND_CONFIG_PATH) as _f:
-            backend_url = json.load(_f).get("base_url")
+            _cfg = json.load(_f)
+            backend_url = _cfg.get("base_url")
+            api_key = _cfg.get("api_key")
     except Exception as _e:
         log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
         return "main"
-    if not backend_url:
+    if not backend_url or not api_key:
         return "main"
     try:
         _r = subprocess.run(
-            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3", "--",
+            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3",
+             "-H", "Authorization: Bearer " + api_key, "--",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
             capture_output=True, timeout=5,
         )
