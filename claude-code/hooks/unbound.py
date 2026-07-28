@@ -1995,15 +1995,22 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return response
 
 
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no glob metacharacters."""
+    return bool(value) and '/' not in value and '..' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
 def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[str]:
     """Absolute path of the invoked skill's SKILL.md. The tool call carries only
     the skill name, so map it back on device — the backend joins this against
     the skills discovery already reported. None when it can't be resolved."""
     try:
         prefix, _, name = (skill or '').rpartition(':')
-        if not name or '/' in name or '..' in name:
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
             return None
-        if any(ch in name for ch in '*?['):
+        if not all(_safe_skill_segment(segment) for segment in segments):
             return None
 
         # Plugin skills ("<plugin>:<name>") live outside the project tree.
@@ -2017,7 +2024,7 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         # Directory-scoped skills ("apps/web:deploy") hang off an ancestor dir.
         # A prefixed skill never falls back to the bare name — "slack:standup"
         # and a personal "standup" are different skills.
-        nested = prefix.split('/') if prefix else []
+        nested = segments
         roots = []
         if cwd:
             start = Path(cwd)

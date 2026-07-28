@@ -150,16 +150,41 @@ _cached_api_key = None
 _reporting_error = False
 
 
+def _skill_name_from_path(file_path):
+    """Skill name when a path sits under a known skills root, else None."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.split(os.sep)
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) == tuple(root):
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no glob metacharacters."""
+    return bool(value) and '/' not in value and '..' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
 def _resolve_skill_path(skill, cwd):
     """Absolute path of an invoked skill's SKILL.md, or None when it does not
     resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
     try:
         prefix, _, name = (skill or '').rpartition(':')
-        if not name or '/' in name or '..' in name:
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
             return None
-        if any(ch in name for ch in '*?['):
+        if not all(_safe_skill_segment(segment) for segment in segments):
             return None
-        nested = prefix.split('/') if prefix else []
+        nested = segments
         roots = []
         if cwd:
             start = Path(cwd)
@@ -185,7 +210,6 @@ def _skill_tool_uses_from_events(skill_events, cwd):
     and a missing path falls back to resolving the name on disk."""
     entries = []
     try:
-        seen = set()
         for data in skill_events or []:
             if not isinstance(data, dict):
                 continue
@@ -208,19 +232,22 @@ def _skill_tool_uses_from_events(skill_events, cwd):
                     path = path or name
                     parts = parts[:-1]
                 name = parts[-1] if parts else ''
-            if not name or name in seen:
+            if not name:
                 continue
-            seen.add(name)
-            if not path:
+            # The event payload is undocumented, so only trust a path that
+            # is really a skill file on disk; otherwise resolve it ourselves.
+            if not (path and _skill_name_from_path(path) and os.path.isfile(path)):
                 path = _resolve_skill_path(name, cwd) or ''
+            # Index keeps repeat invocations of one skill distinct; a shared id
+            # would collapse them into a single row.
+            key = 'skill\x1f%s\x1f%s\x1f%s' % (name, path, len(entries))
             entries.append({
                 'type': 'PostToolUse',
                 'tool_name': SKILL_TOOL_NAME,
                 'tool_input': {'skill': name, 'args': ''},
                 'tool_response': {},
                 'tool_use_id': 'unb-' + hashlib.sha256(
-                    ('skill\x1f%s\x1f%s' % (name, path)).encode('utf-8', 'replace')
-                ).hexdigest()[:24],
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
                 'skill_name': name,
                 'skill_path': path,
             })

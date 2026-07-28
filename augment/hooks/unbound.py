@@ -108,16 +108,23 @@ _cached_api_key = None
 _reporting_error = False
 
 
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no glob metacharacters."""
+    return bool(value) and '/' not in value and '..' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
 def _resolve_skill_path(skill, cwd):
     """Absolute path of an invoked skill's SKILL.md, or None when it does not
     resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
     try:
         prefix, _, name = (skill or '').rpartition(':')
-        if not name or '/' in name or '..' in name:
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
             return None
-        if any(ch in name for ch in '*?['):
+        if not all(_safe_skill_segment(segment) for segment in segments):
             return None
-        nested = prefix.split('/') if prefix else []
+        nested = segments
         roots = []
         if cwd:
             start = Path(cwd)
@@ -147,20 +154,47 @@ def _skill_dirs(cwd):
     return [root.joinpath(*skill_dir) for root in roots for skill_dir in SKILL_SEARCH_DIRS]
 
 
+SKILL_READ_TOOLS = frozenset({'view', 'read-file', 'read'})
+
+
+def _skill_read_path(event):
+    """Path a read tool opened, across the field names Augment uses."""
+    try:
+        if (event.get('tool_name') or '') not in SKILL_READ_TOOLS:
+            return None
+        tool_input = event.get('tool_input') or {}
+        for key in ('path', 'file_path', 'filePath'):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for change in (event.get('file_changes') or []):
+            if isinstance(change, dict):
+                value = change.get('path') or change.get('file_path')
+                if isinstance(value, str) and value:
+                    return value
+        return None
+    except Exception:
+        return None
+
+
 def _skill_name_from_path(file_path):
-    """Skill name when a path is a skill's SKILL.md, else None."""
+    """Skill name when a path sits under a known skills root, else None.
+    The root check is what stops an ordinary read of, say,
+    docs/skills/x/SKILL.md being counted as a skill invocation."""
     try:
         if not isinstance(file_path, str):
             return None
         parts = file_path.split(os.sep)
-        if len(parts) < 3 or parts[-1] != 'SKILL.md':
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
             return None
-        if 'skills' not in parts[:-2]:
-            return None
-        return parts[-2]
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) == tuple(root):
+                    return parts[-2]
+        return None
     except Exception:
         return None
-
 
 def _skill_body(path):
     """SKILL.md contents with any YAML frontmatter stripped."""
@@ -189,7 +223,8 @@ def _skill_from_prompt_body(prompt, cwd):
         normalized = ' '.join(text.split())
         scanned = 0
         for base in _skill_dirs(cwd):
-            for path in sorted(base.glob('*/SKILL.md')):
+            candidates = sorted(base.glob('*/SKILL.md')) + sorted(base.glob('*/*/SKILL.md'))
+            for path in candidates:
                 scanned += 1
                 if scanned > _SKILL_BODY_SCAN_LIMIT:
                     return None
@@ -1759,10 +1794,10 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             shaped['project'] = tool_project
             assistant_tool_uses.append(shaped)
 
-            # Auggie loads an auto-triggered skill by reading its SKILL.md, so
-            # that read is the invocation signal.
-            tool_input = ev.get('tool_input') or {}
-            read_path = tool_input.get('path') or tool_input.get('file_path')
+            # Auggie loads an auto-triggered skill by READING its SKILL.md, so
+            # that read is the invocation signal. Writes and edits to a skill
+            # file are not invocations.
+            read_path = _skill_read_path(ev)
             skill_name = _skill_name_from_path(read_path)
             if skill_name:
                 assistant_tool_uses.append(

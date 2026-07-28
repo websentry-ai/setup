@@ -69,6 +69,8 @@ FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery
 
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
+SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
+                     ('.claude', 'skills'), ('.codex', 'skills'))
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
@@ -1213,20 +1215,23 @@ _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 
 def _skill_name_from_path(file_path):
-    """Skill name when a path is a skill's SKILL.md, else None. Cursor reads
-    SKILL.md to load a skill, so the read path is the invocation signal."""
+    """Skill name when a path sits under a known skills root, else None.
+    The root check is what stops an ordinary read of, say,
+    docs/skills/x/SKILL.md being counted as a skill invocation."""
     try:
         if not isinstance(file_path, str):
             return None
         parts = file_path.split(os.sep)
-        if len(parts) < 3 or parts[-1] != 'SKILL.md':
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
             return None
-        if 'skills' not in parts[:-2]:
-            return None
-        return parts[-2]
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) == tuple(root):
+                    return parts[-2]
+        return None
     except Exception:
         return None
-
 
 def _project_for_paths(candidates, root_projects):
     """First project ("<org>/<repo>") resolved from `candidates` paths.

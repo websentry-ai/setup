@@ -1186,16 +1186,23 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
     return None
 
 
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no glob metacharacters."""
+    return bool(value) and '/' not in value and '..' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
 def _resolve_skill_path(skill, cwd):
     """Absolute path of an invoked skill's SKILL.md, or None when it does not
     resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
     try:
         prefix, _, name = (skill or '').rpartition(':')
-        if not name or '/' in name or '..' in name:
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
             return None
-        if any(ch in name for ch in '*?['):
+        if not all(_safe_skill_segment(segment) for segment in segments):
             return None
-        nested = prefix.split('/') if prefix else []
+        nested = segments
         roots = []
         if cwd:
             start = Path(cwd)
