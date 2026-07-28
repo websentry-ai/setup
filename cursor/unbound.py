@@ -1216,7 +1216,7 @@ _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 def _skill_roots(cwd):
     """Directories a skill root may hang off: every given root's ancestors,
-    plus home. Accepts one path or several (Cursor can open multiple)."""
+    plus home. Accepts one path or several."""
     starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
     roots = []
     for start in starts:
@@ -1224,17 +1224,18 @@ def _skill_roots(cwd):
             path = Path(start)
             roots += [path] + list(path.parents)
     roots.append(Path.home())
-    return {str(r) for r in roots}
+    return {str(r).replace('\\', '/') for r in roots}
 
 
 def _skill_name_from_path(file_path, cwd=None):
     """Skill name when a path sits under a real skill root, else None. The root
     must hang off cwd's ancestry or home, so a lookalike such as
-    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted."""
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
     try:
         if not isinstance(file_path, str):
             return None
-        parts = file_path.split(os.sep)
+        parts = file_path.replace('\\', '/').split('/')
         if len(parts) < 4 or parts[-1] != 'SKILL.md':
             return None
         allowed = _skill_roots(cwd)
@@ -1243,7 +1244,7 @@ def _skill_name_from_path(file_path, cwd=None):
             for i in range(len(parts) - span - 1):
                 if tuple(parts[i:i + span]) != tuple(root):
                     continue
-                if os.sep.join(parts[:i]) in allowed:
+                if '/'.join(parts[:i]) in allowed:
                     return parts[-2]
         return None
     except Exception:
