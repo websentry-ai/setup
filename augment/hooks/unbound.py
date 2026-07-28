@@ -78,36 +78,30 @@ IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 SELF_UPDATE_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/{branch}/augment/hooks/unbound.py"
 
 def _setup_branch():
-    # Which branch of the setup repo to fetch: a staging backend runs the staging
-    # hooks, everything else main. The backend is authoritative (it reports its own
-    # environment, so this survives a domain/subdomain rename); fall back to a host
-    # substring, and ultimately to main. Same approach as coding-discovery install.sh.
+    # Ask the backend which branch to fetch: staging only when it replies
+    # "staging", otherwise main.
     backend_url = None
     try:
         with open(UNBOUND_CONFIG_PATH) as _f:
             backend_url = json.load(_f).get("base_url")
     except Exception as _e:
-        log_error("setup-branch: could not read %s (%s); using host fallback" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
-    if backend_url:
-        try:
-            # Trivial static response; keep the timeout tight so this stays well
-            # inside the SessionStart budget even when self-update is due.
-            _r = subprocess.run(
-                ["curl", "-fsS", "--connect-timeout", "2", "-m", "3",
-                 backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
-                capture_output=True, timeout=5,
-            )
-            if _r.returncode == 0:
-                _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
-                if _b in ("main", "staging"):
-                    return _b
-                log_error("setup-branch: unexpected endpoint reply %r; using host fallback" % (_r.stdout[:80],), 'self_update')
-            else:
-                log_error("setup-branch: endpoint exit %d; using host fallback" % _r.returncode, 'self_update')
-        except Exception as _e:
-            log_error("setup-branch: endpoint lookup failed (%s); using host fallback" % _e, 'self_update')
-    _host = (backend_url or "").split("://", 1)[-1].split("/", 1)[0].lower()
-    return "staging" if "staging" in _host else "main"
+        log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
+        return "main"
+    if not backend_url:
+        return "main"
+    try:
+        _r = subprocess.run(
+            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3",
+             backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
+            capture_output=True, timeout=5,
+        )
+        if _r.returncode == 0:
+            _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
+            return "staging" if _b == "staging" else "main"
+        log_error("setup-branch: endpoint exit %d; defaulting to main" % _r.returncode, 'self_update')
+    except Exception as _e:
+        log_error("setup-branch: endpoint lookup failed (%s); defaulting to main" % _e, 'self_update')
+    return "main"
 
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
 SELF_UPDATE_LOCK_TTL_SECONDS = 30
