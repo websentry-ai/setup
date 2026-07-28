@@ -117,6 +117,10 @@ INTERNAL_TOOLS = {
 }
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
+                     ('.agents', 'skills'), ('.claude', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -144,6 +148,116 @@ except Exception:
 
 _cached_api_key = None
 _reporting_error = False
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        if not name or '/' in name or '..' in name:
+            return None
+        if any(ch in name for ch in '*?['):
+            return None
+        nested = prefix.split('/') if prefix else []
+        roots = []
+        if cwd:
+            start = Path(cwd)
+            roots = [start] + list(start.parents)
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                for match in sorted(base.glob('*/%s/SKILL.md' % name)):
+                    return str(match)
+        return None
+    except Exception:
+        return None
+
+
+def _skill_tool_uses_from_events(skill_events, cwd):
+    """Skill invocations from Copilot's session event stream. `skill.invoked` is
+    undocumented and unversioned, so each field is probed across plausible names
+    and a missing path falls back to resolving the name on disk."""
+    entries = []
+    try:
+        seen = set()
+        for data in skill_events or []:
+            if not isinstance(data, dict):
+                continue
+            name = ''
+            for key in ('name', 'skillName', 'skill_name', 'skill', 'id'):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    name = value.strip()
+                    break
+            path = ''
+            for key in ('path', 'skillPath', 'skill_path', 'filePath', 'file_path'):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = value.strip()
+                    break
+            # The name field may itself be a path; derive the skill from it.
+            if name and ('/' in name or os.sep in name):
+                parts = [seg for seg in name.replace(os.sep, '/').split('/') if seg]
+                if parts and parts[-1] == 'SKILL.md':
+                    path = path or name
+                    parts = parts[:-1]
+                name = parts[-1] if parts else ''
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if not path:
+                path = _resolve_skill_path(name, cwd) or ''
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    ('skill\x1f%s\x1f%s' % (name, path)).encode('utf-8', 'replace')
+                ).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
 
 
 def _should_report():
@@ -1621,6 +1735,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     text_parts = []
     tool_calls = []          # ordered list of call ids
     tool_data = {}           # call_id -> {name, arguments, result, success}
+    skill_events = []        # raw `skill.invoked` payloads seen this turn
 
     def _register(call_id):
         if call_id not in tool_data:
@@ -1647,6 +1762,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call = _register(call_id)
                 call['name'] = req.get('name') or call['name']
                 call['arguments'] = _normalize_arguments(req.get('arguments'))
+
+        elif entry_type == 'skill.invoked':
+            skill_events.append(data)
 
         elif entry_type == 'tool.execution_start':
             call_id = data.get('toolCallId')
@@ -1706,6 +1824,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     text_sig = hashlib.sha256(
         '\x1f'.join([user_prompt or ''] + text_parts).encode('utf-8', 'replace')
     ).hexdigest()
+
+    # Copilot injects SKILL.md rather than calling a tool, but its session event
+    # stream records the load; fall back to the prompt token when it doesn't.
+    skill_uses = _skill_tool_uses_from_events(skill_events, cwd)
+    if not skill_uses:
+        skill_uses = _skill_tool_uses_from_prompt(user_prompt, cwd, conversation_id, text_sig)
+    tool_use.extend(skill_uses)
 
     messages = []
     if user_prompt:

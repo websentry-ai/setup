@@ -41,6 +41,12 @@ AUGMENT_TOOL_FAMILY = {
 # EXCLUDED: it is a destructive delete that must always reach the gateway, so it
 # lives only in ALLOWED_NON_MCP_HOOK_NAMES (never eligible for the fast path).
 NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.augment', 'skills'), ('.claude', 'skills'),
+                     ('.agents', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
+_SKILL_BODY_SCAN_LIMIT = 400
+_SKILL_BODY_MATCH_CHARS = 400
 # Non-MCP Augment tools we always evaluate (the rest fall through to the cache
 # fast path). MCP tools are detected via the is_mcp_tool flag, not a name prefix.
 ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files']
@@ -100,6 +106,147 @@ APPROVAL_POLL_PHASES = (
 
 _cached_api_key = None
 _reporting_error = False
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        if not name or '/' in name or '..' in name:
+            return None
+        if any(ch in name for ch in '*?['):
+            return None
+        nested = prefix.split('/') if prefix else []
+        roots = []
+        if cwd:
+            start = Path(cwd)
+            roots = [start] + list(start.parents)
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                for match in sorted(base.glob('*/%s/SKILL.md' % name)):
+                    return str(match)
+        return None
+    except Exception:
+        return None
+
+
+def _skill_dirs(cwd):
+    """Every directory a skill could live in for this invocation."""
+    roots = []
+    if cwd:
+        start = Path(cwd)
+        roots = [start] + list(start.parents)
+    roots.append(Path.home())
+    return [root.joinpath(*skill_dir) for root in roots for skill_dir in SKILL_SEARCH_DIRS]
+
+
+def _skill_name_from_path(file_path):
+    """Skill name when a path is a skill's SKILL.md, else None."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.split(os.sep)
+        if len(parts) < 3 or parts[-1] != 'SKILL.md':
+            return None
+        if 'skills' not in parts[:-2]:
+            return None
+        return parts[-2]
+    except Exception:
+        return None
+
+
+def _skill_body(path):
+    """SKILL.md contents with any YAML frontmatter stripped."""
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return ''
+    if text.startswith('---'):
+        end = text.find('\n---', 3)
+        if end != -1:
+            text = text[text.find('\n', end + 1) + 1:]
+    return text.strip()
+
+
+def _skill_from_prompt_body(prompt, cwd):
+    """(name, path) when a prompt IS a skill's body. Auggie submits a skill's
+    instructions as the request instead of the slash token, so matching the
+    body on disk is the only way to identify a typed invocation."""
+    try:
+        text = (prompt or '').strip()
+        if not text or '\n' not in text:
+            return None
+        head = text.splitlines()[0].strip()
+        if not head:
+            return None
+        normalized = ' '.join(text.split())
+        scanned = 0
+        for base in _skill_dirs(cwd):
+            for path in sorted(base.glob('*/SKILL.md')):
+                scanned += 1
+                if scanned > _SKILL_BODY_SCAN_LIMIT:
+                    return None
+                body = _skill_body(path)
+                if not body or body.splitlines()[0].strip() != head:
+                    continue
+                if normalized.startswith(' '.join(body.split())[:_SKILL_BODY_MATCH_CHARS]):
+                    return path.parent.name, str(path)
+        return None
+    except Exception:
+        return None
+
+
+def _skill_entry(name, path, session_id, stamp):
+    """A skill invocation shaped like the tool_use entries the backend reads."""
+    key = '\x1f'.join((str(session_id or ''), str(name), str(stamp or '')))
+    return {
+        'type': 'PostToolUse',
+        'tool_name': SKILL_TOOL_NAME,
+        'tool_input': {'skill': name, 'args': ''},
+        'tool_response': {},
+        'tool_use_id': 'unb-' + hashlib.sha256(
+            key.encode('utf-8', 'replace')).hexdigest()[:24],
+        'skill_name': name,
+        'skill_path': path,
+    }
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
 
 
 def _utc_now_z() -> str:
@@ -1611,6 +1758,26 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
                 shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
             shaped['project'] = tool_project
             assistant_tool_uses.append(shaped)
+
+            # Auggie loads an auto-triggered skill by reading its SKILL.md, so
+            # that read is the invocation signal.
+            tool_input = ev.get('tool_input') or {}
+            read_path = tool_input.get('path') or tool_input.get('file_path')
+            skill_name = _skill_name_from_path(read_path)
+            if skill_name:
+                assistant_tool_uses.append(
+                    _skill_entry(skill_name, read_path, session_id, log_entry.get('timestamp')))
+
+    if not any(entry.get('skill_name') for entry in assistant_tool_uses):
+        # A typed `/name` arrives as the skill's body, not the token, so match
+        # the prompt against SKILL.md on disk before falling back to the token.
+        matched = _skill_from_prompt_body(user_prompt, cwd)
+        if matched:
+            assistant_tool_uses.append(
+                _skill_entry(matched[0], matched[1], session_id, event.get('timestamp')))
+        else:
+            assistant_tool_uses.extend(
+                _skill_tool_uses_from_prompt(user_prompt, cwd, session_id, event.get('timestamp')))
 
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})

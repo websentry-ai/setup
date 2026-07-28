@@ -25,6 +25,9 @@ LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'apply_patch']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'apply_patch'}
 MCP_TOOL_PREFIX = 'mcp__'
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -1183,6 +1186,66 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
     return None
 
 
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        if not name or '/' in name or '..' in name:
+            return None
+        if any(ch in name for ch in '*?['):
+            return None
+        nested = prefix.split('/') if prefix else []
+        roots = []
+        if cwd:
+            start = Path(cwd)
+            roots = [start] + list(start.parents)
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                for match in sorted(base.glob('*/%s/SKILL.md' % name)):
+                    return str(match)
+        return None
+    except Exception:
+        return None
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
+
+
 def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None, session_cwd: Optional[str] = None) -> List[Dict]:
     """Parse Codex transcript for function_call/function_call_output pairs.
 
@@ -1397,6 +1460,9 @@ def process_stop_event(event: Dict, api_key: str):
     # attribution.
     cwd = event.get('cwd')
     assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp, session_cwd=cwd)
+
+    assistant_tool_uses.extend(
+        _skill_tool_uses_from_prompt(user_prompt, cwd, session_id, user_prompt_timestamp))
 
     for item in assistant_tool_uses:
         if not item.get('tool_use_id'):
