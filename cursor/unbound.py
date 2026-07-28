@@ -1229,7 +1229,8 @@ def _trusted_ancestors(start):
                 info = path.stat()
             except OSError:
                 break
-            if info.st_uid not in (uid, 0) or (info.st_mode & 0o002):
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
                 break
         out.append(path)
     return out
@@ -1354,8 +1355,13 @@ def build_llm_exchange(events, api_key=None):
             }
             # Cursor loads a skill by reading its SKILL.md, so this read is the
             # only skill-invocation signal it emits.
+            # Prefer the read event's own roots: the first logged event may
+            # have carried an incomplete list.
+            event_roots = [r for r in (event.get('workspace_roots') or [])
+                           if isinstance(r, str) and r]
             skill_name = _skill_name_from_path(
-                file_path, workspace_roots or workspace_cwd)
+                file_path,
+                (event_roots + workspace_roots) or workspace_cwd)
             if skill_name:
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path

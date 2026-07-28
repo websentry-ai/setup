@@ -2010,15 +2010,19 @@ def _trusted_ancestors(start):
                 info = path.stat()
             except OSError:
                 break
-            if info.st_uid not in (uid, 0) or (info.st_mode & 0o002):
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
                 break
         out.append(path)
     return out
 
 
 def _safe_skill_segment(value):
-    """A path segment safe to join or glob: no traversal, no glob metacharacters."""
-    return bool(value) and '/' not in value and '..' not in value \
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
         and not any(ch in value for ch in '*?[')
 
 
