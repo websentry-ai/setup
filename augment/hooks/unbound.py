@@ -161,6 +161,21 @@ def _skill_dirs(cwd):
 SKILL_READ_TOOLS = frozenset({'view', 'read-file', 'read'})
 
 
+def _skill_absolute_read_path(read_path, roots):
+    """Absolute form of a read path. Augment can report workspace-relative
+    paths, which no absolute skill root would ever match."""
+    try:
+        if not read_path or os.path.isabs(read_path):
+            return read_path
+        for root in roots or []:
+            candidate = os.path.join(root, read_path)
+            if os.path.isfile(candidate):
+                return candidate
+        return read_path
+    except Exception:
+        return read_path
+
+
 def _skill_read_path(event):
     """Path a read tool opened, across the field names Augment uses."""
     try:
@@ -1792,8 +1807,13 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             # Auggie loads an auto-triggered skill by READING its SKILL.md, so
             # that read is the invocation signal. Writes and edits to a skill
             # file are not invocations.
-            read_path = _skill_read_path(ev)
-            skill_name = _skill_name_from_path(read_path, cwd)
+            # The read event carries its own workspace roots; the Stop cwd
+            # alone misses reads in a subdirectory or under a relative path.
+            event_roots = [str(r) for r in _augment_workspace_roots(ev)]
+            if cwd:
+                event_roots.append(cwd)
+            read_path = _skill_absolute_read_path(_skill_read_path(ev), event_roots)
+            skill_name = _skill_name_from_path(read_path, event_roots or cwd)
             if skill_name:
                 assistant_tool_uses.append(
                     _skill_entry(skill_name, read_path, session_id,
