@@ -87,11 +87,11 @@ def _setup_branch():
     except Exception as _e:
         log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
         return "main"
-    if not backend_url:
+    if not backend_url or not backend_url.startswith("https://"):
         return "main"
     try:
         _r = subprocess.run(
-            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3",
+            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3", "--",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
             capture_output=True, timeout=5,
         )
@@ -1665,7 +1665,7 @@ def _acquire_self_update_lock() -> bool:
 def _download_latest_hook():
     try:
         result = subprocess.run(
-            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL_TMPL.format(branch=_setup_branch())],
+            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), "--", SELF_UPDATE_URL_TMPL.format(branch=_setup_branch())],
             capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
         )
         if result.returncode != 0 or not result.stdout:
