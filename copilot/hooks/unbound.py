@@ -254,9 +254,11 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
                 name = parts[-1] if parts else ''
             if not name:
                 continue
-            # The event payload is undocumented, so only trust a path that
-            # is really a skill file on disk; otherwise resolve it ourselves.
-            if not (path and _skill_name_from_path(path, cwd) and os.path.isfile(path)):
+            # The event payload is undocumented, so only trust a path that is
+            # really a skill file on disk AND names the same skill; otherwise a
+            # valid path for a different skill would misattribute the row.
+            path_name = _skill_name_from_path(path, cwd) if path else None
+            if not (path_name == name and os.path.isfile(path)):
                 path = _resolve_skill_path(name, cwd) or ''
             # Index keeps repeat invocations of one skill distinct; a shared id
             # would collapse them into a single row.
