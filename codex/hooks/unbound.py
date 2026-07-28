@@ -1215,8 +1215,13 @@ def _resolve_skill_path(skill, cwd):
                 if candidate.is_file():
                     return str(candidate)
                 # Bundled skills sit one level deeper (skills/<bundle>/<name>).
-                for match in sorted(base.glob('*/%s/SKILL.md' % name)):
-                    return str(match)
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
         return None
     except Exception:
         return None

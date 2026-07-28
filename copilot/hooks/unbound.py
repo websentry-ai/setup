@@ -197,15 +197,21 @@ def _resolve_skill_path(skill, cwd):
                 if candidate.is_file():
                     return str(candidate)
                 # Bundled skills sit one level deeper (skills/<bundle>/<name>).
-                for match in sorted(base.glob('*/%s/SKILL.md' % name)):
-                    return str(match)
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
         return None
     except Exception:
         return None
 
 
-def _skill_tool_uses_from_events(skill_events, cwd):
-    """Skill invocations from Copilot's session event stream. `skill.invoked` is
+def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
+    """Skill invocations from Copilot's session event stream, keyed to the turn
+    so a later turn's use of the same skill is a distinct row. `skill.invoked` is
     undocumented and unversioned, so each field is probed across plausible names
     and a missing path falls back to resolving the name on disk."""
     entries = []
@@ -240,7 +246,7 @@ def _skill_tool_uses_from_events(skill_events, cwd):
                 path = _resolve_skill_path(name, cwd) or ''
             # Index keeps repeat invocations of one skill distinct; a shared id
             # would collapse them into a single row.
-            key = 'skill\x1f%s\x1f%s\x1f%s' % (name, path, len(entries))
+            key = 'skill\x1f%s\x1f%s\x1f%s\x1f%s' % (turn_key or '', name, path, len(entries))
             entries.append({
                 'type': 'PostToolUse',
                 'tool_name': SKILL_TOOL_NAME,
@@ -271,7 +277,7 @@ def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
             path = _resolve_skill_path(name, cwd)
             if not path:
                 continue
-            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or ''), str(len(entries))))
             entries.append({
                 'type': 'PostToolUse',
                 'tool_name': SKILL_TOOL_NAME,
@@ -1854,10 +1860,18 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     # Copilot injects SKILL.md rather than calling a tool, but its session event
     # stream records the load; fall back to the prompt token when it doesn't.
-    skill_uses = _skill_tool_uses_from_events(skill_events, cwd)
+    skill_uses = _skill_tool_uses_from_events(skill_events, cwd, turn_key=text_sig)
     if not skill_uses:
         skill_uses = _skill_tool_uses_from_prompt(user_prompt, cwd, conversation_id, text_sig)
-    tool_use.extend(skill_uses)
+    # Skills ride the same watermark as tool calls; without this a later Stop in
+    # the same turn re-sends them and inflates counts.
+    for entry in skill_uses:
+        entry_id = entry.get('tool_use_id')
+        if entry_id in already_forwarded:
+            continue
+        if entry_id:
+            forwarded_now.add(entry_id)
+        tool_use.append(entry)
 
     messages = []
     if user_prompt:
