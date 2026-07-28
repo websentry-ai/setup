@@ -69,6 +69,10 @@ FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery
 
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
 SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
                      ('.claude', 'skills'), ('.codex', 'skills'))
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"

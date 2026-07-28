@@ -41,6 +41,10 @@ AUGMENT_TOOL_FAMILY = {
 # EXCLUDED: it is a destructive delete that must always reach the gateway, so it
 # lives only in ALLOWED_NON_MCP_HOOK_NAMES (never eligible for the fast path).
 NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.augment', 'skills'), ('.claude', 'skills'),
                      ('.agents', 'skills'))

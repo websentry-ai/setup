@@ -117,6 +117,10 @@ INTERNAL_TOOLS = {
 }
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
                      ('.agents', 'skills'), ('.claude', 'skills'))

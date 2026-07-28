@@ -25,6 +25,10 @@ LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'apply_patch']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'apply_patch'}
 MCP_TOOL_PREFIX = 'mcp__'
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
