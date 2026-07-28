@@ -1186,6 +1186,27 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
     return None
 
 
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o002):
+                break
+        out.append(path)
+    return out
+
+
 def _safe_skill_segment(value):
     """A path segment safe to join or glob: no traversal, no glob metacharacters."""
     return bool(value) and '/' not in value and '..' not in value \
@@ -1205,8 +1226,7 @@ def _resolve_skill_path(skill, cwd):
         nested = segments
         roots = []
         if cwd:
-            start = Path(cwd)
-            roots = [start] + list(start.parents)
+            roots = _trusted_ancestors(Path(cwd))
         roots.append(Path.home())
         for root in roots:
             for skill_dir in SKILL_SEARCH_DIRS:

@@ -1214,6 +1214,27 @@ def _find_git_root(path):
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o002):
+                break
+        out.append(path)
+    return out
+
+
 def _skill_roots(cwd):
     """Directories a skill root may hang off: every given root's ancestors,
     plus home. Accepts one path or several."""
@@ -1221,8 +1242,7 @@ def _skill_roots(cwd):
     roots = []
     for start in starts:
         if start:
-            path = Path(start)
-            roots += [path] + list(path.parents)
+            roots += _trusted_ancestors(Path(start))
     roots.append(Path.home())
     return {str(r).replace('\\', '/') for r in roots}
 
