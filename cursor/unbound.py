@@ -1248,6 +1248,12 @@ def _skill_roots(cwd):
     return {str(r).replace('\\', '/') for r in roots}
 
 
+def _skill_path_key(path):
+    """Separator-normalised path, so a read (which keeps the payload's '/')
+    and a body match (which uses str(Path), '\\' on Windows) compare equal."""
+    return path.replace('\\', '/') if isinstance(path, str) else path
+
+
 def _skill_name_from_path(file_path, cwd=None):
     """Skill name when a path sits under a real skill root, else None. The root
     must hang off cwd's ancestry or home, so a lookalike such as
@@ -1366,8 +1372,8 @@ def build_llm_exchange(events, api_key=None):
             # Re-reading one SKILL.md in a turn is still a single invocation.
             # Keyed by path, not name: two skills can share a name under
             # different roots and are different skills.
-            if skill_name and file_path not in read_skills:
-                read_skills.add(file_path)
+            if skill_name and _skill_path_key(file_path) not in read_skills:
+                read_skills.add(_skill_path_key(file_path))
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path
             assistant_tool_uses.append(read_entry)

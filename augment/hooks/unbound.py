@@ -244,6 +244,12 @@ def _skill_roots(cwd):
     return {str(r).replace('\\', '/') for r in roots}
 
 
+def _skill_path_key(path):
+    """Separator-normalised path, so a read (which keeps the payload's '/')
+    and a body match (which uses str(Path), '\\' on Windows) compare equal."""
+    return path.replace('\\', '/') if isinstance(path, str) else path
+
+
 def _skill_name_from_path(file_path, cwd=None):
     """Skill name when a path sits under a real skill root, else None. The root
     must hang off cwd's ancestry or home, so a lookalike such as
@@ -1853,8 +1859,8 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             # Re-reading one SKILL.md in a turn is still a single invocation.
             # Keyed by path, not name: two skills can share a name under
             # different roots and are different skills.
-            if skill_name and read_path not in read_skills:
-                read_skills.add(read_path)
+            if skill_name and _skill_path_key(read_path) not in read_skills:
+                read_skills.add(_skill_path_key(read_path))
                 assistant_tool_uses.append(
                     _skill_entry(skill_name, read_path, session_id,
                                  log_entry.get('timestamp'), len(assistant_tool_uses)))
@@ -1862,7 +1868,8 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     # A typed `/name` arrives as the skill's body, not the token, so match the
     # prompt against SKILL.md on disk before falling back to the token. Skills
     # already seen in a read are skipped individually, not wholesale.
-    seen_skills = {e.get('skill_path') for e in assistant_tool_uses if e.get('skill_name')}
+    seen_skills = {_skill_path_key(e.get('skill_path'))
+                   for e in assistant_tool_uses if e.get('skill_name')}
     # Same roots the read path uses, so a skill under another workspace folder
     # resolves from the prompt body too.
     body_roots = []
@@ -1872,7 +1879,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     if cwd:
         body_roots.append(cwd)
     matched = _skill_from_prompt_body(user_prompt, body_roots or cwd)
-    if matched and matched[1] not in seen_skills:
+    if matched and _skill_path_key(matched[1]) not in seen_skills:
         assistant_tool_uses.append(
             _skill_entry(matched[0], matched[1], session_id,
                          event.get('timestamp'), len(assistant_tool_uses)))
