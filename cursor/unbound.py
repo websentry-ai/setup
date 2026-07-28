@@ -69,6 +69,12 @@ FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery
 
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
+                     ('.claude', 'skills'), ('.codex', 'skills'))
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
@@ -1212,6 +1218,69 @@ def _find_git_root(path):
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    return {str(r).replace('\\', '/') for r in roots}
+
+
+def _skill_path_key(path):
+    """Separator-normalised path, so a read (which keeps the payload's '/')
+    and a body match (which uses str(Path), '\\' on Windows) compare equal."""
+    return path.replace('\\', '/') if isinstance(path, str) else path
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.replace('\\', '/').split('/')
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        allowed = _skill_roots(cwd)
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if '/'.join(parts[:i]) in allowed:
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
 def _project_for_paths(candidates, root_projects):
     """First project ("<org>/<repo>") resolved from `candidates` paths.
     `root_projects` caches origin lookups so `git remote get-url` runs at
@@ -1249,6 +1318,8 @@ def build_llm_exchange(events, api_key=None):
     # Working-dir context for per-entry project attribution: every Cursor
     # event carries workspace_roots; shell events carry an explicit cwd.
     workspace_cwd = None
+    workspace_roots = []
+    read_skills = set()
     root_projects = {}
 
     for log_entry in events:
@@ -1259,6 +1330,7 @@ def build_llm_exchange(events, api_key=None):
             roots = event.get('workspace_roots')
             if isinstance(roots, list) and roots and isinstance(roots[0], str):
                 workspace_cwd = roots[0]
+                workspace_roots = list(roots)
 
         if not conversation_id:
             conversation_id = event.get('conversation_id')
@@ -1282,7 +1354,7 @@ def build_llm_exchange(events, api_key=None):
 
         elif hook_event_name == 'beforeReadFile':
             file_path = event.get('file_path')
-            assistant_tool_uses.append({
+            read_entry = {
                 'type': hook_event_name,
                 'file_path': file_path,
                 'content': event.get('content', ''),
@@ -1291,7 +1363,24 @@ def build_llm_exchange(events, api_key=None):
                 'project': _project_for_paths(
                     [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
                     root_projects)
-            })
+            }
+            # Cursor loads a skill by reading its SKILL.md, so this read is the
+            # only skill-invocation signal it emits.
+            # Prefer the read event's own roots: the first logged event may
+            # have carried an incomplete list.
+            event_roots = [r for r in (event.get('workspace_roots') or [])
+                           if isinstance(r, str) and r]
+            skill_name = _skill_name_from_path(
+                file_path,
+                (event_roots + workspace_roots) or workspace_cwd)
+            # Re-reading one SKILL.md in a turn is still a single invocation.
+            # Keyed by path, not name: two skills can share a name under
+            # different roots and are different skills.
+            if skill_name and _skill_path_key(file_path) not in read_skills:
+                read_skills.add(_skill_path_key(file_path))
+                read_entry['skill_name'] = skill_name
+                read_entry['skill_path'] = file_path
+            assistant_tool_uses.append(read_entry)
 
         elif hook_event_name == 'postToolUse':
             tool_name = event.get('tool_name', '')

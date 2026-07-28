@@ -24,6 +24,12 @@ LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
 
 # CoWork built-in tools that are exposed under mcp__
 COWORK_BUILTIN_MCP_SERVERS = frozenset({
@@ -1993,11 +1999,96 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     return response
 
 
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[str]:
+    """Absolute path of the invoked skill's SKILL.md. The tool call carries only
+    the skill name, so map it back on device — the backend joins this against
+    the skills discovery already reported. None when it can't be resolved."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+
+        # Plugin skills ("<plugin>:<name>") live outside the project tree.
+        if prefix and '/' not in prefix:
+            plugins_dir = CLAUDE_PLUGIN_CACHE_DIR.parent
+            for pattern in ('cache/*/%s/*/skills/%s/SKILL.md',
+                            'marketplaces/*/plugins/%s/skills/%s/SKILL.md'):
+                matches = sorted(plugins_dir.glob(pattern % (prefix, name)))
+                # Several copies of one plugin skill is ambiguous, so resolve
+                # nothing rather than guess, as the bundled path already does.
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+
+        # Directory-scoped skills ("apps/web:deploy") hang off an ancestor dir.
+        # A prefixed skill never falls back to the bare name — "slack:standup"
+        # and a personal "standup" are different skills.
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
     messages = []
     assistant_tool_uses = []
 
     user_prompt = None
+    prompt_cwd = None
     session_id = None
     permission_mode = None
     # Per-tool-use project resolution state: the persistent shell starts at
@@ -2019,6 +2110,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             prompt = event.get('prompt')
             if prompt:
                 user_prompt = prompt
+                # The prompt's own cwd beats the session cwd for resolving a
+                # repo-level skill when the agent was opened at a parent dir.
+                prompt_cwd = event.get('cwd') or prompt_cwd
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
@@ -2034,15 +2128,49 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             # can store per-call project on each analytics row.
             tool_project, shell_dir = _project_for_tool_use(tool_name, tool_input, shell_dir, root_projects)
 
-            assistant_tool_uses.append({
+            tool_use_entry = {
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
                 'tool_use_id': resolve_tool_use_id(event),
                 'project': tool_project
-            })
+            }
+            # Lift the invoked skill to stable keys so the backend reads one
+            # field regardless of how a tool spells its skill input.
+            if tool_name == SKILL_TOOL_NAME and isinstance(tool_input, dict):
+                skill = tool_input.get('skill')
+                tool_use_entry['skill_name'] = skill
+                skill_path = _resolve_skill_path(
+                    skill, event.get('cwd') or prompt_cwd or cwd)
+                if skill_path:
+                    tool_use_entry['skill_path'] = skill_path
+            assistant_tool_uses.append(tool_use_entry)
     
+    # A typed `/name` is expanded by Claude Code itself and never reaches the
+    # Skill tool, so recover it from the prompt. Resolving on disk is what
+    # keeps built-ins like /clear and /help out.
+    if user_prompt and user_prompt.startswith('/'):
+        typed = user_prompt[1:].split(None, 1)
+        typed_skill = typed[0] if typed else ''
+        typed_args = typed[1] if len(typed) > 1 else ''
+        typed_path = _resolve_skill_path(typed_skill, prompt_cwd or cwd)
+        if typed_path:
+            typed_key = '\x1f'.join((
+                str(session_id or ''), typed_skill, typed_args,
+                str(request_initialized or ''),
+            ))
+            assistant_tool_uses.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': typed_skill, 'args': typed_args},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    typed_key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': typed_skill,
+                'skill_path': typed_path,
+            })
+
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     

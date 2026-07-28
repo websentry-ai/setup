@@ -25,6 +25,13 @@ LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'apply_patch']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'apply_patch'}
 MCP_TOOL_PREFIX = 'mcp__'
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -1183,6 +1190,102 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
     return None
 
 
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
+
+
 def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None, session_cwd: Optional[str] = None) -> List[Dict]:
     """Parse Codex transcript for function_call/function_call_output pairs.
 
@@ -1397,6 +1500,9 @@ def process_stop_event(event: Dict, api_key: str):
     # attribution.
     cwd = event.get('cwd')
     assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp, session_cwd=cwd)
+
+    assistant_tool_uses.extend(
+        _skill_tool_uses_from_prompt(user_prompt, cwd, session_id, user_prompt_timestamp))
 
     for item in assistant_tool_uses:
         if not item.get('tool_use_id'):
