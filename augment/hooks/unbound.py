@@ -87,7 +87,7 @@ def _setup_branch():
     except Exception as _e:
         log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
         return "main"
-    if not backend_url or not backend_url.startswith("https://"):
+    if not backend_url:
         return "main"
     try:
         _r = subprocess.run(
