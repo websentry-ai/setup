@@ -170,10 +170,13 @@ def _resolve_skill_path(skill, cwd):
 
 def _skill_dirs(cwd):
     """Every directory a skill could live in for this invocation, bounded by
-    the same trust boundary the other skill helpers use."""
+    the same trust boundary the other skill helpers use. Accepts one path or
+    several, since Augment can report more than one workspace root."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
     roots = []
-    if cwd:
-        roots = _trusted_ancestors(Path(cwd))
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
     roots.append(Path.home())
     return [root.joinpath(*skill_dir) for root in roots for skill_dir in SKILL_SEARCH_DIRS]
 
@@ -1842,7 +1845,15 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     # prompt against SKILL.md on disk before falling back to the token. Skills
     # already seen in a read are skipped individually, not wholesale.
     seen_skills = {e.get('skill_name') for e in assistant_tool_uses if e.get('skill_name')}
-    matched = _skill_from_prompt_body(user_prompt, cwd)
+    # Same roots the read path uses, so a skill under another workspace folder
+    # resolves from the prompt body too.
+    body_roots = []
+    for log_entry in post_tool_events:
+        ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
+        body_roots += [str(r) for r in _augment_workspace_roots(ev)]
+    if cwd:
+        body_roots.append(cwd)
+    matched = _skill_from_prompt_body(user_prompt, body_roots or cwd)
     if matched and matched[0] not in seen_skills:
         assistant_tool_uses.append(
             _skill_entry(matched[0], matched[1], session_id,

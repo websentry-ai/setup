@@ -1820,8 +1820,11 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # text_sig grows as assistant text accumulates, so it changes between
         # Stops of one turn and would defeat the watermark. The user prompt does
         # not change mid-turn, so hash that instead.
+        # last_user_index is the turn's position in the session: fixed while a
+        # turn's assistant text grows, and different for a later turn even when
+        # its prompt is identical.
         turn_id = hashlib.sha256(
-            ('%s\x1f%s' % (conversation_id or '', user_prompt or '')
+            ('%s\x1f%s\x1f%s' % (conversation_id or '', last_user_index, user_prompt or '')
              ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
