@@ -230,7 +230,10 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
     and a missing path falls back to resolving the name on disk."""
     entries = []
     try:
-        for data in skill_events or []:
+        for event in skill_events or []:
+            if not isinstance(event, dict):
+                continue
+            data = event.get('data')
             if not isinstance(data, dict):
                 continue
             name = ''
@@ -265,9 +268,11 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
                 # than none, so drop it rather than watermark it as sent.
                 if not path:
                     continue
-            # Index keeps repeat invocations of one skill distinct; a shared id
-            # would collapse them into a single row.
-            key = 'skill\x1f%s\x1f%s\x1f%s\x1f%s' % (turn_key or '', name, path, len(entries))
+            # The envelope id is unique per event, so it keeps repeat invocations
+            # distinct without depending on turn text, which repeats verbatim
+            # across identical turns. Index only backs it up if an id is absent.
+            key = 'skill\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' % (
+                event.get('id') or '', turn_key or '', name, path, len(entries))
             entries.append({
                 'type': 'PostToolUse',
                 'tool_name': SKILL_TOOL_NAME,
@@ -1818,7 +1823,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call['arguments'] = _normalize_arguments(req.get('arguments'))
 
         elif entry_type == 'skill.invoked':
-            skill_events.append(data)
+            skill_events.append(entry)
 
         elif entry_type == 'tool.execution_start':
             call_id = data.get('toolCallId')

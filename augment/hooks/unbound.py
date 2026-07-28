@@ -238,19 +238,24 @@ def _skill_from_prompt_body(prompt, cwd):
         if not head:
             return None
         normalized = ' '.join(text.split())
+        best = None
         scanned = 0
         for base in _skill_dirs(cwd):
             candidates = sorted(base.glob('*/SKILL.md')) + sorted(base.glob('*/*/SKILL.md'))
             for path in candidates:
                 scanned += 1
                 if scanned > _SKILL_BODY_SCAN_LIMIT:
-                    return None
+                    return (best[1], best[2]) if best else None
                 body = _skill_body(path)
                 if not body or body.splitlines()[0].strip() != head:
                     continue
-                if normalized.startswith(' '.join(body.split())[:_SKILL_BODY_MATCH_CHARS]):
-                    return path.parent.name, str(path)
-        return None
+                flat = ' '.join(body.split())
+                if normalized.startswith(flat[:_SKILL_BODY_MATCH_CHARS]):
+                    # A short skill can be a prefix of a longer one, so keep the
+                    # most specific match rather than the first.
+                    if best is None or len(flat) > best[0]:
+                        best = (len(flat), path.parent.name, str(path))
+        return (best[1], best[2]) if best else None
     except Exception:
         return None
 

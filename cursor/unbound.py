@@ -1215,11 +1215,14 @@ _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 
 def _skill_roots(cwd):
-    """Directories a skill root may hang off: cwd's ancestors, plus home."""
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several (Cursor can open multiple)."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
     roots = []
-    if cwd:
-        start = Path(cwd)
-        roots = [start] + list(start.parents)
+    for start in starts:
+        if start:
+            path = Path(start)
+            roots += [path] + list(path.parents)
     roots.append(Path.home())
     return {str(r) for r in roots}
 
@@ -1283,6 +1286,7 @@ def build_llm_exchange(events, api_key=None):
     # Working-dir context for per-entry project attribution: every Cursor
     # event carries workspace_roots; shell events carry an explicit cwd.
     workspace_cwd = None
+    workspace_roots = []
     root_projects = {}
 
     for log_entry in events:
@@ -1293,6 +1297,7 @@ def build_llm_exchange(events, api_key=None):
             roots = event.get('workspace_roots')
             if isinstance(roots, list) and roots and isinstance(roots[0], str):
                 workspace_cwd = roots[0]
+                workspace_roots = list(roots)
 
         if not conversation_id:
             conversation_id = event.get('conversation_id')
@@ -1328,7 +1333,8 @@ def build_llm_exchange(events, api_key=None):
             }
             # Cursor loads a skill by reading its SKILL.md, so this read is the
             # only skill-invocation signal it emits.
-            skill_name = _skill_name_from_path(file_path, workspace_cwd)
+            skill_name = _skill_name_from_path(
+                file_path, workspace_roots or workspace_cwd)
             if skill_name:
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path
