@@ -169,11 +169,11 @@ def _resolve_skill_path(skill, cwd):
 
 
 def _skill_dirs(cwd):
-    """Every directory a skill could live in for this invocation."""
+    """Every directory a skill could live in for this invocation, bounded by
+    the same trust boundary the other skill helpers use."""
     roots = []
     if cwd:
-        start = Path(cwd)
-        roots = [start] + list(start.parents)
+        roots = _trusted_ancestors(Path(cwd))
     roots.append(Path.home())
     return [root.joinpath(*skill_dir) for root in roots for skill_dir in SKILL_SEARCH_DIRS]
 

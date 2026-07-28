@@ -1816,6 +1816,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     # Envelope id of this turn's user message: unique even when two turns
     # carry identical text, unlike a hash of that text.
     turn_id = entries[last_user_index].get('id') or ''
+    if not turn_id:
+        # text_sig grows as assistant text accumulates, so it changes between
+        # Stops of one turn and would defeat the watermark. The user prompt does
+        # not change mid-turn, so hash that instead.
+        turn_id = hashlib.sha256(
+            ('%s\x1f%s' % (conversation_id or '', user_prompt or '')
+             ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
     tool_calls = []          # ordered list of call ids
@@ -1913,10 +1920,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     # Copilot injects SKILL.md rather than calling a tool, but its session event
     # stream records the load; fall back to the prompt token when it doesn't.
     skill_uses = _skill_tool_uses_from_events(
-        skill_events, cwd, turn_key=turn_id or text_sig)
+        skill_events, cwd, turn_key=turn_id)
     seen_skills = {e.get('skill_name') for e in skill_uses}
     skill_uses += [e for e in _skill_tool_uses_from_prompt(
-        user_prompt, cwd, conversation_id, turn_id or text_sig)
+        user_prompt, cwd, conversation_id, turn_id)
         if e.get('skill_name') not in seen_skills]
     # Skills ride the same watermark as tool calls; without this a later Stop in
     # the same turn re-sends them and inflates counts.
