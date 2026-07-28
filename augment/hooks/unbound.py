@@ -44,7 +44,6 @@ NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.augment', 'skills'), ('.claude', 'skills'),
                      ('.agents', 'skills'))
-SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 _SKILL_BODY_SCAN_LIMIT = 400
 _SKILL_BODY_MATCH_CHARS = 400
 # Non-MCP Augment tools we always evaluate (the rest fall through to the cache
@@ -269,37 +268,6 @@ def _skill_entry(name, path, session_id, stamp, seq=0):
         'skill_name': name,
         'skill_path': path,
     }
-
-
-def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
-    """Skill invocations named in a prompt, as tool_use entries. This tool loads
-    a skill by injecting SKILL.md into context rather than calling a tool, so
-    the token in the prompt is the only signal the hook can see."""
-    entries = []
-    try:
-        seen = set()
-        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
-            name = match.group(1)
-            if name in seen:
-                continue
-            seen.add(name)
-            path = _resolve_skill_path(name, cwd)
-            if not path:
-                continue
-            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
-            entries.append({
-                'type': 'PostToolUse',
-                'tool_name': SKILL_TOOL_NAME,
-                'tool_input': {'skill': name, 'args': ''},
-                'tool_response': {},
-                'tool_use_id': 'unb-' + hashlib.sha256(
-                    key.encode('utf-8', 'replace')).hexdigest()[:24],
-                'skill_name': name,
-                'skill_path': path,
-            })
-    except Exception:
-        return []
-    return entries
 
 
 def _utc_now_z() -> str:
@@ -1827,15 +1795,10 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     # already seen in a read are skipped individually, not wholesale.
     seen_skills = {e.get('skill_name') for e in assistant_tool_uses if e.get('skill_name')}
     matched = _skill_from_prompt_body(user_prompt, cwd)
-    prompt_entries = []
-    if matched:
-        prompt_entries = [_skill_entry(matched[0], matched[1], session_id,
-                                       event.get('timestamp'), len(assistant_tool_uses))]
-    else:
-        prompt_entries = _skill_tool_uses_from_prompt(
-            user_prompt, cwd, session_id, event.get('timestamp'))
-    assistant_tool_uses.extend(
-        e for e in prompt_entries if e.get('skill_name') not in seen_skills)
+    if matched and matched[0] not in seen_skills:
+        assistant_tool_uses.append(
+            _skill_entry(matched[0], matched[1], session_id,
+                         event.get('timestamp'), len(assistant_tool_uses)))
 
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
