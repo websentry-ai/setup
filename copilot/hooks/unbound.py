@@ -59,7 +59,7 @@ def _setup_branch():
             backend_url = _cfg.get("base_url")
             api_key = _cfg.get("api_key")
     except Exception as _e:
-        log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
+        log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, type(_e).__name__), 'self_update')
         return "main"
     # Only send the key over https.
     if not backend_url or not api_key or not backend_url.startswith("https://"):
@@ -76,7 +76,7 @@ def _setup_branch():
             return "staging" if _b == "staging" else "main"
         log_error("setup-branch: endpoint exit %d; defaulting to main" % _r.returncode, 'self_update')
     except Exception as _e:
-        log_error("setup-branch: endpoint lookup failed (%s); defaulting to main" % _e, 'self_update')
+        log_error("setup-branch: endpoint lookup failed (%s); defaulting to main" % type(_e).__name__, 'self_update')
     return "main"
 
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
