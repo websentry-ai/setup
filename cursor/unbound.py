@@ -1364,8 +1364,10 @@ def build_llm_exchange(events, api_key=None):
                 file_path,
                 (event_roots + workspace_roots) or workspace_cwd)
             # Re-reading one SKILL.md in a turn is still a single invocation.
-            if skill_name and skill_name not in read_skills:
-                read_skills.add(skill_name)
+            # Keyed by path, not name: two skills can share a name under
+            # different roots and are different skills.
+            if skill_name and file_path not in read_skills:
+                read_skills.add(file_path)
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path
             assistant_tool_uses.append(read_entry)

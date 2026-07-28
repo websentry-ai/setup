@@ -1851,8 +1851,10 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             read_path = _skill_absolute_read_path(_skill_read_path(ev), event_roots)
             skill_name = _skill_name_from_path(read_path, event_roots or cwd)
             # Re-reading one SKILL.md in a turn is still a single invocation.
-            if skill_name and skill_name not in read_skills:
-                read_skills.add(skill_name)
+            # Keyed by path, not name: two skills can share a name under
+            # different roots and are different skills.
+            if skill_name and read_path not in read_skills:
+                read_skills.add(read_path)
                 assistant_tool_uses.append(
                     _skill_entry(skill_name, read_path, session_id,
                                  log_entry.get('timestamp'), len(assistant_tool_uses)))
@@ -1860,7 +1862,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     # A typed `/name` arrives as the skill's body, not the token, so match the
     # prompt against SKILL.md on disk before falling back to the token. Skills
     # already seen in a read are skipped individually, not wholesale.
-    seen_skills = {e.get('skill_name') for e in assistant_tool_uses if e.get('skill_name')}
+    seen_skills = {e.get('skill_path') for e in assistant_tool_uses if e.get('skill_name')}
     # Same roots the read path uses, so a skill under another workspace folder
     # resolves from the prompt body too.
     body_roots = []
@@ -1870,7 +1872,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     if cwd:
         body_roots.append(cwd)
     matched = _skill_from_prompt_body(user_prompt, body_roots or cwd)
-    if matched and matched[0] not in seen_skills:
+    if matched and matched[1] not in seen_skills:
         assistant_tool_uses.append(
             _skill_entry(matched[0], matched[1], session_id,
                          event.get('timestamp'), len(assistant_tool_uses)))
