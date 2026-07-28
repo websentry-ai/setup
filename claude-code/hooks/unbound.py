@@ -2108,7 +2108,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             if tool_name == SKILL_TOOL_NAME and isinstance(tool_input, dict):
                 skill = tool_input.get('skill')
                 tool_use_entry['skill_name'] = skill
-                skill_path = _resolve_skill_path(skill, event.get('cwd') or cwd)
+                skill_path = _resolve_skill_path(
+                    skill, event.get('cwd') or prompt_cwd or cwd)
                 if skill_path:
                     tool_use_entry['skill_path'] = skill_path
             assistant_tool_uses.append(tool_use_entry)

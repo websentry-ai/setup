@@ -260,6 +260,11 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
             path_name = _skill_name_from_path(path, cwd) if path else None
             if not (path_name == name and os.path.isfile(path)):
                 path = _resolve_skill_path(name, cwd) or ''
+                # No path means no evidence this name is a real skill. Every
+                # other detector requires that, and an unjoinable row is worse
+                # than none, so drop it rather than watermark it as sent.
+                if not path:
+                    continue
             # Index keeps repeat invocations of one skill distinct; a shared id
             # would collapse them into a single row.
             key = 'skill\x1f%s\x1f%s\x1f%s\x1f%s' % (turn_key or '', name, path, len(entries))
