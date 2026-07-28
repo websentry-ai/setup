@@ -75,7 +75,35 @@ DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
-SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/augment/hooks/unbound.py"
+SELF_UPDATE_URL_TMPL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/{branch}/augment/hooks/unbound.py"
+
+def _setup_branch():
+    # Which branch of the setup repo to fetch: a staging backend runs the staging
+    # hooks, everything else main. The backend is authoritative (it reports its own
+    # environment, so this survives a domain/subdomain rename); fall back to a host
+    # substring, and ultimately to main. Same approach as coding-discovery install.sh.
+    backend_url = None
+    try:
+        with open(UNBOUND_CONFIG_PATH) as _f:
+            backend_url = json.load(_f).get("base_url")
+    except Exception:
+        pass
+    if backend_url:
+        try:
+            _r = subprocess.run(
+                ["curl", "-fsS", "--connect-timeout", "2", "-m", "5",
+                 backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
+                capture_output=True, timeout=8,
+            )
+            if _r.returncode == 0:
+                _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
+                if _b in ("main", "staging"):
+                    return _b
+        except Exception:
+            pass
+    _host = (backend_url or "").split("://", 1)[-1].split("/", 1)[0].lower()
+    return "staging" if "staging" in _host else "main"
+
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
 SELF_UPDATE_LOCK_TTL_SECONDS = 30
 SELF_UPDATE_CURL_TIMEOUT = 10
@@ -1638,7 +1666,7 @@ def _acquire_self_update_lock() -> bool:
 def _download_latest_hook():
     try:
         result = subprocess.run(
-            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL],
+            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL_TMPL.format(branch=_setup_branch())],
             capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
         )
         if result.returncode != 0 or not result.stdout:
