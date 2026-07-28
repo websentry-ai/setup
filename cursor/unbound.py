@@ -62,21 +62,26 @@ def _setup_branch():
     try:
         with open(UNBOUND_CONFIG_PATH) as _f:
             backend_url = json.load(_f).get("base_url")
-    except Exception:
-        pass
+    except Exception as _e:
+        log_error("setup-branch: could not read %s (%s); using host fallback" % (UNBOUND_CONFIG_PATH, _e), 'self_update')
     if backend_url:
         try:
+            # Trivial static response; keep the timeout tight so this stays well
+            # inside the SessionStart budget even when self-update is due.
             _r = subprocess.run(
-                ["curl", "-fsS", "--connect-timeout", "2", "-m", "5",
+                ["curl", "-fsS", "--connect-timeout", "2", "-m", "3",
                  backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
-                capture_output=True, timeout=8,
+                capture_output=True, timeout=5,
             )
             if _r.returncode == 0:
                 _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
                 if _b in ("main", "staging"):
                     return _b
-        except Exception:
-            pass
+                log_error("setup-branch: unexpected endpoint reply %r; using host fallback" % (_r.stdout[:80],), 'self_update')
+            else:
+                log_error("setup-branch: endpoint exit %d; using host fallback" % _r.returncode, 'self_update')
+        except Exception as _e:
+            log_error("setup-branch: endpoint lookup failed (%s); using host fallback" % _e, 'self_update')
     _host = (backend_url or "").split("://", 1)[-1].split("/", 1)[0].lower()
     return "staging" if "staging" in _host else "main"
 
