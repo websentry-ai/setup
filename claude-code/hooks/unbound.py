@@ -2039,8 +2039,13 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
             plugins_dir = CLAUDE_PLUGIN_CACHE_DIR.parent
             for pattern in ('cache/*/%s/*/skills/%s/SKILL.md',
                             'marketplaces/*/plugins/%s/skills/%s/SKILL.md'):
-                for match in sorted(plugins_dir.glob(pattern % (prefix, name))):
-                    return str(match)
+                matches = sorted(plugins_dir.glob(pattern % (prefix, name)))
+                # Several copies of one plugin skill is ambiguous, so resolve
+                # nothing rather than guess, as the bundled path already does.
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
 
         # Directory-scoped skills ("apps/web:deploy") hang off an ancestor dir.
         # A prefixed skill never falls back to the bare name — "slack:standup"

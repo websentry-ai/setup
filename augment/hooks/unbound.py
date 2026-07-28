@@ -1811,6 +1811,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     shell_dir = cwd
     root_projects = {}
 
+    read_skills = set()
     mcp_servers = read_augment_mcp_servers(event)
     for log_entry in post_tool_events:
         ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1836,7 +1837,9 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
                 event_roots.append(cwd)
             read_path = _skill_absolute_read_path(_skill_read_path(ev), event_roots)
             skill_name = _skill_name_from_path(read_path, event_roots or cwd)
-            if skill_name:
+            # Re-reading one SKILL.md in a turn is still a single invocation.
+            if skill_name and skill_name not in read_skills:
+                read_skills.add(skill_name)
                 assistant_tool_uses.append(
                     _skill_entry(skill_name, read_path, session_id,
                                  log_entry.get('timestamp'), len(assistant_tool_uses)))
