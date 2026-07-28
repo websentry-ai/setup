@@ -1309,6 +1309,7 @@ def build_llm_exchange(events, api_key=None):
     # event carries workspace_roots; shell events carry an explicit cwd.
     workspace_cwd = None
     workspace_roots = []
+    read_skills = set()
     root_projects = {}
 
     for log_entry in events:
@@ -1362,7 +1363,9 @@ def build_llm_exchange(events, api_key=None):
             skill_name = _skill_name_from_path(
                 file_path,
                 (event_roots + workspace_roots) or workspace_cwd)
-            if skill_name:
+            # Re-reading one SKILL.md in a turn is still a single invocation.
+            if skill_name and skill_name not in read_skills:
+                read_skills.add(skill_name)
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path
             assistant_tool_uses.append(read_entry)

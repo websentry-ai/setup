@@ -182,7 +182,16 @@ def _skill_dirs(cwd):
         if start:
             roots += _trusted_ancestors(Path(start))
     roots.append(Path.home())
-    return [root.joinpath(*skill_dir) for root in roots for skill_dir in SKILL_SEARCH_DIRS]
+    # Workspace roots repeat across events and their ancestor chains overlap;
+    # without this the same tree is rescanned and the scan cap trips early.
+    dirs, seen = [], set()
+    for root in roots:
+        for skill_dir in SKILL_SEARCH_DIRS:
+            candidate = root.joinpath(*skill_dir)
+            if str(candidate) not in seen:
+                seen.add(str(candidate))
+                dirs.append(candidate)
+    return dirs
 
 
 SKILL_READ_TOOLS = frozenset({'view', 'read-file', 'read'})
