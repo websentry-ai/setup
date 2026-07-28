@@ -1214,20 +1214,33 @@ def _find_git_root(path):
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
 
 
-def _skill_name_from_path(file_path):
-    """Skill name when a path sits under a known skills root, else None.
-    The root check is what stops an ordinary read of, say,
-    docs/skills/x/SKILL.md being counted as a skill invocation."""
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: cwd's ancestors, plus home."""
+    roots = []
+    if cwd:
+        start = Path(cwd)
+        roots = [start] + list(start.parents)
+    roots.append(Path.home())
+    return {str(r) for r in roots}
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted."""
     try:
         if not isinstance(file_path, str):
             return None
         parts = file_path.split(os.sep)
         if len(parts) < 4 or parts[-1] != 'SKILL.md':
             return None
+        allowed = _skill_roots(cwd)
         for root in SKILL_SEARCH_DIRS:
             span = len(root)
             for i in range(len(parts) - span - 1):
-                if tuple(parts[i:i + span]) == tuple(root):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if os.sep.join(parts[:i]) in allowed:
                     return parts[-2]
         return None
     except Exception:
@@ -1315,7 +1328,7 @@ def build_llm_exchange(events, api_key=None):
             }
             # Cursor loads a skill by reading its SKILL.md, so this read is the
             # only skill-invocation signal it emits.
-            skill_name = _skill_name_from_path(file_path)
+            skill_name = _skill_name_from_path(file_path, workspace_cwd)
             if skill_name:
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path

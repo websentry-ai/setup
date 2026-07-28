@@ -150,23 +150,37 @@ _cached_api_key = None
 _reporting_error = False
 
 
-def _skill_name_from_path(file_path):
-    """Skill name when a path sits under a known skills root, else None."""
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: cwd's ancestors, plus home."""
+    roots = []
+    if cwd:
+        start = Path(cwd)
+        roots = [start] + list(start.parents)
+    roots.append(Path.home())
+    return {str(r) for r in roots}
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted."""
     try:
         if not isinstance(file_path, str):
             return None
         parts = file_path.split(os.sep)
         if len(parts) < 4 or parts[-1] != 'SKILL.md':
             return None
+        allowed = _skill_roots(cwd)
         for root in SKILL_SEARCH_DIRS:
             span = len(root)
             for i in range(len(parts) - span - 1):
-                if tuple(parts[i:i + span]) == tuple(root):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if os.sep.join(parts[:i]) in allowed:
                     return parts[-2]
         return None
     except Exception:
         return None
-
 
 def _safe_skill_segment(value):
     """A path segment safe to join or glob: no traversal, no glob metacharacters."""
@@ -220,7 +234,7 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
             if not isinstance(data, dict):
                 continue
             name = ''
-            for key in ('name', 'skillName', 'skill_name', 'skill', 'id'):
+            for key in ('name', 'skillName', 'skill_name', 'skill'):
                 value = data.get(key)
                 if isinstance(value, str) and value.strip():
                     name = value.strip()
@@ -242,7 +256,7 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
                 continue
             # The event payload is undocumented, so only trust a path that
             # is really a skill file on disk; otherwise resolve it ourselves.
-            if not (path and _skill_name_from_path(path) and os.path.isfile(path)):
+            if not (path and _skill_name_from_path(path, cwd) and os.path.isfile(path)):
                 path = _resolve_skill_path(name, cwd) or ''
             # Index keeps repeat invocations of one skill distinct; a shared id
             # would collapse them into a single row.
@@ -1861,8 +1875,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     # Copilot injects SKILL.md rather than calling a tool, but its session event
     # stream records the load; fall back to the prompt token when it doesn't.
     skill_uses = _skill_tool_uses_from_events(skill_events, cwd, turn_key=text_sig)
-    if not skill_uses:
-        skill_uses = _skill_tool_uses_from_prompt(user_prompt, cwd, conversation_id, text_sig)
+    seen_skills = {e.get('skill_name') for e in skill_uses}
+    skill_uses += [e for e in _skill_tool_uses_from_prompt(
+        user_prompt, cwd, conversation_id, text_sig)
+        if e.get('skill_name') not in seen_skills]
     # Skills ride the same watermark as tool calls; without this a later Stop in
     # the same turn re-sends them and inflates counts.
     for entry in skill_uses:

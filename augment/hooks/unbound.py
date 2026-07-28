@@ -182,20 +182,33 @@ def _skill_read_path(event):
         return None
 
 
-def _skill_name_from_path(file_path):
-    """Skill name when a path sits under a known skills root, else None.
-    The root check is what stops an ordinary read of, say,
-    docs/skills/x/SKILL.md being counted as a skill invocation."""
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: cwd's ancestors, plus home."""
+    roots = []
+    if cwd:
+        start = Path(cwd)
+        roots = [start] + list(start.parents)
+    roots.append(Path.home())
+    return {str(r) for r in roots}
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted."""
     try:
         if not isinstance(file_path, str):
             return None
         parts = file_path.split(os.sep)
         if len(parts) < 4 or parts[-1] != 'SKILL.md':
             return None
+        allowed = _skill_roots(cwd)
         for root in SKILL_SEARCH_DIRS:
             span = len(root)
             for i in range(len(parts) - span - 1):
-                if tuple(parts[i:i + span]) == tuple(root):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if os.sep.join(parts[:i]) in allowed:
                     return parts[-2]
         return None
     except Exception:
@@ -243,9 +256,9 @@ def _skill_from_prompt_body(prompt, cwd):
         return None
 
 
-def _skill_entry(name, path, session_id, stamp):
+def _skill_entry(name, path, session_id, stamp, seq=0):
     """A skill invocation shaped like the tool_use entries the backend reads."""
-    key = '\x1f'.join((str(session_id or ''), str(name), str(stamp or '')))
+    key = '\x1f'.join((str(session_id or ''), str(name), str(stamp or ''), str(seq)))
     return {
         'type': 'PostToolUse',
         'tool_name': SKILL_TOOL_NAME,
@@ -1803,21 +1816,26 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             # that read is the invocation signal. Writes and edits to a skill
             # file are not invocations.
             read_path = _skill_read_path(ev)
-            skill_name = _skill_name_from_path(read_path)
+            skill_name = _skill_name_from_path(read_path, cwd)
             if skill_name:
                 assistant_tool_uses.append(
-                    _skill_entry(skill_name, read_path, session_id, log_entry.get('timestamp')))
+                    _skill_entry(skill_name, read_path, session_id,
+                                 log_entry.get('timestamp'), len(assistant_tool_uses)))
 
-    if not any(entry.get('skill_name') for entry in assistant_tool_uses):
-        # A typed `/name` arrives as the skill's body, not the token, so match
-        # the prompt against SKILL.md on disk before falling back to the token.
-        matched = _skill_from_prompt_body(user_prompt, cwd)
-        if matched:
-            assistant_tool_uses.append(
-                _skill_entry(matched[0], matched[1], session_id, event.get('timestamp')))
-        else:
-            assistant_tool_uses.extend(
-                _skill_tool_uses_from_prompt(user_prompt, cwd, session_id, event.get('timestamp')))
+    # A typed `/name` arrives as the skill's body, not the token, so match the
+    # prompt against SKILL.md on disk before falling back to the token. Skills
+    # already seen in a read are skipped individually, not wholesale.
+    seen_skills = {e.get('skill_name') for e in assistant_tool_uses if e.get('skill_name')}
+    matched = _skill_from_prompt_body(user_prompt, cwd)
+    prompt_entries = []
+    if matched:
+        prompt_entries = [_skill_entry(matched[0], matched[1], session_id,
+                                       event.get('timestamp'), len(assistant_tool_uses))]
+    else:
+        prompt_entries = _skill_tool_uses_from_prompt(
+            user_prompt, cwd, session_id, event.get('timestamp'))
+    assistant_tool_uses.extend(
+        e for e in prompt_entries if e.get('skill_name') not in seen_skills)
 
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
