@@ -45,7 +45,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import urllib.request
 
 # On Windows, when this script runs as a child of the MDM onboard wrapper its
 # stdout is a non-console pipe defaulting to the legacy code page (cp1252),
@@ -120,17 +119,24 @@ def fetch_script(url: str) -> bytes:
     """Downloads `url` with explicit error checking. Raises on any failure
     (network, HTTP non-2xx, empty body) so the caller never silently runs an
     empty script — the silent-failure mode that `python3 -c "$(curl …)"` has
-    when curl fails (`$(…)` returns empty, `python3 -c ""` exits 0).
-
-    Note: urllib.request.urlopen raises HTTPError for any non-2xx response,
-    so we don't need an explicit status-code check here — anything reaching
-    `body = resp.read()` is already a 2xx."""
-    req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.1"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read()
-        if not body or not body.strip():
-            raise RuntimeError("empty response body")
-        return body
+    when curl fails (`$(…)` returns empty, `python3 -c ""` exits 0)."""
+    # -q first: this download is executed as root, so it must not inherit
+    # TLS-weakening defaults (e.g. `insecure`) from an ambient curlrc.
+    cmd = ["curl", "-q", "-fsSL", "--max-time", "30",
+           "-H", "User-Agent: unbound-mdm-onboard/1.1", "--", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("request timed out after 45s")
+    except FileNotFoundError:
+        raise RuntimeError("curl not found on PATH")
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"curl exited {result.returncode}: {stderr or 'no stderr'}")
+    body = result.stdout
+    if not body or not body.strip():
+        raise RuntimeError("empty response body")
+    return body
 
 
 def run_tool(name: str, url: str, args: list) -> bool:

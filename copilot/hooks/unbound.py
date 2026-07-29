@@ -117,6 +117,14 @@ INTERNAL_TOOLS = {
 }
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
+                     ('.agents', 'skills'), ('.claude', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -144,6 +152,202 @@ except Exception:
 
 _cached_api_key = None
 _reporting_error = False
+
+
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    return {str(r).replace('\\', '/') for r in roots}
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.replace('\\', '/').split('/')
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        allowed = _skill_roots(cwd)
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if '/'.join(parts[:i]) in allowed:
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
+def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
+    """Skill invocations from Copilot's session event stream, keyed to the turn
+    so a later turn's use of the same skill is a distinct row. `skill.invoked` is
+    undocumented and unversioned, so each field is probed across plausible names
+    and a missing path falls back to resolving the name on disk."""
+    entries = []
+    try:
+        for event in skill_events or []:
+            if not isinstance(event, dict):
+                continue
+            data = event.get('data')
+            if not isinstance(data, dict):
+                continue
+            name = ''
+            for key in ('name', 'skillName', 'skill_name', 'skill'):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    name = value.strip()
+                    break
+            path = ''
+            for key in ('path', 'skillPath', 'skill_path', 'filePath', 'file_path'):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = value.strip()
+                    break
+            # The name field may itself be a path; derive the skill from it.
+            if name and ('/' in name or os.sep in name):
+                parts = [seg for seg in name.replace(os.sep, '/').split('/') if seg]
+                if parts and parts[-1] == 'SKILL.md':
+                    path = path or name
+                    parts = parts[:-1]
+                name = parts[-1] if parts else ''
+            if not name:
+                continue
+            # The event payload is undocumented, so only trust a path that is
+            # really a skill file on disk AND names the same skill; otherwise a
+            # valid path for a different skill would misattribute the row.
+            path_name = _skill_name_from_path(path, cwd) if path else None
+            if not (path_name == name and os.path.isfile(path)):
+                path = _resolve_skill_path(name, cwd) or ''
+                # No path means no evidence this name is a real skill. Every
+                # other detector requires that, and an unjoinable row is worse
+                # than none, so drop it rather than watermark it as sent.
+                if not path:
+                    continue
+            # The envelope id is unique per event, so it keeps repeat invocations
+            # distinct without depending on turn text, which repeats verbatim
+            # across identical turns. Index only backs it up if an id is absent.
+            key = 'skill\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' % (
+                event.get('id') or '', turn_key or '', name, path, len(entries))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or ''), str(len(entries))))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
 
 
 def _should_report():
@@ -1617,10 +1821,24 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         return None, set(), None
 
     user_prompt = (entries[last_user_index].get('data') or {}).get('content')
+    # Envelope id of this turn's user message: unique even when two turns
+    # carry identical text, unlike a hash of that text.
+    turn_id = entries[last_user_index].get('id') or ''
+    if not turn_id:
+        # text_sig grows as assistant text accumulates, so it changes between
+        # Stops of one turn and would defeat the watermark. The user prompt does
+        # not change mid-turn, so hash that instead.
+        # last_user_index is the turn's position in the session: fixed while a
+        # turn's assistant text grows, and different for a later turn even when
+        # its prompt is identical.
+        turn_id = hashlib.sha256(
+            ('%s\x1f%s\x1f%s' % (conversation_id or '', last_user_index, user_prompt or '')
+             ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
     tool_calls = []          # ordered list of call ids
     tool_data = {}           # call_id -> {name, arguments, result, success}
+    skill_events = []        # raw `skill.invoked` payloads seen this turn
 
     def _register(call_id):
         if call_id not in tool_data:
@@ -1647,6 +1865,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call = _register(call_id)
                 call['name'] = req.get('name') or call['name']
                 call['arguments'] = _normalize_arguments(req.get('arguments'))
+
+        elif entry_type == 'skill.invoked':
+            skill_events.append(entry)
 
         elif entry_type == 'tool.execution_start':
             call_id = data.get('toolCallId')
@@ -1706,6 +1927,24 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     text_sig = hashlib.sha256(
         '\x1f'.join([user_prompt or ''] + text_parts).encode('utf-8', 'replace')
     ).hexdigest()
+
+    # Copilot injects SKILL.md rather than calling a tool, but its session event
+    # stream records the load; fall back to the prompt token when it doesn't.
+    skill_uses = _skill_tool_uses_from_events(
+        skill_events, cwd, turn_key=turn_id)
+    seen_skills = {e.get('skill_name') for e in skill_uses}
+    skill_uses += [e for e in _skill_tool_uses_from_prompt(
+        user_prompt, cwd, conversation_id, turn_id)
+        if e.get('skill_name') not in seen_skills]
+    # Skills ride the same watermark as tool calls; without this a later Stop in
+    # the same turn re-sends them and inflates counts.
+    for entry in skill_uses:
+        entry_id = entry.get('tool_use_id')
+        if entry_id in already_forwarded:
+            continue
+        if entry_id:
+            forwarded_now.add(entry_id)
+        tool_use.append(entry)
 
     messages = []
     if user_prompt:

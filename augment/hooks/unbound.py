@@ -41,6 +41,15 @@ AUGMENT_TOOL_FAMILY = {
 # EXCLUDED: it is a destructive delete that must always reach the gateway, so it
 # lives only in ALLOWED_NON_MCP_HOOK_NAMES (never eligible for the fast path).
 NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.augment', 'skills'), ('.claude', 'skills'),
+                     ('.agents', 'skills'))
+_SKILL_BODY_SCAN_LIMIT = 400
+_SKILL_BODY_MATCH_CHARS = 400
 # Non-MCP Augment tools we always evaluate (the rest fall through to the cache
 # fast path). MCP tools are detected via the is_mcp_tool flag, not a name prefix.
 ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files']
@@ -100,6 +109,234 @@ APPROVAL_POLL_PHASES = (
 
 _cached_api_key = None
 _reporting_error = False
+
+
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
+def _skill_dirs(cwd):
+    """Every directory a skill could live in for this invocation, bounded by
+    the same trust boundary the other skill helpers use. Accepts one path or
+    several, since Augment can report more than one workspace root."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    # Workspace roots repeat across events and their ancestor chains overlap;
+    # without this the same tree is rescanned and the scan cap trips early.
+    dirs, seen = [], set()
+    for root in roots:
+        for skill_dir in SKILL_SEARCH_DIRS:
+            candidate = root.joinpath(*skill_dir)
+            if str(candidate) not in seen:
+                seen.add(str(candidate))
+                dirs.append(candidate)
+    return dirs
+
+
+SKILL_READ_TOOLS = frozenset({'view', 'read-file', 'read'})
+
+
+def _skill_absolute_read_path(read_path, roots):
+    """Absolute form of a read path. Augment can report workspace-relative
+    paths, which no absolute skill root would ever match."""
+    try:
+        if not read_path or os.path.isabs(read_path):
+            return read_path
+        for root in roots or []:
+            candidate = os.path.join(root, read_path)
+            if os.path.isfile(candidate):
+                return candidate
+        return read_path
+    except Exception:
+        return read_path
+
+
+def _skill_read_path(event):
+    """Path a read tool opened, across the field names Augment uses."""
+    try:
+        if (event.get('tool_name') or '') not in SKILL_READ_TOOLS:
+            return None
+        tool_input = event.get('tool_input') or {}
+        for key in ('path', 'file_path', 'filePath'):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for change in (event.get('file_changes') or []):
+            if isinstance(change, dict):
+                value = change.get('path') or change.get('file_path')
+                if isinstance(value, str) and value:
+                    return value
+        return None
+    except Exception:
+        return None
+
+
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    return {str(r).replace('\\', '/') for r in roots}
+
+
+def _skill_path_key(path):
+    """Separator-normalised path, so a read (which keeps the payload's '/')
+    and a body match (which uses str(Path), '\\' on Windows) compare equal."""
+    return path.replace('\\', '/') if isinstance(path, str) else path
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.replace('\\', '/').split('/')
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        allowed = _skill_roots(cwd)
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if '/'.join(parts[:i]) in allowed:
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
+def _skill_body(path):
+    """SKILL.md contents with any YAML frontmatter stripped."""
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return ''
+    if text.startswith('---'):
+        end = text.find('\n---', 3)
+        if end != -1:
+            text = text[text.find('\n', end + 1) + 1:]
+    return text.strip()
+
+
+def _skill_from_prompt_body(prompt, cwd):
+    """(name, path) when a prompt IS a skill's body. Auggie submits a skill's
+    instructions as the request instead of the slash token, so matching the
+    body on disk is the only way to identify a typed invocation."""
+    try:
+        text = (prompt or '').strip()
+        if not text or '\n' not in text:
+            return None
+        head = text.splitlines()[0].strip()
+        if not head:
+            return None
+        normalized = ' '.join(text.split())
+        best = None
+        scanned = 0
+        for base in _skill_dirs(cwd):
+            candidates = sorted(base.glob('*/SKILL.md')) + sorted(base.glob('*/*/SKILL.md'))
+            for path in candidates:
+                scanned += 1
+                if scanned > _SKILL_BODY_SCAN_LIMIT:
+                    return (best[1], best[2]) if best else None
+                body = _skill_body(path)
+                if not body or body.splitlines()[0].strip() != head:
+                    continue
+                flat = ' '.join(body.split())
+                if normalized.startswith(flat[:_SKILL_BODY_MATCH_CHARS]):
+                    # A short skill can be a prefix of a longer one, so keep the
+                    # most specific match rather than the first.
+                    if best is None or len(flat) > best[0]:
+                        best = (len(flat), path.parent.name, str(path))
+        return (best[1], best[2]) if best else None
+    except Exception:
+        return None
+
+
+def _skill_entry(name, path, session_id, stamp, seq=0):
+    """A skill invocation shaped like the tool_use entries the backend reads."""
+    key = '\x1f'.join((str(session_id or ''), str(name), str(stamp or ''), str(seq)))
+    return {
+        'type': 'PostToolUse',
+        'tool_name': SKILL_TOOL_NAME,
+        'tool_input': {'skill': name, 'args': ''},
+        'tool_response': {},
+        'tool_use_id': 'unb-' + hashlib.sha256(
+            key.encode('utf-8', 'replace')).hexdigest()[:24],
+        'skill_name': name,
+        'skill_path': path,
+    }
 
 
 def _utc_now_z() -> str:
@@ -1597,6 +1834,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     shell_dir = cwd
     root_projects = {}
 
+    read_skills = set()
     mcp_servers = read_augment_mcp_servers(event)
     for log_entry in post_tool_events:
         ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1611,6 +1849,44 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
                 shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
             shaped['project'] = tool_project
             assistant_tool_uses.append(shaped)
+
+            # Auggie loads an auto-triggered skill by READING its SKILL.md, so
+            # that read is the invocation signal. Writes and edits to a skill
+            # file are not invocations.
+            # The read event carries its own workspace roots; the Stop cwd
+            # alone misses reads in a subdirectory or under a relative path.
+            event_roots = [str(r) for r in _augment_workspace_roots(ev)]
+            if cwd:
+                event_roots.append(cwd)
+            read_path = _skill_absolute_read_path(_skill_read_path(ev), event_roots)
+            skill_name = _skill_name_from_path(read_path, event_roots or cwd)
+            # Re-reading one SKILL.md in a turn is still a single invocation.
+            # Keyed by path, not name: two skills can share a name under
+            # different roots and are different skills.
+            if skill_name and _skill_path_key(read_path) not in read_skills:
+                read_skills.add(_skill_path_key(read_path))
+                assistant_tool_uses.append(
+                    _skill_entry(skill_name, read_path, session_id,
+                                 log_entry.get('timestamp'), len(assistant_tool_uses)))
+
+    # A typed `/name` arrives as the skill's body, not the token, so match the
+    # prompt against SKILL.md on disk before falling back to the token. Skills
+    # already seen in a read are skipped individually, not wholesale.
+    seen_skills = {_skill_path_key(e.get('skill_path'))
+                   for e in assistant_tool_uses if e.get('skill_name')}
+    # Same roots the read path uses, so a skill under another workspace folder
+    # resolves from the prompt body too.
+    body_roots = []
+    for log_entry in post_tool_events:
+        ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
+        body_roots += [str(r) for r in _augment_workspace_roots(ev)]
+    if cwd:
+        body_roots.append(cwd)
+    matched = _skill_from_prompt_body(user_prompt, body_roots or cwd)
+    if matched and _skill_path_key(matched[1]) not in seen_skills:
+        assistant_tool_uses.append(
+            _skill_entry(matched[0], matched[1], session_id,
+                         event.get('timestamp'), len(assistant_tool_uses)))
 
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
