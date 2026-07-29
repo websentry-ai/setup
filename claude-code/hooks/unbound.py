@@ -74,10 +74,11 @@ def _setup_branch():
     if not backend_url or not api_key or not backend_url.startswith("https://"):
         return "main"
     try:
+        # key via stdin (-H @-), never argv
         _r = subprocess.run(
-            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3",
-             "-H", "Authorization: Bearer " + api_key, "--",
+            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3", "-H", "@-", "--",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
+            input=("Authorization: Bearer " + api_key + "\n").encode(),
             capture_output=True, timeout=5,
         )
         if _r.returncode == 0:
