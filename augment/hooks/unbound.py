@@ -87,24 +87,25 @@ def _setup_branch():
             backend_url = _cfg.get("base_url")
             api_key = _cfg.get("api_key")
     except Exception as _e:
-        log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, type(_e).__name__), 'self_update')
+        log_error("setup-branch: could not read %s (%s); defaulting to main" % (UNBOUND_CONFIG_PATH, type(_e).__name__), 'self_update', report_to_gateway=False)
         return "main"
     # Only send the key over https.
     if not backend_url or not api_key or not backend_url.startswith("https://"):
+        log_error("setup-branch: no https backend_url or api_key in config; defaulting to main", 'self_update', report_to_gateway=False)
         return "main"
     try:
         _r = curl_with_auth(
             ["Authorization: Bearer " + api_key],
-            ["-fsS", "--connect-timeout", "2", "-m", "3", "--",
+            ["-fsS", "--connect-timeout", "2", "-m", "2",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
             timeout=5,
         )
         if _r.returncode == 0:
             _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
             return "staging" if _b == "staging" else "main"
-        log_error("setup-branch: endpoint exit %d; defaulting to main" % _r.returncode, 'self_update')
+        log_error("setup-branch: endpoint exit %d; defaulting to main" % _r.returncode, 'self_update', report_to_gateway=False)
     except Exception as _e:
-        log_error("setup-branch: endpoint lookup failed (%s); defaulting to main" % type(_e).__name__, 'self_update')
+        log_error("setup-branch: endpoint lookup failed (%s); defaulting to main" % type(_e).__name__, 'self_update', report_to_gateway=False)
     return "main"
 
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600

@@ -72,11 +72,12 @@ def _setup_branch():
         return "main"
     # Only send the key over https.
     if not backend_url or not api_key or not backend_url.startswith("https://"):
+        log_error("setup-branch: no https backend_url or api_key in config; defaulting to main", 'self_update')
         return "main"
     try:
         # key via stdin (-H @-), never argv
         _r = subprocess.run(
-            ["curl", "-fsS", "--connect-timeout", "2", "-m", "3", "-H", "@-", "--",
+            ["curl", "-fsS", "--connect-timeout", "2", "-m", "2", "-H", "@-", "--",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
             input=("Authorization: Bearer " + api_key + "\n").encode(),
             capture_output=True, timeout=5,
