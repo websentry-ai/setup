@@ -120,7 +120,9 @@ def fetch_script(url: str) -> bytes:
     (network, HTTP non-2xx, empty body) so the caller never silently runs an
     empty script — the silent-failure mode that `python3 -c "$(curl …)"` has
     when curl fails (`$(…)` returns empty, `python3 -c ""` exits 0)."""
-    cmd = ["curl", "-fsSL", "--max-time", "30",
+    # -q first: this download is executed as root, so it must not inherit
+    # TLS-weakening defaults (e.g. `insecure`) from an ambient curlrc.
+    cmd = ["curl", "-q", "-fsSL", "--max-time", "30",
            "-H", "User-Agent: unbound-mdm-onboard/1.1", "--", url]
     try:
         result = subprocess.run(cmd, capture_output=True, timeout=45)
