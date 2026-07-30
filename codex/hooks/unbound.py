@@ -71,7 +71,7 @@ def _setup_branch():
             ["curl", "-fsS", "--connect-timeout", "2", "-m", "2", "-H", "@-", "--",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
             input=("Authorization: Bearer " + api_key + "\n").encode(),
-            capture_output=True, timeout=5,
+            capture_output=True, timeout=3,
         )
         if _r.returncode == 0:
             _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
