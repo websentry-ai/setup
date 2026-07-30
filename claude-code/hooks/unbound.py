@@ -77,10 +77,10 @@ def _setup_branch():
     try:
         # key via stdin (-H @-), never argv
         _r = subprocess.run(
-            ["curl", "-fsS", "--connect-timeout", "2", "-m", "2", "-H", "@-", "--",
+            ["curl", "-fsS", "--connect-timeout", "3", "-m", "5", "-H", "@-", "--",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
             input=("Authorization: Bearer " + api_key + "\n").encode(),
-            capture_output=True, timeout=3,
+            capture_output=True, timeout=6,
         )
         if _r.returncode == 0:
             _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()

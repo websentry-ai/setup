@@ -96,9 +96,9 @@ def _setup_branch():
     try:
         _r = curl_with_auth(
             ["Authorization: Bearer " + api_key],
-            ["-fsS", "--connect-timeout", "2", "-m", "2",
+            ["-fsS", "--connect-timeout", "3", "-m", "5",
              backend_url.rstrip("/") + "/api/v1/ai-tools/discovery-branch/"],
-            timeout=3,
+            timeout=6,
         )
         if _r.returncode == 0:
             _b = (json.loads(_r.stdout.decode() or "{}").get("branch") or "").strip().lower()
