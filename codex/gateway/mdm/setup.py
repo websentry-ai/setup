@@ -627,30 +627,37 @@ def write_codex_config_for_user(username: str, home_dir: Path, base_url: str) ->
     return True
 
 
-def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> bool:
+def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> str:
     """Remove openai_base_url from {home_dir}/.codex/config.toml.
     Privilege-drops to the target user before any FS op.
-    Returns True if the key was found and removed, False otherwise."""
+    Returns "cleared" | "not_found" | "failed" — matching remove_env_var_from_user
+    and the user-level clear in codex/gateway/setup.py. Nothing to remove is
+    "not_found", never a failure: `nuke` runs the user-level clear first, so by
+    the time this runs the key is normally already gone."""
     config_file = home_dir / ".codex" / "config.toml"
     if not config_file.exists():
-        return False
+        return "not_found"
 
     def _remove():
         with open(config_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines, removed = _remove_toml_root_key(lines, "openai_base_url")
         if not removed:
-            return False
+            return "not_found"
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o644)
         with os.fdopen(fd, 'w', encoding="utf-8") as f:
             f.writelines(new_lines)
-        return True
+        return "cleared"
 
-    result = _run_as_user(username, _remove)
-    if result:
+    # _run_as_user returns None when the fork/privilege-drop or _remove itself
+    # raised — that is the only genuine failure.
+    status = _run_as_user(username, _remove)
+    if status is None:
+        return "failed"
+    if status == "cleared":
         debug_print(f"Removed openai_base_url from {config_file} for {username}")
-    return bool(result)
+    return status
 
 
 def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
@@ -699,9 +706,11 @@ def clear_setup() -> bool:
             print(f"Failed to clear for {max(f1, f2)} user(s)")
         for username, home_dir in user_homes:
             if home_dir is not None:
-                if not remove_codex_config_base_url_for_user(username, home_dir):
+                status = remove_codex_config_base_url_for_user(username, home_dir)
+                # Fail closed on anything unexpected, like the sibling clears do.
+                if status not in ("cleared", "not_found"):
                     teardown_failed = True
-                    debug_print(f"Could not remove openai_base_url from codex config for {username}")
+                    print(f"Failed to clear openai_base_url in codex config for {username}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
