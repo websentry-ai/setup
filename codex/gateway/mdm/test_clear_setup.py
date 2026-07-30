@@ -10,6 +10,7 @@ a `setup.py`, so a bare `from setup import ...` collides across a pytest session
 """
 import importlib.util
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -26,6 +27,7 @@ class TestRemoveCodexConfigBaseUrlForUser(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = Path(self.tmp) / "alice"
         (self.home / ".codex").mkdir(parents=True)
         self.config = self.home / ".codex" / "config.toml"
@@ -91,6 +93,7 @@ class TestClearSetupExitStatus(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.home = Path(self.tmp) / "alice"
         (self.home / ".codex").mkdir(parents=True)
         self.config = self.home / ".codex" / "config.toml"
@@ -113,8 +116,12 @@ class TestClearSetupExitStatus(unittest.TestCase):
             setup._run_as_user,
             home,
         ) = self._saved
+        # A process that started without HOME must not inherit the fixture's,
+        # or the rest of the suite becomes order-dependent.
         if home is not None:
             os.environ["HOME"] = home
+        else:
+            os.environ.pop("HOME", None)
 
     def test_nothing_left_to_clear_still_succeeds(self):
         """The `sudo unbound nuke` case: user-level clear already stripped the key."""
