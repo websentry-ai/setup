@@ -883,6 +883,50 @@ class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
         self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
             "plugin__toolchain", cache_dir=self.cache))
 
+    def test_partial_segment_suffix_does_not_match(self):
+        # Key "api" must not bind inside "internal_api": plugin half not all digits.
+        self._install(servers={"api": {"url": "https://api.example/mcp", "type": "http"}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_internal_api", cache_dir=self.cache))
+        # positive control: the true all-digit half still resolves
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config_by_server_key(
+                "plugin_1693077056_api", cache_dir=self.cache),
+            {"url": "https://api.example/mcp", "type": "http"})
+
+    def test_non_numeric_plugin_half_does_not_match(self):
+        self._install()
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_someother_toolchain", cache_dir=self.cache))
+
+    def test_registry_tier_beats_stale_cache_tier(self):
+        # Registry (authoritative) and a stale cache copy disagree: registry wins, no false ambiguity.
+        self._install()
+        _make_plugin(self.cache, "mkt", "stale-toolset", "0.0.9",
+                     {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://stale.example/mcp"}}}})
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config_by_server_key(
+                "plugin_1693077056_toolchain", cache_dir=self.cache),
+            self.TOOLCHAIN)
+
+    def test_first_authoritative_dir_wins_within_plugin(self):
+        # Directory-marketplace live dir and the plugin's stale installPath disagree:
+        # the first authoritative dir defining the key wins (mirrors the prefix resolver).
+        live = self.root / "clone" / "plugins" / "toolset"
+        _write_json(live / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        stale_install = self.root / "install" / "toolset"
+        _write_json(stale_install / ".mcp.json",
+                    {"mcpServers": {"toolchain": {"url": "https://stale.example/mcp"}}})
+        _write_json(self.plugins_root / "known_marketplaces.json", {"forter-datastores": {
+            "source": {"source": "directory", "path": str(self.root / "clone")},
+            "installLocation": str(self.root / "clone")}})
+        _write_json(self.plugins_root / "installed_plugins.json", {"version": 2, "plugins": {
+            "toolset@forter-datastores": [{"scope": "user", "installPath": str(stale_install)}]}})
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config_by_server_key(
+                "plugin_1693077056_toolchain", cache_dir=self.cache),
+            self.TOOLCHAIN)
+
     def test_no_match_returns_none(self):
         self._install()
         self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
@@ -933,6 +977,37 @@ class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
                      {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://b.example/mcp"}}}})
         md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
         self.assertNotIn("mcp_server_config", md)
+
+    def test_plugin_url_argv_skips_fallback(self):
+        # --plugin-url plugins have no verifiable local files: fallback fails closed
+        # even when an installed plugin's key would suffix-match.
+        _make_plugin(self.plugin_cache, "mkt", "toolset", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": self.TOOLCHAIN}}}, in_use=True)
+        self._patch_claude_argv(["claude", "--plugin-url", "https://plugins.example/tool.zip"])
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
+        self.assertNotIn("mcp_server_config", md)
+
+    def test_miss_log_redacts_plugin_url_secrets(self):
+        self._patch_claude_argv(["claude", "--plugin-url",
+                                 "https://user:hunter2@plugins.example/tool.zip?token=SECRET#frag"])
+        logged = []
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_1693077056_toolchain__glean-search",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api",
+                          lambda body, key: {"decision": "deny", "unknown_mcp_server": True}), \
+             patch.object(unbound, "log_error",
+                          lambda msg, cat='general': logged.append((msg, cat))):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        miss = [m for m, _ in logged if m.startswith("unknown mcp server with no resolvable config")]
+        self.assertEqual(len(miss), 1)
+        self.assertIn("https://plugins.example/tool.zip", miss[0])
+        for secret in ("hunter2", "user:", "token=SECRET", "#frag"):
+            self.assertNotIn(secret, miss[0])
 
     def test_named_plugin_still_prefers_prefix_resolution(self):
         # regression: normal named-plugin resolution is unaffected by the fallback

@@ -13,6 +13,7 @@ import hashlib
 import re
 import tempfile
 import platform
+from urllib.parse import urlparse
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -961,23 +962,69 @@ def _plugin_dir_roots(path: Path) -> list:
         return []
 
 
+def _redact_url(url: str) -> str:
+    """Scheme + host[:port] + path only: strips userinfo, query, and fragment."""
+    try:
+        p = urlparse(url)
+        if not p.scheme:
+            return url.split('?', 1)[0].split('#', 1)[0]
+        host = p.hostname or ''
+        if p.port:
+            host = '%s:%d' % (host, p.port)
+        return '%s://%s%s' % (p.scheme, host, p.path)
+    except Exception:
+        return '<unparseable-url>'
+
+
+def _match_server_key_suffix(plugin_dir: Path, body: str) -> list:
+    """Configs in plugin_dir whose mangled server key is body's suffix; [] on error."""
+    try:
+        server_map = _plugin_mcp_server_map(plugin_dir)
+    except Exception as exc:
+        log_error(f"mcp plugin dir error: {plugin_dir}: {exc}", 'mcp_plugin')
+        return []
+    matches = []
+    for server_key, entry in server_map.items():
+        suffix = '_' + _mangle_mcp_token(server_key)
+        if len(suffix) < 2 or not body.endswith(suffix):
+            continue
+        # All-digit plugin half only (the rename pattern); blocks partial-segment binds.
+        if not body[:-len(suffix)].isdigit():
+            continue
+        fields = _extract_mcp_server_fields(entry)
+        if fields is not None:
+            matches.append(fields)
+    return matches
+
+
 def _resolve_plugin_mcp_config_by_server_key(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR,
                                              extra_dirs: Optional[list] = None) -> Optional[Dict]:
-    """Last resort for opaque plugin IDs (e.g. plugin_1693077056_toolchain): the
-    plugin half of `plugin_<plugin>_<server>` is unrecognized, so match every
-    known plugin's servers on the mangled server-key SUFFIX instead. Ambiguous
-    (distinct configs from different keys/plugins) -> None, never guess."""
+    """Last resort for numerically renamed plugin IDs (e.g. plugin_1693077056_toolchain):
+    the plugin half of `plugin_<plugin>_<server>` is an opaque all-digit ID, so
+    match known plugins' servers on the mangled server-key SUFFIX instead.
+    Authority tiers mirror the prefix resolver (registry dirs incl. live
+    marketplace paths, then cache tree, then --plugin-dir roots); the first tier
+    with a match decides, and within a plugin the first dir defining the key
+    wins. Ambiguity within a tier (distinct configs) -> None, never guess."""
     if not server_name.startswith('plugin_'):
         return None
     try:
-        candidate_dirs = []
+        body = server_name[len('plugin_'):]
         plugins_root = cache_dir.parent
+        seen_dirs = set()
+
+        registry_matches = []
         marketplaces = _marketplace_registry(plugins_root)
         for full_name, entries in _installed_plugins_registry(plugins_root).items():
             plugin, _, marketplace = full_name.partition('@')
             for d in _authoritative_plugin_dirs(plugin, marketplaces.get(marketplace) or {}, entries):
-                if d not in candidate_dirs:
-                    candidate_dirs.append(d)
+                seen_dirs.add(d)
+                found = _match_server_key_suffix(d, body)
+                if found:
+                    registry_matches.extend(found)
+                    break  # first dir defining the key is authoritative for this plugin
+
+        cache_matches = []
         if cache_dir.is_dir():
             for marketplace_dir in cache_dir.iterdir():
                 if not marketplace_dir.is_dir():
@@ -989,40 +1036,31 @@ def _resolve_plugin_mcp_config_by_server_key(server_name: str, cache_dir: Path =
                         version_dir = _select_plugin_version_dir(plugin_dir)
                     except Exception:
                         continue
-                    if version_dir is not None and version_dir not in candidate_dirs:
-                        candidate_dirs.append(version_dir)
+                    if version_dir is None or version_dir in seen_dirs:
+                        continue
+                    seen_dirs.add(version_dir)
+                    cache_matches.extend(_match_server_key_suffix(version_dir, body))
+
+        extra_matches = []
         for extra in (extra_dirs or []):
             for root in _plugin_dir_roots(Path(extra)):
-                if root not in candidate_dirs:
-                    candidate_dirs.append(root)
-
-        body = server_name[len('plugin_'):]
-        matches = []
-        for plugin_dir in candidate_dirs:
-            try:
-                server_map = _plugin_mcp_server_map(plugin_dir)
-            except Exception as exc:
-                log_error(f"mcp plugin dir error: {plugin_dir}: {exc}", 'mcp_plugin')
-                continue
-            for server_key, entry in server_map.items():
-                suffix = '_' + _mangle_mcp_token(server_key)
-                # Guards: non-empty mangled key, real suffix match, non-empty plugin half.
-                if len(suffix) < 2 or not body.endswith(suffix) or len(body) <= len(suffix):
+                if root in seen_dirs:
                     continue
-                fields = _extract_mcp_server_fields(entry)
-                if fields is not None:
-                    matches.append(fields)
+                seen_dirs.add(root)
+                extra_matches.extend(_match_server_key_suffix(root, body))
 
-        distinct = []
-        for cfg in matches:
-            if cfg not in distinct:
-                distinct.append(cfg)
-        if len(distinct) == 1:
-            return distinct[0]
-        if len(distinct) > 1:
+        for matches in (registry_matches, cache_matches, extra_matches):
+            if not matches:
+                continue
+            distinct = []
+            for cfg in matches:
+                if cfg not in distinct:
+                    distinct.append(cfg)
+            if len(distinct) == 1:
+                return distinct[0]
             log_error(f"mcp plugin suffix resolve ambiguous: {server_name}", 'mcp_plugin')
-        else:
-            log_error(f"mcp plugin suffix resolve miss: {server_name}", 'mcp_plugin')
+            return None
+        log_error(f"mcp plugin suffix resolve miss: {server_name}", 'mcp_plugin')
         return None
     except Exception as exc:
         log_error(f"mcp plugin suffix resolve error: {server_name}: {exc}", 'mcp_plugin')
@@ -1831,12 +1869,19 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                             elif mcp_server_name.startswith('plugin_'):
                                 # Opaque plugin ID: no prefix matched, fall back to server-key suffix.
                                 plugin_dirs, plugin_urls = _claude_plugin_launch_values()
-                                fallback_cfg = _resolve_plugin_mcp_config_by_server_key(
-                                    mcp_server_name, cache_dir=CLAUDE_PLUGIN_CACHE_DIR,
-                                    extra_dirs=plugin_dirs,
-                                )
-                                if fallback_cfg:
-                                    metadata['mcp_server_config'] = fallback_cfg
+                                if plugin_urls:
+                                    # --plugin-url plugins have no verifiable local files: fail closed.
+                                    log_error(
+                                        f"mcp plugin suffix fallback skipped (--plugin-url present): {mcp_server_name}",
+                                        'mcp_plugin',
+                                    )
+                                else:
+                                    fallback_cfg = _resolve_plugin_mcp_config_by_server_key(
+                                        mcp_server_name, cache_dir=CLAUDE_PLUGIN_CACHE_DIR,
+                                        extra_dirs=plugin_dirs,
+                                    )
+                                    if fallback_cfg:
+                                        metadata['mcp_server_config'] = fallback_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -1930,7 +1975,8 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                 plugin_dirs, plugin_urls = _claude_plugin_launch_values()
             log_error(
                 f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
-                f" (plugin-dir={[str(p) for p in plugin_dirs]} plugin-url={plugin_urls})",
+                f" (plugin-dir={[str(p) for p in plugin_dirs]}"
+                f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
                 'mcp_server',
             )
 
