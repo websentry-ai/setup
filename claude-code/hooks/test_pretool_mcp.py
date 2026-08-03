@@ -899,6 +899,40 @@ class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
         self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
             "plugin_someother_toolchain", cache_dir=self.cache))
 
+    def test_exact_identity_from_dir_basename(self):
+        # A dir literally named 1693077056 reconstructs the full name: verified identity.
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, extra_dirs=[pd])
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_exact_identity_survives_suffix_guess_disabled(self):
+        # Reviewer scenario: an unrelated --plugin-url must not strip a verifiable
+        # local plugin of its identity -- exact stage runs even with guessing off.
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache,
+            extra_dirs=[pd], suffix_guess=False)
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_suffix_guess_disabled_blocks_unverified_match(self):
+        # With guessing off, a same-key plugin whose dir name does NOT reconstruct
+        # the server name stays unresolved (the P1 fail-closed path).
+        self._install()
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, suffix_guess=False))
+
+    def test_exact_identity_beats_suffix_guess(self):
+        # Exact reconstruction wins over a would-be suffix match in another plugin.
+        self._install(servers={"toolchain": {"url": "https://other.example/mcp"}})
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, extra_dirs=[pd])
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
     def test_registry_tier_beats_stale_cache_tier(self):
         # Registry (authoritative) and a stale cache copy disagree: registry wins, no false ambiguity.
         self._install()
@@ -978,14 +1012,24 @@ class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
         md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
         self.assertNotIn("mcp_server_config", md)
 
-    def test_plugin_url_argv_skips_fallback(self):
-        # --plugin-url plugins have no verifiable local files: fallback fails closed
-        # even when an installed plugin's key would suffix-match.
+    def test_plugin_url_argv_skips_suffix_guess(self):
+        # --plugin-url plugins have no verifiable local files: the suffix GUESS
+        # fails closed even when an installed plugin's key would match.
         _make_plugin(self.plugin_cache, "mkt", "toolset", "1.0.0",
                      {".mcp.json": {"mcpServers": {"toolchain": self.TOOLCHAIN}}}, in_use=True)
         self._patch_claude_argv(["claude", "--plugin-url", "https://plugins.example/tool.zip"])
         md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
         self.assertNotIn("mcp_server_config", md)
+
+    def test_plugin_url_does_not_break_exact_identity(self):
+        # Mixed launch: unrelated --plugin-url alongside a --plugin-dir whose dir
+        # basename reconstructs the name -- verified identity still resolves.
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        self._patch_claude_argv(["claude", "--plugin-dir", str(pd),
+                                 "--plugin-url", "https://plugins.example/tool.zip"])
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
+        self.assertEqual(md.get("mcp_server_config"), self.TOOLCHAIN)
 
     def test_miss_log_redacts_plugin_url_secrets(self):
         self._patch_claude_argv(["claude", "--plugin-url",
