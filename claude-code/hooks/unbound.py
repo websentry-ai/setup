@@ -949,6 +949,86 @@ def _resolve_plugin_mcp_config_from_cache(server_name: str, cache_dir: Path = CL
         return None
 
 
+def _plugin_dir_roots(path: Path) -> list:
+    # A --plugin-dir is either a plugin root itself or a directory of plugin roots.
+    try:
+        if not path.is_dir():
+            return []
+        if (path / ".claude-plugin" / "plugin.json").is_file() or (path / ".mcp.json").is_file():
+            return [path]
+        return [d for d in path.iterdir() if d.is_dir()]
+    except Exception:
+        return []
+
+
+def _resolve_plugin_mcp_config_by_server_key(server_name: str, cache_dir: Path = CLAUDE_PLUGIN_CACHE_DIR,
+                                             extra_dirs: Optional[list] = None) -> Optional[Dict]:
+    """Last resort for opaque plugin IDs (e.g. plugin_1693077056_toolchain): the
+    plugin half of `plugin_<plugin>_<server>` is unrecognized, so match every
+    known plugin's servers on the mangled server-key SUFFIX instead. Ambiguous
+    (distinct configs from different keys/plugins) -> None, never guess."""
+    if not server_name.startswith('plugin_'):
+        return None
+    try:
+        candidate_dirs = []
+        plugins_root = cache_dir.parent
+        marketplaces = _marketplace_registry(plugins_root)
+        for full_name, entries in _installed_plugins_registry(plugins_root).items():
+            plugin, _, marketplace = full_name.partition('@')
+            for d in _authoritative_plugin_dirs(plugin, marketplaces.get(marketplace) or {}, entries):
+                if d not in candidate_dirs:
+                    candidate_dirs.append(d)
+        if cache_dir.is_dir():
+            for marketplace_dir in cache_dir.iterdir():
+                if not marketplace_dir.is_dir():
+                    continue
+                for plugin_dir in marketplace_dir.iterdir():
+                    if not plugin_dir.is_dir():
+                        continue
+                    try:
+                        version_dir = _select_plugin_version_dir(plugin_dir)
+                    except Exception:
+                        continue
+                    if version_dir is not None and version_dir not in candidate_dirs:
+                        candidate_dirs.append(version_dir)
+        for extra in (extra_dirs or []):
+            for root in _plugin_dir_roots(Path(extra)):
+                if root not in candidate_dirs:
+                    candidate_dirs.append(root)
+
+        body = server_name[len('plugin_'):]
+        matches = []
+        for plugin_dir in candidate_dirs:
+            try:
+                server_map = _plugin_mcp_server_map(plugin_dir)
+            except Exception as exc:
+                log_error(f"mcp plugin dir error: {plugin_dir}: {exc}", 'mcp_plugin')
+                continue
+            for server_key, entry in server_map.items():
+                suffix = '_' + _mangle_mcp_token(server_key)
+                # Guards: non-empty mangled key, real suffix match, non-empty plugin half.
+                if len(suffix) < 2 or not body.endswith(suffix) or len(body) <= len(suffix):
+                    continue
+                fields = _extract_mcp_server_fields(entry)
+                if fields is not None:
+                    matches.append(fields)
+
+        distinct = []
+        for cfg in matches:
+            if cfg not in distinct:
+                distinct.append(cfg)
+        if len(distinct) == 1:
+            return distinct[0]
+        if len(distinct) > 1:
+            log_error(f"mcp plugin suffix resolve ambiguous: {server_name}", 'mcp_plugin')
+        else:
+            log_error(f"mcp plugin suffix resolve miss: {server_name}", 'mcp_plugin')
+        return None
+    except Exception as exc:
+        log_error(f"mcp plugin suffix resolve error: {server_name}: {exc}", 'mcp_plugin')
+        return None
+
+
 def _resolve_claude_ai_connector(server_name: str, config_path: Path = CLAUDE_MCP_CONFIG_PATH) -> Optional[tuple]:
     if not server_name.startswith('claude_ai_'):
         return None
@@ -1263,23 +1343,28 @@ def _claude_launch_argv() -> Optional[tuple]:
     return None
 
 
-def _mcp_config_values_from_argv(argv: List[str]) -> List[str]:
-    # --mcp-config is variadic: it consumes every following token until the next flag.
+def _argv_flag_values(argv: List[str], flag: str) -> List[str]:
+    # Variadic flag: it consumes every following token until the next flag.
     values = []
     i = 0
     n = len(argv)
+    prefix = flag + '='
     while i < n:
         a = argv[i]
-        if a == '--mcp-config':
+        if a == flag:
             i += 1
             while i < n and not argv[i].startswith('-'):
                 values.append(argv[i])
                 i += 1
             continue
-        if a.startswith('--mcp-config='):
-            values.append(a[len('--mcp-config='):])
+        if a.startswith(prefix):
+            values.append(a[len(prefix):])
         i += 1
     return values
+
+
+def _mcp_config_values_from_argv(argv: List[str]) -> List[str]:
+    return _argv_flag_values(argv, '--mcp-config')
 
 
 def _proc_cwd(pid: int) -> Optional[str]:
@@ -1339,6 +1424,31 @@ def _resolve_launch_mcp_config(server_name: str) -> Optional[Dict]:
         return _augment_script_hash(match, cwd) if match else None
     except Exception:
         return None
+
+
+def _claude_plugin_launch_values() -> tuple:
+    """(--plugin-dir paths, --plugin-url values) from the Claude CLI ancestor argv."""
+    try:
+        found = _claude_launch_argv()
+        if not found:
+            return [], []
+        pid, argv = found
+        urls = _argv_flag_values(argv, '--plugin-url')
+        dirs = []
+        cwd = None
+        for raw in _argv_flag_values(argv, '--plugin-dir'):
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                if cwd is None:
+                    cwd = _proc_cwd(pid) or ''
+                if not cwd:
+                    continue
+                path = Path(cwd) / path
+            if path not in dirs:
+                dirs.append(path)
+        return dirs, urls
+    except Exception:
+        return [], []
 
 
 def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[str] = None) -> Optional[Dict]:
@@ -1686,6 +1796,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         mcp_server_name = parts[0] if len(parts) >= 1 else ''
         metadata['mcp_server'] = mcp_server_name
         metadata['mcp_tool'] = parts[1] if len(parts) >= 2 else ''
+        plugin_dirs = plugin_urls = None  # lazy: --plugin-dir paths / --plugin-url values
 
         if mcp_server_name:
             cwd = event.get('cwd')
@@ -1696,13 +1807,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                 metadata['mcp_server_config'] = server_cfg
 
             if not server_cfg:
-                connector = _resolve_claude_ai_connector(mcp_server_name)
+                connector = _resolve_claude_ai_connector(mcp_server_name, config_path=CLAUDE_MCP_CONFIG_PATH)
                 if connector:
                     display_name, connector_cfg = connector
                     metadata['mcp_server'] = display_name
                     metadata['mcp_server_config'] = connector_cfg
                 else:
-                    plugin_cfg = _resolve_plugin_mcp_config(mcp_server_name)
+                    plugin_cfg = _resolve_plugin_mcp_config(mcp_server_name, cache_dir=CLAUDE_PLUGIN_CACHE_DIR)
                     if plugin_cfg:
                         metadata['mcp_server_config'] = plugin_cfg
                     else:
@@ -1717,6 +1828,15 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                             launch_cfg = _resolve_launch_mcp_config(mcp_server_name)
                             if launch_cfg:
                                 metadata['mcp_server_config'] = launch_cfg
+                            elif mcp_server_name.startswith('plugin_'):
+                                # Opaque plugin ID: no prefix matched, fall back to server-key suffix.
+                                plugin_dirs, plugin_urls = _claude_plugin_launch_values()
+                                fallback_cfg = _resolve_plugin_mcp_config_by_server_key(
+                                    mcp_server_name, cache_dir=CLAUDE_PLUGIN_CACHE_DIR,
+                                    extra_dirs=plugin_dirs,
+                                )
+                                if fallback_cfg:
+                                    metadata['mcp_server_config'] = fallback_cfg
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -1804,6 +1924,15 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
+        else:
+            # No config -> no scan possible; surface the miss instead of failing silently.
+            if plugin_dirs is None:
+                plugin_dirs, plugin_urls = _claude_plugin_launch_values()
+            log_error(
+                f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
+                f" (plugin-dir={[str(p) for p in plugin_dirs]} plugin-url={plugin_urls})",
+                'mcp_server',
+            )
 
     return transform_response_for_claude(api_response)
 
