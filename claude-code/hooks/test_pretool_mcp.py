@@ -914,7 +914,7 @@ class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
         _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
         cfg = unbound._resolve_plugin_mcp_config_by_server_key(
             "plugin_1693077056_toolchain", cache_dir=self.cache,
-            extra_dirs=[pd], suffix_guess=False)
+            extra_dirs=[pd], allow_suffix_guess=False)
         self.assertEqual(cfg, self.TOOLCHAIN)
 
     def test_suffix_guess_disabled_blocks_unverified_match(self):
@@ -922,7 +922,7 @@ class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
         # the server name stays unresolved (the P1 fail-closed path).
         self._install()
         self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
-            "plugin_1693077056_toolchain", cache_dir=self.cache, suffix_guess=False))
+            "plugin_1693077056_toolchain", cache_dir=self.cache, allow_suffix_guess=False))
 
     def test_exact_identity_beats_suffix_guess(self):
         # Exact reconstruction wins over a would-be suffix match in another plugin.
@@ -1030,6 +1030,15 @@ class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
                                  "--plugin-url", "https://plugins.example/tool.zip"])
         md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
         self.assertEqual(md.get("mcp_server_config"), self.TOOLCHAIN)
+
+    def test_redact_url_schemeless_credential_fails_safe(self):
+        # urlparse reads 'svc:TOKEN@host/x' as scheme='svc' with no netloc; the
+        # redactor must not echo the raw string back.
+        for raw in ("svc-account:AKIA_SECRET@internal.example/pkg.zip",
+                    "not a url at all"):
+            self.assertEqual(unbound._redact_url(raw), "<unparseable-url>")
+        self.assertEqual(unbound._redact_url("https://u:p@h.example:8443/a/b?t=s#f"),
+                         "https://h.example:8443/a/b")
 
     def test_miss_log_redacts_plugin_url_secrets(self):
         self._patch_claude_argv(["claude", "--plugin-url",
