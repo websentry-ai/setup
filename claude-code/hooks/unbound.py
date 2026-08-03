@@ -387,7 +387,50 @@ def _get_session_model(session_id: str) -> Optional[str]:
         return None
 
 
-def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
+def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
+    """Store a message's usage keyed by (message.id, requestId). Claude Code writes the
+    same assistant message several times verbatim; keying dedups it so tokens aren't
+    counted 2-4x. Entries missing either id are kept individually."""
+    msg_usage = message.get('usage')
+    if not isinstance(msg_usage, dict) or not msg_usage:
+        return
+    mid, rid = message.get('id'), entry.get('requestId')
+    usage_by_key[(mid, rid) if (mid and rid) else ('', len(usage_by_key))] = msg_usage
+
+
+def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
+    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to
+    <transcript_dir>/<session>/subagents/*.jsonl, never the main transcript the Stop event
+    points at, so their tokens would otherwise be dropped. Same per-turn scope + dedup."""
+    try:
+        subdir = os.path.join(os.path.splitext(transcript_path)[0], 'subagents')
+        names = os.listdir(subdir) if os.path.isdir(subdir) else []
+    except Exception:
+        return
+    for name in names:
+        if not name.endswith('.jsonl'):
+            continue
+        try:
+            with open(os.path.join(subdir, name), 'r', encoding='utf-8') as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get('type') != 'assistant':
+                        continue
+                    ts = entry.get('timestamp')
+                    # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
+                    if user_prompt_timestamp and (not ts or ts <= user_prompt_timestamp):
+                        continue
+                    _record_usage(entry, entry.get('message') or {}, usage_by_key)
+        except Exception:
+            continue
+
+
+def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None, include_usage: bool = True) -> Dict:
     conversation_data = {
         'user_messages': [],
         'assistant_messages': [],
@@ -400,6 +443,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         return conversation_data
 
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
+    usage_by_key: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
 
     try:
@@ -442,16 +486,23 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                             # Model is captured unconditionally so it survives even on usage-less assistant entries.
                             turn_model = turn_model or message.get('model')
 
-                            msg_usage = message.get('usage') or {}
-                            if msg_usage:
-                                for k in usage:
-                                    usage[k] += int(msg_usage.get(k) or 0)
+                            if include_usage:
+                                _record_usage(entry, message, usage_by_key)
 
                 except json.JSONDecodeError:
                     continue
 
     except Exception:
         pass
+
+    if include_usage:
+        try:
+            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key)
+            for msg_usage in usage_by_key.values():
+                for k in usage:
+                    usage[k] += int(msg_usage.get(k) or 0)
+        except Exception:
+            pass
 
     if any(usage.values()):
         conversation_data['usage'] = {**usage, 'total_tokens': sum(usage.values())}
@@ -486,7 +537,7 @@ def get_recent_user_prompts_for_session(
         return prompts[-n:]
 
     if transcript_path and transcript_path != 'undefined' and os.path.exists(transcript_path):
-        data = parse_transcript_file(transcript_path)
+        data = parse_transcript_file(transcript_path, include_usage=False)
         user_messages = data.get('user_messages') or []
         return [m.get('content') for m in user_messages[-n:] if m.get('content')]
 
