@@ -220,6 +220,20 @@ class TestDiagRender(unittest.TestCase):
             self.assertIn(marker, r)
 
 
+class TestDiagValueScrub(unittest.TestCase):
+    def test_strips_proxy_userinfo(self):
+        self.assertEqual(
+            unbound._diag_scrub_value('http://user:pw@proxy.corp:8080'),
+            'http://proxy.corp:8080',
+        )
+
+    def test_redacts_credential_bearing_value(self):
+        self.assertEqual(unbound._diag_scrub_value('Bearer sk-abc123'), '<redacted>')
+
+    def test_plain_value_passes_through(self):
+        self.assertEqual(unbound._diag_scrub_value('cli'), 'cli')
+
+
 class TestDiagLaunchContext(unittest.TestCase):
     def test_forwarded_launch_argv_is_honored(self):
         env = {'UNBOUND_DIAG_LAUNCH_PID': '4321',

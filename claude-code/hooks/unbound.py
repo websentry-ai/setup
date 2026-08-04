@@ -3123,11 +3123,13 @@ def _mcp_diag_claude_json(server, cwd):
 
     for proj, v in projects.items():
         if isinstance(v, dict) and server in (v.get('mcpServers') or {}):
+            # The hook matches project keys literally against the raw cwd (not
+            # realpath), so judge the marker the same way to avoid a false 'hit'.
             marker = ''
-            if proj == cwd or proj == real:
+            if cwd and proj == cwd:
                 marker = 'matches-cwd'
-            elif real and real.startswith(proj.rstrip('/') + '/'):
-                marker = 'ancestor-of-cwd (hook walks up, so this HITS)'
+            elif cwd and cwd.startswith(proj.rstrip('/') + '/'):
+                marker = 'ancestor-of-cwd (hook walks up literally)'
             out['scoped_under'].append({'dir': proj, 'marker': marker})
     return out
 
@@ -3191,6 +3193,16 @@ def _mcp_diag_error_log_tail():
     sig = re.compile(r'(?i)mcp|fingerprint|resolve|connector|plugin')
     tail = [l[:300] for l in lines if sig.search(l)][-15:]
     return _mcp_diag_scrub('\n'.join(tail)).splitlines()
+
+
+def _diag_scrub_value(v):
+    """Strip URL userinfo (proxy creds) and drop a whole credential-bearing token
+    before a raw value (env var, ps flag) goes into the report."""
+    s = str(v)
+    if _MCP_DIAG_SECRETISH.search(s):
+        return '<redacted>'
+    s = re.sub(r'(://)[^/@\s]*@', r'\1', s)
+    return s[:200]
 
 
 def _diag_summarize_entry(entry):
@@ -3312,8 +3324,11 @@ def _diag_inventory(cwd, ps_out):
                 inv.append({'source': 'plugin %s' % label, 'file': str(cand), 'servers': _summ(m)})
     for p in _diag_mcp_config_paths_from_ps(ps_out):
         path = Path(os.path.expanduser(p))
-        m = _diag_servers_from_json(path) if path.is_file() else None
-        inv.append({'source': '--mcp-config (hook does NOT read)', 'file': str(path), 'servers': _summ(m)})
+        is_file = path.is_file()
+        m = _diag_servers_from_json(path) if is_file else None
+        # --mcp-config can be inline JSON (secret-bearing), not a path — don't echo it.
+        shown = str(path) if is_file else '<inline or non-file --mcp-config>'
+        inv.append({'source': '--mcp-config (hook reads via launch_config)', 'file': shown, 'servers': _summ(m)})
     return inv
 
 
@@ -3384,7 +3399,7 @@ def _diag_launch_flags(ps_out):
         flags = re.findall(
             r'--(?:mcp-config|strict-mcp-config|settings|add-dir|permission-mode)(?:[= ]\S+)?', l)
         if flags:
-            rows.append(' '.join(flags))
+            rows.append(_diag_scrub_value(' '.join(flags)))
     return rows[:15]
 
 
@@ -3432,7 +3447,7 @@ def _build_mcp_diagnostic(server, cwd):
                                 capture_output=True, text=True, timeout=20).stdout or ''
     except Exception:
         ps_out = ''
-    env_vars = {v: os.environ[v] for v in (
+    env_vars = {v: _diag_scrub_value(os.environ[v]) for v in (
         'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_ENTRYPOINT', 'ANTHROPIC_BASE_URL',
         'ANTHROPIC_API_URL', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY') if os.environ.get(v)}
     inventory = _diag_inventory(cwd, ps_out)
