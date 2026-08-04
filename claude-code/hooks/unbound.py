@@ -387,15 +387,32 @@ def _get_session_model(session_id: str) -> Optional[str]:
         return None
 
 
+_USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
+
+
+def _usage_total(usage: Dict) -> int:
+    total = 0
+    for k in _USAGE_FIELDS:
+        try:
+            total += int(usage.get(k) or 0)
+        except (TypeError, ValueError):
+            pass
+    return total
+
+
 def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
     """Store a message's usage keyed by (message.id, requestId). Claude Code writes the
-    same assistant message several times verbatim; keying dedups it so tokens aren't
-    counted 2-4x. Entries missing either id are kept individually."""
+    same assistant message as several streamed lines under one id; keep the highest-total
+    line (the completed message, whose output has finished growing) so tokens aren't over-
+    or under-counted. Mirrors ccusage's dedup. Entries missing either id are kept individually."""
     msg_usage = message.get('usage')
     if not isinstance(msg_usage, dict) or not msg_usage:
         return
     mid, rid = message.get('id'), entry.get('requestId')
-    usage_by_key[(mid, rid) if (mid and rid) else ('', len(usage_by_key))] = msg_usage
+    key = (mid, rid) if (mid and rid) else ('', len(usage_by_key))
+    prev = usage_by_key.get(key)
+    if prev is None or _usage_total(msg_usage) > _usage_total(prev):
+        usage_by_key[key] = msg_usage
 
 
 def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
