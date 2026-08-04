@@ -405,7 +405,8 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
     try:
         subdir = os.path.join(os.path.splitext(transcript_path)[0], 'subagents')
         names = os.listdir(subdir) if os.path.isdir(subdir) else []
-    except Exception:
+    except Exception as e:
+        log_error(f"subagent usage: cannot list dir for {transcript_path}: {e}", 'usage')
         return
     for name in names:
         if not name.endswith('.jsonl'):
@@ -426,7 +427,8 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                     if user_prompt_timestamp and (not ts or ts <= user_prompt_timestamp):
                         continue
                     _record_usage(entry, entry.get('message') or {}, usage_by_key)
-        except Exception:
+        except Exception as e:
+            log_error(f"subagent usage: failed reading {name}: {e}", 'usage')
             continue
 
 
@@ -501,8 +503,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
             for msg_usage in usage_by_key.values():
                 for k in usage:
                     usage[k] += int(msg_usage.get(k) or 0)
-        except Exception:
-            pass
+        except Exception as e:
+            log_error(f"usage aggregation failed for {transcript_path}: {e}", 'usage')
 
     if any(usage.values()):
         conversation_data['usage'] = {**usage, 'total_tokens': sum(usage.values())}
