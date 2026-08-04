@@ -92,6 +92,7 @@ MCP_DIAG_VERSION = "v1"
 
 _cached_api_key = None
 _reporting_error = False
+_suppress_error_logging = False
 
 
 def _should_report():
@@ -145,6 +146,8 @@ def report_error_to_gateway(message, category='general', api_key=None):
 
 def log_error(message: str, category: str = 'general'):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
+    if _suppress_error_logging:
+        return
     message = redact_secrets(message, _cached_api_key)
     timestamp = datetime.utcnow().isoformat() + 'Z'
     error_entry = f"{timestamp}: {message}\n"
@@ -2898,8 +2901,23 @@ def _mcp_diag_hook_info():
 
 
 def _mcp_diag_resolution(server, cwd):
+    # Suppress the resolvers' own log_error/report_error_to_gateway calls: this is
+    # a passive replay, so it must not pollute the shared error.log or its own tail.
+    global _suppress_error_logging
     sources = {}
     resolved, via, cfg = None, None, None
+
+    def _plugin_by_key():
+        # Match the live ladder exactly (only for plugin_ ids, with launch values),
+        # else the replay can claim a hit the hook would refuse.
+        if not str(server).startswith('plugin_'):
+            return None
+        dirs, urls = _claude_plugin_launch_values()
+        return _resolve_plugin_mcp_config_by_server_key(
+            server, cache_dir=CLAUDE_PLUGIN_CACHE_DIR,
+            extra_dirs=dirs, allow_suffix_guess=not urls,
+        )
+
     attempts = (
         ('claude_json', lambda: _read_mcp_server_config(server, CLAUDE_MCP_CONFIG_PATH, cwd=cwd)),
         ('claude_ai_connector',
@@ -2908,18 +2926,21 @@ def _mcp_diag_resolution(server, cwd):
         ('session_connector',
          lambda: (_resolve_claude_code_session_connector(server) or (None, None))[1]),
         ('launch_config', lambda: _resolve_launch_mcp_config(server)),
-        ('plugin_by_key',
-         lambda: _resolve_plugin_mcp_config_by_server_key(server, cache_dir=CLAUDE_PLUGIN_CACHE_DIR)),
+        ('plugin_by_key', _plugin_by_key),
     )
-    for label, fn in attempts:
-        try:
-            got = fn()
-        except Exception:
-            sources[label] = 'error'
-            continue
-        sources[label] = 'hit' if got else 'miss'
-        if got and resolved is None:
-            resolved, via, cfg = True, label, got
+    _suppress_error_logging = True
+    try:
+        for label, fn in attempts:
+            try:
+                got = fn()
+            except Exception:
+                sources[label] = 'error'
+                continue
+            sources[label] = 'hit' if got else 'miss'
+            if got and resolved is None:
+                resolved, via, cfg = True, label, got
+    finally:
+        _suppress_error_logging = False
     return {
         'sources': sources,
         'resolved': bool(resolved),
