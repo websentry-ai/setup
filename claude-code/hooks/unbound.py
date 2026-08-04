@@ -2827,8 +2827,14 @@ _MCP_DIAG_SECRETISH = re.compile(
 
 
 def _mcp_diag_host_of(url):
-    m = re.match(r'^([a-zA-Z][a-zA-Z0-9+.-]*)://([^/?#]+)', str(url))
-    return '%s://%s' % (m.group(1), m.group(2)) if m else '<unparseable-url>'
+    # hostname[:port] only — urlparse drops any user:pass@ userinfo (a credential).
+    try:
+        p = urlparse(str(url))
+        if p.scheme and p.hostname:
+            return '%s://%s%s' % (p.scheme, p.hostname, ':%d' % p.port if p.port else '')
+    except Exception:
+        pass
+    return '<unparseable-url>'
 
 
 def _mcp_diag_redact_cfg(cfg):
@@ -2901,6 +2907,9 @@ def _mcp_diag_resolution(server, cwd):
         ('plugin_cache', lambda: _resolve_plugin_mcp_config(server, cache_dir=CLAUDE_PLUGIN_CACHE_DIR)),
         ('session_connector',
          lambda: (_resolve_claude_code_session_connector(server) or (None, None))[1]),
+        ('launch_config', lambda: _resolve_launch_mcp_config(server)),
+        ('plugin_by_key',
+         lambda: _resolve_plugin_mcp_config_by_server_key(server, cache_dir=CLAUDE_PLUGIN_CACHE_DIR)),
     )
     for label, fn in attempts:
         try:
@@ -2957,7 +2966,10 @@ def _mcp_diag_project_mcp_json(cwd):
         seen.add(f)
         try:
             data = json.loads(f.read_text(encoding='utf-8'))
-            names = sorted((data.get('mcpServers') or data or {}).keys())
+            m = data.get('mcpServers')
+            if not isinstance(m, dict):
+                m = data if isinstance(data, dict) else {}
+            names = sorted(m.keys())
         except Exception:
             names = []
         found.append({'file': str(f), 'servers': names[:40]})
@@ -2965,12 +2977,14 @@ def _mcp_diag_project_mcp_json(cwd):
 
 
 def _mcp_diag_scrub(text):
+    def _strip(m):
+        return re.sub(r'://[^/@\s]*@', '://', m.group(1)) + '…'
     lines, dropped = [], 0
     for line in str(text).splitlines():
         if _MCP_DIAG_SECRETISH.search(line):
             dropped += 1
             continue
-        line = re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://[^/?#\s]+)[^\s]*', r'\1…', line)
+        line = re.sub(r'([a-zA-Z][a-zA-Z0-9+.-]*://[^/?#\s]+)[^\s]*', _strip, line)
         lines.append(line[:220])
     if dropped:
         lines.append('[%d credential-bearing line(s) suppressed]' % dropped)
@@ -2994,7 +3008,8 @@ def _mcp_diag_error_log_tail():
     except Exception:
         return []
     sig = re.compile(r'(?i)mcp|fingerprint|resolve|connector|plugin')
-    return [l[:300] for l in lines if sig.search(l)][-15:]
+    tail = [l[:300] for l in lines if sig.search(l)][-15:]
+    return _mcp_diag_scrub('\n'.join(tail)).splitlines()
 
 
 def _build_mcp_diagnostic(server, cwd):
@@ -3031,16 +3046,24 @@ def _upload_mcp_diagnostic(payload, api_key):
     except Exception as exc:
         log_error('mcp diagnostic serialize failed: %s' % exc, 'mcp_server')
         return
+    proc = None
     try:
         proc = subprocess.Popen(
-            ['curl', '-fsSL', '-X', 'POST',
+            ['curl', '-fsSL', '--max-time', '30', '-X', 'POST',
              '-H', 'Authorization: Bearer %s' % api_key,
              '-H', 'Content-Type: application/json',
              '--data-binary', '@-',
              '%s/v1/hooks/mcp-diagnostics' % UNBOUND_GATEWAY_URL],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        proc.communicate(body.encode(), timeout=30)
+        proc.communicate(body.encode(), timeout=35)
     except Exception as exc:
+        # Don't leave an orphaned curl on timeout — kill and reap it.
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.communicate()
+            except Exception:
+                pass
         log_error('mcp diagnostic upload failed: %s' % exc, 'mcp_server')
 
 
@@ -3058,17 +3081,25 @@ def _run_mcp_diagnostic_cli():
     _upload_mcp_diagnostic(payload, api_key)
 
 
-def _mcp_diag_should_dispatch(server, cwd):
+def _mcp_diag_stamp_path(server, cwd):
+    key = hashlib.sha256(('%s\x00%s' % (server, cwd or '')).encode('utf-8', 'replace')).hexdigest()[:16]
+    return MCP_DIAG_STAMP_DIR / key
+
+
+def _mcp_diag_on_cooldown(server, cwd):
     try:
-        MCP_DIAG_STAMP_DIR.mkdir(parents=True, exist_ok=True)
-        key = hashlib.sha256(('%s\x00%s' % (server, cwd or '')).encode('utf-8', 'replace')).hexdigest()[:16]
-        stamp = MCP_DIAG_STAMP_DIR / key
-        if stamp.exists() and (time.time() - stamp.stat().st_mtime) < MCP_DIAG_COOLDOWN_SECONDS:
-            return False
-        stamp.write_text(str(int(time.time())), encoding='utf-8')
-        return True
+        stamp = _mcp_diag_stamp_path(server, cwd)
+        return stamp.exists() and (time.time() - stamp.stat().st_mtime) < MCP_DIAG_COOLDOWN_SECONDS
     except Exception:
         return False
+
+
+def _mcp_diag_mark_dispatched(server, cwd):
+    try:
+        MCP_DIAG_STAMP_DIR.mkdir(parents=True, exist_ok=True)
+        _mcp_diag_stamp_path(server, cwd).write_text(str(int(time.time())), encoding='utf-8')
+    except Exception:
+        pass
 
 
 def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
@@ -3080,7 +3111,7 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
         script = os.path.abspath(__file__)
     except Exception:
         return
-    if not os.path.isfile(script) or not _mcp_diag_should_dispatch(server_name, cwd):
+    if not os.path.isfile(script) or _mcp_diag_on_cooldown(server_name, cwd):
         return
     try:
         popen_kwargs = {
@@ -3096,6 +3127,8 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
         else:
             popen_kwargs['start_new_session'] = True
         subprocess.Popen([sys.executable, script, '--mcp-diagnostic'], **popen_kwargs)
+        # Stamp only after a successful spawn, so a failed dispatch doesn't mute 6h.
+        _mcp_diag_mark_dispatched(server_name, cwd)
     except Exception as exc:
         log_error('mcp diagnostic dispatch failed for %s: %s' % (server_name, exc), 'mcp_server')
 
