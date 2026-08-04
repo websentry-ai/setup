@@ -2884,6 +2884,7 @@ def _mcp_diag_hook_info():
             Path.home() / '.claude' / 'settings.local.json',
             Path('/Library/Application Support/ClaudeCode/managed-settings.json'),
             Path('/etc/claude-code/managed-settings.json'),
+            Path('C:/ProgramData/ClaudeCode/managed-settings.json'),
         ]
         referenced = False
         for s in settings_files:
@@ -3077,6 +3078,9 @@ def _upload_mcp_diagnostic(payload, api_key):
              '%s/v1/hooks/mcp-diagnostics' % UNBOUND_GATEWAY_URL],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         proc.communicate(body.encode(), timeout=35)
+        # curl -f exits non-zero on HTTP/transfer errors without raising.
+        if proc.returncode:
+            log_error('mcp diagnostic upload: curl exit %s' % proc.returncode, 'mcp_server')
     except Exception as exc:
         # Don't leave an orphaned curl on timeout — kill and reap it.
         if proc is not None and proc.poll() is None:

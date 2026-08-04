@@ -131,5 +131,25 @@ class TestDiagLogSuppression(unittest.TestCase):
         self.assertFalse(unbound._suppress_error_logging)
 
 
+class TestDiagUpload(unittest.TestCase):
+    def _proc(self, returncode):
+        proc = MagicMock()
+        proc.communicate.return_value = (None, None)
+        proc.returncode = returncode
+        return proc
+
+    def test_curl_failure_is_logged(self):
+        with patch.object(unbound.subprocess, 'Popen', return_value=self._proc(22)), \
+             patch.object(unbound, 'log_error') as mock_log:
+            unbound._upload_mcp_diagnostic({'server': 'x'}, 'key')
+        self.assertTrue(any('curl exit' in str(c) for c in mock_log.call_args_list))
+
+    def test_curl_success_is_not_logged(self):
+        with patch.object(unbound.subprocess, 'Popen', return_value=self._proc(0)), \
+             patch.object(unbound, 'log_error') as mock_log:
+            unbound._upload_mcp_diagnostic({'server': 'x'}, 'key')
+        mock_log.assert_not_called()
+
+
 if __name__ == '__main__':
     unittest.main()
