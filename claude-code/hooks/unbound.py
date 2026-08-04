@@ -88,7 +88,9 @@ APPROVAL_POLL_PHASES = (
 
 MCP_DIAG_STAMP_DIR = Path.home() / ".unbound" / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
-MCP_DIAG_VERSION = "v1"
+MCP_DIAG_VERSION = "v2"
+MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
+_DIAG_CLAUDE_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
 
 _cached_api_key = None
 _reporting_error = False
@@ -1498,6 +1500,15 @@ def _is_claude_cli(argv: List[str]) -> bool:
 
 
 def _claude_launch_argv() -> Optional[tuple]:
+    # The detached --mcp-diagnostic child is reparented, so it can't walk up to
+    # Claude. The parent forwards Claude's pid+argv via env; honor that here so
+    # launch_config / plugin_by_key replay against the real launch context.
+    fwd = os.environ.get('UNBOUND_DIAG_LAUNCH_ARGV')
+    if fwd:
+        try:
+            return int(os.environ.get('UNBOUND_DIAG_LAUNCH_PID') or os.getpid()), json.loads(fwd)
+        except Exception:
+            pass
     # Prefer the Claude CLI ancestor as the --mcp-config source. argv[0] is
     # best-effort provenance (spoofable via exec -a), but the launcher already
     # controls its own config, so this mainly avoids reading an unrelated
@@ -2932,32 +2943,82 @@ def _mcp_diag_redact_cfg(cfg):
     return out
 
 
-def _mcp_diag_hook_info():
-    """sha256 (version identity) + whether settings still reference the hook."""
-    info = {'path': None, 'size': None, 'mtime': None, 'sha256': None, 'registration': 'unknown'}
+def _diag_settings_files(cwd):
+    proj = Path(cwd) if cwd else Path.cwd()
+    return [
+        _DIAG_CLAUDE_DIR / 'settings.json',
+        _DIAG_CLAUDE_DIR / 'settings.local.json',
+        proj / '.claude' / 'settings.json',
+        proj / '.claude' / 'settings.local.json',
+        Path('/Library/Application Support/ClaudeCode/managed-settings.json'),
+        Path('/etc/claude-code/managed-settings.json'),
+        Path('C:/ProgramData/ClaudeCode/managed-settings.json'),
+    ]
+
+
+def _diag_hash_file(path):
     try:
-        path = os.path.abspath(__file__)
-        info['path'] = path
         st = os.stat(path)
-        info['size'] = st.st_size
-        info['mtime'] = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
         h = hashlib.sha256()
         with open(path, 'rb') as fh:
             for chunk in iter(lambda: fh.read(65536), b''):
                 h.update(chunk)
-        info['sha256'] = h.hexdigest()
+        return {
+            'path': str(path),
+            'size': st.st_size,
+            'mtime': datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z',
+            'sha256': h.hexdigest(),
+        }
     except Exception:
-        pass
+        return None
+
+
+def _diag_installed_hooks(cwd):
+    """Locate the hook Claude Code actually runs (not this file when run from a
+    repo checkout): the standard install path plus any .py named by a hook
+    command in settings. Each with its own sha256 so versions are comparable."""
+    cands = [
+        SELF_SCRIPT_PATH,
+        _DIAG_CLAUDE_DIR / 'hooks' / 'unbound.py',
+        Path('/Library/Application Support/ClaudeCode/hooks/unbound.py'),
+        Path('C:/ProgramData/ClaudeCode/hooks/unbound.py'),
+    ]
+    for s in _diag_settings_files(cwd):
+        try:
+            data = json.loads(s.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        for entries in (data.get('hooks') or {}).values():
+            for entry in (entries if isinstance(entries, list) else []):
+                for hk in ((entry or {}).get('hooks') or []):
+                    cmd = (hk or {}).get('command')
+                    if isinstance(cmd, str):
+                        for m in re.finditer(r'([^\s"\']+\.py)', cmd):
+                            cands.append(Path(os.path.expanduser(m.group(1))))
+    out, seen = [], set()
+    for c in cands:
+        try:
+            rp = os.path.realpath(c)
+            if rp in seen or not os.path.isfile(rp):
+                continue
+            seen.add(rp)
+            info = _diag_hash_file(rp)
+            if info:
+                out.append(info)
+        except Exception:
+            continue
+    return out
+
+
+def _mcp_diag_hook_info(cwd):
+    """sha256 of the running file + the installed hook(s) Claude runs, plus
+    whether settings still reference the hook (persisted vs tampered)."""
+    info = {'running': _diag_hash_file(os.path.abspath(__file__)),
+            'installed': _diag_installed_hooks(cwd),
+            'registration': 'unknown'}
     try:
-        settings_files = [
-            Path.home() / '.claude' / 'settings.json',
-            Path.home() / '.claude' / 'settings.local.json',
-            Path('/Library/Application Support/ClaudeCode/managed-settings.json'),
-            Path('/etc/claude-code/managed-settings.json'),
-            Path('C:/ProgramData/ClaudeCode/managed-settings.json'),
-        ]
         referenced = False
-        for s in settings_files:
+        for s in _diag_settings_files(cwd):
             try:
                 blob = json.dumps(json.loads(s.read_text(encoding='utf-8')).get('hooks') or {})
             except Exception:
@@ -3021,10 +3082,17 @@ def _mcp_diag_resolution(server, cwd):
 
 
 def _mcp_diag_claude_json(server, cwd):
-    out = {'present': CLAUDE_MCP_CONFIG_PATH.exists(), 'parse_ok': None,
-           'top_level': None, 'project_count': None, 'scoped_under': []}
+    out = {'present': CLAUDE_MCP_CONFIG_PATH.exists(), 'size': None, 'mtime': None,
+           'parse_ok': None, 'top_level': None, 'top_level_servers': [],
+           'project_count': None, 'project_entry': None, 'scoped_under': []}
     if not out['present']:
         return out
+    try:
+        st = CLAUDE_MCP_CONFIG_PATH.stat()
+        out['size'] = st.st_size
+        out['mtime'] = datetime.utcfromtimestamp(st.st_mtime).isoformat() + 'Z'
+    except Exception:
+        pass
     try:
         cfg = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
         out['parse_ok'] = True
@@ -3036,10 +3104,31 @@ def _mcp_diag_claude_json(server, cwd):
     top = cfg.get('mcpServers') or {}
     projects = cfg.get('projects') or {}
     out['top_level'] = server in top
+    out['top_level_servers'] = sorted(top.keys())
     out['project_count'] = len(projects)
+
+    real = os.path.realpath(cwd) if cwd else os.path.realpath(os.getcwd())
+    entry = projects.get(cwd) if cwd else None
+    entry = entry or projects.get(real)
+    if isinstance(entry, dict):
+        pe = {}
+        for k in ('enableAllProjectMcpServers', 'hasTrustDialogAccepted'):
+            if k in entry:
+                pe[k] = entry[k]
+        for k in ('enabledMcpjsonServers', 'disabledMcpjsonServers'):
+            if entry.get(k):
+                pe[k] = entry[k]
+        pe['mcpServers'] = sorted((entry.get('mcpServers') or {}).keys())
+        out['project_entry'] = pe
+
     for proj, v in projects.items():
         if isinstance(v, dict) and server in (v.get('mcpServers') or {}):
-            out['scoped_under'].append(proj)
+            marker = ''
+            if proj == cwd or proj == real:
+                marker = 'matches-cwd'
+            elif real and real.startswith(proj.rstrip('/') + '/'):
+                marker = 'ancestor-of-cwd (hook walks up, so this HITS)'
+            out['scoped_under'].append({'dir': proj, 'marker': marker})
     return out
 
 
@@ -3104,29 +3193,274 @@ def _mcp_diag_error_log_tail():
     return _mcp_diag_scrub('\n'.join(tail)).splitlines()
 
 
-def _build_mcp_diagnostic(server, cwd):
+def _diag_summarize_entry(entry):
+    """Compact, secret-free summary of one MCP server config entry."""
+    if not isinstance(entry, dict):
+        return str(entry)[:80]
+    bits = []
+    if entry.get('type'):
+        bits.append(str(entry['type']))
+    if entry.get('url'):
+        bits.append(_mcp_diag_host_of(entry['url']) + ('…' if '?' in str(entry['url']) else ''))
+    if entry.get('command'):
+        cmd = str(entry['command'])
+        bits.append('cmd=%s' % os.path.basename(cmd))
+        if os.path.isabs(cmd):
+            bits.append('exists' if os.path.exists(cmd) else 'MISSING-ON-DISK')
+    if isinstance(entry.get('args'), list) and entry['args']:
+        bits.append('args=%d' % len(entry['args']))
+    if isinstance(entry.get('env'), dict):
+        bits.append('env=%d keys' % len(entry['env']))
+    if isinstance(entry.get('headers'), dict):
+        bits.append('headers=%d keys' % len(entry['headers']))
+    return ', '.join(bits) or '<empty>'
+
+
+def _diag_servers_from_json(path):
     try:
-        p = subprocess.run(['claude', '--version'], capture_output=True, text=True, timeout=20)
-        out = (p.stdout or '') or (p.stderr or '')
-        claude_version = out.splitlines()[0] if out else '<not on PATH>'
+        data = json.loads(Path(path).read_text(encoding='utf-8'))
     except Exception:
-        claude_version = '<not on PATH>'
+        return None
+    if not isinstance(data, dict):
+        return None
+    m = data.get('mcpServers')
+    if isinstance(m, dict):
+        return m
+    # some plugins ship an unwrapped {name: entry} map at the root
+    if data and all(isinstance(v, dict) and ('command' in v or 'url' in v) for v in data.values()):
+        return data
+    return None
+
+
+def _diag_plugin_dirs():
+    dirs = []
+    root = _DIAG_CLAUDE_DIR / 'plugins'
     try:
-        real_cwd = os.path.realpath(cwd) if cwd else os.path.realpath(os.getcwd())
+        data = json.loads((root / 'installed_plugins.json').read_text(encoding='utf-8'))
+        for full_name, entries in (data.get('plugins') or {}).items():
+            for e in (entries or []):
+                ip = e.get('installPath') if isinstance(e, dict) else None
+                if ip:
+                    dirs.append(('installed:%s' % full_name, Path(ip)))
+    except Exception:
+        pass
+    try:
+        for marketplace in (root / 'cache').iterdir():
+            if not marketplace.is_dir():
+                continue
+            for plugin in marketplace.iterdir():
+                if not plugin.is_dir():
+                    continue
+                for version in plugin.iterdir():
+                    if version.is_dir():
+                        dirs.append(('cache:%s/%s/%s' % (marketplace.name, plugin.name, version.name), version))
+    except Exception:
+        pass
+    return dirs
+
+
+def _diag_mcp_config_paths_from_ps(ps_out):
+    paths = []
+    for line in ps_out.splitlines():
+        if 'claude' not in line or 'mcp-diagnostic' in line:
+            continue
+        for m in re.finditer(r'--mcp-config[= ]+("[^"]+"|\'[^\']+\'|\S+)', line):
+            paths.append(m.group(1).strip('"\''))
+    return list(dict.fromkeys(paths))
+
+
+def _diag_inventory(cwd, ps_out):
+    """Every MCP server source on disk — the ones the hook reads AND the ones it
+    does NOT (project .mcp.json, plugin dirs, --mcp-config) — each summarized."""
+    def _summ(m):
+        return {k: _diag_summarize_entry(v) for k, v in (m or {}).items()}
+
+    inv = []
+    try:
+        cfg = json.loads(CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        cfg = None
+    if isinstance(cfg, dict):
+        if isinstance(cfg.get('mcpServers'), dict) and cfg['mcpServers']:
+            inv.append({'source': '~/.claude.json (user)', 'file': str(CLAUDE_MCP_CONFIG_PATH),
+                        'servers': _summ(cfg['mcpServers'])})
+        for proj, v in (cfg.get('projects') or {}).items():
+            m = v.get('mcpServers') if isinstance(v, dict) else None
+            if isinstance(m, dict) and m:
+                inv.append({'source': '~/.claude.json project[%s]' % proj,
+                            'file': str(CLAUDE_MCP_CONFIG_PATH), 'servers': _summ(m)})
+    seen = set()
+    try:
+        start = Path(cwd or os.getcwd()).resolve()
+        for d in [start] + list(start.parents):
+            f = d / '.mcp.json'
+            if f in seen or not f.is_file():
+                continue
+            seen.add(f)
+            m = _diag_servers_from_json(f)
+            if m:
+                inv.append({'source': 'project .mcp.json (hook does NOT read)',
+                            'file': str(f), 'servers': _summ(m)})
+    except Exception:
+        pass
+    for label, d in _diag_plugin_dirs():
+        for cand in (d / '.mcp.json', d / '.claude-plugin' / 'plugin.json'):
+            if not cand.is_file():
+                continue
+            m = _diag_servers_from_json(cand)
+            if m:
+                inv.append({'source': 'plugin %s' % label, 'file': str(cand), 'servers': _summ(m)})
+    for p in _diag_mcp_config_paths_from_ps(ps_out):
+        path = Path(os.path.expanduser(p))
+        m = _diag_servers_from_json(path) if path.is_file() else None
+        inv.append({'source': '--mcp-config (hook does NOT read)', 'file': str(path), 'servers': _summ(m)})
+    return inv
+
+
+def _diag_norm(s):
+    return re.sub(r'[^a-z0-9]', '', str(s).lower())
+
+
+def _diag_target_appears(server, inventory):
+    exact, near = [], []
+    ns = _diag_norm(server)
+    for item in inventory:
+        for k, summ in (item.get('servers') or {}).items():
+            row = {'source': item['source'], 'file': item['file'], 'name': k, 'cfg': summ}
+            if k == server:
+                exact.append(row)
+            elif ns and (ns in _diag_norm(k) or _diag_norm(k) in ns):
+                near.append(row)
+    return {'exact': exact, 'near': near}
+
+
+def _diag_unbound_client():
+    out = {}
+    base = Path.home() / '.unbound'
+    try:
+        c = json.loads((base / 'config.json').read_text(encoding='utf-8'))
+        for k in ('email', 'org_name', 'gateway_url', 'base_url', 'frontend_url', 'discovery_local_dir'):
+            if c.get(k):
+                out[k] = c[k]
+        out['api_key'] = 'present' if c.get('api_key') else 'absent'
+    except Exception:
+        out['config'] = 'missing-or-unreadable'
+    for fname in ('identity.json', 'discovery-cache.json'):
+        p = base / fname
+        try:
+            out[fname] = p.stat().st_size if p.is_file() else 'missing'
+        except Exception:
+            out[fname] = 'unreadable'
+    return out
+
+
+def _diag_claude_mcp_list():
+    try:
+        p = subprocess.run(['claude', 'mcp', 'list'], capture_output=True, text=True, timeout=45)
+        return _mcp_diag_scrub((p.stdout or '') + (p.stderr or ''))
+    except Exception as exc:
+        return '<claude mcp list failed: %s>' % type(exc).__name__
+
+
+def _diag_plugin_registries():
+    out = {}
+    root = _DIAG_CLAUDE_DIR / 'plugins'
+    for f in ('installed_plugins.json', 'known_marketplaces.json'):
+        try:
+            data = json.loads((root / f).read_text(encoding='utf-8'))
+            keys = data.get('plugins') if f.startswith('installed') else data
+            out[f] = sorted((keys or {}).keys())
+        except Exception:
+            out[f] = 'missing-or-unreadable'
+    out['cache_dir'] = str(root / 'cache') if (root / 'cache').is_dir() else 'missing'
+    return out
+
+
+def _diag_launch_flags(ps_out):
+    rows = []
+    for l in ps_out.splitlines():
+        if 'claude' not in l or 'mcp-diagnostic' in l or ' grep ' in l:
+            continue
+        flags = re.findall(
+            r'--(?:mcp-config|strict-mcp-config|settings|add-dir|permission-mode)(?:[= ]\S+)?', l)
+        if flags:
+            rows.append(' '.join(flags))
+    return rows[:15]
+
+
+def _diag_settings_registration(cwd):
+    out = []
+    for s in _diag_settings_files(cwd):
+        try:
+            if not s.is_file():
+                continue
+            data = json.loads(s.read_text(encoding='utf-8'))
+        except Exception:
+            continue
+        hooks = data.get('hooks') or {}
+        if not hooks:
+            continue
+        events, cmds = [], []
+        for event, entries in hooks.items():
+            events.append('%s%s' % (event, ' [unbound]' if 'unbound' in json.dumps(entries) else ''))
+            for entry in (entries if isinstance(entries, list) else []):
+                for hk in ((entry or {}).get('hooks') or []):
+                    cmd = (hk or {}).get('command')
+                    if isinstance(cmd, str):
+                        cmds.append(cmd[:200])
+        out.append({'file': str(s), 'events': events, 'commands': sorted(set(cmds))})
+    return out
+
+
+def _diag_run1(cmd, timeout=15):
+    try:
+        return (subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout or '').strip()
+    except Exception:
+        return ''
+
+
+def _build_mcp_diagnostic(server, cwd):
+    out = _diag_run1(['claude', '--version'], 20)
+    claude_version = out.splitlines()[0] if out else '<not on PATH>'
+    abs_cwd = os.path.abspath(cwd) if cwd else os.path.abspath(os.getcwd())
+    try:
+        real_cwd = os.path.realpath(abs_cwd)
     except Exception:
         real_cwd = None
+    try:
+        ps_out = subprocess.run(['ps', '-eo', 'pid,ppid,args'],
+                                capture_output=True, text=True, timeout=20).stdout or ''
+    except Exception:
+        ps_out = ''
+    env_vars = {v: os.environ[v] for v in (
+        'CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_ENTRYPOINT', 'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_API_URL', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY') if os.environ.get(v)}
+    inventory = _diag_inventory(cwd, ps_out)
     return {
         'version': MCP_DIAG_VERSION,
         'server': server,
         'cwd': cwd,
         'cwd_resolved': real_cwd,
+        'cwd_is_symlink': bool(real_cwd and real_cwd != abs_cwd),
+        'home': str(Path.home()),
+        'user': os.environ.get('USER') or os.environ.get('LOGNAME') or '?',
+        'hostname': _diag_run1(['hostname'])[:80],
         'platform': sys.platform,
         'python': sys.version.split()[0],
         'claude_version': claude_version,
-        'hook': _mcp_diag_hook_info(),
+        'claude_path': _diag_run1(['bash', '-lc', 'command -v claude'], 20),
+        'env_vars': env_vars,
+        'hook': _mcp_diag_hook_info(cwd),
+        'hook_registration': _diag_settings_registration(cwd),
         'resolution': _mcp_diag_resolution(server, cwd),
         'claude_json': _mcp_diag_claude_json(server, cwd),
         'project_mcp_json': _mcp_diag_project_mcp_json(cwd),
+        'mcp_inventory': inventory,
+        'target_appears': _diag_target_appears(server, inventory),
+        'unbound_client': _diag_unbound_client(),
+        'plugin_registries': _diag_plugin_registries(),
+        'launch_flags': _diag_launch_flags(ps_out),
+        'claude_mcp_list': _diag_claude_mcp_list(),
         'claude_mcp_get': _mcp_diag_claude_mcp_get(server),
         'error_log_tail': _mcp_diag_error_log_tail(),
     }
@@ -3162,6 +3496,98 @@ def _upload_mcp_diagnostic(payload, api_key):
         log_error('mcp diagnostic upload failed: %s' % exc, 'mcp_server')
 
 
+def _render_mcp_diagnostic(d):
+    """Flatten the diagnostic dict into a plain-text report (consumed by an agent,
+    so structure isn't needed). Kept simple so new sections are one append away."""
+    L = []
+
+    def head(t):
+        L.append('\n=== %s ===' % t)
+
+    def kv(k, v):
+        L.append('%-18s: %s' % (k, v))
+
+    L.append('unbound-mcp-diag %s   server=%s' % (d.get('version'), d.get('server')))
+    head('environment')
+    for k in ('cwd', 'cwd_resolved', 'cwd_is_symlink', 'home', 'user', 'hostname',
+              'platform', 'python', 'claude_version', 'claude_path'):
+        kv(k, d.get(k))
+    for k, v in (d.get('env_vars') or {}).items():
+        kv(k, v)
+
+    head('unbound hook')
+    hk = d.get('hook') or {}
+    run = hk.get('running') or {}
+    kv('running', '%s  (sha256 %s)' % (run.get('path'), (run.get('sha256') or '')[:16]))
+    for ih in (hk.get('installed') or []):
+        kv('installed', '%s  (sha256 %s)' % (ih.get('path'), (ih.get('sha256') or '')[:16]))
+    kv('registration', hk.get('registration'))
+
+    head('hook registration in settings')
+    for row in (d.get('hook_registration') or []):
+        L.append('  %s -> %s' % (row.get('file'), ', '.join(row.get('events') or [])))
+        for c in (row.get('commands') or []):
+            L.append('      cmd: %s' % c)
+
+    head('~/.claude.json')
+    cj = d.get('claude_json') or {}
+    for k in ('present', 'size', 'mtime', 'parse_ok', 'project_count'):
+        kv(k, cj.get(k))
+    kv('top-level servers', ', '.join(cj.get('top_level_servers') or []) or '<none>')
+    if cj.get('project_entry'):
+        kv('project entry', json.dumps(cj['project_entry']))
+    for su in (cj.get('scoped_under') or []):
+        L.append('  scoped under %s   %s' % (su.get('dir'), su.get('marker') or ''))
+
+    head('resolution replay (authoritative)')
+    res = d.get('resolution') or {}
+    for k, v in (res.get('sources') or {}).items():
+        kv('  ' + k, v)
+    kv('resolved', res.get('resolved'))
+    kv('via', res.get('via'))
+    if res.get('config'):
+        kv('config', json.dumps(res['config']))
+
+    head('MCP server inventory (every source on disk)')
+    for it in (d.get('mcp_inventory') or []):
+        L.append('  %s   (%s)' % (it.get('source'), it.get('file')))
+        for name, summ in (it.get('servers') or {}).items():
+            L.append('      %-42s %s' % (name, summ))
+
+    head('where does the target appear')
+    ta = d.get('target_appears') or {}
+    for kind in ('exact', 'near'):
+        for e in (ta.get(kind) or []):
+            L.append('  %-5s %s   in %s   [%s]' % (kind, e.get('name'), e.get('source'), e.get('cfg')))
+
+    head('unbound client state (~/.unbound)')
+    for k, v in (d.get('unbound_client') or {}).items():
+        kv('  ' + k, v)
+
+    head('plugin registries')
+    for k, v in (d.get('plugin_registries') or {}).items():
+        kv('  ' + k, v if isinstance(v, str) else ', '.join(v))
+
+    head('claude processes / launch flags')
+    for f in (d.get('launch_flags') or []):
+        L.append('  %s' % f)
+
+    head('project .mcp.json files (hook does NOT read)')
+    for pj in (d.get('project_mcp_json') or []):
+        L.append('  %s -> %s' % (pj.get('file'), ', '.join(pj.get('servers') or [])))
+
+    head('claude mcp list')
+    L.append(d.get('claude_mcp_list') or '<none>')
+    head('claude mcp get %s' % d.get('server'))
+    L.append(d.get('claude_mcp_get') or '<none>')
+
+    head('hook error.log (mcp-related)')
+    for ln in (d.get('error_log_tail') or []):
+        L.append('  %s' % ln)
+
+    return '\n'.join(str(x) for x in L)
+
+
 def _run_mcp_diagnostic_cli():
     server = os.environ.get('UNBOUND_DIAG_SERVER') or ''
     cwd = os.environ.get('UNBOUND_DIAG_CWD') or None
@@ -3169,11 +3595,13 @@ def _run_mcp_diagnostic_cli():
     if not server or not api_key:
         return
     try:
-        payload = _build_mcp_diagnostic(server, cwd)
+        report = _render_mcp_diagnostic(_build_mcp_diagnostic(server, cwd))
     except Exception as exc:
         log_error('mcp diagnostic build failed: %s' % exc, 'mcp_server')
         return
-    _upload_mcp_diagnostic(payload, api_key)
+    if len(report) > MCP_DIAG_MAX_REPORT_CHARS:
+        report = report[:MCP_DIAG_MAX_REPORT_CHARS] + '\n… [report truncated]'
+    _upload_mcp_diagnostic({'report': report, 'server': server, 'cwd': cwd or ''}, api_key)
 
 
 def _mcp_diag_stamp_path(server, cwd):
@@ -3208,14 +3636,24 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
         return
     if not os.path.isfile(script) or _mcp_diag_on_cooldown(server_name, cwd):
         return
+    # Capture Claude's launch context HERE (in-process, before the child detaches
+    # and loses it) and forward it so the replay sees the real --plugin-*/--mcp-config.
+    child_env = {'UNBOUND_DIAG_SERVER': server_name,
+                 'UNBOUND_DIAG_CWD': cwd or '',
+                 'UNBOUND_DIAG_API_KEY': api_key}
+    try:
+        found = _claude_launch_argv()
+        if found:
+            pid, argv = found
+            child_env['UNBOUND_DIAG_LAUNCH_PID'] = str(pid)
+            child_env['UNBOUND_DIAG_LAUNCH_ARGV'] = json.dumps(argv)
+    except Exception:
+        pass
     try:
         popen_kwargs = {
             'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
             'stdin': subprocess.DEVNULL, 'close_fds': True,
-            'env': {**os.environ,
-                    'UNBOUND_DIAG_SERVER': server_name,
-                    'UNBOUND_DIAG_CWD': cwd or '',
-                    'UNBOUND_DIAG_API_KEY': api_key},
+            'env': {**os.environ, **child_env},
         }
         if os.name == 'nt':
             popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP

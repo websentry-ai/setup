@@ -151,5 +151,90 @@ class TestDiagUpload(unittest.TestCase):
         mock_log.assert_not_called()
 
 
+class TestDiagInventory(unittest.TestCase):
+    def test_summarize_entry_url_strips_userinfo_and_marks_query(self):
+        s = unbound._diag_summarize_entry({'url': 'https://user:pw@h.com/mcp?t=1', 'type': 'http'})
+        self.assertIn('https://h.com', s)
+        self.assertNotIn('user:pw', s)
+        self.assertIn('…', s)  # query marker
+
+    def test_summarize_entry_command_missing_on_disk(self):
+        s = unbound._diag_summarize_entry({'command': '/no/such/bin/xyz', 'args': ['a', 'b']})
+        self.assertIn('cmd=xyz', s)
+        self.assertIn('MISSING-ON-DISK', s)
+        self.assertIn('args=2', s)
+
+    def test_summarize_entry_counts_env_and_headers(self):
+        s = unbound._diag_summarize_entry({'command': 'x', 'env': {'A': 1, 'B': 2}, 'headers': {'H': 1}})
+        self.assertIn('env=2 keys', s)
+        self.assertIn('headers=1 keys', s)
+
+    def test_servers_from_json_wrapped_and_unwrapped(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            wrapped = Path(d) / 'a.json'
+            wrapped.write_text(_json.dumps({'mcpServers': {'s1': {'command': 'x'}}}))
+            self.assertEqual(set(unbound._diag_servers_from_json(wrapped)), {'s1'})
+            root = Path(d) / 'b.json'
+            root.write_text(_json.dumps({'s2': {'url': 'http://h'}}))
+            self.assertEqual(set(unbound._diag_servers_from_json(root)), {'s2'})
+
+    def test_target_appears_exact_and_near(self):
+        inv = [{'source': 'src', 'file': 'f',
+                'servers': {'acme-mcp': 'cmd=x', 'plugin_bar_acme_mcp': 'cmd=y', 'other': 'cmd=z'}}]
+        res = unbound._diag_target_appears('acme-mcp', inv)
+        self.assertEqual([e['name'] for e in res['exact']], ['acme-mcp'])
+        self.assertIn('plugin_bar_acme_mcp', [n['name'] for n in res['near']])
+        self.assertNotIn('other', [n['name'] for n in res['near']])
+
+
+class TestDiagRender(unittest.TestCase):
+    def test_render_produces_text_with_sections(self):
+        d = {
+            'version': 'v2', 'server': 'acme-mcp', 'cwd': '/p', 'cwd_resolved': '/p',
+            'platform': 'darwin', 'python': '3.11', 'claude_version': '1.2', 'claude_path': '/bin/claude',
+            'env_vars': {'CLAUDE_CONFIG_DIR': '/cfg'},
+            'hook': {'running': {'path': '/run/unbound.py', 'sha256': 'a' * 64},
+                     'installed': [{'path': '/inst/unbound.py', 'sha256': 'b' * 64}],
+                     'registration': 'persisted'},
+            'hook_registration': [{'file': '/s.json', 'events': ['PreToolUse [unbound]'], 'commands': ['python unbound.py']}],
+            'claude_json': {'present': True, 'size': 10, 'mtime': 't', 'parse_ok': True,
+                            'top_level_servers': ['figma'], 'project_count': 1, 'project_entry': None, 'scoped_under': []},
+            'resolution': {'sources': {'claude_json': 'miss', 'plugin_by_key': 'miss'}, 'resolved': False, 'via': None, 'config': None},
+            'mcp_inventory': [{'source': 'plugin installed:context7', 'file': '/c/.mcp.json', 'servers': {'context7': 'cmd=npx, args=2'}}],
+            'target_appears': {'exact': [], 'near': []},
+            'unbound_client': {'org_name': 'unbound', 'api_key': 'present'},
+            'plugin_registries': {'installed_plugins.json': ['context7'], 'cache_dir': '/cache'},
+            'launch_flags': ['--permission-mode auto'],
+            'project_mcp_json': [{'file': '/.mcp.json', 'servers': ['x']}],
+            'claude_mcp_list': 'server: ok',
+            'claude_mcp_get': '<no output>',
+            'error_log_tail': ['some mcp error'],
+        }
+        r = unbound._render_mcp_diagnostic(d)
+        self.assertIsInstance(r, str)
+        for marker in ('server=acme-mcp', '=== environment ===', 'MCP server inventory',
+                       'context7', 'claude mcp list', 'installed:context7',
+                       '/inst/unbound.py', 'registration'):
+            self.assertIn(marker, r)
+
+
+class TestDiagLaunchContext(unittest.TestCase):
+    def test_forwarded_launch_argv_is_honored(self):
+        env = {'UNBOUND_DIAG_LAUNCH_PID': '4321',
+               'UNBOUND_DIAG_LAUNCH_ARGV': '["claude", "--plugin-url", "http://x"]'}
+        with patch.dict('os.environ', env):
+            got = unbound._claude_launch_argv()
+        self.assertEqual(got, (4321, ['claude', '--plugin-url', 'http://x']))
+
+    def test_no_forwarded_env_falls_back_to_walk(self):
+        # With no forwarding env, it must not raise and returns a tuple-or-None.
+        import os as _os
+        _os.environ.pop('UNBOUND_DIAG_LAUNCH_ARGV', None)
+        got = unbound._claude_launch_argv()
+        self.assertTrue(got is None or isinstance(got, tuple))
+
+
 if __name__ == '__main__':
     unittest.main()
