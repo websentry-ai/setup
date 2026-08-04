@@ -233,6 +233,19 @@ class TestDiagValueScrub(unittest.TestCase):
     def test_plain_value_passes_through(self):
         self.assertEqual(unbound._diag_scrub_value('cli'), 'cli')
 
+    def test_settings_registration_scrubs_hook_commands(self):
+        import json as _json
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            s = Path(d) / 'settings.json'
+            s.write_text(_json.dumps({'hooks': {'PreToolUse': [
+                {'hooks': [{'command': 'python hook.py --token=sk-leak'}]}]}}))
+            with patch.object(unbound, '_diag_settings_files', return_value=[s]):
+                out = unbound._diag_settings_registration('/cwd')
+        cmds = out[0]['commands']
+        self.assertIn('<redacted>', cmds)
+        self.assertFalse(any('sk-leak' in c for c in cmds))
+
 
 class TestDiagLaunchContext(unittest.TestCase):
     def test_forwarded_launch_argv_is_honored(self):

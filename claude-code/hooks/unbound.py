@@ -3422,7 +3422,7 @@ def _diag_settings_registration(cwd):
                 for hk in ((entry or {}).get('hooks') or []):
                     cmd = (hk or {}).get('command')
                     if isinstance(cmd, str):
-                        cmds.append(cmd[:200])
+                        cmds.append(_diag_scrub_value(cmd))
         out.append({'file': str(s), 'events': events, 'commands': sorted(set(cmds))})
     return out
 
