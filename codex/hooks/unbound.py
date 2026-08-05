@@ -25,6 +25,13 @@ LAST_REPORT_FILE = Path.home() / ".codex" / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'apply_patch']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'apply_patch'}
 MCP_TOOL_PREFIX = 'mcp__'
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
@@ -35,8 +42,6 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
@@ -506,8 +511,25 @@ def extract_command_for_pretool(event: Dict) -> str:
     # Task: prompt
     if tool_name == 'Task' and 'prompt' in tool_input:
         return tool_input['prompt']
+    # apply_patch: the patch/diff content, so each patch gets a distinct synthetic
+    # id instead of every apply_patch in a turn collapsing to the tool name.
+    if tool_name == 'apply_patch' and tool_input:
+        return tool_input.get('input') or tool_input.get('patch') or tool_input.get('diff') or json.dumps(tool_input, sort_keys=True)
     # Default: tool name
     return tool_name
+
+
+def _synthetic_tool_use_id(session_id, turn_id, tool_name, command) -> str:
+    """Deterministic fallback id for tools with no native id (byte-identical pre vs
+    completion). MCP input is canonicalized (sort_keys) so key-order variance between
+    the pre event and the transcript-decoded completion can't diverge the id."""
+    try:
+        command = json.dumps(json.loads(command), sort_keys=True)
+    except (ValueError, TypeError):
+        pass
+    key = '\x1f'.join((str(session_id or ''), str(turn_id or ''),
+                       str(tool_name or ''), str(command or '')))
+    return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
 
 
 def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
@@ -594,6 +616,20 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
         return {
             'decision': 'block',
             'reason': reason
+        }
+
+    # Allowed with injected context (e.g. the spend-limit alert-threshold
+    # warning "you've used $X of your $Y limit"): Codex hooks are
+    # Claude-parity — additionalContext feeds the model, systemMessage shows
+    # the same text to the user.
+    additional_context = api_response.get('additionalContext', '')
+    if additional_context:
+        return {
+            'hookSpecificOutput': {
+                'hookEventName': 'UserPromptSubmit',
+                'additionalContext': additional_context,
+            },
+            'systemMessage': additional_context,
         }
 
     return {}
@@ -1000,9 +1036,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
-    if _tuid:
-        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+    request_body['pre_tool_use_data']['tool_use_id'] = (
+        event.get('tool_use_id')
+        or _synthetic_tool_use_id(session_id, event.get('turn_id'), tool_name, command)
+    )
 
     if not is_retry:
         request_body['first_approval_check'] = True
@@ -1158,14 +1195,224 @@ def cleanup_old_logs():
         save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
 
 
-def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> List[Dict]:
+def _strip_git_suffix(segment: str) -> str:
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url: str) -> Optional[str]:
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd: Optional[str]) -> Optional[str]:
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+def _find_git_root(path: str) -> Optional[str]:
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the shell's working directory across the turn's exec_command calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+
+def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
+    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
+    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
+    when the command has no cd or on any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Optional[str]]) -> Optional[str]:
+    """First project ("<org>/<repo>") resolved from `candidates` paths.
+    `root_projects` caches origin lookups so `git remote get-url` runs at
+    most once per distinct repo. None when nothing resolves (fail-open)."""
+    try:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root]
+    except Exception:
+        pass
+    return None
+
+
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or '')))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
+
+
+def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp: Optional[str] = None, session_cwd: Optional[str] = None) -> List[Dict]:
     """Parse Codex transcript for function_call/function_call_output pairs.
 
     Codex transcripts use response_item entries with:
     - type: 'function_call' (contains name, arguments with cmd)
     - type: 'function_call_output' (contains output)
 
-    Converts to PostToolUse format matching Claude Code hooks for backend compatibility.
+    Converts to PostToolUse format matching Claude Code hooks for backend
+    compatibility. Each entry gets a per-call `project` ("<org>/<repo>")
+    resolved from the command's workdir / absolute paths / the shell dir
+    tracked across the turn's `cd`s (seeded with `session_cwd`).
     """
     tool_uses = []
     if not transcript_path or not os.path.exists(transcript_path):
@@ -1212,7 +1459,11 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 except json.JSONDecodeError:
                     continue
 
-        # Match calls with outputs and convert to PostToolUse format
+        # Match calls with outputs and convert to PostToolUse format.
+        # shell_dir mirrors the persistent shell across the turn's commands
+        # (seeded with the session cwd); root_projects caches origin lookups.
+        shell_dir = session_cwd
+        root_projects: Dict[str, Optional[str]] = {}
         for call_id, call_data in function_calls.items():
             name = call_data.get('name', '')
             args = call_data.get('arguments', {})
@@ -1223,7 +1474,23 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
             # are handled generically as fallback for future Codex tool support.
             if name == 'exec_command':
                 tool_name = 'Bash'
-                tool_input = {'command': args.get('cmd', '')}
+                command = args.get('cmd', '')
+                if isinstance(command, list):
+                    command = ' '.join(str(c) for c in command)
+                tool_input = {'command': command}
+                # Attribute the call to the repo it ran in: explicit workdir
+                # first, then absolute paths in the command, then the tracked
+                # shell dir.
+                candidates = []
+                workdir = args.get('workdir')
+                if isinstance(workdir, str) and workdir:
+                    candidates.append(workdir)
+                if isinstance(command, str):
+                    candidates.extend(_ABS_PATH_RE.findall(command))
+                    shell_dir = _next_shell_dir(command, shell_dir)
+                if not candidates and shell_dir:
+                    candidates.append(shell_dir)
+                project = _project_for_paths(candidates, root_projects)
                 # Parse exec_command output format to extract clean stdout and exit_code
                 stdout = output
                 exit_code = 0
@@ -1241,13 +1508,20 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                 tool_name = name
                 tool_input = args if isinstance(args, dict) else {'command': str(args)}
                 tool_response = {'stdout': output}
+                # Resolve from any absolute paths in the arguments (e.g.
+                # apply_patch file paths), falling back to the shell dir.
+                candidates = _ABS_PATH_RE.findall(json.dumps(tool_input))
+                if not candidates and shell_dir:
+                    candidates = [shell_dir]
+                project = _project_for_paths(candidates, root_projects)
 
             tool_uses.append({
                 'type': 'PostToolUse',
                 'tool_name': tool_name,
                 'tool_input': tool_input,
                 'tool_response': tool_response,
-                'tool_use_id': call_id
+                'tool_use_id': call_id,
+                'project': project
             })
 
     except Exception:
@@ -1337,8 +1611,21 @@ def process_stop_event(event: Dict, api_key: str):
 
     messages = [{'role': 'user', 'content': user_prompt}]
 
-    # Parse tool uses from Codex transcript (function_call/function_call_output pairs)
-    assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp)
+    # Parse tool uses from Codex transcript (function_call/function_call_output
+    # pairs); the session cwd seeds shell-dir tracking for per-call project
+    # attribution.
+    cwd = event.get('cwd')
+    assistant_tool_uses = parse_codex_transcript_for_tools(transcript_path, user_prompt_timestamp, session_cwd=cwd)
+
+    assistant_tool_uses.extend(
+        _skill_tool_uses_from_prompt(user_prompt, cwd, session_id, user_prompt_timestamp))
+
+    for item in assistant_tool_uses:
+        if not item.get('tool_use_id'):
+            item['tool_use_id'] = _synthetic_tool_use_id(
+                session_id, event.get('turn_id'), item.get('tool_name'),
+                extract_command_for_pretool({'tool_name': item.get('tool_name'),
+                                             'tool_input': item.get('tool_input') or {}}))
 
     assistant_msg = {
         'role': 'assistant',
@@ -1355,7 +1642,11 @@ def process_stop_event(event: Dict, api_key: str):
         'conversation_id': session_id or 'unknown',
         'model': event.get('model', 'auto'),
         'messages': messages,
-        'permission_mode': permission_mode or 'default'
+        'permission_mode': permission_mode or 'default',
+        'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
+        'project': _get_project(cwd)
     }
 
     usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
@@ -1515,69 +1806,6 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _hook_discovery_enabled_for_org() -> bool:
-    """Return whether SessionStart-triggered discovery is enabled for this
-    user's org. Reads ~/.unbound/discovery-cache.json first; refetches from
-    the gateway only when the cached value is missing or older than
-    DISCOVERY_HOOK_FLAG_TTL_SECONDS. Fail-closed: any error and no usable
-    cached value means False."""
-    cache: Dict = {}
-    if DISCOVERY_CACHE_PATH.exists():
-        try:
-            with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
-                cache = json.load(f) or {}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
-    if not isinstance(cache, dict):
-        cache = {}
-    _hd = cache.get("hook_discovery")
-    flag = _hd if isinstance(_hd, dict) else {}
-    last_fetched = flag.get("fetched_at")
-    if isinstance(last_fetched, str):
-        try:
-            ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-            if (time.time() - ts) < DISCOVERY_HOOK_FLAG_TTL_SECONDS:
-                return bool(flag.get("enabled", False))
-        except ValueError:
-            pass
-
-    try:
-        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
-        return bool(flag.get("enabled", False))
-    api_key = cfg.get("api_key")
-    if not api_key:
-        return bool(flag.get("enabled", False))
-    try:
-        r = subprocess.run(
-            ["curl", "-fsSL",
-             "-H", f"Authorization: Bearer {api_key}",
-             "--max-time", "5",
-             f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"],
-            capture_output=True, timeout=8,
-        )
-        if r.returncode != 0:
-            return bool(flag.get("enabled", False))
-        enabled = bool(json.loads(r.stdout.decode("utf-8", errors="replace")).get("enabled", False))
-    except Exception:
-        return bool(flag.get("enabled", False))
-
-    cache["hook_discovery"] = {
-        "enabled": enabled,
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, sort_keys=True)
-        os.replace(tmp, DISCOVERY_CACHE_PATH)
-    except OSError:
-        pass
-    return enabled
-
-
 def _install_sh_is_stale() -> bool:
     try:
         return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
@@ -1647,8 +1875,6 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
 
 
 def _dispatch_discovery() -> None:
-    if not _hook_discovery_enabled_for_org():
-        return
     try:
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
@@ -1815,6 +2041,20 @@ def main():
 
             # If denied (response has decision: block), log the event then return
             if response.get('decision') == 'block':
+                append_to_audit_log({
+                    'timestamp': datetime.utcnow().isoformat() + 'Z',
+                    'session_id': event.get('session_id'),
+                    'event': event
+                })
+                response["suppressOutput"] = True
+                print(json.dumps(response), flush=True)
+                return
+
+            # Allowed but with hook output to emit (e.g. the spend-limit
+            # alert-threshold warning riding additionalContext/systemMessage):
+            # log the event, then print the response instead of the default
+            # suppressOutput so Codex surfaces the warning.
+            if response:
                 append_to_audit_log({
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'session_id': event.get('session_id'),

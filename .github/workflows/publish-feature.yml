@@ -29,7 +29,7 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Vendor canonical hook into the feature (zero-drift)
         run: cp claude-code/hooks/unbound.py devcontainer-feature/src/unbound-hooks/unbound.py
@@ -61,7 +61,7 @@ jobs:
           fi
 
       - name: Publish Feature
-        uses: devcontainers/action@v1
+        uses: devcontainers/action@1082abd5d2bf3a11abccba70eef98df068277772 # v1
         with:
           publish-features: "true"
           base-path-to-features: "./devcontainer-feature/src"

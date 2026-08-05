@@ -41,6 +41,15 @@ AUGMENT_TOOL_FAMILY = {
 # EXCLUDED: it is a destructive delete that must always reach the gateway, so it
 # lives only in ALLOWED_NON_MCP_HOOK_NAMES (never eligible for the fast path).
 NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.augment', 'skills'), ('.claude', 'skills'),
+                     ('.agents', 'skills'))
+_SKILL_BODY_SCAN_LIMIT = 400
+_SKILL_BODY_MATCH_CHARS = 400
 # Non-MCP Augment tools we always evaluate (the rest fall through to the cache
 # fast path). MCP tools are detected via the is_mcp_tool flag, not a name prefix.
 ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files']
@@ -62,8 +71,6 @@ APPROVAL_TIMEOUT = 4 * 60 * 60
 PRETOOL_CURL_TIMEOUT = 12
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
@@ -102,6 +109,234 @@ APPROVAL_POLL_PHASES = (
 
 _cached_api_key = None
 _reporting_error = False
+
+
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
+def _skill_dirs(cwd):
+    """Every directory a skill could live in for this invocation, bounded by
+    the same trust boundary the other skill helpers use. Accepts one path or
+    several, since Augment can report more than one workspace root."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    # Workspace roots repeat across events and their ancestor chains overlap;
+    # without this the same tree is rescanned and the scan cap trips early.
+    dirs, seen = [], set()
+    for root in roots:
+        for skill_dir in SKILL_SEARCH_DIRS:
+            candidate = root.joinpath(*skill_dir)
+            if str(candidate) not in seen:
+                seen.add(str(candidate))
+                dirs.append(candidate)
+    return dirs
+
+
+SKILL_READ_TOOLS = frozenset({'view', 'read-file', 'read'})
+
+
+def _skill_absolute_read_path(read_path, roots):
+    """Absolute form of a read path. Augment can report workspace-relative
+    paths, which no absolute skill root would ever match."""
+    try:
+        if not read_path or os.path.isabs(read_path):
+            return read_path
+        for root in roots or []:
+            candidate = os.path.join(root, read_path)
+            if os.path.isfile(candidate):
+                return candidate
+        return read_path
+    except Exception:
+        return read_path
+
+
+def _skill_read_path(event):
+    """Path a read tool opened, across the field names Augment uses."""
+    try:
+        if (event.get('tool_name') or '') not in SKILL_READ_TOOLS:
+            return None
+        tool_input = event.get('tool_input') or {}
+        for key in ('path', 'file_path', 'filePath'):
+            value = tool_input.get(key)
+            if isinstance(value, str) and value:
+                return value
+        for change in (event.get('file_changes') or []):
+            if isinstance(change, dict):
+                value = change.get('path') or change.get('file_path')
+                if isinstance(value, str) and value:
+                    return value
+        return None
+    except Exception:
+        return None
+
+
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    return {str(r).replace('\\', '/') for r in roots}
+
+
+def _skill_path_key(path):
+    """Separator-normalised path, so a read (which keeps the payload's '/')
+    and a body match (which uses str(Path), '\\' on Windows) compare equal."""
+    return path.replace('\\', '/') if isinstance(path, str) else path
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.replace('\\', '/').split('/')
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        allowed = _skill_roots(cwd)
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if '/'.join(parts[:i]) in allowed:
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
+def _skill_body(path):
+    """SKILL.md contents with any YAML frontmatter stripped."""
+    try:
+        text = path.read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return ''
+    if text.startswith('---'):
+        end = text.find('\n---', 3)
+        if end != -1:
+            text = text[text.find('\n', end + 1) + 1:]
+    return text.strip()
+
+
+def _skill_from_prompt_body(prompt, cwd):
+    """(name, path) when a prompt IS a skill's body. Auggie submits a skill's
+    instructions as the request instead of the slash token, so matching the
+    body on disk is the only way to identify a typed invocation."""
+    try:
+        text = (prompt or '').strip()
+        if not text or '\n' not in text:
+            return None
+        head = text.splitlines()[0].strip()
+        if not head:
+            return None
+        normalized = ' '.join(text.split())
+        best = None
+        scanned = 0
+        for base in _skill_dirs(cwd):
+            candidates = sorted(base.glob('*/SKILL.md')) + sorted(base.glob('*/*/SKILL.md'))
+            for path in candidates:
+                scanned += 1
+                if scanned > _SKILL_BODY_SCAN_LIMIT:
+                    return (best[1], best[2]) if best else None
+                body = _skill_body(path)
+                if not body or body.splitlines()[0].strip() != head:
+                    continue
+                flat = ' '.join(body.split())
+                if normalized.startswith(flat[:_SKILL_BODY_MATCH_CHARS]):
+                    # A short skill can be a prefix of a longer one, so keep the
+                    # most specific match rather than the first.
+                    if best is None or len(flat) > best[0]:
+                        best = (len(flat), path.parent.name, str(path))
+        return (best[1], best[2]) if best else None
+    except Exception:
+        return None
+
+
+def _skill_entry(name, path, session_id, stamp, seq=0):
+    """A skill invocation shaped like the tool_use entries the backend reads."""
+    key = '\x1f'.join((str(session_id or ''), str(name), str(stamp or ''), str(seq)))
+    return {
+        'type': 'PostToolUse',
+        'tool_name': SKILL_TOOL_NAME,
+        'tool_input': {'skill': name, 'args': ''},
+        'tool_response': {},
+        'tool_use_id': 'unb-' + hashlib.sha256(
+            key.encode('utf-8', 'replace')).hexdigest()[:24],
+        'skill_name': name,
+        'skill_path': path,
+    }
 
 
 def _utc_now_z() -> str:
@@ -497,12 +732,20 @@ def extract_command_for_pretool(event: Dict) -> str:
                 return value if isinstance(value, str) else json.dumps(value)
         return json.dumps(tool_input)
 
-    # File families (edit/write/read/delete): the path.
+    # File families (edit/write/read/delete): the path. Post-tool events may carry the
+    # path only in file_changes[0] (not tool_input), so fall back to it -- matching how
+    # _augment_posttooluse_to_exchange resolves the path -- so a pre event (tool_input
+    # path) and its completion (file_changes path) hash to the same id.
     if family in ('Edit', 'Write', 'Read', 'Delete') or tool_name in NATIVE_FILE_TOOLS:
         for key in ('path', 'file_path', 'filePath'):
             value = tool_input.get(key)
             if value:
                 return value if isinstance(value, str) else json.dumps(value)
+        file_changes = event.get('file_changes')
+        if isinstance(file_changes, list) and file_changes and isinstance(file_changes[0], dict):
+            path = file_changes[0].get('path')
+            if path:
+                return path if isinstance(path, str) else json.dumps(path)
         return json.dumps(tool_input)
 
     # Unknown tool: surface whatever input it carries so policy can still match.
@@ -1275,6 +1518,34 @@ def _augment_model(event: Dict, session_id: Optional[str]) -> str:
     return event.get('model') or _get_session_model(session_id) or 'auto'
 
 
+def _resolve_tool_use_id(event: Dict) -> str:
+    """Native per-call id if present, else a deterministic synthetic one.
+
+    Augment has no native tool_use_id and no turn id, so the id is derived
+    purely from replay-stable content (conversation/session id + raw tool name
+    + extracted command). The PreToolUse emit and the Stop-replayed PostToolUse
+    emit run in different processes yet compute the byte-identical id for the
+    same call — no side file, no timestamps. Native id always wins; any error
+    falls back to native-or-absent (fail-open, never crashes the hook)."""
+    native = event.get('tool_use_id')
+    if native:
+        return native
+    try:
+        content = extract_command_for_pretool(event)
+        try:
+            content = json.dumps(json.loads(content), sort_keys=True)
+        except (ValueError, TypeError):
+            pass
+        key = '\x1f'.join((
+            str(event.get('session_id') or event.get('conversation_id') or ''),
+            str(event.get('tool_name') or ''),
+            str(content),
+        ))
+        return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+    except Exception:
+        return native
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -1352,7 +1623,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         'user_prompts': [],
     }
 
-    _tuid = event.get('tool_use_id')
+    _tuid = _resolve_tool_use_id(event)
     if _tuid:
         request_body['pre_tool_use_data']['tool_use_id'] = _tuid
 
@@ -1438,6 +1709,142 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     return transform_response_for_claude(api_response)
 
 
+def _strip_git_suffix(segment: str) -> str:
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url: Optional[str]) -> Optional[str]:
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd: Optional[str]) -> Optional[str]:
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+# Canonical (post-AUGMENT_TOOL_FAMILY) tool names whose input carries a file
+# path — used for per-tool-call project attribution on the Stop exchange.
+_FILE_TOOLS = {'Read', 'Write', 'Edit', 'Delete'}
+
+# Any absolute path inside a shell command (cd targets, git -C, pytest /x/…).
+# Left boundary required so the slash inside a relative token (tests/webapp/)
+# doesn't read as an absolute path.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the shell's working directory across the turn's launch-process calls.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+
+def _find_git_root(path: str) -> Optional[str]:
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
+    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
+    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
+    when the command has no cd or on any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':  # `cd -` — previous dir isn't tracked; keep as-is
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Optional[str]]) -> tuple:
+    """Resolve the git project ("<org>/<repo>") a single tool call worked in.
+    File tools resolve from the tool's file path (Augment often sends
+    workspace-relative paths — those join onto the tracked shell dir); Bash
+    resolves from the first absolute path in the command, else the shell's
+    working directory tracked across the turn's `cd`s. Returns
+    (project, shell_dir) — shell_dir updated when the command changed
+    directory. `root_projects` caches the origin lookup so `git remote
+    get-url` runs at most once per distinct repo. (None, shell_dir) when
+    nothing resolves (fail-open)."""
+    try:
+        tool_input = tool_input or {}
+        candidates = []
+        if tool_name in _FILE_TOOLS:
+            path = tool_input.get('file_path')
+            if isinstance(path, str) and path:
+                if not path.startswith('/') and shell_dir:
+                    path = os.path.normpath(os.path.join(shell_dir, path))
+                if path.startswith('/'):
+                    candidates.append(os.path.dirname(path))
+        elif tool_name == 'Bash':
+            command = tool_input.get('command')
+            if isinstance(command, str):
+                candidates.extend(_ABS_PATH_RE.findall(command))
+                shell_dir = _next_shell_dir(command, shell_dir)
+                if not candidates and shell_dir:
+                    candidates.append(shell_dir)
+        for candidate in candidates:
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root], shell_dir
+        return None, shell_dir
+    except Exception:
+        return None, shell_dir
+
+
 def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = None) -> Optional[Dict]:
     """Map an Augment PostToolUse event to the Claude-Code-hooks tool_use shape the
     backend analyzer consumes (type / tool_name / tool_input / tool_response).
@@ -1474,7 +1881,7 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
             'tool_name': f'mcp__{server}__{tool}',
             'tool_input': tool_input,
             'tool_response': _io_response(),
-            'tool_use_id': ev.get('tool_use_id'),
+            'tool_use_id': ev.get('tool_use_id') or _resolve_tool_use_id(ev),
         }
 
     canonical = AUGMENT_TOOL_FAMILY.get(raw_name, raw_name)
@@ -1513,7 +1920,7 @@ def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = Non
         'tool_name': canonical,
         'tool_input': canon_input,
         'tool_response': tool_response,
-        'tool_use_id': ev.get('tool_use_id'),
+        'tool_use_id': ev.get('tool_use_id') or _resolve_tool_use_id(ev),
     }
 
 
@@ -1537,6 +1944,13 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     assistant_response = (exchange.get('response_text')
                           or conversation.get('agentTextResponse') or '').strip()
 
+    # Per-tool-use project resolution state: the shell starts at the session
+    # cwd; origin lookups are cached per repo root across the turn.
+    cwd = event.get('cwd')
+    shell_dir = cwd
+    root_projects = {}
+
+    read_skills = set()
     mcp_servers = read_augment_mcp_servers(event)
     for log_entry in post_tool_events:
         ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
@@ -1544,7 +1958,51 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
             continue
         shaped = _augment_posttooluse_to_exchange(ev, mcp_servers)
         if shaped:
+            # Attribute this tool call to the repo it worked in (file path /
+            # shell cwd tracking); rides on the tool_use entry so the backend
+            # can store per-call project on each analytics row.
+            tool_project, shell_dir = _project_for_tool_use(
+                shaped.get('tool_name'), shaped.get('tool_input'), shell_dir, root_projects)
+            shaped['project'] = tool_project
             assistant_tool_uses.append(shaped)
+
+            # Auggie loads an auto-triggered skill by READING its SKILL.md, so
+            # that read is the invocation signal. Writes and edits to a skill
+            # file are not invocations.
+            # The read event carries its own workspace roots; the Stop cwd
+            # alone misses reads in a subdirectory or under a relative path.
+            event_roots = [str(r) for r in _augment_workspace_roots(ev)]
+            if cwd:
+                event_roots.append(cwd)
+            read_path = _skill_absolute_read_path(_skill_read_path(ev), event_roots)
+            skill_name = _skill_name_from_path(read_path, event_roots or cwd)
+            # Re-reading one SKILL.md in a turn is still a single invocation.
+            # Keyed by path, not name: two skills can share a name under
+            # different roots and are different skills.
+            if skill_name and _skill_path_key(read_path) not in read_skills:
+                read_skills.add(_skill_path_key(read_path))
+                assistant_tool_uses.append(
+                    _skill_entry(skill_name, read_path, session_id,
+                                 log_entry.get('timestamp'), len(assistant_tool_uses)))
+
+    # A typed `/name` arrives as the skill's body, not the token, so match the
+    # prompt against SKILL.md on disk before falling back to the token. Skills
+    # already seen in a read are skipped individually, not wholesale.
+    seen_skills = {_skill_path_key(e.get('skill_path'))
+                   for e in assistant_tool_uses if e.get('skill_name')}
+    # Same roots the read path uses, so a skill under another workspace folder
+    # resolves from the prompt body too.
+    body_roots = []
+    for log_entry in post_tool_events:
+        ev = log_entry.get('event', {}) if 'event' in log_entry else log_entry
+        body_roots += [str(r) for r in _augment_workspace_roots(ev)]
+    if cwd:
+        body_roots.append(cwd)
+    matched = _skill_from_prompt_body(user_prompt, body_roots or cwd)
+    if matched and _skill_path_key(matched[1]) not in seen_skills:
+        assistant_tool_uses.append(
+            _skill_entry(matched[0], matched[1], session_id,
+                         event.get('timestamp'), len(assistant_tool_uses)))
 
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
@@ -1570,6 +2028,10 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
         'model': model,
         'messages': messages,
         'permission_mode': 'default',
+        'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
+        'project': _get_project(cwd),
         'account_identity': build_account_identity(event, probe=True),
     }
 
@@ -1849,70 +2311,6 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _hook_discovery_enabled_for_org() -> bool:
-    """Return whether SessionStart-triggered discovery is enabled for this
-    user's org. Reads ~/.unbound/discovery-cache.json first; refetches from
-    the gateway only when the cached value is missing or older than
-    DISCOVERY_HOOK_FLAG_TTL_SECONDS. Fail-closed: any error and no usable
-    cached value means False."""
-    cache: Dict = {}
-    if DISCOVERY_CACHE_PATH.exists():
-        try:
-            with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
-                cache = json.load(f) or {}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
-    if not isinstance(cache, dict):
-        cache = {}
-    _hd = cache.get("hook_discovery")
-    flag = _hd if isinstance(_hd, dict) else {}
-    last_fetched = flag.get("fetched_at")
-    if isinstance(last_fetched, str):
-        try:
-            ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-            if (time.time() - ts) < DISCOVERY_HOOK_FLAG_TTL_SECONDS:
-                return bool(flag.get("enabled", False))
-        except ValueError:
-            pass
-
-    try:
-        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
-        return bool(flag.get("enabled", False))
-    api_key = cfg.get("api_key")
-    if not api_key:
-        return bool(flag.get("enabled", False))
-    url = f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"
-    try:
-        # Auth header off-argv (0600 temp file) — GET, no body.
-        r = curl_with_auth(
-            [f"Authorization: Bearer {api_key}"],
-            ["-fsSL", "--max-time", "5", url],
-            timeout=8,
-        )
-        if r is None or r.returncode != 0:
-            return bool(flag.get("enabled", False))
-        body = r.stdout.decode("utf-8", errors="replace")
-        enabled = bool(json.loads(body).get("enabled", False))
-    except Exception:
-        return bool(flag.get("enabled", False))
-
-    cache["hook_discovery"] = {
-        "enabled": enabled,
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, sort_keys=True)
-        os.replace(tmp, DISCOVERY_CACHE_PATH)
-    except OSError:
-        pass
-    return enabled
-
-
 def _install_sh_is_stale() -> bool:
     try:
         return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
@@ -1982,8 +2380,6 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
 
 
 def _dispatch_discovery() -> None:
-    if not _hook_discovery_enabled_for_org():
-        return
     try:
         cache: Dict = {}
         if DISCOVERY_CACHE_PATH.exists():

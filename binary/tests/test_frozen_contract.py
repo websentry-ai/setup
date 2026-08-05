@@ -62,7 +62,6 @@ def frozen_module(tmp_path, monkeypatch, request):
 @pytest.mark.parametrize("frozen_module", list(TOOL_PY), indirect=True)
 def test_frozen_discovery_exec_contract(frozen_module, monkeypatch):
     m, calls = frozen_module
-    monkeypatch.setattr(m, "_hook_discovery_enabled_for_org", lambda: True)
     m._dispatch_discovery()
     assert len(calls) == 1, "expected exactly one discovery exec"
     cmd, kwargs = calls[0]
@@ -92,7 +91,6 @@ def test_frozen_mcp_scan_exec_contract(frozen_module):
 @pytest.mark.parametrize("frozen_module", list(TOOL_PY), indirect=True)
 def test_frozen_discovery_missing_binary_skips_without_exec(frozen_module, monkeypatch):
     m, calls = frozen_module
-    monkeypatch.setattr(m, "_hook_discovery_enabled_for_org", lambda: True)
     monkeypatch.setattr(m, "FROZEN_DISCOVERY_BIN", str(REPO / "does-not-exist"))
     m._dispatch_discovery()
     assert calls == [], "must not exec (or fall back to download) when binary missing"

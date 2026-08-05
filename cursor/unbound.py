@@ -25,8 +25,6 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
@@ -71,6 +69,12 @@ FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery
 
 PRETOOL_NATIVE_TOOLS = {'Delete', 'Write', 'Read'}   # preToolUse → policy check
 EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exchange
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
+                     ('.claude', 'skills'), ('.codex', 'skills'))
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
@@ -662,6 +666,58 @@ def build_account_identity(event=None, probe=False):
     return identity
 
 
+# Cursor surfaces file ops through several event shapes; map each to a normalized
+# operation so a pre event (preToolUse Write/Read/Delete) and its completion
+# (afterFileEdit / beforeReadFile) for the same path hash to the same synthetic id.
+_CURSOR_FILE_OP = {
+    'Write': 'write', 'Edit': 'write', 'Delete': 'delete', 'Read': 'read',
+    'afterFileEdit': 'write', 'beforeReadFile': 'read',
+}
+
+
+def _resolve_tool_use_id(event):
+    """Stable per-call id: the native tool_use_id when Cursor supplies one, else a
+    deterministic synthetic id. The key uses ONLY fields byte-identical across the
+    before* (pre) and after* (completion) event for the same call — conversation_id,
+    generation_id, raw tool_name, and canonical content — so pre and post compute the
+    same id. MCP after* events drop the server 'command', so MCP is keyed on
+    tool_input only. Fail-open: never raises, falls back to native-or-None."""
+    try:
+        if not isinstance(event, dict):
+            return None
+        native = event.get('tool_use_id')
+        if native:
+            return native
+        hook_name = event.get('hook_event_name') or ''
+        tool_name = event.get('tool_name') or ''
+        ti = event.get('tool_input') if isinstance(event.get('tool_input'), dict) else {}
+        # File ops arrive in several shapes (preToolUse Write/Read/Delete, afterFileEdit,
+        # beforeReadFile). Normalize them to (operation, path) so a pre event and its
+        # completion for the SAME file hash to the same id -- the differing tool_name /
+        # tool_input / edits shapes would otherwise fork the id.
+        file_op = _CURSOR_FILE_OP.get(tool_name) or _CURSOR_FILE_OP.get(hook_name)
+        file_path = event.get('file_path') or ti.get('file_path') or ti.get('path')
+        if file_op and file_path:
+            tool_disc, content = 'file', file_op + ':' + str(file_path)
+        elif 'MCP' in hook_name:
+            tool_disc, content = tool_name, json.dumps(ti, sort_keys=True)
+        elif event.get('command') is not None:
+            tool_disc, content = tool_name, str(event.get('command'))
+        elif ti:
+            tool_disc, content = tool_name, json.dumps(ti, sort_keys=True)
+        else:
+            tool_disc, content = tool_name, ''
+        key = '\x1f'.join((
+            str(event.get('conversation_id') or ''),
+            str(event.get('generation_id') or ''),
+            tool_disc,
+            content,
+        ))
+        return 'unb-' + hashlib.sha256(key.encode('utf-8', 'replace')).hexdigest()[:24]
+    except Exception:
+        return event.get('tool_use_id') if isinstance(event, dict) else None
+
+
 def process_pre_tool_use(event, api_key):
     """Process preToolUse event - check policy before tool execution."""
     tool_name = event.get('tool_name', '')
@@ -706,7 +762,7 @@ def process_pre_tool_use(event, api_key):
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
-    _tuid = event.get('tool_use_id')
+    _tuid = _resolve_tool_use_id(event)
     if _tuid:
         request_body['pre_tool_use_data']['tool_use_id'] = _tuid
 
@@ -1069,6 +1125,10 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
+    _tuid = _resolve_tool_use_id(event)
+    if _tuid:
+        request_body['pre_tool_use_data']['tool_use_id'] = _tuid
+
     if not is_retry:
         request_body['first_approval_check'] = True
 
@@ -1210,6 +1270,154 @@ def _cursor_usage_from_event(event):
     }
 
 
+def _strip_git_suffix(segment):
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url):
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _get_project(cwd):
+    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
+    requests for analytics. None when cwd is missing, not a git repo, has no
+    origin, or anything fails — fully fail-open (never raises)."""
+    try:
+        if not cwd:
+            return None
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _github_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = _strip_git_suffix(parts[0])
+        repo = _strip_git_suffix(parts[1])
+        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+    except Exception:
+        return None
+
+
+def _find_git_root(path):
+    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
+    (directory, or file for linked worktrees). Pure filesystem stats — no
+    subprocess. None when outside any repo or on any error (fail-open)."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+
+
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    return {str(r).replace('\\', '/') for r in roots}
+
+
+def _skill_path_key(path):
+    """Separator-normalised path, so a read (which keeps the payload's '/')
+    and a body match (which uses str(Path), '\\' on Windows) compare equal."""
+    return path.replace('\\', '/') if isinstance(path, str) else path
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.replace('\\', '/').split('/')
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        allowed = _skill_roots(cwd)
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if '/'.join(parts[:i]) in allowed:
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
+def _project_for_paths(candidates, root_projects):
+    """First project ("<org>/<repo>") resolved from `candidates` paths.
+    `root_projects` caches origin lookups so `git remote get-url` runs at
+    most once per distinct repo. None when nothing resolves (fail-open)."""
+    try:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root]
+    except Exception:
+        pass
+    return None
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
@@ -1224,10 +1432,22 @@ def build_llm_exchange(events, api_key=None):
     request_initialized = None
     request_completed = None
     usage = None
+    # Working-dir context for per-entry project attribution: every Cursor
+    # event carries workspace_roots; shell events carry an explicit cwd.
+    workspace_cwd = None
+    workspace_roots = []
+    read_skills = set()
+    root_projects = {}
 
     for log_entry in events:
         event = log_entry.get('event', {})
         hook_event_name = event.get('hook_event_name')
+
+        if not workspace_cwd:
+            roots = event.get('workspace_roots')
+            if isinstance(roots, list) and roots and isinstance(roots[0], str):
+                workspace_cwd = roots[0]
+                workspace_roots = list(roots)
 
         if not conversation_id:
             conversation_id = event.get('conversation_id')
@@ -1250,50 +1470,102 @@ def build_llm_exchange(events, api_key=None):
             usage = _cursor_usage_from_event(event) or usage
 
         elif hook_event_name == 'beforeReadFile':
-            assistant_tool_uses.append({
+            file_path = event.get('file_path')
+            read_entry = {
                 'type': hook_event_name,
-                'file_path': event.get('file_path'),
+                'file_path': file_path,
                 'content': event.get('content', ''),
-                'attachments': event.get('attachments', [])
-            })
+                'attachments': event.get('attachments', []),
+                'tool_use_id': _resolve_tool_use_id(event),
+                'project': _project_for_paths(
+                    [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
+                    root_projects)
+            }
+            # Cursor loads a skill by reading its SKILL.md, so this read is the
+            # only skill-invocation signal it emits.
+            # Prefer the read event's own roots: the first logged event may
+            # have carried an incomplete list.
+            event_roots = [r for r in (event.get('workspace_roots') or [])
+                           if isinstance(r, str) and r]
+            skill_name = _skill_name_from_path(
+                file_path,
+                (event_roots + workspace_roots) or workspace_cwd)
+            # Re-reading one SKILL.md in a turn is still a single invocation.
+            # Keyed by path, not name: two skills can share a name under
+            # different roots and are different skills.
+            if skill_name and _skill_path_key(file_path) not in read_skills:
+                read_skills.add(_skill_path_key(file_path))
+                read_entry['skill_name'] = skill_name
+                read_entry['skill_path'] = file_path
+            assistant_tool_uses.append(read_entry)
 
         elif hook_event_name == 'postToolUse':
             tool_name = event.get('tool_name', '')
 
             if tool_name not in EXCHANGE_NATIVE_TOOLS:
                 continue
-            
+
             tool_output = event.get('tool_output', '')
+
+            # Attribute the call to the repo it worked in: the event's own
+            # cwd when present, else absolute paths inside tool_input.
+            candidates = []
+            if isinstance(event.get('cwd'), str):
+                candidates.append(event['cwd'])
+            tool_input = event.get('tool_input')
+            if isinstance(tool_input, dict):
+                for value in tool_input.values():
+                    if isinstance(value, str) and value.startswith('/'):
+                        candidates.append(os.path.dirname(value))
 
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'tool_name': tool_name,
-                'tool_input': event.get('tool_input'),
+                'tool_input': tool_input,
                 'tool_output': tool_output,
                 'duration': event.get('duration'),
-                'tool_use_id': event.get('tool_use_id')
+                'tool_use_id': _resolve_tool_use_id(event),
+                'project': _project_for_paths(candidates or [workspace_cwd], root_projects)
             })
-        
+
         elif hook_event_name == 'afterFileEdit':
+            file_path = event.get('file_path')
             assistant_tool_uses.append({
                 'type': hook_event_name,
-                'file_path': event.get('file_path'),
-                'edits': event.get('edits', [])
+                'file_path': file_path,
+                'edits': event.get('edits', []),
+                'tool_use_id': _resolve_tool_use_id(event),
+                'project': _project_for_paths(
+                    [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
+                    root_projects)
             })
-        
+
         elif hook_event_name == 'afterShellExecution':
+            command = event.get('command')
+            # The event's cwd is where the command actually ran; absolute
+            # paths in the command and the workspace root are fallbacks.
+            candidates = []
+            if isinstance(event.get('cwd'), str):
+                candidates.append(event['cwd'])
+            if isinstance(command, str):
+                candidates.extend(_ABS_PATH_RE.findall(command))
+            if not candidates and workspace_cwd:
+                candidates.append(workspace_cwd)
             assistant_tool_uses.append({
                 'type': hook_event_name,
-                'command': event.get('command'),
-                'output': event.get('output', '')
+                'command': command,
+                'output': event.get('output', ''),
+                'tool_use_id': _resolve_tool_use_id(event),
+                'project': _project_for_paths(candidates, root_projects)
             })
-        
+
         elif hook_event_name == 'afterMCPExecution':
             assistant_tool_uses.append({
                 'type': hook_event_name,
                 'tool_name': event.get('tool_name'),
                 'tool_input': event.get('tool_input'),
-                'result_json': event.get('result_json')
+                'result_json': event.get('result_json'),
+                'tool_use_id': _resolve_tool_use_id(event)
             })
         
         elif hook_event_name == 'afterAgentResponse':
@@ -1312,13 +1584,17 @@ def build_llm_exchange(events, api_key=None):
     if not messages:
         return None
     
-    if not model or model == 'default':
+    if not model or model == 'default' or model == 'unknown':
         model = 'auto'
 
     exchange = {
         'conversation_id': conversation_id,
         'model': model,
         'messages': messages,
+        'cwd': workspace_cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the workspace repo.
+        'project': _project_for_paths([workspace_cwd], root_projects),
         'account_identity': build_account_identity({'user_email': user_email}, probe=True)
     }
 
@@ -1633,69 +1909,6 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _hook_discovery_enabled_for_org() -> bool:
-    """Return whether SessionStart-triggered discovery is enabled for this
-    user's org. Reads ~/.unbound/discovery-cache.json first; refetches from
-    the gateway only when the cached value is missing or older than
-    DISCOVERY_HOOK_FLAG_TTL_SECONDS. Fail-closed: any error and no usable
-    cached value means False."""
-    cache = {}
-    if DISCOVERY_CACHE_PATH.exists():
-        try:
-            with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
-                cache = json.load(f) or {}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
-    if not isinstance(cache, dict):
-        cache = {}
-    _hd = cache.get("hook_discovery")
-    flag = _hd if isinstance(_hd, dict) else {}
-    last_fetched = flag.get("fetched_at")
-    if isinstance(last_fetched, str):
-        try:
-            ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-            if (time.time() - ts) < DISCOVERY_HOOK_FLAG_TTL_SECONDS:
-                return bool(flag.get("enabled", False))
-        except ValueError:
-            pass
-
-    try:
-        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
-        return bool(flag.get("enabled", False))
-    api_key = cfg.get("api_key")
-    if not api_key:
-        return bool(flag.get("enabled", False))
-    try:
-        r = subprocess.run(
-            ["curl", "-fsSL",
-             "-H", f"Authorization: Bearer {api_key}",
-             "--max-time", "5",
-             f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"],
-            capture_output=True, timeout=8,
-        )
-        if r.returncode != 0:
-            return bool(flag.get("enabled", False))
-        enabled = bool(json.loads(r.stdout.decode("utf-8", errors="replace")).get("enabled", False))
-    except Exception:
-        return bool(flag.get("enabled", False))
-
-    cache["hook_discovery"] = {
-        "enabled": enabled,
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, sort_keys=True)
-        os.replace(tmp, DISCOVERY_CACHE_PATH)
-    except OSError:
-        pass
-    return enabled
-
-
 def _install_sh_is_stale():
     try:
         return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
@@ -1765,8 +1978,6 @@ def _dispatch_mcp_server_scan(server_name, server_config):
 
 
 def _dispatch_discovery() -> None:
-    if not _hook_discovery_enabled_for_org():
-        return
     try:
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
