@@ -769,7 +769,10 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
         return {
             'decision': 'block',
             'reason': reason,
-            'suppressOriginalPrompt': True,
+            'hookSpecificOutput': {
+                'hookEventName': 'UserPromptSubmit',
+                'suppressOriginalPrompt': True,
+            },
         }
 
     # Allowed with injected context (e.g. the spend-limit alert-threshold
