@@ -11,7 +11,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import unbound
 
@@ -331,6 +331,7 @@ class ProcessPreToolUseBase(unittest.TestCase):
         _write_json(self.claude_json, {"mcpServers": {}})
         self.plugin_cache = self.root / "plugins" / "cache"
         self.plugin_cache.mkdir(parents=True, exist_ok=True)
+        self.dispatch_diag = MagicMock()
         self._patchers = [
             patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", self.claude_json),
             patch.object(unbound, "CLAUDE_PLUGIN_CACHE_DIR", self.plugin_cache),
@@ -342,6 +343,7 @@ class ProcessPreToolUseBase(unittest.TestCase):
             patch.object(unbound, "build_account_identity", lambda *a, **k: {}),
             patch.object(unbound, "report_error_to_gateway", lambda *a, **k: None),
             patch.object(unbound, "_dispatch_mcp_server_scan", lambda *a, **k: None),
+            patch.object(unbound, "_dispatch_mcp_diagnostic", self.dispatch_diag),
         ]
         for p in self._patchers:
             p.start()
@@ -399,6 +401,25 @@ class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
         md = self.run_capture("mcp__plugin_unknown_unknown__do_thing")
         self.assertEqual(md.get("mcp_server"), "plugin_unknown_unknown")  # unchanged
         self.assertNotIn("mcp_server_config", md)
+
+    def test_null_fingerprint_dispatches_diagnostic_without_unknown_hint(self):
+        # Regression: a null fingerprint yields a plain allow (the gateway never
+        # sets unknown_mcp_server for it), yet the diagnostic MUST still fire off
+        # the hook's own no-config result. The old code gated it on
+        # unknown_mcp_server, so it never ran for the exact case it's built for.
+        md = self.run_capture("mcp__mystery_server__do_thing")
+        self.assertNotIn("mcp_server_config", md)
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "mystery_server")
+
+    def test_resolved_config_does_not_dispatch_diagnostic(self):
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp"}}}},
+        )
+        md = self.run_capture("mcp__plugin_slack_slack__post_message")
+        self.assertIn("mcp_server_config", md)
+        self.dispatch_diag.assert_not_called()
 
     def test_config_file_server_takes_precedence_over_resolvers(self):
         # A real config-file entry must win; resolvers must not run/override it.

@@ -2109,17 +2109,20 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
-        else:
-            # Null fingerprint: log the miss and fire the resolution diagnostic.
-            if plugin_dirs is None:
-                plugin_dirs, plugin_urls = _claude_plugin_launch_values()
-            log_error(
-                f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
-                f" (plugin-dir={[str(p) for p in plugin_dirs]}"
-                f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
-                'mcp_server',
-            )
-            _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
+
+    # Null fingerprint: the hook resolved no config for a real MCP server. The
+    # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
+    # hint — so key off our own resolution result, not the gateway response.
+    if is_mcp and metadata.get('mcp_server') and not metadata.get('mcp_server_config'):
+        if plugin_dirs is None:
+            plugin_dirs, plugin_urls = _claude_plugin_launch_values()
+        log_error(
+            f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
+            f" (plugin-dir={[str(p) for p in plugin_dirs]}"
+            f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
+            'mcp_server',
+        )
+        _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
 
     return transform_response_for_claude(api_response)
 
