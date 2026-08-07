@@ -421,6 +421,23 @@ class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
         self.assertIn("mcp_server_config", md)
         self.dispatch_diag.assert_not_called()
 
+    def test_null_fingerprint_dispatches_diagnostic_on_deny(self):
+        # The real case: a null-fp MCP server the org policy DENIES (e.g. the
+        # blocked computer-use server, pretool_blocked=true). The deny path has no
+        # early return before the trigger, so the diagnostic must still dispatch.
+        def deny_gw(request_body, api_key):
+            return {"decision": "deny", "reason": "blocked", "pretool_blocked": True}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__computer-use__request_access",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api", deny_gw):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "computer-use")
+
     def test_config_file_server_takes_precedence_over_resolvers(self):
         # A real config-file entry must win; resolvers must not run/override it.
         _write_json(self.claude_json, {
