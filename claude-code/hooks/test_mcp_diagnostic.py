@@ -263,5 +263,32 @@ class TestDiagLaunchContext(unittest.TestCase):
         self.assertTrue(got is None or isinstance(got, tuple))
 
 
+class TestDiagDispatchFrozen(unittest.TestCase):
+    def _capture_cmd(self, frozen, env=None):
+        popen = MagicMock()
+        with patch.object(unbound, 'RUNNING_FROZEN', frozen), \
+             patch.object(unbound, '_mcp_diag_on_cooldown', return_value=False), \
+             patch.object(unbound, '_mcp_diag_mark_dispatched'), \
+             patch.dict('os.environ', env or {}, clear=False), \
+             patch.object(unbound.subprocess, 'Popen', popen):
+            unbound._dispatch_mcp_diagnostic('nullfp_demo', '/cwd', 'key')
+        return popen.call_args[0][0] if popen.call_args else None
+
+    def test_frozen_reinvokes_binary_subcommand(self):
+        cmd = self._capture_cmd(True, {'UNBOUND_HOOK_TOOL': 'claude-code'})
+        self.assertEqual(cmd[1:], ['mcp-diagnostic', 'claude-code'])
+
+    def test_frozen_defaults_tool_when_env_missing(self):
+        import os as _os
+        _os.environ.pop('UNBOUND_HOOK_TOOL', None)
+        cmd = self._capture_cmd(True)
+        self.assertEqual(cmd[1:], ['mcp-diagnostic', 'claude-code'])
+
+    def test_non_frozen_reinvokes_self_with_flag(self):
+        cmd = self._capture_cmd(False)
+        self.assertIn('--mcp-diagnostic', cmd)
+        self.assertTrue(cmd[1].endswith('unbound.py'))
+
+
 if __name__ == '__main__':
     unittest.main()
