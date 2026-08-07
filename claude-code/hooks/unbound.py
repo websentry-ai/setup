@@ -3647,15 +3647,23 @@ def _mcp_diag_mark_dispatched(server, cwd):
 
 
 def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
-    """Re-invoke the hook in --mcp-diagnostic mode, detached, so the slow
-    `claude mcp` CLI stays off the blocking PreToolUse path."""
-    if not server_name or not api_key or RUNNING_FROZEN:
+    """Re-invoke the diagnostic detached so the slow `claude mcp` CLI stays off
+    the blocking PreToolUse path. Frozen builds drive the binary's
+    `mcp-diagnostic` subcommand; the .py hook re-invokes itself."""
+    if not server_name or not api_key:
         return
-    try:
-        script = os.path.abspath(__file__)
-    except Exception:
-        return
-    if not os.path.isfile(script) or _mcp_diag_on_cooldown(server_name, cwd):
+    if RUNNING_FROZEN:
+        # sys.executable is the frozen unbound-hook binary itself.
+        cmd = [sys.executable, 'mcp-diagnostic', os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+    else:
+        try:
+            script = os.path.abspath(__file__)
+        except Exception:
+            return
+        if not os.path.isfile(script):
+            return
+        cmd = [sys.executable, script, '--mcp-diagnostic']
+    if _mcp_diag_on_cooldown(server_name, cwd):
         return
     # Capture Claude's launch context HERE (in-process, before the child detaches
     # and loses it) and forward it so the replay sees the real --plugin-*/--mcp-config.
@@ -3680,7 +3688,7 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
             popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs['start_new_session'] = True
-        subprocess.Popen([sys.executable, script, '--mcp-diagnostic'], **popen_kwargs)
+        subprocess.Popen(cmd, **popen_kwargs)
         # Stamp only after a successful spawn, so a failed dispatch doesn't mute 6h.
         _mcp_diag_mark_dispatched(server_name, cwd)
     except Exception as exc:
