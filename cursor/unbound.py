@@ -1216,6 +1216,30 @@ def _find_git_root(path):
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# Package-manager / OS checkouts that are real git clones but never the
+# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
+# so a command merely referencing /opt/homebrew/bin/… would otherwise
+# attribute the call to "homebrew/brew". Candidates under these roots are
+# skipped so resolution falls through to the cwd / workspace fallbacks.
+_SYSTEM_CHECKOUT_ROOTS = (
+    '/opt/homebrew',
+    '/home/linuxbrew',
+    '/nix',
+    '/usr',
+    '/Library',
+    '/System',
+)
+
+
+def _is_system_checkout_path(path):
+    try:
+        normalized = os.path.normpath(path)
+        return any(
+            normalized == root or normalized.startswith(root + '/')
+            for root in _SYSTEM_CHECKOUT_ROOTS
+        )
+    except Exception:
+        return False
 
 
 def _trusted_ancestors(start):
@@ -1361,7 +1385,9 @@ def build_llm_exchange(events, api_key=None):
                 'attachments': event.get('attachments', []),
                 'tool_use_id': _resolve_tool_use_id(event),
                 'project': _project_for_paths(
-                    [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
+                    [os.path.dirname(file_path)]
+                    if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
+                    else [],
                     root_projects)
             }
             # Cursor loads a skill by reading its SKILL.md, so this read is the
@@ -1398,7 +1424,7 @@ def build_llm_exchange(events, api_key=None):
             tool_input = event.get('tool_input')
             if isinstance(tool_input, dict):
                 for value in tool_input.values():
-                    if isinstance(value, str) and value.startswith('/'):
+                    if isinstance(value, str) and value.startswith('/') and not _is_system_checkout_path(value):
                         candidates.append(os.path.dirname(value))
 
             assistant_tool_uses.append({
@@ -1419,7 +1445,9 @@ def build_llm_exchange(events, api_key=None):
                 'edits': event.get('edits', []),
                 'tool_use_id': _resolve_tool_use_id(event),
                 'project': _project_for_paths(
-                    [os.path.dirname(file_path)] if isinstance(file_path, str) and file_path.startswith('/') else [],
+                    [os.path.dirname(file_path)]
+                    if isinstance(file_path, str) and file_path.startswith('/') and not _is_system_checkout_path(file_path)
+                    else [],
                     root_projects)
             })
 
@@ -1431,7 +1459,9 @@ def build_llm_exchange(events, api_key=None):
             if isinstance(event.get('cwd'), str):
                 candidates.append(event['cwd'])
             if isinstance(command, str):
-                candidates.extend(_ABS_PATH_RE.findall(command))
+                candidates.extend(
+                    p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
+                )
             if not candidates and workspace_cwd:
                 candidates.append(workspace_cwd)
             assistant_tool_uses.append({

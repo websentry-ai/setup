@@ -194,3 +194,21 @@ def test_frozen_binary_session_start_makes_no_downloads(discovery_enabled_home):
     assert got.returncode == 0
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
     assert not (home / ".claude" / "hooks" / ".self_update_check").exists()
+
+
+def test_mcp_diagnostic_subcommand_fails_open(sandbox_home):
+    # The frozen `mcp-diagnostic <tool>` subcommand builds + uploads the report
+    # from env; with a dead gateway it must still exit 0 (fail-open), never hang.
+    res = run_cli_dev(
+        ["mcp-diagnostic", "claude-code"], None, sandbox_home,
+        extra_env={"UNBOUND_DIAG_SERVER": "nullfp_demo",
+                   "UNBOUND_DIAG_API_KEY": "test-key",
+                   "UNBOUND_DIAG_CWD": str(sandbox_home)},
+        stdin_close=True,
+    )
+    assert res.returncode == 0
+
+
+def test_mcp_diagnostic_unknown_tool_is_noop(sandbox_home):
+    res = run_cli_dev(["mcp-diagnostic", "not-a-tool"], None, sandbox_home, stdin_close=True)
+    assert res.returncode == 0

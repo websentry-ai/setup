@@ -1601,6 +1601,30 @@ def _find_git_root(path):
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# Package-manager / OS checkouts that are real git clones but never the
+# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
+# so a command merely referencing /opt/homebrew/bin/… would otherwise
+# attribute the call to "homebrew/brew". Candidates under these roots are
+# skipped so resolution falls through to the shell's working directory.
+_SYSTEM_CHECKOUT_ROOTS = (
+    '/opt/homebrew',
+    '/home/linuxbrew',
+    '/nix',
+    '/usr',
+    '/Library',
+    '/System',
+)
+
+
+def _is_system_checkout_path(path):
+    try:
+        normalized = os.path.normpath(path)
+        return any(
+            normalized == root or normalized.startswith(root + '/')
+            for root in _SYSTEM_CHECKOUT_ROOTS
+        )
+    except Exception:
+        return False
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the shell's working directory across the turn's shell commands.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
@@ -1713,7 +1737,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         }
         candidates = []
         if isinstance(command, str):
-            candidates.extend(_ABS_PATH_RE.findall(command))
+            candidates.extend(p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p))
             shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
         if not candidates and shell_state.get('dir'):
             candidates.append(shell_state['dir'])
@@ -1726,6 +1750,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             'content': result_content or '',
         }
         abs_path = _abs(file_path)
+        if abs_path and _is_system_checkout_path(abs_path):
+            abs_path = None
         project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     elif name in WRITE_TOOLS or name in EDIT_TOOLS:
         file_path = (args.get('filePath') or args.get('path') or args.get('file_path')
@@ -1736,6 +1762,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             'content': args.get('content') or args.get('file_text') or result_content or '',
         }
         abs_path = _abs(file_path)
+        if abs_path and _is_system_checkout_path(abs_path):
+            abs_path = None
         project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
         entry = {
@@ -1745,7 +1773,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             'result_json': result_content or '',
         }
         try:
-            candidates = _ABS_PATH_RE.findall(json.dumps(args))
+            candidates = [p for p in _ABS_PATH_RE.findall(json.dumps(args)) if not _is_system_checkout_path(p)]
         except Exception:
             candidates = []
         project = _project_for_paths(candidates, root_projects)

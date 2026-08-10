@@ -2114,17 +2114,20 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
-        else:
-            # Null fingerprint: log the miss and fire the resolution diagnostic.
-            if plugin_dirs is None:
-                plugin_dirs, plugin_urls = _claude_plugin_launch_values()
-            log_error(
-                f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
-                f" (plugin-dir={[str(p) for p in plugin_dirs]}"
-                f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
-                'mcp_server',
-            )
-            _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
+
+    # Null fingerprint: the hook resolved no config for a real MCP server. The
+    # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
+    # hint — so key off our own resolution result, not the gateway response.
+    if is_mcp and metadata.get('mcp_server') and not metadata.get('mcp_server_config'):
+        if plugin_dirs is None:
+            plugin_dirs, plugin_urls = _claude_plugin_launch_values()
+        log_error(
+            f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
+            f" (plugin-dir={[str(p) for p in plugin_dirs]}"
+            f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
+            'mcp_server',
+        )
+        _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
 
     return transform_response_for_claude(api_response)
 
@@ -2218,6 +2221,30 @@ _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 # Left boundary required so the slash inside a relative token (tests/webapp/)
 # doesn't read as an absolute path.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# Package-manager / OS checkouts that are real git clones but never the
+# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
+# so a command merely referencing /opt/homebrew/bin/… would otherwise
+# attribute the call to "homebrew/brew". Candidates under these roots are
+# skipped so resolution falls through to the shell's working directory.
+_SYSTEM_CHECKOUT_ROOTS = (
+    '/opt/homebrew',
+    '/home/linuxbrew',
+    '/nix',
+    '/usr',
+    '/Library',
+    '/System',
+)
+
+
+def _is_system_checkout_path(path: str) -> bool:
+    try:
+        normalized = os.path.normpath(path)
+        return any(
+            normalized == root or normalized.startswith(root + '/')
+            for root in _SYSTEM_CHECKOUT_ROOTS
+        )
+    except Exception:
+        return False
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
@@ -2274,16 +2301,18 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         candidates = []
         if tool_name in _WRITE_TOOLS:
             path = tool_input.get('file_path') or tool_input.get('notebook_path')
-            if isinstance(path, str) and path.startswith('/'):
+            if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
                 candidates.append(os.path.dirname(path))
         elif tool_name in _READ_TOOLS:
             path = tool_input.get('file_path') or tool_input.get('path')
-            if isinstance(path, str) and path.startswith('/'):
+            if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
                 candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
         elif tool_name == 'Bash':
             command = tool_input.get('command')
             if isinstance(command, str):
-                candidates.extend(_ABS_PATH_RE.findall(command))
+                candidates.extend(
+                    p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
+                )
                 shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)
@@ -3649,15 +3678,23 @@ def _mcp_diag_mark_dispatched(server, cwd):
 
 
 def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
-    """Re-invoke the hook in --mcp-diagnostic mode, detached, so the slow
-    `claude mcp` CLI stays off the blocking PreToolUse path."""
-    if not server_name or not api_key or RUNNING_FROZEN:
+    """Re-invoke the diagnostic detached so the slow `claude mcp` CLI stays off
+    the blocking PreToolUse path. Frozen builds drive the binary's
+    `mcp-diagnostic` subcommand; the .py hook re-invokes itself."""
+    if not server_name or not api_key:
         return
-    try:
-        script = os.path.abspath(__file__)
-    except Exception:
-        return
-    if not os.path.isfile(script) or _mcp_diag_on_cooldown(server_name, cwd):
+    if RUNNING_FROZEN:
+        # sys.executable is the frozen unbound-hook binary itself.
+        cmd = [sys.executable, 'mcp-diagnostic', os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+    else:
+        try:
+            script = os.path.abspath(__file__)
+        except Exception:
+            return
+        if not os.path.isfile(script):
+            return
+        cmd = [sys.executable, script, '--mcp-diagnostic']
+    if _mcp_diag_on_cooldown(server_name, cwd):
         return
     # Capture Claude's launch context HERE (in-process, before the child detaches
     # and loses it) and forward it so the replay sees the real --plugin-*/--mcp-config.
@@ -3682,7 +3719,7 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
             popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs['start_new_session'] = True
-        subprocess.Popen([sys.executable, script, '--mcp-diagnostic'], **popen_kwargs)
+        subprocess.Popen(cmd, **popen_kwargs)
         # Stamp only after a successful spawn, so a failed dispatch doesn't mute 6h.
         _mcp_diag_mark_dispatched(server_name, cwd)
     except Exception as exc:
