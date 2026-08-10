@@ -2026,6 +2026,10 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
+    # Raw CLAUDE_CODE_ENTRYPOINT, forwarded so the gateway can tell a headless
+    # session (sdk-cli/sdk-ts/sdk-py) apart from an interactive one.
+    client_entrypoint = os.environ.get('CLAUDE_CODE_ENTRYPOINT', 'cli')
+
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': _unbound_app_label(event),
@@ -2037,6 +2041,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'metadata': metadata
         },
         'account_identity': build_account_identity(),
+        'client_entrypoint': client_entrypoint,
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
