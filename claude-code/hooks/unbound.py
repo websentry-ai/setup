@@ -2109,17 +2109,20 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
-        else:
-            # Null fingerprint: log the miss and fire the resolution diagnostic.
-            if plugin_dirs is None:
-                plugin_dirs, plugin_urls = _claude_plugin_launch_values()
-            log_error(
-                f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
-                f" (plugin-dir={[str(p) for p in plugin_dirs]}"
-                f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
-                'mcp_server',
-            )
-            _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
+
+    # Null fingerprint: the hook resolved no config for a real MCP server. The
+    # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
+    # hint — so key off our own resolution result, not the gateway response.
+    if is_mcp and metadata.get('mcp_server') and not metadata.get('mcp_server_config'):
+        if plugin_dirs is None:
+            plugin_dirs, plugin_urls = _claude_plugin_launch_values()
+        log_error(
+            f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
+            f" (plugin-dir={[str(p) for p in plugin_dirs]}"
+            f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
+            'mcp_server',
+        )
+        _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
 
     return transform_response_for_claude(api_response)
 
@@ -3644,15 +3647,23 @@ def _mcp_diag_mark_dispatched(server, cwd):
 
 
 def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
-    """Re-invoke the hook in --mcp-diagnostic mode, detached, so the slow
-    `claude mcp` CLI stays off the blocking PreToolUse path."""
-    if not server_name or not api_key or RUNNING_FROZEN:
+    """Re-invoke the diagnostic detached so the slow `claude mcp` CLI stays off
+    the blocking PreToolUse path. Frozen builds drive the binary's
+    `mcp-diagnostic` subcommand; the .py hook re-invokes itself."""
+    if not server_name or not api_key:
         return
-    try:
-        script = os.path.abspath(__file__)
-    except Exception:
-        return
-    if not os.path.isfile(script) or _mcp_diag_on_cooldown(server_name, cwd):
+    if RUNNING_FROZEN:
+        # sys.executable is the frozen unbound-hook binary itself.
+        cmd = [sys.executable, 'mcp-diagnostic', os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+    else:
+        try:
+            script = os.path.abspath(__file__)
+        except Exception:
+            return
+        if not os.path.isfile(script):
+            return
+        cmd = [sys.executable, script, '--mcp-diagnostic']
+    if _mcp_diag_on_cooldown(server_name, cwd):
         return
     # Capture Claude's launch context HERE (in-process, before the child detaches
     # and loses it) and forward it so the replay sees the real --plugin-*/--mcp-config.
@@ -3677,7 +3688,7 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
             popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs['start_new_session'] = True
-        subprocess.Popen([sys.executable, script, '--mcp-diagnostic'], **popen_kwargs)
+        subprocess.Popen(cmd, **popen_kwargs)
         # Stamp only after a successful spawn, so a failed dispatch doesn't mute 6h.
         _mcp_diag_mark_dispatched(server_name, cwd)
     except Exception as exc:
