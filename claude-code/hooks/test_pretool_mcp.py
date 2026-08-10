@@ -8,6 +8,7 @@ to give the gateway a non-null fingerprint.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -396,6 +397,53 @@ class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
         self.assertEqual(md.get("mcp_server"), "claude.ai Slack")
         self.assertEqual(md.get("mcp_tool"), "send_message")  # tool half preserved through rewrite
         self.assertEqual(md.get("mcp_server_config"), {"additional_data": {"scope": "claudeai"}})
+
+    def test_client_entrypoint_forwarded_from_env(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        with patch.object(unbound, "send_to_hook_api", capturing_gw), \
+             patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(captured["body"].get("client_entrypoint"), "sdk-cli")
+
+    def test_client_entrypoint_defaults_to_cli_when_unset(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        env_without_entrypoint = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_ENTRYPOINT"}
+        with patch.object(unbound, "send_to_hook_api", capturing_gw), \
+             patch.dict(os.environ, env_without_entrypoint, clear=True):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(captured["body"].get("client_entrypoint"), "cli")
 
     def test_unresolved_mcp_carries_no_config(self):
         md = self.run_capture("mcp__plugin_unknown_unknown__do_thing")
