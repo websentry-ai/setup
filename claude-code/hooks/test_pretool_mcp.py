@@ -438,6 +438,24 @@ class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
         self.dispatch_diag.assert_called_once()
         self.assertEqual(self.dispatch_diag.call_args[0][0], "computer-use")
 
+    def test_null_fingerprint_dispatches_diagnostic_on_approval_required(self):
+        # The approval_required path returns before the response-based triggers,
+        # so the diagnostic must fire off our own no-config result, which happens
+        # before any decision/approval return. Guards against moving it back down.
+        def approval_gw(request_body, api_key):
+            return {"decision": "approval_required", "policy_ids": [], "application_id": ""}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__mystery_server__do_thing",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api", approval_gw), \
+             patch.object(unbound, "_handle_approval_required_response", lambda *a, **k: {}):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "mystery_server")
+
     def test_config_file_server_takes_precedence_over_resolvers(self):
         # A real config-file entry must win; resolvers must not run/override it.
         _write_json(self.claude_json, {
