@@ -38,7 +38,12 @@ COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
 })
 
-CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
+# CLAUDE_CONFIG_DIR relocates .claude.json entirely; read the file Claude uses.
+CLAUDE_MCP_CONFIG_PATH = (
+    Path(os.environ['CLAUDE_CONFIG_DIR']) / '.claude.json'
+    if os.environ.get('CLAUDE_CONFIG_DIR')
+    else Path.home() / '.claude.json'
+)
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
