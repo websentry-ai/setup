@@ -15,6 +15,7 @@ _RESOLVERS_MISS = (
     '_resolve_plugin_mcp_config',
     '_resolve_claude_code_session_connector',
     '_resolve_launch_mcp_config',
+    '_read_mcp_server_config_worktree_union',
 )
 
 
@@ -56,7 +57,7 @@ class TestDiagResolutionLadder(unittest.TestCase):
             for p in patchers:
                 p.stop()
 
-    def test_all_six_sources_present(self):
+    def test_all_seven_sources_present(self):
         r = self._run(
             'some-server',
             [patch.object(unbound, '_resolve_plugin_mcp_config_by_server_key', return_value=None)],
@@ -64,7 +65,8 @@ class TestDiagResolutionLadder(unittest.TestCase):
         self.assertEqual(
             set(r['sources']),
             {'claude_json', 'claude_ai_connector', 'plugin_cache',
-             'session_connector', 'launch_config', 'plugin_by_key'},
+             'session_connector', 'launch_config', 'plugin_by_key',
+             'worktree_union'},
         )
         self.assertFalse(r['resolved'])
 
