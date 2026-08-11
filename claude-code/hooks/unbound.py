@@ -88,7 +88,7 @@ APPROVAL_POLL_PHASES = (
 
 MCP_DIAG_STAMP_DIR = Path.home() / ".unbound" / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
-MCP_DIAG_VERSION = "v2"
+MCP_DIAG_VERSION = "v3"
 MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
 _DIAG_CLAUDE_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
 
@@ -3505,16 +3505,83 @@ def _diag_plugin_registries():
     return out
 
 
+def _diag_scrub_cmdline(tokens, cap=1500):
+    """Scrub a command line token-by-token so one secret redacts alone."""
+    try:
+        out = []
+        redact_next = False
+        for t in tokens:
+            s = str(t)
+            if redact_next and not s.startswith('-'):
+                out.append('<redacted>')
+                redact_next = False
+                continue
+            redact_next = False
+            if _MCP_DIAG_SECRETISH.search(s):
+                out.append('<redacted>')
+                # A bare `--api-key VALUE` pair: the value token carries no
+                # keyword, so redact it via lookahead unless it was inline (=).
+                redact_next = '=' not in s
+                continue
+            out.append(re.sub(r'(://)[^/@\s]*@', r'\1', s)[:600])
+        return ' '.join(out)[:cap]
+    except Exception:
+        return None
+
+
 def _diag_launch_flags(ps_out):
+    """Full scrubbed command line of every running claude process."""
     rows = []
     for l in ps_out.splitlines():
         if 'claude' not in l or 'mcp-diagnostic' in l or ' grep ' in l:
             continue
-        flags = re.findall(
-            r'--(?:mcp-config|strict-mcp-config|settings|add-dir|permission-mode)(?:[= ]\S+)?', l)
-        if flags:
-            rows.append(_diag_scrub_value(' '.join(flags)))
-    return rows[:15]
+        parts = l.split(None, 2)
+        args = parts[2] if len(parts) == 3 else l
+        if 'claude' not in args:
+            continue
+        row = _diag_scrub_cmdline(args.split())
+        if row:
+            rows.append(row)
+    return rows[:10]
+
+
+def _diag_launch_argv():
+    """The session's own Claude ancestor argv, scrubbed."""
+    try:
+        found = _claude_launch_argv()
+        if not found:
+            return None
+        return _diag_scrub_cmdline(found[1], cap=6000)
+    except Exception:
+        return None
+
+
+def _mcp_diag_worktrees(server, cwd):
+    """The .git pointer for cwd and each worktree root's project-entry servers."""
+    out = {'git_root': None, 'dot_git': None, 'roots': []}
+    try:
+        start = os.path.abspath(cwd) if cwd else os.getcwd()
+        root = _find_git_root(start)
+        out['git_root'] = root
+        if not root:
+            return out
+        dot_git = Path(root) / '.git'
+        out['dot_git'] = (dot_git.read_text(encoding='utf-8').strip()[:300]
+                          if dot_git.is_file() else '<directory>')
+        try:
+            projects = json.loads(
+                CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8')).get('projects') or {}
+        except Exception:
+            projects = {}
+        for r in _git_worktree_roots(start):
+            entry = projects.get(r.replace('\\', '/').rstrip('/'))
+            servers = entry.get('mcpServers') if isinstance(entry, dict) else None
+            names = sorted(servers.keys()) if isinstance(servers, dict) else []
+            out['roots'].append(
+                {'root': r, 'servers': names[:20], 'has_target': server in names})
+    except Exception:
+        pass
+    return out
 
 
 def _diag_settings_registration(cwd):
@@ -3582,6 +3649,8 @@ def _build_mcp_diagnostic(server, cwd):
         'hook': _mcp_diag_hook_info(cwd),
         'hook_registration': _diag_settings_registration(cwd),
         'resolution': _mcp_diag_resolution(server, cwd),
+        'worktrees': _mcp_diag_worktrees(server, cwd),
+        'launch_argv': _diag_launch_argv(),
         'claude_json': _mcp_diag_claude_json(server, cwd),
         'project_mcp_json': _mcp_diag_project_mcp_json(cwd),
         'mcp_inventory': inventory,
@@ -3677,6 +3746,15 @@ def _render_mcp_diagnostic(d):
     if res.get('config'):
         kv('config', json.dumps(res['config']))
 
+    head('git worktree chain (claude unions local scope across these roots)')
+    wt = d.get('worktrees') or {}
+    kv('git_root', wt.get('git_root'))
+    kv('.git', wt.get('dot_git'))
+    for r in (wt.get('roots') or []):
+        mark = '   <-- has target' if r.get('has_target') else ''
+        L.append('  %s   servers=[%s]%s' % (
+            r.get('root'), ', '.join(r.get('servers') or []), mark))
+
     head('MCP server inventory (every source on disk)')
     for it in (d.get('mcp_inventory') or []):
         L.append('  %s   (%s)' % (it.get('source'), it.get('file')))
@@ -3697,7 +3775,10 @@ def _render_mcp_diagnostic(d):
     for k, v in (d.get('plugin_registries') or {}).items():
         kv('  ' + k, v if isinstance(v, str) else ', '.join(v))
 
-    head('claude processes / launch flags')
+    head('claude launch command (session ancestor)')
+    L.append(d.get('launch_argv') or '<not found>')
+
+    head('claude processes (full scrubbed command lines)')
     for f in (d.get('launch_flags') or []):
         L.append('  %s' % f)
 
