@@ -1672,6 +1672,34 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
         return None
 
 
+def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
+                                           cwd: Optional[str] = None) -> Optional[Dict]:
+    """Claude unions local-scope servers across all linked worktrees of cwd's
+    repo, so a sibling checkout's project entry can be live here too."""
+    try:
+        if not cwd or not config_path.exists():
+            return None
+        roots = _git_worktree_roots(cwd)
+        if not roots:
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            projects = (json.loads(f.read()) or {}).get('projects')
+        if not isinstance(projects, dict):
+            return None
+        for root in roots:
+            proj_data = projects.get(root.replace('\\', '/').rstrip('/'))
+            if not isinstance(proj_data, dict):
+                continue
+            proj_servers = proj_data.get('mcpServers', {})
+            if isinstance(proj_servers, dict) and server_name in proj_servers:
+                result = _extract_mcp_server_fields(proj_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+        return None
+    except Exception:
+        return None
+
+
 def _email_domain(email: Optional[str]) -> Optional[str]:
     try:
         if email and '@' in email:
@@ -2023,6 +2051,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                                 if fallback_cfg:
                                     metadata['mcp_server_config'] = fallback_cfg
 
+            if not metadata.get('mcp_server_config'):
+                union_cfg = _read_mcp_server_config_worktree_union(
+                    mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+                )
+                if union_cfg:
+                    metadata['mcp_server_config'] = union_cfg
+
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
@@ -2262,6 +2297,46 @@ def _find_git_root(path: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _git_worktree_roots(path: str) -> List[str]:
+    """Worktree roots of the repo containing `path`, main checkout first.
+    Pure file reads, no git subprocess; [] outside a repo or on any error."""
+    try:
+        root = _find_git_root(path)
+        if not root:
+            return []
+        dot_git = Path(root) / '.git'
+        if dot_git.is_dir():
+            common = dot_git
+            main_root = root
+        else:
+            target = dot_git.read_text(encoding='utf-8').strip()
+            if not target.startswith('gitdir:'):
+                return []
+            # gitdir pointers may be relative; git resolves them against the
+            # directory holding them, so mirror that.
+            gitdir = Path(os.path.normpath(
+                os.path.join(root, target[len('gitdir:'):].strip())))
+            if gitdir.parent.name != 'worktrees' or gitdir.parent.parent.name != '.git':
+                return []
+            common = gitdir.parent.parent
+            main_root = str(common.parent)
+        roots = [main_root]
+        wt_dir = common / 'worktrees'
+        if wt_dir.is_dir():
+            for entry in sorted(wt_dir.iterdir()):
+                try:
+                    linked = (entry / 'gitdir').read_text(encoding='utf-8').strip()
+                except OSError:
+                    continue
+                wt_root = str(Path(os.path.normpath(
+                    os.path.join(str(entry), linked))).parent)
+                if wt_root not in roots:
+                    roots.append(wt_root)
+        return roots
+    except Exception:
+        return []
 
 
 def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
@@ -3096,6 +3171,8 @@ def _mcp_diag_resolution(server, cwd):
          lambda: (_resolve_claude_code_session_connector(server) or (None, None))[1]),
         ('launch_config', lambda: _resolve_launch_mcp_config(server)),
         ('plugin_by_key', _plugin_by_key),
+        ('worktree_union',
+         lambda: _read_mcp_server_config_worktree_union(server, CLAUDE_MCP_CONFIG_PATH, cwd=cwd)),
     )
     _suppress_error_logging = True
     try:
