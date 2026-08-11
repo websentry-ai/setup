@@ -38,7 +38,12 @@ COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
 })
 
-CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
+# CLAUDE_CONFIG_DIR relocates .claude.json entirely; read the file Claude uses.
+CLAUDE_MCP_CONFIG_PATH = (
+    Path(os.environ['CLAUDE_CONFIG_DIR']) / '.claude.json'
+    if os.environ.get('CLAUDE_CONFIG_DIR')
+    else Path.home() / '.claude.json'
+)
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
@@ -88,7 +93,7 @@ APPROVAL_POLL_PHASES = (
 
 MCP_DIAG_STAMP_DIR = Path.home() / ".unbound" / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
-MCP_DIAG_VERSION = "v2"
+MCP_DIAG_VERSION = "v3"
 MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
 _DIAG_CLAUDE_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
 
@@ -1672,6 +1677,34 @@ def _read_mcp_server_config(server_name: str, config_path: Path, cwd: Optional[s
         return None
 
 
+def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
+                                           cwd: Optional[str] = None) -> Optional[Dict]:
+    """Claude unions local-scope servers across all linked worktrees of cwd's
+    repo, so a sibling checkout's project entry can be live here too."""
+    try:
+        if not cwd or not config_path.exists():
+            return None
+        roots = _git_worktree_roots(cwd)
+        if not roots:
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            projects = (json.loads(f.read()) or {}).get('projects')
+        if not isinstance(projects, dict):
+            return None
+        for root in roots:
+            proj_data = projects.get(root.replace('\\', '/').rstrip('/'))
+            if not isinstance(proj_data, dict):
+                continue
+            proj_servers = proj_data.get('mcpServers', {})
+            if isinstance(proj_servers, dict) and server_name in proj_servers:
+                result = _extract_mcp_server_fields(proj_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+        return None
+    except Exception:
+        return None
+
+
 def _email_domain(email: Optional[str]) -> Optional[str]:
     try:
         if email and '@' in email:
@@ -2023,6 +2056,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                                 if fallback_cfg:
                                     metadata['mcp_server_config'] = fallback_cfg
 
+            if not metadata.get('mcp_server_config'):
+                union_cfg = _read_mcp_server_config_worktree_union(
+                    mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+                )
+                if union_cfg:
+                    metadata['mcp_server_config'] = union_cfg
+
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
@@ -2262,6 +2302,46 @@ def _find_git_root(path: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _git_worktree_roots(path: str) -> List[str]:
+    """Worktree roots of the repo containing `path`, main checkout first.
+    Pure file reads, no git subprocess; [] outside a repo or on any error."""
+    try:
+        root = _find_git_root(path)
+        if not root:
+            return []
+        dot_git = Path(root) / '.git'
+        if dot_git.is_dir():
+            common = dot_git
+            main_root = root
+        else:
+            target = dot_git.read_text(encoding='utf-8').strip()
+            if not target.startswith('gitdir:'):
+                return []
+            # gitdir pointers may be relative; git resolves them against the
+            # directory holding them, so mirror that.
+            gitdir = Path(os.path.normpath(
+                os.path.join(root, target[len('gitdir:'):].strip())))
+            if gitdir.parent.name != 'worktrees' or gitdir.parent.parent.name != '.git':
+                return []
+            common = gitdir.parent.parent
+            main_root = str(common.parent)
+        roots = [main_root]
+        wt_dir = common / 'worktrees'
+        if wt_dir.is_dir():
+            for entry in sorted(wt_dir.iterdir()):
+                try:
+                    linked = (entry / 'gitdir').read_text(encoding='utf-8').strip()
+                except OSError:
+                    continue
+                wt_root = str(Path(os.path.normpath(
+                    os.path.join(str(entry), linked))).parent)
+                if wt_root not in roots:
+                    roots.append(wt_root)
+        return roots
+    except Exception:
+        return []
 
 
 def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
@@ -3096,6 +3176,8 @@ def _mcp_diag_resolution(server, cwd):
          lambda: (_resolve_claude_code_session_connector(server) or (None, None))[1]),
         ('launch_config', lambda: _resolve_launch_mcp_config(server)),
         ('plugin_by_key', _plugin_by_key),
+        ('worktree_union',
+         lambda: _read_mcp_server_config_worktree_union(server, CLAUDE_MCP_CONFIG_PATH, cwd=cwd)),
     )
     _suppress_error_logging = True
     try:
@@ -3428,16 +3510,92 @@ def _diag_plugin_registries():
     return out
 
 
+_DIAG_SECRET_VALUE = re.compile(
+    r'^(sk-|sk_live_|sk_test_|ghp_|gho_|ghu_|ghs_|github_pat_|xox[baprs]-'
+    r'|glpat-|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,})'
+    r'|^[A-Za-z0-9+_=-]{32,}$'
+)
+
+
+def _diag_scrub_cmdline(tokens, cap=1500):
+    """Scrub a command line token-by-token so one secret redacts alone."""
+    try:
+        out = []
+        redact_next = False
+        for t in tokens:
+            s = str(t)
+            if redact_next and not s.startswith('-'):
+                out.append('<redacted>')
+                redact_next = False
+                continue
+            redact_next = False
+            candidates = [s.strip('\'"')]
+            if '=' in s:
+                candidates.append(s.split('=', 1)[1].strip('\'"'))
+            keyword_hit = _MCP_DIAG_SECRETISH.search(s)
+            if keyword_hit or any(_DIAG_SECRET_VALUE.match(c) for c in candidates):
+                out.append('<redacted>')
+                redact_next = bool(keyword_hit) and s.startswith('-') and '=' not in s
+                continue
+            out.append(re.sub(r'(://)[^/@\s]*@', r'\1', s)[:600])
+        return ' '.join(out)[:cap]
+    except Exception:
+        return None
+
+
 def _diag_launch_flags(ps_out):
+    """Full scrubbed command line of every running claude process."""
     rows = []
     for l in ps_out.splitlines():
         if 'claude' not in l or 'mcp-diagnostic' in l or ' grep ' in l:
             continue
-        flags = re.findall(
-            r'--(?:mcp-config|strict-mcp-config|settings|add-dir|permission-mode)(?:[= ]\S+)?', l)
-        if flags:
-            rows.append(_diag_scrub_value(' '.join(flags)))
-    return rows[:15]
+        parts = l.split(None, 2)
+        args = parts[2] if len(parts) == 3 else l
+        if 'claude' not in args:
+            continue
+        row = _diag_scrub_cmdline(args.split())
+        if row:
+            rows.append(row)
+    return rows[:10]
+
+
+def _diag_launch_argv():
+    """The session's own Claude ancestor argv, scrubbed."""
+    try:
+        found = _claude_launch_argv()
+        if not found:
+            return None
+        return _diag_scrub_cmdline(found[1], cap=6000)
+    except Exception:
+        return None
+
+
+def _mcp_diag_worktrees(server, cwd):
+    """The .git pointer for cwd and each worktree root's project-entry servers."""
+    out = {'git_root': None, 'dot_git': None, 'roots': []}
+    try:
+        start = os.path.abspath(cwd) if cwd else os.getcwd()
+        root = _find_git_root(start)
+        out['git_root'] = root
+        if not root:
+            return out
+        dot_git = Path(root) / '.git'
+        out['dot_git'] = (dot_git.read_text(encoding='utf-8').strip()[:300]
+                          if dot_git.is_file() else '<directory>')
+        try:
+            projects = json.loads(
+                CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8')).get('projects') or {}
+        except Exception:
+            projects = {}
+        for r in _git_worktree_roots(start):
+            entry = projects.get(r.replace('\\', '/').rstrip('/'))
+            servers = entry.get('mcpServers') if isinstance(entry, dict) else None
+            names = sorted(servers.keys()) if isinstance(servers, dict) else []
+            out['roots'].append(
+                {'root': r, 'servers': names[:20], 'has_target': server in names})
+    except Exception:
+        pass
+    return out
 
 
 def _diag_settings_registration(cwd):
@@ -3505,6 +3663,8 @@ def _build_mcp_diagnostic(server, cwd):
         'hook': _mcp_diag_hook_info(cwd),
         'hook_registration': _diag_settings_registration(cwd),
         'resolution': _mcp_diag_resolution(server, cwd),
+        'worktrees': _mcp_diag_worktrees(server, cwd),
+        'launch_argv': _diag_launch_argv(),
         'claude_json': _mcp_diag_claude_json(server, cwd),
         'project_mcp_json': _mcp_diag_project_mcp_json(cwd),
         'mcp_inventory': inventory,
@@ -3600,6 +3760,15 @@ def _render_mcp_diagnostic(d):
     if res.get('config'):
         kv('config', json.dumps(res['config']))
 
+    head('git worktree chain (claude unions local scope across these roots)')
+    wt = d.get('worktrees') or {}
+    kv('git_root', wt.get('git_root'))
+    kv('.git', wt.get('dot_git'))
+    for r in (wt.get('roots') or []):
+        mark = '   <-- has target' if r.get('has_target') else ''
+        L.append('  %s   servers=[%s]%s' % (
+            r.get('root'), ', '.join(r.get('servers') or []), mark))
+
     head('MCP server inventory (every source on disk)')
     for it in (d.get('mcp_inventory') or []):
         L.append('  %s   (%s)' % (it.get('source'), it.get('file')))
@@ -3620,7 +3789,10 @@ def _render_mcp_diagnostic(d):
     for k, v in (d.get('plugin_registries') or {}).items():
         kv('  ' + k, v if isinstance(v, str) else ', '.join(v))
 
-    head('claude processes / launch flags')
+    head('claude launch command (session ancestor)')
+    L.append(d.get('launch_argv') or '<not found>')
+
+    head('claude processes (full scrubbed command lines)')
     for f in (d.get('launch_flags') or []):
         L.append('  %s' % f)
 
