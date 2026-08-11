@@ -3510,6 +3510,13 @@ def _diag_plugin_registries():
     return out
 
 
+_DIAG_SECRET_VALUE = re.compile(
+    r'^(sk-|sk_live_|sk_test_|ghp_|gho_|ghu_|ghs_|github_pat_|xox[baprs]-'
+    r'|glpat-|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,})'
+    r'|^[A-Za-z0-9+_=-]{32,}$'
+)
+
+
 def _diag_scrub_cmdline(tokens, cap=1500):
     """Scrub a command line token-by-token so one secret redacts alone."""
     try:
@@ -3522,10 +3529,9 @@ def _diag_scrub_cmdline(tokens, cap=1500):
                 redact_next = False
                 continue
             redact_next = False
-            if _MCP_DIAG_SECRETISH.search(s):
+            value = s.split('=', 1)[1] if '=' in s else s
+            if _MCP_DIAG_SECRETISH.search(s) or _DIAG_SECRET_VALUE.match(value):
                 out.append('<redacted>')
-                # A bare `--api-key VALUE` pair: the value token carries no
-                # keyword, so redact it via lookahead unless it was inline (=).
                 redact_next = '=' not in s
                 continue
             out.append(re.sub(r'(://)[^/@\s]*@', r'\1', s)[:600])
