@@ -38,7 +38,12 @@ COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
 })
 
-CLAUDE_MCP_CONFIG_PATH = Path.home() / ".claude.json"
+# CLAUDE_CONFIG_DIR relocates .claude.json entirely; read the file Claude uses.
+CLAUDE_MCP_CONFIG_PATH = (
+    Path(os.environ['CLAUDE_CONFIG_DIR']) / '.claude.json'
+    if os.environ.get('CLAUDE_CONFIG_DIR')
+    else Path.home() / '.claude.json'
+)
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
@@ -88,7 +93,7 @@ APPROVAL_POLL_PHASES = (
 
 MCP_DIAG_STAMP_DIR = Path.home() / ".unbound" / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
-MCP_DIAG_VERSION = "v2"
+MCP_DIAG_VERSION = "v3"
 MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
 _DIAG_CLAUDE_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
 
@@ -1770,6 +1775,34 @@ def _lookup_tool_content_hash(server_name, mcp_tool, server_cfg):
         return None
 
 
+def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
+                                           cwd: Optional[str] = None) -> Optional[Dict]:
+    """Claude unions local-scope servers across all linked worktrees of cwd's
+    repo, so a sibling checkout's project entry can be live here too."""
+    try:
+        if not cwd or not config_path.exists():
+            return None
+        roots = _git_worktree_roots(cwd)
+        if not roots:
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            projects = (json.loads(f.read()) or {}).get('projects')
+        if not isinstance(projects, dict):
+            return None
+        for root in roots:
+            proj_data = projects.get(root.replace('\\', '/').rstrip('/'))
+            if not isinstance(proj_data, dict):
+                continue
+            proj_servers = proj_data.get('mcpServers', {})
+            if isinstance(proj_servers, dict) and server_name in proj_servers:
+                result = _extract_mcp_server_fields(proj_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+        return None
+    except Exception:
+        return None
+
+
 def _attach_tool_content_hash(metadata):
     try:
         server_cfg = metadata.get('mcp_server_config')
@@ -2138,10 +2171,21 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
                                 if fallback_cfg:
                                     metadata['mcp_server_config'] = fallback_cfg
 
+            if not metadata.get('mcp_server_config'):
+                union_cfg = _read_mcp_server_config_worktree_union(
+                    mcp_server_name, CLAUDE_MCP_CONFIG_PATH, cwd=cwd
+                )
+                if union_cfg:
+                    metadata['mcp_server_config'] = union_cfg
+
             _attach_tool_content_hash(metadata)
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
+
+    # Raw CLAUDE_CODE_ENTRYPOINT, forwarded so the gateway can tell a headless
+    # session (sdk-cli/sdk-ts/sdk-py) apart from an interactive one.
+    client_entrypoint = os.environ.get('CLAUDE_CODE_ENTRYPOINT', 'cli')
 
     request_body = {
         'conversation_id': session_id,
@@ -2154,6 +2198,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'metadata': metadata
         },
         'account_identity': build_account_identity(),
+        'client_entrypoint': client_entrypoint,
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
@@ -2226,17 +2271,20 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         server_cfg = metadata.get('mcp_server_config')
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg, cwd=metadata.get('cwd'))
-        else:
-            # Null fingerprint: log the miss and fire the resolution diagnostic.
-            if plugin_dirs is None:
-                plugin_dirs, plugin_urls = _claude_plugin_launch_values()
-            log_error(
-                f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
-                f" (plugin-dir={[str(p) for p in plugin_dirs]}"
-                f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
-                'mcp_server',
-            )
-            _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
+
+    # Null fingerprint: the hook resolved no config for a real MCP server. The
+    # gateway can't flag this — a null fingerprint yields no unknown_mcp_server
+    # hint — so key off our own resolution result, not the gateway response.
+    if is_mcp and metadata.get('mcp_server') and not metadata.get('mcp_server_config'):
+        if plugin_dirs is None:
+            plugin_dirs, plugin_urls = _claude_plugin_launch_values()
+        log_error(
+            f"unknown mcp server with no resolvable config: {metadata.get('mcp_server', '')}"
+            f" (plugin-dir={[str(p) for p in plugin_dirs]}"
+            f" plugin-url={[_redact_url(u) for u in plugin_urls]})",
+            'mcp_server',
+        )
+        _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
 
     return transform_response_for_claude(api_response)
 
@@ -2330,6 +2378,30 @@ _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 # Left boundary required so the slash inside a relative token (tests/webapp/)
 # doesn't read as an absolute path.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# Package-manager / OS checkouts that are real git clones but never the
+# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
+# so a command merely referencing /opt/homebrew/bin/… would otherwise
+# attribute the call to "homebrew/brew". Candidates under these roots are
+# skipped so resolution falls through to the shell's working directory.
+_SYSTEM_CHECKOUT_ROOTS = (
+    '/opt/homebrew',
+    '/home/linuxbrew',
+    '/nix',
+    '/usr',
+    '/Library',
+    '/System',
+)
+
+
+def _is_system_checkout_path(path: str) -> bool:
+    try:
+        normalized = os.path.normpath(path)
+        return any(
+            normalized == root or normalized.startswith(root + '/')
+            for root in _SYSTEM_CHECKOUT_ROOTS
+        )
+    except Exception:
+        return False
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
@@ -2347,6 +2419,46 @@ def _find_git_root(path: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+def _git_worktree_roots(path: str) -> List[str]:
+    """Worktree roots of the repo containing `path`, main checkout first.
+    Pure file reads, no git subprocess; [] outside a repo or on any error."""
+    try:
+        root = _find_git_root(path)
+        if not root:
+            return []
+        dot_git = Path(root) / '.git'
+        if dot_git.is_dir():
+            common = dot_git
+            main_root = root
+        else:
+            target = dot_git.read_text(encoding='utf-8').strip()
+            if not target.startswith('gitdir:'):
+                return []
+            # gitdir pointers may be relative; git resolves them against the
+            # directory holding them, so mirror that.
+            gitdir = Path(os.path.normpath(
+                os.path.join(root, target[len('gitdir:'):].strip())))
+            if gitdir.parent.name != 'worktrees' or gitdir.parent.parent.name != '.git':
+                return []
+            common = gitdir.parent.parent
+            main_root = str(common.parent)
+        roots = [main_root]
+        wt_dir = common / 'worktrees'
+        if wt_dir.is_dir():
+            for entry in sorted(wt_dir.iterdir()):
+                try:
+                    linked = (entry / 'gitdir').read_text(encoding='utf-8').strip()
+                except OSError:
+                    continue
+                wt_root = str(Path(os.path.normpath(
+                    os.path.join(str(entry), linked))).parent)
+                if wt_root not in roots:
+                    roots.append(wt_root)
+        return roots
+    except Exception:
+        return []
 
 
 def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
@@ -2386,16 +2498,18 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         candidates = []
         if tool_name in _WRITE_TOOLS:
             path = tool_input.get('file_path') or tool_input.get('notebook_path')
-            if isinstance(path, str) and path.startswith('/'):
+            if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
                 candidates.append(os.path.dirname(path))
         elif tool_name in _READ_TOOLS:
             path = tool_input.get('file_path') or tool_input.get('path')
-            if isinstance(path, str) and path.startswith('/'):
+            if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
                 candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
         elif tool_name == 'Bash':
             command = tool_input.get('command')
             if isinstance(command, str):
-                candidates.extend(_ABS_PATH_RE.findall(command))
+                candidates.extend(
+                    p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
+                )
                 shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)
@@ -3180,6 +3294,8 @@ def _mcp_diag_resolution(server, cwd):
          lambda: (_resolve_claude_code_session_connector(server) or (None, None))[1]),
         ('launch_config', lambda: _resolve_launch_mcp_config(server)),
         ('plugin_by_key', _plugin_by_key),
+        ('worktree_union',
+         lambda: _read_mcp_server_config_worktree_union(server, CLAUDE_MCP_CONFIG_PATH, cwd=cwd)),
     )
     _suppress_error_logging = True
     try:
@@ -3512,16 +3628,92 @@ def _diag_plugin_registries():
     return out
 
 
+_DIAG_SECRET_VALUE = re.compile(
+    r'^(sk-|sk_live_|sk_test_|ghp_|gho_|ghu_|ghs_|github_pat_|xox[baprs]-'
+    r'|glpat-|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,})'
+    r'|^[A-Za-z0-9+_=-]{32,}$'
+)
+
+
+def _diag_scrub_cmdline(tokens, cap=1500):
+    """Scrub a command line token-by-token so one secret redacts alone."""
+    try:
+        out = []
+        redact_next = False
+        for t in tokens:
+            s = str(t)
+            if redact_next and not s.startswith('-'):
+                out.append('<redacted>')
+                redact_next = False
+                continue
+            redact_next = False
+            candidates = [s.strip('\'"')]
+            if '=' in s:
+                candidates.append(s.split('=', 1)[1].strip('\'"'))
+            keyword_hit = _MCP_DIAG_SECRETISH.search(s)
+            if keyword_hit or any(_DIAG_SECRET_VALUE.match(c) for c in candidates):
+                out.append('<redacted>')
+                redact_next = bool(keyword_hit) and s.startswith('-') and '=' not in s
+                continue
+            out.append(re.sub(r'(://)[^/@\s]*@', r'\1', s)[:600])
+        return ' '.join(out)[:cap]
+    except Exception:
+        return None
+
+
 def _diag_launch_flags(ps_out):
+    """Full scrubbed command line of every running claude process."""
     rows = []
     for l in ps_out.splitlines():
         if 'claude' not in l or 'mcp-diagnostic' in l or ' grep ' in l:
             continue
-        flags = re.findall(
-            r'--(?:mcp-config|strict-mcp-config|settings|add-dir|permission-mode)(?:[= ]\S+)?', l)
-        if flags:
-            rows.append(_diag_scrub_value(' '.join(flags)))
-    return rows[:15]
+        parts = l.split(None, 2)
+        args = parts[2] if len(parts) == 3 else l
+        if 'claude' not in args:
+            continue
+        row = _diag_scrub_cmdline(args.split())
+        if row:
+            rows.append(row)
+    return rows[:10]
+
+
+def _diag_launch_argv():
+    """The session's own Claude ancestor argv, scrubbed."""
+    try:
+        found = _claude_launch_argv()
+        if not found:
+            return None
+        return _diag_scrub_cmdline(found[1], cap=6000)
+    except Exception:
+        return None
+
+
+def _mcp_diag_worktrees(server, cwd):
+    """The .git pointer for cwd and each worktree root's project-entry servers."""
+    out = {'git_root': None, 'dot_git': None, 'roots': []}
+    try:
+        start = os.path.abspath(cwd) if cwd else os.getcwd()
+        root = _find_git_root(start)
+        out['git_root'] = root
+        if not root:
+            return out
+        dot_git = Path(root) / '.git'
+        out['dot_git'] = (dot_git.read_text(encoding='utf-8').strip()[:300]
+                          if dot_git.is_file() else '<directory>')
+        try:
+            projects = json.loads(
+                CLAUDE_MCP_CONFIG_PATH.read_text(encoding='utf-8')).get('projects') or {}
+        except Exception:
+            projects = {}
+        for r in _git_worktree_roots(start):
+            entry = projects.get(r.replace('\\', '/').rstrip('/'))
+            servers = entry.get('mcpServers') if isinstance(entry, dict) else None
+            names = sorted(servers.keys()) if isinstance(servers, dict) else []
+            out['roots'].append(
+                {'root': r, 'servers': names[:20], 'has_target': server in names})
+    except Exception:
+        pass
+    return out
 
 
 def _diag_settings_registration(cwd):
@@ -3589,6 +3781,8 @@ def _build_mcp_diagnostic(server, cwd):
         'hook': _mcp_diag_hook_info(cwd),
         'hook_registration': _diag_settings_registration(cwd),
         'resolution': _mcp_diag_resolution(server, cwd),
+        'worktrees': _mcp_diag_worktrees(server, cwd),
+        'launch_argv': _diag_launch_argv(),
         'claude_json': _mcp_diag_claude_json(server, cwd),
         'project_mcp_json': _mcp_diag_project_mcp_json(cwd),
         'mcp_inventory': inventory,
@@ -3684,6 +3878,15 @@ def _render_mcp_diagnostic(d):
     if res.get('config'):
         kv('config', json.dumps(res['config']))
 
+    head('git worktree chain (claude unions local scope across these roots)')
+    wt = d.get('worktrees') or {}
+    kv('git_root', wt.get('git_root'))
+    kv('.git', wt.get('dot_git'))
+    for r in (wt.get('roots') or []):
+        mark = '   <-- has target' if r.get('has_target') else ''
+        L.append('  %s   servers=[%s]%s' % (
+            r.get('root'), ', '.join(r.get('servers') or []), mark))
+
     head('MCP server inventory (every source on disk)')
     for it in (d.get('mcp_inventory') or []):
         L.append('  %s   (%s)' % (it.get('source'), it.get('file')))
@@ -3704,7 +3907,10 @@ def _render_mcp_diagnostic(d):
     for k, v in (d.get('plugin_registries') or {}).items():
         kv('  ' + k, v if isinstance(v, str) else ', '.join(v))
 
-    head('claude processes / launch flags')
+    head('claude launch command (session ancestor)')
+    L.append(d.get('launch_argv') or '<not found>')
+
+    head('claude processes (full scrubbed command lines)')
     for f in (d.get('launch_flags') or []):
         L.append('  %s' % f)
 
@@ -3762,15 +3968,23 @@ def _mcp_diag_mark_dispatched(server, cwd):
 
 
 def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
-    """Re-invoke the hook in --mcp-diagnostic mode, detached, so the slow
-    `claude mcp` CLI stays off the blocking PreToolUse path."""
-    if not server_name or not api_key or RUNNING_FROZEN:
+    """Re-invoke the diagnostic detached so the slow `claude mcp` CLI stays off
+    the blocking PreToolUse path. Frozen builds drive the binary's
+    `mcp-diagnostic` subcommand; the .py hook re-invokes itself."""
+    if not server_name or not api_key:
         return
-    try:
-        script = os.path.abspath(__file__)
-    except Exception:
-        return
-    if not os.path.isfile(script) or _mcp_diag_on_cooldown(server_name, cwd):
+    if RUNNING_FROZEN:
+        # sys.executable is the frozen unbound-hook binary itself.
+        cmd = [sys.executable, 'mcp-diagnostic', os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+    else:
+        try:
+            script = os.path.abspath(__file__)
+        except Exception:
+            return
+        if not os.path.isfile(script):
+            return
+        cmd = [sys.executable, script, '--mcp-diagnostic']
+    if _mcp_diag_on_cooldown(server_name, cwd):
         return
     # Capture Claude's launch context HERE (in-process, before the child detaches
     # and loses it) and forward it so the replay sees the real --plugin-*/--mcp-config.
@@ -3795,7 +4009,7 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
             popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             popen_kwargs['start_new_session'] = True
-        subprocess.Popen([sys.executable, script, '--mcp-diagnostic'], **popen_kwargs)
+        subprocess.Popen(cmd, **popen_kwargs)
         # Stamp only after a successful spawn, so a failed dispatch doesn't mute 6h.
         _mcp_diag_mark_dispatched(server_name, cwd)
     except Exception as exc:

@@ -15,6 +15,7 @@ _RESOLVERS_MISS = (
     '_resolve_plugin_mcp_config',
     '_resolve_claude_code_session_connector',
     '_resolve_launch_mcp_config',
+    '_read_mcp_server_config_worktree_union',
 )
 
 
@@ -56,7 +57,7 @@ class TestDiagResolutionLadder(unittest.TestCase):
             for p in patchers:
                 p.stop()
 
-    def test_all_six_sources_present(self):
+    def test_all_seven_sources_present(self):
         r = self._run(
             'some-server',
             [patch.object(unbound, '_resolve_plugin_mcp_config_by_server_key', return_value=None)],
@@ -64,7 +65,8 @@ class TestDiagResolutionLadder(unittest.TestCase):
         self.assertEqual(
             set(r['sources']),
             {'claude_json', 'claude_ai_connector', 'plugin_cache',
-             'session_connector', 'launch_config', 'plugin_by_key'},
+             'session_connector', 'launch_config', 'plugin_by_key',
+             'worktree_union'},
         )
         self.assertFalse(r['resolved'])
 
@@ -261,6 +263,33 @@ class TestDiagLaunchContext(unittest.TestCase):
         _os.environ.pop('UNBOUND_DIAG_LAUNCH_ARGV', None)
         got = unbound._claude_launch_argv()
         self.assertTrue(got is None or isinstance(got, tuple))
+
+
+class TestDiagDispatchFrozen(unittest.TestCase):
+    def _capture_cmd(self, frozen, env=None):
+        popen = MagicMock()
+        with patch.object(unbound, 'RUNNING_FROZEN', frozen), \
+             patch.object(unbound, '_mcp_diag_on_cooldown', return_value=False), \
+             patch.object(unbound, '_mcp_diag_mark_dispatched'), \
+             patch.dict('os.environ', env or {}, clear=False), \
+             patch.object(unbound.subprocess, 'Popen', popen):
+            unbound._dispatch_mcp_diagnostic('nullfp_demo', '/cwd', 'key')
+        return popen.call_args[0][0] if popen.call_args else None
+
+    def test_frozen_reinvokes_binary_subcommand(self):
+        cmd = self._capture_cmd(True, {'UNBOUND_HOOK_TOOL': 'claude-code'})
+        self.assertEqual(cmd[1:], ['mcp-diagnostic', 'claude-code'])
+
+    def test_frozen_defaults_tool_when_env_missing(self):
+        import os as _os
+        _os.environ.pop('UNBOUND_HOOK_TOOL', None)
+        cmd = self._capture_cmd(True)
+        self.assertEqual(cmd[1:], ['mcp-diagnostic', 'claude-code'])
+
+    def test_non_frozen_reinvokes_self_with_flag(self):
+        cmd = self._capture_cmd(False)
+        self.assertIn('--mcp-diagnostic', cmd)
+        self.assertTrue(cmd[1].endswith('unbound.py'))
 
 
 if __name__ == '__main__':

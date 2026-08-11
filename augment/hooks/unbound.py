@@ -1763,6 +1763,30 @@ _FILE_TOOLS = {'Read', 'Write', 'Edit', 'Delete'}
 # Left boundary required so the slash inside a relative token (tests/webapp/)
 # doesn't read as an absolute path.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# Package-manager / OS checkouts that are real git clones but never the
+# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
+# so a command merely referencing /opt/homebrew/bin/… would otherwise
+# attribute the call to "homebrew/brew". Candidates under these roots are
+# skipped so resolution falls through to the shell's working directory.
+_SYSTEM_CHECKOUT_ROOTS = (
+    '/opt/homebrew',
+    '/home/linuxbrew',
+    '/nix',
+    '/usr',
+    '/Library',
+    '/System',
+)
+
+
+def _is_system_checkout_path(path: str) -> bool:
+    try:
+        normalized = os.path.normpath(path)
+        return any(
+            normalized == root or normalized.startswith(root + '/')
+            for root in _SYSTEM_CHECKOUT_ROOTS
+        )
+    except Exception:
+        return False
 # `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
 # the shell's working directory across the turn's launch-process calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
@@ -1823,12 +1847,14 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
             if isinstance(path, str) and path:
                 if not path.startswith('/') and shell_dir:
                     path = os.path.normpath(os.path.join(shell_dir, path))
-                if path.startswith('/'):
+                if path.startswith('/') and not _is_system_checkout_path(path):
                     candidates.append(os.path.dirname(path))
         elif tool_name == 'Bash':
             command = tool_input.get('command')
             if isinstance(command, str):
-                candidates.extend(_ABS_PATH_RE.findall(command))
+                candidates.extend(
+                    p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
+                )
                 shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)

@@ -8,10 +8,11 @@ to give the gateway a non-null fingerprint.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 
 import unbound
 
@@ -331,6 +332,7 @@ class ProcessPreToolUseBase(unittest.TestCase):
         _write_json(self.claude_json, {"mcpServers": {}})
         self.plugin_cache = self.root / "plugins" / "cache"
         self.plugin_cache.mkdir(parents=True, exist_ok=True)
+        self.dispatch_diag = MagicMock()
         self._patchers = [
             patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", self.claude_json),
             patch.object(unbound, "CLAUDE_PLUGIN_CACHE_DIR", self.plugin_cache),
@@ -342,6 +344,7 @@ class ProcessPreToolUseBase(unittest.TestCase):
             patch.object(unbound, "build_account_identity", lambda *a, **k: {}),
             patch.object(unbound, "report_error_to_gateway", lambda *a, **k: None),
             patch.object(unbound, "_dispatch_mcp_server_scan", lambda *a, **k: None),
+            patch.object(unbound, "_dispatch_mcp_diagnostic", self.dispatch_diag),
         ]
         for p in self._patchers:
             p.start()
@@ -395,10 +398,93 @@ class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
         self.assertEqual(md.get("mcp_tool"), "send_message")  # tool half preserved through rewrite
         self.assertEqual(md.get("mcp_server_config"), {"additional_data": {"scope": "claudeai"}})
 
+    def test_client_entrypoint_forwarded_from_env(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        with patch.object(unbound, "send_to_hook_api", capturing_gw), \
+             patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(captured["body"].get("client_entrypoint"), "sdk-cli")
+
+    def test_client_entrypoint_defaults_to_cli_when_unset(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        env_without_entrypoint = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_ENTRYPOINT"}
+        with patch.object(unbound, "send_to_hook_api", capturing_gw), \
+             patch.dict(os.environ, env_without_entrypoint, clear=True):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(captured["body"].get("client_entrypoint"), "cli")
+
     def test_unresolved_mcp_carries_no_config(self):
         md = self.run_capture("mcp__plugin_unknown_unknown__do_thing")
         self.assertEqual(md.get("mcp_server"), "plugin_unknown_unknown")  # unchanged
         self.assertNotIn("mcp_server_config", md)
+
+    def test_null_fingerprint_dispatches_diagnostic_without_unknown_hint(self):
+        # Regression: a null fingerprint yields a plain allow (the gateway never
+        # sets unknown_mcp_server for it), yet the diagnostic MUST still fire off
+        # the hook's own no-config result. The old code gated it on
+        # unknown_mcp_server, so it never ran for the exact case it's built for.
+        md = self.run_capture("mcp__mystery_server__do_thing")
+        self.assertNotIn("mcp_server_config", md)
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "mystery_server")
+
+    def test_resolved_config_does_not_dispatch_diagnostic(self):
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp"}}}},
+        )
+        md = self.run_capture("mcp__plugin_slack_slack__post_message")
+        self.assertIn("mcp_server_config", md)
+        self.dispatch_diag.assert_not_called()
+
+    def test_null_fingerprint_dispatches_diagnostic_on_deny(self):
+        # The real case: a null-fp MCP server the org policy DENIES (e.g. the
+        # blocked computer-use server, pretool_blocked=true). The deny path has no
+        # early return before the trigger, so the diagnostic must still dispatch.
+        def deny_gw(request_body, api_key):
+            return {"decision": "deny", "reason": "blocked", "pretool_blocked": True}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__computer-use__request_access",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api", deny_gw):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "computer-use")
 
     def test_config_file_server_takes_precedence_over_resolvers(self):
         # A real config-file entry must win; resolvers must not run/override it.
