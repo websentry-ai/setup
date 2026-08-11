@@ -3529,10 +3529,11 @@ def _diag_scrub_cmdline(tokens, cap=1500):
                 redact_next = False
                 continue
             redact_next = False
-            value = s.split('=', 1)[1] if '=' in s else s
-            if _MCP_DIAG_SECRETISH.search(s) or _DIAG_SECRET_VALUE.match(value):
+            value = (s.split('=', 1)[1] if '=' in s else s).strip('\'"')
+            keyword_hit = _MCP_DIAG_SECRETISH.search(s)
+            if keyword_hit or _DIAG_SECRET_VALUE.match(value):
                 out.append('<redacted>')
-                redact_next = '=' not in s
+                redact_next = bool(keyword_hit) and s.startswith('-') and '=' not in s
                 continue
             out.append(re.sub(r'(://)[^/@\s]*@', r'\1', s)[:600])
         return ' '.join(out)[:cap]
