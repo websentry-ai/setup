@@ -78,6 +78,13 @@ SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
+# Repo-scope gate (WEB-5456). Grace is session-scoped and deliberately does not
+# survive a new session: it is an advisory nudge, not an audit trail.
+REPO_GATE_STATE_FILE = LOG_DIR / ".repo_gate_state.json"
+REPO_GATE_TURN_MEMORY = 20
+# _repo_gate_turn_id's "I could not tell which turn this is" answer. It is an
+# unknown, not an identity, and _repo_gate_decide must never memoize it.
+REPO_GATE_UNKNOWN_TURN = '_session_turn'
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -204,7 +211,16 @@ def get_policy_check_failure_action():
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
-def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
+def get_repo_policies():
+    """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return []
+    policies = cache.get('repo_policies')
+    return policies if isinstance(policies, list) else []
+
+
+def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -213,10 +229,13 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
             tools_to_check = prior.get('tools_to_check', [])
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
+        if not isinstance(repo_policies, list):
+            repo_policies = get_repo_policies()
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
+            'repo_policies': repo_policies,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
@@ -231,6 +250,22 @@ def _gateway_unreachable_response():
         'user_message': POLICY_CHECK_FAILURE_BLOCK_REASON,
         'agent_message': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
     }
+
+
+def _cache_policies_from_response(api_response):
+    """Without this a session never loads policies and the gate cannot fire."""
+    if not isinstance(api_response, dict):
+        return
+    if (
+        'tools_to_check' in api_response
+        or 'policy_check_failure_action' in api_response
+        or 'repo_policies' in api_response
+    ):
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+            repo_policies=api_response.get('repo_policies'),
+        )
 
 
 def is_cache_stale(cache):
@@ -719,7 +754,27 @@ def _resolve_tool_use_id(event):
 
 
 def process_pre_tool_use(event, api_key):
-    """Process preToolUse event - check policy before tool execution."""
+    """preToolUse entry point.
+
+    The repo gate runs FIRST, before _evaluate_pre_tool_use_policies, because
+    that function short-circuits for file tools whenever no policy covers them
+    — evaluating the gate inside it would silently never fire for exactly the
+    tools the gate exists to govern. A gate block returns here without a
+    gateway round trip: only this machine can resolve a path to a git root, so
+    the decision is already final."""
+    gate = _repo_gate_evaluate(event, event.get('tool_name', ''))
+    if gate and gate['decision'] == 'deny':
+        return _repo_gate_deny_response(gate['repo'])
+    response = _evaluate_pre_tool_use_policies(event, api_key)
+    if gate:
+        return _with_repo_gate_context(
+            response, _repo_gate_warning(gate['repo'], gate['remaining'])
+        )
+    return response
+
+
+def _evaluate_pre_tool_use_policies(event, api_key):
+    """Run the gateway policy check for a preToolUse event."""
     tool_name = event.get('tool_name', '')
 
     if tool_name not in PRETOOL_NATIVE_TOOLS:
@@ -813,11 +868,7 @@ def process_pre_tool_use(event, api_key):
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
@@ -967,7 +1018,23 @@ def _read_mcp_server_config(server_name, config_path):
 
 
 def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
-    """Process beforeShellExecution or beforeMCPExecution event."""
+    """beforeShellExecution / beforeMCPExecution entry point. The repo gate runs
+    first and applies to the shell event only — an MCP call names no local
+    path for the gate to resolve."""
+    gate = _repo_gate_evaluate(event, tool_name, command)
+    if gate and gate['decision'] == 'deny':
+        return _repo_gate_deny_response(gate['repo'])
+    response = _evaluate_pre_tool_use_execution_policies(
+        event, api_key, tool_name, command, mcp_server=mcp_server, mcp_tool=mcp_tool)
+    if gate:
+        return _with_repo_gate_context(
+            response, _repo_gate_warning(gate['repo'], gate['remaining'])
+        )
+    return response
+
+
+def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
+    """Run the gateway policy check for a shell/MCP execution event."""
     generation_id = event.get('generation_id')
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
@@ -1060,11 +1127,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
@@ -1104,10 +1167,21 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
 
 
 def process_user_prompt_submit(event, api_key):
-    """Process beforeSubmitPrompt event for policy checking"""
+    """Process beforeSubmitPrompt event for policy checking.
+
+    Also refreshes the policy cache when it is cold or past its TTL. This is
+    load-bearing for the repo gate (WEB-5456), not incidental: the gate itself
+    never calls the network, so it can only enforce policies already cached, and
+    warming the cache here is what makes the session's FIRST gated tool call
+    enforceable. Without it a cold session's first write or git command would
+    read an empty policy list and be allowed. The TTL is respected so a cold
+    cache does not re-pull on every prompt."""
     conversation_id = event.get('conversation_id')
     model = event.get('model') or 'auto'
     prompt = event.get('prompt', '')
+
+    cache = load_policy_cache()
+    need_pull_policies = cache is None or is_cache_stale(cache)
 
     request_body = {
         'conversation_id': conversation_id,
@@ -1117,8 +1191,11 @@ def process_user_prompt_submit(event, api_key):
         'account_identity': build_account_identity(event),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
+    if need_pull_policies:
+        request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
+    _cache_policies_from_response(api_response)
     return api_response if api_response else {}
 
 
@@ -1173,36 +1250,59 @@ def _github_remote_path(remote_url):
     return None
 
 
+def _git_origin_url(cwd):
+    """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
+    result = subprocess.run(
+        ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+
+def _remote_host(remote_url):
+    """Reject a host-less remote URL, so file:///srv/git/x is not org 'srv'."""
+    url = (remote_url or '').strip()
+    if '://' in url:
+        host = url.split('://', 1)[1].split('/', 1)[0]
+    elif ':' in url:
+        host = url.split(':', 1)[0]
+    else:
+        return None
+    host = host.rsplit('@', 1)[-1].split('?', 1)[0]
+    return host.lower() or None
+
+
+def _get_git_origin_org_repo(cwd):
+    """Lowercased (org, repo) of `cwd`'s origin; git failure propagates upward."""
+    url = _git_origin_url(cwd)
+    if not url or not _remote_host(url):
+        return (None, None)
+    path = _github_remote_path(url)
+    if not path:
+        return (None, None)
+    parts = path.split('/')
+    if len(parts) < 2:
+        return (None, None)
+    org = _strip_git_suffix(parts[0]).lower()
+    repo = _strip_git_suffix(parts[1]).lower()
+    return (org or None, repo or None)
+
 def _get_project(cwd):
-    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
-    requests for analytics. None when cwd is missing, not a git repo, has no
-    origin, or anything fails — fully fail-open (never raises)."""
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, for analytics; never raises."""
     try:
         if not cwd:
             return None
-        result = subprocess.run(
-            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return None
-        path = _github_remote_path(result.stdout.strip())
-        if not path:
-            return None
-        parts = path.split('/')
-        if len(parts) < 2:
-            return None
-        org = _strip_git_suffix(parts[0])
-        repo = _strip_git_suffix(parts[1])
-        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+        org, repo = _get_git_origin_org_repo(cwd)
+        return f"{org}/{repo}" if org and repo else None
     except Exception:
         return None
 
 
 def _find_git_root(path):
-    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
-    (directory, or file for linked worktrees). Pure filesystem stats — no
-    subprocess. None when outside any repo or on any error (fail-open)."""
+    """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
         p = Path(path)
         for parent in [p] + list(p.parents):
@@ -1216,11 +1316,8 @@ def _find_git_root(path):
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
-# Package-manager / OS checkouts that are real git clones but never the
-# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
-# so a command merely referencing /opt/homebrew/bin/… would otherwise
-# attribute the call to "homebrew/brew". Candidates under these roots are
-# skipped so resolution falls through to the cwd / workspace fallbacks.
+# Real git clones that are never the engineer's project: a path under
+# /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
     '/opt/homebrew',
     '/home/linuxbrew',
@@ -1240,6 +1337,442 @@ def _is_system_checkout_path(path):
         )
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# --- what makes a Bash call in scope for the repo gate (WEB-5456) -----------
+#
+# A shell call is gated only when it invokes git or writes to the working tree.
+# Both detectors read the COMMAND WORD of each separator-delimited segment —
+# never a substring of the line — so `cat rm-notes.md` and `grep -r "rm -rf" .`
+# are not gated. Quoted runs are blanked first, so shell syntax written inside a
+# string (`echo "a && git push"`) is never read as syntax.
+#
+# Both are deliberately conservative: when a segment cannot be classified with
+# confidence it is NOT gated. An over-eager block stops legitimate work in a
+# repo the developer is entitled to use; a miss only loses one enforcement point
+# that the write TOOLS already largely cover. Known and accepted misses: a
+# command reached indirectly (`xargs rm`, `sh -c "git push"`, `$(...)`), a
+# quoted command word (`"git" push`), and `2> err.log`.
+_QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Wrappers that stand in front of the real command word.
+_COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
+# Creating or appending redirect. The lookahead drops `2>&1` and `1>&2`, which
+# move an existing stream rather than create a file; the lookbehind keeps `>>`
+# from being counted twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+
+# Shell commands that mutate the working tree, in one editable place.
+# ALWAYS a write, whatever the flags:
+_SHELL_WRITE_COMMANDS = frozenset({
+    'rm', 'rmdir', 'unlink', 'shred',       # delete
+    'mv', 'cp', 'ln', 'install',            # create or relocate
+    'touch', 'mkdir',                       # create
+    'tee', 'truncate', 'patch',             # rewrite contents
+})
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read, so
+# gating every invocation would block ordinary inspection.
+_SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
+_INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository
+# content, and gating them would block ordinary `chmod +x` on a script.
+
+
+def _mask_quoted_runs(command):
+    """Blank the inside of quoted runs, preserving length. An unbalanced quote
+    leaves its tail untouched, which can only make detection more cautious."""
+    return _QUOTED_RUN_RE.sub(
+        lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
+        command)
+
+
+def _segment_words(segment):
+    """A segment's words from its command word on, dropping env assignments and
+    a leading sudo/env/command wrapper with its flags."""
+    words = []
+    for word in segment.split():
+        word = word.strip('()`{}"\'')
+        if not words and (not word or word.startswith('-')
+                          or _ENV_ASSIGNMENT_RE.match(word)
+                          or word in _COMMAND_PREFIX_WORDS):
+            continue
+        words.append(word)
+    return words
+
+
+def _segment_writes(words):
+    """Whether a segment's command word plus its flags mutate the working tree."""
+    name = os.path.basename(words[0])
+    if name in _SHELL_WRITE_COMMANDS:
+        return True
+    if name in _SHELL_INPLACE_COMMANDS:
+        return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
+    if name == 'dd':
+        return any(w.startswith('of=') for w in words[1:])
+    return False
+
+
+def _is_git_command(command):
+    """Whether any segment of `command` directly invokes git; False on any error."""
+    try:
+        if not isinstance(command, str) or 'git' not in command:
+            return False
+        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+            words = _segment_words(segment)
+            if words and os.path.basename(words[0]) == 'git':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_shell_write_command(command):
+    """Whether `command` mutates the working tree — a write command word in any
+    segment, or a creating/appending redirect. False on any error."""
+    try:
+        if not isinstance(command, str) or not command:
+            return False
+        masked = _mask_quoted_runs(command)
+        if _REDIRECT_RE.search(masked):
+            return True
+        for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
+            words = _segment_words(segment)
+            if words and _segment_writes(words):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+# Repository-scope gate (WEB-5456)
+#
+# Blocks WRITES, GIT COMMANDS and SHELL WRITES in git repos outside the org's
+# allowed scope. Conversation and reads are never gated, and a directory under
+# no git root is never gated either — there is no origin to judge. Decided
+# on-device — only this machine maps a path to a git root — and every failure
+# mode allows it through: a broken gate is a missed inspection, never a false
+# block.
+#
+# Cursor splits tool calls across preToolUse (file tools) and
+# beforeShellExecution (the command), so both consult the gate; it tracks no
+# shell cwd between calls, so a command resolves from the paths it names.
+# ---------------------------------------------------------------------------
+
+# Write operations, git commands and shell writes only (WEB-5456). Read is
+# dropped from the gate: it names no intent to change anything, and gating it
+# blocked ordinary navigation. Conversation is ungated. A shell call is in scope
+# only when it runs git or mutates the working tree; every other command (ls,
+# cat, npm test) is out of scope.
+_REPO_GATE_SHELL_TOOL = 'Shell'
+_REPO_GATE_SHELL_TOOLS = frozenset({_REPO_GATE_SHELL_TOOL})
+_REPO_GATE_WRITE_TOOLS = frozenset({'Write', 'Delete'})
+_REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
+REPO_GATE_BLOCK_CONTEXT = (
+    'This action was blocked by an organization repository-scope policy. Do not '
+    'attempt to achieve the same result using alternative tools, file operations, '
+    'or workarounds. Inform the user and stop.'
+)
+
+
+
+
+
+
+def _repo_gate_applies(tool_name, command):
+    """Whether this call is in the gate's scope: a write tool always, a shell
+    call only when it invokes git or writes to the working tree."""
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        return _is_git_command(command) or _is_shell_write_command(command)
+    return tool_name in _REPO_GATE_WRITE_TOOLS
+
+
+def _repo_gate_block_policies(policies):
+    """Enforceable subset; a policy this hook cannot read is dropped, not guessed."""
+    enforceable = []
+    for policy in policies or []:
+        if not isinstance(policy, dict):
+            continue
+        grace = policy.get('grace_turns')
+        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
+            continue
+        org = policy.get('github_org')
+        if not isinstance(org, str) or not org.strip():
+            continue
+        enforceable.append(policy)
+    return enforceable
+
+
+def _repo_gate_scope_allows(policy, org, repo):
+    """Whether `org` matches this policy's allowed organization; both lowercased."""
+    return org == policy['github_org'].strip().lower()
+
+
+def _repo_gate_violating_repo(candidates, block_policies, root_projects):
+    """First candidate outside every scope; a git failure propagates to fail open."""
+    for candidate in candidates:
+        root = _find_git_root(candidate)
+        if not root:
+            continue
+        if root not in root_projects:
+            root_projects[root] = _get_git_origin_org_repo(root)
+        org, repo = root_projects[root]
+        if not org or not repo:
+            continue
+        if not any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+            return '%s/%s' % (org, repo)
+    return None
+
+
+def _repo_gate_workspace_dir(event):
+    """The event's cwd when Cursor sends one, else the first workspace root."""
+    cwd = event.get('cwd')
+    if isinstance(cwd, str) and cwd:
+        return cwd
+    roots = event.get('workspace_roots')
+    if isinstance(roots, list) and roots and isinstance(roots[0], str):
+        return roots[0]
+    return None
+
+
+def _repo_gate_candidates(event, tool_name, command):
+    """Paths a Cursor call works in, backstopped by the workspace root."""
+    if tool_name == _REPO_GATE_SHELL_TOOL:
+        candidates = []
+        if isinstance(command, str) and command:
+            candidates.extend(
+                p for p in _ABS_PATH_RE.findall(command)
+                if not _is_system_checkout_path(p)
+            )
+        if not candidates:
+            workspace = _repo_gate_workspace_dir(event)
+            if workspace:
+                candidates.append(workspace)
+        return candidates
+    tool_input = event.get('tool_input') or {}
+    path = (event.get('file_path') or tool_input.get('file_path')
+            or tool_input.get('path'))
+    if isinstance(path, str) and path.startswith('/') \
+            and not _is_system_checkout_path(path):
+        return [os.path.dirname(path)]
+    return []
+
+
+def _repo_gate_turn_id(event):
+    """Turn identity so one turn burns one grace; `generation_id`, else per call."""
+    generation_id = event.get('generation_id')
+    if generation_id:
+        return str(generation_id)
+    return REPO_GATE_UNKNOWN_TURN
+
+
+def _load_repo_gate_state(session_id):
+    """Grace state, keyed on session; anything unreadable reads as unused grace."""
+    fresh = {'used': 0, 'turns': []}
+    try:
+        with open(REPO_GATE_STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.loads(f.read())
+        if not isinstance(state, dict) or state.get('session_id') != session_id:
+            return fresh
+        used = state.get('used')
+        turns = state.get('turns')
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            return fresh
+        if not isinstance(turns, list):
+            return fresh
+        return {'used': used, 'turns': [t for t in turns if isinstance(t, str)]}
+    except (OSError, ValueError):
+        return fresh
+
+
+def _save_repo_gate_state(session_id, state):
+    """Atomic replace, so parallel calls in one turn cannot leave a torn file."""
+    try:
+        REPO_GATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({
+            'session_id': session_id,
+            'used': state['used'],
+            'turns': state['turns'][-REPO_GATE_TURN_MEMORY:],
+        })
+        tmp = REPO_GATE_STATE_FILE.parent / ('.repo_gate.%d.tmp' % os.getpid())
+        tmp.write_text(payload, encoding='utf-8')
+        os.replace(str(tmp), str(REPO_GATE_STATE_FILE))
+    except Exception:
+        pass
+
+
+def _repo_gate_warning(repo, remaining):
+    if remaining <= 0:
+        tail = 'This is the final warning — the next turn touching an out-of-scope repository will be blocked.'
+    elif remaining == 1:
+        tail = '1 warning left before out-of-scope repositories are blocked.'
+    else:
+        tail = '%d warnings left before out-of-scope repositories are blocked.' % remaining
+    return (
+        'Unbound repository policy: this action works in "%s", which is outside '
+        'your organization\'s allowed repository scope. %s' % (repo, tail)
+    )
+
+
+def _repo_gate_block_reason(repo):
+    return (
+        'Blocked by organization policy. "%s" is outside your organization\'s '
+        'allowed repository scope.' % repo
+    )
+
+
+# --- incident reporting ----------------------------------------------------
+# Telemetry only: dispatched after the verdict already exists, handed to a curl
+# nobody waits on, every failure swallowed. No verdict waits on a report.
+#
+# `surface` is now always "tool". The conversation gate was the only producer of
+# surface="prompt", so that value of the server's enum is unreachable from any
+# hook; the field stays because the server still reads it (WEB-5456).
+# ---------------------------------------------------------------------------
+
+REPO_GATE_AGENT = 'cursor'
+REPO_GATE_REPORT_MAX_CHARS = 2000
+_REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
+                         'path', 'notebook_path')
+
+
+def _repo_gate_clip(text):
+    """Cap one reported string, keeping the body inside curl's pipe buffer."""
+    if not isinstance(text, str) or not text:
+        return None
+    return text[:REPO_GATE_REPORT_MAX_CHARS]
+
+
+def _repo_gate_binding_policy(block_policies):
+    """The denying policy whose grace decided warn-vs-block."""
+    return min(block_policies, key=lambda p: p['grace_turns'])
+
+
+def _repo_gate_post(body, api_key):
+    """Never waited on, so the blocking path stays free of synchronous work."""
+    proc = subprocess.Popen(
+        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
+         '-H', 'Authorization: Bearer %s' % api_key,
+         '-H', 'Content-Type: application/json',
+         '--data-binary', '@-',
+         '%s/v1/hooks/repo-gate' % UNBOUND_GATEWAY_URL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(body.encode())
+    proc.stdin.close()
+
+
+def _repo_gate_report(gate, block_policies, context):
+    """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
+    try:
+        decision = (gate or {}).get('decision')
+        if decision not in ('warn', 'deny'):
+            return
+        # main() already resolved the key; the fallback covers entry points that
+        # reach the gate without having gone through it.
+        api_key = _cached_api_key or get_api_key()
+        if not api_key:
+            return
+        policy = _repo_gate_binding_policy(block_policies)
+        # WARN reports how far into the grace it got; BLOCK reports the whole
+        # grace, which by definition is spent.
+        grace = policy.get('grace_turns')
+        remaining = gate.get('remaining')
+        if isinstance(grace, bool) or not isinstance(grace, int):
+            turn = None
+        elif isinstance(remaining, int) and not isinstance(remaining, bool):
+            turn = grace - remaining
+        else:
+            turn = grace
+        # What the call was about: its shell command, or the path it names.
+        tool_input = context.get('tool_input')
+        if isinstance(tool_input, dict):
+            named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
+            tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        _repo_gate_post(json.dumps({
+            'policy_id': policy.get('id'),
+            'policy_name': policy.get('name'),
+            'repository': gate.get('repo'),
+            'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+            'agent': REPO_GATE_AGENT,
+            'surface': context.get('surface'),
+            'tool_name': context.get('tool_name'),
+            'session_id': context.get('session_id'),
+            'turn': turn,
+            'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+            'tool_input': _repo_gate_clip(tool_input),
+        }), api_key)
+    except Exception:
+        pass
+
+
+def _repo_gate_evaluate(event, tool_name, command=''):
+    """Verdict for one tool call: None allows, else deny or warn. Never raises."""
+    try:
+        if not _repo_gate_applies(tool_name, command):
+            return None
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+
+        candidates = _repo_gate_candidates(event, tool_name, command)
+        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        gate = _repo_gate_decide(event, block_policies, repo)
+        _repo_gate_report(gate, block_policies, {
+            'surface': 'tool',
+            'session_id': event.get('conversation_id'),
+            'tool_name': tool_name,
+            # The shell event carries its command as an argument; the file
+            # events name their path on the event itself, not under tool_input.
+            'tool_input': command or event.get('tool_input') or event,
+        })
+        return gate
+    except Exception:
+        return None
+
+
+def _repo_gate_decide(event, block_policies, repo):
+    """One grace per turn; memoizing the unknown-turn sentinel freezes grace."""
+    if not repo:
+        return None
+    grace = min(p['grace_turns'] for p in block_policies)
+    conversation_id = event.get('conversation_id')
+    state = _load_repo_gate_state(conversation_id)
+    turn_id = _repo_gate_turn_id(event)
+    known_turn = turn_id != REPO_GATE_UNKNOWN_TURN
+    if not known_turn or turn_id not in state['turns']:
+        if state['used'] >= grace:
+            return {'decision': 'deny', 'repo': repo}
+        state['used'] += 1
+        if known_turn:
+            state['turns'].append(turn_id)
+        _save_repo_gate_state(conversation_id, state)
+    return {
+        'decision': 'warn',
+        'repo': repo,
+        'remaining': max(0, grace - state['used']),
+    }
+
+
+def _repo_gate_deny_response(repo):
+    return format_hook_response({
+        'decision': 'deny',
+        'reason': _repo_gate_block_reason(repo),
+        'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+    })
+
+
+def _with_repo_gate_context(response, context):
+    """Append via `agent_message`; additive, so a real block is never downgraded."""
+    if not context:
+        return response
+    merged = dict(response or {})
+    existing = merged.get('agent_message') or ''
+    merged['agent_message'] = (
+        existing + '\n\n' + context if existing else context
+    )
+    return merged
 
 
 def _trusted_ancestors(start):
@@ -2080,6 +2613,9 @@ def main():
 
         # Handle beforeSubmitPrompt - check policy before processing
         if hook_event_name == 'beforeSubmitPrompt':
+            # No repo gate here: conversation is never gated (WEB-5456). This
+            # call still matters to the gate — it refreshes the policy cache, so
+            # the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
 
             # If denied, log the event, transform response for Cursor format and exit
@@ -2120,7 +2656,7 @@ def main():
         
         # Output required by Cursor hooks
         print("{}")
-        
+
     except Exception as e:
         # Log errors but still output {} to not break Cursor
         log_error(f"Exception in main: {str(e)}", 'general')
