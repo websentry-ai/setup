@@ -1553,8 +1553,14 @@ def _repo_gate_candidates(event, tool_name, command):
     tool_input = event.get('tool_input') or {}
     path = (event.get('file_path') or tool_input.get('file_path')
             or tool_input.get('path'))
-    if isinstance(path, str) and path.startswith('/') \
-            and not _is_system_checkout_path(path):
+    if not isinstance(path, str) or not path:
+        return []
+    # A relative path resolves against the workspace dir, or nothing is judged.
+    if not path.startswith('/'):
+        workspace = _repo_gate_workspace_dir(event)
+        if workspace:
+            path = os.path.normpath(os.path.join(workspace, path))
+    if path.startswith('/') and not _is_system_checkout_path(path):
         return [os.path.dirname(path)]
     return []
 

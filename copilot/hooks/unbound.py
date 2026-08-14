@@ -1968,6 +1968,9 @@ def _repo_gate_candidates(canonical, tool_input, cwd):
         return candidates
     path = (tool_input.get('filePath') or tool_input.get('path')
             or tool_input.get('file_path'))
+    # A relative path resolves against the cwd; unresolvable falls to the blob scan.
+    if isinstance(path, str) and path and not path.startswith('/') and cwd:
+        path = os.path.normpath(os.path.join(cwd, path))
     if isinstance(path, str) and path.startswith('/'):
         if not _is_system_checkout_path(path):
             candidates.append(os.path.dirname(path))

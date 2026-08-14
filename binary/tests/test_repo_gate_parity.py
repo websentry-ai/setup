@@ -521,15 +521,16 @@ _READ_TOOL = {
 }
 
 
-def _file_event(tool, repo_dir, turn='t1', table=_WRITE_TOOL):
+def _file_event(tool, repo_dir, turn='t1', table=_WRITE_TOOL, target=None):
     """A file-tool call naming a path inside `repo_dir`, in that hook's own
     vocabulary. Returns None when the hook has no such tool (Codex has no read
-    tool the gate ever saw)."""
+    tool the gate ever saw). `target` overrides the named path, so the same
+    builder can name it relative to `repo_dir` instead of absolutely."""
     entry = table.get(tool)
     if entry is None:
         return None
     tool_name, key = entry
-    target = '%s/notes.txt' % repo_dir
+    target = target or '%s/notes.txt' % repo_dir
     if tool == 'cursor':
         return {'hook_event_name': 'preToolUse', 'conversation_id': 'S1',
                 'generation_id': turn, 'tool_name': tool_name,
@@ -1140,6 +1141,42 @@ def test_a_write_tool_is_allowed_in_scope_and_under_no_repo(hook, repos):
                                                getattr(repos, where)))
         _assert_tool_allowed(response)
     assert _grace_used(hook) == 0
+
+
+# -- relative write paths ---------------------------------------------------
+# A write tool may name its target relative to the directory the call is made
+# from. Resolving it is what stops `Edit src/main.py` from walking out of the
+# gate's reach: three hooks used to derive no repository at all from a relative
+# path, so the write was allowed with neither warning nor block.
+
+RELATIVE_TARGET = 'src/main.py'
+
+
+def test_a_relative_write_path_is_judged_in_the_repo_it_resolves_in(hook, repos):
+    """The bypass itself: a relative path in an out-of-scope repo must be
+    resolved against the call's own directory, not discarded."""
+    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    event = _file_event(hook.tool_name, repos.out_scope, target=RELATIVE_TARGET)
+    _assert_tool_denied(hook, _run_tool(hook, event), 'acme/widgets')
+
+
+def test_a_relative_write_path_in_scope_is_still_allowed(hook, repos):
+    """Resolving must not invent a violation: the same relative path inside an
+    allowed repo stays allowed and spends no grace."""
+    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    event = _file_event(hook.tool_name, repos.in_scope, target=RELATIVE_TARGET)
+    _assert_tool_allowed(_run_tool(hook, event))
+    assert _grace_used(hook) == 0
+
+
+def test_a_relative_write_path_with_nothing_to_resolve_against_allows(hook, repos):
+    """Fail-open is absolute. With no cwd the path names no repository, so the
+    gate has nothing to judge and must allow rather than block."""
+    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    event = _file_event(hook.tool_name, repos.out_scope, target=RELATIVE_TARGET)
+    event.pop('cwd', None)
+    event.pop('workspace_roots', None)
+    _assert_tool_allowed(_run_tool(hook, event))
 
 
 def test_a_read_tool_in_an_out_of_scope_repo_is_allowed(hook, repos):

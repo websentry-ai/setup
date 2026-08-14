@@ -2539,8 +2539,12 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
     candidates = []
     if tool_name in _WRITE_TOOLS:
         path = tool_input.get('file_path') or tool_input.get('notebook_path')
-        if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
-            candidates.append(os.path.dirname(path))
+        if isinstance(path, str) and path:
+            # A relative path resolves against the cwd, or the gate sees nothing.
+            if not path.startswith('/') and shell_dir:
+                path = os.path.normpath(os.path.join(shell_dir, path))
+            if path.startswith('/') and not _is_system_checkout_path(path):
+                candidates.append(os.path.dirname(path))
     elif tool_name in _READ_TOOLS:
         path = tool_input.get('file_path') or tool_input.get('path')
         if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
