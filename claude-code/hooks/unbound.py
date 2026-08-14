@@ -1775,6 +1775,25 @@ def _lookup_tool_content_hash(server_name, mcp_tool, server_cfg):
         return None
 
 
+def _attach_tool_content_hash(metadata):
+    try:
+        server_cfg = metadata.get('mcp_server_config')
+        if not isinstance(server_cfg, dict):
+            return
+        content_hash = _lookup_tool_content_hash(
+            metadata.get('mcp_server'), metadata.get('mcp_tool'), server_cfg
+        )
+        if content_hash:
+            server_cfg['tool_content_hash'] = content_hash
+    except Exception:
+        pass
+
+
+# ───────────────────────── end MCP tool risk-scoring section ─────────────────
+
+
+# Claude-only: kept outside the synced section above because the other agents
+# have no `projects` worktree-union semantics to read.
 def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
                                            cwd: Optional[str] = None) -> Optional[Dict]:
     """Claude unions local-scope servers across all linked worktrees of cwd's
@@ -1801,23 +1820,6 @@ def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
         return None
     except Exception:
         return None
-
-
-def _attach_tool_content_hash(metadata):
-    try:
-        server_cfg = metadata.get('mcp_server_config')
-        if not isinstance(server_cfg, dict):
-            return
-        content_hash = _lookup_tool_content_hash(
-            metadata.get('mcp_server'), metadata.get('mcp_tool'), server_cfg
-        )
-        if content_hash:
-            server_cfg['tool_content_hash'] = content_hash
-    except Exception:
-        pass
-
-
-# ───────────────────────── end MCP tool risk-scoring section ─────────────────
 
 
 def _email_domain(email: Optional[str]) -> Optional[str]:
