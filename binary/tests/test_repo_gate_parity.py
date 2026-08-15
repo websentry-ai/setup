@@ -1,31 +1,4 @@
-"""The repository-scope gate (WEB-5456) must decide identically on all five hooks.
-
-The gate is the one policy check evaluated entirely on-device: only this machine
-can resolve a file path to a git root, so each hook carries its own copy. Copies
-drift, and a drifted copy either stops blocking (a silent hole) or starts
-blocking work it should not (a false block on a developer's machine). These
-tests pin the shared semantics against every hook at once:
-
-  * scope — WHICH calls the gate applies to at all: write tools, git commands
-    and shell writes; never conversation, never reads, never any other command
-  * policy interpretation — BLOCK only, min grace, org vs repositories scope
-  * remote parsing — a host-less URL is never judged against a GitHub org
-  * grace bookkeeping — session-keyed, corruption-tolerant, atomic
-  * fail-open — every error path allows
-  * one grace per turn, shared by every gated call the turn makes
-
-Two things below DO assert per-hook wiring, because the behaviour they cover
-has to be true on every hook and nowhere else tests all five at once:
-
-  * conversation — a prompt is never gated, in that hook's own prompt-event and
-    response shape, and never spends the grace a later write needs
-  * `cd` — is a shell command that walks into an out-of-scope repo and writes
-    or runs git there caught
-
-Both sections carry the per-hook wiring in a table rather than pretending the
-hooks are interchangeable. Augment is the deliberate exception throughout: it
-has no prompt event and no turn id, so it is documented separately.
-"""
+"""The repository-scope gate must decide identically on all five hooks."""
 import importlib.util
 import io
 import json
@@ -335,11 +308,7 @@ def test_block_reason_names_the_repo(hook):
 
 
 # ===========================================================================
-# Conversation is never gated (WEB-5456).
-#
-# The conversation's own working directory used to BE the violation, with no
-# tool call required. It no longer is: the gate fires on work, not on talking.
-# What must survive is the policy-cache refresh that shares this event.
+# Conversation is never gated; what must survive is the policy-cache refresh sharing this event.
 # ===========================================================================
 
 def _make_repo(root, origin):
@@ -476,9 +445,7 @@ def _prompt_event(tool, cwd, turn='t1'):
     return event
 
 
-# The default command has to be one the gate is in scope for at all (WEB-5456):
-# `git status` runs git, so it is gated wherever it resolves. `ls -la`, the old
-# default, is now correctly ignored by the gate everywhere.
+# The default command must be one the gate is in scope for: `git status` runs git.
 GATED_COMMAND = 'git status'
 # Commands the gate now ignores entirely, whatever repo they resolve in.
 UNGATED_COMMANDS = ['ls -la', 'cat README.md', 'npm test', 'python -m pytest']
@@ -576,10 +543,7 @@ def _assert_tool_allowed(response, repo='acme/widgets'):
 
 
 def test_conversation_in_out_of_scope_repo_is_allowed(prompt_hook, repos):
-    """The semantic change (WEB-5456). A conversation held inside a repo outside
-    the org is no longer a violation on its own: talking is not working. Three
-    turns in a row are allowed with grace_turns=0, which under the old rule
-    would have blocked the first."""
+    """A conversation inside an out-of-scope repo is not a violation: talking is not working."""
     _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=0)])
     for turn in ('t1', 't2', 't3'):
         out, code, _ = _run_main(
@@ -746,13 +710,7 @@ def test_augment_gate_deny_still_denies_a_gateway_blocked_call(augment, repos):
 
 
 # ===========================================================================
-# The prompt path must still refresh the policy cache (WEB-5456).
-#
-# This matters MORE now, not less. The gate never calls the network, so it can
-# only enforce policies already cached, and save_policy_cache is otherwise
-# reached only from the PreToolUse path. Warming the cache on the prompt is what
-# makes the session's FIRST write or git command enforceable; without it every
-# cold session's first gated call would sail through.
+# The prompt path must still refresh the policy cache, or a cold session's first gated call sails through.
 # ===========================================================================
 
 def _cache(hook):
@@ -878,12 +836,7 @@ def test_decide_charges_per_call_when_the_turn_is_unknown(grace_hook):
 
 
 # ===========================================================================
-# What the gate is in scope for at all (WEB-5456).
-#
-# The rule: write TOOLS always; a shell call only when it runs git or mutates
-# the working tree; everything else — conversation, reads, and any other shell
-# command — never. These pin the scope decision itself, independent of which
-# repo the call resolves in.
+# Scope: write tools always, a shell call only when it runs git or mutates the working tree.
 # ===========================================================================
 
 GIT_COMMANDS = [
@@ -1026,9 +979,7 @@ def test_cd_into_an_out_of_scope_repo_is_caught(hook, repos, command):
 
 
 def test_bare_cd_with_no_git_or_write_is_allowed(hook, repos):
-    """Changed by WEB-5456. Walking into an out-of-scope repo is not itself a
-    gated act any more — only writing or running git there is. `cd` alone, and
-    `cd` followed by a read, both pass."""
+    """Walking into an out-of-scope repo is not gated; only writing or running git there is."""
     _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
     for command in ('cd %s', 'cd %s && cat README.md', 'cd %s && ls -la'):
         response = _run_tool(hook, _tool_event(
@@ -1068,7 +1019,7 @@ def test_cd_escape_escalates_to_a_block_on_the_next_turn(native_turn_hook, repos
 
 
 # ===========================================================================
-# The new table, end to end on every hook (WEB-5456).
+# The scope table, end to end on every hook.
 #
 #                        | inside allowed org | outside it | no git repo
 #   read / grep / glob   | allow              | allow      | allow
@@ -1209,11 +1160,7 @@ def test_grace_is_spent_once_per_turn_across_several_gated_calls(native_turn_hoo
 
 
 def test_copilot_successive_tool_calls_escalate_to_a_block(repos, tmp_path):
-    """WEB-5456 gap 1. Copilot's PreToolUse payload carries no turn id, and a
-    session with no logged prompt has nothing to date one from, so every call
-    resolves to REPO_GATE_UNKNOWN_TURN. Before the fix the first call burned the
-    only grace, memoized the sentinel, and every later call matched it — the
-    gate warned forever and never blocked."""
+    """Copilot has no turn id, so memoizing the unknown-turn sentinel would warn forever and never block."""
     hook = _prepare('copilot', tmp_path)
     _set_policies(hook, [dict(BLOCK_ORG, grace_turns=1)])
     event = _tool_event('copilot', repos.out_scope, 't1')
@@ -1239,8 +1186,7 @@ def test_copilot_cd_into_an_out_of_scope_repo_blocks(repos, tmp_path):
 # PostToolUse, Stop, SessionStart, SessionEnd) and no pre-prompt event. Exit 2
 # is "Blocking Error — PreToolUse only: Blocks tool execution"; on SessionStart
 # the same code means "Hook failed at startup, user needs to fix". So
-# conversation-level blocking is impossible — and no longer wanted (WEB-5456).
-# The workspace-level gate now denies only the calls the gate is in scope for.
+# conversation-level blocking is impossible and no longer wanted; only in-scope calls are denied.
 # ===========================================================================
 
 @pytest.fixture
@@ -1300,10 +1246,7 @@ def test_augment_out_of_scope_workspace_denies_gated_tools(augment, repos,
 ])
 def test_augment_out_of_scope_workspace_allows_ungated_tools(augment, repos,
                                                              tool_name, tool_input):
-    """Changed by WEB-5456. The workspace gate used to deny EVERY tool as a
-    stand-in for blocking the conversation. Conversation is no longer gated
-    anywhere, so the stand-in is gone: reads, plain shell commands and MCP calls
-    pass even when the workspace itself is out of scope."""
+    """Reads, plain shell commands and MCP calls pass even when the workspace is out of scope."""
     _set_policies(augment, [BLOCK_ORG])
     response = _run_tool(augment, _augment_event(
         repos.out_scope, tool_name, tool_input,
@@ -1347,9 +1290,7 @@ def test_augment_in_scope_workspace_still_gates_individual_paths(augment, repos)
     'cd %s && echo x > out.txt',
 ])
 def test_augment_cd_out_of_an_in_scope_workspace_is_denied(augment, repos, command):
-    """WEB-5456 gap 2, the "personal repo" bypass. The workspace is in scope so
-    the workspace gate never fires; before the fix the per-path gate warned with
-    session-scoped grace that could never escalate, so it warned forever."""
+    """The personal-repo bypass: an in-scope workspace must not let a per-path violation warn forever."""
     _set_policies(augment, [BLOCK_ORG])
     response = _run_tool(augment, _augment_event(
         repos.in_scope, 'launch-process',

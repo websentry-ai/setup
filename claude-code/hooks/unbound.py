@@ -47,12 +47,10 @@ CLAUDE_MCP_CONFIG_PATH = (
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
-# Repo-scope gate (WEB-5456). Grace is session-scoped and deliberately does not
-# survive a new session: it is an advisory nudge, not an audit trail.
+# Repo-scope gate. Grace is session-scoped: an advisory nudge, not an audit trail.
 REPO_GATE_STATE_FILE = Path.home() / ".claude" / "hooks" / ".repo_gate_state.json"
 REPO_GATE_TURN_MEMORY = 20
-# _repo_gate_turn_id's "I could not tell which turn this is" answer. It is an
-# unknown, not an identity, and _repo_gate_decide must never memoize it.
+# _repo_gate_turn_id's unknown-turn answer, not an identity: never memoize it.
 REPO_GATE_UNKNOWN_TURN = '_session_turn'
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
@@ -2007,14 +2005,7 @@ def _unbound_app_label(event: Dict) -> str:
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
-    """PreToolUse entry point - DO NOT LOG.
-
-    The repo gate runs FIRST, before _evaluate_pre_tool_use_policies, because
-    that function short-circuits for Write/Edit whenever no terminal-command
-    policy covers them — evaluating the gate inside it would silently never fire
-    for exactly the file tools the gate exists to govern. A gate block returns
-    here without a gateway round trip: only this machine can resolve a path to a
-    git root, so the decision is already final."""
+    """PreToolUse entry point - DO NOT LOG. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Write/Edit when no terminal-command policy covers them."""
     gate = _repo_gate_evaluate(event)
     if gate and gate['decision'] == 'deny':
         return transform_response_for_claude({
@@ -2427,57 +2418,37 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
 
 
-# --- what makes a Bash call in scope for the repo gate (WEB-5456) -----------
-#
-# A shell call is gated only when it invokes git or writes to the working tree.
-# Both detectors read the COMMAND WORD of each separator-delimited segment —
-# never a substring of the line — so `cat rm-notes.md` and `grep -r "rm -rf" .`
-# are not gated. Quoted runs are blanked first, so shell syntax written inside a
-# string (`echo "a && git push"`) is never read as syntax.
-#
-# Both are deliberately conservative: when a segment cannot be classified with
-# confidence it is NOT gated. An over-eager block stops legitimate work in a
-# repo the developer is entitled to use; a miss only loses one enforcement point
-# that the write TOOLS already largely cover. Known and accepted misses: a
-# command reached indirectly (`xargs rm`, `sh -c "git push"`, `$(...)`), a
-# quoted command word (`"git" push`), and `2> err.log`.
+# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
 _QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
 _SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
 _ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
 # Wrappers that stand in front of the real command word.
 _COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
-# Creating or appending redirect. The lookahead drops `2>&1` and `1>&2`, which
-# move an existing stream rather than create a file; the lookbehind keeps `>>`
-# from being counted twice.
+# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
 _REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
 
-# Shell commands that mutate the working tree, in one editable place.
-# ALWAYS a write, whatever the flags:
+# Shell commands that mutate the working tree, always a write whatever the flags:
 _SHELL_WRITE_COMMANDS = frozenset({
     'rm', 'rmdir', 'unlink', 'shred',       # delete
     'mv', 'cp', 'ln', 'install',            # create or relocate
     'touch', 'mkdir',                       # create
     'tee', 'truncate', 'patch',             # rewrite contents
 })
-# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read, so
-# gating every invocation would block ordinary inspection.
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
 _SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
 _INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
-# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository
-# content, and gating them would block ordinary `chmod +x` on a script.
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
 
 
 def _mask_quoted_runs(command):
-    """Blank the inside of quoted runs, preserving length. An unbalanced quote
-    leaves its tail untouched, which can only make detection more cautious."""
+    """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
     return _QUOTED_RUN_RE.sub(
         lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
         command)
 
 
 def _segment_words(segment):
-    """A segment's words from its command word on, dropping env assignments and
-    a leading sudo/env/command wrapper with its flags."""
+    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
     words = []
     for word in segment.split():
         word = word.strip('()`{}"\'')
@@ -2516,8 +2487,7 @@ def _is_git_command(command):
 
 
 def _is_shell_write_command(command):
-    """Whether `command` mutates the working tree — a write command word in any
-    segment, or a creating/appending redirect. False on any error."""
+    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
     try:
         if not isinstance(command, str) or not command:
             return False
@@ -2584,22 +2554,9 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
 
 
-# ---------------------------------------------------------------------------
-# Repository-scope gate (WEB-5456)
-#
-# Blocks WRITES, GIT COMMANDS and SHELL WRITES in git repos outside the org's
-# allowed scope. Conversation and reads are never gated, and a directory under
-# no git root is never gated either — there is no origin to judge. Decided
-# on-device — only this machine maps a path to a git root — and every failure
-# mode allows it through: a broken gate is a missed inspection, never a false
-# block.
-# ---------------------------------------------------------------------------
+# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
 
-# Write operations, git commands and shell writes only (WEB-5456). Reads are
-# ungated: a Read names no intent to change anything, and gating them blocked
-# ordinary navigation. Conversation is ungated for the same reason. A shell call
-# is in scope only when it runs git or mutates the working tree; every other
-# command (ls, cat, npm test) is out of scope.
+# Write tools, git commands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated.
 _REPO_GATE_WRITE_TOOLS = frozenset(_WRITE_TOOLS)
 _REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
 _REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
@@ -2619,8 +2576,7 @@ def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
 
 
 def _repo_gate_applies(tool_name, command):
-    """Whether this call is in the gate's scope: a write tool always, a shell
-    call only when it invokes git or writes to the working tree."""
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
     if tool_name in _REPO_GATE_SHELL_TOOLS:
         return _is_git_command(command) or _is_shell_write_command(command)
     return tool_name in _REPO_GATE_WRITE_TOOLS
@@ -2732,14 +2688,7 @@ def _repo_gate_block_reason(repo: str) -> str:
     )
 
 
-# --- incident reporting ----------------------------------------------------
-# Telemetry only: dispatched after the verdict already exists, handed to a curl
-# nobody waits on, every failure swallowed. No verdict waits on a report.
-#
-# `surface` is now always "tool". The conversation gate was the only producer of
-# surface="prompt", so that value of the server's enum is unreachable from any
-# hook; the field stays because the server still reads it (WEB-5456).
-# ---------------------------------------------------------------------------
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on; `surface` is always "tool" ---
 
 REPO_GATE_AGENT = 'claude-code'
 REPO_GATE_REPORT_MAX_CHARS = 2000
@@ -2779,14 +2728,12 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
         decision = (gate or {}).get('decision')
         if decision not in ('warn', 'deny'):
             return
-        # main() already resolved the key; the fallback covers entry points that
-        # reach the gate without having gone through it.
+        # main() already resolved the key; the fallback covers entry points that skip it.
         api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
-        # WARN reports how far into the grace it got; BLOCK reports the whole
-        # grace, which by definition is spent.
+        # WARN reports how far into the grace it got; BLOCK reports the whole grace.
         grace = policy.get('grace_turns')
         remaining = gate.get('remaining')
         if isinstance(grace, bool) or not isinstance(grace, int):
@@ -2879,8 +2826,7 @@ def _with_repo_gate_context(response: Dict, context: str) -> Dict:
         existing + '\n\n' + context if existing else context
     )
     merged['hookSpecificOutput'] = hook_output
-    # additionalContext feeds the model; systemMessage shows the developer the
-    # same text, mirroring the spend-limit warning on UserPromptSubmit.
+    # additionalContext feeds the model; systemMessage shows the developer the same text.
     merged['systemMessage'] = (
         merged['systemMessage'] + '\n\n' + context
         if merged.get('systemMessage') else context
@@ -2889,15 +2835,7 @@ def _with_repo_gate_context(response: Dict, context: str) -> Dict:
 
 
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
-    """Process UserPromptSubmit event for policy checking.
-
-    Also refreshes the policy cache when it is cold or past its TTL. This is
-    load-bearing for the repo gate (WEB-5456), not incidental: the gate itself
-    never calls the network, so it can only enforce policies already cached, and
-    warming the cache here is what makes the session's FIRST write or git
-    command enforceable. Without it a cold session's first gated tool call would
-    read an empty policy list and be allowed. The TTL is respected so a cold
-    cache does not re-pull on every prompt."""
+    """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
     model = event.get('model') or _get_session_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
@@ -4559,9 +4497,7 @@ def main():
 
         # Handle UserPromptSubmit - check policy before processing
         if hook_event_name == 'UserPromptSubmit':
-            # No repo gate here: conversation is never gated (WEB-5456). This
-            # call still matters to the gate — it refreshes the policy cache, so
-            # the session's first TOOL call is enforceable.
+            # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
 
             # If denied (response has decision: block), log the event then return

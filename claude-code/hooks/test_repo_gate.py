@@ -1,12 +1,4 @@
-"""Tests for the client-side repository-scope gate (WEB-5456) in
-claude-code/hooks/unbound.py.
-
-Driven through `process_pre_tool_use`, the hook's real PreToolUse entry point,
-against real `git init`-ed repositories on disk — the gate's entire job is
-resolving a path to a git root and reading its origin, so stubbing that away
-would test nothing. The one exception is the fail-open suite, which has to
-inject failures (missing git, timeout) that cannot be provoked for real.
-"""
+"""Repo-scope gate tests, driven through process_pre_tool_use against real git repos on disk."""
 
 import io
 import json
@@ -111,8 +103,7 @@ class RepoGateCase(unittest.TestCase):
             return unbound.process_pre_tool_use(event, 'KEY')
 
     def write_file(self, repo: Path, **kw):
-        """The default GATED file call (WEB-5456): a write, not a read. Reads
-        are no longer in the gate's scope at all — see TestReadsAreUngated."""
+        """The default gated file call: a write, not a read. Reads are out of scope entirely."""
         return self.run_tool('Edit', {'file_path': str(repo / 'src' / 'main.py'),
                                       'old_string': 'x', 'new_string': 'y'}, **kw)
 
@@ -155,9 +146,7 @@ class RepoGateCase(unittest.TestCase):
         self.assertNotEqual(response.get('decision'), 'block')
         self.assertNotIn('outside your organization', json.dumps(response))
 
-    # assertPromptWarned/assertPromptBlocked are gone with the gate that
-    # produced them (WEB-5456): a prompt has exactly two outcomes now, allowed
-    # by the gate or blocked by the gateway on its own merits.
+    # assertPromptWarned/assertPromptBlocked are gone: a prompt is never gated now.
 
     # -- incident reports --------------------------------------------------
 
@@ -337,11 +326,7 @@ class TestUnidentifiableTurn(RepoGateCase):
 
 
 class TestPromptPathRefreshesThePolicyCache(RepoGateCase):
-    """WEB-5456. save_policy_cache is otherwise reachable only from the
-    PreToolUse path, and the gate never calls the network, so it can only
-    enforce policies already cached. Warming the cache here is what makes the
-    session's FIRST write or git command enforceable — more important now that
-    there is no prompt gate, not less."""
+    """Warming the cache on the prompt path is what makes the session's first gated call enforceable."""
 
     def test_the_refresh_makes_the_first_tool_call_enforceable(self):
         self.assertFalse(self.cache_file.exists(), 'starts genuinely cold')
@@ -399,9 +384,7 @@ class TestPromptPathRefreshesThePolicyCache(RepoGateCase):
 
 
 class TestConversationIsNeverGated(RepoGateCase):
-    """WEB-5456 removed the session gate outright. The conversation's own cwd
-    used to BE the violation, with no tool call required; now the gate fires on
-    work, not on talking."""
+    """The gate fires on work, not on talking: a conversation's own cwd is never the violation."""
 
     def test_conversation_in_out_of_scope_repo_is_allowed(self):
         """grace_turns=0, so the old rule would have blocked the first prompt.
@@ -469,8 +452,7 @@ class TestConversationIsNeverGated(RepoGateCase):
 
 
 class TestReadsAreUngated(RepoGateCase):
-    """The other half of the WEB-5456 change: Read/Grep/Glob left the gate
-    entirely. A read names no intent to change anything."""
+    """Read/Grep/Glob are out of scope: a read names no intent to change anything."""
 
     def test_read_in_an_out_of_scope_repo_is_allowed(self):
         self.set_policies([dict(ORG_POLICY, grace_turns=0)])
@@ -500,8 +482,7 @@ class TestReadsAreUngated(RepoGateCase):
 
 
 class TestShellDirectoryChanges(RepoGateCase):
-    """`cd` into an out-of-scope repo and then writing or running git there is
-    the violation. The `cd` alone no longer is (WEB-5456)."""
+    """Writing or running git after a cd is the violation; the cd alone is not."""
 
     def test_cd_into_out_of_scope_repo_then_git_or_write_is_caught(self):
         self.set_policies([ORG_POLICY])
@@ -514,8 +495,7 @@ class TestShellDirectoryChanges(RepoGateCase):
                     'acme/widgets')
 
     def test_bare_cd_with_no_git_or_write_is_allowed(self):
-        """Changed by WEB-5456: walking into an out-of-scope repo is not itself
-        a gated act, and neither is reading once there."""
+        """Walking into an out-of-scope repo is not gated, and neither is reading once there."""
         self.set_policies([dict(ORG_POLICY, grace_turns=0)])
         for command in ('cd %s', 'cd %s && cat README.md', 'cd %s && ls -la'):
             with self.subTest(command=command):
@@ -568,8 +548,7 @@ class TestBashPaths(RepoGateCase):
 
 
 class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
-    """WEB-5456: a Bash call is in the gate's scope only when it runs git or
-    mutates the working tree. Everything else is ignored wherever it runs."""
+    """A Bash call is in scope only when it runs git or mutates the working tree."""
 
     # No absolute paths here: a command that names one resolves against THAT
     # path, not the cwd, which is a separate axis covered by TestBashPaths.
@@ -812,15 +791,7 @@ if __name__ == '__main__':
 
 
 class TestIncidentReporting(RepoGateCase):
-    """The gate decides on-device and returns without a network round trip, so
-    a WARN or a BLOCK leaves no trace off this machine unless it is reported.
-
-    CARDINALITY: exactly one report per non-allow verdict. This hook reaches one
-    verdict per GATED PreToolUse call — there is no prompt verdict any more
-    (WEB-5456) — so a turn with N violating tool calls files N reports and never
-    a multiple of N. An ALLOW files none, which now includes every prompt and
-    every read.
-    """
+    """Exactly one report per non-allow verdict; the gate decides on-device, so an unreported verdict leaves no trace."""
 
     def test_a_warned_tool_call_reports_one_warn(self):
         self.set_policies([ORG_POLICY])
