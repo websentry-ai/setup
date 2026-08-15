@@ -1532,9 +1532,8 @@ def _repo_gate_block_reason(repo: str) -> str:
     )
 
 
-# --- incident reporting: telemetry only, dispatched after the verdict and never waited on; `surface` is always "tool" ---
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
 
-REPO_GATE_AGENT = 'codex'
 REPO_GATE_REPORT_MAX_CHARS = 2000
 _REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
                          'path', 'notebook_path')
@@ -1559,7 +1558,7 @@ def _repo_gate_post(body: str, api_key: str):
          '-H', 'Authorization: Bearer %s' % api_key,
          '-H', 'Content-Type: application/json',
          '--data-binary', '@-',
-         '%s/v1/hooks/repo-gate' % UNBOUND_GATEWAY_URL],
+         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc.stdin.write(body.encode())
@@ -1591,18 +1590,25 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
         if isinstance(tool_input, dict):
             named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
             tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        # The pretool envelope every other post uses; the verdict rides under repo_gate.
+        app_label = context.get('app_label')
         _repo_gate_post(json.dumps({
-            'policy_id': policy.get('id'),
-            'policy_name': policy.get('name'),
-            'repository': gate.get('repo'),
-            'decision': 'BLOCK' if decision == 'deny' else 'WARN',
-            'agent': REPO_GATE_AGENT,
-            'surface': context.get('surface'),
-            'tool_name': context.get('tool_name'),
-            'session_id': context.get('session_id'),
-            'turn': turn,
-            'prompt_text': _repo_gate_clip(context.get('prompt_text')),
-            'tool_input': _repo_gate_clip(tool_input),
+            'conversation_id': context.get('session_id'),
+            'event_name': 'RepoGate',
+            'unbound_app_label': app_label,
+            'repo_gate': {
+                'policy_id': policy.get('id'),
+                'repository': gate.get('repo'),
+                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                # Same value as the label above: the incidents page reads this one.
+                'agent': app_label,
+                'tool_name': context.get('tool_name'),
+                # Repeats conversation_id above: the analytics row digests this one.
+                'session_id': context.get('session_id'),
+                'turn': turn,
+                'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+                'tool_input': _repo_gate_clip(tool_input),
+            },
         }), api_key)
     except Exception:
         pass
@@ -1625,7 +1631,7 @@ def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
         gate = _repo_gate_decide(event, block_policies, repo)
         _repo_gate_report(gate, block_policies, {
-            'surface': 'tool',
+            'app_label': 'codex',
             'session_id': event.get('session_id'),
             'tool_name': tool_name,
             'tool_input': event.get('tool_input'),

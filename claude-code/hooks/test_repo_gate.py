@@ -150,14 +150,18 @@ class RepoGateCase(unittest.TestCase):
 
     # -- incident reports --------------------------------------------------
 
-    def reports(self):
-        """Every incident report dispatched so far, decoded."""
+    def envelopes(self):
+        """Every request body dispatched so far, decoded."""
         return [json.loads(call.args[0]) for call in self.post.call_args_list]
+
+    def reports(self):
+        """The verdict carried by each dispatched envelope."""
+        return [envelope['repo_gate'] for envelope in self.envelopes()]
 
     def assertNoReports(self):
         self.assertEqual(self.reports(), [])
 
-    def assertOneReport(self, decision, repo, surface, **extra):
+    def assertOneReport(self, decision, repo, **extra):
         """Exactly one report, carrying the fields the analytics row is keyed
         on. Cardinality is the point of `assertEqual(len(...), 1)`: one gate
         verdict must produce one report, never a duplicate pair."""
@@ -166,10 +170,10 @@ class RepoGateCase(unittest.TestCase):
         report = got[0]
         self.assertEqual(report['decision'], decision)
         self.assertEqual(report['repository'], repo)
-        self.assertEqual(report['surface'], surface)
         self.assertEqual(report['agent'], 'claude-code')
         self.assertEqual(report['policy_id'], ORG_POLICY['id'])
-        self.assertEqual(report['policy_name'], ORG_POLICY['name'])
+        # The app label the gateway reads is the envelope's, not the verdict's.
+        self.assertEqual(self.envelopes()[0]['unbound_app_label'], 'claude-code')
         for key, value in extra.items():
             self.assertEqual(report[key], value, report)
         return report
@@ -797,7 +801,7 @@ class TestIncidentReporting(RepoGateCase):
         self.set_policies([ORG_POLICY])
         self.assertWarned(self.write_file(self.out_scope), 'acme/widgets')
         report = self.assertOneReport(
-            'WARN', 'acme/widgets', 'tool',
+            'WARN', 'acme/widgets',
             tool_name='Edit', session_id='S1', prompt_text=None)
         self.assertEqual(report['tool_input'],
                          str(self.out_scope / 'src' / 'main.py'))
@@ -811,7 +815,7 @@ class TestIncidentReporting(RepoGateCase):
         self.post.reset_mock()
         self.assertBlocked(self.write_file(self.out_scope, prompt_id='turn-3'),
                            'acme/widgets')
-        self.assertOneReport('BLOCK', 'acme/widgets', 'tool', tool_name='Edit')
+        self.assertOneReport('BLOCK', 'acme/widgets', tool_name='Edit')
 
     def test_a_compliant_repo_reports_nothing(self):
         self.set_policies([ORG_POLICY])
@@ -845,16 +849,16 @@ class TestIncidentReporting(RepoGateCase):
         self.assertNoReports()
 
     def test_a_prompt_never_reports_anything(self):
-        """`surface` is now always "tool": the conversation gate was the only
-        producer of surface="prompt", leaving that value of the server's enum
-        unreachable from this hook."""
+        """No prompt ever reports, so every incident this hook files names a
+        tool. `surface` is no longer sent at all: the server derives it from
+        tool_name, and derives "tool" for exactly these reports."""
         self.set_policies([dict(ORG_POLICY, grace_turns=0)])
         for cwd in (str(self.out_scope), str(self.in_scope), str(self.no_repo),
                     None):
             self.assertPromptAllowed(self.run_prompt(cwd=cwd))
         self.assertNoReports()
         source = Path(unbound.__file__).read_text(encoding='utf-8')
-        self.assertNotIn("'surface': 'prompt'", source)
+        self.assertNotIn("'surface'", source)
 
     def test_one_turn_of_violating_calls_files_one_report_each(self):
         """The pinned cardinality: three calls, one burned grace, three
@@ -875,8 +879,8 @@ class TestIncidentReporting(RepoGateCase):
         self.write_file(self.out_scope, prompt_id='turn-1')
         self.bash('git push', prompt_id='turn-1', cwd=str(self.out_scope))
         self.assertEqual(self.grace_used(), 1)
-        self.assertEqual([(r['surface'], r['decision']) for r in self.reports()],
-                         [('tool', 'WARN'), ('tool', 'WARN')])
+        self.assertEqual([r['decision'] for r in self.reports()],
+                         ['WARN', 'WARN'])
 
     # -- nothing about a report can reach a decision ----------------------
 
@@ -891,7 +895,7 @@ class TestIncidentReporting(RepoGateCase):
             self.real_post('{"repository": "acme/widgets"}', 'KEY')
         argv = popen.call_args.args[0]
         self.assertEqual(argv[0], 'curl')
-        self.assertTrue(argv[-1].endswith('/v1/hooks/repo-gate'))
+        self.assertTrue(argv[-1].endswith('/v1/hooks/pretool'))
         self.assertIn('Authorization: Bearer KEY', argv)
         self.assertIn('--max-time', argv)
         proc.stdin.write.assert_called_once_with(b'{"repository": "acme/widgets"}')
@@ -964,12 +968,39 @@ class TestIncidentReporting(RepoGateCase):
     def test_allow_is_never_reported(self):
         """Rule 5: the server refuses an ALLOW anyway, but the client does not
         send one. None is the gate's allow verdict."""
-        unbound._repo_gate_report(None, [ORG_POLICY], {'surface': 'tool'})
+        unbound._repo_gate_report(None, [ORG_POLICY], {'app_label': 'claude-code'})
         unbound._repo_gate_report({'decision': 'allow', 'repo': 'a/b'},
-                                  [ORG_POLICY], {'surface': 'tool'})
+                                  [ORG_POLICY], {'app_label': 'claude-code'})
         self.assertNoReports()
 
     # -- payload shape -----------------------------------------------------
+
+    def test_the_report_rides_the_standard_pretool_envelope(self):
+        """The gateway routes on event_name and reads the app label off the top
+        level, exactly as it does for every other post from this hook."""
+        self.set_policies([ORG_POLICY])
+        self.write_file(self.out_scope)
+        envelope = self.envelopes()[0]
+        self.assertEqual(envelope['event_name'], 'RepoGate')
+        self.assertEqual(envelope['unbound_app_label'], 'claude-code')
+        self.assertEqual(sorted(envelope),
+                         ['conversation_id', 'event_name', 'repo_gate',
+                          'unbound_app_label'])
+        self.assertEqual(envelope['conversation_id'], 'S1')
+        self.assertEqual(sorted(envelope['repo_gate']),
+                         ['agent', 'decision', 'policy_id', 'prompt_text',
+                          'repository', 'session_id', 'tool_input',
+                          'tool_name', 'turn'])
+
+    def test_a_cowork_session_reports_under_its_own_label(self):
+        """The label comes from the same helper the other posts call, so a
+        Cowork incident is not filed against Claude Code."""
+        self.set_policies([ORG_POLICY])
+        with patch.dict(os.environ, {'CLAUDE_CODE_IS_COWORK': '1'}):
+            self.write_file(self.out_scope)
+        envelope = self.envelopes()[0]
+        self.assertEqual(envelope['unbound_app_label'], 'cowork')
+        self.assertEqual(envelope['repo_gate']['agent'], 'cowork')
 
     def test_long_fields_are_capped_so_the_body_fits_the_pipe(self):
         """The write into curl's stdin must never block, which it cannot as
@@ -979,7 +1010,7 @@ class TestIncidentReporting(RepoGateCase):
         self.bash('rm %s/%s' % (self.out_scope, 'x' * 99999))
         body = self.post.call_args.args[0]
         self.assertLess(len(body), 16 * 1024)
-        self.assertEqual(len(json.loads(body)['tool_input']), cap)
+        self.assertEqual(len(json.loads(body)['repo_gate']['tool_input']), cap)
 
     def test_the_report_names_the_policy_whose_grace_governed(self):
         """A repo outside every policy's scope is denied by all of them; the
@@ -988,6 +1019,4 @@ class TestIncidentReporting(RepoGateCase):
         lax = dict(ORG_POLICY, id=8, name='Lax', grace_turns=9)
         self.set_policies([lax, strict])
         self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
-        report = self.reports()[0]
-        self.assertEqual((report['policy_id'], report['policy_name']),
-                         (7, 'Strict'))
+        self.assertEqual(self.reports()[0]['policy_id'], 7)

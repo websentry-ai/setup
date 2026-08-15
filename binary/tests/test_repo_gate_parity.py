@@ -28,6 +28,16 @@ GRACE_HOOKS = PROMPT_HOOKS
 # when the session has yet to log one.
 NATIVE_TURN_ID_HOOKS = ['claude-code', 'codex', 'cursor']
 
+# The app label each tree already sends on its ordinary posts; the gate report
+# must reuse it rather than coin an agent name of its own.
+APP_LABELS = {
+    'claude-code': 'claude-code',
+    'cursor': 'cursor',
+    'codex': 'codex',
+    'copilot': 'copilot',
+    'augment': 'augment_code',
+}
+
 BLOCK_ORG = {
     'id': 12, 'name': 'Block Non-Unbound Repos',
     'github_org': 'unboundsec',
@@ -349,7 +359,7 @@ def _grace_used(hook):
         hook.REPO_GATE_STATE_FILE.read_text(encoding='utf-8'))['used']
 
 
-def _stubs(hook, api, posts=None, real_post=False):
+def _stubs(hook, api, posts=None, real_post=False, bodies=None):
     """Patches that keep a hook's entry points off the network and off the
     developer's real config, skipping helpers a given hook does not have.
 
@@ -366,8 +376,10 @@ def _stubs(hook, api, posts=None, real_post=False):
         out.append(patch.object(hook, 'report_error_to_gateway', MagicMock()))
 
     def record(body, api_key):
+        if bodies is not None:
+            bodies.append(body)
         if posts is not None:
-            posts.append(json.loads(body))
+            posts.append(json.loads(body)['repo_gate'])
 
     if not real_post:
         out.append(patch.object(hook, '_repo_gate_post',
@@ -413,10 +425,10 @@ def _drive_tool(hook, event):
     return hook.process_pre_tool_use(event, 'KEY')
 
 
-def _run_tool(hook, event, gateway=None, posts=None):
+def _run_tool(hook, event, gateway=None, posts=None, bodies=None):
     """Drive one tool call through the hook's real PreToolUse entry point."""
     api = MagicMock(return_value=gateway or {})
-    stack = _stubs(hook, api, posts)
+    stack = _stubs(hook, api, posts, bodies=bodies)
     for p in stack:
         p.start()
     try:
@@ -1470,22 +1482,34 @@ def _reported_prompt(hook, event, gateway=None):
     return _run_main(hook, event, gateway=gateway, posts=posts)[0], posts
 
 
-def _assert_report(report, hook, decision, surface, repo='acme/widgets'):
+def _assert_report(report, hook, decision, repo='acme/widgets'):
     """The fields the analytics row is keyed on."""
     assert report['decision'] == decision
     assert report['repository'] == repo
-    assert report['surface'] == surface
-    assert report['agent'] == hook.tool_name
+    assert report['agent'] == APP_LABELS[hook.tool_name]
     assert report['policy_id'] == BLOCK_ORG['id']
-    assert report['policy_name'] == BLOCK_ORG['name']
     assert report['session_id'] == 'S1'
 
 
-def test_agent_label_is_the_hook_it_ships_with(hook):
-    """One label per tree, and it is the tree's own name — a copy-paste that
-    left claude-code's label on another hook would silently mis-attribute every
-    incident that hook ever files."""
-    assert hook.REPO_GATE_AGENT == hook.tool_name
+def test_the_report_rides_the_standard_pretool_envelope(hook, repos):
+    """One envelope per tree, carrying that tree's own app label at the top
+    level where the gateway reads it. A copy-paste that left claude-code's label
+    on another hook would silently mis-attribute every incident it files."""
+    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    bodies = []
+    _run_tool(hook, _violating_event(hook, repos.out_scope), bodies=bodies)
+    assert len(bodies) == 1, bodies
+    envelope = json.loads(bodies[0])
+    assert envelope['event_name'] == 'RepoGate'
+    assert envelope['unbound_app_label'] == APP_LABELS[hook.tool_name]
+    assert sorted(envelope) == [
+        'conversation_id', 'event_name', 'repo_gate', 'unbound_app_label']
+    # The verdict's session_id repeats it; the analytics digest reads that copy.
+    assert envelope['conversation_id'] == envelope['repo_gate']['session_id']
+    # The verdict carries only what the analytics row reads.
+    assert sorted(envelope['repo_gate']) == [
+        'agent', 'decision', 'policy_id', 'prompt_text', 'repository',
+        'session_id', 'tool_input', 'tool_name', 'turn']
 
 
 def test_tool_warn_reports_one_incident(grace_hook, repos):
@@ -1494,7 +1518,7 @@ def test_tool_warn_reports_one_incident(grace_hook, repos):
     response, reports = _reported_tool(grace_hook, event)
     _assert_tool_warned(grace_hook, response, 'acme/widgets')
     assert len(reports) == 1, reports
-    _assert_report(reports[0], grace_hook, 'WARN', 'tool')
+    _assert_report(reports[0], grace_hook, 'WARN')
     assert reports[0]['tool_input'] == GATED_COMMAND
     assert reports[0]['prompt_text'] is None
 
@@ -1506,7 +1530,7 @@ def test_tool_block_reports_one_incident(hook, repos):
     response, reports = _reported_tool(hook, _violating_event(hook, repos.out_scope))
     _assert_tool_denied(hook, response, 'acme/widgets')
     assert len(reports) == 1, reports
-    _assert_report(reports[0], hook, 'BLOCK', 'tool')
+    _assert_report(reports[0], hook, 'BLOCK')
 
 
 @pytest.mark.parametrize("where", ['in_scope', 'plain'])
@@ -1540,16 +1564,18 @@ def test_a_prompt_never_reports_an_incident(prompt_hook, repos):
 
 
 def test_no_hook_can_emit_the_prompt_surface(hook, repos):
-    """Every report any hook can still file names the tool surface."""
+    """`surface` is no longer sent: the server derives it from tool_name. Every
+    report any hook can still file names a tool, so that derivation yields
+    "tool" and the prompt surface stays unreachable from any hook."""
     _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
     posts = []
     for command in ('git push', 'rm notes.txt'):
         _run_tool(hook, _tool_event(hook.tool_name, repos.out_scope, 't1', command),
                   posts=posts)
     assert posts, "the gate must have reported something to make this meaningful"
-    assert {p['surface'] for p in posts} == {'tool'}
+    assert all(p['tool_name'] for p in posts), posts
     source = TOOL_PY[hook.tool_name].read_text(encoding='utf-8')
-    assert "'surface': 'prompt'" not in source
+    assert "'surface'" not in source
 
 
 def test_one_turn_of_violating_calls_reports_once_per_call(hook, repos):
@@ -1594,7 +1620,7 @@ def test_report_is_handed_off_without_ever_being_waited_on(hook):
         hook._repo_gate_post('{"repository": "acme/thing"}', 'KEY')
     argv = popen.call_args.args[0]
     assert argv[0] == 'curl'
-    assert argv[-1].endswith('/v1/hooks/repo-gate')
+    assert argv[-1].endswith('/v1/hooks/pretool')
     assert 'Authorization: Bearer KEY' in argv
     assert '--max-time' in argv, 'a hung gateway must not leave curl forever'
     proc.stdin.write.assert_called_once_with(b'{"repository": "acme/thing"}')
@@ -1679,9 +1705,9 @@ def test_allow_is_never_reported_even_when_asked_directly(hook):
     one. None is the gate's allow verdict."""
     post = MagicMock()
     with patch.object(hook, '_repo_gate_post', post):
-        hook._repo_gate_report(None, [BLOCK_ORG], {'surface': 'tool'})
+        hook._repo_gate_report(None, [BLOCK_ORG], {'app_label': 'x'})
         hook._repo_gate_report({'decision': 'allow', 'repo': 'a/b'},
-                               [BLOCK_ORG], {'surface': 'tool'})
+                               [BLOCK_ORG], {'app_label': 'x'})
     post.assert_not_called()
 
 
@@ -1698,11 +1724,11 @@ def test_long_fields_are_capped_so_the_body_fits_the_pipe(hook):
     with patch.object(hook, '_repo_gate_post', post):
         hook._repo_gate_report(
             {'decision': 'deny', 'repo': 'acme/thing'}, [BLOCK_ORG],
-            {'surface': 'tool', 'prompt_text': 'p' * 99999,
+            {'app_label': 'x', 'prompt_text': 'p' * 99999,
              'tool_input': {'command': 'c' * 99999}})
     body = post.call_args.args[0]
     assert len(body) < 16 * 1024
-    payload = json.loads(body)
+    payload = json.loads(body)['repo_gate']
     assert len(payload['prompt_text']) == cap
     assert len(payload['tool_input']) == cap
 
@@ -1772,7 +1798,7 @@ def test_cursor_file_tool_reports_the_path_it_names(tmp_path, repos):
         response = cursor.process_pre_tool_use(event, 'KEY')
     _assert_tool_denied(cursor, response, 'acme/widgets')
     assert len(posts) == 1, posts
-    _assert_report(posts[0], cursor, 'BLOCK', 'tool')
+    _assert_report(posts[0], cursor, 'BLOCK')
     assert posts[0]['tool_name'] == 'Write'
     assert posts[0]['tool_input'] == target
 
