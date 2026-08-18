@@ -2205,10 +2205,22 @@ def _dispatch_skills_sync(api_key: str) -> None:
     try:
         if not api_key:
             return
+        if RUNNING_FROZEN:
+            # sys.executable is the frozen unbound-hook binary itself.
+            cmd = [sys.executable, 'sync-skills',
+                   os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+        else:
+            # The running file, not SELF_SCRIPT_PATH: under MDM the hook executes from an
+            # admin-managed directory and that user-level path does not exist.
+            script = os.path.abspath(__file__)
+            if not os.path.isfile(script):
+                log_error(f"skills sync skipped: script not found at {script}", 'skill_injection')
+                return
+            cmd = [sys.executable, script, '--sync-skills']
         subprocess.Popen(
-            [sys.executable, str(SELF_SCRIPT_PATH), '--sync-skills'],
+            cmd,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env={**os.environ, 'UNBOUND_API_KEY': api_key}, start_new_session=True,
+            env={**os.environ, 'UNBOUND_CLAUDE_API_KEY': api_key}, start_new_session=True,
         )
     except Exception as e:
         log_error(f"skills sync dispatch failed: {e}", 'skill_injection')

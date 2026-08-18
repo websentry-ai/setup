@@ -583,6 +583,49 @@ class TestSkillsSync(ProcessPreToolUseSkillBase):
         dispatch.assert_not_called()
 
 
+class TestSkillsSyncDispatchTarget(unittest.TestCase):
+    def test_re_execs_the_running_file_not_the_user_level_install_path(self):
+        with patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_skills_sync("test-key")
+
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[1], os.path.abspath(unbound.__file__))
+        self.assertEqual(argv[2], "--sync-skills")
+        self.assertNotEqual(argv[1], str(unbound.SELF_SCRIPT_PATH))
+
+    def test_spawns_nothing_when_the_running_file_is_gone(self):
+        with patch.object(unbound.os.path, "isfile", return_value=False), \
+             patch.object(unbound.subprocess, "Popen") as popen, \
+             patch.object(unbound, "log_error") as log_error:
+            unbound._dispatch_skills_sync("test-key")
+
+        popen.assert_not_called()
+        log_error.assert_called_once()
+
+    def test_a_frozen_build_re_execs_the_binary_subcommand(self):
+        with patch.dict(os.environ, {"UNBOUND_HOOK_TOOL": "claude-code"}), \
+             patch.object(unbound, "RUNNING_FROZEN", True), \
+             patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_skills_sync("test-key")
+
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv, [unbound.sys.executable, "sync-skills", "claude-code"])
+
+    def test_the_key_travels_by_env_never_argv(self):
+        with patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_skills_sync("test-key")
+
+        argv, kwargs = popen.call_args[0][0], popen.call_args[1]
+        self.assertNotIn("test-key", argv)
+        self.assertEqual(kwargs["env"]["UNBOUND_CLAUDE_API_KEY"], "test-key")
+
+    def test_spawns_nothing_without_an_api_key(self):
+        with patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_skills_sync("")
+
+        popen.assert_not_called()
+
+
 class TestSessionLoadCount(ProcessPreToolUseSkillBase):
     def _managed(self, slug):
         directory = self.skills_root / ("unbound-" + slug)
