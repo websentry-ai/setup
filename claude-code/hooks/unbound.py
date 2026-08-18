@@ -34,11 +34,8 @@ SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
 
 UNBOUND_SKILL_PREFIX = 'unbound-'
-# CLAUDE_CONFIG_DIR relocates the whole config tree, skills included.
 CLAUDE_SKILLS_ROOT = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude')) / 'skills'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
-# An agent that ignores a deny records no invocation, so the transcript cannot tell us
-# we already denied this turn.
 INJECTION_TURN_GUARD_PATH = Path.home() / '.unbound' / 'injection-turn'
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
