@@ -411,19 +411,38 @@ class TestPreToolUseSkillInstall(ProcessPreToolUseSkillBase):
         self.assertEqual(result["hookSpecificOutput"]["permissionDecision"], "deny")
 
     def test_deny_records_the_turn_so_the_retry_is_not_blocked_again(self):
-        guard = self.tmp / "injection-turn"
-        with patch.object(unbound, "INJECTION_TURN_GUARD_PATH", guard):
+        guard_dir = self.tmp / "injection-turn"
+        with patch.object(unbound, "INJECTION_TURN_GUARD_DIR", guard_dir):
             metadata, _ = self._run({"decision": "allow"}, prompt_id="turn-1")
             self.assertNotIn("already_injected_this_turn", metadata)
 
             self._run(self._deny_response(), prompt_id="turn-1")
-            self.assertEqual(guard.read_text(encoding="utf-8"), "turn-1")
+            self.assertEqual(
+                unbound._turn_guard_path("sess").read_text(encoding="utf-8"), "turn-1"
+            )
 
             metadata, _ = self._run({"decision": "allow"}, prompt_id="turn-1")
             self.assertTrue(metadata["already_injected_this_turn"])
 
             metadata, _ = self._run({"decision": "allow"}, prompt_id="turn-2")
             self.assertNotIn("already_injected_this_turn", metadata)
+
+    def test_the_turn_guard_is_scoped_per_session(self):
+        guard_dir = self.tmp / "injection-turn"
+        with patch.object(unbound, "INJECTION_TURN_GUARD_DIR", guard_dir):
+            unbound._turn_guard_write("session-a", "turn-1")
+            unbound._turn_guard_write("session-b", "turn-9")
+
+            self.assertEqual(unbound._turn_guard_read("session-a"), "turn-1")
+            self.assertEqual(unbound._turn_guard_read("session-b"), "turn-9")
+            self.assertEqual(unbound._turn_guard_read("session-c"), "")
+
+    def test_a_path_hostile_session_id_cannot_escape_the_guard_dir(self):
+        guard_dir = self.tmp / "injection-turn"
+        with patch.object(unbound, "INJECTION_TURN_GUARD_DIR", guard_dir):
+            target = unbound._turn_guard_path("../../etc/passwd")
+
+        self.assertEqual(target.parent, guard_dir)
 
     def test_allow_never_installs(self):
         response = dict(self._deny_response(), decision="allow")

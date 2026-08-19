@@ -36,7 +36,7 @@ SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
 UNBOUND_SKILL_PREFIX = 'unbound-'
 CLAUDE_SKILLS_ROOT = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude')) / 'skills'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
-INJECTION_TURN_GUARD_PATH = Path.home() / '.unbound' / 'injection-turn'
+INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn'
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 20
@@ -2052,17 +2052,26 @@ def _slug_of(directory: Path) -> Optional[str]:
     return slug if _SLUG_RE.match(slug) else None
 
 
-def _turn_guard_read() -> str:
+def _turn_guard_path(session_id) -> Path:
+    safe = re.sub(r'[^A-Za-z0-9._-]', '', str(session_id or ''))[:64]
+    return INJECTION_TURN_GUARD_DIR / (safe or 'default')
+
+
+def _turn_guard_read(session_id) -> str:
     try:
-        return INJECTION_TURN_GUARD_PATH.read_text(encoding='utf-8').strip()
+        return _turn_guard_path(session_id).read_text(encoding='utf-8').strip()
     except OSError:
         return ''
 
 
-def _turn_guard_write(prompt_id: str) -> None:
+def _turn_guard_write(session_id, prompt_id: str) -> None:
     try:
-        INJECTION_TURN_GUARD_PATH.parent.mkdir(parents=True, exist_ok=True)
-        INJECTION_TURN_GUARD_PATH.write_text(prompt_id, encoding='utf-8')
+        INJECTION_TURN_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+        _turn_guard_path(session_id).write_text(prompt_id, encoding='utf-8')
+        cutoff = time.time() - 7 * 24 * 3600
+        for stale in INJECTION_TURN_GUARD_DIR.iterdir():
+            if stale.is_file() and stale.stat().st_mtime < cutoff:
+                stale.unlink()
     except OSError:
         pass
 
@@ -2151,26 +2160,45 @@ def install_injected_skills(inject_skills) -> None:
         log_error(f"skill injection failed: {e}", 'skill_injection')
 
 
-def _sync_skills_once(api_key: str) -> None:
-    # The lock stops two sessions interleaving a delete with an install.
-    lock_fd = None
+def _skills_lock_acquire():
     try:
         SKILLS_SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
         try:
-            lock_fd = os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         except FileExistsError:
             try:
                 age = time.time() - SKILLS_SYNC_LOCK_PATH.stat().st_mtime
             except OSError:
                 age = SKILLS_SYNC_STALE_LOCK_SECONDS + 1
             if age < SKILLS_SYNC_STALE_LOCK_SECONDS:
-                return
+                return None
             try:
                 SKILLS_SYNC_LOCK_PATH.unlink()
-                lock_fd = os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             except OSError:
-                return
+                return None
+    except OSError:
+        return None
 
+
+def _skills_lock_release(lock_fd) -> None:
+    if lock_fd is None:
+        return
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+    try:
+        SKILLS_SYNC_LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _sync_skills_once(api_key: str) -> None:
+    lock_fd = _skills_lock_acquire()
+    if lock_fd is None:
+        return
+    try:
         payload = json.dumps({'installed': installed_skill_report()})
         result = subprocess.run(
             ["curl", "-fsSL", "-X", "POST",
@@ -2189,15 +2217,7 @@ def _sync_skills_once(api_key: str) -> None:
     except Exception as e:
         log_error(f"skills sync failed: {e}", 'skill_injection')
     finally:
-        if lock_fd is not None:
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
-            try:
-                SKILLS_SYNC_LOCK_PATH.unlink()
-            except OSError:
-                pass
+        _skills_lock_release(lock_fd)
 
 
 def _dispatch_skills_sync(api_key: str) -> None:
@@ -2299,7 +2319,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             metadata['loaded_skills'] = sorted(facts['loaded'])
         metadata['skills_loaded_this_session'] = facts['session_count']
     prompt_id = event.get('prompt_id')
-    if prompt_id and _turn_guard_read() == prompt_id:
+    if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
         metadata['already_injected_this_turn'] = True
 
     if is_mcp:
@@ -2467,9 +2487,14 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         # The gateway only denies for a skill this device already reported current, so
         # there is nothing to install here — just remember the turn.
         if event.get('prompt_id'):
-            _turn_guard_write(event['prompt_id'])
+            _turn_guard_write(event.get('session_id'), event['prompt_id'])
     if api_response.get('remove_skills'):
-        prune_injected_skills(api_response.get('remove_skills'))
+        prune_lock = _skills_lock_acquire()
+        if prune_lock is not None:
+            try:
+                prune_injected_skills(api_response.get('remove_skills'))
+            finally:
+                _skills_lock_release(prune_lock)
     if api_response.get('sync_skills'):
         _dispatch_skills_sync(api_key)
 
