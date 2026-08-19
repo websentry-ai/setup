@@ -404,29 +404,91 @@ def _get_session_model(session_id: str) -> Optional[str]:
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
+def _cache_creation_tokens(usage: Dict) -> int:
+    """Cache-creation is reported either as a flat count or split across ephemeral TTLs."""
+    block = usage.get('cache_creation')
+    if isinstance(block, dict):
+        total = 0
+        for k in ('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens'):
+            try:
+                total += int(block.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+    try:
+        return int(usage.get('cache_creation_input_tokens') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_value(usage: Dict, field: str) -> int:
+    if field == 'cache_creation_input_tokens':
+        return _cache_creation_tokens(usage)
+    try:
+        return int(usage.get(field) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _usage_total(usage: Dict) -> int:
-    total = 0
-    for k in _USAGE_FIELDS:
-        try:
-            total += int(usage.get(k) or 0)
-        except (TypeError, ValueError):
-            pass
-    return total
+    return sum(_usage_value(usage, k) for k in _USAGE_FIELDS)
+
+
+def _advisor_usages(message: Dict) -> List[Dict]:
+    """Advisor turns ride inside usage.iterations as flattened token blocks under their own
+    model. Iterations of type 'message' are already inside the top-level usage."""
+    usage = message.get('usage')
+    if not isinstance(usage, dict):
+        return []
+    iterations = usage.get('iterations')
+    if not isinstance(iterations, list):
+        return []
+    return [
+        it for it in iterations
+        if isinstance(it, dict) and it.get('type') == 'advisor_message' and it.get('model')
+    ]
+
+
+def _agent_progress_entry(entry: Dict) -> Optional[Dict]:
+    """Agent-progress lines wrap the assistant record one level deeper, so the outer type is
+    not 'assistant'; the inner record carries the usage, timestamp and isSidechain."""
+    data = entry.get('data')
+    inner = data.get('message') if isinstance(data, dict) else None
+    if isinstance(inner, dict) and isinstance(inner.get('message'), dict):
+        return inner
+    return None
 
 
 def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
-    """Store a message's usage keyed by (message.id, requestId). Claude Code writes the
-    same assistant message as several streamed lines under one id; keep the highest-total
-    line (the completed message, whose output has finished growing) so tokens aren't over-
-    or under-counted. Mirrors ccusage's dedup. Entries missing either id are kept individually."""
+    """Store a message's usage keyed by message.id. Claude Code writes the same assistant
+    message as several streamed lines, and a replay can carry a new requestId, so the id
+    alone is the identity. Prefer the non-sidechain line, then the highest total (the
+    completed message, whose output has finished growing). Mirrors ccusage's dedup.
+    Entries without an id are kept individually."""
     msg_usage = message.get('usage')
-    if not isinstance(msg_usage, dict) or not msg_usage:
-        return
-    mid, rid = message.get('id'), entry.get('requestId')
-    key = (mid, rid) if (mid and rid) else ('', len(usage_by_key))
+    sidechain = entry.get('isSidechain') is True
+    mid = message.get('id')
+
+    if isinstance(msg_usage, dict) and msg_usage:
+        _keep_usage(usage_by_key, mid or ('', len(usage_by_key)), msg_usage, sidechain)
+
+    for index, advisor in enumerate(_advisor_usages(message)):
+        key = (mid, 'advisor', index) if mid else ('', len(usage_by_key))
+        _keep_usage(usage_by_key, key, advisor, sidechain)
+
+
+def _keep_usage(usage_by_key: Dict, key, msg_usage: Dict, sidechain: bool) -> None:
     prev = usage_by_key.get(key)
-    if prev is None or _usage_total(msg_usage) > _usage_total(prev):
-        usage_by_key[key] = msg_usage
+    if prev is None:
+        usage_by_key[key] = (msg_usage, sidechain)
+        return
+    prev_usage, prev_sidechain = prev
+    if sidechain != prev_sidechain:
+        if prev_sidechain:
+            usage_by_key[key] = (msg_usage, sidechain)
+        return
+    if _usage_total(msg_usage) > _usage_total(prev_usage):
+        usage_by_key[key] = (msg_usage, sidechain)
 
 
 def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
@@ -451,7 +513,9 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if entry.get('type') != 'assistant':
+                    progress = _agent_progress_entry(entry)
+                    entry = progress or entry
+                    if progress is None and entry.get('type') != 'assistant':
                         continue
                     ts = entry.get('timestamp')
                     # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
@@ -509,7 +573,10 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
                 try:
                     entry = json.loads(line)
-                    entry_type = entry.get('type', '')
+                    progress = _agent_progress_entry(entry)
+                    if progress is not None:
+                        entry = progress
+                    entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
 
                     if entry_type == 'user':
@@ -526,7 +593,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                                 continue
 
                         message = entry.get('message', {})
-                        if message.get('role') == 'assistant':
+                        # Agent-progress records carry usage without a role field.
+                        if message.get('role') == 'assistant' or progress is not None:
                             for content_item in message.get('content', []):
                                 if isinstance(content_item, dict) and content_item.get('type') == 'text':
                                     text_content = content_item.get('text', '')
@@ -551,9 +619,9 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     if include_usage:
         try:
             _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key)
-            for msg_usage in usage_by_key.values():
+            for msg_usage, _ in usage_by_key.values():
                 for k in usage:
-                    usage[k] += int(msg_usage.get(k) or 0)
+                    usage[k] += _usage_value(msg_usage, k)
         except Exception as e:
             log_error(f"usage aggregation failed for {transcript_path}: {e}", 'usage')
 

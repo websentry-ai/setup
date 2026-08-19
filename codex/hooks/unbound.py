@@ -1462,12 +1462,33 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
     return tool_uses
 
 
+_CODEX_TOKEN_ALIASES = {
+    'input_tokens': ('input_tokens', 'prompt_tokens', 'input'),
+    'cached_input_tokens': ('cached_input_tokens', 'cache_read_input_tokens', 'cached_tokens'),
+    'output_tokens': ('output_tokens', 'completion_tokens', 'output'),
+}
+
+
+def _codex_token(usage: Dict, field: str) -> int:
+    for name in _CODEX_TOKEN_ALIASES[field]:
+        value = usage.get(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
-    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
+    """Per-turn token usage via total_token_usage deltas, falling back to this turn's
+    summed last_token_usage when a rollout carries no cumulative totals."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
         return None
 
     before, after = {}, {}
+    turn_usages = []
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -1480,22 +1501,37 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 payload = entry.get('payload') or {}
                 if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
                     continue
-                total = (payload.get('info') or {}).get('total_token_usage')
-                if not total:
+                info = payload.get('info') or {}
+                in_turn = entry.get('timestamp', '') >= user_prompt_timestamp
+                total = info.get('total_token_usage')
+                if total:
+                    if in_turn:
+                        after = total
+                    else:
+                        before = total
                     continue
-                if entry.get('timestamp', '') < user_prompt_timestamp:
-                    before = total
-                else:
-                    after = total
+                last = info.get('last_token_usage')
+                # Only summed when no cumulative total exists; last_token_usage re-emits across
+                # turns (openai/codex#14489), so it can't be trusted alongside the deltas.
+                if last and in_turn:
+                    turn_usages.append(last)
 
-        if not after:
+        if after:
+            def field(name):
+                return max(_codex_token(after, name) - _codex_token(before, name), 0)
+        elif turn_usages:
+            def field(name):
+                return sum(_codex_token(usage, name) for usage in turn_usages)
+        else:
             return None
 
-        delta = lambda k: max(int(after.get(k) or 0) - int(before.get(k) or 0), 0)
-        # Codex input_tokens includes cached_input_tokens; subtract so cache isn't billed at the base rate too.
-        prompt = max(delta('input_tokens') - delta('cached_input_tokens'), 0)
-        completion = delta('output_tokens') + delta('reasoning_output_tokens')
-        cache_read = delta('cached_input_tokens')
+        input_tokens = field('input_tokens')
+        # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
+        # isn't billed at the base rate and can never exceed the input it came from.
+        cache_read = min(field('cached_input_tokens'), input_tokens)
+        prompt = input_tokens - cache_read
+        # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
+        completion = field('output_tokens')
     except Exception:
         return None
 
