@@ -2015,6 +2015,7 @@ def read_skill_facts(transcript_path: Optional[str]) -> Dict:
         return facts
 
     session_names = set()
+    seen_turn_keys = set()
     turns = 0
     in_window = True
     for raw in reversed(lines):
@@ -2031,7 +2032,14 @@ def read_skill_facts(transcript_path: Optional[str]) -> Dict:
             in_window = False
             continue
         if entry_type == 'assistant':
-            turns += 1
+            # One assistant message arrives as several streamed lines under one id, so
+            # counting lines would shrink the window to a fraction of the turns it names.
+            message = entry.get('message') or {}
+            mid, rid = message.get('id'), entry.get('requestId')
+            key = (mid, rid) if (mid and rid) else ('', len(seen_turn_keys))
+            if key not in seen_turn_keys:
+                seen_turn_keys.add(key)
+                turns += 1
             if turns > SKILL_LOADED_WINDOW:
                 in_window = False
             continue

@@ -1,9 +1,3 @@
-"""
-Tests for the skill injection device half in claude-code/hooks/unbound.py:
-the transcript suppression scan (skill_loaded), the PreToolUse report
-(loaded_skill_slugs), and the on-deny install (install_injected_skills).
-"""
-
 import hashlib
 import json
 import os
@@ -15,18 +9,22 @@ from unittest.mock import MagicMock, patch
 import unbound
 
 
-def unbound_skill_loaded(transcript_path, invoked_name, window=unbound.SKILL_LOADED_WINDOW):
-    """Shim for the retired helper: one reader now answers both skill facts."""
+def unbound_skill_loaded(transcript_path, invoked_name):
     slug = invoked_name[len(unbound.UNBOUND_SKILL_PREFIX):]
     return slug in unbound.read_skill_facts(transcript_path)['loaded']
 
 
-def unbound_loaded_slugs(transcript_path, window=unbound.SKILL_LOADED_WINDOW):
+def unbound_loaded_slugs(transcript_path):
     return sorted(unbound.read_skill_facts(transcript_path)['loaded'])
 
 
 ASSISTANT = {"type": "assistant", "message": {"role": "assistant", "content": []}}
 COMPACT = {"type": "system", "subtype": "compact_boundary"}
+
+
+def _streamed(mid, rid="req"):
+    """One line of a streamed assistant message. Several share the same pair of ids."""
+    return {"type": "assistant", "requestId": rid, "message": {"role": "assistant", "id": mid, "content": []}}
 
 
 def _invocation(name, success=True):
@@ -63,8 +61,7 @@ class TestSkillLoaded(unittest.TestCase):
 
     def test_invocation_after_the_boundary_survives_it(self):
         # Compaction only drops what precedes it, so a skill invoked after the boundary
-        # is still in context. Verified against SkillLoaded in transcript.go, which
-        # returns true here because the backwards scan reaches the invocation first.
+        # is still in context.
         _write_transcript(self.transcript, [
             ASSISTANT, COMPACT, _invocation("unbound-secure-sql"), ASSISTANT,
         ])
@@ -78,8 +75,7 @@ class TestSkillLoaded(unittest.TestCase):
         self.assertFalse(unbound_skill_loaded(str(self.transcript), "unbound-pii"))
 
     def test_bare_string_tool_use_result(self):
-        # The hook-denial shape. It must not crash the scan, must not match, and must
-        # not stop the scan from reaching a real invocation behind it.
+        # The hook-denial shape: toolUseResult is a bare string, not an object.
         _write_transcript(self.transcript, [
             _invocation("unbound-secure-sql"),
             {"type": "user", "toolUseResult": "blocked by policy"},
@@ -96,8 +92,6 @@ class TestSkillLoaded(unittest.TestCase):
         self.assertFalse(unbound_skill_loaded(missing, "unbound-secure-sql"))
 
     def test_window_counts_assistant_turns_not_lines(self):
-        # Far more than `window` non-assistant lines after the invocation, but only
-        # three assistant turns. A line-counting implementation answers False here.
         entries = [_invocation("unbound-secure-sql")]
         for i in range(3):
             entries.extend([{"type": "attachment", "n": j} for j in range(60)])
@@ -107,6 +101,22 @@ class TestSkillLoaded(unittest.TestCase):
         _write_transcript(self.transcript, entries)
         self.assertGreater(len(entries), 180)
         self.assertTrue(unbound_skill_loaded(str(self.transcript), "unbound-secure-sql"))
+
+    def test_streamed_lines_of_one_message_are_one_turn(self):
+        entries = [_invocation("unbound-secure-sql")]
+        for turn in range(unbound.SKILL_LOADED_WINDOW - 1):
+            entries.extend(_streamed(f"msg_{turn}", f"req_{turn}") for _ in range(3))
+        _write_transcript(self.transcript, entries)
+
+        self.assertGreater(len(entries), unbound.SKILL_LOADED_WINDOW * 2)
+        self.assertTrue(unbound_skill_loaded(str(self.transcript), "unbound-secure-sql"))
+
+    def test_distinct_messages_still_close_the_window(self):
+        entries = [_invocation("unbound-secure-sql")]
+        entries.extend(_streamed(f"msg_{t}", f"req_{t}") for t in range(unbound.SKILL_LOADED_WINDOW + 1))
+        _write_transcript(self.transcript, entries)
+
+        self.assertFalse(unbound_skill_loaded(str(self.transcript), "unbound-secure-sql"))
 
     def test_unsuccessful_invocation_does_not_match(self):
         _write_transcript(self.transcript, [_invocation("unbound-secure-sql", success=False), ASSISTANT])
@@ -146,7 +156,6 @@ class TestSkillLoaded(unittest.TestCase):
         self.assertFalse(unbound_skill_loaded(str(self.transcript), ""))
 
     def test_the_whole_transcript_is_read_not_just_a_tail(self):
-        """A megabytes-old invocation still counts toward the session total."""
         filler = json.dumps({"type": "attachment", "pad": "x" * 4096})
         entries = [_invocation("unbound-secure-sql")]
         entries += [filler] * 300
@@ -185,8 +194,6 @@ class TestLoadedSkillSlugs(unittest.TestCase):
         self.assertEqual([e['slug'] for e in unbound.installed_skill_report()], [])
 
     def test_nothing_installed_skips_the_transcript(self):
-        """The skip lives at the call site now: with nothing on disk there is no
-        injection to suppress or count, so the file is never opened."""
         reader = MagicMock(return_value={"loaded": set(), "session_count": 0})
         with patch.object(unbound, "read_skill_facts", reader):
             self.assertEqual(unbound_loaded_slugs(str(self.transcript)), [])
@@ -504,8 +511,6 @@ class TestPreToolUseSkillPrune(ProcessPreToolUseSkillBase):
 
 
 class TestSkillsSync(ProcessPreToolUseSkillBase):
-    """The one round trip that installs, updates and deletes."""
-
     def _managed(self, slug, body="old body\n"):
         directory = self.skills_root / ("unbound-" + slug)
         directory.mkdir(parents=True)
