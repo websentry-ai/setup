@@ -1482,13 +1482,11 @@ def _codex_token(usage: Dict, field: str) -> int:
 
 
 def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
-    """Per-turn token usage via total_token_usage deltas, falling back to this turn's
-    summed last_token_usage when a rollout carries no cumulative totals."""
+    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
         return None
 
     before, after = {}, {}
-    turn_usages = []
     try:
         with open(transcript_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -1501,29 +1499,21 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 payload = entry.get('payload') or {}
                 if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
                     continue
-                info = payload.get('info') or {}
-                in_turn = entry.get('timestamp', '') >= user_prompt_timestamp
-                total = info.get('total_token_usage')
-                if total:
-                    if in_turn:
-                        after = total
-                    else:
-                        before = total
+                # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
+                # later token_count events, so summing it would bill the same call twice.
+                total = (payload.get('info') or {}).get('total_token_usage')
+                if not total:
                     continue
-                last = info.get('last_token_usage')
-                # Only summed when no cumulative total exists; last_token_usage re-emits across
-                # turns (openai/codex#14489), so it can't be trusted alongside the deltas.
-                if last and in_turn:
-                    turn_usages.append(last)
+                if entry.get('timestamp', '') < user_prompt_timestamp:
+                    before = total
+                else:
+                    after = total
 
-        if after:
-            def field(name):
-                return max(_codex_token(after, name) - _codex_token(before, name), 0)
-        elif turn_usages:
-            def field(name):
-                return sum(_codex_token(usage, name) for usage in turn_usages)
-        else:
+        if not after:
             return None
+
+        def field(name):
+            return max(_codex_token(after, name) - _codex_token(before, name), 0)
 
         input_tokens = field('input_tokens')
         # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
