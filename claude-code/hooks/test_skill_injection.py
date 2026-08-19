@@ -300,6 +300,21 @@ class TestInstallInjectedSkills(unittest.TestCase):
         unbound.install_injected_skills([entry])
         self.assertEqual((directory / "SKILL.md").read_text(encoding="utf-8"), entry["content"])
 
+    def test_a_failed_marker_write_leaves_nothing_to_skip_next_run(self):
+        real_write = unbound.Path.write_text
+
+        def fail_on_marker(self_path, *args, **kwargs):
+            if self_path.name == unbound.UNBOUND_SKILL_MARKER:
+                raise OSError("read-only")
+            return real_write(self_path, *args, **kwargs)
+
+        with patch.object(unbound.Path, "write_text", fail_on_marker):
+            unbound.install_injected_skills([self._entry()])
+        self.assertFalse((self.root / "unbound-secure-sql").exists())
+
+        unbound.install_injected_skills([self._entry()])
+        self.assertTrue((self.root / "unbound-secure-sql" / "SKILL.md").exists())
+
     def test_write_failure_is_non_fatal(self):
         with patch.object(unbound.tempfile, "mkstemp", side_effect=OSError("no space")):
             unbound.install_injected_skills([self._entry()])

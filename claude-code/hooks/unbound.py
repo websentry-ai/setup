@@ -2165,9 +2165,20 @@ def install_injected_skills(inject_skills) -> None:
                 if state['exists'] and state['managed'] and state['content_hash'] == expected:
                     continue
 
+                created = not state['exists']
                 directory.mkdir(parents=True, exist_ok=True)
-                # Marker first: a marked dir with a stale body is rewritten next run.
-                (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
+                try:
+                    # Marker first: a marked dir with a stale body is rewritten next run.
+                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
+                except OSError:
+                    # A later reconcile reads an unmarked dir as the developer's own
+                    # skill and skips it forever, so drop the empty one we just made.
+                    if created:
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
+                    raise
 
                 # '.SKILL.' hides the partial file from a scan; the fd closes before the
                 # rename because Windows will not replace an open file.
