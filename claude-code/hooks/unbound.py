@@ -2237,11 +2237,18 @@ def _dispatch_skills_sync(api_key: str) -> None:
                 log_error(f"skills sync skipped: script not found at {script}", 'skill_injection')
                 return
             cmd = [sys.executable, script, '--sync-skills']
-        subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env={**os.environ, 'UNBOUND_CLAUDE_API_KEY': api_key}, start_new_session=True,
-        )
+        popen_kwargs = {
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL,
+            'close_fds': True,
+            'env': {**os.environ, 'UNBOUND_CLAUDE_API_KEY': api_key},
+        }
+        if os.name == 'nt':
+            popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        subprocess.Popen(cmd, **popen_kwargs)
     except Exception as e:
         log_error(f"skills sync dispatch failed: {e}", 'skill_injection')
 

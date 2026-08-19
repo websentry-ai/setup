@@ -638,6 +638,19 @@ class TestSkillsSyncDispatchTarget(unittest.TestCase):
         self.assertNotIn("test-key", argv)
         self.assertEqual(kwargs["env"]["UNBOUND_CLAUDE_API_KEY"], "test-key")
 
+    def test_the_child_is_detached_on_this_platform(self):
+        with patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_skills_sync("test-key")
+
+        kwargs = popen.call_args[1]
+        self.assertTrue(kwargs["close_fds"])
+        if os.name == "nt":
+            self.assertIn("creationflags", kwargs)
+            self.assertNotIn("start_new_session", kwargs)
+        else:
+            self.assertTrue(kwargs["start_new_session"])
+            self.assertNotIn("creationflags", kwargs)
+
     def test_spawns_nothing_without_an_api_key(self):
         with patch.object(unbound.subprocess, "Popen") as popen:
             unbound._dispatch_skills_sync("")
