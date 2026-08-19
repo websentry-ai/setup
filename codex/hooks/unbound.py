@@ -384,6 +384,28 @@ def append_to_audit_log(event_data: Dict):
         pass
 
 
+def _typed_user_text(entry: Dict) -> str:
+    """The typed text of a transcript entry, forwarded verbatim so DLP scans what
+    the user wrote. Only text blocks are prompt text: tool results, meta entries
+    and images are not, and yield '' so the caller skips the entry."""
+    if 'toolUseResult' in entry or entry.get('isMeta'):
+        return ''
+    message = entry.get('message') or {}
+    if message.get('role') != 'user':
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content if content.strip() else ''
+    if isinstance(content, list):
+        texts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        joined = '\n'.join(t for t in texts if isinstance(t, str))
+        return joined if joined.strip() else ''
+    return ''
+
+
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
@@ -406,14 +428,12 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_timestamp = entry.get('timestamp')
 
                     if entry_type == 'user':
-                        message = entry.get('message', {})
-                        if message.get('role') == 'user':
-                            content = message.get('content', '')
-                            if content:
-                                conversation_data['user_messages'].append({
-                                    'content': content,
-                                    'timestamp': entry_timestamp
-                                })
+                        typed = _typed_user_text(entry)
+                        if typed:
+                            conversation_data['user_messages'].append({
+                                'content': typed,
+                                'timestamp': entry_timestamp
+                            })
 
                     elif entry_type == 'assistant':
                         if user_prompt_timestamp and entry_timestamp:
