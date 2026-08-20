@@ -1486,47 +1486,154 @@ def _codex_token(usage: Dict, field: str) -> int:
     return 0
 
 
+_SUBAGENT_SCAN_WINDOW_SECONDS = 24 * 3600
+
+
+def _codex_session_meta(transcript_path: str) -> Dict:
+    """A rollout opens with a session_meta line carrying its id, the thread it was spawned
+    from, and the fork time."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            entry = json.loads(f.readline() or '{}')
+    except (OSError, ValueError):
+        return {}
+    if entry.get('type') != 'session_meta':
+        return {}
+    payload = entry.get('payload')
+    if not isinstance(payload, dict):
+        return {}
+
+    def nested(value, *keys):
+        for key in keys:
+            if not isinstance(value, dict):
+                return {}
+            value = value.get(key)
+        return value if isinstance(value, dict) else {}
+
+    # source is a plain string ("cli") on ordinary rollouts and only a mapping on spawned ones.
+    spawn = nested(payload, 'source', 'subagent', 'thread_spawn')
+    return {
+        'id': payload.get('id'),
+        'parent_id': payload.get('forked_from_id') or spawn.get('parent_thread_id'),
+        'forked_at': entry.get('timestamp'),
+    }
+
+
+def _codex_sessions_root(transcript_path: str) -> Optional[str]:
+    path = os.path.abspath(transcript_path)
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        if os.path.basename(parent) == 'sessions':
+            return parent
+        path = parent
+    default = Path.home() / '.codex' / 'sessions'
+    return str(default) if default.is_dir() else None
+
+
+def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[tuple]:
+    """Rollouts this session spawned during the turn. Codex writes every subagent to its own
+    file, so the parent transcript carries none of their usage."""
+    session_id = _codex_session_meta(transcript_path).get('id')
+    root = _codex_sessions_root(transcript_path)
+    if not session_id or not root:
+        return []
+    parent_real = os.path.realpath(transcript_path)
+    cutoff = time.time() - _SUBAGENT_SCAN_WINDOW_SECONDS
+    found = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith('.jsonl'):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                # Recency keeps the scan off historical rollouts. mtime is compared against
+                # the same clock, never against a transcript timestamp, so skew cannot drop
+                # a live child; the window is wide enough that only stale files are pruned.
+                if os.path.realpath(path) == parent_real or os.path.getmtime(path) < cutoff:
+                    continue
+            except OSError:
+                continue
+            meta = _codex_session_meta(path)
+            if meta.get('parent_id') != session_id:
+                continue
+            forked_at = meta.get('forked_at')
+            if _ts_lt(forked_at, user_prompt_timestamp):
+                continue
+            found.append((path, forked_at))
+    return found
+
+
+def _codex_totals_around(transcript_path: str, anchor: Optional[str]) -> tuple:
+    """Last cumulative snapshot at or before the anchor, and the last one after it."""
+    before, after = {}, {}
+    with open(transcript_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get('payload') or {}
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
+            # later events, so summing double-bills; estimating a turn beats over-billing it.
+            total = (payload.get('info') or {}).get('total_token_usage')
+            if not total:
+                continue
+            if _ts_lt(entry.get('timestamp'), anchor):
+                before = total
+            else:
+                after = total
+    return before, after
+
+
+def _codex_usage_delta(before: Dict, after: Dict) -> tuple:
+    def field(name):
+        return max(_codex_token(after, name) - _codex_token(before, name), 0)
+
+    input_tokens = field('input_tokens')
+    # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
+    # isn't billed at the base rate and can never exceed the input it came from.
+    cache_read = min(field('cached_input_tokens'), input_tokens)
+    # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
+    return input_tokens - cache_read, field('output_tokens'), cache_read
+
+
 def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
-    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
+    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489),
+    plus the same delta over any subagent rollout this turn spawned."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
         return None
 
-    before, after = {}, {}
     try:
-        with open(transcript_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = entry.get('payload') or {}
-                if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
-                    continue
-                # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
-                # later events, so summing double-bills; estimating a turn beats over-billing it.
-                total = (payload.get('info') or {}).get('total_token_usage')
-                if not total:
-                    continue
-                if _ts_lt(entry.get('timestamp'), user_prompt_timestamp):
-                    before = total
-                else:
-                    after = total
+        before, after = _codex_totals_around(transcript_path, user_prompt_timestamp)
+        prompt, completion, cache_read = _codex_usage_delta(before, after) if after else (0, 0, 0)
 
-        if not after:
-            return None
+        try:
+            children = _codex_subagent_rollouts(transcript_path, user_prompt_timestamp)
+        except Exception as e:
+            # The parent's own usage is already computed; never trade it for the children.
+            log_error(f"subagent usage: cannot enumerate for {transcript_path}: {e}", 'usage')
+            children = []
 
-        def field(name):
-            return max(_codex_token(after, name) - _codex_token(before, name), 0)
-
-        input_tokens = field('input_tokens')
-        # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
-        # isn't billed at the base rate and can never exceed the input it came from.
-        cache_read = min(field('cached_input_tokens'), input_tokens)
-        prompt = input_tokens - cache_read
-        # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
-        completion = field('output_tokens')
+        for child_path, forked_at in children:
+            try:
+                # Anchoring on the fork puts the replayed parent history in `before`, which is
+                # the snapshot the child inherited; the delta is the child's own spend.
+                child_before, child_after = _codex_totals_around(child_path, forked_at)
+                if not child_after:
+                    continue
+                child = _codex_usage_delta(child_before, child_after)
+            except Exception as e:
+                log_error(f"subagent usage: failed reading {child_path}: {e}", 'usage')
+                continue
+            prompt += child[0]
+            completion += child[1]
+            cache_read += child[2]
     except Exception:
         return None
 
