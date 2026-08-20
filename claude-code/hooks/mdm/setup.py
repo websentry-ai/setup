@@ -863,7 +863,8 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # No hook config of our own: the remote policy owns it, and stale local
         # hooks would let the device enforce from two places at once.
         if skip_settings:
-            stripped, strip_error = _strip_unbound_hooks_from_settings(managed_dir, script_path)
+            stripped, strip_error = _strip_unbound_hooks_from_settings(
+                managed_dir, script_path, delete_when_empty=False)
             if stripped:
                 print("Removed Unbound hooks left behind in the local managed settings")
             if strip_error:
@@ -1027,11 +1028,14 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
 
-def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path) -> Tuple[bool, bool]:
+def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path,
+                                       delete_when_empty: bool = True) -> Tuple[bool, bool]:
     """Remove ONLY our hook entries from the managed Claude config, preserving
     foreign content; managed-settings.json is shared with org/Enterprise policy.
 
-    Returns (stripped_any, had_error). Leaves the hook script itself alone.
+    delete_when_empty removes a file that held nothing but our hooks — right for
+    teardown, wrong mid-install. Returns (stripped_any, had_error). Leaves the
+    hook script itself alone.
     """
     stripped_any = False
     had_error = False
@@ -1085,7 +1089,7 @@ def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path) -> 
                 # Delete the file only when nothing foreign remains (our
                 # drop-in, or a managed-settings.json that held only our
                 # hooks); otherwise rewrite in place so org policy survives.
-                if isinstance(settings, dict) and not settings:
+                if delete_when_empty and isinstance(settings, dict) and not settings:
                     settings_path.unlink()
                     debug_print(f"Removed empty settings {settings_path}")
                 else:
