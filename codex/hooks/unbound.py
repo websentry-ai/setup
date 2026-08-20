@@ -1552,9 +1552,9 @@ def _codex_sessions_root(transcript_path: str) -> Optional[str]:
     return str(default) if default.is_dir() else None
 
 
-def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[tuple]:
-    """Rollouts this session spawned during the turn. Codex writes every subagent to its own
-    file, so the parent transcript carries none of their usage."""
+def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[str]:
+    """Rollouts this session spawned. Codex writes every subagent to its own file, so the
+    parent transcript carries none of their usage."""
     session_id = _codex_session_meta(transcript_path).get('id')
     root = _codex_sessions_root(transcript_path)
     if not session_id or not root:
@@ -1581,12 +1581,11 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
             # session's spend against this turn, so it is left out rather than guessed at.
             if meta.get('parent_id') != session_id:
                 continue
-            forked_at = meta.get('forked_at')
-            # Without a placeable fork instant there is no way to read the snapshot the child
-            # inherited, and counting its total would bill the parent's spend a second time.
-            if _ts_key(forked_at) is None or _ts_lt(forked_at, user_prompt_timestamp):
-                continue
-            found.append((path, forked_at))
+            # Fork time is not used to include or exclude a child. The hook's prompt
+            # timestamp is written when the hook runs, which is after the model has already
+            # spawned its subagents, so a child of this very turn routinely reports a fork
+            # instant earlier than the anchor. Scoping happens per child below instead.
+            found.append(path)
     return found
 
 
@@ -1678,7 +1677,7 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
             children = []
             parent_totals = []
 
-        for child_path, forked_at in children:
+        for child_path in children:
             try:
                 # A child opens with the parent's history replayed under the spawn instant, so
                 # its own timestamps cannot separate inherited totals from new spend. The
@@ -1699,6 +1698,13 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                     if not any(_codex_same_totals(total, seen) for seen in parent_totals):
                         break
                     inherited = total
+                # Spend from the child's earlier turns is excluded the same way the parent's
+                # is: by its own snapshot at the anchor. Cumulative totals only climb, so the
+                # larger of the two lower bounds is the tighter one, and a child that finished
+                # before this turn lands on its final total and contributes nothing.
+                at_anchor, _ = _codex_totals_around(child_path, user_prompt_timestamp)
+                if _codex_token(at_anchor, 'input_tokens') > _codex_token(inherited, 'input_tokens'):
+                    inherited = at_anchor
                 child = _codex_usage_delta(inherited, child_totals[-1])
             except Exception as e:
                 log_error(f"subagent usage: failed reading {child_path}: {e}", 'usage')
