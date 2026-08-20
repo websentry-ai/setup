@@ -1576,6 +1576,9 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
             except OSError:
                 continue
             meta = _codex_session_meta(path)
+            # A rollout that declares itself a subagent but records no lineage cannot be tied
+            # to a parent by id at all. Matching it on cwd and timing instead would bill another
+            # session's spend against this turn, so it is left out rather than guessed at.
             if meta.get('parent_id') != session_id:
                 continue
             forked_at = meta.get('forked_at')
@@ -1688,6 +1691,9 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 # the last leading entry the parent also recorded. Magnitude cannot decide this:
                 # a subagent that starts clean can still outspend the parent, and subtracting
                 # from that one erases its work instead of isolating it.
+                # parent_totals is the parent's whole stream as of this Stop and snapshots are
+                # only ever appended, so it is a superset of anything the child could have
+                # replayed: a leading entry matching nothing was never replayed.
                 inherited = {}
                 for total in child_totals:
                     if not any(_codex_same_totals(total, seen) for seen in parent_totals):
