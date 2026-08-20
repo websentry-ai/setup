@@ -19,7 +19,7 @@ DEBUG = False
 ENV_VAR_NAME = "UNBOUND_OPENCLAW_API_KEY"
 PLUGIN_NAME = "unbound-openclaw-plugin"
 PROVIDER_NAME = "unbound"
-DEFAULT_MODEL = "unbound/claude-sonnet-4-20250514"
+DEFAULT_MODEL = "unbound/claude-sonnet-4-6"
 
 
 def debug_print(message: str) -> None:
@@ -308,7 +308,7 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
 
         if setup_provider:
             providers = config.setdefault("models", {}).setdefault("providers", {})
-            model_id = model or "claude-sonnet-4-20250514"
+            model_id = model or "claude-sonnet-4-6"
 
             if PROVIDER_NAME not in providers:
                 providers[PROVIDER_NAME] = {
