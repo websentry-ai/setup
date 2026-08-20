@@ -1532,13 +1532,18 @@ def _codex_session_meta(transcript_path: str) -> Dict:
     # source is a plain string ("cli") on ordinary rollouts and a mapping on spawned ones,
     # where subagent is itself either a bare label ({"subagent": "review"}, carrying no
     # lineage at all) or a mapping naming the thread that spawned it.
+    source = payload.get('source')
     spawn = nested(payload, 'source', 'subagent', 'thread_spawn')
     parent_id = (payload.get('forked_from_id')
                  or payload.get('parent_thread_id')
                  or spawn.get('parent_thread_id'))
+    # forked_from_id is also how an ordinary `codex fork` or resume records its origin, and
+    # such a session reports its own usage on its own Stop. Folding one into the parent would
+    # bill it twice, so lineage counts only when the rollout also declares itself a subagent.
+    is_subagent = isinstance(source, dict) and 'subagent' in source
     return {
         'id': payload.get('id'),
-        'parent_id': parent_id if isinstance(parent_id, str) and parent_id else None,
+        'parent_id': parent_id if is_subagent and isinstance(parent_id, str) and parent_id else None,
         'forked_at': entry.get('timestamp'),
     }
 
@@ -1556,7 +1561,7 @@ def _codex_sessions_root(transcript_path: str) -> Optional[str]:
     return str(default) if default.is_dir() else None
 
 
-def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[str]:
+def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[tuple]:
     """Rollouts this session spawned. Codex writes every subagent to its own file, so the
     parent transcript carries none of their usage."""
     session_id = _codex_session_meta(transcript_path).get('id')
@@ -1585,10 +1590,10 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
             # session's spend against this turn, so it is left out rather than guessed at.
             if meta.get('parent_id') != session_id:
                 continue
-            # Fork time is not used to include or exclude a child. A subagent can outlive
-            # the turn that spawned it, so what matters is the spend inside this turn rather
-            # than which turn created the file. That bound is applied per child below.
-            found.append(path)
+            # Fork time does not include or exclude a child: a subagent can outlive the turn
+            # that spawned it, so what matters is the spend inside this turn. It is carried
+            # anyway, to bound which parent snapshots a replay may match.
+            found.append((path, meta.get('forked_at')))
     return found
 
 
@@ -1604,8 +1609,9 @@ def _codex_same_totals(left: Dict, right: Dict) -> bool:
     return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
 
 
-def _codex_all_totals(transcript_path: str) -> List[Dict]:
-    """Every cumulative snapshot in a rollout, in file order."""
+def _codex_all_totals(transcript_path: str, until: Optional[str] = None) -> List[Dict]:
+    """Every cumulative snapshot in a rollout, in file order, optionally only those at or
+    before a given instant."""
     totals = []
     with open(transcript_path, 'r', encoding='utf-8') as f:
         for line in f:
@@ -1619,7 +1625,7 @@ def _codex_all_totals(transcript_path: str) -> List[Dict]:
             if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
                 continue
             total = (payload.get('info') or {}).get('total_token_usage')
-            if total:
+            if total and not (until and _ts_lt(until, entry.get('timestamp'))):
                 totals.append(total)
     return totals
 
@@ -1686,7 +1692,7 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
             children = []
             parent_totals = []
 
-        for child_path in children:
+        for child_path, forked_at in children:
             try:
                 # A child opens with the parent's history replayed under the spawn instant, so
                 # its own timestamps cannot separate inherited totals from new spend. The
@@ -1702,9 +1708,13 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 # parent_totals is the parent's whole stream as of this Stop and snapshots are
                 # only ever appended, so it is a superset of anything the child could have
                 # replayed: a leading entry matching nothing was never replayed.
+                # Only snapshots the parent had reached by the fork can have been replayed.
+                # Matching against later ones lets a child's own total coincide with a parent
+                # total it never inherited, which would subtract spend the child really made.
+                replayable = _codex_all_totals(transcript_path, until=forked_at) if forked_at else parent_totals
                 inherited = {}
                 for total in child_totals:
-                    if not any(_codex_same_totals(total, seen) for seen in parent_totals):
+                    if not any(_codex_same_totals(total, seen) for seen in replayable):
                         break
                     inherited = total
                 # Spend already uploaded is excluded by the child's own snapshot at the floor,
