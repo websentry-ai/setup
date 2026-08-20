@@ -2345,6 +2345,42 @@ def _is_system_checkout_path(path: str) -> bool:
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another
+# checkout. A relative target is invisible to _ABS_PATH_RE, so without this the
+# gate saw only the (allowed) cwd and let `git -C ../other-repo commit` through.
+_GIT_PATH_OPT_RE = re.compile(
+    r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
+)
+
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved to absolute.
+
+    Relative targets resolve against the directory the command starts in; a
+    `cd` earlier in the same command line is not modelled, so those still fall
+    back to the absolute-path scan and the cwd candidate.
+    """
+    targets = []
+    try:
+        for match in _GIT_PATH_OPT_RE.finditer(command):
+            target = match.group(1) or match.group(2) or match.group(3)
+            if not target:
+                continue
+            if target.startswith('~'):
+                target = os.path.expanduser(target)
+            if not target.startswith('/'):
+                if not shell_dir:
+                    continue
+                target = os.path.join(shell_dir, target)
+            target = os.path.normpath(target)
+            if not _is_system_checkout_path(target):
+                targets.append(target)
+    except Exception:
+        return targets
+    return targets
+
+
 
 def _find_git_root(path: str) -> Optional[str]:
     """Nearest ancestor of `path` holding a `.git`; None on any error."""
@@ -2525,6 +2561,7 @@ def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dic
             candidates.extend(
                 p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
             )
+            candidates.extend(_git_path_opt_targets(command, shell_dir))
             shell_dir = _next_shell_dir(command, shell_dir)
             if not candidates and shell_dir:
                 candidates.append(shell_dir)

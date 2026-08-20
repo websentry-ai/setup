@@ -248,6 +248,79 @@ class TestCoreDecisions(RepoGateCase):
         self.assertBlocked(self.write_file(self.out_scope, prompt_id='t2'),
                            'acme/widgets')
 
+    # --- git's path-redirecting options (WEB-5456 / greptile P1) -------------
+    # `git -C <dir>` and friends retarget git at another checkout. A relative
+    # target is invisible to the absolute-path scan, so before these the gate
+    # saw only the (allowed) cwd and let the write through.
+
+    def test_relative_dash_c_into_an_out_of_scope_repo_is_gated(self):
+        """git -C ../widgets, run from an allowed repo, must not slip past."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('git -C ../widgets commit -am wip', cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_relative_git_dir_into_an_out_of_scope_repo_is_gated(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('git --git-dir=../widgets/.git commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_relative_work_tree_into_an_out_of_scope_repo_is_gated(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('git --work-tree ../widgets checkout .',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_quoted_dash_c_target_is_gated(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('git -C "../widgets" commit -am wip', cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_absolute_dash_c_into_an_out_of_scope_repo_is_gated(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash(f'git -C {self.out_scope} commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    # The gate fires on the repo being written, so a -C at an allowed repo is
+    # allowed no matter where it was launched from.
+
+    def test_dash_c_into_an_in_scope_repo_is_allowed(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash('git -C ../setup commit -am wip', cwd=str(self.in_scope)))
+        self.assertEqual(self.grace_used(), 0)
+
+    def test_dash_c_into_an_in_scope_repo_from_outside_is_allowed(self):
+        """Nothing is written to the launch directory, so it is not the subject."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash(f'git -C {self.in_scope} commit -am wip',
+                      cwd=str(self.out_scope)))
+
+    def test_dash_c_into_a_non_git_directory_is_allowed(self):
+        """Non-git folders stay exempt however git is pointed at them."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash(f'git -C {self.no_repo} init', cwd=str(self.in_scope)))
+
+    def test_dash_c_is_not_gated_without_a_configured_policy(self):
+        """No org configured means no gating, wherever git is pointed."""
+        self.set_policies([])
+        self.assertAllowed(
+            self.bash('git -C ../widgets commit -am wip', cwd=str(self.in_scope)))
+
+    def test_a_bare_dash_c_flag_on_another_command_is_not_a_path(self):
+        """`grep -C 3` is context lines, not a directory — must not gate."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(self.bash('grep -C 3 needle README.md',
+                                     cwd=str(self.in_scope)))
+
     def test_no_git_anywhere_above_is_allowed(self):
         self.set_policies([ORG_POLICY])
         response = self.run_tool(
