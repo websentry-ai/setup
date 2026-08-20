@@ -382,6 +382,27 @@ class TestCoreDecisions(RepoGateCase):
                       cwd=str(self.in_scope)),
             'acme/widgets')
 
+    def test_a_failed_and_chain_followed_by_or_still_resolves_from_the_original(self):
+        """cd /nonexistent && true || git -C ../widgets — the chain short-circuited, so git runs where it started."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('cd /nonexistent-dir && true || git -C ../widgets commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_a_cd_across_a_pipe_does_not_move_the_git_target(self):
+        """A pipeline runs each side in its own subshell, so the cd never reaches git.
+        Relative target: an absolute one is caught by the absolute-path scan, which
+        has always matched any /path in a command and is not what this covers."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash('cd ../widgets | git -C . status', cwd=str(self.in_scope)))
+
+    def test_a_backgrounded_cd_does_not_move_the_git_target(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash('cd ../widgets & git -C . commit -am wip', cwd=str(self.in_scope)))
+
     def test_no_git_anywhere_above_is_allowed(self):
         self.set_policies([ORG_POLICY])
         response = self.run_tool(

@@ -1760,11 +1760,23 @@ def _shell_segments(command):
     return out
 
 
+def _merge_cwds(first, second):
+    """Ordered union, dropping duplicates and bounding the fan-out."""
+    out = list(first)
+    for c in second:
+        if c not in out:
+            out.append(c)
+    return out[:8]
+
+
 def _git_path_opt_targets(command, shell_dir):
-    """Directories a git invocation redirects itself at, resolved against every cwd reachable at that segment."""
+    """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
     targets = []
     try:
         cwds = [shell_dir]
+        # Where control lands if the current && chain short-circuits: `a && b || c`
+        # runs c when a failed (original cwd) or when b failed (a's cwd).
+        fallback = [shell_dir]
         for segment, separator in _shell_segments(command):
             words = _segment_words(segment)
             # git only: `grep -C 3` is context lines, not a directory.
@@ -1784,12 +1796,22 @@ def _git_path_opt_targets(command, shell_dir):
                             continue
                         targets.append(target)
             moved = [_next_shell_dir(segment, c) for c in cwds]
-            # The separator says whether this segment's cd actually took effect:
-            # `&&` runs the next only on success, `||` only on failure, others either way.
             if separator == '&&':
+                # Next runs only if this one succeeded, so its cd took effect —
+                # but this segment may instead have failed, which a later || reaches.
+                fallback = _merge_cwds(fallback, cwds)
                 cwds = moved
-            elif separator != '||':
-                cwds = moved + [c for c in cwds if c not in moved]
+            elif separator == '||':
+                # Reached because something failed, so that cd did not apply.
+                cwds = _merge_cwds(cwds, fallback)
+                fallback = list(cwds)
+            elif separator in ('|', '&'):
+                # Subshell: a cd on the left never reaches the right-hand command.
+                pass
+            else:
+                # `;` or a newline: sequential, so the cd may or may not have taken.
+                cwds = _merge_cwds(moved, cwds)
+                fallback = list(cwds)
             cwds = cwds[:8]
     except Exception:
         return targets
