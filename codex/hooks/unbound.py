@@ -499,6 +499,10 @@ def get_recent_user_prompts_for_session(
         event = log.get('event', {})
         if event.get('hook_event_name') != 'UserPromptSubmit':
             continue
+        # Delegated subagent prompts arrive under the parent's session id; they are not
+        # things the user typed, so they do not belong in the user's recent history.
+        if event.get('agent_id'):
+            continue
         prompt = event.get('prompt')
         if prompt:
             prompts.append(prompt)
@@ -1501,51 +1505,236 @@ def _codex_token(usage: Dict, field: str) -> int:
     return 0
 
 
-def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
-    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
+_SUBAGENT_SCAN_WINDOW_SECONDS = 24 * 3600
+
+
+def _codex_session_meta(transcript_path: str) -> Dict:
+    """A rollout opens with a session_meta line carrying its id, the thread it was spawned
+    from, and the fork time."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            entry = json.loads(f.readline() or '{}')
+    except (OSError, ValueError):
+        return {}
+    if entry.get('type') != 'session_meta':
+        return {}
+    payload = entry.get('payload')
+    if not isinstance(payload, dict):
+        return {}
+
+    def nested(value, *keys):
+        for key in keys:
+            if not isinstance(value, dict):
+                return {}
+            value = value.get(key)
+        return value if isinstance(value, dict) else {}
+
+    # source is a plain string ("cli") on ordinary rollouts and a mapping on spawned ones,
+    # where subagent is itself either a bare label ({"subagent": "review"}, carrying no
+    # lineage at all) or a mapping naming the thread that spawned it.
+    source = payload.get('source')
+    spawn = nested(payload, 'source', 'subagent', 'thread_spawn')
+    parent_id = (payload.get('forked_from_id')
+                 or payload.get('parent_thread_id')
+                 or spawn.get('parent_thread_id'))
+    # forked_from_id is also how an ordinary `codex fork` or resume records its origin, and
+    # such a session reports its own usage on its own Stop. Folding one into the parent would
+    # bill it twice, so lineage counts only when the rollout also declares itself a subagent.
+    is_subagent = isinstance(source, dict) and 'subagent' in source
+    return {
+        'id': payload.get('id'),
+        'parent_id': parent_id if is_subagent and isinstance(parent_id, str) and parent_id else None,
+        'forked_at': entry.get('timestamp'),
+    }
+
+
+def _codex_sessions_root(transcript_path: str) -> Optional[str]:
+    path = os.path.abspath(transcript_path)
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        if os.path.basename(parent) == 'sessions':
+            return parent
+        path = parent
+    default = Path.home() / '.codex' / 'sessions'
+    return str(default) if default.is_dir() else None
+
+
+def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[tuple]:
+    """Rollouts this session spawned. Codex writes every subagent to its own file, so the
+    parent transcript carries none of their usage."""
+    session_id = _codex_session_meta(transcript_path).get('id')
+    root = _codex_sessions_root(transcript_path)
+    if not session_id or not root:
+        return []
+    parent_real = os.path.realpath(transcript_path)
+    cutoff = time.time() - _SUBAGENT_SCAN_WINDOW_SECONDS
+    found = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith('.jsonl'):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                # Recency keeps the scan off historical rollouts. mtime is compared against
+                # the same clock, never against a transcript timestamp, so skew cannot drop
+                # a live child; the window is wide enough that only stale files are pruned.
+                if os.path.realpath(path) == parent_real or os.path.getmtime(path) < cutoff:
+                    continue
+            except OSError:
+                continue
+            meta = _codex_session_meta(path)
+            # A rollout that declares itself a subagent but records no lineage cannot be tied
+            # to a parent by id at all. Matching it on cwd and timing instead would bill another
+            # session's spend against this turn, so it is left out rather than guessed at.
+            if meta.get('parent_id') != session_id:
+                continue
+            # Fork time does not include or exclude a child: a subagent can outlive the turn
+            # that spawned it, so what matters is the spend inside this turn. It is carried
+            # anyway, to bound which parent snapshots a replay may match.
+            found.append((path, meta.get('forked_at')))
+    return found
+
+
+def _codex_snapshot_total(snapshot: Dict) -> int:
+    """How far a cumulative snapshot has advanced, across every field we count."""
+    return sum(_codex_token(snapshot, field) for field in _CODEX_TOKEN_ALIASES)
+
+
+def _codex_same_totals(left: Dict, right: Dict) -> bool:
+    """Two cumulative snapshots describing the same point in a session."""
+    if not left or not right:
+        return False
+    return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
+
+
+def _codex_all_totals(transcript_path: str, until: Optional[str] = None) -> List[Dict]:
+    """Every cumulative snapshot in a rollout, in file order, optionally only those at or
+    before a given instant."""
+    totals = []
+    with open(transcript_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get('payload') or {}
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            total = (payload.get('info') or {}).get('total_token_usage')
+            if total and not (until and _ts_lt(until, entry.get('timestamp'))):
+                totals.append(total)
+    return totals
+
+
+def _codex_totals_around(transcript_path: str, anchor: Optional[str]) -> tuple:
+    """Last cumulative snapshot at or before the anchor, and the last one after it."""
+    before, after = {}, {}
+    with open(transcript_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get('payload') or {}
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
+            # later events, so summing double-bills; estimating a turn beats over-billing it.
+            total = (payload.get('info') or {}).get('total_token_usage')
+            if not total:
+                continue
+            # An unorderable timestamp is treated as the pre-anchor baseline: a cumulative
+            # snapshot we cannot place is far likelier to predate the anchor than to follow it,
+            # and guessing the other way bills earlier spend against this turn.
+            stamp = entry.get('timestamp')
+            if _ts_key(stamp) is None or _ts_lt(stamp, anchor):
+                before = total
+            else:
+                after = total
+    return before, after
+
+
+def _codex_usage_delta(before: Dict, after: Dict) -> tuple:
+    def field(name):
+        return max(_codex_token(after, name) - _codex_token(before, name), 0)
+
+    input_tokens = field('input_tokens')
+    # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
+    # isn't billed at the base rate and can never exceed the input it came from.
+    cache_read = min(field('cached_input_tokens'), input_tokens)
+    # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
+    return input_tokens - cache_read, field('output_tokens'), cache_read
+
+
+def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
+                                     subagent_floor: Optional[str] = None) -> Optional[Dict]:
+    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489),
+    plus the same delta over any subagent rollout this turn spawned."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
         return None
 
-    before, after = {}, {}
     try:
-        with open(transcript_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = entry.get('payload') or {}
-                if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
-                    continue
-                # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
-                # later events, so summing double-bills; estimating a turn beats over-billing it.
-                total = (payload.get('info') or {}).get('total_token_usage')
-                if not total:
-                    continue
-                # An unorderable timestamp is treated as the pre-prompt baseline: a cumulative
-                # snapshot we cannot place is far likelier to predate the turn than to be its
-                # spend, and guessing the other way bills a past session against this one.
-                stamp = entry.get('timestamp')
-                if _ts_key(stamp) is None or _ts_lt(stamp, user_prompt_timestamp):
-                    before = total
-                else:
-                    after = total
+        before, after = _codex_totals_around(transcript_path, user_prompt_timestamp)
+        prompt, completion, cache_read = _codex_usage_delta(before, after) if after else (0, 0, 0)
 
-        if not after:
-            return None
+        try:
+            children = _codex_subagent_rollouts(transcript_path, user_prompt_timestamp)
+            parent_totals = _codex_all_totals(transcript_path) if children else []
+        except Exception as e:
+            # The parent's own usage is already computed; never trade it for the children.
+            log_error(f"subagent usage: cannot enumerate for {transcript_path}: {e}", 'usage')
+            children = []
+            parent_totals = []
 
-        def field(name):
-            return max(_codex_token(after, name) - _codex_token(before, name), 0)
-
-        input_tokens = field('input_tokens')
-        # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
-        # isn't billed at the base rate and can never exceed the input it came from.
-        cache_read = min(field('cached_input_tokens'), input_tokens)
-        prompt = input_tokens - cache_read
-        # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
-        completion = field('output_tokens')
+        for child_path, forked_at in children:
+            try:
+                # A child opens with the parent's history replayed under the spawn instant, so
+                # its own timestamps cannot separate inherited totals from new spend. The
+                # baseline is taken from the parent at the fork instead, where the timestamps
+                # are the parent's own and were never rewritten.
+                child_totals = _codex_all_totals(child_path)
+                if not child_totals:
+                    continue
+                # A replay is a prefix of the parent's own stream, so the inherited snapshot is
+                # the last leading entry the parent also recorded. Magnitude cannot decide this:
+                # a subagent that starts clean can still outspend the parent, and subtracting
+                # from that one erases its work instead of isolating it.
+                # parent_totals is the parent's whole stream as of this Stop and snapshots are
+                # only ever appended, so it is a superset of anything the child could have
+                # replayed: a leading entry matching nothing was never replayed.
+                # Only snapshots the parent had reached by the fork can have been replayed.
+                # Matching against later ones lets a child's own total coincide with a parent
+                # total it never inherited, which would subtract spend the child really made.
+                replayable = _codex_all_totals(transcript_path, until=forked_at) if forked_at else parent_totals
+                inherited = {}
+                for total in child_totals:
+                    if not any(_codex_same_totals(total, seen) for seen in replayable):
+                        break
+                    inherited = total
+                # Spend already uploaded is excluded by the child's own snapshot at the floor,
+                # which is the previous Stop rather than this turn's prompt so that work
+                # finishing between the two is still counted once. Cumulative totals only
+                # climb, so the larger of the two lower bounds is the tighter one, and a child
+                # that finished before the floor lands on its final total and adds nothing.
+                at_anchor, _ = _codex_totals_around(child_path, subagent_floor or user_prompt_timestamp)
+                # Compared across every counted field, not input alone: a snapshot can advance
+                # on output or cache with input unchanged, and picking the looser bound then
+                # re-adds spend the previous Stop already uploaded.
+                if _codex_snapshot_total(at_anchor) > _codex_snapshot_total(inherited):
+                    inherited = at_anchor
+                child = _codex_usage_delta(inherited, child_totals[-1])
+            except Exception as e:
+                log_error(f"subagent usage: failed reading {child_path}: {e}", 'usage')
+                continue
+            prompt += child[0]
+            completion += child[1]
+            cache_read += child[2]
     except Exception:
         return None
 
@@ -1572,7 +1761,9 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt = None
     user_prompt_timestamp = None
     permission_mode = None
+    submitted_prompts = []
     stop_timestamp = None
+    previous_stop = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -1582,15 +1773,38 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log_event.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                user_prompt = log_event.get('prompt')
-                user_prompt_timestamp = log.get('timestamp')
+                # A spawned subagent's delegated prompt is reported under the parent's session
+                # id and would otherwise be taken for the user's, pairing the child's
+                # instructions with the parent's reply and anchoring the turn at the spawn.
+                if log_event.get('agent_id'):
+                    continue
+                prompt_text = log_event.get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
                 permission_mode = log_event.get('permission_mode', 'default')
             elif event_name == 'Stop':
+                # This Stop is already logged, so the one before it marks how far the last
+                # upload reported. Subagent work landing between the two belongs to nobody
+                # otherwise, and a subagent routinely outlives the turn that spawned it.
+                previous_stop = stop_timestamp
                 stop_timestamp = log.get('timestamp')
+
+    # Codex closes one turn for every prompt typed while it was still working, so a turn can
+    # carry more than one. Keeping only the last drops what the user actually asked first, and
+    # anchoring on it would start the token window after work already done.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
+        user_prompt = '\n\n'.join(text for _, text in turn_prompts)
 
     if not user_prompt:
         return
 
+    # One message, not one per prompt: the backend keeps the last user message, so several
+    # would silently discard everything the user typed before the final one.
     messages = [{'role': 'user', 'content': user_prompt}]
 
     # Parse tool uses from Codex transcript (function_call/function_call_output
@@ -1631,7 +1845,8 @@ def process_stop_event(event: Dict, api_key: str):
         'project': _get_project(cwd)
     }
 
-    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
+    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp,
+                                             subagent_floor=previous_stop)
     if usage:
         exchange['usage'] = usage
 
