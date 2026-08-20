@@ -321,6 +321,43 @@ class TestCoreDecisions(RepoGateCase):
         self.assertAllowed(self.bash('grep -C 3 needle README.md',
                                      cwd=str(self.in_scope)))
 
+    def test_cd_then_relative_dash_c_resolves_against_the_new_cwd(self):
+        """cd /elsewhere && git -C ../widgets — the target is relative to the cd, not the launch dir."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash(f'cd {self.in_scope} && git -C ../widgets commit -am wip',
+                      cwd=str(self.no_repo)),
+            'acme/widgets')
+
+    def test_relative_cd_then_relative_dash_c_is_gated(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('cd src && git -C ../../widgets commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_a_cd_after_the_git_call_does_not_shift_resolution(self):
+        """The cd runs later, so ../setup resolves against the launch dir. Relative
+        so the absolute-path scan (which has always matched any /path in a command,
+        cd target included) is not what decides this."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash('git -C ../setup commit -am wip && cd ../widgets',
+                      cwd=str(self.in_scope)))
+
+    def test_chained_cds_use_the_last_one(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash(f'cd /tmp && cd {self.in_scope} && git -C ../widgets commit -am wip',
+                      cwd=str(self.no_repo)),
+            'acme/widgets')
+
+    def test_cd_into_an_in_scope_repo_then_dash_c_in_scope_is_allowed(self):
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertAllowed(
+            self.bash(f'cd {self.in_scope} && git -C . commit -am wip',
+                      cwd=str(self.no_repo)))
+
     def test_no_git_anywhere_above_is_allowed(self):
         self.set_policies([ORG_POLICY])
         response = self.run_tool(

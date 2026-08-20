@@ -1741,37 +1741,49 @@ def _is_system_checkout_path(path: str) -> bool:
 # the shell's working directory across the turn's launch-process calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
-# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another
-# checkout. A relative target is invisible to _ABS_PATH_RE, so without this the
-# gate saw only the (allowed) cwd and let `git -C ../other-repo commit` through.
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
 _GIT_PATH_OPT_RE = re.compile(
     r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
     r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
 )
 
 
-def _git_path_opt_targets(command, shell_dir):
-    """Directories a git invocation redirects itself at, resolved to absolute.
+def _shell_segments(command):
+    """Segments split on unquoted separators, sliced from the original so quoted paths survive."""
+    masked = _mask_quoted_runs(command)
+    out, last = [], 0
+    for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
+        out.append(command[last:m.start()].strip())
+        last = m.end()
+    out.append(command[last:].strip())
+    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    return out
 
-    Relative targets resolve against the directory the command starts in; a
-    `cd` earlier in the same command line is not modelled, so those still fall
-    back to the absolute-path scan and the cwd candidate.
-    """
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved against the cwd in effect at that segment."""
     targets = []
     try:
-        for match in _GIT_PATH_OPT_RE.finditer(command):
-            target = match.group(1) or match.group(2) or match.group(3)
-            if not target:
-                continue
-            if target.startswith('~'):
-                target = os.path.expanduser(target)
-            if not target.startswith('/'):
-                if not shell_dir:
+        cwd = shell_dir
+        for segment in _shell_segments(command):
+            words = _segment_words(segment)
+            # git only: `grep -C 3` is context lines, not a directory.
+            is_git = bool(words) and os.path.basename(words[0]) == 'git'
+            for match in _GIT_PATH_OPT_RE.finditer(segment) if is_git else ():
+                target = match.group(1) or match.group(2) or match.group(3)
+                if not target:
                     continue
-                target = os.path.join(shell_dir, target)
-            target = os.path.normpath(target)
-            if not _is_system_checkout_path(target):
-                targets.append(target)
+                if target.startswith('~'):
+                    target = os.path.expanduser(target)
+                if not target.startswith('/'):
+                    if not cwd:
+                        continue
+                    target = os.path.join(cwd, target)
+                target = os.path.normpath(target)
+                if not _is_system_checkout_path(target):
+                    targets.append(target)
+            # After this segment's own options: `cd x && git -C y` resolves y under x.
+            cwd = _next_shell_dir(segment, cwd)
     except Exception:
         return targets
     return targets
