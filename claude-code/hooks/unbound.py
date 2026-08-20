@@ -812,9 +812,8 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
             },
         }
 
-    # Allowed with injected context (e.g. the spend-limit alert-threshold
-    # warning "you've used $X of your $Y limit"): additionalContext feeds it
-    # to the model, systemMessage shows the same text to the user.
+    # additionalContext feeds the model; the user sees user_notice when the gateway
+    # sends one (a skill instruction's admin message), else the same text (spend-limit path).
     additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
@@ -822,7 +821,7 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
                 'hookEventName': 'UserPromptSubmit',
                 'additionalContext': additional_context,
             },
-            'systemMessage': additional_context,
+            'systemMessage': api_response.get('user_notice') or additional_context,
         }
 
     return {}
@@ -2094,6 +2093,10 @@ def _turn_guard_read(session_id) -> str:
 
 def _turn_guard_write(session_id, prompt_id: str) -> None:
     try:
+        # Pre-39fac10 hooks kept the guard as ONE file at this path; mkdir raises on it
+        # forever and the OSError pass kills the guard silently. Migrate it away.
+        if INJECTION_TURN_GUARD_DIR.exists() and not INJECTION_TURN_GUARD_DIR.is_dir():
+            INJECTION_TURN_GUARD_DIR.unlink()
         INJECTION_TURN_GUARD_DIR.mkdir(parents=True, exist_ok=True)
         _turn_guard_path(session_id).write_text(prompt_id, encoding='utf-8')
         cutoff = time.time() - 7 * 24 * 3600
@@ -2102,6 +2105,15 @@ def _turn_guard_write(session_id, prompt_id: str) -> None:
                 stale.unlink()
     except OSError:
         pass
+
+
+def _inject_skill_slugs(inject_skills) -> List[str]:
+    if not isinstance(inject_skills, list):
+        return []
+    return [
+        entry['slug'] for entry in inject_skills
+        if isinstance(entry, dict) and isinstance(entry.get('slug'), str) and entry['slug']
+    ]
 
 
 def installed_skill_report() -> List[Dict]:
@@ -2116,6 +2128,21 @@ def installed_skill_report() -> List[Dict]:
             continue
         report.append({'slug': slug, 'sha256': digest})
     return report
+
+
+def _attach_skill_facts(metadata: Dict, transcript_path: Optional[str]) -> None:
+    """`installed_skills` is what the device will DELETE, so it is marker-managed only.
+    `loaded_skills` also counts a developer's own unbound-<slug>: excluding it would
+    re-inject on every turn for a slug we are never allowed to overwrite."""
+    installed_skills = installed_skill_report()
+    if not installed_skills:
+        # Nothing installed means nothing to suppress or count, so skip the read.
+        return
+    metadata['installed_skills'] = installed_skills
+    facts = read_skill_facts(transcript_path)
+    if facts['loaded']:
+        metadata['loaded_skills'] = sorted(facts['loaded'])
+    metadata['skills_loaded_this_session'] = facts['session_count']
 
 
 def _skill_dir_state(slug: str) -> Dict:
@@ -2350,20 +2377,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
 
-    # Two different questions, so two different sets. `installed_skills` is what the
-    # device is willing to DELETE, so it is marker-managed only. `loaded_skills` is
-    # whether the guidance is already in context, which a developer's own
-    # unbound-<slug> also satisfies — excluding it would re-inject on every turn for
-    # a slug we are never allowed to overwrite.
-    installed_skills = installed_skill_report()
-    if installed_skills:
-        metadata['installed_skills'] = installed_skills
-    # Nothing installed means nothing to suppress or count, so skip the read.
-    if installed_skills:
-        facts = read_skill_facts(transcript_path)
-        if facts['loaded']:
-            metadata['loaded_skills'] = sorted(facts['loaded'])
-        metadata['skills_loaded_this_session'] = facts['session_count']
+    _attach_skill_facts(metadata, transcript_path)
     prompt_id = event.get('prompt_id')
     if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
         metadata['already_injected_this_turn'] = True
@@ -2784,6 +2798,45 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
 
 
+def _prompt_injection_metadata(event: Dict) -> Dict:
+    """Facts a USER_PROMPT skill policy is decided against. Nothing in here may
+    raise: a prompt submission must not fail over a marker file."""
+    metadata = {}
+    try:
+        cwd = event.get('cwd')
+        if cwd:
+            metadata['cwd'] = cwd
+        _attach_skill_facts(metadata, event.get('transcript_path'))
+        prompt_id = event.get('prompt_id')
+        if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"prompt injection metadata failed: {exc}", 'skill_injection')
+    return metadata
+
+
+def _apply_prompt_skill_actions(event: Dict, api_response, api_key: str) -> None:
+    """An allow carrying inject_skills is the in-turn skill instruction; it claims the
+    turn so a TOOL_USE injection cannot fire a second time inside it."""
+    if not isinstance(api_response, dict):
+        return
+    try:
+        instructed_slugs = _inject_skill_slugs(api_response.get('inject_skills'))
+        if instructed_slugs and api_response.get('decision') != 'deny' and event.get('prompt_id'):
+            _turn_guard_write(event.get('session_id'), event['prompt_id'])
+        if api_response.get('remove_skills'):
+            prune_lock = _skills_lock_acquire()
+            if prune_lock is not None:
+                try:
+                    prune_injected_skills(api_response.get('remove_skills'))
+                finally:
+                    _skills_lock_release(prune_lock)
+        if api_response.get('sync_skills'):
+            _dispatch_skills_sync(api_key)
+    except Exception as exc:
+        log_error(f"prompt skill actions failed: {exc}", 'skill_injection')
+
+
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking."""
     session_id = event.get('session_id')
@@ -2796,12 +2849,17 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
-        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
+        'pre_tool_use_data': {
+            'tool_name': '',
+            'command': '',
+            'metadata': _prompt_injection_metadata(event),
+        },
     }
 
     api_response = send_to_hook_api(request_body, api_key)
-    response = transform_response_for_claude_prompt(api_response)
-    return response
+    _apply_prompt_skill_actions(event, api_response, api_key)
+    return transform_response_for_claude_prompt(api_response)
 
 
 def _trusted_ancestors(start):

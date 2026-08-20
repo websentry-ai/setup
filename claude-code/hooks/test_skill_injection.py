@@ -449,6 +449,17 @@ class TestPreToolUseSkillInstall(ProcessPreToolUseSkillBase):
             metadata, _ = self._run({"decision": "allow"}, prompt_id="turn-2")
             self.assertNotIn("already_injected_this_turn", metadata)
 
+    def test_a_legacy_single_file_guard_is_migrated_to_the_directory(self):
+        """Pre-39fac10 hooks kept the guard as ONE file at the dir's path; mkdir raises
+        on it forever and the guard dies silently unless the write migrates it away."""
+        guard_dir = self.tmp / "injection-turn"
+        guard_dir.write_text("stale-prompt-id", encoding="utf-8")
+        with patch.object(unbound, "INJECTION_TURN_GUARD_DIR", guard_dir):
+            self.assertEqual(unbound._turn_guard_read("sess"), "")
+            unbound._turn_guard_write("sess", "turn-1")
+            self.assertTrue(guard_dir.is_dir())
+            self.assertEqual(unbound._turn_guard_read("sess"), "turn-1")
+
     def test_the_turn_guard_is_scoped_per_session(self):
         guard_dir = self.tmp / "injection-turn"
         with patch.object(unbound, "INJECTION_TURN_GUARD_DIR", guard_dir):
