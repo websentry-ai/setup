@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 import time
 import hashlib
 import re
+import shutil
 import tempfile
 import platform
 from urllib.parse import urlparse
@@ -31,6 +32,17 @@ MCP_TOOL_PREFIX = 'mcp__'
 # are byte-identical, so nothing can tell a replay from a genuine repeat.
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
+
+UNBOUND_SKILL_PREFIX = 'unbound-'
+CLAUDE_SKILLS_ROOT = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude')) / 'skills'
+UNBOUND_SKILL_MARKER = '.unbound-managed'
+INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn'
+SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
+SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
+SKILLS_SYNC_TIMEOUT_SECONDS = 20
+SKILL_LOADED_WINDOW = 10
+# unbound-<slug> is the skill name, so the slug carries the spec's name rules.
+_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
 # CoWork built-in tools that are exposed under mcp__
 COWORK_BUILTIN_MCP_SERVERS = frozenset({
@@ -903,9 +915,8 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
             },
         }
 
-    # Allowed with injected context (e.g. the spend-limit alert-threshold
-    # warning "you've used $X of your $Y limit"): additionalContext feeds it
-    # to the model, systemMessage shows the same text to the user.
+    # additionalContext feeds the model; the user sees user_notice when the gateway
+    # sends one (a skill instruction's admin message), else the same text (spend-limit path).
     additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
@@ -913,7 +924,7 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
                 'hookEventName': 'UserPromptSubmit',
                 'additionalContext': additional_context,
             },
-            'systemMessage': additional_context,
+            'systemMessage': api_response.get('user_notice') or additional_context,
         }
 
     return {}
@@ -2094,6 +2105,344 @@ def _unbound_app_label(event: Dict) -> str:
     return 'claude-code'
 
 
+def read_skill_facts(transcript_path: Optional[str]) -> Dict:
+    """`loaded` is in-window and pre-compaction; `session_count` ignores both."""
+    facts = {'loaded': set(), 'session_count': 0}
+    if not transcript_path:
+        return facts
+    try:
+        with open(transcript_path, 'rb') as f:
+            lines = f.read().split(b'\n')
+    except OSError:
+        return facts
+
+    session_names = set()
+    seen_turn_keys = set()
+    turns = 0
+    in_window = True
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get('isSidechain'):
+            continue
+        entry_type = entry.get('type')
+        if entry_type == 'system' and entry.get('subtype') == 'compact_boundary':
+            in_window = False
+            continue
+        if entry_type == 'assistant':
+            # One assistant message arrives as several streamed lines under one id, so
+            # counting lines would shrink the window to a fraction of the turns it names.
+            message = entry.get('message') or {}
+            mid, rid = message.get('id'), entry.get('requestId')
+            key = (mid, rid) if (mid and rid) else ('', len(seen_turn_keys))
+            if key not in seen_turn_keys:
+                seen_turn_keys.add(key)
+                turns += 1
+            if turns > SKILL_LOADED_WINDOW:
+                in_window = False
+            continue
+        if entry_type != 'user':
+            continue
+        result = entry.get('toolUseResult')
+        if not isinstance(result, dict) or result.get('success') is not True:
+            continue
+        name = result.get('commandName')
+        if not isinstance(name, str) or not name.startswith(UNBOUND_SKILL_PREFIX):
+            continue
+        session_names.add(name)
+        if in_window:
+            facts['loaded'].add(name[len(UNBOUND_SKILL_PREFIX):])
+
+    facts['session_count'] = len(session_names)
+    return facts
+
+
+def _managed_skill_dirs() -> List[Path]:
+    # Marker, not prefix, so the prefix can change without orphaning older installs.
+    try:
+        found = []
+        for entry in CLAUDE_SKILLS_ROOT.iterdir():
+            try:
+                if entry.is_dir() and (entry / UNBOUND_SKILL_MARKER).exists():
+                    found.append(entry)
+            except OSError:
+                continue
+        return sorted(found, key=lambda p: p.name)
+    except Exception:
+        return []
+
+
+def _slug_of(directory: Path) -> Optional[str]:
+    name = directory.name
+    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    return slug if _SLUG_RE.match(slug) else None
+
+
+def _turn_guard_path(session_id) -> Path:
+    safe = re.sub(r'[^A-Za-z0-9._-]', '', str(session_id or ''))[:64]
+    return INJECTION_TURN_GUARD_DIR / (safe or 'default')
+
+
+def _turn_guard_read(session_id) -> str:
+    try:
+        return _turn_guard_path(session_id).read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def _turn_guard_write(session_id, prompt_id: str) -> None:
+    try:
+        # Pre-39fac10 hooks kept the guard as ONE file at this path; mkdir raises on it
+        # forever and the OSError pass kills the guard silently. Migrate it away.
+        if INJECTION_TURN_GUARD_DIR.exists() and not INJECTION_TURN_GUARD_DIR.is_dir():
+            INJECTION_TURN_GUARD_DIR.unlink()
+        INJECTION_TURN_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+        _turn_guard_path(session_id).write_text(prompt_id, encoding='utf-8')
+        cutoff = time.time() - 7 * 24 * 3600
+        for stale in INJECTION_TURN_GUARD_DIR.iterdir():
+            if stale.is_file() and stale.stat().st_mtime < cutoff:
+                stale.unlink()
+    except OSError:
+        pass
+
+
+def _inject_skill_slugs(inject_skills) -> List[str]:
+    if not isinstance(inject_skills, list):
+        return []
+    return [
+        entry['slug'] for entry in inject_skills
+        if isinstance(entry, dict) and isinstance(entry.get('slug'), str) and entry['slug']
+    ]
+
+
+def installed_skill_report() -> List[Dict]:
+    report = []
+    for directory in _managed_skill_dirs():
+        slug = _slug_of(directory)
+        if not slug:
+            continue
+        try:
+            digest = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+        except OSError:
+            continue
+        report.append({'slug': slug, 'sha256': digest})
+    return report
+
+
+def _attach_skill_facts(metadata: Dict, transcript_path: Optional[str]) -> None:
+    """`installed_skills` is what the device will DELETE, so it is marker-managed only.
+    `loaded_skills` also counts a developer's own unbound-<slug>: excluding it would
+    re-inject on every turn for a slug we are never allowed to overwrite."""
+    installed_skills = installed_skill_report()
+    if not installed_skills:
+        # Nothing installed means nothing to suppress or count, so skip the read.
+        return
+    metadata['installed_skills'] = installed_skills
+    facts = read_skill_facts(transcript_path)
+    if facts['loaded']:
+        metadata['loaded_skills'] = sorted(facts['loaded'])
+    metadata['skills_loaded_this_session'] = facts['session_count']
+
+
+def _skill_dir_state(slug: str) -> Dict:
+    directory = CLAUDE_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+    state = {'path': directory, 'exists': False, 'managed': False, 'content_hash': None}
+    try:
+        state['exists'] = directory.is_dir()
+        if state['exists']:
+            state['managed'] = (directory / UNBOUND_SKILL_MARKER).exists()
+            state['content_hash'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+    except Exception:
+        pass
+    return state
+
+
+def install_injected_skills(inject_skills) -> None:
+    try:
+        for entry in inject_skills or []:
+            slug = entry.get('slug') if isinstance(entry, dict) else None
+            try:
+                if not isinstance(entry, dict):
+                    log_error(f"skill injection entry is not an object: {type(entry).__name__}", 'skill_injection')
+                    continue
+                content = entry.get('content')
+                if not isinstance(slug, str) or not _safe_skill_segment(slug) or not _SLUG_RE.match(slug):
+                    log_error(f"skill injection rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                if not isinstance(content, str) or not content:
+                    log_error(f"skill injection rejected empty content for slug: {slug}", 'skill_injection')
+                    continue
+
+                data = content.encode('utf-8')
+                # Hash what gets written: a wrong wire hash would pin stale content.
+                expected = hashlib.sha256(data).hexdigest()
+                wire_hash = entry.get('sha256')
+                if isinstance(wire_hash, str) and wire_hash and wire_hash.lower() != expected:
+                    log_error(
+                        f"skill injection hash mismatch for {slug}: wire={wire_hash} computed={expected}",
+                        'skill_injection',
+                    )
+
+                state = _skill_dir_state(slug)
+                directory = state['path']
+                if state['exists'] and not state['managed']:
+                    log_error(f"skill dir not unbound-managed, skipping install: {directory}", 'skill_injection')
+                    continue
+                if state['exists'] and state['managed'] and state['content_hash'] == expected:
+                    continue
+
+                created = not state['exists']
+                directory.mkdir(parents=True, exist_ok=True)
+                try:
+                    # Marker first: a marked dir with a stale body is rewritten next run.
+                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
+                except OSError:
+                    # A later reconcile reads an unmarked dir as the developer's own
+                    # skill and skips it forever, so drop the empty one we just made.
+                    if created:
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
+                    raise
+
+                # '.SKILL.' hides the partial file from a scan; the fd closes before the
+                # rename because Windows will not replace an open file.
+                fd, tmp = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(data)
+                    os.replace(tmp, str(directory / 'SKILL.md'))
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as e:
+                log_error(f"skill injection failed for {str(slug)[:64]}: {e}", 'skill_injection')
+    except Exception as e:
+        log_error(f"skill injection failed: {e}", 'skill_injection')
+
+
+def _skills_lock_acquire():
+    try:
+        SKILLS_SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - SKILLS_SYNC_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = SKILLS_SYNC_STALE_LOCK_SECONDS + 1
+            if age < SKILLS_SYNC_STALE_LOCK_SECONDS:
+                return None
+            try:
+                SKILLS_SYNC_LOCK_PATH.unlink()
+                return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except OSError:
+                return None
+    except OSError:
+        return None
+
+
+def _skills_lock_release(lock_fd) -> None:
+    if lock_fd is None:
+        return
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+    try:
+        SKILLS_SYNC_LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _sync_skills_once(api_key: str) -> None:
+    lock_fd = _skills_lock_acquire()
+    if lock_fd is None:
+        return
+    try:
+        payload = json.dumps({'installed': installed_skill_report()})
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", f"{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync"],
+            input=payload.encode(), capture_output=True, timeout=SKILLS_SYNC_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return
+        plan = json.loads(result.stdout.decode('utf-8'))
+        if not isinstance(plan, dict):
+            return
+        prune_injected_skills(plan.get('remove'))
+        install_injected_skills(plan.get('install'))
+    except Exception as e:
+        log_error(f"skills sync failed: {e}", 'skill_injection')
+    finally:
+        _skills_lock_release(lock_fd)
+
+
+def _dispatch_skills_sync(api_key: str) -> None:
+    # Detached: the blocking PreToolUse path must not wait on a reconcile.
+    try:
+        if not api_key:
+            return
+        if RUNNING_FROZEN:
+            # sys.executable is the frozen unbound-hook binary itself.
+            cmd = [sys.executable, 'sync-skills',
+                   os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+        else:
+            # The running file, not SELF_SCRIPT_PATH: under MDM the hook executes from an
+            # admin-managed directory and that user-level path does not exist.
+            script = os.path.abspath(__file__)
+            if not os.path.isfile(script):
+                log_error(f"skills sync skipped: script not found at {script}", 'skill_injection')
+                return
+            cmd = [sys.executable, script, '--sync-skills']
+        popen_kwargs = {
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL,
+            'close_fds': True,
+            'env': {**os.environ, 'UNBOUND_CLAUDE_API_KEY': api_key},
+        }
+        if os.name == 'nt':
+            popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as e:
+        log_error(f"skills sync dispatch failed: {e}", 'skill_injection')
+
+
+def prune_injected_skills(remove_skills) -> None:
+    # Only ever deletes a directory we marked, even if the gateway names another.
+    try:
+        for slug in remove_skills or []:
+            try:
+                if not isinstance(slug, str) or not _safe_skill_segment(slug) or not _SLUG_RE.match(slug):
+                    log_error(f"skill prune rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                directory = CLAUDE_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+                if not directory.is_dir():
+                    continue
+                if directory.is_symlink() or not (directory / UNBOUND_SKILL_MARKER).exists():
+                    log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
+                    continue
+                shutil.rmtree(directory)
+            except Exception as e:
+                log_error(f"skill prune failed for {str(slug)[:64]}: {e}", 'skill_injection')
+    except Exception as e:
+        log_error(f"skill prune failed: {e}", 'skill_injection')
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """Process PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
@@ -2130,6 +2479,11 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_input = event.get('tool_input') or {}
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
+
+    _attach_skill_facts(metadata, transcript_path)
+    prompt_id = event.get('prompt_id')
+    if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
+        metadata['already_injected_this_turn'] = True
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -2291,6 +2645,21 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'mcp_server',
         )
         _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
+
+    if api_response.get('decision') == 'deny' and api_response.get('inject_skills'):
+        # The gateway only denies for a skill this device already reported current, so
+        # there is nothing to install here — just remember the turn.
+        if event.get('prompt_id'):
+            _turn_guard_write(event.get('session_id'), event['prompt_id'])
+    if api_response.get('remove_skills'):
+        prune_lock = _skills_lock_acquire()
+        if prune_lock is not None:
+            try:
+                prune_injected_skills(api_response.get('remove_skills'))
+            finally:
+                _skills_lock_release(prune_lock)
+    if api_response.get('sync_skills'):
+        _dispatch_skills_sync(api_key)
 
     return transform_response_for_claude(api_response)
 
@@ -2532,6 +2901,45 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
 
 
+def _prompt_injection_metadata(event: Dict) -> Dict:
+    """Facts a USER_PROMPT skill policy is decided against. Nothing in here may
+    raise: a prompt submission must not fail over a marker file."""
+    metadata = {}
+    try:
+        cwd = event.get('cwd')
+        if cwd:
+            metadata['cwd'] = cwd
+        _attach_skill_facts(metadata, event.get('transcript_path'))
+        prompt_id = event.get('prompt_id')
+        if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"prompt injection metadata failed: {exc}", 'skill_injection')
+    return metadata
+
+
+def _apply_prompt_skill_actions(event: Dict, api_response, api_key: str) -> None:
+    """An allow carrying inject_skills is the in-turn skill instruction; it claims the
+    turn so a TOOL_USE injection cannot fire a second time inside it."""
+    if not isinstance(api_response, dict):
+        return
+    try:
+        instructed_slugs = _inject_skill_slugs(api_response.get('inject_skills'))
+        if instructed_slugs and api_response.get('decision') != 'deny' and event.get('prompt_id'):
+            _turn_guard_write(event.get('session_id'), event['prompt_id'])
+        if api_response.get('remove_skills'):
+            prune_lock = _skills_lock_acquire()
+            if prune_lock is not None:
+                try:
+                    prune_injected_skills(api_response.get('remove_skills'))
+                finally:
+                    _skills_lock_release(prune_lock)
+        if api_response.get('sync_skills'):
+            _dispatch_skills_sync(api_key)
+    except Exception as exc:
+        log_error(f"prompt skill actions failed: {exc}", 'skill_injection')
+
+
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking."""
     session_id = event.get('session_id')
@@ -2544,12 +2952,17 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
-        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
+        'pre_tool_use_data': {
+            'tool_name': '',
+            'command': '',
+            'metadata': _prompt_injection_metadata(event),
+        },
     }
 
     api_response = send_to_hook_api(request_body, api_key)
-    response = transform_response_for_claude_prompt(api_response)
-    return response
+    _apply_prompt_skill_actions(event, api_response, api_key)
+    return transform_response_for_claude_prompt(api_response)
 
 
 def _trusted_ancestors(start):
@@ -4156,6 +4569,10 @@ def main():
         _run_mcp_diagnostic_cli()
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
+        _sync_skills_once(api_key)
+        return
+
     try:
         input_data = sys.stdin.read().strip()
 
@@ -4177,6 +4594,7 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
+            _dispatch_skills_sync(api_key)
             print("{}")
             return
         session_id = event.get('session_id')

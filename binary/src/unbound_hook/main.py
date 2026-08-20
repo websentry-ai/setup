@@ -3,6 +3,7 @@
 Subcommands:
   hook <tool> [<event>]   stdin/stdout hook dispatch (fail-open, exit 0)
   mcp-diagnostic <tool>   detached null-fp diagnostic (env-driven, exit 0)
+  sync-skills <tool>      detached injected-skill reconcile (exit 0)
   setup [...]             MDM onboarding (port of mdm/onboard.py)
   backfill [...]          historical transcript seeding
   clear [...]             full deregistration
@@ -48,6 +49,7 @@ USAGE = """unbound-hook %s
 Usage:
   unbound-hook hook <tool> [<event>]      tools: claude-code|cursor|copilot|codex|augment
   unbound-hook mcp-diagnostic <tool>      internal: detached null-fp diagnostic (env-driven)
+  unbound-hook sync-skills <tool>         internal: detached injected-skill reconcile
   unbound-hook setup --api-key <key> [--discovery-key <key>] [options]
   unbound-hook backfill (--all | --user <name>) [--dry-run] [options]
   unbound-hook clear
@@ -73,6 +75,9 @@ def main(argv=None) -> int:
     if cmd == "mcp-diagnostic":
         from . import hook_cmd
         return hook_cmd.run_mcp_diagnostic(rest)
+    if cmd == "sync-skills":
+        from . import hook_cmd
+        return hook_cmd.run_skills_sync(rest)
     if cmd == "setup":
         from . import setup_cmd
         return setup_cmd.run(rest)
