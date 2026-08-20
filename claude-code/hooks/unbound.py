@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
-    "UNBOUND_GATEWAY_URL", "http://localhost:8787"
+    "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
 AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
