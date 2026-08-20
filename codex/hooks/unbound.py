@@ -406,6 +406,12 @@ def _typed_user_text(entry: Dict) -> str:
     return ''
 
 
+def _ts_lt(earlier, later) -> bool:
+    """Timestamp ordering that tolerates a non-string timestamp. Only strings are ordered, so
+    a format change can never raise here and discard the turn's usage."""
+    return isinstance(earlier, str) and isinstance(later, str) and earlier < later
+
+
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
@@ -436,9 +442,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                             })
 
                     elif entry_type == 'assistant':
-                        if user_prompt_timestamp and entry_timestamp:
-                            if entry_timestamp <= user_prompt_timestamp:
-                                continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
 
                         message = entry.get('message', {})
                         if message.get('role') == 'assistant':
@@ -1362,7 +1367,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     payload = entry.get('payload', {})
 
                     # Skip entries before user prompt if timestamp provided
-                    if user_prompt_timestamp and entry_timestamp and entry_timestamp <= user_prompt_timestamp:
+                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
                         continue
 
                     if entry_type == 'response_item':
@@ -1504,7 +1509,7 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 total = (payload.get('info') or {}).get('total_token_usage')
                 if not total:
                     continue
-                if entry.get('timestamp', '') < user_prompt_timestamp:
+                if _ts_lt(entry.get('timestamp'), user_prompt_timestamp):
                     before = total
                 else:
                     after = total
