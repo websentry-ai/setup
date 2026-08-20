@@ -1592,6 +1592,11 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
     return found
 
 
+def _codex_snapshot_total(snapshot: Dict) -> int:
+    """How far a cumulative snapshot has advanced, across every field we count."""
+    return sum(_codex_token(snapshot, field) for field in _CODEX_TOKEN_ALIASES)
+
+
 def _codex_same_totals(left: Dict, right: Dict) -> bool:
     """Two cumulative snapshots describing the same point in a session."""
     if not left or not right:
@@ -1708,7 +1713,10 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 # climb, so the larger of the two lower bounds is the tighter one, and a child
                 # that finished before the floor lands on its final total and adds nothing.
                 at_anchor, _ = _codex_totals_around(child_path, subagent_floor or user_prompt_timestamp)
-                if _codex_token(at_anchor, 'input_tokens') > _codex_token(inherited, 'input_tokens'):
+                # Compared across every counted field, not input alone: a snapshot can advance
+                # on output or cache with input unchanged, and picking the looser bound then
+                # re-adds spend the previous Stop already uploaded.
+                if _codex_snapshot_total(at_anchor) > _codex_snapshot_total(inherited):
                     inherited = at_anchor
                 child = _codex_usage_delta(inherited, child_totals[-1])
             except Exception as e:
