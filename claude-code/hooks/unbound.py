@@ -404,11 +404,25 @@ def _get_session_model(session_id: str) -> Optional[str]:
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
 def _ts_lt(earlier, later) -> bool:
-    """Timestamp ordering that tolerates a non-string timestamp. Only strings are ordered, so
-    a format change can never raise here and discard a turn; an unorderable entry is excluded
-    by every caller rather than re-folded on each later Stop."""
-    return isinstance(earlier, str) and isinstance(later, str) and earlier < later
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
 
 
 def _cache_creation_tokens(usage: Dict) -> int:

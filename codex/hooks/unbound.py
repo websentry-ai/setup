@@ -406,10 +406,25 @@ def _typed_user_text(entry: Dict) -> str:
     return ''
 
 
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
 def _ts_lt(earlier, later) -> bool:
-    """Timestamp ordering that tolerates a non-string timestamp. Only strings are ordered, so
-    a format change can never raise here and discard the turn's usage."""
-    return isinstance(earlier, str) and isinstance(later, str) and earlier < later
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
 
 
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
@@ -1584,7 +1599,11 @@ def _codex_totals_around(transcript_path: str, anchor: Optional[str]) -> tuple:
             total = (payload.get('info') or {}).get('total_token_usage')
             if not total:
                 continue
-            if _ts_lt(entry.get('timestamp'), anchor):
+            # An unorderable timestamp is treated as the pre-anchor baseline: a cumulative
+            # snapshot we cannot place is far likelier to predate the anchor than to follow it,
+            # and guessing the other way bills earlier spend against this turn.
+            stamp = entry.get('timestamp')
+            if _ts_key(stamp) is None or _ts_lt(stamp, anchor):
                 before = total
             else:
                 after = total
@@ -1622,12 +1641,19 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
 
         for child_path, forked_at in children:
             try:
-                # Anchoring on the fork puts the replayed parent history in `before`, which is
-                # the snapshot the child inherited; the delta is the child's own spend.
-                child_before, child_after = _codex_totals_around(child_path, forked_at)
-                if not child_after:
+                # A child opens with the parent's history replayed under the spawn instant, so
+                # its own timestamps cannot separate inherited totals from new spend. The
+                # baseline is taken from the parent at the fork instead, where the timestamps
+                # are the parent's own and were never rewritten.
+                inherited, _ = _codex_totals_around(transcript_path, forked_at)
+                _, child_total = _codex_totals_around(child_path, None)
+                if not child_total:
                     continue
-                child = _codex_usage_delta(child_before, child_after)
+                # A child whose total sits below the inherited snapshot never inherited one, so
+                # subtracting would erase its spend rather than isolate it.
+                if _codex_token(child_total, 'input_tokens') < _codex_token(inherited, 'input_tokens'):
+                    inherited = {}
+                child = _codex_usage_delta(inherited, child_total)
             except Exception as e:
                 log_error(f"subagent usage: failed reading {child_path}: {e}", 'usage')
                 continue
