@@ -1500,7 +1500,7 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
                     continue
                 # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
-                # later token_count events, so summing it would bill the same call twice.
+                # later events, so summing double-bills; estimating a turn beats over-billing it.
                 total = (payload.get('info') or {}).get('total_token_usage')
                 if not total:
                     continue
