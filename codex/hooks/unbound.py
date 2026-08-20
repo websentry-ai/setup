@@ -499,6 +499,10 @@ def get_recent_user_prompts_for_session(
         event = log.get('event', {})
         if event.get('hook_event_name') != 'UserPromptSubmit':
             continue
+        # Delegated subagent prompts arrive under the parent's session id; they are not
+        # things the user typed, so they do not belong in the user's recent history.
+        if event.get('agent_id'):
+            continue
         prompt = event.get('prompt')
         if prompt:
             prompts.append(prompt)
@@ -1581,10 +1585,9 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
             # session's spend against this turn, so it is left out rather than guessed at.
             if meta.get('parent_id') != session_id:
                 continue
-            # Fork time is not used to include or exclude a child. The hook's prompt
-            # timestamp is written when the hook runs, which is after the model has already
-            # spawned its subagents, so a child of this very turn routinely reports a fork
-            # instant earlier than the anchor. Scoping happens per child below instead.
+            # Fork time is not used to include or exclude a child. A subagent can outlive
+            # the turn that spawned it, so what matters is the spend inside this turn rather
+            # than which turn created the file. That bound is applied per child below.
             found.append(path)
     return found
 
@@ -1748,6 +1751,11 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log_event.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
+                # A spawned subagent's delegated prompt is reported under the parent's session
+                # id and would otherwise win this loop, pairing the child's instructions with
+                # the parent's reply and anchoring the turn at the spawn instead of the prompt.
+                if log_event.get('agent_id'):
+                    continue
                 user_prompt = log_event.get('prompt')
                 user_prompt_timestamp = log.get('timestamp')
                 permission_mode = log_event.get('permission_mode', 'default')
