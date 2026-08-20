@@ -404,6 +404,27 @@ def _get_session_model(session_id: str) -> Optional[str]:
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _ts_lt(earlier, later) -> bool:
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
+
+
 def _cache_creation_tokens(usage: Dict) -> int:
     """Cache-creation is reported either as a flat count or split across ephemeral TTLs."""
     block = usage.get('cache_creation')
@@ -495,21 +516,32 @@ def _keep_usage(usage_by_key: Dict, key, msg_usage: Dict, sidechain: bool) -> No
         usage_by_key[key] = (msg_usage, sidechain)
 
 
+def _subagent_dir(transcript_path: str) -> Optional[str]:
+    """subagents/ sits beside the session's JSONL: under {session}/ in the flat layout,
+    alongside the transcript in the nested one."""
+    for candidate in (os.path.join(os.path.splitext(transcript_path)[0], 'subagents'),
+                      os.path.join(os.path.dirname(transcript_path), 'subagents')):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
 def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
-    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to
-    <transcript_dir>/<session>/subagents/*.jsonl, never the main transcript the Stop event
-    points at, so their tokens would otherwise be dropped. Same per-turn scope + dedup."""
+    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to a
+    subagents/ dir, never the main transcript the Stop event points at, so their tokens
+    would otherwise be dropped. Same per-turn scope + dedup."""
     try:
-        subdir = os.path.join(os.path.splitext(transcript_path)[0], 'subagents')
-        names = os.listdir(subdir) if os.path.isdir(subdir) else []
+        subdir = _subagent_dir(transcript_path)
+        names = []
+        if subdir:
+            for root, _dirs, files in os.walk(subdir):
+                names.extend(os.path.join(root, n) for n in files if n.endswith('.jsonl'))
     except Exception as e:
         log_error(f"subagent usage: cannot list dir for {transcript_path}: {e}", 'usage')
         return
     for name in names:
-        if not name.endswith('.jsonl'):
-            continue
         try:
-            with open(os.path.join(subdir, name), 'r', encoding='utf-8') as f:
+            with open(name, 'r', encoding='utf-8') as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -523,7 +555,7 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                         continue
                     ts = entry.get('timestamp')
                     # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
-                    if user_prompt_timestamp and (not ts or ts <= user_prompt_timestamp):
+                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, ts):
                         continue
                     _record_usage(entry, entry.get('message') or {}, usage_by_key)
         except Exception as e:
@@ -592,9 +624,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                             })
 
                     elif entry_type == 'assistant':
-                        if user_prompt_timestamp and entry_timestamp:
-                            if entry_timestamp <= user_prompt_timestamp:
-                                continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
 
                         message = entry.get('message', {})
                         # Agent-progress records carry usage without a role field.
