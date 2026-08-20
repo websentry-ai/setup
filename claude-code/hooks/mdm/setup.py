@@ -860,9 +860,8 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             os.chmod(script_path, 0o755)
             debug_print("Set script as executable")
 
-        # Write no hook config of our own; the org's remote Claude Code policy
-        # owns it. Any hooks a previous install left in the local file are
-        # stripped so the device cannot enforce from both places at once.
+        # No hook config of our own: the remote policy owns it, and stale local
+        # hooks would let the device enforce from two places at once.
         if skip_settings:
             stripped, strip_error = _strip_unbound_hooks_from_settings(managed_dir, script_path)
             if stripped:
