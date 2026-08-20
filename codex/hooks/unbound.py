@@ -406,10 +406,25 @@ def _typed_user_text(entry: Dict) -> str:
     return ''
 
 
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
 def _ts_lt(earlier, later) -> bool:
-    """Timestamp ordering that tolerates a non-string timestamp. Only strings are ordered, so
-    a format change can never raise here and discard the turn's usage."""
-    return isinstance(earlier, str) and isinstance(later, str) and earlier < later
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
 
 
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
@@ -1509,7 +1524,11 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 total = (payload.get('info') or {}).get('total_token_usage')
                 if not total:
                     continue
-                if _ts_lt(entry.get('timestamp'), user_prompt_timestamp):
+                # An unorderable timestamp is treated as the pre-prompt baseline: a cumulative
+                # snapshot we cannot place is far likelier to predate the turn than to be its
+                # spend, and guessing the other way bills a past session against this one.
+                stamp = entry.get('timestamp')
+                if _ts_key(stamp) is None or _ts_lt(stamp, user_prompt_timestamp):
                     before = total
                 else:
                     after = total
