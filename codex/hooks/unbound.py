@@ -1743,6 +1743,7 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt = None
     user_prompt_timestamp = None
     permission_mode = None
+    submitted_prompts = []
     stop_timestamp = None
     previous_stop = None
 
@@ -1755,12 +1756,13 @@ def process_stop_event(event: Dict, api_key: str):
 
             if event_name == 'UserPromptSubmit':
                 # A spawned subagent's delegated prompt is reported under the parent's session
-                # id and would otherwise win this loop, pairing the child's instructions with
-                # the parent's reply and anchoring the turn at the spawn instead of the prompt.
+                # id and would otherwise be taken for the user's, pairing the child's
+                # instructions with the parent's reply and anchoring the turn at the spawn.
                 if log_event.get('agent_id'):
                     continue
-                user_prompt = log_event.get('prompt')
-                user_prompt_timestamp = log.get('timestamp')
+                prompt_text = log_event.get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
                 permission_mode = log_event.get('permission_mode', 'default')
             elif event_name == 'Stop':
                 # This Stop is already logged, so the one before it marks how far the last
@@ -1769,10 +1771,21 @@ def process_stop_event(event: Dict, api_key: str):
                 previous_stop = stop_timestamp
                 stop_timestamp = log.get('timestamp')
 
+    # Codex closes one turn for every prompt typed while it was still working, so a turn can
+    # carry more than one. Keeping only the last drops what the user actually asked first, and
+    # anchoring on it would start the token window after work already done.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
+        user_prompt = '\n\n'.join(text for _, text in turn_prompts)
+
     if not user_prompt:
         return
 
-    messages = [{'role': 'user', 'content': user_prompt}]
+    messages = [{'role': 'user', 'content': text} for _, text in turn_prompts]
 
     # Parse tool uses from Codex transcript (function_call/function_call_output
     # pairs); the session cwd seeds shell-dir tracking for per-call project
