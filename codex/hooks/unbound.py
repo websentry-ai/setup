@@ -1587,6 +1587,33 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
     return found
 
 
+def _codex_same_totals(left: Dict, right: Dict) -> bool:
+    """Two cumulative snapshots describing the same point in a session."""
+    if not left or not right:
+        return False
+    return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
+
+
+def _codex_all_totals(transcript_path: str) -> List[Dict]:
+    """Every cumulative snapshot in a rollout, in file order."""
+    totals = []
+    with open(transcript_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get('payload') or {}
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            total = (payload.get('info') or {}).get('total_token_usage')
+            if total:
+                totals.append(total)
+    return totals
+
+
 def _codex_totals_around(transcript_path: str, anchor: Optional[str]) -> tuple:
     """Last cumulative snapshot at or before the anchor, and the last one after it."""
     before, after = {}, {}
@@ -1641,10 +1668,12 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
 
         try:
             children = _codex_subagent_rollouts(transcript_path, user_prompt_timestamp)
+            parent_totals = _codex_all_totals(transcript_path) if children else []
         except Exception as e:
             # The parent's own usage is already computed; never trade it for the children.
             log_error(f"subagent usage: cannot enumerate for {transcript_path}: {e}", 'usage')
             children = []
+            parent_totals = []
 
         for child_path, forked_at in children:
             try:
@@ -1652,15 +1681,19 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 # its own timestamps cannot separate inherited totals from new spend. The
                 # baseline is taken from the parent at the fork instead, where the timestamps
                 # are the parent's own and were never rewritten.
-                inherited, _ = _codex_totals_around(transcript_path, forked_at)
-                _, child_total = _codex_totals_around(child_path, None)
-                if not child_total:
+                child_totals = _codex_all_totals(child_path)
+                if not child_totals:
                     continue
-                # A child whose total sits below the inherited snapshot never inherited one, so
-                # subtracting would erase its spend rather than isolate it.
-                if _codex_token(child_total, 'input_tokens') < _codex_token(inherited, 'input_tokens'):
-                    inherited = {}
-                child = _codex_usage_delta(inherited, child_total)
+                # A replay is a prefix of the parent's own stream, so the inherited snapshot is
+                # the last leading entry the parent also recorded. Magnitude cannot decide this:
+                # a subagent that starts clean can still outspend the parent, and subtracting
+                # from that one erases its work instead of isolating it.
+                inherited = {}
+                for total in child_totals:
+                    if not any(_codex_same_totals(total, seen) for seen in parent_totals):
+                        break
+                    inherited = total
+                child = _codex_usage_delta(inherited, child_totals[-1])
             except Exception as e:
                 log_error(f"subagent usage: failed reading {child_path}: {e}", 'usage')
                 continue
