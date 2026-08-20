@@ -860,13 +860,19 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             os.chmod(script_path, 0o755)
             debug_print("Set script as executable")
 
-        # Leave any managed settings file untouched — the org's remote Claude
-        # Code policy owns the hook config on this device.
+        # Write no hook config of our own; the org's remote Claude Code policy
+        # owns it. Any hooks a previous install left in the local file are
+        # stripped so the device cannot enforce from both places at once.
         if skip_settings:
+            stripped, strip_error = _strip_unbound_hooks_from_settings(managed_dir, script_path)
+            if stripped:
+                print("Removed Unbound hooks left behind in the local managed settings")
+            if strip_error:
+                print(f"Warning: could not strip existing Unbound hooks from {managed_dir}; check it by hand")
             if system in ["darwin", "linux"]:
                 os.chmod(managed_dir, 0o755)
                 os.chmod(hooks_dir, 0o755)
-            debug_print("Skipped managed settings; installed hook script only")
+            debug_print("Installed hook script only; wrote no managed settings")
             return True
 
         # Read existing settings or create new
@@ -1022,6 +1028,82 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
 
+def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path) -> Tuple[bool, bool]:
+    """Remove ONLY our hook entries from the managed Claude config, preserving
+    foreign content; managed-settings.json is shared with org/Enterprise policy.
+
+    Returns (stripped_any, had_error). Leaves the hook script itself alone.
+    """
+    stripped_any = False
+    had_error = False
+    settings_candidates = [
+        managed_dir / "managed-settings.d" / "unbound.json",
+        managed_dir / "managed-settings.json",
+    ]
+
+    for settings_path in settings_candidates:
+        if not settings_path.exists():
+            continue
+        try:
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+            modified = False
+            hooks_block = settings.get("hooks") if isinstance(settings, dict) else None
+            if isinstance(hooks_block, dict):
+                for event in list(hooks_block.keys()):
+                    event_config = hooks_block[event]
+                    if not isinstance(event_config, list):
+                        continue
+                    new_config = []
+                    for item in event_config:
+                        # Only touch items with a real list of hooks; preserve
+                        # everything else untouched (foreign items, dicts with
+                        # no/"null" hooks). Drop an item only when every hook in
+                        # it was ours.
+                        if isinstance(item, dict) and isinstance(item.get("hooks"), list):
+                            hooks = item["hooks"]
+                            new_hooks = [
+                                h for h in hooks
+                                if not (isinstance(h, dict) and _is_unbound_hook_command(h.get("command", ""), script_path))
+                            ]
+                            if len(new_hooks) != len(hooks):
+                                modified = True
+                                if new_hooks:
+                                    item["hooks"] = new_hooks
+                                    new_config.append(item)
+                            else:
+                                new_config.append(item)
+                        else:
+                            new_config.append(item)
+                    if new_config:
+                        hooks_block[event] = new_config
+                    else:
+                        del hooks_block[event]
+                        modified = True
+                if not hooks_block:
+                    del settings["hooks"]
+            if modified:
+                # Delete the file only when nothing foreign remains (our
+                # drop-in, or a managed-settings.json that held only our
+                # hooks); otherwise rewrite in place so org policy survives.
+                if isinstance(settings, dict) and not settings:
+                    settings_path.unlink()
+                    debug_print(f"Removed empty settings {settings_path}")
+                else:
+                    # tmp + os.replace: a crash mid-write must never leave the
+                    # org's own policy in this shared file truncated.
+                    tmp = settings_path.parent / f"{settings_path.name}.{os.getpid()}.tmp"
+                    tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+                    os.replace(tmp, settings_path)
+                    debug_print(f"Stripped our hooks from {settings_path}")
+                stripped_any = True
+        except Exception as e:
+            debug_print(f"Failed to update {settings_path}: {e}")
+            had_error = True
+
+    return stripped_any, had_error
+
+
 def clear_managed_hooks() -> str:
     """Strip ONLY our hook entries from the managed Claude config, preserving
     foreign content; managed-settings.json is shared with org/Enterprise policy.
@@ -1032,11 +1114,6 @@ def clear_managed_hooks() -> str:
         managed_dir = get_managed_settings_dir()
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
-
-        settings_candidates = [
-            managed_dir / "managed-settings.d" / "unbound.json",
-            managed_dir / "managed-settings.json",
-        ]
 
         cleared_any = False
         had_error = False
@@ -1058,62 +1135,9 @@ def clear_managed_hooks() -> str:
             except Exception as e:
                 debug_print(f"Could not remove directory {hooks_dir}: {e}")
 
-        for settings_path in settings_candidates:
-            if not settings_path.exists():
-                continue
-            try:
-                with open(settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
-                modified = False
-                hooks_block = settings.get("hooks") if isinstance(settings, dict) else None
-                if isinstance(hooks_block, dict):
-                    for event in list(hooks_block.keys()):
-                        event_config = hooks_block[event]
-                        if not isinstance(event_config, list):
-                            continue
-                        new_config = []
-                        for item in event_config:
-                            # Only touch items with a real list of hooks; preserve
-                            # everything else untouched (foreign items, dicts with
-                            # no/"null" hooks). Drop an item only when every hook in
-                            # it was ours.
-                            if isinstance(item, dict) and isinstance(item.get("hooks"), list):
-                                hooks = item["hooks"]
-                                new_hooks = [
-                                    h for h in hooks
-                                    if not (isinstance(h, dict) and _is_unbound_hook_command(h.get("command", ""), script_path))
-                                ]
-                                if len(new_hooks) != len(hooks):
-                                    modified = True
-                                    if new_hooks:
-                                        item["hooks"] = new_hooks
-                                        new_config.append(item)
-                                else:
-                                    new_config.append(item)
-                            else:
-                                new_config.append(item)
-                        if new_config:
-                            hooks_block[event] = new_config
-                        else:
-                            del hooks_block[event]
-                            modified = True
-                    if not hooks_block:
-                        del settings["hooks"]
-                if modified:
-                    # Delete the file only when nothing foreign remains (our
-                    # drop-in, or a managed-settings.json that held only our
-                    # hooks); otherwise rewrite in place so org policy survives.
-                    if isinstance(settings, dict) and not settings:
-                        settings_path.unlink()
-                        debug_print(f"Removed empty settings {settings_path}")
-                    else:
-                        with open(settings_path, "w", encoding="utf-8") as f:
-                            json.dump(settings, f, indent=2)
-                        debug_print(f"Stripped our hooks from {settings_path}")
-                    cleared_any = True
-            except Exception as e:
-                debug_print(f"Failed to update {settings_path}: {e}")
-                had_error = True
+        stripped, strip_error = _strip_unbound_hooks_from_settings(managed_dir, script_path)
+        cleared_any = cleared_any or stripped
+        had_error = had_error or strip_error
 
         if cleared_any:
             return "cleared"
