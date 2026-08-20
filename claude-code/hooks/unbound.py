@@ -451,10 +451,14 @@ def _advisor_usages(message: Dict) -> List[Dict]:
 
 def _agent_progress_entry(entry: Dict) -> Optional[Dict]:
     """Agent-progress lines wrap the assistant record one level deeper, so the outer type is
-    not 'assistant'; the inner record carries the usage, timestamp and isSidechain."""
+    not 'assistant'. The wrapper also carries user and tool-result records, which have no
+    role either, so the inner usage block is what identifies a model response."""
     data = entry.get('data')
     inner = data.get('message') if isinstance(data, dict) else None
-    if isinstance(inner, dict) and isinstance(inner.get('message'), dict):
+    if not isinstance(inner, dict):
+        return None
+    message = inner.get('message')
+    if isinstance(message, dict) and isinstance(message.get('usage'), dict):
         return inner
     return None
 
