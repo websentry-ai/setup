@@ -1023,7 +1023,9 @@ def _is_unbound_hook_command(cmd: str, script_path: Path) -> bool:
     install prefix and the binary name, so a foreign hook in a shared/Enterprise
     config that merely references some other unbound.py / mentions /opt/unbound/
     isn't stripped."""
-    if not cmd:
+    # A non-string command is never ours; matching one raises and would abandon
+    # every remaining entry in the file.
+    if not cmd or not isinstance(cmd, str):
         return False
     return str(script_path) in cmd or ("/opt/unbound/" in cmd and "unbound-hook" in cmd)
 
@@ -1093,11 +1095,21 @@ def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path,
                     settings_path.unlink()
                     debug_print(f"Removed empty settings {settings_path}")
                 else:
-                    # tmp + os.replace: a crash mid-write must never leave the
-                    # org's own policy in this shared file truncated.
+                    # tmp + os.replace so a crash never truncates org policy; the
+                    # mode carries over so a tight umask cannot hide the file from
+                    # the non-root users whose Claude Code has to read it.
+                    try:
+                        mode = stat.S_IMODE(settings_path.stat().st_mode)
+                    except OSError:
+                        mode = 0o644
                     tmp = settings_path.parent / f"{settings_path.name}.{os.getpid()}.tmp"
-                    tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
-                    os.replace(tmp, settings_path)
+                    try:
+                        tmp.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+                        os.chmod(tmp, mode)
+                        os.replace(tmp, settings_path)
+                    except Exception:
+                        tmp.unlink(missing_ok=True)
+                        raise
                     debug_print(f"Stripped our hooks from {settings_path}")
                 stripped_any = True
         except Exception as e:
