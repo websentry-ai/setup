@@ -21,6 +21,14 @@ PLUGIN_NAME = "unbound-openclaw-plugin"
 PROVIDER_NAME = "unbound"
 DEFAULT_MODEL = "unbound/claude-sonnet-4-6"
 
+# Anthropic has retired these, so a config still naming one 404s on every prompt.
+RETIRED_MODEL_REPLACEMENTS = {
+    "claude-sonnet-4-20250514": "claude-sonnet-4-6",
+    "claude-opus-4-20250514": "claude-opus-4-8",
+    "claude-opus-4-1-20250805": "claude-opus-4-8",
+    "claude-3-5-haiku-20241022": "claude-haiku-4-5-20251001",
+}
+
 
 def debug_print(message: str) -> None:
     if DEBUG:
@@ -240,6 +248,30 @@ def run_callback_server(frontend_url: str) -> Optional[str]:
         return None
 
 
+def retired_replacement(model_id: str) -> Optional[str]:
+    """Replacement for a retired model id, keeping any provider prefix. None if still current."""
+    prefix, _, bare = model_id.rpartition("/")
+    replacement = RETIRED_MODEL_REPLACEMENTS.get(bare)
+    if replacement is None:
+        return None
+    return f"{prefix}/{replacement}" if prefix else replacement
+
+
+def migrate_retired_provider_models(provider: dict) -> list:
+    """Rewrite retired ids in a provider's model list, returning the (old, new) pairs."""
+    migrated = []
+    for entry in provider.get("models", []):
+        old = entry.get("id", "")
+        replacement = retired_replacement(old)
+        if replacement is None:
+            continue
+        entry["id"] = replacement
+        if entry.get("name") == old:
+            entry["name"] = replacement
+        migrated.append((old, replacement))
+    return migrated
+
+
 def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provider: bool = True, model: str = None) -> bool:
     """Configure OpenClaw with the Unbound plugin and/or provider."""
     config_dir = Path.home() / ".openclaw"
@@ -337,7 +369,11 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
                     ]
                     print(f"ℹ️  Updated model to {model_id}")
                 else:
-                    print("ℹ️  Updating baseUrl in existing unbound provider")
+                    migrated = migrate_retired_provider_models(providers[PROVIDER_NAME])
+                    for old, new in migrated:
+                        print(f"ℹ️  Replaced retired model {old} with {new}")
+                    if not migrated:
+                        print("ℹ️  Updating baseUrl in existing unbound provider")
 
             model_config = config.setdefault("agents", {}).setdefault("defaults", {}).setdefault("model", {})
             default_model = f"unbound/{model_id}"
@@ -345,7 +381,13 @@ def configure_openclaw(gateway_url: str, setup_plugin: bool = True, setup_provid
             if "primary" not in model_config or model:
                 model_config["primary"] = default_model
             else:
-                print(f"ℹ️  Keeping existing default model: {model_config['primary']}")
+                existing = model_config["primary"]
+                replacement = retired_replacement(existing)
+                if replacement is not None:
+                    model_config["primary"] = replacement
+                    print(f"ℹ️  Replaced retired default model {existing} with {replacement}")
+                else:
+                    print(f"ℹ️  Keeping existing default model: {existing}")
 
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
