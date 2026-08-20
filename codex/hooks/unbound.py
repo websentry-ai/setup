@@ -1661,7 +1661,8 @@ def _codex_usage_delta(before: Dict, after: Dict) -> tuple:
     return input_tokens - cache_read, field('output_tokens'), cache_read
 
 
-def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
+def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
+                                     subagent_floor: Optional[str] = None) -> Optional[Dict]:
     """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489),
     plus the same delta over any subagent rollout this turn spawned."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
@@ -1701,11 +1702,12 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                     if not any(_codex_same_totals(total, seen) for seen in parent_totals):
                         break
                     inherited = total
-                # Spend from the child's earlier turns is excluded the same way the parent's
-                # is: by its own snapshot at the anchor. Cumulative totals only climb, so the
-                # larger of the two lower bounds is the tighter one, and a child that finished
-                # before this turn lands on its final total and contributes nothing.
-                at_anchor, _ = _codex_totals_around(child_path, user_prompt_timestamp)
+                # Spend already uploaded is excluded by the child's own snapshot at the floor,
+                # which is the previous Stop rather than this turn's prompt so that work
+                # finishing between the two is still counted once. Cumulative totals only
+                # climb, so the larger of the two lower bounds is the tighter one, and a child
+                # that finished before the floor lands on its final total and adds nothing.
+                at_anchor, _ = _codex_totals_around(child_path, subagent_floor or user_prompt_timestamp)
                 if _codex_token(at_anchor, 'input_tokens') > _codex_token(inherited, 'input_tokens'):
                     inherited = at_anchor
                 child = _codex_usage_delta(inherited, child_totals[-1])
@@ -1742,6 +1744,7 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt_timestamp = None
     permission_mode = None
     stop_timestamp = None
+    previous_stop = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -1760,6 +1763,10 @@ def process_stop_event(event: Dict, api_key: str):
                 user_prompt_timestamp = log.get('timestamp')
                 permission_mode = log_event.get('permission_mode', 'default')
             elif event_name == 'Stop':
+                # This Stop is already logged, so the one before it marks how far the last
+                # upload reported. Subagent work landing between the two belongs to nobody
+                # otherwise, and a subagent routinely outlives the turn that spawned it.
+                previous_stop = stop_timestamp
                 stop_timestamp = log.get('timestamp')
 
     if not user_prompt:
@@ -1805,7 +1812,8 @@ def process_stop_event(event: Dict, api_key: str):
         'project': _get_project(cwd)
     }
 
-    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
+    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp,
+                                             subagent_floor=previous_stop)
     if usage:
         exchange['usage'] = usage
 
