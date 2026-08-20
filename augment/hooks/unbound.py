@@ -1749,41 +1749,48 @@ _GIT_PATH_OPT_RE = re.compile(
 
 
 def _shell_segments(command):
-    """Segments split on unquoted separators, sliced from the original so quoted paths survive."""
+    """(segment, following-separator) pairs, sliced from the original so quoted paths survive."""
     masked = _mask_quoted_runs(command)
     out, last = [], 0
     for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
-        out.append(command[last:m.start()].strip())
+        out.append((command[last:m.start()].strip(), m.group(0).strip()))
         last = m.end()
-    out.append(command[last:].strip())
+    out.append((command[last:].strip(), ''))
     # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
     return out
 
 
 def _git_path_opt_targets(command, shell_dir):
-    """Directories a git invocation redirects itself at, resolved against the cwd in effect at that segment."""
+    """Directories a git invocation redirects itself at, resolved against every cwd reachable at that segment."""
     targets = []
     try:
-        cwd = shell_dir
-        for segment in _shell_segments(command):
+        cwds = [shell_dir]
+        for segment, separator in _shell_segments(command):
             words = _segment_words(segment)
             # git only: `grep -C 3` is context lines, not a directory.
-            is_git = bool(words) and os.path.basename(words[0]) == 'git'
-            for match in _GIT_PATH_OPT_RE.finditer(segment) if is_git else ():
-                target = match.group(1) or match.group(2) or match.group(3)
-                if not target:
-                    continue
-                if target.startswith('~'):
-                    target = os.path.expanduser(target)
-                if not target.startswith('/'):
-                    if not cwd:
+            if words and os.path.basename(words[0]) == 'git':
+                for match in _GIT_PATH_OPT_RE.finditer(segment):
+                    raw = match.group(1) or match.group(2) or match.group(3)
+                    if not raw:
                         continue
-                    target = os.path.join(cwd, target)
-                target = os.path.normpath(target)
-                if not _is_system_checkout_path(target):
-                    targets.append(target)
-            # After this segment's own options: `cd x && git -C y` resolves y under x.
-            cwd = _next_shell_dir(segment, cwd)
+                    for cwd in cwds:
+                        target = os.path.expanduser(raw) if raw.startswith('~') else raw
+                        if not target.startswith('/'):
+                            if not cwd:
+                                continue
+                            target = os.path.join(cwd, target)
+                        target = os.path.normpath(target)
+                        if _is_system_checkout_path(target) or target in targets:
+                            continue
+                        targets.append(target)
+            moved = [_next_shell_dir(segment, c) for c in cwds]
+            # The separator says whether this segment's cd actually took effect:
+            # `&&` runs the next only on success, `||` only on failure, others either way.
+            if separator == '&&':
+                cwds = moved
+            elif separator != '||':
+                cwds = moved + [c for c in cwds if c not in moved]
+            cwds = cwds[:8]
     except Exception:
         return targets
     return targets

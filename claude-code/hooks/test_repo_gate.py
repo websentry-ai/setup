@@ -358,6 +358,30 @@ class TestCoreDecisions(RepoGateCase):
             self.bash(f'cd {self.in_scope} && git -C . commit -am wip',
                       cwd=str(self.no_repo)))
 
+    def test_a_failed_cd_before_a_relative_dash_c_is_gated(self):
+        """cd /nonexistent || git -C ../widgets — the cd failed, so git runs in the original cwd."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash('cd /nonexistent-dir || git -C ../widgets commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_an_or_after_a_successful_cd_still_resolves_from_the_original(self):
+        """`||` only runs when the left side failed, so the cd must not be applied."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash(f'cd {self.no_repo} || git -C ../widgets commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
+    def test_semicolon_covers_both_possible_cwds(self):
+        """`;` runs regardless, so either resolution is reachable and both are gated."""
+        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.assertBlocked(
+            self.bash(f'cd {self.no_repo} ; git -C ../widgets commit -am wip',
+                      cwd=str(self.in_scope)),
+            'acme/widgets')
+
     def test_no_git_anywhere_above_is_allowed(self):
         self.set_policies([ORG_POLICY])
         response = self.run_tool(
