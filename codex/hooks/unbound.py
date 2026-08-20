@@ -1525,11 +1525,16 @@ def _codex_session_meta(transcript_path: str) -> Dict:
             value = value.get(key)
         return value if isinstance(value, dict) else {}
 
-    # source is a plain string ("cli") on ordinary rollouts and only a mapping on spawned ones.
+    # source is a plain string ("cli") on ordinary rollouts and a mapping on spawned ones,
+    # where subagent is itself either a bare label ({"subagent": "review"}, carrying no
+    # lineage at all) or a mapping naming the thread that spawned it.
     spawn = nested(payload, 'source', 'subagent', 'thread_spawn')
+    parent_id = (payload.get('forked_from_id')
+                 or payload.get('parent_thread_id')
+                 or spawn.get('parent_thread_id'))
     return {
         'id': payload.get('id'),
-        'parent_id': payload.get('forked_from_id') or spawn.get('parent_thread_id'),
+        'parent_id': parent_id if isinstance(parent_id, str) and parent_id else None,
         'forked_at': entry.get('timestamp'),
     }
 
@@ -1574,7 +1579,9 @@ def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -
             if meta.get('parent_id') != session_id:
                 continue
             forked_at = meta.get('forked_at')
-            if _ts_lt(forked_at, user_prompt_timestamp):
+            # Without a placeable fork instant there is no way to read the snapshot the child
+            # inherited, and counting its total would bill the parent's spend a second time.
+            if _ts_key(forked_at) is None or _ts_lt(forked_at, user_prompt_timestamp):
                 continue
             found.append((path, forked_at))
     return found
