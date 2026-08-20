@@ -33,6 +33,9 @@ Optional parameters:
 
 # Enable backfill of historical transcripts (opt-in)
 .\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -Backfill
+
+# Claude Code only: install the hook script, leave managed-settings.json alone
+.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -SkipManagedSettings
 ```
 
 ### Clearing Setup (Windows)
@@ -58,6 +61,8 @@ sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/set
 ```
 
 Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`). The `--backend-url` value also becomes the discovery scan's `--domain`.
+
+`--skip-managed-settings` is passed to the **Claude Code** step only: it installs the hook script and leaves `managed-settings.json` alone, for orgs whose Claude Code policy is managed remotely from the Anthropic admin console. See `claude-code/hooks/mdm/README.md` for the ordering caveats.
 
 ### Clearing Setup (macOS/Linux)
 

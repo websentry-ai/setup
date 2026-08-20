@@ -12,6 +12,8 @@ sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/set
 
 Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`).
 
+`--skip-managed-settings` installs only the hook script (`<managed settings dir>/hooks/unbound.py`) and neither creates nor modifies `managed-settings.json`. Use it for orgs on a Claude Enterprise / Teams plan whose Claude Code policy is managed remotely from the Anthropic admin console: remote settings override the file-based ones, so the local file is ignored anyway. Their admin must point the remote policy's hook commands at the installed script path. Set the remote policy up before running this, not after: like every MDM run it strips any user-level Unbound hooks, so nothing enforces on the device until the remote policy names the script. On a device that already has a full MDM install, run `--clear` first: the flag leaves an existing `managed-settings.json` exactly as it is, hooks included.
+
 ### Clearing Setup
 
 ```bash

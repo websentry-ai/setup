@@ -384,6 +384,49 @@ def append_to_audit_log(event_data: Dict):
         pass
 
 
+def _typed_user_text(entry: Dict) -> str:
+    """The typed text of a transcript entry, forwarded verbatim so DLP scans what
+    the user wrote. Only text blocks are prompt text: tool results, meta entries
+    and images are not, and yield '' so the caller skips the entry."""
+    if 'toolUseResult' in entry or entry.get('isMeta'):
+        return ''
+    message = entry.get('message') or {}
+    if message.get('role') != 'user':
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content if content.strip() else ''
+    if isinstance(content, list):
+        texts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        joined = '\n'.join(t for t in texts if isinstance(t, str))
+        return joined if joined.strip() else ''
+    return ''
+
+
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _ts_lt(earlier, later) -> bool:
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
+
+
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
@@ -406,19 +449,16 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_timestamp = entry.get('timestamp')
 
                     if entry_type == 'user':
-                        message = entry.get('message', {})
-                        if message.get('role') == 'user':
-                            content = message.get('content', '')
-                            if content:
-                                conversation_data['user_messages'].append({
-                                    'content': content,
-                                    'timestamp': entry_timestamp
-                                })
+                        typed = _typed_user_text(entry)
+                        if typed:
+                            conversation_data['user_messages'].append({
+                                'content': typed,
+                                'timestamp': entry_timestamp
+                            })
 
                     elif entry_type == 'assistant':
-                        if user_prompt_timestamp and entry_timestamp:
-                            if entry_timestamp <= user_prompt_timestamp:
-                                continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
 
                         message = entry.get('message', {})
                         if message.get('role') == 'assistant':
@@ -1342,7 +1382,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     payload = entry.get('payload', {})
 
                     # Skip entries before user prompt if timestamp provided
-                    if user_prompt_timestamp and entry_timestamp and entry_timestamp <= user_prompt_timestamp:
+                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
                         continue
 
                     if entry_type == 'response_item':
@@ -1442,6 +1482,25 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
     return tool_uses
 
 
+_CODEX_TOKEN_ALIASES = {
+    'input_tokens': ('input_tokens', 'prompt_tokens', 'input'),
+    'cached_input_tokens': ('cached_input_tokens', 'cache_read_input_tokens', 'cached_tokens'),
+    'output_tokens': ('output_tokens', 'completion_tokens', 'output'),
+}
+
+
+def _codex_token(usage: Dict, field: str) -> int:
+    for name in _CODEX_TOKEN_ALIASES[field]:
+        value = usage.get(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
 def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
     """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
@@ -1460,10 +1519,16 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
                 payload = entry.get('payload') or {}
                 if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
                     continue
+                # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
+                # later events, so summing double-bills; estimating a turn beats over-billing it.
                 total = (payload.get('info') or {}).get('total_token_usage')
                 if not total:
                     continue
-                if entry.get('timestamp', '') < user_prompt_timestamp:
+                # An unorderable timestamp is treated as the pre-prompt baseline: a cumulative
+                # snapshot we cannot place is far likelier to predate the turn than to be its
+                # spend, and guessing the other way bills a past session against this one.
+                stamp = entry.get('timestamp')
+                if _ts_key(stamp) is None or _ts_lt(stamp, user_prompt_timestamp):
                     before = total
                 else:
                     after = total
@@ -1471,11 +1536,16 @@ def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp
         if not after:
             return None
 
-        delta = lambda k: max(int(after.get(k) or 0) - int(before.get(k) or 0), 0)
-        # Codex input_tokens includes cached_input_tokens; subtract so cache isn't billed at the base rate too.
-        prompt = max(delta('input_tokens') - delta('cached_input_tokens'), 0)
-        completion = delta('output_tokens') + delta('reasoning_output_tokens')
-        cache_read = delta('cached_input_tokens')
+        def field(name):
+            return max(_codex_token(after, name) - _codex_token(before, name), 0)
+
+        input_tokens = field('input_tokens')
+        # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
+        # isn't billed at the base rate and can never exceed the input it came from.
+        cache_read = min(field('cached_input_tokens'), input_tokens)
+        prompt = input_tokens - cache_read
+        # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
+        completion = field('output_tokens')
     except Exception:
         return None
 

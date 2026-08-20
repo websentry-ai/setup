@@ -404,46 +404,144 @@ def _get_session_model(session_id: str) -> Optional[str]:
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
-def _usage_total(usage: Dict) -> int:
-    total = 0
-    for k in _USAGE_FIELDS:
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
         try:
-            total += int(usage.get(k) or 0)
-        except (TypeError, ValueError):
-            pass
-    return total
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _ts_lt(earlier, later) -> bool:
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
+
+
+def _cache_creation_tokens(usage: Dict) -> int:
+    """Cache-creation is reported either as a flat count or split across ephemeral TTLs."""
+    block = usage.get('cache_creation')
+    if isinstance(block, dict):
+        total = 0
+        for k in ('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens'):
+            try:
+                total += int(block.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+    try:
+        return int(usage.get('cache_creation_input_tokens') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_value(usage: Dict, field: str) -> int:
+    if field == 'cache_creation_input_tokens':
+        return _cache_creation_tokens(usage)
+    try:
+        return int(usage.get(field) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_total(usage: Dict) -> int:
+    return sum(_usage_value(usage, k) for k in _USAGE_FIELDS)
+
+
+def _advisor_usages(message: Dict) -> List[Dict]:
+    """Advisor turns ride inside usage.iterations as flattened token blocks under their own
+    model. Iterations of type 'message' are already inside the top-level usage."""
+    usage = message.get('usage')
+    if not isinstance(usage, dict):
+        return []
+    iterations = usage.get('iterations')
+    if not isinstance(iterations, list):
+        return []
+    return [
+        it for it in iterations
+        if isinstance(it, dict) and it.get('type') == 'advisor_message' and it.get('model')
+    ]
+
+
+def _agent_progress_entry(entry: Dict) -> Optional[Dict]:
+    """Agent-progress lines wrap the assistant record one level deeper, so the outer type is
+    not 'assistant'. The wrapper also carries user and tool-result records, which have no
+    role either, so the inner usage block is what identifies a model response."""
+    data = entry.get('data')
+    inner = data.get('message') if isinstance(data, dict) else None
+    if not isinstance(inner, dict):
+        return None
+    message = inner.get('message')
+    if isinstance(message, dict) and isinstance(message.get('usage'), dict):
+        return inner
+    return None
 
 
 def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
-    """Store a message's usage keyed by (message.id, requestId). Claude Code writes the
-    same assistant message as several streamed lines under one id; keep the highest-total
-    line (the completed message, whose output has finished growing) so tokens aren't over-
-    or under-counted. Mirrors ccusage's dedup. Entries missing either id are kept individually."""
+    """Store a message's usage keyed by message.id. Claude Code writes the same assistant
+    message as several streamed lines, and a replay can carry a new requestId, so the id
+    alone is the identity. Prefer the non-sidechain line, then the highest total (the
+    completed message, whose output has finished growing). Mirrors ccusage's dedup.
+    Entries without an id are kept individually."""
     msg_usage = message.get('usage')
-    if not isinstance(msg_usage, dict) or not msg_usage:
-        return
-    mid, rid = message.get('id'), entry.get('requestId')
-    key = (mid, rid) if (mid and rid) else ('', len(usage_by_key))
+    sidechain = entry.get('isSidechain') is True
+    mid = message.get('id')
+
+    if isinstance(msg_usage, dict) and msg_usage:
+        _keep_usage(usage_by_key, mid or ('', len(usage_by_key)), msg_usage, sidechain)
+
+    for index, advisor in enumerate(_advisor_usages(message)):
+        key = (mid, 'advisor', index) if mid else ('', len(usage_by_key))
+        _keep_usage(usage_by_key, key, advisor, sidechain)
+
+
+def _keep_usage(usage_by_key: Dict, key, msg_usage: Dict, sidechain: bool) -> None:
     prev = usage_by_key.get(key)
-    if prev is None or _usage_total(msg_usage) > _usage_total(prev):
-        usage_by_key[key] = msg_usage
+    if prev is None:
+        usage_by_key[key] = (msg_usage, sidechain)
+        return
+    prev_usage, prev_sidechain = prev
+    if sidechain != prev_sidechain:
+        if prev_sidechain:
+            usage_by_key[key] = (msg_usage, sidechain)
+        return
+    if _usage_total(msg_usage) > _usage_total(prev_usage):
+        usage_by_key[key] = (msg_usage, sidechain)
+
+
+def _subagent_dir(transcript_path: str) -> Optional[str]:
+    """subagents/ sits beside the session's JSONL: under {session}/ in the flat layout,
+    alongside the transcript in the nested one."""
+    for candidate in (os.path.join(os.path.splitext(transcript_path)[0], 'subagents'),
+                      os.path.join(os.path.dirname(transcript_path), 'subagents')):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
 
 
 def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
-    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to
-    <transcript_dir>/<session>/subagents/*.jsonl, never the main transcript the Stop event
-    points at, so their tokens would otherwise be dropped. Same per-turn scope + dedup."""
+    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to a
+    subagents/ dir, never the main transcript the Stop event points at, so their tokens
+    would otherwise be dropped. Same per-turn scope + dedup."""
     try:
-        subdir = os.path.join(os.path.splitext(transcript_path)[0], 'subagents')
-        names = os.listdir(subdir) if os.path.isdir(subdir) else []
+        subdir = _subagent_dir(transcript_path)
+        names = []
+        if subdir:
+            for root, _dirs, files in os.walk(subdir):
+                names.extend(os.path.join(root, n) for n in files if n.endswith('.jsonl'))
     except Exception as e:
         log_error(f"subagent usage: cannot list dir for {transcript_path}: {e}", 'usage')
         return
     for name in names:
-        if not name.endswith('.jsonl'):
-            continue
         try:
-            with open(os.path.join(subdir, name), 'r', encoding='utf-8') as f:
+            with open(name, 'r', encoding='utf-8') as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -451,16 +549,40 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if entry.get('type') != 'assistant':
+                    progress = _agent_progress_entry(entry)
+                    entry = progress or entry
+                    if progress is None and entry.get('type') != 'assistant':
                         continue
                     ts = entry.get('timestamp')
                     # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
-                    if user_prompt_timestamp and (not ts or ts <= user_prompt_timestamp):
+                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, ts):
                         continue
                     _record_usage(entry, entry.get('message') or {}, usage_by_key)
         except Exception as e:
             log_error(f"subagent usage: failed reading {name}: {e}", 'usage')
             continue
+
+
+def _typed_user_text(entry: Dict) -> str:
+    """The typed text of a transcript entry, forwarded verbatim so DLP scans what
+    the user wrote. Only text blocks are prompt text: tool results, meta entries
+    and images are not, and yield '' so the caller skips the entry."""
+    if 'toolUseResult' in entry or entry.get('isMeta'):
+        return ''
+    message = entry.get('message') or {}
+    if message.get('role') != 'user':
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content if content.strip() else ''
+    if isinstance(content, list):
+        texts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        joined = '\n'.join(t for t in texts if isinstance(t, str))
+        return joined if joined.strip() else ''
+    return ''
 
 
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None, include_usage: bool = True) -> Dict:
@@ -487,26 +609,27 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
                 try:
                     entry = json.loads(line)
-                    entry_type = entry.get('type', '')
+                    progress = _agent_progress_entry(entry)
+                    if progress is not None:
+                        entry = progress
+                    entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
 
                     if entry_type == 'user':
-                        message = entry.get('message', {})
-                        if message.get('role') == 'user':
-                            content = message.get('content', '')
-                            if content:
-                                conversation_data['user_messages'].append({
-                                    'content': content,
-                                    'timestamp': entry_timestamp
-                                })
+                        typed = _typed_user_text(entry)
+                        if typed:
+                            conversation_data['user_messages'].append({
+                                'content': typed,
+                                'timestamp': entry_timestamp
+                            })
 
                     elif entry_type == 'assistant':
-                        if user_prompt_timestamp and entry_timestamp:
-                            if entry_timestamp <= user_prompt_timestamp:
-                                continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
 
                         message = entry.get('message', {})
-                        if message.get('role') == 'assistant':
+                        # Agent-progress records carry usage without a role field.
+                        if message.get('role') == 'assistant' or progress is not None:
                             for content_item in message.get('content', []):
                                 if isinstance(content_item, dict) and content_item.get('type') == 'text':
                                     text_content = content_item.get('text', '')
@@ -531,9 +654,9 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     if include_usage:
         try:
             _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key)
-            for msg_usage in usage_by_key.values():
+            for msg_usage, _ in usage_by_key.values():
                 for k in usage:
-                    usage[k] += int(msg_usage.get(k) or 0)
+                    usage[k] += _usage_value(msg_usage, k)
         except Exception as e:
             log_error(f"usage aggregation failed for {transcript_path}: {e}", 'usage')
 

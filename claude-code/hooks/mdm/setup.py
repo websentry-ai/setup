@@ -819,20 +819,20 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
         debug_print(f"Could not rewrite gateway URL in {path}: {e}")
 
 
-def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
-    """
-    Set up system-wide managed hooks for Claude Code.
-    Downloads unbound.py and configures managed-settings.json with hooks.
-    """
+def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: bool = False) -> bool:
+    """Set up system-wide managed hooks for Claude Code: download unbound.py and
+    configure managed-settings.json. With skip_settings, install only the script."""
     system = platform.system().lower()
     try:
         managed_dir = get_managed_settings_dir()
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
 
+        if skip_settings:
+            settings_path = None
         # On Windows, prefer the drop-in directory to avoid clobbering an
         # existing admin-managed settings file; fall back if we can't create it.
-        if system == "windows":
+        elif system == "windows":
             dropin_dir = managed_dir / "managed-settings.d"
             try:
                 dropin_dir.mkdir(parents=True, exist_ok=True)
@@ -859,6 +859,15 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
         if system in ["darwin", "linux"]:
             os.chmod(script_path, 0o755)
             debug_print("Set script as executable")
+
+        # Leave any managed settings file untouched — the org's remote Claude
+        # Code policy owns the hook config on this device.
+        if skip_settings:
+            if system in ["darwin", "linux"]:
+                os.chmod(managed_dir, 0o755)
+                os.chmod(hooks_dir, 0o755)
+            debug_print("Skipped managed settings; installed hook script only")
+            return True
 
         # Read existing settings or create new
         settings = {}
@@ -1564,16 +1573,19 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-def detect_install_state() -> Optional[str]:
+def detect_install_state(skip_settings: bool = False) -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
     Existence-based: the self-update rewrites these files, so content checks
     are unreliable — only file existence is trustworthy.
     'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error."""
+    'tampered' (config present but hook script missing), or None on any error.
+    With skip_settings no config is written, so the hook script is the marker."""
     try:
         managed_dir = get_managed_settings_dir()
         config_path = managed_dir / "managed-settings.json"
         script_path = managed_dir / "hooks" / "unbound.py"
+        if skip_settings:
+            return 'persisted' if script_path.exists() else 'fresh'
         if not config_path.exists():
             return 'fresh'
         return 'persisted' if script_path.exists() else 'tampered'
@@ -1637,6 +1649,7 @@ def main():
     app_name = None
     auth_api_key = None
     backfill_mode = False
+    skip_managed_settings = False
 
     args = sys.argv[1:]
     i = 0
@@ -1661,12 +1674,15 @@ def main():
         elif args[i] == "--backfill":
             backfill_mode = True
             i += 1
+        elif args[i] == "--skip-managed-settings":
+            skip_managed_settings = True
+            i += 1
         else:
             i += 1
 
     if not auth_api_key:
         print("\nMissing required argument: --api-key")
-        print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug] [--backfill]")
+        print("Usage: sudo python3 setup.py --api-key <api_key> [--backend-url <url>] [--app_name <app_name>] [--debug] [--backfill] [--skip-managed-settings]")
         print("   Or: sudo python3 setup.py --clear [--debug]")
         return False
 
@@ -1703,12 +1719,16 @@ def main():
         remove_user_level_hooks_for_user(username, home_dir)
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
 
-    state = detect_install_state()
+    state = detect_install_state(skip_settings=skip_managed_settings)
 
-    print("\nConfiguring Claude managed hooks...")
-    if setup_managed_hooks(gateway_url=gateway_url):
+    print("\nInstalling Claude hook script..." if skip_managed_settings else "\nConfiguring Claude managed hooks...")
+    if setup_managed_hooks(gateway_url=gateway_url, skip_settings=skip_managed_settings):
         managed_dir = get_managed_settings_dir()
-        print(f"Created managed hooks in {managed_dir}")
+        if skip_managed_settings:
+            print(f"Installed hook script at {managed_dir / 'hooks' / 'unbound.py'}")
+            print("Skipped managed-settings.json - point your remote Claude Code policy at that path.")
+        else:
+            print(f"Created managed hooks in {managed_dir}")
     else:
         print("Failed to configure managed hooks")
         return False
