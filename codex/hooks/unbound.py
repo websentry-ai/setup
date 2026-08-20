@@ -1785,7 +1785,9 @@ def process_stop_event(event: Dict, api_key: str):
     if not user_prompt:
         return
 
-    messages = [{'role': 'user', 'content': text} for _, text in turn_prompts]
+    # One message, not one per prompt: the backend keeps the last user message, so several
+    # would silently discard everything the user typed before the final one.
+    messages = [{'role': 'user', 'content': user_prompt}]
 
     # Parse tool uses from Codex transcript (function_call/function_call_output
     # pairs); the session cwd seeds shell-dir tracking for per-call project
