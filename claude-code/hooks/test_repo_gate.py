@@ -194,9 +194,9 @@ class TestCoreDecisions(RepoGateCase):
         self.assertAllowed(self.write_file(self.in_scope))
 
     def test_out_of_org_is_blocked_from_the_first_write(self):
-        """WEB-5523: no warning phase. Reading anywhere stays fine, but the
-        first write outside the allowed org is blocked, and so is every one
-        after it — same turn or a later one."""
+        """Reading anywhere stays fine, but the first write outside the allowed
+        org is blocked, and so is every one after it — same turn or a later
+        one."""
         self.set_policies([ORG_POLICY])
         for turn in ('t1', 't1', 't2', 't3'):
             self.assertBlocked(self.write_file(self.out_scope, prompt_id=turn),
@@ -395,10 +395,9 @@ class TestCoreDecisions(RepoGateCase):
 
 
 class TestATurnCannotBeIdentified(RepoGateCase):
-    """A client that sends no prompt_id and has no user prompt to hash used to
-    be the hard case: the gate had to attribute the call to a turn to know
-    whose allowance it spent. WEB-5523 removed the allowance, so the turn no
-    longer has to be identified for the gate to decide."""
+    """A client that sends no prompt_id and has no user prompt to hash leaves
+    the turn unidentifiable. The gate decides without needing to attribute the
+    call to a turn at all."""
 
     def test_an_unidentifiable_turn_is_blocked_like_any_other(self):
         self.set_policies([ORG_POLICY])
@@ -408,7 +407,7 @@ class TestATurnCannotBeIdentified(RepoGateCase):
 
     def test_no_turn_identity_is_computed_at_all(self):
         """The helper is gone, not merely unused: a turn id is not something the
-        gate can ask for any more."""
+        gate can ask for."""
         self.assertFalse(hasattr(unbound, '_repo_gate_turn_id'))
 
 
@@ -691,7 +690,7 @@ class TestPolicySemantics(RepoGateCase):
         self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
 
     def test_a_stray_grace_turns_is_ignored(self):
-        """A gateway that has not deployed WEB-5523 still sends it; a policy
+        """A gateway that has not deployed the removal still sends it; a policy
         carrying one must enforce exactly as if it did not."""
         for grace in (0, 3, 'three', None, -1):
             with self.subTest(grace_turns=grace):
@@ -825,9 +824,8 @@ class TestFailsOpen(RepoGateCase):
                 self.assertAllowed(self.write_file(self.out_scope))
 
     def test_the_gate_reads_no_state_file_to_be_corrupted(self):
-        """The grace counter was the only file the gate read, and a corrupt one
-        used to decide whether a call warned or blocked. There is no such file
-        now, so there is no such failure mode."""
+        """The gate reads no file to decide, so a corrupt one cannot change a
+        verdict."""
         for gone in ('REPO_GATE_STATE_FILE', '_load_repo_gate_state',
                      '_save_repo_gate_state'):
             self.assertFalse(hasattr(unbound, gone), gone)

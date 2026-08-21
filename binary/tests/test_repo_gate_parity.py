@@ -17,9 +17,8 @@ ALL_HOOKS = sorted(TOOL_PY)
 # (https://docs.augmentcode.com/cli/hooks lists PreToolUse, PostToolUse, Stop,
 # SessionStart, SessionEnd and nothing else).
 PROMPT_HOOKS = [h for h in ALL_HOOKS if h != 'augment']
-# WEB-5523 removed the warning phase: every hook now denies from the first
-# violating call, which is what Augment always did. Nothing distinguishes the
-# hooks here any more, so the gate contract is asserted across ALL of them.
+# Every hook denies from the first violating call, so the gate contract is
+# asserted across ALL of them.
 
 # The app label each tree already sends on its ordinary posts; the gate report
 # must reuse it rather than coin an agent name of its own.
@@ -96,10 +95,9 @@ def test_malformed_policies_are_dropped(hook, policies):
 
 @pytest.mark.parametrize("grace", ['three', None, -1, True, 99, 0])
 def test_a_grace_turns_from_an_older_gateway_is_inert(hook, grace):
-    """WEB-5523 removed the warning phase. grace_turns was load-bearing enough
-    that an unreadable one dropped the whole policy; a gateway that has not
-    deployed the change yet still sends it, and the gate must now ignore it
-    rather than let it decide anything -- github_org is the only key read."""
+    """A gateway that has not deployed the removal yet still sends grace_turns.
+    The gate must ignore it rather than let it decide anything: github_org is
+    the only key read."""
     policies = [dict(BLOCK_ORG, grace_turns=grace)]
     assert hook._repo_gate_block_policies(policies) == policies
 
@@ -107,11 +105,9 @@ def test_a_grace_turns_from_an_older_gateway_is_inert(hook, grace):
 # -- incident ordinal ------------------------------------------------------
 
 def test_ordinal_is_unique_per_incident(hook):
-    """WEB-5523: the ordinal is the only field that separates two incidents of
-    one session downstream, where it is hashed into the record identity. A
-    repeated value reads as a redelivery, and every report after the first is
-    silently dropped -- which is exactly how the warning phase used to lose
-    every block after the grace ran out."""
+    """The ordinal is the only field separating two incidents of one session
+    downstream, where it is hashed into the record identity. A repeated value
+    reads as a redelivery and is silently dropped."""
     seen = [hook._repo_gate_incident_ordinal() for _ in range(50)]
     assert len(set(seen)) == len(seen)
     assert seen == sorted(seen), "must not go backwards within a session"
@@ -126,9 +122,8 @@ def test_ordinal_needs_no_state_on_disk(hook, tmp_path):
 
 
 def test_no_hook_can_warn_any_more(hook):
-    """WEB-5523, pinned as a deletion. The warning phase left nothing behind:
-    no advisory copy, no grace ledger, no per-turn arbitration to re-grow. A
-    straying write is blocked, and there is no path that softens that."""
+    """A straying write is blocked, and no path softens that: no advisory copy,
+    no grace ledger, no per-turn arbitration."""
     for gone in ('_repo_gate_warning', '_repo_gate_decide', '_repo_gate_turn_id',
                  '_load_repo_gate_state', '_save_repo_gate_state',
                  '_with_repo_gate_context', 'REPO_GATE_STATE_FILE',
@@ -479,9 +474,8 @@ def test_tool_gate_fails_open_when_git_is_unavailable(hook, repos):
 
 
 def test_the_gate_keeps_no_state_on_disk(hook, repos):
-    """WEB-5523: the grace counter was the gate's only persistent state, and it
-    is gone. Nothing the gate does may leave a file behind to be corrupted,
-    migrated or reset -- a blocked call is decided from the policy alone."""
+    """Nothing the gate does may leave a file behind to be corrupted, migrated
+    or reset: a blocked call is decided from the policy alone."""
     _set_policies(hook, [BLOCK_ORG])
     before = {p.name for p in hook.POLICY_CACHE_FILE.parent.iterdir()}
     _run_tool(hook, _tool_event(hook.tool_name, repos.out_scope))
@@ -596,9 +590,8 @@ def test_an_in_scope_repo_reaches_no_verdict(hook):
 
 
 def test_every_call_into_an_out_of_scope_repo_denies(hook, repos):
-    """WEB-5523: no warning phase, no escalation, no per-turn arbitration. The
-    first straying write is blocked and so is every one after it, in the same
-    turn or a later one."""
+    """The first straying write is blocked and so is every one after it, in the
+    same turn or a later one."""
     _set_policies(hook, [BLOCK_ORG])
     for turn in ('t1', 't1', 't2', 't3'):
         response = _run_tool(
@@ -923,8 +916,7 @@ def test_several_gated_calls_in_one_turn_are_each_blocked(hook,
 
 
 def test_copilot_tool_calls_are_blocked_from_the_first(repos, tmp_path):
-    """Copilot has no turn id at all, which used to be the hard case for a
-    per-turn allowance. Without one to keep, it simply blocks like the rest."""
+    """Copilot has no turn id at all, and needs none: it blocks like the rest."""
     hook = _prepare('copilot', tmp_path)
     _set_policies(hook, [BLOCK_ORG])
     event = _tool_event('copilot', repos.out_scope, 't1')
@@ -1020,9 +1012,8 @@ def test_augment_out_of_scope_workspace_allows_ungated_tools(augment, repos,
 
 @pytest.mark.parametrize("grace", [0, 1, 3, None])
 def test_augment_workspace_deny_ignores_a_stray_grace_turns(augment, repos, grace):
-    """A gateway that has not deployed WEB-5523 yet still sends grace_turns, and
-    one that has sends none. The workspace gate denies from the first call
-    either way -- it used to drop a policy that carried no grace at all."""
+    """A gateway that has not deployed the removal yet still sends grace_turns,
+    and one that has sends none. The workspace gate denies either way."""
     policy = dict(BLOCK_ORG)
     if grace is not None:
         policy['grace_turns'] = grace
@@ -1331,10 +1322,8 @@ def test_one_turn_of_violating_calls_reports_once_per_call(hook, repos):
 
 
 def test_every_blocked_call_of_a_turn_reports_its_own_incident(hook, repos):
-    """Three gated calls of one turn are three blocks and three incidents, each
-    separately numbered. They used to share a turn's allowance and report one
-    verdict between them; nothing is shared now, and the ordinals are what stop
-    the three collapsing onto one record downstream."""
+    """Three gated calls of one turn are three blocks and three incidents. The
+    ordinals are what stop them collapsing onto one record downstream."""
     _set_policies(hook, [BLOCK_ORG])
     posts = []
     for _ in range(3):
@@ -1473,9 +1462,7 @@ def test_long_fields_are_capped_so_the_body_fits_the_pipe(hook):
 
 def test_binding_policy_is_the_first_denying_policy(hook):
     """A repo outside every policy's scope is denied by all of them, so there is
-    no arbitration left to do: the incident is filed against the first. This
-    used to pick the policy whose grace was smallest, which is the last thing
-    grace decided anywhere."""
+    no arbitration to do: the incident is filed against the first."""
     first = dict(BLOCK_ORG, id=8, name='First')
     second = dict(BLOCK_ORG, id=7, name='Second')
     assert hook._repo_gate_binding_policy([first, second])['id'] == 8

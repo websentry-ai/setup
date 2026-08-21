@@ -2145,18 +2145,10 @@ _REPO_GATE_LAST_ORDINAL = [0]
 
 
 def _repo_gate_incident_ordinal():
-    """A value unique to this incident, which the backend hashes into the
-    record's identity.
-
-    Read from the clock rather than a counter file, so the gate keeps no state
-    on disk. Redelivery still dedups: the value is stamped into the payload
-    once, so a resend carries the same one. The step below is what makes it
-    unique -- the clock resolves to about a microsecond, which two reports can
-    share, and a repeat reads downstream as a redelivery and loses the second
-    incident. Two SEPARATE hook processes in the same microsecond can still
-    collide; that needs genuinely concurrent tool calls and costs one merged
-    incident, which is why this is not worth a lock or a state file.
-    """
+    """A value unique to this incident; the backend hashes it into the record's
+    identity, so a repeat is read as a redelivery and dropped. The step past the
+    last value is what guarantees that: the clock resolves to about a
+    microsecond, which two reports of one process can share."""
     try:
         value = time.time_ns() // 1000
         if value <= _REPO_GATE_LAST_ORDINAL[0]:
