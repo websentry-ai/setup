@@ -62,7 +62,6 @@ def frozen_module(tmp_path, monkeypatch, request):
 @pytest.mark.parametrize("frozen_module", list(TOOL_PY), indirect=True)
 def test_frozen_discovery_exec_contract(frozen_module, monkeypatch):
     m, calls = frozen_module
-    monkeypatch.setattr(m, "_hook_discovery_enabled_for_org", lambda: True)
     m._dispatch_discovery()
     assert len(calls) == 1, "expected exactly one discovery exec"
     cmd, kwargs = calls[0]
@@ -89,10 +88,30 @@ def test_frozen_mcp_scan_exec_contract(frozen_module):
     assert json.loads(env.get("UNBOUND_MCP_SERVER_JSON", "{}")) == server_config
 
 
+@pytest.mark.parametrize("frozen_module", ["claude-code"], indirect=True)
+def test_frozen_skills_sync_exec_contract(frozen_module, monkeypatch):
+    m, calls = frozen_module
+    monkeypatch.setenv("UNBOUND_HOOK_TOOL", "claude-code")
+    m._dispatch_skills_sync("contract-key")
+    assert len(calls) == 1, "expected exactly one skills-sync exec"
+    cmd, kwargs = calls[0]
+    assert cmd == [m.sys.executable, "sync-skills", "claude-code"]
+    env = kwargs.get("env") or {}
+    assert env.get("UNBOUND_CLAUDE_API_KEY") == "contract-key"
+    assert "contract-key" not in cmd, "key must travel via env, never argv"
+
+
+@pytest.mark.parametrize("frozen_module", ["claude-code"], indirect=True)
+def test_frozen_skills_sync_defaults_the_tool(frozen_module, monkeypatch):
+    m, calls = frozen_module
+    monkeypatch.delenv("UNBOUND_HOOK_TOOL", raising=False)
+    m._dispatch_skills_sync("contract-key")
+    assert calls[0][0] == [m.sys.executable, "sync-skills", "claude-code"]
+
+
 @pytest.mark.parametrize("frozen_module", list(TOOL_PY), indirect=True)
 def test_frozen_discovery_missing_binary_skips_without_exec(frozen_module, monkeypatch):
     m, calls = frozen_module
-    monkeypatch.setattr(m, "_hook_discovery_enabled_for_org", lambda: True)
     monkeypatch.setattr(m, "FROZEN_DISCOVERY_BIN", str(REPO / "does-not-exist"))
     m._dispatch_discovery()
     assert calls == [], "must not exec (or fall back to download) when binary missing"

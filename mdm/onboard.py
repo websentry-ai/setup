@@ -31,6 +31,12 @@ the discovery --domain):
   --backend-url <url>   default https://backend.getunbound.ai
   --gateway-url <url>   default https://api.getunbound.ai  (MDM tools only)
 
+Claude Code only:
+  --skip-managed-settings   install the hook script but leave
+                            managed-settings.json alone, for orgs whose Claude
+                            Code policy is managed remotely from the Anthropic
+                            admin console.
+
 To clear MDM setup for the four tools (no discovery — it's a one-shot scan,
 nothing to clear; backfill is also skipped because there's nothing to seed):
   sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --clear
@@ -45,7 +51,6 @@ import signal
 import subprocess
 import sys
 import tempfile
-import urllib.request
 
 # On Windows, when this script runs as a child of the MDM onboard wrapper its
 # stdout is a non-console pipe defaulting to the legacy code page (cp1252),
@@ -80,15 +85,16 @@ SUBPROCESS_TIMEOUT_SECONDS = 600
 DISCOVERY_TIMEOUT_SECONDS = 9000   # 150 min; kept in sync with the discovery --timeout
 DISCOVERY_KILL_GRACE_SECONDS = 120
 
-# (display_name, url, supports_backfill). Only tools whose hook scripts
-# accept `--backfill` get the flag appended; Cursor and GitHub Copilot have no
-# historical transcript store and would just print "not supported" and continue.
+# (display_name, url, supports_backfill, supports_skip_managed_settings). Only
+# tools whose hook scripts accept `--backfill` get the flag appended; Cursor and
+# GitHub Copilot have no historical transcript store and would just print "not
+# supported" and continue. `--skip-managed-settings` is Claude Code's alone.
 TOOLS = [
-    ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True),
-    ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False),
-    ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True),
-    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True),
-    ("Augment",        f"{_RAW_SETUP}/augment/hooks/mdm/setup.py",     False),
+    ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True,  True),
+    ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False, False),
+    ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True,  False),
+    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True,  False),
+    ("Augment",        f"{_RAW_SETUP}/augment/hooks/mdm/setup.py",     False, False),
 ]
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
@@ -99,7 +105,7 @@ USAGE = (
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" \\\n"
     "      --api-key YOUR_ADMIN_API_KEY \\\n"
     "      --discovery-key YOUR_DISCOVERY_KEY \\\n"
-    "      [--backend-url <url>] [--gateway-url <url>]\n"
+    "      [--backend-url <url>] [--gateway-url <url>] [--skip-managed-settings]\n"
     "\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" --clear\n"
 )
@@ -120,17 +126,24 @@ def fetch_script(url: str) -> bytes:
     """Downloads `url` with explicit error checking. Raises on any failure
     (network, HTTP non-2xx, empty body) so the caller never silently runs an
     empty script — the silent-failure mode that `python3 -c "$(curl …)"` has
-    when curl fails (`$(…)` returns empty, `python3 -c ""` exits 0).
-
-    Note: urllib.request.urlopen raises HTTPError for any non-2xx response,
-    so we don't need an explicit status-code check here — anything reaching
-    `body = resp.read()` is already a 2xx."""
-    req = urllib.request.Request(url, headers={"User-Agent": "unbound-mdm-onboard/1.1"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        body = resp.read()
-        if not body or not body.strip():
-            raise RuntimeError("empty response body")
-        return body
+    when curl fails (`$(…)` returns empty, `python3 -c ""` exits 0)."""
+    # -q first: this download is executed as root, so it must not inherit
+    # TLS-weakening defaults (e.g. `insecure`) from an ambient curlrc.
+    cmd = ["curl", "-q", "-fsSL", "--max-time", "30",
+           "-H", "User-Agent: unbound-mdm-onboard/1.1", "--", url]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=45)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("request timed out after 45s")
+    except FileNotFoundError:
+        raise RuntimeError("curl not found on PATH")
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", "replace").strip()
+        raise RuntimeError(f"curl exited {result.returncode}: {stderr or 'no stderr'}")
+    body = result.stdout
+    if not body or not body.strip():
+        raise RuntimeError("empty response body")
+    return body
 
 
 def run_tool(name: str, url: str, args: list) -> bool:
@@ -290,15 +303,19 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
 
 
 def parse_args(argv: list) -> tuple:
-    """Splits argv into (discovery_key, mdm_args, backend_url, is_clear).
+    """Splits argv into (discovery_key, mdm_args, backend_url, is_clear,
+    skip_managed_settings).
 
     --discovery-key is consumed here and NOT forwarded to the per-tool MDM
-    scripts (they don't recognize it; would error). Everything else passes
-    through. We also peek at --backend-url to default discovery's --domain.
+    scripts (they don't recognize it; would error). --skip-managed-settings is
+    consumed too and re-added per tool, since only Claude Code acts on it.
+    Everything else passes through. We also peek at --backend-url to default
+    discovery's --domain.
     """
     discovery_key = None
     backend_url = None
     is_clear = False
+    skip_managed_settings = False
     mdm_args = []
     i = 0
     while i < len(argv):
@@ -313,11 +330,15 @@ def parse_args(argv: list) -> tuple:
             mdm_args.append(argv[i + 1])
             i += 2
             continue
+        if token == "--skip-managed-settings":
+            skip_managed_settings = True
+            i += 1
+            continue
         if token == "--clear":
             is_clear = True
         mdm_args.append(token)
         i += 1
-    return discovery_key, mdm_args, backend_url, is_clear
+    return discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings
 
 
 def main() -> int:
@@ -327,7 +348,7 @@ def main() -> int:
         print(USAGE, file=sys.stderr)
         return 1
 
-    discovery_key, mdm_args, backend_url, is_clear = parse_args(args)
+    discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings = parse_args(args)
 
     # Validate flags. --clear short-circuits the key checks: nothing to
     # authenticate, just remove the configuration.
@@ -354,11 +375,13 @@ def main() -> int:
 
     failures = []
 
-    for name, url, supports_backfill in TOOLS:
+    for name, url, supports_backfill, supports_skip_settings in TOOLS:
         print(f"\n{'=' * 60}\n[{name}] MDM setup\n{'=' * 60}\n")
         # Pass through mdm_args as-is. Backfill is only enabled when the user
         # explicitly passes --backfill (typically via PowerShell's -Backfill flag).
         tool_args = list(mdm_args)
+        if skip_managed_settings and supports_skip_settings:
+            tool_args.append("--skip-managed-settings")
         if not run_tool(name, url, tool_args):
             failures.append(name)
 

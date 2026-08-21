@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import os
+import re
+import stat
 import sys
 import platform
 import subprocess
@@ -627,30 +629,37 @@ def write_codex_config_for_user(username: str, home_dir: Path, base_url: str) ->
     return True
 
 
-def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> bool:
+def remove_codex_config_base_url_for_user(username: str, home_dir: Path) -> str:
     """Remove openai_base_url from {home_dir}/.codex/config.toml.
     Privilege-drops to the target user before any FS op.
-    Returns True if the key was found and removed, False otherwise."""
+    Returns "cleared" | "not_found" | "failed" — matching remove_env_var_from_user
+    and the user-level clear in codex/gateway/setup.py. Nothing to remove is
+    "not_found", never a failure: `nuke` runs the user-level clear first, so by
+    the time this runs the key is normally already gone."""
     config_file = home_dir / ".codex" / "config.toml"
     if not config_file.exists():
-        return False
+        return "not_found"
 
     def _remove():
         with open(config_file, "r", encoding="utf-8") as f:
             lines = f.readlines()
         new_lines, removed = _remove_toml_root_key(lines, "openai_base_url")
         if not removed:
-            return False
+            return "not_found"
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o644)
         with os.fdopen(fd, 'w', encoding="utf-8") as f:
             f.writelines(new_lines)
-        return True
+        return "cleared"
 
-    result = _run_as_user(username, _remove)
-    if result:
+    # _run_as_user returns None when the fork/privilege-drop or _remove itself
+    # raised — that is the only genuine failure.
+    status = _run_as_user(username, _remove)
+    if status is None:
+        return "failed"
+    if status == "cleared":
         debug_print(f"Removed openai_base_url from {config_file} for {username}")
-    return bool(result)
+    return status
 
 
 def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
@@ -699,9 +708,11 @@ def clear_setup() -> bool:
             print(f"Failed to clear for {max(f1, f2)} user(s)")
         for username, home_dir in user_homes:
             if home_dir is not None:
-                if not remove_codex_config_base_url_for_user(username, home_dir):
+                status = remove_codex_config_base_url_for_user(username, home_dir)
+                # Fail closed on anything unexpected, like the sibling clears do.
+                if status not in ("cleared", "not_found"):
                     teardown_failed = True
-                    debug_print(f"Could not remove openai_base_url from codex config for {username}")
+                    print(f"Failed to clear openai_base_url in codex config for {username}")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -728,18 +739,221 @@ def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Removed {script_path} for {username}")
 
 
+_HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
+
+
+# TOML spells this header several ways and allows a trailing comment. Missing one both
+# strips the wrong lines and appends a second [features], which TOML rejects outright.
+_FEATURES_HEADER_RE = re.compile(r'^\[\s*(?:features|"features"|\'features\')\s*\]\s*(#.*)?$')
+
+
+def _is_features_header(stripped) -> bool:
+    return bool(_FEATURES_HEADER_RE.match(stripped))
+
+
+try:
+    import tomllib
+except ImportError:  # system python older than 3.11
+    tomllib = None
+
+
+def _write_is_safe(text, want_enabled) -> bool:
+    """Whether text is a config Codex can load with the flag in the intended state. Every
+    edit is checked against this before it reaches disk, so a line-scan mistake is discarded
+    rather than written."""
+    if tomllib is None:
+        # No parser to check the result with, so only edit files without the constructs the
+        # line scan can misread. A config left alone beats a config written blind.
+        if '"""' in text or "'''" in text:
+            return False
+        depth = 0
+        for line in text.splitlines():
+            _, extra = _scan_code(line)
+            depth += extra
+            if depth:
+                return False  # a multi-line array
+        return True
+    try:
+        features = tomllib.loads(text).get('features')
+    except Exception:
+        return False
+    if features is None:
+        features = {}
+    if not isinstance(features, dict) or 'codex_hooks' in features:
+        return False
+    return features.get('hooks') is True if want_enabled else 'hooks' not in features
+
+
+def _find_delim(text, delim, start=0) -> int:
+    """Index of the closing delimiter, skipping backslash escapes. A backslash consumes the
+    character after it, so an escaped quote can never be read as part of a terminator.
+    Multi-line literal strings take no escapes, so only the basic form needs the walk."""
+    if delim != '"""':
+        return text.find(delim, start)
+    i, n = start, len(text)
+    while i < n:
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text.startswith(delim, i):
+            return i
+        i += 1
+    return -1
+
+
+def _scan_code(text):
+    """(unclosed multi-line delimiter, net bracket depth change) for the code on one line.
+    Brackets and quotes inside comments or strings are not counted, and the same-line close
+    of a triple-quoted value skips escapes so it cannot end on an escaped quote."""
+    i, n, depth = 0, len(text), 0
+    while i < n:
+        ch = text[i]
+        if ch == '#':
+            break
+        if text.startswith('"""', i) or text.startswith("'''", i):
+            delim = text[i:i + 3]
+            end = _find_delim(text, delim, i + 3)
+            if end == -1:
+                return delim, depth
+            i = end + 3
+            continue
+        if ch == '"':
+            i += 1
+            while i < n:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "'":
+            end = text.find("'", i + 1)
+            if end == -1:
+                break
+            i = end + 1
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+        i += 1
+    return None, depth
+
+
+def _config_lines(lines):
+    """Yield each line stripped, or None for anything that is not a statement of its own:
+    the interior of a multi-line string and the continuation lines of a multi-line array.
+    Either one can hold text that looks like a table header or like our flag."""
+    delim, depth = None, 0
+    for line in lines:
+        if delim is not None:
+            yield None
+            end = _find_delim(line, delim)
+            if end == -1:
+                continue
+            delim, extra = _scan_code(line[end + 3:])
+            depth += extra
+            continue
+        if depth > 0:
+            yield None
+            delim, extra = _scan_code(line)
+            depth += extra
+            continue
+        yield line.strip()
+        delim, extra = _scan_code(line)
+        depth += extra
+
+
+def _strip_hooks_flags(lines):
+    """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
+    and scoped to that table so [hooks.state] and its entries are left alone."""
+    out, in_features = [], False
+    for line, stripped in zip(lines, _config_lines(lines)):
+        if stripped is None:
+            out.append(line)
+            continue
+        if stripped.startswith('['):
+            in_features = _is_features_header(stripped)
+            out.append(line)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            continue
+        out.append(line)
+    return out
+
+
+# A FIFO would hang provisioning and an oversized file would exhaust memory, so the read
+# is capped and restricted to a regular file.
+_HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _hooks_still_registered(hooks_path):
+    """True when hooks.json still registers a command, False when none does, None when that
+    cannot be determined. The feature flag is one switch over every hook a user has, so
+    clearing it while somebody else's entry remains turns their tooling off; None keeps the
+    flag and marks the uninstall incomplete rather than guessing either way. Call this only
+    after our own entries have been stripped."""
+    try:
+        fd = os.open(str(hooks_path),
+                     os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None  # includes a symlink refused by O_NOFOLLOW
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOKS_JSON_MAX_BYTES:
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        handle = os.fdopen(fd, 'r', encoding='utf-8')
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        with handle as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return None
+    events = config.get('hooks')
+    if not isinstance(events, dict):
+        return False
+    for entries in events.values():
+        for item in entries if isinstance(entries, list) else []:
+            if isinstance(item, dict) and item.get('hooks'):
+                return True
+    return False
+
+
 def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
-    """Remove codex_hooks feature flag from user's ~/.codex/config.toml.
+    """Remove the hooks feature flag, in either spelling, from user's ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
     config_path = home_dir / ".codex" / "config.toml"
     if not config_path.exists():
         return
 
     def _disable():
+        # Runs after the privilege drop: reading a user-owned path as root invites a
+        # symlink or FIFO pointed at a file only root can open.
+        registered = _hooks_still_registered(home_dir / ".codex" / "hooks.json")
+        if registered is None:
+            print(f"could not read {username}'s hooks.json; hooks feature flag left set")
+            return False
+        if registered:
+            debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
+            return False
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
+            return False
+        if not _write_is_safe(''.join(new_lines), False):
+            print(f"could not clear the hooks flag in {username}'s config.toml; left unchanged")
             return False
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_path), flags, 0o600)
@@ -748,7 +962,7 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         return True
 
     if _run_as_user(username, _disable):
-        debug_print(f"Removed codex_hooks feature for {username}")
+        debug_print(f"Removed hooks feature flag for {username}")
 
 
 def get_managed_settings_dir() -> Path:
@@ -799,9 +1013,32 @@ def clear_managed_hooks() -> bool:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 changed = False
-                if "hooks" in settings:
-                    del settings["hooks"]
-                    changed = True
+                # Strip only entries pointing at our own script. The managed config can carry
+                # an administrator's hooks too, and dropping the whole table would remove them.
+                events = settings.get("hooks")
+                if isinstance(events, dict):
+                    for event in list(events.keys()):
+                        kept_groups = []
+                        for group in events[event] if isinstance(events[event], list) else []:
+                            if not isinstance(group, dict):
+                                kept_groups.append(group)
+                                continue
+                            entries = group.get("hooks") or []
+                            kept = [h for h in entries
+                                    if str(h.get("command", "")).find(str(script_path)) == -1]
+                            if kept != entries:
+                                changed = True
+                            if kept:
+                                group["hooks"] = kept
+                                kept_groups.append(group)
+                        if kept_groups:
+                            events[event] = kept_groups
+                        else:
+                            del events[event]
+                            changed = True
+                    if not events:
+                        del settings["hooks"]
+                        changed = True
                 if changed:
                     with open(settings_path, "w", encoding="utf-8") as f:
                         json.dump(settings, f, indent=2)

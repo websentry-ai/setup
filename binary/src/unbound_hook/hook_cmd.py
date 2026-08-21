@@ -12,6 +12,7 @@ The modules' own main() functions already fail open internally; SystemExit
 raised by a module (cursor exits 2 on deny) is propagated untouched.
 """
 
+import os
 import sys
 
 from ._resources import TOOLS
@@ -24,6 +25,9 @@ def run(args) -> int:
         print("{}", flush=True)
         return 0
     tool = args[0]
+    # So the hook's detached diagnostic can re-invoke this binary's
+    # `mcp-diagnostic <tool>` subcommand for the right tool.
+    os.environ["UNBOUND_HOOK_TOOL"] = tool
     try:
         module = load_hook_module(tool)
         module.main()
@@ -34,4 +38,38 @@ def run(args) -> int:
     except Exception:
         print("{}", flush=True)
         return 0
+    return 0
+
+
+def run_skills_sync(args) -> int:
+    """Reconcile the device's injected skills against the org (detached child of
+    the hook's SessionStart)."""
+    if not args or args[0] not in TOOLS:
+        return 0
+    try:
+        module = load_hook_module(args[0])
+        sync = getattr(module, "_sync_skills_once", None)
+        read_key = getattr(module, "get_api_key", None)
+        if sync is None or read_key is None:
+            return 0
+        api_key = read_key()
+        if api_key:
+            sync(api_key)
+    except Exception:
+        pass
+    return 0
+
+
+def run_mcp_diagnostic(args) -> int:
+    """Build + upload the null-fingerprint diagnostic (env-driven, detached).
+    Fail-open: never raises. Only tools whose module defines the entry run it."""
+    if not args or args[0] not in TOOLS:
+        return 0
+    try:
+        module = load_hook_module(args[0])
+        run_fn = getattr(module, "_run_mcp_diagnostic_cli", None)
+        if run_fn is not None:
+            run_fn()
+    except Exception:
+        pass
     return 0

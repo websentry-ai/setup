@@ -24,8 +24,6 @@ UNBOUND_GATEWAY_URL = os.environ.get(
 APPROVAL_TIMEOUT = 4 * 60 * 60
 
 DISCOVERY_DEBOUNCE_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_TTL_SECONDS = 24 * 3600
-DISCOVERY_HOOK_FLAG_PATH = "/v1/hooks/discovery-enabled"
 DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
@@ -119,12 +117,27 @@ INTERNAL_TOOLS = {
 }
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+# INVARIANT: every skill entry below carries a tool_use_id - the native one
+# when the tool reports it, otherwise a deterministic synthetic one. The backend
+# relies on this: two id-less invocations of one skill with the same arguments
+# are byte-identical, so nothing can tell a replay from a genuine repeat.
+SKILL_TOOL_NAME = 'Skill'
+SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
+                     ('.agents', 'skills'), ('.claude', 'skills'))
+SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
 AUDIT_LOG_TOTAL_LIMIT = 100
+# Sentinel hook_event_name for the agent-audit.log rows that record which toolCallIds
+# were already forwarded, so a later Stop sends only new tool calls. Not a real Copilot
+# event: every existing reader filters by its own event name and skips it, and
+# cleanup_old_logs prunes it per-session like any other row (no new file, no new state).
+FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
 
 # Ensure log directory exists
 try:
@@ -141,6 +154,202 @@ except Exception:
 
 _cached_api_key = None
 _reporting_error = False
+
+
+def _skill_roots(cwd):
+    """Directories a skill root may hang off: every given root's ancestors,
+    plus home. Accepts one path or several."""
+    starts = [cwd] if isinstance(cwd, str) else list(cwd or [])
+    roots = []
+    for start in starts:
+        if start:
+            roots += _trusted_ancestors(Path(start))
+    roots.append(Path.home())
+    return {str(r).replace('\\', '/') for r in roots}
+
+
+def _skill_name_from_path(file_path, cwd=None):
+    """Skill name when a path sits under a real skill root, else None. The root
+    must hang off cwd's ancestry or home, so a lookalike such as
+    <project>/fixtures/.cursor/skills/x/SKILL.md is not counted. Separators are
+    normalised because hook payloads use '/' even on Windows."""
+    try:
+        if not isinstance(file_path, str):
+            return None
+        parts = file_path.replace('\\', '/').split('/')
+        if len(parts) < 4 or parts[-1] != 'SKILL.md':
+            return None
+        allowed = _skill_roots(cwd)
+        for root in SKILL_SEARCH_DIRS:
+            span = len(root)
+            for i in range(len(parts) - span - 1):
+                if tuple(parts[i:i + span]) != tuple(root):
+                    continue
+                if '/'.join(parts[:i]) in allowed:
+                    return parts[-2]
+        return None
+    except Exception:
+        return None
+
+def _trusted_ancestors(start):
+    """Ancestors of `start`, stopping before the first directory another local
+    user could write to. Without this the walk reaches shared dirs like /tmp,
+    where anyone can plant a SKILL.md and spoof skill telemetry."""
+    out = []
+    try:
+        uid = os.getuid()
+    except AttributeError:
+        uid = None  # Windows: no uid model, fall back to the plain walk
+    for path in [start] + list(start.parents):
+        if uid is not None:
+            try:
+                info = path.stat()
+            except OSError:
+                break
+            # 0o022: group- or world-writable, both plantable by another user.
+            if info.st_uid not in (uid, 0) or (info.st_mode & 0o022):
+                break
+        out.append(path)
+    return out
+
+
+def _safe_skill_segment(value):
+    """A path segment safe to join or glob: no traversal, no separators, no
+    glob metacharacters, and nothing Windows reads as a drive or UNC root,
+    which joinpath would treat as absolute and use to escape containment."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _resolve_skill_path(skill, cwd):
+    """Absolute path of an invoked skill's SKILL.md, or None when it does not
+    resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
+    try:
+        prefix, _, name = (skill or '').rpartition(':')
+        segments = prefix.split('/') if prefix else []
+        if not _safe_skill_segment(name):
+            return None
+        if not all(_safe_skill_segment(segment) for segment in segments):
+            return None
+        nested = segments
+        roots = []
+        if cwd:
+            roots = _trusted_ancestors(Path(cwd))
+        roots.append(Path.home())
+        for root in roots:
+            for skill_dir in SKILL_SEARCH_DIRS:
+                base = root.joinpath(*nested, *skill_dir)
+                candidate = base / name / 'SKILL.md'
+                if candidate.is_file():
+                    return str(candidate)
+                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+                # Several bundles sharing a name is ambiguous, so resolve
+                # nothing rather than attach the wrong path to a join key.
+                matches = sorted(base.glob('*/%s/SKILL.md' % name))
+                if len(matches) > 1:
+                    return None
+                if matches:
+                    return str(matches[0])
+        return None
+    except Exception:
+        return None
+
+
+def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
+    """Skill invocations from Copilot's session event stream, keyed to the turn
+    so a later turn's use of the same skill is a distinct row. `skill.invoked` is
+    undocumented and unversioned, so each field is probed across plausible names
+    and a missing path falls back to resolving the name on disk."""
+    entries = []
+    try:
+        for event in skill_events or []:
+            if not isinstance(event, dict):
+                continue
+            data = event.get('data')
+            if not isinstance(data, dict):
+                continue
+            name = ''
+            for key in ('name', 'skillName', 'skill_name', 'skill'):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    name = value.strip()
+                    break
+            path = ''
+            for key in ('path', 'skillPath', 'skill_path', 'filePath', 'file_path'):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    path = value.strip()
+                    break
+            # The name field may itself be a path; derive the skill from it.
+            if name and ('/' in name or os.sep in name):
+                parts = [seg for seg in name.replace(os.sep, '/').split('/') if seg]
+                if parts and parts[-1] == 'SKILL.md':
+                    path = path or name
+                    parts = parts[:-1]
+                name = parts[-1] if parts else ''
+            if not name:
+                continue
+            # The event payload is undocumented, so only trust a path that is
+            # really a skill file on disk AND names the same skill; otherwise a
+            # valid path for a different skill would misattribute the row.
+            path_name = _skill_name_from_path(path, cwd) if path else None
+            if not (path_name == name and os.path.isfile(path)):
+                path = _resolve_skill_path(name, cwd) or ''
+                # No path means no evidence this name is a real skill. Every
+                # other detector requires that, and an unjoinable row is worse
+                # than none, so drop it rather than watermark it as sent.
+                if not path:
+                    continue
+            # The envelope id is unique per event, so it keeps repeat invocations
+            # distinct without depending on turn text, which repeats verbatim
+            # across identical turns. Index only backs it up if an id is absent.
+            key = 'skill\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' % (
+                event.get('id') or '', turn_key or '', name, path, len(entries))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
+
+
+def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
+    """Skill invocations named in a prompt, as tool_use entries. This tool loads
+    a skill by injecting SKILL.md into context rather than calling a tool, so
+    the token in the prompt is the only signal the hook can see."""
+    entries = []
+    try:
+        seen = set()
+        for match in SKILL_INVOKE_RE.finditer(prompt or ''):
+            name = match.group(1)
+            if name in seen:
+                continue
+            seen.add(name)
+            path = _resolve_skill_path(name, cwd)
+            if not path:
+                continue
+            key = '\x1f'.join((str(session_id or ''), name, str(stamp or ''), str(len(entries))))
+            entries.append({
+                'type': 'PostToolUse',
+                'tool_name': SKILL_TOOL_NAME,
+                'tool_input': {'skill': name, 'args': ''},
+                'tool_response': {},
+                'tool_use_id': 'unb-' + hashlib.sha256(
+                    key.encode('utf-8', 'replace')).hexdigest()[:24],
+                'skill_name': name,
+                'skill_path': path,
+            })
+    except Exception:
+        return []
+    return entries
 
 
 def _should_report():
@@ -247,7 +456,16 @@ def get_policy_check_failure_action():
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
-def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
+def get_repo_policies():
+    """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return []
+    policies = cache.get('repo_policies')
+    return policies if isinstance(policies, list) else []
+
+
+def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -256,15 +474,34 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
             tools_to_check = prior.get('tools_to_check', [])
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
+        if not isinstance(repo_policies, list):
+            repo_policies = get_repo_policies()
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
+            'repo_policies': repo_policies,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
         pass
+
+
+def _cache_policies_from_response(api_response):
+    """Without this a session never loads policies and the gate cannot fire."""
+    if not isinstance(api_response, dict):
+        return
+    if (
+        'tools_to_check' in api_response
+        or 'policy_check_failure_action' in api_response
+        or 'repo_policies' in api_response
+    ):
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+            repo_policies=api_response.get('repo_policies'),
+        )
 
 
 def is_cache_stale(cache):
@@ -317,32 +554,130 @@ def append_to_audit_log(event_data):
 
 
 def cleanup_old_logs():
-    """Manage log file size by keeping only the most recent session's entries
-    once the audit log exceeds AUDIT_LOG_TOTAL_LIMIT."""
+    """Manage log file size by keeping only the most recent session's entries once the
+    audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
+    handled separately: excluded from session grouping (their key is transcript-derived,
+    not the payload session_id, so they must not be mistaken for a distinct session) and
+    always retained (last few sessions' consolidated markers), so a long session's dedup
+    state is never evicted."""
     logs = load_existing_logs()
 
     if len(logs) <= AUDIT_LOG_TOTAL_LIMIT:
         return
 
+    def _is_marker(log):
+        return log.get('event', {}).get('hook_event_name') == FORWARDED_TOOLS_EVENT
+
+    markers = [log for log in logs if _is_marker(log)]
+    entries = [log for log in logs if not _is_marker(log)]
+
     session_order = []
     seen_sessions = set()
-
-    for log in logs:
-        event = log.get('event', {})
-        session_id = event.get('session_id')
+    for log in entries:
+        session_id = log.get('event', {}).get('session_id')
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
 
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
-        kept_logs = [
-            log for log in logs
-            if log.get('event', {}).get('session_id') == most_recent_session
-        ]
-        save_logs(kept_logs)
-    elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        kept = [log for log in entries
+                if log.get('event', {}).get('session_id') == most_recent_session]
+    elif len(entries) > AUDIT_LOG_TOTAL_LIMIT:
+        kept = entries[-AUDIT_LOG_TOTAL_LIMIT:]
+    else:
+        kept = entries
+    # Always keep the watermark markers (one small consolidated row per session; the
+    # active session's is always the newest), bounded to the most recent sessions.
+    save_logs(kept + markers[-20:])
+
+
+def stop_session_key(event):
+    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
+    path FIRST -- it is constant for a session and present on every Stop that builds an
+    exchange -- so the key never flips between Stops that do and don't carry session_id
+    (which would split the watermark and resend the whole history). Falls back to
+    session_id only when there is no transcript path."""
+    tp = event.get('transcript_path')
+    if tp:
+        p = Path(tp)
+        return p.parent.name if p.stem == 'events' else p.stem
+    return event.get('session_id') or event.get('sessionId')
+
+
+def get_forwarded_state(session_id):
+    """(forwarded toolCallIds, last-sent text signature) for this session, from the
+    consolidated audit-log marker. Lets each Stop send only new tool calls, and skip a
+    Stop whose text+tools are both unchanged from the last send.
+
+    This is a best-effort PAYLOAD OPTIMIZATION, not a security control: the audit log is
+    user-writable, so a local process could forge `_unbound_forwarded` rows to omit tools
+    from the exchange. That's not a new exposure -- the hook already runs as the user and
+    the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
+    the integrity backstop. Keyed on bare ids only for that reason (never trusted for
+    enforcement)."""
+    sent, last_sig, prompted = set(), None, set()
+    if not session_id:
+        return sent, last_sig, prompted
+    for log in load_existing_logs():
+        event = log.get('event', {})
+        if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
+            continue
+        if event.get('session_id') != session_id:
+            continue
+        ids = event.get('forwarded_tool_ids')
+        if isinstance(ids, list):
+            sent.update(ids)
+        sig = event.get('text_sig')
+        if sig:
+            last_sig = sig
+        # Advisory like the tool ids above, and with the same caveat: a local writer could
+        # seed these to keep prompt text out of an exchange. The hook already runs as the
+        # user, who can equally edit the transcript it reads, so this adds no exposure --
+        # the gateway's server-side record is the integrity backstop.
+        prompt_ids = event.get('forwarded_prompt_ids')
+        if isinstance(prompt_ids, list):
+            prompted.update(prompt_ids)
+    return sent, last_sig, prompted
+
+
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None):
+    """Persist the forwarded toolCallIds + the last-sent text signature for this session as
+    a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
+    cumulative marker -- rather than one append per Stop -- means it survives
+    cleanup_old_logs' last-N trim in a long session, so old ids aren't forgotten and their
+    tool calls resent. Called after a successful send; a failed send simply resends next
+    Stop (the backend dedups)."""
+    if not session_id:
+        return
+    merged = set(tool_ids or ())
+    merged_prompts = set(prompt_ids or ())
+    kept = []
+    for log in load_existing_logs():
+        ev = log.get('event', {})
+        if (ev.get('hook_event_name') == FORWARDED_TOOLS_EVENT
+                and ev.get('session_id') == session_id):
+            ids = ev.get('forwarded_tool_ids')
+            if isinstance(ids, list):
+                merged.update(ids)
+            old_prompts = ev.get('forwarded_prompt_ids')
+            if isinstance(old_prompts, list):
+                merged_prompts.update(old_prompts)
+            if text_sig is None:
+                text_sig = ev.get('text_sig')  # carry forward the last known text sig
+            continue  # drop the old marker; a fresh consolidated one is appended below
+        kept.append(log)
+    kept.append({
+        'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+        'event': {
+            'hook_event_name': FORWARDED_TOOLS_EVENT,
+            'session_id': session_id,
+            'forwarded_tool_ids': sorted(merged),
+            'forwarded_prompt_ids': sorted(merged_prompts),
+            'text_sig': text_sig,
+        },
+    })
+    save_logs(kept)
 
 
 def get_recent_user_prompts_for_session(session_id, n):
@@ -381,21 +716,28 @@ def get_session_start_model(session_id):
     return found
 
 
-def get_last_user_prompt_timestamp_for_session(session_id):
-    """Latest UserPromptSubmit audit-log timestamp; turn start."""
+def get_turn_start_timestamp_for_session(session_id):
+    """First UserPromptSubmit of the turn; turn start. Typing while Copilot is still
+    working adds prompts to the running turn, and anchoring on the last would start the
+    turn after work the earlier prompt had already caused. The Stop being handled is
+    already logged, so the turn it closed is reported through completed_start."""
     if not session_id:
         return None
-    found = None
+    turn_start = None
+    completed_start = None
     for log in load_existing_logs():
         event = log.get('event', {})
-        if event.get('hook_event_name') != 'UserPromptSubmit':
-            continue
         if event.get('session_id') != session_id:
             continue
-        ts = log.get('timestamp')
-        if ts:
-            found = ts
-    return found
+        name = event.get('hook_event_name')
+        if name == 'UserPromptSubmit':
+            if turn_start is None:
+                turn_start = log.get('timestamp')
+        elif name == 'Stop':
+            if turn_start is not None:
+                completed_start = turn_start
+            turn_start = None
+    return turn_start or completed_start
 
 
 def _build_user_prompt_payload(recent_user_prompts):
@@ -447,10 +789,25 @@ def _vscode_user_dirs():
     return [base / "Code" / "User", base / "Code - Insiders" / "User"]
 
 
-# All Copilot MCP config locations. Untrusted workspace files (from cwd) come
-# first; trusted user/global/CLI configs last so they win the last-wins merge in
-# read_copilot_mcp_servers.
-def _copilot_mcp_config_paths(cwd=None):
+# Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
+# into mcp.json, so scan them. Not capped — a dropped config would fail open.
+def _plugin_mcp_config_paths(home):
+    paths = []
+    for user_dir in _vscode_user_dirs():
+        try:
+            paths.extend(sorted((user_dir.parent / "agentPlugins").glob("*/*/*/.mcp.json")))
+        except OSError:
+            pass
+    try:
+        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
+    except OSError:
+        pass
+    return paths
+
+
+# All Copilot MCP config locations, ordered for the last-wins merge in
+# read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
+def _copilot_mcp_config_paths(cwd=None, plugins=None):
     home = Path.home()
 
     workspace = []
@@ -472,7 +829,9 @@ def _copilot_mcp_config_paths(cwd=None):
     trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
     trusted.append(home / ".copilot" / "mcp-config.json")
 
-    return workspace + trusted
+    if plugins is None:
+        plugins = _plugin_mcp_config_paths(home)
+    return workspace + plugins + trusted
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -664,7 +1023,11 @@ def _augment_script_hash(result, cwd):
 
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
-    for config_path in _copilot_mcp_config_paths(cwd):
+    plugin_names = set()
+    # Match plugin bundles by exact path (a substring check could misclassify).
+    plugin_list = _plugin_mcp_config_paths(Path.home())
+    plugin_paths = set(plugin_list)
+    for config_path in _copilot_mcp_config_paths(cwd, plugin_list):
         try:
             if not config_path.exists():
                 continue
@@ -682,9 +1045,20 @@ def read_copilot_mcp_servers(cwd=None):
                 raw = nested.get('servers') if isinstance(nested, dict) else None
             if not isinstance(raw, dict):
                 continue
+            is_plugin = config_path in plugin_paths
+            # Hash a plugin's relative script against its own bundle, not cwd,
+            # so the fingerprint is correct and not workspace-spoofable.
+            base = config_path.parent if is_plugin else cwd
             for name, server in raw.items():
-                fields = _sanitize_mcp_server_fields(server, cwd)
-                servers[name] = fields or {}
+                fields = _sanitize_mcp_server_fields(server, base) or {}
+                # Surface only genuine plugin-vs-plugin name clashes (name only).
+                if is_plugin:
+                    if name in plugin_names and servers.get(name) != fields:
+                        log_error(
+                            f"copilot mcp plugin name collision: {name}", 'mcp_plugin'
+                        )
+                    plugin_names.add(name)
+                servers[name] = fields
         except Exception as e:
             # Missing files are skipped above without raising; this only fires on
             # a genuine read failure, so it's worth surfacing for diagnosis.
@@ -815,9 +1189,11 @@ def extract_command_for_pretool(canonical, tool_input):
     if canonical == 'Bash':
         # Shell tools key the payload differently: run_in_terminal/bash use
         # `command`; send_to_terminal and some variants use `input`/`text`.
+        # `value` holds an unparseable raw payload preserved by _normalize_arguments.
         # Try all so the policy check never sees an empty command for a real
         # shell execution.
-        return tool_input.get('command') or tool_input.get('input') or tool_input.get('text') or ''
+        return (tool_input.get('command') or tool_input.get('input')
+                or tool_input.get('text') or tool_input.get('value') or '')
     if canonical in ('Read', 'Write', 'Edit'):
         return tool_input.get('filePath') or tool_input.get('path') or tool_input.get('file_path') or ''
     if canonical.startswith('mcp'):
@@ -1011,9 +1387,24 @@ def transform_response_for_copilot_prompt(api_response):
 
 
 def process_pre_tool_use(event, api_key):
-    """Process PreToolUse event - check policy before tool execution."""
+    """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them."""
+    gate = _repo_gate_evaluate(event)
+    if gate:
+        return transform_response_for_copilot({
+            'decision': 'deny',
+            'reason': _repo_gate_block_reason(gate['repo']),
+            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        })
+    return _evaluate_pre_tool_use_policies(event, api_key)
+
+
+def _evaluate_pre_tool_use_policies(event, api_key):
+    """Run the gateway policy check for a PreToolUse event."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
-    tool_input = event.get('tool_input') or event.get('toolArgs') or {}
+    # VS Code can hand toolArgs over as a JSON string. Every reader below calls
+    # tool_input.get(), so normalize once here — a raw str raised out of the hook, and a
+    # hook that raises fails open, so the tool ran with no policy check at all.
+    tool_input = _normalize_arguments(event.get('tool_input') or event.get('toolArgs') or {})
     session_id = event.get('session_id') or event.get('sessionId')
 
     # Translate the Copilot tool name to the canonical gateway vocabulary.
@@ -1162,11 +1553,7 @@ def process_pre_tool_use(event, api_key):
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
@@ -1191,10 +1578,13 @@ def process_pre_tool_use(event, api_key):
 
 
 def process_user_prompt_submit(event, api_key):
-    """Process UserPromptSubmit event for policy checking."""
+    """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
     model = get_session_start_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
+
+    cache = load_policy_cache()
+    need_pull_policies = cache is None or is_cache_stale(cache)
 
     request_body = {
         'conversation_id': session_id,
@@ -1203,9 +1593,564 @@ def process_user_prompt_submit(event, api_key):
         'event_name': 'user_prompt',
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
+    if need_pull_policies:
+        request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
+    _cache_policies_from_response(api_response)
     return transform_response_for_copilot_prompt(api_response)
+
+
+def _strip_git_suffix(segment):
+    return segment[:-4] if segment.endswith('.git') else segment
+
+
+def _github_remote_path(remote_url):
+    """Path portion ("org/repo[.git]") of an SSH or HTTPS git remote URL.
+    None when the URL is empty or has no recognizable path."""
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        rest = url.split('://', 1)[1]
+        parts = rest.split('/', 1)
+        return parts[1] if len(parts) == 2 and parts[1] else None
+    if ':' in url:
+        rest = url.split(':', 1)[1]
+        return rest if rest else None
+    return None
+
+
+def _git_origin_url(cwd):
+    """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
+    result = subprocess.run(
+        ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+
+def _remote_host(remote_url):
+    """Reject a host-less remote URL, so file:///srv/git/x is not org 'srv'."""
+    url = (remote_url or '').strip()
+    if '://' in url:
+        host = url.split('://', 1)[1].split('/', 1)[0]
+    elif ':' in url:
+        host = url.split(':', 1)[0]
+    else:
+        return None
+    host = host.rsplit('@', 1)[-1].split('?', 1)[0]
+    return host.lower() or None
+
+
+def _get_git_origin_org_repo(cwd):
+    """Lowercased (org, repo) of `cwd`'s origin; git failure propagates upward."""
+    url = _git_origin_url(cwd)
+    if not url or not _remote_host(url):
+        return (None, None)
+    path = _github_remote_path(url)
+    if not path:
+        return (None, None)
+    parts = path.split('/')
+    if len(parts) < 2:
+        return (None, None)
+    org = _strip_git_suffix(parts[0]).lower()
+    repo = _strip_git_suffix(parts[1]).lower()
+    return (org or None, repo or None)
+
+def _get_project(cwd):
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, for analytics; never raises."""
+    try:
+        if not cwd:
+            return None
+        org, repo = _get_git_origin_org_repo(cwd)
+        return f"{org}/{repo}" if org and repo else None
+    except Exception:
+        return None
+
+
+def _find_git_root(path):
+    """Nearest ancestor of `path` holding a `.git`; None on any error."""
+    try:
+        p = Path(path)
+        for parent in [p] + list(p.parents):
+            if (parent / '.git').exists():
+                return str(parent)
+    except Exception:
+        pass
+    return None
+
+
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
+_ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
+# Real git clones that are never the engineer's project: a path under
+# /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
+_SYSTEM_CHECKOUT_ROOTS = (
+    '/opt/homebrew',
+    '/home/linuxbrew',
+    '/nix',
+    '/usr',
+    '/Library',
+    '/System',
+)
+
+
+def _is_system_checkout_path(path):
+    try:
+        normalized = os.path.normpath(path)
+        return any(
+            normalized == root or normalized.startswith(root + '/')
+            for root in _SYSTEM_CHECKOUT_ROOTS
+        )
+    except Exception:
+        return False
+# `cd <target>` occurrences — absolute, ~-rooted, or relative — used to track
+# the shell's working directory across the turn's shell commands.
+_CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
+
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
+_GIT_PATH_OPT_RE = re.compile(
+    r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
+)
+
+
+def _shell_segments(command):
+    """(segment, following-separator) pairs, sliced from the original so quoted paths survive."""
+    masked = _mask_quoted_runs(command)
+    out, last = [], 0
+    for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
+        out.append((command[last:m.start()].strip(), m.group(0).strip()))
+        last = m.end()
+    out.append((command[last:].strip(), ''))
+    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    return out
+
+
+def _merge_cwds(first, second):
+    """Ordered union, dropping duplicates and bounding the fan-out."""
+    out = list(first)
+    for c in second:
+        if c not in out:
+            out.append(c)
+    return out[:8]
+
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
+    targets = []
+    try:
+        cwds = [shell_dir]
+        # Where control lands if the current && chain short-circuits: `a && b || c`
+        # runs c when a failed (original cwd) or when b failed (a's cwd).
+        fallback = [shell_dir]
+        for segment, separator in _shell_segments(command):
+            words = _segment_words(segment)
+            # git only: `grep -C 3` is context lines, not a directory.
+            if words and os.path.basename(words[0]) == 'git':
+                for match in _GIT_PATH_OPT_RE.finditer(segment):
+                    raw = match.group(1) or match.group(2) or match.group(3)
+                    if not raw:
+                        continue
+                    for cwd in cwds:
+                        target = os.path.expanduser(raw) if raw.startswith('~') else raw
+                        if not target.startswith('/'):
+                            if not cwd:
+                                continue
+                            target = os.path.join(cwd, target)
+                        target = os.path.normpath(target)
+                        if _is_system_checkout_path(target) or target in targets:
+                            continue
+                        targets.append(target)
+            moved = [_next_shell_dir(segment, c) for c in cwds]
+            if separator == '&&':
+                # Next runs only if this one succeeded, so its cd took effect —
+                # but this segment may instead have failed, which a later || reaches.
+                fallback = _merge_cwds(fallback, cwds)
+                cwds = moved
+            elif separator == '||':
+                # Reached because something failed, so that cd did not apply.
+                cwds = _merge_cwds(cwds, fallback)
+                fallback = list(cwds)
+            elif separator in ('|', '&'):
+                # Subshell: a cd on the left never reaches the right-hand command.
+                pass
+            else:
+                # `;` or a newline: sequential, so the cd may or may not have taken.
+                cwds = _merge_cwds(moved, cwds)
+                fallback = list(cwds)
+            cwds = cwds[:8]
+    except Exception:
+        return targets
+    return targets
+
+
+
+def _next_shell_dir(command, shell_dir):
+    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
+    try:
+        target = None
+        for m in _CD_TARGET_RE.finditer(command):
+            target = m.group(2)
+        if not target:
+            return shell_dir
+        if target.startswith('~'):
+            target = os.path.expanduser(target)
+        if target.startswith('/'):
+            return os.path.normpath(target)
+        if target == '-':
+            return shell_dir
+        if shell_dir:
+            return os.path.normpath(os.path.join(shell_dir, target))
+        return shell_dir
+    except Exception:
+        return shell_dir
+
+
+# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+_QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Wrappers that stand in front of the real command word.
+_COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
+# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+
+# Shell commands that mutate the working tree, always a write whatever the flags:
+_SHELL_WRITE_COMMANDS = frozenset({
+    'rm', 'rmdir', 'unlink', 'shred',       # delete
+    'mv', 'cp', 'ln', 'install',            # create or relocate
+    'touch', 'mkdir',                       # create
+    'tee', 'truncate', 'patch',             # rewrite contents
+})
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
+_SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
+_INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
+
+
+def _mask_quoted_runs(command):
+    """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
+    return _QUOTED_RUN_RE.sub(
+        lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
+        command)
+
+
+def _segment_words(segment):
+    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    words = []
+    for word in segment.split():
+        word = word.strip('()`{}"\'')
+        if not words and (not word or word.startswith('-')
+                          or _ENV_ASSIGNMENT_RE.match(word)
+                          or word in _COMMAND_PREFIX_WORDS):
+            continue
+        words.append(word)
+    return words
+
+
+def _segment_writes(words):
+    """Whether a segment's command word plus its flags mutate the working tree."""
+    name = os.path.basename(words[0])
+    if name in _SHELL_WRITE_COMMANDS:
+        return True
+    if name in _SHELL_INPLACE_COMMANDS:
+        return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
+    if name == 'dd':
+        return any(w.startswith('of=') for w in words[1:])
+    return False
+
+
+def _is_git_command(command):
+    """Whether any segment of `command` directly invokes git; False on any error."""
+    try:
+        if not isinstance(command, str) or 'git' not in command:
+            return False
+        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+            words = _segment_words(segment)
+            if words and os.path.basename(words[0]) == 'git':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_shell_write_command(command):
+    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    try:
+        if not isinstance(command, str) or not command:
+            return False
+        masked = _mask_quoted_runs(command)
+        if _REDIRECT_RE.search(masked):
+            return True
+        for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
+            words = _segment_words(segment)
+            if words and _segment_writes(words):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _project_for_paths(candidates, root_projects):
+    """First project ("<org>/<repo>") resolved from `candidates` paths.
+    `root_projects` caches origin lookups so `git remote get-url` runs at
+    most once per distinct repo. None when nothing resolves (fail-open)."""
+    try:
+        for candidate in candidates:
+            if not candidate:
+                continue
+            root = _find_git_root(candidate)
+            if not root:
+                continue
+            if root not in root_projects:
+                root_projects[root] = _get_project(root)
+            if root_projects[root]:
+                return root_projects[root]
+    except Exception:
+        pass
+    return None
+
+
+# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
+
+# Write tools, git commands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated. Names are canonical_tool_name output.
+_REPO_GATE_WRITE_TOOLS = frozenset({'Write', 'Edit'})
+_REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
+_REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
+REPO_GATE_BLOCK_CONTEXT = (
+    'This action was blocked by an organization repository-scope policy. Do not '
+    'attempt to achieve the same result using alternative tools, file operations, '
+    'or workarounds. Inform the user and stop.'
+)
+
+
+
+
+
+
+def _repo_gate_command(tool_input):
+    """The shell command a Bash call carries; Copilot spells the key four ways."""
+    if not isinstance(tool_input, dict):
+        return None
+    command = (tool_input.get('command') or tool_input.get('input')
+               or tool_input.get('text') or tool_input.get('value'))
+    return command if isinstance(command, str) else None
+
+
+def _repo_gate_applies(tool_name, command):
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        return _is_git_command(command) or _is_shell_write_command(command)
+    return tool_name in _REPO_GATE_WRITE_TOOLS
+
+
+def _repo_gate_block_policies(policies):
+    """Enforceable subset; a policy this hook cannot read is dropped, not guessed."""
+    enforceable = []
+    for policy in policies or []:
+        if not isinstance(policy, dict):
+            continue
+        org = policy.get('github_org')
+        if not isinstance(org, str) or not org.strip():
+            continue
+        enforceable.append(policy)
+    return enforceable
+
+
+def _repo_gate_scope_allows(policy, org, repo):
+    """Whether `org` matches this policy's allowed organization; both lowercased."""
+    return org == policy['github_org'].strip().lower()
+
+
+def _repo_gate_violating_repo(candidates, block_policies, root_projects):
+    """First candidate outside every scope; a git failure propagates to fail open."""
+    for candidate in candidates:
+        root = _find_git_root(candidate)
+        if not root:
+            continue
+        if root not in root_projects:
+            root_projects[root] = _get_git_origin_org_repo(root)
+        org, repo = root_projects[root]
+        if not org or not repo:
+            continue
+        if not any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+            return '%s/%s' % (org, repo)
+    return None
+
+
+def _repo_gate_candidates(canonical, tool_input, cwd):
+    """Paths a Copilot call works in; pathless file tools scan serialized input."""
+    tool_input = tool_input or {}
+    candidates = []
+    if canonical == 'Bash':
+        command = (tool_input.get('command') or tool_input.get('input')
+                   or tool_input.get('text') or tool_input.get('value') or '')
+        if isinstance(command, str) and command:
+            candidates.extend(
+                p for p in _ABS_PATH_RE.findall(command)
+                if not _is_system_checkout_path(p)
+            )
+            candidates.extend(_git_path_opt_targets(command, cwd))
+            cwd = _next_shell_dir(command, cwd)
+        if not candidates and cwd:
+            candidates.append(cwd)
+        return candidates
+    path = (tool_input.get('filePath') or tool_input.get('path')
+            or tool_input.get('file_path'))
+    # A relative path resolves against the cwd; unresolvable falls to the blob scan.
+    if isinstance(path, str) and path and not path.startswith('/') and cwd:
+        path = os.path.normpath(os.path.join(cwd, path))
+    if isinstance(path, str) and path.startswith('/'):
+        if not _is_system_checkout_path(path):
+            candidates.append(os.path.dirname(path))
+        return candidates
+    try:
+        blob = json.dumps(tool_input)
+    except (TypeError, ValueError):
+        blob = ''
+    candidates.extend(
+        p for p in _ABS_PATH_RE.findall(blob) if not _is_system_checkout_path(p)
+    )
+    return candidates
+
+
+def _repo_gate_session_id(event):
+    """Copilot sends the conversation id under either spelling."""
+    return event.get('session_id') or event.get('sessionId')
+
+
+def _repo_gate_block_reason(repo):
+    return (
+        'Blocked by organization policy. "%s" is outside your organization\'s '
+        'allowed repository scope.' % repo
+    )
+
+
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
+
+REPO_GATE_REPORT_MAX_CHARS = 2000
+_REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
+                         'path', 'notebook_path')
+
+
+def _repo_gate_clip(text):
+    """Cap one reported string, keeping the body inside curl's pipe buffer."""
+    if not isinstance(text, str) or not text:
+        return None
+    return text[:REPO_GATE_REPORT_MAX_CHARS]
+
+
+def _repo_gate_binding_policy(block_policies):
+    """The policy the incident is filed against; every match denies alike."""
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident; the backend hashes it into the record's
+    identity, so a repeat is read as a redelivery and dropped. The step past the
+    last value is what guarantees that: the clock resolves to about a
+    microsecond, which two reports of one process can share."""
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
+
+
+def _repo_gate_post(body, api_key):
+    """Never waited on, so the blocking path stays free of synchronous work."""
+    proc = subprocess.Popen(
+        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
+         '-H', 'Authorization: Bearer %s' % api_key,
+         '-H', 'Content-Type: application/json',
+         '--data-binary', '@-',
+         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(body.encode())
+    proc.stdin.close()
+
+
+def _repo_gate_report(gate, block_policies, context):
+    """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
+    try:
+        if (gate or {}).get('decision') != 'deny':
+            return
+        # main() already resolved the key; the fallback covers entry points that skip it.
+        api_key = _cached_api_key or get_api_key()
+        if not api_key:
+            return
+        policy = _repo_gate_binding_policy(block_policies)
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
+        # What the call was about: its shell command, or the path it names.
+        tool_input = context.get('tool_input')
+        if isinstance(tool_input, dict):
+            named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
+            tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        # The pretool envelope every other post uses; the verdict rides under repo_gate.
+        app_label = context.get('app_label')
+        _repo_gate_post(json.dumps({
+            'conversation_id': context.get('session_id'),
+            'event_name': 'RepoGate',
+            'unbound_app_label': app_label,
+            'repo_gate': {
+                'policy_id': policy.get('id'),
+                'repository': gate.get('repo'),
+                'decision': 'BLOCK',
+                # Same value as the label above: the incidents page reads this one.
+                'agent': app_label,
+                'tool_name': context.get('tool_name'),
+                # Repeats conversation_id above: the analytics row digests this one.
+                'session_id': context.get('session_id'),
+                'turn': turn,
+                'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+                'tool_input': _repo_gate_clip(tool_input),
+            },
+        }), api_key)
+    except Exception:
+        pass
+
+
+def _repo_gate_evaluate(event):
+    """Verdict for one tool call: None allows, else deny. Never raises."""
+    try:
+        canonical = canonical_tool_name(
+            event.get('tool_name') or event.get('toolName') or '')
+        tool_input = _normalize_arguments(
+            event.get('tool_input') or event.get('toolArgs') or {})
+        if not _repo_gate_applies(canonical, _repo_gate_command(tool_input)):
+            return None
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+
+        candidates = _repo_gate_candidates(
+            canonical, tool_input, event.get('cwd'))
+        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        gate = {'decision': 'deny', 'repo': repo} if repo else None
+        _repo_gate_report(gate, block_policies, {
+            'app_label': 'copilot',
+            'session_id': event.get('session_id'),
+            'tool_name': canonical,
+            'tool_input': tool_input,
+        })
+        return gate
+    except Exception:
+        return None
 
 
 def _normalize_arguments(arguments):
@@ -1216,7 +2161,9 @@ def _normalize_arguments(arguments):
         try:
             parsed = json.loads(arguments)
             return parsed if isinstance(parsed, dict) else {'value': arguments}
-        except json.JSONDecodeError:
+        except (ValueError, RecursionError):
+            # RecursionError (deeply nested args) is not a ValueError, and an uncaught one
+            # here fails the hook open — keep the raw payload so the policy check still sees it.
             return {'value': arguments}
     return {}
 
@@ -1233,38 +2180,72 @@ def _extract_patch_target_path(args):
     return m.group(1).strip() if m else ''
 
 
-def map_copilot_tool(name, args, result_content):
+def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal orchestration tools (intentionally not emitted).
+
+    When `shell_state` ({'dir': <path>} tracked across the turn) and
+    `root_projects` (per-repo origin cache) are provided, each entry gets a
+    per-call `project` ("<org>/<repo>") — file entries resolve from their
+    file path (relative paths joined onto the shell dir), shell entries from
+    absolute paths in the command or the tracked shell dir.
     """
     if name in INTERNAL_TOOLS:
         return None
-    if name in SHELL_TOOLS:
+    shell_state = shell_state if shell_state is not None else {}
+    root_projects = root_projects if root_projects is not None else {}
+
+    def _abs(path):
+        if not isinstance(path, str) or not path:
+            return None
+        if path.startswith('/'):
+            return path
+        base = shell_state.get('dir')
+        return os.path.normpath(os.path.join(base, path)) if base else None
+
+    project = None
+    if name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
+        if name in SHELL_TOOLS:
+            command = args.get('command') or args.get('input') or args.get('text') or ''
+        else:
+            command = TERMINAL_LIKE_TOOLS[name](args)
         entry = {
             'type': 'afterShellExecution',
-            'command': args.get('command') or args.get('input') or args.get('text') or '',
+            'command': command,
             'output': result_content or '',
         }
-    elif name in TERMINAL_LIKE_TOOLS:
-        entry = {
-            'type': 'afterShellExecution',
-            'command': TERMINAL_LIKE_TOOLS[name](args),
-            'output': result_content or '',
-        }
+        candidates = []
+        if isinstance(command, str):
+            candidates.extend(p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p))
+            candidates.extend(_git_path_opt_targets(command, shell_state.get('dir')))
+            shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
+        if not candidates and shell_state.get('dir'):
+            candidates.append(shell_state['dir'])
+        project = _project_for_paths(candidates, root_projects)
     elif name in READ_TOOLS:
+        file_path = args.get('filePath') or args.get('path') or args.get('file_path') or ''
         entry = {
             'type': 'beforeReadFile',
-            'file_path': args.get('filePath') or args.get('path') or args.get('file_path') or '',
+            'file_path': file_path,
             'content': result_content or '',
         }
+        abs_path = _abs(file_path)
+        if abs_path and _is_system_checkout_path(abs_path):
+            abs_path = None
+        project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     elif name in WRITE_TOOLS or name in EDIT_TOOLS:
+        file_path = (args.get('filePath') or args.get('path') or args.get('file_path')
+                     or _extract_patch_target_path(args) or '')
         entry = {
             'type': 'afterFileEdit',
-            'file_path': (args.get('filePath') or args.get('path') or args.get('file_path')
-                          or _extract_patch_target_path(args) or ''),
+            'file_path': file_path,
             'content': args.get('content') or args.get('file_text') or result_content or '',
         }
+        abs_path = _abs(file_path)
+        if abs_path and _is_system_checkout_path(abs_path):
+            abs_path = None
+        project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
         entry = {
             'type': 'afterMCPExecution',
@@ -1272,16 +2253,39 @@ def map_copilot_tool(name, args, result_content):
             'tool_input': args,
             'result_json': result_content or '',
         }
+        try:
+            candidates = [p for p in _ABS_PATH_RE.findall(json.dumps(args)) if not _is_system_checkout_path(p)]
+        except Exception:
+            candidates = []
+        project = _project_for_paths(candidates, root_projects)
+
     # Drop empty-string values.
-    return {k: v for k, v in entry.items() if v != ''}
+    mapped = {k: v for k, v in entry.items() if v != ''}
+    if project:
+        mapped['project'] = project
+    return mapped
 
 
-def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None):
+def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None,
+                                   cwd=None, already_forwarded=None, already_prompted=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
 
-    Reads defensively — blank or unparseable lines are skipped, never raised."""
+    `cwd` (the hook event's working directory) seeds shell-dir tracking for
+    per-call project attribution and rides on the exchange.
+
+    Reads defensively — blank or unparseable lines are skipped, never raised.
+
+    Copilot fires a Stop per agent turn but the transcript slice below spans every
+    turn since the last user message, so without a guard each Stop re-sends the whole
+    accumulated tool history. `already_forwarded` is the set of toolCallIds sent on
+    earlier Stops of this session (from the audit-log markers); tool calls in it are
+    skipped so only NEW ones ride each request. Returns (exchange, forwarded_now, text_sig) where forwarded_now is the set of
+    toolCallIds included this time and text_sig fingerprints the turn's text — the caller
+    records them only after a successful send, so a failed send simply retries."""
+    already_forwarded = already_forwarded or set()
+    already_prompted = already_prompted or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None
+        return None, set(), None, set()
 
     entries = []
     try:
@@ -1295,7 +2299,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None
+        return None, set(), None, set()
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -1305,7 +2309,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         p = Path(transcript_path)
         conversation_id = p.parent.name if p.stem == 'events' else p.stem
     model = None
-    last_user_index = -1
+    turn_start_index = -1
+    turn_prompts = []
+    turn_prompt_ids = set()
+    # The turn is every prompt not yet reported. Position in the transcript cannot decide
+    # this: a prompt typed mid-turn lands inside the open agent turn in the CLI and outside
+    # it in VS Code, and Copilot narrates progress as assistant text, so neither the agent
+    # turn nor the assistant messages mark a boundary.
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -1321,16 +2331,44 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             if new_model:
                 model = new_model
         elif entry_type == 'user.message':
-            last_user_index = i
+            content = data.get('content')
+            # An entry without an envelope id still has to be watermarked, or every later
+            # Stop re-selects it and re-uploads its text with the current turn. Keyed the
+            # same way turn_id is when its id is missing.
+            message_id = entry.get('id') or 'unb-' + hashlib.sha256(
+                ('%s\x1f%d\x1f%s' % (conversation_id or '', i, content or ''))
+                .encode('utf-8', 'replace')).hexdigest()[:24]
+            if message_id in already_prompted:
+                continue
+            if turn_start_index < 0:
+                turn_start_index = i
+            if content:
+                turn_prompts.append(content)
+            turn_prompt_ids.add(message_id)
 
-    if last_user_index < 0:
-        return None
+    if turn_start_index < 0:
+        return None, set(), None, set()
 
-    user_prompt = (entries[last_user_index].get('data') or {}).get('content')
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(turn_prompts) or None
+    # Envelope id of this turn's user message: unique even when two turns
+    # carry identical text, unlike a hash of that text.
+    turn_id = entries[turn_start_index].get('id') or ''
+    if not turn_id:
+        # text_sig grows as assistant text accumulates, so it changes between
+        # Stops of one turn and would defeat the watermark. The user prompt does
+        # not change mid-turn, so hash that instead.
+        # turn_start_index is the turn's position in the session: fixed while a
+        # turn's assistant text grows, and different for a later turn even when
+        # its prompt is identical.
+        turn_id = hashlib.sha256(
+            ('%s\x1f%s\x1f%s' % (conversation_id or '', turn_start_index, user_prompt or '')
+             ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
     tool_calls = []          # ordered list of call ids
     tool_data = {}           # call_id -> {name, arguments, result, success}
+    skill_events = []        # raw `skill.invoked` payloads seen this turn
 
     def _register(call_id):
         if call_id not in tool_data:
@@ -1338,7 +2376,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             tool_calls.append(call_id)
         return tool_data[call_id]
 
-    for entry in entries[last_user_index + 1:]:
+    for entry in entries[turn_start_index + 1:]:
         if not isinstance(entry, dict):
             continue
         entry_type = entry.get('type')
@@ -1357,6 +2395,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call = _register(call_id)
                 call['name'] = req.get('name') or call['name']
                 call['arguments'] = _normalize_arguments(req.get('arguments'))
+
+        elif entry_type == 'skill.invoked':
+            skill_events.append(entry)
 
         elif entry_type == 'tool.execution_start':
             call_id = data.get('toolCallId')
@@ -1379,13 +2420,61 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 call['result'] = result.get('content')
 
     tool_use = []
+    # Per-call project attribution state: the shell starts at the session
+    # cwd; origin lookups are cached once per repo across the turn.
+    shell_state = {'dir': cwd}
+    root_projects = {}
+    forwarded_now = set()
     for call_id in tool_calls:
         call = tool_data[call_id]
-        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'])
+        if call_id in already_forwarded:
+            # Sent on an earlier Stop of this session — don't resend, but still
+            # follow any `cd` so later calls' project attribution keeps tracking
+            # the shell's working directory across the whole slice.
+            if call['name'] in SHELL_TOOLS and isinstance(call.get('arguments'), dict):
+                command = (call['arguments'].get('command') or call['arguments'].get('input')
+                           or call['arguments'].get('text') or '')
+                if isinstance(command, str):
+                    shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
+            continue
+        mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
+                                  shell_state=shell_state, root_projects=root_projects)
+        # Advance the watermark for EVERY handled call, mapped or not: an internal tool
+        # maps to None (nothing to send) but must still be recorded, else a turn of only
+        # internal tools is reparsed on every later Stop and never records progress.
+        forwarded_now.add(call_id)
         # `is not None` (not truthiness): None means a consciously-dropped internal
         # tool; an empty-but-valid dict should still be appended.
         if mapped is not None:
+            if call_id:
+                mapped['tool_use_id'] = call_id  # native transcript toolCallId — no synthetic id
             tool_use.append(mapped)
+
+    # Signature of the turn's user+assistant TEXT (independent of tool_use). The caller
+    # sends when there are new tools OR new text, and no-ops only when BOTH are unchanged
+    # from the last successful send. So a pure tool-replay doesn't re-post, but a Stop
+    # that appended new assistant text still sends (and is logged) even with no new tools.
+    text_sig = hashlib.sha256(
+        '\x1f'.join([user_prompt or ''] + text_parts).encode('utf-8', 'replace')
+    ).hexdigest()
+
+    # Copilot injects SKILL.md rather than calling a tool, but its session event
+    # stream records the load; fall back to the prompt token when it doesn't.
+    skill_uses = _skill_tool_uses_from_events(
+        skill_events, cwd, turn_key=turn_id)
+    seen_skills = {e.get('skill_name') for e in skill_uses}
+    skill_uses += [e for e in _skill_tool_uses_from_prompt(
+        user_prompt, cwd, conversation_id, turn_id)
+        if e.get('skill_name') not in seen_skills]
+    # Skills ride the same watermark as tool calls; without this a later Stop in
+    # the same turn re-sends them and inflates counts.
+    for entry in skill_uses:
+        entry_id = entry.get('tool_use_id')
+        if entry_id in already_forwarded:
+            continue
+        if entry_id:
+            forwarded_now.add(entry_id)
+        tool_use.append(entry)
 
     messages = []
     if user_prompt:
@@ -1397,13 +2486,17 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None
+        return None, set(), None, set()
 
     return {
         'conversation_id': conversation_id,
         'model': model or session_start_model or 'auto',
         'messages': messages,
-    }
+        'cwd': cwd,
+        # Turn-level fallback: rows without a per-call project (the user
+        # prompt row, or tool-less turns) inherit the session cwd's repo.
+        'project': _get_project(cwd),
+    }, forwarded_now, text_sig, turn_prompt_ids
 
 
 def send_to_api(exchange, api_key):
@@ -1594,72 +2687,7 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _hook_discovery_enabled_for_org() -> bool:
-    """Return whether SessionStart-triggered discovery is enabled for this
-    user's org. Reads ~/.unbound/discovery-cache.json first; refetches from
-    the gateway only when the cached value is missing or older than
-    DISCOVERY_HOOK_FLAG_TTL_SECONDS. Fail-closed: any error and no usable
-    cached value means False."""
-    cache = {}
-    if DISCOVERY_CACHE_PATH.exists():
-        try:
-            with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
-                cache = json.load(f) or {}
-        except (OSError, json.JSONDecodeError):
-            cache = {}
-    if not isinstance(cache, dict):
-        cache = {}
-    _hd = cache.get("hook_discovery")
-    flag = _hd if isinstance(_hd, dict) else {}
-    last_fetched = flag.get("fetched_at")
-    if isinstance(last_fetched, str):
-        try:
-            ts = datetime.strptime(last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc).timestamp()
-            if (time.time() - ts) < DISCOVERY_HOOK_FLAG_TTL_SECONDS:
-                return bool(flag.get("enabled", False))
-        except ValueError:
-            pass
-
-    try:
-        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            cfg = json.load(f) or {}
-    except (OSError, json.JSONDecodeError):
-        return bool(flag.get("enabled", False))
-    api_key = cfg.get("api_key")
-    if not api_key:
-        return bool(flag.get("enabled", False))
-    try:
-        r = subprocess.run(
-            ["curl", "-fsSL",
-             "-H", f"Authorization: Bearer {api_key}",
-             "--max-time", "5",
-             f"{UNBOUND_GATEWAY_URL}{DISCOVERY_HOOK_FLAG_PATH}"],
-            capture_output=True, timeout=8,
-        )
-        if r.returncode != 0:
-            return bool(flag.get("enabled", False))
-        enabled = bool(json.loads(r.stdout.decode("utf-8", errors="replace")).get("enabled", False))
-    except Exception:
-        return bool(flag.get("enabled", False))
-
-    cache["hook_discovery"] = {
-        "enabled": enabled,
-        "fetched_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
-    try:
-        DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as f:
-            json.dump(cache, f, indent=2, sort_keys=True)
-        os.replace(tmp, DISCOVERY_CACHE_PATH)
-    except OSError:
-        pass
-    return enabled
-
-
 def _dispatch_discovery() -> None:
-    if not _hook_discovery_enabled_for_org():
-        return
     try:
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
@@ -1811,14 +2839,14 @@ def main():
             return
 
         if event_name == 'UserPromptSubmit':
+            append_to_audit_log({
+                'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                'event': event,
+            })
+            # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
-            if response.get('decision') == 'block':
-                append_to_audit_log({
-                    'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
-                    'event': event,
-                })
-                print(json.dumps(response), flush=True)
-                return
+            print(json.dumps(response) if response else "{}", flush=True)
+            return
 
         # Create log entry with timestamp; the event already carries hook_event_name
         timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')
@@ -1830,17 +2858,31 @@ def main():
 
         if event_name == 'Stop':
             session_id = event.get('session_id')
-            exchange = build_exchange_from_transcript(
+            # Watermark key mirrors the exchange's session fallback, so get/record stay
+            # consistent even when the Stop payload omits session_id.
+            wm_key = stop_session_key(event)
+            already_forwarded, last_text_sig, already_prompted = get_forwarded_state(wm_key)
+            exchange, forwarded_now, text_sig, prompts_now = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
+                cwd=event.get('cwd'),
+                already_forwarded=already_forwarded,
+                already_prompted=already_prompted,
             )
-            if exchange:
+            # Send only when there is something new -- new tool calls OR new assistant
+            # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
+            # (even with no new tools) is still sent and logged.
+            if exchange and (forwarded_now or text_sig != last_text_sig):
                 # Turn boundaries from event-fire times
-                request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
+                request_initialized = get_turn_start_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
-                send_to_api(exchange, api_key)
+                # Record only after the send succeeds, so a failed send retries next Stop
+                # (the backend dedups). Updates the text signature too, even with no new
+                # tools, so an unchanged later Stop becomes a no-op.
+                if send_to_api(exchange, api_key):
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now)
             cleanup_old_logs()
 
         # Output required by Copilot hooks

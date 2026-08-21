@@ -33,20 +33,21 @@ DEBUG = False
 # <CMD>). They are kept as builder functions so the per-hook command can be
 # swapped for the MDM path / Windows launcher without duplicating the schema.
 
-# No per-hook `metadata` is seeded. Auggie rejects a `metadata` property on a
-# hook entry ("Unknown property metadata ... will be ignored") and shows a
-# "Some plugin hooks use unsupported configuration" warning on every run. It is
-# also unnecessary: Auggie delivers the turn conversation by DEFAULT on the Stop
-# event (event._exchange.exchange.{request_message, response_text}) — which is
-# what the end-of-turn analytics read.
+# Block-level metadata (sibling to `hooks`, not the hook entry) we opt into; Auggie
+# excludes all of it by default. userContext=context.userEmail, MCPMetadata=accurate MCP names.
+_HOOK_METADATA = {
+    "PreToolUse": {"includeUserContext": True, "includeMCPMetadata": True},
+    "PostToolUse": {"includeUserContext": True, "includeMCPMetadata": True},
+    "Stop": {"includeConversationData": True, "includeUserContext": True},
+    "SessionStart": {"includeUserContext": True},
+}
 
 
 def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
     """The Augment `hooks` block. Augment has no UserPromptSubmit event, so it is
     absent. Timeouts are in milliseconds. `extra` (e.g. {"shell": "powershell"})
-    is merged into every hook entry for the Windows launcher. No per-hook
-    metadata is emitted — Auggie rejects it and the turn conversation arrives by
-    default on Stop (see the note above)."""
+    is merged into every hook entry for the Windows launcher. Each block gets the
+    block-level metadata flags in _HOOK_METADATA (see the note above)."""
     def _hook(timeout: int) -> Dict:
         entry = {"type": "command", "command": hook_command, "timeout": timeout}
         if extra:
@@ -54,10 +55,10 @@ def build_hooks_block(hook_command: str, extra: Optional[Dict] = None) -> Dict:
         return entry
 
     return {
-        "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000)]}],
-        "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000)]}],
-        "Stop": [{"hooks": [_hook(10000)]}],
-        "SessionStart": [{"hooks": [_hook(60000)]}],
+        "PreToolUse": [{"matcher": ".*", "hooks": [_hook(15000)], "metadata": dict(_HOOK_METADATA["PreToolUse"])}],
+        "PostToolUse": [{"matcher": ".*", "hooks": [_hook(10000)], "metadata": dict(_HOOK_METADATA["PostToolUse"])}],
+        "Stop": [{"hooks": [_hook(10000)], "metadata": dict(_HOOK_METADATA["Stop"])}],
+        "SessionStart": [{"hooks": [_hook(60000)], "metadata": dict(_HOOK_METADATA["SessionStart"])}],
         "SessionEnd": [{"hooks": [_hook(10000)]}],
     }
 
@@ -529,6 +530,23 @@ def configure_augment_settings() -> bool:
             # A foreign non-list hooks[event] is left untouched — never clobber an
             # org's own Augment config in the shared settings file.
 
+        # Set the _HOOK_METADATA flags on our own blocks, even when the hook
+        # already exists, so already-installed devices pick them up on re-run.
+        for event, flags in _HOOK_METADATA.items():
+            blocks = settings["hooks"].get(event)
+            if not isinstance(blocks, list):
+                continue
+            for item in blocks:
+                if not isinstance(item, dict):
+                    continue
+                if any(_hook_command_matches(hook.get("command", ""), hook_command, script_path, is_windows)
+                       for hook in item.get("hooks", []) if isinstance(hook, dict)):
+                    metadata = item.get("metadata")
+                    if not isinstance(metadata, dict):
+                        metadata = {}
+                        item["metadata"] = metadata
+                    metadata.update(flags)
+
         # Merge toolPermissions, preserving any foreign rules. Match on our rule
         # identity (toolName + shellInputRegex) so re-running never duplicates.
         existing_perms = settings.get("toolPermissions")
@@ -591,11 +609,21 @@ def remove_hooks_from_settings() -> str:
                     if isinstance(item, dict):
                         hooks = item.get("hooks", [])
                         new_hooks = [h for h in hooks if not _is_unbound(h.get("command", ""))]
-                        if new_hooks != hooks:
+                        removed_ours = new_hooks != hooks
+                        if removed_ours:
                             modified = True
                             debug_print(f"Removed unbound hook from {event}")
                         if new_hooks:
                             item["hooks"] = new_hooks
+                            # Symmetry with install: drop our flags when the hook
+                            # leaves a surviving shared block.
+                            if removed_ours:
+                                meta = item.get("metadata")
+                                if isinstance(meta, dict):
+                                    for k in _HOOK_METADATA.get(event, {}):
+                                        meta.pop(k, None)
+                                    if not meta:
+                                        item.pop("metadata", None)
                             new_config.append(item)
                     else:
                         new_config.append(item)
