@@ -201,16 +201,32 @@ UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
 UNBOUND_KEY_HELPER_SETTING = "~/.claude/anthropic_key.sh"
 
 
+def _recorded_gateway_url() -> str:
+    """The gateway URL this install recorded for the current user, or "". Read from the
+    user's own config as that user -- it says which endpoint we pointed them at, so it
+    can authorise removing their own export and nothing else."""
+    try:
+        text = (Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8")
+        recorded = json.loads(text).get("gateway_url")
+    except (OSError, ValueError):
+        return ""
+    return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
+
 def _is_unbound_base_url(value) -> bool:
     """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
     the customer's own endpoint and is left alone.
 
-    The default gateway only. A URL supplied through --gateway-url is not recognised
-    here and is therefore left in place: guessing wrong removes an endpoint the customer
-    configured, which is the failure this check exists to prevent. Managed settings do
-    not depend on this -- the drop-in written by this setup is identified by being that
-    file, not by the value inside it."""
-    return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
+    Our default gateway, or the one this install recorded for this user. A URL that is
+    neither is the customer's and stays: guessing wrong removes an endpoint they
+    configured, which is the failure this check exists to prevent."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip().rstrip("/")
+    if candidate == UNBOUND_GATEWAY_URL:
+        return True
+    recorded = _recorded_gateway_url()
+    return bool(recorded) and candidate == recorded
 
 
 def _export_value(line: str, prefix: str) -> str:

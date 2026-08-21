@@ -522,6 +522,41 @@ def _is_unbound_base_url(value) -> bool:
     return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
 
 
+def _recorded_gateway_url_for_user(username, home_dir) -> str:
+    """The gateway URL this install recorded for one user, read as that user. It says
+    which endpoint we pointed *them* at, so it authorises removing *their* export and
+    nothing else. Never consulted for the system-wide managed settings: one account's
+    record must not decide what comes out of a file the whole device shares."""
+    config_file = home_dir / ".unbound" / "config.json"
+
+    def _read():
+        try:
+            fd = os.open(str(config_file), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+                recorded = json.loads(handle.read()).get("gateway_url")
+        except (OSError, ValueError):
+            return ""
+        return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
+    result = _run_as_user(username, _read) if username else _read()
+    return result or ""
+
+
+def _unbound_base_url_matcher(username, home_dir):
+    """Accepts our default gateway, or the one recorded for this user. The record is read
+    here rather than inside the predicate: the removal runs under a privilege drop, and a
+    second drop nested in the first cannot call setgroups."""
+    recorded = _recorded_gateway_url_for_user(username, home_dir)
+
+    def _matches(value):
+        if _is_unbound_base_url(value):
+            return True
+        return (bool(recorded) and isinstance(value, str)
+                and value.strip().rstrip("/") == recorded)
+
+    return _matches
+
+
 def _export_value(line: str, prefix: str) -> str:
     return line.strip()[len(prefix):].strip().strip('"').strip("'")
 
@@ -1840,7 +1875,7 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
-                                 _is_unbound_base_url)
+                                 _unbound_base_url_matcher(username, home_dir))
 
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:

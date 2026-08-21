@@ -52,6 +52,82 @@ class TestBaseUrlIdentity(unittest.TestCase):
                                  "%s %r" % (mod.__name__, value))
 
 
+class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
+    """An org running Unbound on their own --gateway-url still installed it through us.
+    The URL we recorded for a user says which endpoint we pointed them at, so it
+    authorises removing that user's export -- and only that."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    @staticmethod
+    def _home(gateway_url=None):
+        home = Path(tempfile.mkdtemp())
+        (home / ".unbound").mkdir()
+        body = {"api_key": "k"}
+        if gateway_url:
+            body["gateway_url"] = gateway_url
+        (home / ".unbound" / "config.json").write_text(json.dumps(body))
+        return home
+
+    def test_user_level_accepts_the_recorded_gateway(self):
+        home = self._home(self.CUSTOM)
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM + "/"), mod.__name__)
+
+    def test_user_level_still_refuses_an_endpoint_nobody_recorded(self):
+        home = self._home(self.CUSTOM)
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                self.assertFalse(mod._is_unbound_base_url(THEIRS), mod.__name__)
+
+    def test_no_record_falls_back_to_the_default_gateway_only(self):
+        home = self._home(None)
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                self.assertTrue(mod._is_unbound_base_url(OURS), mod.__name__)
+                self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+
+    def test_a_corrupt_record_is_not_a_match(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".unbound").mkdir()
+        (home / ".unbound" / "config.json").write_text("{not json")
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+                self.assertTrue(mod._is_unbound_base_url(OURS), mod.__name__)
+
+    def test_mdm_matches_it_for_that_user(self):
+        home = self._home(self.CUSTOM)
+        for mod in MDM:
+            with patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+                matcher = mod._unbound_base_url_matcher("alice", home)
+            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+            self.assertTrue(matcher(OURS), mod.__name__)
+            self.assertFalse(matcher(THEIRS), mod.__name__)
+
+    def test_one_users_record_does_not_reach_the_system_wide_check(self):
+        # this is the boundary: a local account writing our URL into their own config
+        # must not authorise deleting anything from shared managed settings
+        home = self._home(self.CUSTOM)
+        for mod in MDM:
+            with patch.object(mod, "get_all_user_homes", lambda: [("mallory", home)]), \
+                 patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+                self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+
+    def test_the_managed_env_block_still_ignores_a_users_record(self):
+        home = self._home(self.CUSTOM)
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": self.CUSTOM, "ANTHROPIC_AUTH_TOKEN": "t"}}))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM, "get_all_user_homes", lambda: [("mallory", home)]):
+            GATEWAY_MDM.clear_managed_settings()
+        env = json.loads((managed / "managed-settings.json").read_text())["env"]
+        self.assertEqual(env, {"ANTHROPIC_BASE_URL": self.CUSTOM})
+
+
 class TestEnvRemovalKeepsTheirs(unittest.TestCase):
     """export ANTHROPIC_BASE_URL goes only where it holds our gateway."""
 

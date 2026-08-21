@@ -492,6 +492,41 @@ def _is_unbound_base_url(value) -> bool:
     return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
 
 
+def _recorded_gateway_url_for_user(username, home_dir) -> str:
+    """The gateway URL this install recorded for one user, read as that user. It says
+    which endpoint we pointed *them* at, so it authorises removing *their* export and
+    nothing else. Never consulted for the system-wide managed settings: one account's
+    record must not decide what comes out of a file the whole device shares."""
+    config_file = home_dir / ".unbound" / "config.json"
+
+    def _read():
+        try:
+            fd = os.open(str(config_file), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+                recorded = json.loads(handle.read()).get("gateway_url")
+        except (OSError, ValueError):
+            return ""
+        return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
+    result = _run_as_user(username, _read) if username else _read()
+    return result or ""
+
+
+def _unbound_base_url_matcher(username, home_dir):
+    """Accepts our default gateway, or the one recorded for this user. The record is read
+    here rather than inside the predicate: the removal runs under a privilege drop, and a
+    second drop nested in the first cannot call setgroups."""
+    recorded = _recorded_gateway_url_for_user(username, home_dir)
+
+    def _matches(value):
+        if _is_unbound_base_url(value):
+            return True
+        return (bool(recorded) and isinstance(value, str)
+                and value.strip().rstrip("/") == recorded)
+
+    return _matches
+
+
 def _export_value(line: str, prefix: str) -> str:
     return line.strip()[len(prefix):].strip().strip('"').strip("'")
 
@@ -888,14 +923,16 @@ def clear_managed_settings() -> str:
 
 
 def _clear_env_var_across_users(var_name: str, user_homes, label: str = None,
-                                only_if=None) -> tuple:
+                                only_if=None, per_user_matcher: bool = False) -> tuple:
     """Remove var_name for all users. Returns (cleared, not_found, failed) counts."""
     _label = label or var_name
     cleared = 0
     not_found = 0
     failed = 0
     for username, home_dir in user_homes:
-        status = remove_env_var_from_user(username, home_dir, var_name, only_if)
+        matcher = (_unbound_base_url_matcher(username, home_dir)
+                   if per_user_matcher else only_if)
+        status = remove_env_var_from_user(username, home_dir, var_name, matcher)
         if status == "cleared":
             cleared += 1
         elif status == "not_found":
@@ -925,9 +962,9 @@ def clear_setup() -> bool:
     else:
         c1, n1, f1 = _clear_env_var_across_users("UNBOUND_API_KEY", user_homes, label="API_KEY")
         # ANTHROPIC_BASE_URL goes only where it holds our gateway.
+        # per user, judged against that user's own record
         c2, n2, f2 = _clear_env_var_across_users("ANTHROPIC_BASE_URL", user_homes,
-                                                 label="BASE_URL",
-                                                 only_if=_is_unbound_base_url)
+                                                 label="BASE_URL", per_user_matcher=True)
         if c1 or c2:
             print(f"Cleared for {max(c1, c2)} user(s)")
         elif not (f1 or f2):
