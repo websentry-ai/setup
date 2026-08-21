@@ -3,6 +3,7 @@
 
 import os
 import re
+import stat
 import shutil
 import sys
 import time
@@ -582,26 +583,81 @@ def remove_hooks_from_config() -> str:
         return "failed"
 
 
+# A FIFO would hang provisioning and an oversized file would exhaust memory, so the read
+# is capped and restricted to a regular file.
+_HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _hooks_still_registered(hooks_path):
+    """True when hooks.json still registers a command, False when none does, None when that
+    cannot be determined. The feature flag is one switch over every hook a user has, so
+    clearing it while somebody else's entry remains turns their tooling off; None keeps the
+    flag and marks the uninstall incomplete rather than guessing either way. Call this only
+    after our own entries have been stripped."""
+    try:
+        fd = os.open(str(hooks_path),
+                     os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None  # includes a symlink refused by O_NOFOLLOW
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOKS_JSON_MAX_BYTES:
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        handle = os.fdopen(fd, 'r', encoding='utf-8')
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        with handle as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return None
+    events = config.get('hooks')
+    if not isinstance(events, dict):
+        return False
+    for entries in events.values():
+        for item in entries if isinstance(entries, list) else []:
+            if isinstance(item, dict) and item.get('hooks'):
+                return True
+    return False
+
+
 def disable_codex_hooks_feature_status() -> str:
-    """Remove the codex_hooks line from ~/.codex/config.toml.
+    """Remove the hooks feature flag, in either spelling, from ~/.codex/config.toml.
 
     Returns "cleared", "not_found", or "failed".
     """
     config_path = Path.home() / ".codex" / "config.toml"
     if not config_path.exists():
         return "not_found"
+    registered = _hooks_still_registered(Path.home() / ".codex" / "hooks.json")
+    if registered is None:
+        print("could not read hooks.json; hooks feature flag left set")
+        return "failed"
+    if registered:
+        debug_print("hooks feature flag kept: other hooks are still registered")
+        return "not_found"
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return "not_found"
+        if not _write_is_safe(''.join(new_lines), False):
+            return "failed"
         with open(config_path, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
-        debug_print("Removed codex_hooks feature flag from config.toml")
+        debug_print("Removed hooks feature flag from config.toml")
         return "cleared"
     except Exception as e:
-        print(f"Failed to remove codex_hooks feature: {e}")
+        print(f"Failed to remove hooks feature flag: {e}")
         return "failed"
 
 
@@ -661,7 +717,7 @@ def clear_setup() -> bool:
     if feature_status == "cleared":
         any_cleared = True
     elif feature_status == "failed":
-        print("Failed to clear codex_hooks feature flag")
+        print("Failed to clear hooks feature flag")
         any_failed = True
 
     if any_cleared:
@@ -675,10 +731,191 @@ def clear_setup() -> bool:
     return not any_failed
 
 
+_HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
+
+
+# TOML spells this header several ways and allows a trailing comment. Missing one both
+# strips the wrong lines and appends a second [features], which TOML rejects outright.
+_FEATURES_HEADER_RE = re.compile(r'^\[\s*(?:features|"features"|\'features\')\s*\]\s*(#.*)?$')
+
+# features as an inline table cannot take an appended header without redefining it.
+_FEATURES_INLINE_RE = re.compile(r'^features\s*=\s*\{(.*?)\}\s*(#.*)?$')
+
+
+def _is_features_header(stripped) -> bool:
+    return bool(_FEATURES_HEADER_RE.match(stripped))
+
+
+def _features_hooks_flags(lines):
+    """The hooks feature flag lines present inside [features], in either spelling. Scoped to
+    that table: a hooks key in some other table is not this flag and must not be read as one."""
+    found, in_features = [], False
+    for stripped in _config_lines(lines):
+        if stripped is None:
+            continue
+        if stripped.startswith('['):
+            in_features = _is_features_header(stripped)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            found.append(stripped)
+    return found
+
+
+try:
+    import tomllib
+except ImportError:  # system python older than 3.11
+    tomllib = None
+
+
+def _write_is_safe(text, want_enabled) -> bool:
+    """Whether text is a config Codex can load with the flag in the intended state. Every
+    edit is checked against this before it reaches disk, so a line-scan mistake is discarded
+    rather than written."""
+    if tomllib is None:
+        # No parser to check the result with, so only edit files without the constructs the
+        # line scan can misread. A config left alone beats a config written blind.
+        if '"""' in text or "'''" in text:
+            return False
+        depth = 0
+        for line in text.splitlines():
+            _, extra = _scan_code(line)
+            depth += extra
+            if depth:
+                return False  # a multi-line array
+        return True
+    try:
+        features = tomllib.loads(text).get('features')
+    except Exception:
+        return False
+    if features is None:
+        features = {}
+    if not isinstance(features, dict) or 'codex_hooks' in features:
+        return False
+    return features.get('hooks') is True if want_enabled else 'hooks' not in features
+
+
+def _find_delim(text, delim, start=0) -> int:
+    """Index of the closing delimiter, skipping backslash escapes. A backslash consumes the
+    character after it, so an escaped quote can never be read as part of a terminator.
+    Multi-line literal strings take no escapes, so only the basic form needs the walk."""
+    if delim != '"""':
+        return text.find(delim, start)
+    i, n = start, len(text)
+    while i < n:
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text.startswith(delim, i):
+            return i
+        i += 1
+    return -1
+
+
+def _inline_with_flag(stripped):
+    """An inline features table rewritten to carry hooks = true, or None when its values are
+    too complex to split on commas. Refusing there keeps a user from opting out of enforcement
+    by writing the table inline, without risking their values."""
+    match = _FEATURES_INLINE_RE.match(stripped)
+    if not match:
+        return None
+    inner = match.group(1)
+    if any(ch in inner for ch in '"\'{}[]'):
+        return None
+    entries = [part.strip() for part in inner.split(',')]
+    entries = [part for part in entries if part and not _HOOKS_FLAG_RE.match(part)]
+    entries.append('hooks = true')
+    comment = match.group(2)
+    return 'features = { ' + ', '.join(entries) + ' }' + ('  ' + comment if comment else '') + '\n'
+
+
+def _scan_code(text):
+    """(unclosed multi-line delimiter, net bracket depth change) for the code on one line.
+    Brackets and quotes inside comments or strings are not counted, and the same-line close
+    of a triple-quoted value skips escapes so it cannot end on an escaped quote."""
+    i, n, depth = 0, len(text), 0
+    while i < n:
+        ch = text[i]
+        if ch == '#':
+            break
+        if text.startswith('"""', i) or text.startswith("'''", i):
+            delim = text[i:i + 3]
+            end = _find_delim(text, delim, i + 3)
+            if end == -1:
+                return delim, depth
+            i = end + 3
+            continue
+        if ch == '"':
+            i += 1
+            while i < n:
+                if text[i] == '\\':
+                    i += 2
+                    continue
+                if text[i] == '"':
+                    i += 1
+                    break
+                i += 1
+            continue
+        if ch == "'":
+            end = text.find("'", i + 1)
+            if end == -1:
+                break
+            i = end + 1
+            continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
+        i += 1
+    return None, depth
+
+
+def _config_lines(lines):
+    """Yield each line stripped, or None for anything that is not a statement of its own:
+    the interior of a multi-line string and the continuation lines of a multi-line array.
+    Either one can hold text that looks like a table header or like our flag."""
+    delim, depth = None, 0
+    for line in lines:
+        if delim is not None:
+            yield None
+            end = _find_delim(line, delim)
+            if end == -1:
+                continue
+            delim, extra = _scan_code(line[end + 3:])
+            depth += extra
+            continue
+        if depth > 0:
+            yield None
+            delim, extra = _scan_code(line)
+            depth += extra
+            continue
+        yield line.strip()
+        delim, extra = _scan_code(line)
+        depth += extra
+
+
+def _strip_hooks_flags(lines):
+    """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
+    and scoped to that table so [hooks.state] and its entries are left alone."""
+    out, in_features = [], False
+    for line, stripped in zip(lines, _config_lines(lines)):
+        if stripped is None:
+            out.append(line)
+            continue
+        if stripped.startswith('['):
+            in_features = _is_features_header(stripped)
+            out.append(line)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            continue
+        out.append(line)
+    return out
+
+
 def enable_codex_hooks_feature() -> bool:
-    """Enable the codex_hooks feature flag in ~/.codex/config.toml.
-    If [features] section exists, adds the key under it.
-    Otherwise appends a new [features] section at the end of the file."""
+    """Enable the hooks feature flag in ~/.codex/config.toml.
+
+    Codex renamed this flag from codex_hooks to hooks and warns on every start while the old
+    spelling is present, so an existing one is replaced rather than left beside the new one."""
     config_path = Path.home() / ".codex" / "config.toml"
     try:
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -688,55 +925,80 @@ def enable_codex_hooks_feature() -> bool:
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-        # Check if already enabled
-        content = ''.join(lines)
-        if 'codex_hooks = true' in content:
-            debug_print("codex_hooks feature flag already enabled")
+        # Covers the inline spelling too, so a daily re-run does not rewrite a config that is
+        # already correct.
+        if tomllib is not None and _write_is_safe(''.join(lines), True):
+            debug_print("hooks feature flag already enabled")
             return True
 
-        # Check if [features] section already exists
+        # Already correct only when [features] holds exactly the current spelling. A hooks key
+        # in another table is an unrelated setting and must not be read as this flag.
+        if _features_hooks_flags(lines) == ['hooks = true']:
+            debug_print("hooks feature flag already enabled")
+            return True
+
+        lines = _strip_hooks_flags(lines)
         features_idx = None
-        for i, line in enumerate(lines):
-            if line.strip() == '[features]':
+        for i, stripped in enumerate(_config_lines(lines)):
+            if stripped is not None and _is_features_header(stripped):
                 features_idx = i
                 break
 
         if features_idx is not None:
-            # Insert codex_hooks = true right after [features] header
-            lines.insert(features_idx + 1, 'codex_hooks = true\n')
+            lines.insert(features_idx + 1, 'hooks = true\n')
         else:
-            # Append new [features] section at the end
-            if lines and not lines[-1].endswith('\n'):
-                lines.append('\n')
-            lines.append('\n[features]\ncodex_hooks = true\n')
+            merged = False
+            for i, stripped in enumerate(_config_lines(lines)):
+                if stripped is None:
+                    continue
+                if stripped.startswith('['):
+                    break  # an inline features table is a top-level key, not a nested one
+                rewritten = _inline_with_flag(stripped)
+                if rewritten:
+                    lines[i] = rewritten
+                    merged = True
+                    break
+                if _FEATURES_INLINE_RE.match(stripped):
+                    print("features is an inline table in config.toml; add hooks = true to it manually")
+                    return False
+            if not merged:
+                if lines and not lines[-1].endswith('\n'):
+                    lines.append('\n')
+                lines.append('\n[features]\nhooks = true\n')
 
+        if not _write_is_safe(''.join(lines), True):
+            print("could not enable hooks in config.toml without breaking it; left unchanged")
+            return False
         with open(config_path, 'w', encoding='utf-8') as f:
             f.writelines(lines)
 
-        debug_print("Enabled codex_hooks feature flag in config.toml")
+        debug_print("Enabled hooks feature flag in config.toml")
         return True
     except Exception as e:
-        debug_print(f"Failed to enable codex_hooks feature: {e}")
+        debug_print(f"Failed to enable hooks feature: {e}")
         return False
 
 
 def disable_codex_hooks_feature() -> None:
-    """Remove only the codex_hooks line from ~/.codex/config.toml.
+    """Remove the hooks feature flag, in either spelling, from ~/.codex/config.toml.
     Preserves the [features] section and any other flags within it."""
     config_path = Path.home() / ".codex" / "config.toml"
     if not config_path.exists():
+        return
+    if _hooks_still_registered(Path.home() / ".codex" / "hooks.json") is not False:
+        debug_print("hooks feature flag kept: other hooks are still registered or unreadable")
         return
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
-        if len(new_lines) != len(lines):
+        new_lines = _strip_hooks_flags(lines)
+        if len(new_lines) != len(lines) and _write_is_safe(''.join(new_lines), False):
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
-            debug_print("Removed codex_hooks feature flag from config.toml")
+            debug_print("Removed hooks feature flag from config.toml")
     except Exception as e:
-        debug_print(f"Failed to remove codex_hooks feature: {e}")
+        debug_print(f"Failed to remove hooks feature flag: {e}")
 
 
 def get_device_identifier() -> Optional[str]:
@@ -1380,9 +1642,9 @@ def main():
         return False
     debug_print("Codex hooks configured successfully")
 
-    debug_print("Enabling codex_hooks feature flag...")
+    debug_print("Enabling hooks feature flag...")
     if not enable_codex_hooks_feature():
-        print("Failed to enable codex_hooks feature flag")
+        print("Failed to enable hooks feature flag")
         return False
 
     print("API key verified and added")

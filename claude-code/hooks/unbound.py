@@ -59,11 +59,8 @@ CLAUDE_MCP_CONFIG_PATH = (
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
-# Repo-scope gate. Grace is session-scoped: an advisory nudge, not an audit trail.
-REPO_GATE_STATE_FILE = Path.home() / ".claude" / "hooks" / ".repo_gate_state.json"
-REPO_GATE_TURN_MEMORY = 20
-# _repo_gate_turn_id's unknown-turn answer, not an identity: never memoize it.
-REPO_GATE_UNKNOWN_TURN = '_session_turn'
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -571,10 +568,20 @@ def _subagent_dir(transcript_path: str) -> Optional[str]:
     return None
 
 
-def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
+def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict,
+                         subagent_floor: Optional[str] = None, subagent_ceiling: Optional[str] = None) -> None:
     """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to a
     subagents/ dir, never the main transcript the Stop event points at, so their tokens
-    would otherwise be dropped. Same per-turn scope + dedup."""
+    would otherwise be dropped. Scoped from the previous Stop rather than this turn's
+    prompt: a subagent outlives the turn that launched it, and what it spends between the
+    two belongs to neither turn under a prompt-anchored floor. Bounded above by this turn's
+    Stop, which is the next turn's floor, so an entry flushed just after it is billed once."""
+    floor = subagent_floor or user_prompt_timestamp
+    # A streamed assistant message is written as several lines under one id, and its usage
+    # grows with each. Window it on its first line so a message spanning a Stop is billed to
+    # one turn instead of counted whole by both.
+    collected = []
+    first_seen = {}
     try:
         subdir = _subagent_dir(transcript_path)
         names = []
@@ -598,14 +605,26 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                     entry = progress or entry
                     if progress is None and entry.get('type') != 'assistant':
                         continue
+                    message = entry.get('message') or {}
                     ts = entry.get('timestamp')
-                    # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
-                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, ts):
-                        continue
-                    _record_usage(entry, entry.get('message') or {}, usage_by_key)
+                    message_id = message.get('id')
+                    if message_id:
+                        earliest = first_seen.get(message_id)
+                        if earliest is None or _ts_lt(ts, earliest):
+                            first_seen[message_id] = ts
+                    collected.append((message_id, ts, entry, message))
         except Exception as e:
             log_error(f"subagent usage: failed reading {name}: {e}", 'usage')
             continue
+
+    for message_id, ts, entry, message in collected:
+        anchor = first_seen.get(message_id, ts) if message_id else ts
+        # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
+        if floor and not _ts_lt(floor, anchor):
+            continue
+        if subagent_ceiling and _ts_lt(subagent_ceiling, anchor):
+            continue
+        _record_usage(entry, message, usage_by_key)
 
 
 def _typed_user_text(entry: Dict) -> str:
@@ -630,11 +649,14 @@ def _typed_user_text(entry: Dict) -> str:
     return ''
 
 
-def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None, include_usage: bool = True) -> Dict:
+def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
+                          include_usage: bool = True, subagent_floor: Optional[str] = None,
+                          subagent_ceiling: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
         'assistant_messages': [],
         'tool_uses': [],
+        'queued_prompts': [],
         'usage': None,
         'model': None,
     }
@@ -642,6 +664,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     if not transcript_path or not os.path.exists(transcript_path):
         return conversation_data
 
+    queue_floor = subagent_floor or user_prompt_timestamp
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     usage_by_key: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
@@ -660,7 +683,26 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
 
-                    if entry_type == 'user':
+                    if entry_type == 'queue-operation':
+                        # Typing while Claude is working enqueues the prompt and consumes it
+                        # into the running turn; it never becomes a user message and never
+                        # fires UserPromptSubmit, so this record is the only trace of it.
+                        # 'remove' is the consumption: a prompt taken back out for editing
+                        # leaves through 'popAll' and never ran, so it is not this turn's.
+                        if entry.get('operation') != 'remove':
+                            continue
+                        # Floored at the previous Stop, not at this turn's prompt: a queued
+                        # prompt consumed after the last turn closed and before this one was
+                        # typed would otherwise belong to neither.
+                        if queue_floor and not _ts_lt(queue_floor, entry_timestamp):
+                            continue
+                        if subagent_ceiling and _ts_lt(subagent_ceiling, entry_timestamp):
+                            continue
+                        queued = entry.get('content')
+                        if queued:
+                            conversation_data['queued_prompts'].append(queued)
+
+                    elif entry_type == 'user':
                         typed = _typed_user_text(entry)
                         if typed:
                             conversation_data['user_messages'].append({
@@ -698,7 +740,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
     if include_usage:
         try:
-            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key)
+            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor,
+                                 subagent_ceiling)
             for msg_usage, _ in usage_by_key.values():
                 for k in usage:
                     usage[k] += _usage_value(msg_usage, k)
@@ -2479,18 +2522,13 @@ def prune_injected_skills(remove_skills) -> None:
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     """PreToolUse entry point - DO NOT LOG. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Write/Edit when no terminal-command policy covers them."""
     gate = _repo_gate_evaluate(event)
-    if gate and gate['decision'] == 'deny':
+    if gate:
         return transform_response_for_claude({
             'decision': 'deny',
             'reason': _repo_gate_block_reason(gate['repo']),
             'additionalContext': REPO_GATE_BLOCK_CONTEXT,
         })
-    response = _evaluate_pre_tool_use_policies(event, api_key)
-    if gate:
-        return _with_repo_gate_context(
-            response, _repo_gate_warning(gate['repo'], gate['remaining'])
-        )
-    return response
+    return _evaluate_pre_tool_use_policies(event, api_key)
 
 
 def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
@@ -3158,9 +3196,6 @@ def _repo_gate_block_policies(policies: Optional[List[Dict]]) -> List[Dict]:
     for policy in policies or []:
         if not isinstance(policy, dict):
             continue
-        grace = policy.get('grace_turns')
-        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
-            continue
         org = policy.get('github_org')
         if not isinstance(org, str) or not org.strip():
             continue
@@ -3189,68 +3224,6 @@ def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict],
     return None
 
 
-def _repo_gate_turn_id(event: Dict) -> str:
-    """Turn identity so one turn burns one grace; `prompt_id`, else prompt hash."""
-    prompt_id = event.get('prompt_id')
-    if prompt_id:
-        return str(prompt_id)
-    prompts = get_recent_user_prompts_for_session(
-        event.get('session_id'), 1, event.get('transcript_path')
-    )
-    if prompts:
-        digest = hashlib.sha256(prompts[-1].encode('utf-8', 'replace')).hexdigest()
-        return 'p-' + digest[:16]
-    return REPO_GATE_UNKNOWN_TURN
-
-
-def _load_repo_gate_state(session_id: Optional[str]) -> Dict:
-    """Grace state, keyed on session; anything unreadable reads as unused grace."""
-    fresh = {'used': 0, 'turns': []}
-    try:
-        with open(REPO_GATE_STATE_FILE, 'r', encoding='utf-8') as f:
-            state = json.loads(f.read())
-        if not isinstance(state, dict) or state.get('session_id') != session_id:
-            return fresh
-        used = state.get('used')
-        turns = state.get('turns')
-        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
-            return fresh
-        if not isinstance(turns, list):
-            return fresh
-        return {'used': used, 'turns': [t for t in turns if isinstance(t, str)]}
-    except (OSError, ValueError):
-        return fresh
-
-
-def _save_repo_gate_state(session_id: Optional[str], state: Dict):
-    """Atomic replace, so parallel calls in one turn cannot leave a torn file."""
-    try:
-        REPO_GATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({
-            'session_id': session_id,
-            'used': state['used'],
-            'turns': state['turns'][-REPO_GATE_TURN_MEMORY:],
-        })
-        tmp = REPO_GATE_STATE_FILE.parent / ('.repo_gate.%d.tmp' % os.getpid())
-        tmp.write_text(payload, encoding='utf-8')
-        os.replace(str(tmp), str(REPO_GATE_STATE_FILE))
-    except Exception:
-        pass
-
-
-def _repo_gate_warning(repo: str, remaining: int) -> str:
-    if remaining <= 0:
-        tail = 'This is the final warning — the next turn touching an out-of-scope repository will be blocked.'
-    elif remaining == 1:
-        tail = '1 warning left before out-of-scope repositories are blocked.'
-    else:
-        tail = '%d warnings left before out-of-scope repositories are blocked.' % remaining
-    return (
-        'Unbound repository policy: this action works in "%s", which is outside '
-        'your organization\'s allowed repository scope. %s' % (repo, tail)
-    )
-
-
 def _repo_gate_block_reason(repo: str) -> str:
     return (
         'Blocked by organization policy. "%s" is outside your organization\'s '
@@ -3273,8 +3246,27 @@ def _repo_gate_clip(text: Optional[str]) -> Optional[str]:
 
 
 def _repo_gate_binding_policy(block_policies: List[Dict]) -> Dict:
-    """The denying policy whose grace decided warn-vs-block."""
-    return min(block_policies, key=lambda p: p['grace_turns'])
+    """The policy the incident is filed against; every match denies alike."""
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident; the backend hashes it into the record's
+    identity, so a repeat is read as a redelivery and dropped. The step past the
+    last value is what guarantees that: the clock resolves to about a
+    microsecond, which two reports of one process can share."""
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
 
 
 def _repo_gate_post(body: str, api_key: str):
@@ -3294,23 +3286,16 @@ def _repo_gate_post(body: str, api_key: str):
 def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context: Dict):
     """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
     try:
-        decision = (gate or {}).get('decision')
-        if decision not in ('warn', 'deny'):
+        if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
         api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
-        # WARN reports how far into the grace it got; BLOCK reports the whole grace.
-        grace = policy.get('grace_turns')
-        remaining = gate.get('remaining')
-        if isinstance(grace, bool) or not isinstance(grace, int):
-            turn = None
-        elif isinstance(remaining, int) and not isinstance(remaining, bool):
-            turn = grace - remaining
-        else:
-            turn = grace
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
         # What the call was about: its shell command, or the path it names.
         tool_input = context.get('tool_input')
         if isinstance(tool_input, dict):
@@ -3325,7 +3310,7 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
             'repo_gate': {
                 'policy_id': policy.get('id'),
                 'repository': gate.get('repo'),
-                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                'decision': 'BLOCK',
                 # Same value as the label above: the incidents page reads this one.
                 'agent': app_label,
                 'tool_name': context.get('tool_name'),
@@ -3341,7 +3326,7 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
 
 
 def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
-    """Verdict for one tool call: None allows, else deny or warn. Never raises."""
+    """Verdict for one tool call: None allows, else deny. Never raises."""
     try:
         tool_name = event.get('tool_name') or ''
         tool_input = event.get('tool_input')
@@ -3355,7 +3340,7 @@ def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
             tool_name, event.get('tool_input'), event.get('cwd')
         )
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
-        gate = _repo_gate_decide(event, block_policies, repo)
+        gate = {'decision': 'deny', 'repo': repo} if repo else None
         _repo_gate_report(gate, block_policies, {
             'app_label': _unbound_app_label(event),
             'session_id': event.get('session_id'),
@@ -3367,47 +3352,6 @@ def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
         return None
 
 
-def _repo_gate_decide(event: Dict, block_policies: List[Dict], repo: Optional[str]) -> Optional[Dict]:
-    """One grace per turn; memoizing the unknown-turn sentinel freezes grace."""
-    if not repo:
-        return None
-    grace = min(p['grace_turns'] for p in block_policies)
-    session_id = event.get('session_id')
-    state = _load_repo_gate_state(session_id)
-    turn_id = _repo_gate_turn_id(event)
-    known_turn = turn_id != REPO_GATE_UNKNOWN_TURN
-    if not known_turn or turn_id not in state['turns']:
-        if state['used'] >= grace:
-            return {'decision': 'deny', 'repo': repo}
-        state['used'] += 1
-        if known_turn:
-            state['turns'].append(turn_id)
-        _save_repo_gate_state(session_id, state)
-    return {
-        'decision': 'warn',
-        'repo': repo,
-        'remaining': max(0, grace - state['used']),
-    }
-
-
-def _with_repo_gate_context(response: Dict, context: str) -> Dict:
-    """Append the gate's warning; additive, so a real block is never downgraded."""
-    if not context:
-        return response
-    merged = dict(response or {})
-    hook_output = dict(merged.get('hookSpecificOutput') or {})
-    hook_output['hookEventName'] = 'PreToolUse'
-    existing = hook_output.get('additionalContext') or ''
-    hook_output['additionalContext'] = (
-        existing + '\n\n' + context if existing else context
-    )
-    merged['hookSpecificOutput'] = hook_output
-    # additionalContext feeds the model; systemMessage shows the developer the same text.
-    merged['systemMessage'] = (
-        merged['systemMessage'] + '\n\n' + context
-        if merged.get('systemMessage') else context
-    )
-    return merged
 def _prompt_injection_metadata(event: Dict) -> Dict:
     """Facts a USER_PROMPT skill policy is decided against. Nothing in here may
     raise: a prompt submission must not fail over a marker file."""
@@ -3562,11 +3506,11 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
+    user_prompts = []
     assistant_tool_uses = []
 
-    user_prompt = None
     prompt_cwd = None
     session_id = None
     permission_mode = None
@@ -3588,10 +3532,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
             if prompt:
-                user_prompt = prompt
                 # The prompt's own cwd beats the session cwd for resolving a
-                # repo-level skill when the agent was opened at a parent dir.
+                # repo-level skill when the agent was opened at a parent dir. Held per
+                # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
+                user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
@@ -3626,14 +3571,34 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     tool_use_entry['skill_path'] = skill_path
             assistant_tool_uses.append(tool_use_entry)
     
+    # A queued prompt is consumed into this turn without its own submit event, so it is
+    # carried here rather than read from the events above. It was typed after the prompt
+    # that opened the turn, so it belongs at the end. Its queue record carries no directory,
+    # so a repo-scoped skill in it is resolvable only when the turn used exactly one; where
+    # they differ there is nothing to attribute it to and it is left unresolved.
+    first_queued = len(user_prompts)
+    for queued in queued_prompts or []:
+        user_prompts.append((queued, None))
+
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
-    if user_prompt and user_prompt.startswith('/'):
-        typed = user_prompt[1:].split(None, 1)
+    for index, (typed_prompt, typed_cwd) in enumerate(user_prompts):
+        if not typed_prompt.startswith('/'):
+            continue
+        if index >= first_queued:
+            # A queued prompt's record names no directory, and every directory in reach
+            # belongs to some other event, so a repo-scoped skill here can only be guessed
+            # at. It is left unresolved: an absent skill_path is recoverable, a confidently
+            # wrong one is not. The prompt text still reaches the turn.
+            continue
+        typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
-        typed_path = _resolve_skill_path(typed_skill, prompt_cwd or cwd)
+        if '/' in typed_skill or '\\' in typed_skill or '..' in typed_skill:
+            # A skill name is a bare identifier; anything path-shaped is not one.
+            continue
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,
@@ -3650,6 +3615,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'skill_path': typed_path,
             })
 
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
@@ -3738,6 +3705,24 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
     return False
 
 
+def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach each session's most recent Stop when trimming dropped it. That Stop is the
+    next turn's accounting floor, and losing it silently reopens the gap it closes."""
+    have = {id(log) for log in kept}
+    restored = []
+    for session_id in {log.get('session_id') for log in kept if log.get('session_id')}:
+        latest = None
+        for log in logs:
+            if log.get('session_id') != session_id:
+                continue
+            name = (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+            if name == 'Stop':
+                latest = log
+        if latest is not None and id(latest) not in have:
+            restored.append(latest)
+    return restored + kept if restored else kept
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
@@ -3759,9 +3744,9 @@ def cleanup_old_logs():
             log for log in logs
             if log.get('session_id') == most_recent_session
         ]
-        save_logs(kept_logs)
+        save_logs(_keep_latest_stop(logs, kept_logs))
     elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        save_logs(_keep_latest_stop(logs, logs[-AUDIT_LOG_TOTAL_LIMIT:]))
 
 
 def process_stop_event(event: Dict, api_key: str):
@@ -3775,6 +3760,9 @@ def process_stop_event(event: Dict, api_key: str):
     current_conversation_started = False
     user_prompt_timestamp = None
     stop_timestamp = None
+    previous_stop = None
+    submitted_prompts = []
+    prompt_opens_turn = True
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -3783,23 +3771,51 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                session_events = [log]
+                # Typing while Claude is still working produces one turn carrying several
+                # prompts. Only the first opens the turn; the rest join it, so neither their
+                # text nor the tool calls they already caused are discarded.
+                if prompt_opens_turn:
+                    session_events = []
+                    prompt_opens_turn = False
                 current_conversation_started = True
-                user_prompt_timestamp = log.get('timestamp')
-            elif current_conversation_started:
                 session_events.append(log)
+                prompt_text = (log.get('event') or log).get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
+            else:
+                if current_conversation_started:
+                    session_events.append(log)
+                # Tracked whether or not a turn is open: a Stop retained past log trimming
+                # arrives before this turn's prompt and is still the boundary. This Stop is
+                # already logged, so the one before it marks how far the last upload
+                # reported; subagent work landing between the two is this turn's.
                 if event_name == 'Stop':
+                    previous_stop = stop_timestamp
                     stop_timestamp = log.get('timestamp')
+                    prompt_opens_turn = True
+
+    # Anchor on the first prompt of the turn: anchoring on the last would start the token
+    # window after work the earlier prompt had already caused.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
 
     transcript_assistant_messages = []
+    transcript_queued_prompts = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
-        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
+        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
+                                                subagent_floor=previous_stop,
+                                                subagent_ceiling=stop_timestamp)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
         ]
+        transcript_queued_prompts = transcript_data.get('queued_prompts') or []
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
 
@@ -3819,6 +3835,7 @@ def process_stop_event(event: Dict, api_key: str):
         request_initialized=user_prompt_timestamp,
         request_completed=request_completed,
         cwd=event.get('cwd'),
+        queued_prompts=transcript_queued_prompts,
     )
 
     if exchange:

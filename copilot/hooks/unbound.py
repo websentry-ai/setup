@@ -127,11 +127,8 @@ SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
-# Repo-scope gate. Grace is session-scoped: an advisory nudge, not an audit trail.
-REPO_GATE_STATE_FILE = LOG_DIR / ".repo_gate_state.json"
-REPO_GATE_TURN_MEMORY = 20
-# _repo_gate_turn_id's unknown-turn answer, not an identity: never memoize it.
-REPO_GATE_UNKNOWN_TURN = '_session_turn'
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -619,9 +616,9 @@ def get_forwarded_state(session_id):
     the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
     the integrity backstop. Keyed on bare ids only for that reason (never trusted for
     enforcement)."""
-    sent, last_sig = set(), None
+    sent, last_sig, prompted = set(), None, set()
     if not session_id:
-        return sent, last_sig
+        return sent, last_sig, prompted
     for log in load_existing_logs():
         event = log.get('event', {})
         if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
@@ -634,10 +631,17 @@ def get_forwarded_state(session_id):
         sig = event.get('text_sig')
         if sig:
             last_sig = sig
-    return sent, last_sig
+        # Advisory like the tool ids above, and with the same caveat: a local writer could
+        # seed these to keep prompt text out of an exchange. The hook already runs as the
+        # user, who can equally edit the transcript it reads, so this adds no exposure --
+        # the gateway's server-side record is the integrity backstop.
+        prompt_ids = event.get('forwarded_prompt_ids')
+        if isinstance(prompt_ids, list):
+            prompted.update(prompt_ids)
+    return sent, last_sig, prompted
 
 
-def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -647,6 +651,7 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
     if not session_id:
         return
     merged = set(tool_ids or ())
+    merged_prompts = set(prompt_ids or ())
     kept = []
     for log in load_existing_logs():
         ev = log.get('event', {})
@@ -655,6 +660,9 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
             ids = ev.get('forwarded_tool_ids')
             if isinstance(ids, list):
                 merged.update(ids)
+            old_prompts = ev.get('forwarded_prompt_ids')
+            if isinstance(old_prompts, list):
+                merged_prompts.update(old_prompts)
             if text_sig is None:
                 text_sig = ev.get('text_sig')  # carry forward the last known text sig
             continue  # drop the old marker; a fresh consolidated one is appended below
@@ -665,6 +673,7 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
             'hook_event_name': FORWARDED_TOOLS_EVENT,
             'session_id': session_id,
             'forwarded_tool_ids': sorted(merged),
+            'forwarded_prompt_ids': sorted(merged_prompts),
             'text_sig': text_sig,
         },
     })
@@ -707,21 +716,28 @@ def get_session_start_model(session_id):
     return found
 
 
-def get_last_user_prompt_timestamp_for_session(session_id):
-    """Latest UserPromptSubmit audit-log timestamp; turn start."""
+def get_turn_start_timestamp_for_session(session_id):
+    """First UserPromptSubmit of the turn; turn start. Typing while Copilot is still
+    working adds prompts to the running turn, and anchoring on the last would start the
+    turn after work the earlier prompt had already caused. The Stop being handled is
+    already logged, so the turn it closed is reported through completed_start."""
     if not session_id:
         return None
-    found = None
+    turn_start = None
+    completed_start = None
     for log in load_existing_logs():
         event = log.get('event', {})
-        if event.get('hook_event_name') != 'UserPromptSubmit':
-            continue
         if event.get('session_id') != session_id:
             continue
-        ts = log.get('timestamp')
-        if ts:
-            found = ts
-    return found
+        name = event.get('hook_event_name')
+        if name == 'UserPromptSubmit':
+            if turn_start is None:
+                turn_start = log.get('timestamp')
+        elif name == 'Stop':
+            if turn_start is not None:
+                completed_start = turn_start
+            turn_start = None
+    return turn_start or completed_start
 
 
 def _build_user_prompt_payload(recent_user_prompts):
@@ -1373,18 +1389,13 @@ def transform_response_for_copilot_prompt(api_response):
 def process_pre_tool_use(event, api_key):
     """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them."""
     gate = _repo_gate_evaluate(event)
-    if gate and gate['decision'] == 'deny':
+    if gate:
         return transform_response_for_copilot({
             'decision': 'deny',
             'reason': _repo_gate_block_reason(gate['repo']),
             'additionalContext': REPO_GATE_BLOCK_CONTEXT,
         })
-    response = _evaluate_pre_tool_use_policies(event, api_key)
-    if gate:
-        return _with_repo_gate_context(
-            response, _repo_gate_warning(gate['repo'], gate['remaining'])
-        )
-    return response
+    return _evaluate_pre_tool_use_policies(event, api_key)
 
 
 def _evaluate_pre_tool_use_policies(event, api_key):
@@ -1944,9 +1955,6 @@ def _repo_gate_block_policies(policies):
     for policy in policies or []:
         if not isinstance(policy, dict):
             continue
-        grace = policy.get('grace_turns')
-        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
-            continue
         org = policy.get('github_org')
         if not isinstance(org, str) or not org.strip():
             continue
@@ -2016,63 +2024,6 @@ def _repo_gate_session_id(event):
     return event.get('session_id') or event.get('sessionId')
 
 
-def _repo_gate_turn_id(event):
-    """Turn identity so one turn burns one grace; the prompt's logged timestamp."""
-    started = get_last_user_prompt_timestamp_for_session(
-        _repo_gate_session_id(event))
-    if started:
-        return 't-%s' % started
-    return REPO_GATE_UNKNOWN_TURN
-
-
-def _load_repo_gate_state(session_id):
-    """Grace state, keyed on session; anything unreadable reads as unused grace."""
-    fresh = {'used': 0, 'turns': []}
-    try:
-        with open(REPO_GATE_STATE_FILE, 'r', encoding='utf-8') as f:
-            state = json.loads(f.read())
-        if not isinstance(state, dict) or state.get('session_id') != session_id:
-            return fresh
-        used = state.get('used')
-        turns = state.get('turns')
-        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
-            return fresh
-        if not isinstance(turns, list):
-            return fresh
-        return {'used': used, 'turns': [t for t in turns if isinstance(t, str)]}
-    except (OSError, ValueError):
-        return fresh
-
-
-def _save_repo_gate_state(session_id, state):
-    """Atomic replace, so parallel calls in one turn cannot leave a torn file."""
-    try:
-        REPO_GATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({
-            'session_id': session_id,
-            'used': state['used'],
-            'turns': state['turns'][-REPO_GATE_TURN_MEMORY:],
-        })
-        tmp = REPO_GATE_STATE_FILE.parent / ('.repo_gate.%d.tmp' % os.getpid())
-        tmp.write_text(payload, encoding='utf-8')
-        os.replace(str(tmp), str(REPO_GATE_STATE_FILE))
-    except Exception:
-        pass
-
-
-def _repo_gate_warning(repo, remaining):
-    if remaining <= 0:
-        tail = 'This is the final warning — the next turn touching an out-of-scope repository will be blocked.'
-    elif remaining == 1:
-        tail = '1 warning left before out-of-scope repositories are blocked.'
-    else:
-        tail = '%d warnings left before out-of-scope repositories are blocked.' % remaining
-    return (
-        'Unbound repository policy: this action works in "%s", which is outside '
-        'your organization\'s allowed repository scope. %s' % (repo, tail)
-    )
-
-
 def _repo_gate_block_reason(repo):
     return (
         'Blocked by organization policy. "%s" is outside your organization\'s '
@@ -2095,8 +2046,27 @@ def _repo_gate_clip(text):
 
 
 def _repo_gate_binding_policy(block_policies):
-    """The denying policy whose grace decided warn-vs-block."""
-    return min(block_policies, key=lambda p: p['grace_turns'])
+    """The policy the incident is filed against; every match denies alike."""
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident; the backend hashes it into the record's
+    identity, so a repeat is read as a redelivery and dropped. The step past the
+    last value is what guarantees that: the clock resolves to about a
+    microsecond, which two reports of one process can share."""
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
 
 
 def _repo_gate_post(body, api_key):
@@ -2116,23 +2086,16 @@ def _repo_gate_post(body, api_key):
 def _repo_gate_report(gate, block_policies, context):
     """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
     try:
-        decision = (gate or {}).get('decision')
-        if decision not in ('warn', 'deny'):
+        if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
         api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
-        # WARN reports how far into the grace it got; BLOCK reports the whole grace.
-        grace = policy.get('grace_turns')
-        remaining = gate.get('remaining')
-        if isinstance(grace, bool) or not isinstance(grace, int):
-            turn = None
-        elif isinstance(remaining, int) and not isinstance(remaining, bool):
-            turn = grace - remaining
-        else:
-            turn = grace
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
         # What the call was about: its shell command, or the path it names.
         tool_input = context.get('tool_input')
         if isinstance(tool_input, dict):
@@ -2147,7 +2110,7 @@ def _repo_gate_report(gate, block_policies, context):
             'repo_gate': {
                 'policy_id': policy.get('id'),
                 'repository': gate.get('repo'),
-                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                'decision': 'BLOCK',
                 # Same value as the label above: the incidents page reads this one.
                 'agent': app_label,
                 'tool_name': context.get('tool_name'),
@@ -2163,7 +2126,7 @@ def _repo_gate_report(gate, block_policies, context):
 
 
 def _repo_gate_evaluate(event):
-    """Verdict for one tool call: None allows, else deny or warn. Never raises."""
+    """Verdict for one tool call: None allows, else deny. Never raises."""
     try:
         canonical = canonical_tool_name(
             event.get('tool_name') or event.get('toolName') or '')
@@ -2178,7 +2141,7 @@ def _repo_gate_evaluate(event):
         candidates = _repo_gate_candidates(
             canonical, tool_input, event.get('cwd'))
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
-        gate = _repo_gate_decide(event, block_policies, repo)
+        gate = {'decision': 'deny', 'repo': repo} if repo else None
         _repo_gate_report(gate, block_policies, {
             'app_label': 'copilot',
             'session_id': event.get('session_id'),
@@ -2188,44 +2151,6 @@ def _repo_gate_evaluate(event):
         return gate
     except Exception:
         return None
-
-
-def _repo_gate_decide(event, block_policies, repo):
-    """One grace per turn; memoizing the unknown-turn sentinel freezes grace."""
-    if not repo:
-        return None
-    grace = min(p['grace_turns'] for p in block_policies)
-    session_id = _repo_gate_session_id(event)
-    state = _load_repo_gate_state(session_id)
-    turn_id = _repo_gate_turn_id(event)
-    known_turn = turn_id != REPO_GATE_UNKNOWN_TURN
-    if not known_turn or turn_id not in state['turns']:
-        if state['used'] >= grace:
-            return {'decision': 'deny', 'repo': repo}
-        state['used'] += 1
-        if known_turn:
-            state['turns'].append(turn_id)
-        _save_repo_gate_state(session_id, state)
-    return {
-        'decision': 'warn',
-        'repo': repo,
-        'remaining': max(0, grace - state['used']),
-    }
-
-
-def _with_repo_gate_context(response, context):
-    """Append the gate's warning; additive, so a real block is never downgraded."""
-    if not context:
-        return response
-    merged = dict(response or {})
-    hook_output = dict(merged.get('hookSpecificOutput') or {})
-    hook_output['hookEventName'] = 'PreToolUse'
-    existing = hook_output.get('additionalContext') or ''
-    hook_output['additionalContext'] = (
-        existing + '\n\n' + context if existing else context
-    )
-    merged['hookSpecificOutput'] = hook_output
-    return merged
 
 
 def _normalize_arguments(arguments):
@@ -2342,7 +2267,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
 
 
 def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None,
-                                   cwd=None, already_forwarded=None):
+                                   cwd=None, already_forwarded=None, already_prompted=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
 
     `cwd` (the hook event's working directory) seeds shell-dir tracking for
@@ -2358,8 +2283,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     toolCallIds included this time and text_sig fingerprints the turn's text — the caller
     records them only after a successful send, so a failed send simply retries."""
     already_forwarded = already_forwarded or set()
+    already_prompted = already_prompted or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None, set(), None
+        return None, set(), None, set()
 
     entries = []
     try:
@@ -2373,7 +2299,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None, set(), None
+        return None, set(), None, set()
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -2383,7 +2309,13 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         p = Path(transcript_path)
         conversation_id = p.parent.name if p.stem == 'events' else p.stem
     model = None
-    last_user_index = -1
+    turn_start_index = -1
+    turn_prompts = []
+    turn_prompt_ids = set()
+    # The turn is every prompt not yet reported. Position in the transcript cannot decide
+    # this: a prompt typed mid-turn lands inside the open agent turn in the CLI and outside
+    # it in VS Code, and Copilot narrates progress as assistant text, so neither the agent
+    # turn nor the assistant messages mark a boundary.
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -2399,24 +2331,38 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             if new_model:
                 model = new_model
         elif entry_type == 'user.message':
-            last_user_index = i
+            content = data.get('content')
+            # An entry without an envelope id still has to be watermarked, or every later
+            # Stop re-selects it and re-uploads its text with the current turn. Keyed the
+            # same way turn_id is when its id is missing.
+            message_id = entry.get('id') or 'unb-' + hashlib.sha256(
+                ('%s\x1f%d\x1f%s' % (conversation_id or '', i, content or ''))
+                .encode('utf-8', 'replace')).hexdigest()[:24]
+            if message_id in already_prompted:
+                continue
+            if turn_start_index < 0:
+                turn_start_index = i
+            if content:
+                turn_prompts.append(content)
+            turn_prompt_ids.add(message_id)
 
-    if last_user_index < 0:
-        return None, set(), None
+    if turn_start_index < 0:
+        return None, set(), None, set()
 
-    user_prompt = (entries[last_user_index].get('data') or {}).get('content')
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(turn_prompts) or None
     # Envelope id of this turn's user message: unique even when two turns
     # carry identical text, unlike a hash of that text.
-    turn_id = entries[last_user_index].get('id') or ''
+    turn_id = entries[turn_start_index].get('id') or ''
     if not turn_id:
         # text_sig grows as assistant text accumulates, so it changes between
         # Stops of one turn and would defeat the watermark. The user prompt does
         # not change mid-turn, so hash that instead.
-        # last_user_index is the turn's position in the session: fixed while a
+        # turn_start_index is the turn's position in the session: fixed while a
         # turn's assistant text grows, and different for a later turn even when
         # its prompt is identical.
         turn_id = hashlib.sha256(
-            ('%s\x1f%s\x1f%s' % (conversation_id or '', last_user_index, user_prompt or '')
+            ('%s\x1f%s\x1f%s' % (conversation_id or '', turn_start_index, user_prompt or '')
              ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
@@ -2430,7 +2376,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             tool_calls.append(call_id)
         return tool_data[call_id]
 
-    for entry in entries[last_user_index + 1:]:
+    for entry in entries[turn_start_index + 1:]:
         if not isinstance(entry, dict):
             continue
         entry_type = entry.get('type')
@@ -2540,7 +2486,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None, set(), None
+        return None, set(), None, set()
 
     return {
         'conversation_id': conversation_id,
@@ -2550,7 +2496,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-    }, forwarded_now, text_sig
+    }, forwarded_now, text_sig, turn_prompt_ids
 
 
 def send_to_api(exchange, api_key):
@@ -2893,7 +2839,6 @@ def main():
             return
 
         if event_name == 'UserPromptSubmit':
-            # Logged before anything else: this timestamp IS the repo gate's turn id, and logging later would burn a second grace.
             append_to_audit_log({
                 'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
                 'event': event,
@@ -2916,19 +2861,20 @@ def main():
             # Watermark key mirrors the exchange's session fallback, so get/record stay
             # consistent even when the Stop payload omits session_id.
             wm_key = stop_session_key(event)
-            already_forwarded, last_text_sig = get_forwarded_state(wm_key)
-            exchange, forwarded_now, text_sig = build_exchange_from_transcript(
+            already_forwarded, last_text_sig, already_prompted = get_forwarded_state(wm_key)
+            exchange, forwarded_now, text_sig, prompts_now = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
                 cwd=event.get('cwd'),
                 already_forwarded=already_forwarded,
+                already_prompted=already_prompted,
             )
             # Send only when there is something new -- new tool calls OR new assistant
             # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
             # (even with no new tools) is still sent and logged.
             if exchange and (forwarded_now or text_sig != last_text_sig):
                 # Turn boundaries from event-fire times
-                request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
+                request_initialized = get_turn_start_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
@@ -2936,7 +2882,7 @@ def main():
                 # (the backend dedups). Updates the text signature too, even with no new
                 # tools, so an unchanged later Stop becomes a no-op.
                 if send_to_api(exchange, api_key):
-                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig)
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
