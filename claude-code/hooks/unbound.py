@@ -572,13 +572,19 @@ def _subagent_dir(transcript_path: str) -> Optional[str]:
 
 
 def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict,
-                         subagent_floor: Optional[str] = None) -> None:
+                         subagent_floor: Optional[str] = None, subagent_ceiling: Optional[str] = None) -> None:
     """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to a
     subagents/ dir, never the main transcript the Stop event points at, so their tokens
     would otherwise be dropped. Scoped from the previous Stop rather than this turn's
     prompt: a subagent outlives the turn that launched it, and what it spends between the
-    two belongs to neither turn under a prompt-anchored floor."""
+    two belongs to neither turn under a prompt-anchored floor. Bounded above by this turn's
+    Stop, which is the next turn's floor, so an entry flushed just after it is billed once."""
     floor = subagent_floor or user_prompt_timestamp
+    # A streamed assistant message is written as several lines under one id, and its usage
+    # grows with each. Window it on its first line so a message spanning a Stop is billed to
+    # one turn instead of counted whole by both.
+    collected = []
+    first_seen = {}
     try:
         subdir = _subagent_dir(transcript_path)
         names = []
@@ -602,14 +608,26 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                     entry = progress or entry
                     if progress is None and entry.get('type') != 'assistant':
                         continue
+                    message = entry.get('message') or {}
                     ts = entry.get('timestamp')
-                    # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
-                    if floor and not _ts_lt(floor, ts):
-                        continue
-                    _record_usage(entry, entry.get('message') or {}, usage_by_key)
+                    message_id = message.get('id')
+                    if message_id:
+                        earliest = first_seen.get(message_id)
+                        if earliest is None or _ts_lt(ts, earliest):
+                            first_seen[message_id] = ts
+                    collected.append((message_id, ts, entry, message))
         except Exception as e:
             log_error(f"subagent usage: failed reading {name}: {e}", 'usage')
             continue
+
+    for message_id, ts, entry, message in collected:
+        anchor = first_seen.get(message_id, ts) if message_id else ts
+        # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
+        if floor and not _ts_lt(floor, anchor):
+            continue
+        if subagent_ceiling and _ts_lt(subagent_ceiling, anchor):
+            continue
+        _record_usage(entry, message, usage_by_key)
 
 
 def _typed_user_text(entry: Dict) -> str:
@@ -635,7 +653,8 @@ def _typed_user_text(entry: Dict) -> str:
 
 
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
-                          include_usage: bool = True, subagent_floor: Optional[str] = None) -> Dict:
+                          include_usage: bool = True, subagent_floor: Optional[str] = None,
+                          subagent_ceiling: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
         'assistant_messages': [],
@@ -703,7 +722,8 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
     if include_usage:
         try:
-            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor)
+            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor,
+                                 subagent_ceiling)
             for msg_usage, _ in usage_by_key.values():
                 for k in usage:
                     usage[k] += _usage_value(msg_usage, k)
@@ -3747,6 +3767,24 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
     return False
 
 
+def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach each session's most recent Stop when trimming dropped it. That Stop is the
+    next turn's accounting floor, and losing it silently reopens the gap it closes."""
+    have = {id(log) for log in kept}
+    restored = []
+    for session_id in {log.get('session_id') for log in kept if log.get('session_id')}:
+        latest = None
+        for log in logs:
+            if log.get('session_id') != session_id:
+                continue
+            name = (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+            if name == 'Stop':
+                latest = log
+        if latest is not None and id(latest) not in have:
+            restored.append(latest)
+    return restored + kept if restored else kept
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
@@ -3768,9 +3806,9 @@ def cleanup_old_logs():
             log for log in logs
             if log.get('session_id') == most_recent_session
         ]
-        save_logs(kept_logs)
+        save_logs(_keep_latest_stop(logs, kept_logs))
     elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        save_logs(_keep_latest_stop(logs, logs[-AUDIT_LOG_TOTAL_LIMIT:]))
 
 
 def process_stop_event(event: Dict, api_key: str):
@@ -3806,11 +3844,14 @@ def process_stop_event(event: Dict, api_key: str):
                 prompt_text = (log.get('event') or log).get('prompt')
                 if prompt_text:
                     submitted_prompts.append((log.get('timestamp'), prompt_text))
-            elif current_conversation_started:
-                session_events.append(log)
+            else:
+                if current_conversation_started:
+                    session_events.append(log)
+                # Tracked whether or not a turn is open: a Stop retained past log trimming
+                # arrives before this turn's prompt and is still the boundary. This Stop is
+                # already logged, so the one before it marks how far the last upload
+                # reported; subagent work landing between the two is this turn's.
                 if event_name == 'Stop':
-                    # This Stop is already logged, so the one before it marks how far the last
-                    # upload reported; subagent work landing between the two is this turn's.
                     previous_stop = stop_timestamp
                     stop_timestamp = log.get('timestamp')
                     prompt_opens_turn = True
@@ -3829,7 +3870,8 @@ def process_stop_event(event: Dict, api_key: str):
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
         transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
-                                                subagent_floor=previous_stop)
+                                                subagent_floor=previous_stop,
+                                                subagent_ceiling=stop_timestamp)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')

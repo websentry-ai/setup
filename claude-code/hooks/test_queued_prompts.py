@@ -70,9 +70,11 @@ class TestStopEventTurnAssembly(unittest.TestCase):
     def setUp(self):
         self.captured = {}
 
-        def fake_parse(path, prompt_timestamp=None, include_usage=True, subagent_floor=None):
+        def fake_parse(path, prompt_timestamp=None, include_usage=True,
+                       subagent_floor=None, subagent_ceiling=None):
             self.captured["anchor"] = prompt_timestamp
             self.captured["floor"] = subagent_floor
+            self.captured["ceiling"] = subagent_ceiling
             return {"assistant_messages": [], "usage": None, "model": None}
 
         real_build = unbound.build_llm_exchange
@@ -122,6 +124,12 @@ class TestStopEventTurnAssembly(unittest.TestCase):
                          _log("Stop", "2026-08-20T10:00:50Z")])
         self.assertEqual(out["anchor"], THIRD_PROMPT)
         self.assertEqual(_user_messages(out["exchange"]), ["new a\n\nnew b"])
+
+    def test_window_is_bounded_by_this_turns_stop(self):
+        out = self._run([_log("UserPromptSubmit", FIRST_PROMPT, prompt="first"),
+                         _log("UserPromptSubmit", SECOND_PROMPT, prompt="second"),
+                         _log("Stop", FIRST_STOP)])
+        self.assertEqual(out["ceiling"], FIRST_STOP)
 
     def test_single_prompt_turn_is_unchanged(self):
         out = self._run([_log("UserPromptSubmit", FIRST_PROMPT, prompt="only"),
