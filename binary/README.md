@@ -9,6 +9,7 @@ unbound-hook hook <tool> [<event>]     # claude-code | cursor | copilot | codex
 unbound-hook setup --api-key <admin_key> [--discovery-key <key>]
                    [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]
                    [--app_name <name>] [--backfill] [--tools t1,t2]
+                   [--skip-managed-settings]
 unbound-hook backfill (--all | --user <name>) [--dry-run] [--tools claude-code,codex]
 unbound-hook clear
 unbound-hook --version                 # pkg postinstall pre-warm contract

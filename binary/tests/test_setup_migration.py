@@ -577,3 +577,111 @@ def test_clear_removes_hook_logs(env):
         assert not (hooks_dir / "error.log").exists(), tool
     # The Windows machine-wide placeholder (None home) must be a safe no-op.
     env["modules"]["claude-code"].remove_hook_logs_for_user(None, None)
+
+
+# ---------------------------------------------------------------------------
+# --skip-managed-settings: install the hook, let the org's remote Claude Code
+# policy own the hook config, and take our entries back out of the local file.
+# ---------------------------------------------------------------------------
+
+def test_skip_managed_settings_writes_no_hook_config(env):
+    """No settings file exists and none is created; the flag only ever removes."""
+    m = env["modules"]["claude-code"]
+    rc = setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                        "--skip-managed-settings"])
+    assert rc == 0
+    assert not (m.get_managed_settings_dir() / "managed-settings.json").exists()
+
+
+def test_skip_managed_settings_strips_ours_keeps_foreign(env):
+    """Our binary-form and python-era entries go; org policy and foreign hooks stay."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    settings_path = managed / "managed-settings.json"
+    foreign_cmd = "/usr/local/bin/org-audit-hook"
+    python_era = f'"{managed / "hooks" / "unbound.py"}"'
+    settings_path.write_text(json.dumps({
+        "permissions": {"deny": ["Bash(rm:*)"]},
+        "hooks": {
+            "PreToolUse": [{"matcher": "*", "hooks": [
+                {"type": "command", "command": _cmd("claude-code", "PreToolUse")},
+                {"type": "command", "command": foreign_cmd},
+            ]}],
+            "Stop": [{"hooks": [{"type": "command", "command": python_era}]}],
+        },
+    }, indent=2))
+    assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                          "--skip-managed-settings"]) == 0
+    result = json.loads(settings_path.read_text())
+    assert result["permissions"] == {"deny": ["Bash(rm:*)"]}
+    assert "unbound" not in json.dumps(result["hooks"]).lower()
+    cmds = [h["command"] for grp in result["hooks"]["PreToolUse"] for h in grp["hooks"]]
+    assert cmds == [foreign_cmd]
+
+
+def test_skip_managed_settings_keeps_the_file_when_emptied(env):
+    """A file holding only our hooks is left in place as {} — their MDM may own it."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    settings_path = managed / "managed-settings.json"
+    settings_path.write_text(json.dumps({"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": _cmd("claude-code", "Stop")}]}]}}))
+    assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                          "--skip-managed-settings"]) == 0
+    assert settings_path.exists(), "the file must survive; only our lines go"
+    assert json.loads(settings_path.read_text()) == {}
+
+
+def test_skip_managed_settings_keeps_python_era_script(env):
+    """The stale-script sweep is skipped: a remote policy may still name it."""
+    m = env["modules"]["claude-code"]
+    script = m.get_managed_settings_dir() / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# python-era hook\n")
+    assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                          "--skip-managed-settings"]) == 0
+    assert script.is_file(), "deleting it would strand a remote policy pointing here"
+
+
+def test_default_run_still_removes_python_era_script(env):
+    """Without the flag the sweep is unchanged."""
+    m = env["modules"]["claude-code"]
+    script = m.get_managed_settings_dir() / "hooks" / "unbound.py"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("# python-era hook\n")
+    assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code"]) == 0
+    assert not script.exists()
+    assert (m.get_managed_settings_dir() / "managed-settings.json").exists()
+
+
+def test_skip_managed_settings_prints_every_remote_policy_command(env, capsys):
+    """The admin needs all six commands; the binary's differ per event."""
+    setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                   "--skip-managed-settings"])
+    out = capsys.readouterr().out
+    for event in ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop",
+                  "SessionStart", "SessionEnd"):
+        assert _cmd("claude-code", event) in out, f"{event} command not printed"
+
+
+def test_skip_managed_settings_install_state_never_tampered(env):
+    """With no config of ours, a stripped file must not read as tampered."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    settings_path = managed / "managed-settings.json"
+    settings_path.write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
+    assert setup_cmd._detect_state(settings_path, skip_settings=True) == "fresh"
+    assert setup_cmd._detect_state(settings_path) == "tampered"
+    settings_path.write_text(json.dumps({"hooks": {"Stop": [
+        {"hooks": [{"type": "command", "command": _cmd("claude-code", "Stop")}]}]}}))
+    assert setup_cmd._detect_state(settings_path, skip_settings=True) == "persisted"
+
+
+def test_skip_managed_settings_flag_is_accepted_by_the_parser(env):
+    """The parser rejects unknown args outright, so the flag must be declared."""
+    opts = setup_cmd._parse_args(["--api-key", "k", "--skip-managed-settings"])
+    assert opts is not None and opts["skip_managed_settings"] is True
+    assert setup_cmd._parse_args(["--api-key", "k"])["skip_managed_settings"] is False

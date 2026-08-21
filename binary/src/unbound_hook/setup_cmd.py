@@ -40,6 +40,7 @@ USAGE = (
     "Usage: unbound-hook setup --api-key <admin_key> [--discovery-key <key>]\n"
     "           [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]\n"
     "           [--app_name <name>] [--backfill] [--tools t1,t2,...]\n"
+    "           [--skip-managed-settings]\n"
 )
 
 
@@ -52,6 +53,7 @@ def _parse_args(argv):
         "frontend_url": None,
         "app_name": None,
         "backfill": False,
+        "skip_managed_settings": False,
         "tools": list(SETUP_TOOLS),
     }
     i = 0
@@ -71,6 +73,8 @@ def _parse_args(argv):
             opts["app_name"] = argv[i + 1]; i += 2
         elif a == "--backfill":
             opts["backfill"] = True; i += 1
+        elif a == "--skip-managed-settings":
+            opts["skip_managed_settings"] = True; i += 1
         elif a == "--tools" and i + 1 < len(argv):
             opts["tools"] = [t.strip() for t in argv[i + 1].split(",") if t.strip()]
             i += 2
@@ -95,20 +99,22 @@ def _normalized_urls(m, opts):
     return base, gateway
 
 
-def _detect_state(settings_path: Path):
+def _detect_state(settings_path: Path, skip_settings: bool = False):
     """Binary-era analog of the python detect_install_state(): the python
     version checked managed unbound.py existence, which no longer exists.
     'persisted' = settings present and pointing at this binary OR at the
     python-era unbound.py (a legitimate install being migrated — reporting
     those as 'tampered' would flood the backend with false tamper signals on
-    rollout day); 'tampered' = settings present referencing neither."""
+    rollout day); 'tampered' = settings present referencing neither. With
+    skip_settings we own no config file, so a file we already stripped is
+    indistinguishable from a tampered one: report 'fresh' instead."""
     try:
         if not settings_path.exists():
             return "fresh"
         text = settings_path.read_text(encoding="utf-8")
         if str(HOOK_BINARY) in text or "unbound.py" in text:
             return "persisted"
-        return "tampered"
+        return "fresh" if skip_settings else "tampered"
     except Exception as e:
         # None = "unknown" — notify_setup_complete omits the field entirely,
         # which is more honest than guessing 'fresh' over an unreadable but
@@ -250,13 +256,38 @@ def _copilot_hooks_config():
     return {"version": 1, "hooks": hooks}
 
 
-def _write_claude_managed_settings(m) -> bool:
+def _print_remote_policy_hooks() -> None:
+    """One command per event, unlike the python path's single script path —
+    an admin authoring the remote policy needs every one of them."""
+    print("Add these to your remote Claude Code policy:")
+    for event, entries in _claude_hooks_config().items():
+        for entry in entries:
+            for hook in entry.get("hooks", []):
+                print(f"  {event}: {hook['command']}")
+
+
+def _write_claude_managed_settings(m, skip_settings: bool = False) -> bool:
     """Binary variant of claude-code setup_managed_hooks(): same settings
-    file, same gateway-leftover cleanup, no script download."""
+    file, same gateway-leftover cleanup, no script download. With
+    skip_settings it writes no hook config and strips ours instead."""
     try:
         managed_dir = m.get_managed_settings_dir()
         managed_dir.mkdir(parents=True, exist_ok=True)
         settings_path = managed_dir / "managed-settings.json"
+
+        # No hook config of our own: the remote policy owns it. Strips through
+        # the vendored module so this path and the python one cannot drift.
+        if skip_settings:
+            stripped, strip_error = m._strip_unbound_hooks_from_settings(
+                managed_dir, managed_dir / "hooks" / "unbound.py",
+                delete_when_empty=False)
+            if stripped:
+                print("Removed Unbound hooks left behind in the local managed settings")
+            if strip_error:
+                print(f"Warning: could not strip existing Unbound hooks from {managed_dir}")
+            if platform.system().lower() in ("darwin", "linux"):
+                os.chmod(managed_dir, 0o755)
+            return True
 
         settings = {}
         if settings_path.exists():
@@ -542,10 +573,17 @@ def _setup_claude_code(opts):
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
 
-    state = _detect_state(m.get_managed_settings_dir() / "managed-settings.json")
-    if not _write_claude_managed_settings(m):
+    skip_settings = opts["skip_managed_settings"]
+    state = _detect_state(m.get_managed_settings_dir() / "managed-settings.json",
+                          skip_settings=skip_settings)
+    if not _write_claude_managed_settings(m, skip_settings=skip_settings):
         return ("deferred", "managed settings write failed")
-    _remove_stale_managed_script(m.get_managed_settings_dir())
+    if skip_settings:
+        # A remote policy may name the python script; deleting it here would
+        # strand that policy on a missing file with no local error.
+        _print_remote_policy_hooks()
+    else:
+        _remove_stale_managed_script(m.get_managed_settings_dir())
 
     m.notify_setup_complete(api_key, "claude-code", backend_url=base,
                             install_state=state, serial_number=device_id)

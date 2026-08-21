@@ -35,7 +35,7 @@ if [[ "$(uname -s)" != "Darwin" ]]; then
 fi
 
 API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
-GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0
+GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0 SKIP_MANAGED=0
 CURRENT_STEP="init"
 tmpdir=""
 # Set to 1 only on the install path right before its `exit 0`, so the EXIT
@@ -147,11 +147,12 @@ run_with_timeout() {
   return "$rc"
 }
 
-# Positional token matchers for the Jamf $4-$9 mapping: each slot accepts
+# Positional token matchers for the Jamf $4-$10 mapping: each slot accepts
 # generic booleans plus ONLY its own named token, so a value landing in the
 # wrong slot (e.g. "backfill" in the clear slot) can never trigger teardown.
 is_clear_token()    { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|clear|--clear) return 0;; *) return 1;; esac; }
 is_backfill_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|backfill|--backfill) return 0;; *) return 1;; esac; }
+is_skip_managed_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|skip-managed-settings|--skip-managed-settings) return 0;; *) return 1;; esac; }
 
 # --- Arguments: --flags for direct runs, $4-$9 positional from Jamf ----------
 CURRENT_STEP="parse_args"
@@ -162,6 +163,7 @@ if [[ $# -gt 0 && "${1:-}" != --* ]]; then
   [[ -n "${7:-}" ]] && GATEWAY_URL="$7"
   is_clear_token "${8:-}" && CLEAR=1
   is_backfill_token "${9:-}" && BACKFILL=1
+  is_skip_managed_token "${10:-}" && SKIP_MANAGED=1
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -171,6 +173,7 @@ else
       --gateway-url)   GATEWAY_URL="$2"; shift 2 ;;
       --clear)         CLEAR=1; shift ;;
       --backfill)      BACKFILL=1; shift ;;
+      --skip-managed-settings) SKIP_MANAGED=1; shift ;;
       *) echo "Unknown argument: $1" >&2; exit 2 ;;
     esac
   done
@@ -261,12 +264,14 @@ fi
 CURRENT_STEP="setup"
 backfill_flag=""
 [[ $BACKFILL -eq 1 ]] && backfill_flag="--backfill"
+skip_managed_flag=""
+[[ $SKIP_MANAGED -eq 1 ]] && skip_managed_flag="--skip-managed-settings"
 "$PREFIX/current/unbound-hook/unbound-hook" setup \
   --api-key "$API_KEY" \
   --discovery-key "$DISCOVERY_KEY" \
   --backend-url "$BACKEND_URL" \
   --gateway-url "$GATEWAY_URL" \
-  $backfill_flag
+  $backfill_flag $skip_managed_flag
 
 # Reached only when every step above (incl. the idempotent re-run skip) and
 # the runtime `setup` handoff succeeded. Mark success so the EXIT trap emits a
