@@ -1812,12 +1812,65 @@ def _project_for_paths(candidates, root_projects):
     return None
 
 
+def _cursor_user_query(text):
+    """The typed text of a Cursor transcript user entry. Cursor wraps it in <user_query>
+    alongside a <timestamp> preamble; anything unwrapped is returned as-is."""
+    if not isinstance(text, str):
+        return ''
+    start = text.find('<user_query>')
+    if start == -1:
+        return text.strip()
+    # Close on the LAST tag, not the first: the prompt itself may contain the literal
+    # token, and cutting at an interior one would drop everything the user typed after it.
+    end = text.rfind('</user_query>')
+    if end <= start:
+        return text[start + len('<user_query>'):].strip()
+    return text[start + len('<user_query>'):end].strip()
+
+
+def _cursor_turn_prompts(transcript_path):
+    """Every prompt the current turn carries, from Cursor's own transcript. A prompt typed
+    while the agent is working joins the running generation without firing
+    beforeSubmitPrompt, so the hook events alone see only the first one."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return []
+    current, completed = [], []
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('type') == 'turn_ended':
+                    completed = current
+                    current = []
+                    continue
+                if entry.get('role') != 'user':
+                    continue
+                content = (entry.get('message') or {}).get('content')
+                blocks = content if isinstance(content, list) else []
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get('type') != 'text':
+                        continue
+                    typed = _cursor_user_query(block.get('text'))
+                    if typed:
+                        current.append(typed)
+    except OSError:
+        return []
+    return current or completed
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
     assistant_tool_uses = []
     
-    user_prompt = None
+    user_prompts = []
+    transcript_path = None
     assistant_response = None
     conversation_id = None
     generation_id = None
@@ -1856,12 +1909,19 @@ def build_llm_exchange(events, api_key=None):
             user_email = event.get('user_email')
 
         if hook_event_name == 'beforeSubmitPrompt':
-            user_prompt = event.get('prompt')
-            request_initialized = log_entry.get('timestamp')
+            # A generation can carry more than one prompt when the user types while Cursor is
+            # still working. Anchor on the first; keeping the last would start the turn after
+            # work the earlier prompt had already caused.
+            prompt = event.get('prompt')
+            if prompt:
+                user_prompts.append(prompt)
+            if request_initialized is None:
+                request_initialized = log_entry.get('timestamp')
 
         elif hook_event_name == 'stop':
             request_completed = log_entry.get('timestamp')
             usage = _cursor_usage_from_event(event) or usage
+            transcript_path = event.get('transcript_path') or transcript_path
 
         elif hook_event_name == 'beforeReadFile':
             file_path = event.get('file_path')
@@ -1975,6 +2035,19 @@ def build_llm_exchange(events, api_key=None):
             assistant_response = event.get('text')
             usage = _cursor_usage_from_event(event) or usage
     
+    # Cursor's transcript carries every prompt of the turn, including one typed while the
+    # agent was working; the hook events see only those that fired beforeSubmitPrompt. The
+    # transcript is per conversation and may already hold a later turn, so it is trusted
+    # only when it opens with the prompt this generation started from.
+    transcript_prompts = _cursor_turn_prompts(transcript_path)
+    if (user_prompts and len(transcript_prompts) > len(user_prompts)
+            and transcript_prompts[:len(user_prompts)] == user_prompts):
+        # Append only what the hook did not capture. The events are the trusted text, so
+        # they are never rewritten by the transcript, only extended by it.
+        user_prompts = user_prompts + transcript_prompts[len(user_prompts):]
+
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     

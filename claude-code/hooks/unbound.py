@@ -656,6 +656,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'user_messages': [],
         'assistant_messages': [],
         'tool_uses': [],
+        'queued_prompts': [],
         'usage': None,
         'model': None,
     }
@@ -663,6 +664,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     if not transcript_path or not os.path.exists(transcript_path):
         return conversation_data
 
+    queue_floor = subagent_floor or user_prompt_timestamp
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     usage_by_key: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
@@ -681,7 +683,26 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
 
-                    if entry_type == 'user':
+                    if entry_type == 'queue-operation':
+                        # Typing while Claude is working enqueues the prompt and consumes it
+                        # into the running turn; it never becomes a user message and never
+                        # fires UserPromptSubmit, so this record is the only trace of it.
+                        # 'remove' is the consumption: a prompt taken back out for editing
+                        # leaves through 'popAll' and never ran, so it is not this turn's.
+                        if entry.get('operation') != 'remove':
+                            continue
+                        # Floored at the previous Stop, not at this turn's prompt: a queued
+                        # prompt consumed after the last turn closed and before this one was
+                        # typed would otherwise belong to neither.
+                        if queue_floor and not _ts_lt(queue_floor, entry_timestamp):
+                            continue
+                        if subagent_ceiling and _ts_lt(subagent_ceiling, entry_timestamp):
+                            continue
+                        queued = entry.get('content')
+                        if queued:
+                            conversation_data['queued_prompts'].append(queued)
+
+                    elif entry_type == 'user':
                         typed = _typed_user_text(entry)
                         if typed:
                             conversation_data['user_messages'].append({
@@ -3485,11 +3506,11 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
+    user_prompts = []
     assistant_tool_uses = []
 
-    user_prompt = None
     prompt_cwd = None
     session_id = None
     permission_mode = None
@@ -3511,10 +3532,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
             if prompt:
-                user_prompt = prompt
                 # The prompt's own cwd beats the session cwd for resolving a
-                # repo-level skill when the agent was opened at a parent dir.
+                # repo-level skill when the agent was opened at a parent dir. Held per
+                # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
+                user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
@@ -3549,14 +3571,34 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     tool_use_entry['skill_path'] = skill_path
             assistant_tool_uses.append(tool_use_entry)
     
+    # A queued prompt is consumed into this turn without its own submit event, so it is
+    # carried here rather than read from the events above. It was typed after the prompt
+    # that opened the turn, so it belongs at the end. Its queue record carries no directory,
+    # so a repo-scoped skill in it is resolvable only when the turn used exactly one; where
+    # they differ there is nothing to attribute it to and it is left unresolved.
+    first_queued = len(user_prompts)
+    for queued in queued_prompts or []:
+        user_prompts.append((queued, None))
+
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
-    if user_prompt and user_prompt.startswith('/'):
-        typed = user_prompt[1:].split(None, 1)
+    for index, (typed_prompt, typed_cwd) in enumerate(user_prompts):
+        if not typed_prompt.startswith('/'):
+            continue
+        if index >= first_queued:
+            # A queued prompt's record names no directory, and every directory in reach
+            # belongs to some other event, so a repo-scoped skill here can only be guessed
+            # at. It is left unresolved: an absent skill_path is recoverable, a confidently
+            # wrong one is not. The prompt text still reaches the turn.
+            continue
+        typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
-        typed_path = _resolve_skill_path(typed_skill, prompt_cwd or cwd)
+        if '/' in typed_skill or '\\' in typed_skill or '..' in typed_skill:
+            # A skill name is a bare identifier; anything path-shaped is not one.
+            continue
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,
@@ -3573,6 +3615,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'skill_path': typed_path,
             })
 
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
@@ -3717,6 +3761,8 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt_timestamp = None
     stop_timestamp = None
     previous_stop = None
+    submitted_prompts = []
+    prompt_opens_turn = True
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -3725,9 +3771,17 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                session_events = [log]
+                # Typing while Claude is still working produces one turn carrying several
+                # prompts. Only the first opens the turn; the rest join it, so neither their
+                # text nor the tool calls they already caused are discarded.
+                if prompt_opens_turn:
+                    session_events = []
+                    prompt_opens_turn = False
                 current_conversation_started = True
-                user_prompt_timestamp = log.get('timestamp')
+                session_events.append(log)
+                prompt_text = (log.get('event') or log).get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
             else:
                 if current_conversation_started:
                     session_events.append(log)
@@ -3738,8 +3792,19 @@ def process_stop_event(event: Dict, api_key: str):
                 if event_name == 'Stop':
                     previous_stop = stop_timestamp
                     stop_timestamp = log.get('timestamp')
+                    prompt_opens_turn = True
+
+    # Anchor on the first prompt of the turn: anchoring on the last would start the token
+    # window after work the earlier prompt had already caused.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
 
     transcript_assistant_messages = []
+    transcript_queued_prompts = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
@@ -3750,6 +3815,7 @@ def process_stop_event(event: Dict, api_key: str):
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
         ]
+        transcript_queued_prompts = transcript_data.get('queued_prompts') or []
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
 
@@ -3769,6 +3835,7 @@ def process_stop_event(event: Dict, api_key: str):
         request_initialized=user_prompt_timestamp,
         request_completed=request_completed,
         cwd=event.get('cwd'),
+        queued_prompts=transcript_queued_prompts,
     )
 
     if exchange:
