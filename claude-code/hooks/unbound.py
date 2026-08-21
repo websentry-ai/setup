@@ -3671,9 +3671,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     
     # A queued prompt is consumed into this turn without its own submit event, so it is
     # carried here rather than read from the events above. It was typed after the prompt
-    # that opened the turn, so it belongs at the end.
+    # that opened the turn, so it belongs at the end. Its queue record carries no cwd, and
+    # borrowing another prompt's would resolve a repo-scoped skill against the wrong repo,
+    # so it resolves against the turn's own directory instead.
     for queued in queued_prompts or []:
-        user_prompts.append((queued, prompt_cwd))
+        user_prompts.append((queued, None))
 
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what

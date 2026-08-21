@@ -1915,8 +1915,10 @@ def _cursor_user_query(text):
     start = text.find('<user_query>')
     if start == -1:
         return text.strip()
-    end = text.find('</user_query>', start)
-    if end == -1:
+    # Close on the LAST tag, not the first: the prompt itself may contain the literal
+    # token, and cutting at an interior one would drop everything the user typed after it.
+    end = text.rfind('</user_query>')
+    if end <= start:
         return text[start + len('<user_query>'):].strip()
     return text[start + len('<user_query>'):end].strip()
 
@@ -2129,10 +2131,15 @@ def build_llm_exchange(events, api_key=None):
             usage = _cursor_usage_from_event(event) or usage
     
     # Cursor's transcript carries every prompt of the turn, including one typed while the
-    # agent was working; the hook events see only those that fired beforeSubmitPrompt.
+    # agent was working; the hook events see only those that fired beforeSubmitPrompt. The
+    # transcript is per conversation and may already hold a later turn, so it is trusted
+    # only when it opens with the prompt this generation started from.
     transcript_prompts = _cursor_turn_prompts(transcript_path)
-    if len(transcript_prompts) > len(user_prompts):
-        user_prompts = transcript_prompts
+    if (user_prompts and len(transcript_prompts) > len(user_prompts)
+            and transcript_prompts[:len(user_prompts)] == user_prompts):
+        # Append only what the hook did not capture. The events are the trusted text, so
+        # they are never rewritten by the transcript, only extended by it.
+        user_prompts = user_prompts + transcript_prompts[len(user_prompts):]
 
     # One message, not one per prompt: the backend keeps only the last user message.
     user_prompt = '\n\n'.join(user_prompts)

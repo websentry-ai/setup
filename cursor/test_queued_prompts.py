@@ -122,6 +122,60 @@ class TestPromptsFromCursorTranscript(unittest.TestCase):
         ])
         self.assertEqual(unbound._cursor_turn_prompts(path), ["current question"])
 
+    def test_a_later_turn_is_not_misattributed(self):
+        # the transcript is per conversation and may already hold a newer turn
+        path = self._transcript([
+            self._user("this generation's prompt"),
+            self._assistant("its answer"),
+            {"type": "turn_ended", "status": "success"},
+            self._user("a later turn"),
+            self._user("and its queued prompt"),
+            self._assistant("its answer"),
+            {"type": "turn_ended", "status": "success"},
+        ])
+        exchange = unbound.build_llm_exchange([
+            _log("beforeSubmitPrompt", FIRST_PROMPT, prompt="this generation's prompt"),
+            _log("stop", STOP, agentTextResponse="done", transcript_path=path),
+        ])
+        self.assertEqual(_user_messages(exchange), ["this generation's prompt"])
+
+    def test_a_prompt_containing_the_closing_token_is_not_truncated(self):
+        # the envelope closes on the last tag, so text the user typed after a literal
+        # </user_query> still reaches the recorded prompt
+        self.assertEqual(
+            unbound._cursor_user_query(
+                "<user_query>\nrun this </user_query> and then MORE\n</user_query>"),
+            "run this </user_query> and then MORE")
+
+    def test_a_divergent_transcript_cannot_rewrite_hook_text(self):
+        path = self._transcript([
+            self._user("DIFFERENT TEXT"),
+            self._assistant("x"),
+            self._user("second question"),
+            self._assistant("y"),
+            {"type": "turn_ended", "status": "success"},
+        ])
+        exchange = unbound.build_llm_exchange([
+            _log("beforeSubmitPrompt", FIRST_PROMPT, prompt="first question"),
+            _log("stop", STOP, agentTextResponse="done", transcript_path=path),
+        ])
+        self.assertEqual(_user_messages(exchange), ["first question"])
+
+    def test_the_transcript_only_extends_the_hook_prompts(self):
+        path = self._transcript([
+            self._user("first question"),
+            self._assistant("x"),
+            self._user("second question"),
+            self._assistant("y"),
+            {"type": "turn_ended", "status": "success"},
+        ])
+        exchange = unbound.build_llm_exchange([
+            _log("beforeSubmitPrompt", FIRST_PROMPT, prompt="first question"),
+            _log("stop", STOP, agentTextResponse="done", transcript_path=path),
+        ])
+        self.assertEqual(_user_messages(exchange),
+                         ["first question\n\nsecond question"])
+
     def test_a_missing_transcript_is_not_an_error(self):
         self.assertEqual(unbound._cursor_turn_prompts("/nonexistent/x.jsonl"), [])
         self.assertEqual(unbound._cursor_turn_prompts(None), [])

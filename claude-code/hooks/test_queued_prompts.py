@@ -248,6 +248,23 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
         self.assertEqual(_user_messages(exchange),
                          ["typed question\n\nqueued question"])
 
+    def test_a_queued_skill_resolves_against_the_turn_cwd(self):
+        # the queue record carries no cwd, so borrowing another prompt's would resolve a
+        # repo-scoped skill against the wrong repo
+        seen = {}
+
+        def resolve(name, cwd):
+            seen[name] = cwd
+            return "/skills/%s" % name
+
+        with patch.object(unbound, "_resolve_skill_path", side_effect=resolve):
+            unbound.build_llm_exchange(
+                [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one")],
+                stop_assistant_message="done", cwd="/session/dir",
+                queued_prompts=["/beta"])
+        self.assertEqual(seen["alpha"], "/repo/one")
+        self.assertEqual(seen["beta"], "/session/dir")
+
 
 if __name__ == "__main__":
     unittest.main()
