@@ -277,22 +277,41 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
         self.assertEqual(_user_messages(exchange),
                          ["typed question\n\nqueued question"])
 
-    def test_a_queued_skill_resolves_against_the_turn_cwd(self):
-        # the queue record carries no cwd, so borrowing another prompt's would resolve a
-        # repo-scoped skill against the wrong repo
+    @staticmethod
+    def _resolved_skills(events, cwd, queued):
         seen = {}
 
-        def resolve(name, cwd):
-            seen[name] = cwd
+        def resolve(name, directory):
+            seen[name] = directory
             return "/skills/%s" % name
 
         with patch.object(unbound, "_resolve_skill_path", side_effect=resolve):
-            unbound.build_llm_exchange(
-                [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one")],
-                stop_assistant_message="done", cwd="/session/dir",
-                queued_prompts=["/beta"])
+            unbound.build_llm_exchange(events, stop_assistant_message="done",
+                                       cwd=cwd, queued_prompts=queued)
+        return seen
+
+    def test_a_queued_skill_resolves_when_the_turn_used_one_directory(self):
+        seen = self._resolved_skills(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one")],
+            "/repo/one", ["/beta"])
         self.assertEqual(seen["alpha"], "/repo/one")
-        self.assertEqual(seen["beta"], "/session/dir")
+        self.assertEqual(seen["beta"], "/repo/one")
+
+    def test_a_queued_skill_is_left_unresolved_when_directories_differ(self):
+        # the queue record carries no directory of its own, so borrowing one would
+        # attribute the skill to a repository the prompt may not have come from
+        seen = self._resolved_skills(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one")],
+            "/repo/two", ["/beta"])
+        self.assertEqual(seen["alpha"], "/repo/one")
+        self.assertNotIn("beta", seen)
+
+    def test_an_unresolved_queued_skill_still_reaches_the_message(self):
+        with patch.object(unbound, "_resolve_skill_path", side_effect=lambda n, d: None):
+            exchange = unbound.build_llm_exchange(
+                [_log("UserPromptSubmit", FIRST_PROMPT, prompt="hello", cwd="/repo/one")],
+                stop_assistant_message="done", cwd="/repo/two", queued_prompts=["/beta"])
+        self.assertEqual(_user_messages(exchange), ["hello\n\n/beta"])
 
 
 if __name__ == "__main__":

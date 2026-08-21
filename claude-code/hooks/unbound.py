@@ -3536,7 +3536,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 # repo-level skill when the agent was opened at a parent dir. Held per
                 # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
-                user_prompts.append((prompt, prompt_cwd))
+                user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
@@ -3573,11 +3573,15 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     
     # A queued prompt is consumed into this turn without its own submit event, so it is
     # carried here rather than read from the events above. It was typed after the prompt
-    # that opened the turn, so it belongs at the end. Its queue record carries no cwd, and
-    # borrowing another prompt's would resolve a repo-scoped skill against the wrong repo,
-    # so it resolves against the turn's own directory instead.
+    # that opened the turn, so it belongs at the end. Its queue record carries no directory,
+    # so a repo-scoped skill in it is resolvable only when the turn used exactly one; where
+    # they differ there is nothing to attribute it to and it is left unresolved.
+    turn_dirs = {directory for _, directory in user_prompts if directory}
+    if cwd:
+        turn_dirs.add(cwd)
+    queued_cwd = next(iter(turn_dirs)) if len(turn_dirs) == 1 else None
     for queued in queued_prompts or []:
-        user_prompts.append((queued, None))
+        user_prompts.append((queued, queued_cwd))
 
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
@@ -3585,10 +3589,14 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     for typed_prompt, typed_cwd in user_prompts:
         if not typed_prompt.startswith('/'):
             continue
+        if not typed_cwd:
+            # Nothing to resolve against; leaving the skill unresolved beats attributing it
+            # to a repository the prompt may not have come from.
+            continue
         typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
-        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,
