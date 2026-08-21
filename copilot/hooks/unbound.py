@@ -2331,16 +2331,20 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             if new_model:
                 model = new_model
         elif entry_type == 'user.message':
-            message_id = entry.get('id') or ''
-            if message_id and message_id in already_prompted:
+            content = data.get('content')
+            # An entry without an envelope id still has to be watermarked, or every later
+            # Stop re-selects it and re-uploads its text with the current turn. Keyed the
+            # same way turn_id is when its id is missing.
+            message_id = entry.get('id') or 'unb-' + hashlib.sha256(
+                ('%s\x1f%d\x1f%s' % (conversation_id or '', i, content or ''))
+                .encode('utf-8', 'replace')).hexdigest()[:24]
+            if message_id in already_prompted:
                 continue
             if turn_start_index < 0:
                 turn_start_index = i
-            content = data.get('content')
             if content:
                 turn_prompts.append(content)
-            if message_id:
-                turn_prompt_ids.add(message_id)
+            turn_prompt_ids.add(message_id)
 
     if turn_start_index < 0:
         return None, set(), None, set()

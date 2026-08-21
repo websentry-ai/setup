@@ -106,6 +106,28 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertIsNone(exchange)
         self.assertEqual((forwarded, sig, prompts), (set(), None, set()))
 
+    def test_an_entry_without_an_id_is_still_watermarked(self):
+        # otherwise every later Stop re-selects it and re-uploads its text
+        path = _transcript([
+            _entry("user.message", content="no envelope id"),
+            _entry("assistant.message", content="the answer"),
+        ])
+        exchange, _f, _s, prompts = unbound.build_exchange_from_transcript(path, SESSION)
+        self.assertEqual(_user_text(exchange), ["no envelope id"])
+        self.assertEqual(len(prompts), 1)
+        again, _f2, _s2, _p2 = unbound.build_exchange_from_transcript(
+            path, SESSION, already_prompted=prompts)
+        self.assertIsNone(again)
+
+    def test_two_id_less_entries_get_distinct_keys(self):
+        path = _transcript([
+            _entry("user.message", content="first"),
+            _entry("user.message", content="second"),
+            _entry("assistant.message", content="the answer"),
+        ])
+        _ex, _f, _s, prompts = unbound.build_exchange_from_transcript(path, SESSION)
+        self.assertEqual(len(prompts), 2)
+
     def test_a_transcript_with_no_prompt_yields_nothing(self):
         path = _transcript([_entry("session.start", sessionId=SESSION)])
         exchange, forwarded, sig, prompts = unbound.build_exchange_from_transcript(
