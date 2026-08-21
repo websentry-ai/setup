@@ -685,3 +685,20 @@ def test_skip_managed_settings_flag_is_accepted_by_the_parser(env):
     opts = setup_cmd._parse_args(["--api-key", "k", "--skip-managed-settings"])
     assert opts is not None and opts["skip_managed_settings"] is True
     assert setup_cmd._parse_args(["--api-key", "k"])["skip_managed_settings"] is False
+
+
+def test_skip_managed_settings_defers_when_the_strip_fails(env, capsys):
+    """An unstrippable file leaves local hooks live, so claude-code must defer
+    rather than report configured with duplicate enforcement in place."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    settings_path = managed / "managed-settings.json"
+    settings_path.write_text("{ not json ")
+    rc = setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                        "--skip-managed-settings"])
+    assert rc == 1, "a strip failure must surface in the exit code"
+    out = capsys.readouterr().out
+    assert "deferred (managed settings update failed)" in out
+    assert "Failed to strip existing Unbound hooks" in out
+    assert settings_path.read_text() == "{ not json ", "must not clobber what it cannot parse"

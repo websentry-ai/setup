@@ -283,8 +283,11 @@ def _write_claude_managed_settings(m, skip_settings: bool = False) -> bool:
                 delete_when_empty=False)
             if stripped:
                 print("Removed Unbound hooks left behind in the local managed settings")
+            # A failed strip leaves local hooks live next to the remote policy,
+            # so the tool defers instead of reporting itself configured.
             if strip_error:
-                print(f"Warning: could not strip existing Unbound hooks from {managed_dir}")
+                print(f"Failed to strip existing Unbound hooks from {managed_dir}")
+                return False
             if platform.system().lower() in ("darwin", "linux"):
                 os.chmod(managed_dir, 0o755)
             return True
@@ -577,7 +580,7 @@ def _setup_claude_code(opts):
     state = _detect_state(m.get_managed_settings_dir() / "managed-settings.json",
                           skip_settings=skip_settings)
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
-        return ("deferred", "managed settings write failed")
+        return ("deferred", "managed settings update failed")
     if skip_settings:
         # A remote policy may name the python script; deleting it here would
         # strand that policy on a missing file with no local error.
