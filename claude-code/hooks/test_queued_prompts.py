@@ -65,6 +65,31 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
                   for use in msg.get("tool_use", [])]
         self.assertIn("deploy", skills)
 
+    def test_each_queued_skill_resolves_with_its_own_cwd(self):
+        seen = {}
+
+        def resolve(name, cwd):
+            seen[name] = cwd
+            return "/skills/%s" % name
+
+        with patch.object(unbound, "_resolve_skill_path", side_effect=resolve):
+            unbound.build_llm_exchange(
+                [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one"),
+                 _log("UserPromptSubmit", SECOND_PROMPT, prompt="/beta", cwd="/repo/two")],
+                stop_assistant_message="done")
+        self.assertEqual(seen["alpha"], "/repo/one")
+        self.assertEqual(seen["beta"], "/repo/two")
+
+    def test_a_prompt_without_a_cwd_falls_back_to_the_previous_one(self):
+        seen = {}
+        with patch.object(unbound, "_resolve_skill_path",
+                          side_effect=lambda name, cwd: seen.setdefault(name, cwd) and None):
+            unbound.build_llm_exchange(
+                [_log("UserPromptSubmit", FIRST_PROMPT, prompt="plain", cwd="/repo/one"),
+                 _log("UserPromptSubmit", SECOND_PROMPT, prompt="/beta")],
+                stop_assistant_message="done")
+        self.assertEqual(seen["beta"], "/repo/one")
+
 
 class TestStopEventTurnAssembly(unittest.TestCase):
     def setUp(self):

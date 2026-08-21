@@ -3613,10 +3613,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
             if prompt:
-                user_prompts.append(prompt)
                 # The prompt's own cwd beats the session cwd for resolving a
-                # repo-level skill when the agent was opened at a parent dir.
+                # repo-level skill when the agent was opened at a parent dir. Held per
+                # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
+                user_prompts.append((prompt, prompt_cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
@@ -3654,13 +3655,13 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
-    for typed_prompt in user_prompts:
+    for typed_prompt, typed_cwd in user_prompts:
         if not typed_prompt.startswith('/'):
             continue
         typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
-        typed_path = _resolve_skill_path(typed_skill, prompt_cwd or cwd)
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,
@@ -3678,7 +3679,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
             })
 
     # One message, not one per prompt: the backend keeps only the last user message.
-    user_prompt = '\n\n'.join(user_prompts)
+    user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     

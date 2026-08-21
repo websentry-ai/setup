@@ -49,6 +49,21 @@ class TestTurnStartTimestamp(unittest.TestCase):
                            _log("UserPromptSubmit", SECOND_PROMPT)])
         self.assertEqual(one, two)
 
+    def test_several_stops_in_one_turn_keep_the_anchor(self):
+        # Copilot uploads on each Stop and watermarks replays, so a turn can close more
+        # than once; the anchor must stay on the prompt that opened it
+        self.assertEqual(
+            _turn_start([_log("UserPromptSubmit", FIRST_PROMPT),
+                         _log("Stop", FIRST_STOP),
+                         _log("Stop", "2026-08-20T10:00:25Z")]),
+            FIRST_PROMPT)
+
+    def test_a_call_after_a_stop_keeps_the_last_turns_anchor(self):
+        self.assertEqual(
+            _turn_start([_log("UserPromptSubmit", FIRST_PROMPT),
+                         _log("Stop", FIRST_STOP)]),
+            FIRST_PROMPT)
+
     def test_next_turn_anchors_on_its_own_prompt(self):
         self.assertEqual(
             _turn_start([_log("UserPromptSubmit", FIRST_PROMPT),
