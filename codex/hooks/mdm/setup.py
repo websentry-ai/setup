@@ -692,7 +692,7 @@ def remove_user_level_hooks_for_user(username: str, home_dir: Path) -> None:
     ~/.codex/hooks/unbound.py for a given user. Without this, MDM-managed
     hooks fire alongside leftover user-level ones and every event runs twice.
     Only entries pointing to our own unbound.py are removed; unrelated user
-    hooks are preserved. The codex_hooks feature flag in config.toml is left
+    hooks are preserved. The hooks feature flag in config.toml is left
     alone — MDM still relies on it. Privilege-drops to the target user."""
     hooks_path = home_dir / ".codex" / "hooks.json"
     script_path = home_dir / ".codex" / "hooks" / "unbound.py"
@@ -1218,10 +1218,14 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if config_path.exists():
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-        if any(l.strip() == 'hooks = true' for l in lines):
-            return False  # already enabled
+        # Strip first, then decide. This runs from a daily cron, so a machine still carrying
+        # the old spelling has to be migrated on the next run rather than skipped for already
+        # having the new one alongside it.
+        cleaned = _strip_hooks_flags(lines)
+        if len(lines) - len(cleaned) == 1 and any(l.strip() == 'hooks = true' for l in lines):
+            return False  # already exactly right
 
-        lines = _strip_hooks_flags(lines)
+        lines = cleaned
         features_idx = next((i for i, l in enumerate(lines) if l.strip() == '[features]'), None)
         if features_idx is not None:
             lines.insert(features_idx + 1, 'hooks = true\n')
@@ -1245,11 +1249,33 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Failed to enable codex_hooks for {username}")
 
 
+def _hooks_still_registered(hooks_path) -> bool:
+    """True when hooks.json still registers a command. The feature flag is one switch over
+    every hook a user has, so clearing it while somebody else's entry remains turns their
+    tooling off. Call this only after our own entries have been stripped."""
+    try:
+        with open(hooks_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return False
+    events = config.get('hooks')
+    if not isinstance(events, dict):
+        return False
+    for entries in events.values():
+        for item in entries if isinstance(entries, list) else []:
+            if isinstance(item, dict) and item.get('hooks'):
+                return True
+    return False
+
+
 def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     """Remove only the codex_hooks line from user's ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
     config_path = home_dir / ".codex" / "config.toml"
     if not config_path.exists():
+        return
+    if _hooks_still_registered(home_dir / ".codex" / "hooks.json"):
+        debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
         return
 
     def _disable():

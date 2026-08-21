@@ -541,6 +541,25 @@ def _strip_hooks_flags(lines):
     return out
 
 
+def _hooks_still_registered(hooks_path) -> bool:
+    """True when hooks.json still registers a command. The feature flag is one switch over
+    every hook a user has, so clearing it while somebody else's entry remains turns their
+    tooling off. Call this only after our own entries have been stripped."""
+    try:
+        with open(hooks_path, 'r', encoding='utf-8') as f:
+            config = json.load(f)
+    except (OSError, ValueError):
+        return False
+    events = config.get('hooks')
+    if not isinstance(events, dict):
+        return False
+    for entries in events.values():
+        for item in entries if isinstance(entries, list) else []:
+            if isinstance(item, dict) and item.get('hooks'):
+                return True
+    return False
+
+
 def disable_codex_hooks_feature() -> None:
     """Remove the hooks feature flag from ~/.codex/config.toml (leftover from hooks setup).
 
@@ -549,6 +568,9 @@ def disable_codex_hooks_feature() -> None:
     to [features] so [hooks.state] and its entries are untouched."""
     config_path = Path.home() / ".codex" / "config.toml"
     if not config_path.exists():
+        return
+    if _hooks_still_registered(Path.home() / ".codex" / "hooks.json"):
+        debug_print("hooks feature flag kept: other hooks are still registered")
         return
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
