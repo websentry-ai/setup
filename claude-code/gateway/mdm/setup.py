@@ -455,9 +455,14 @@ def remove_env_var_on_windows_machine(var_name: str, only_if=None) -> str:
         )
         if query.returncode != 0:
             return "not_found"
-        if only_if is not None and not only_if(_registry_value(query.stdout, var_name)):
-            debug_print(f"{var_name} left in place: not set by this setup")
-            return "not_found"
+        if only_if is not None:
+            recorded = _registry_value(query.stdout, var_name)
+            if recorded is None:
+                debug_print(f"Could not read {var_name} from the registry")
+                return "failed"
+            if not only_if(recorded):
+                debug_print(f"{var_name} left in place: not set by this setup")
+                return "not_found"
         subprocess.run(
             ["reg", "delete", reg_path, "/F", "/V", var_name],
             check=True, capture_output=True, timeout=10,
@@ -486,16 +491,21 @@ def _export_value(line: str, prefix: str) -> str:
 
 
 def _is_unbound_key_helper_body(text) -> bool:
+    """Exact against the body the gateway writer emits, apart from surrounding whitespace,
+    so a CRLF or a trailing newline still matches but a script carrying anything else is
+    somebody else's."""
     return isinstance(text, str) and text.strip() == UNBOUND_KEY_HELPER_BODY
 
 
-def _registry_value(output: str, var_name: str) -> str:
-    """The value `reg query` printed for var_name, or "" when it printed none."""
+def _registry_value(output: str, var_name: str):
+    """The value `reg query` printed for var_name, or None when its output held no line
+    for it. None is "could not tell", not "not ours" -- the caller reports failure rather
+    than silently leaving our own value behind."""
     for line in (output or "").splitlines():
         parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].lower() == var_name.lower():
-            return parts[2].strip()
-    return ""
+        if len(parts) >= 2 and parts[0].lower() == var_name.lower():
+            return parts[2].strip() if len(parts) == 3 else ""
+    return None
 
 
 def _read_text_or_none(path):
@@ -505,16 +515,27 @@ def _read_text_or_none(path):
         return None
 
 
+def _is_our_dropin(settings_path) -> bool:
+    """Whether this settings file is the drop-in this setup creates. Nothing else writes
+    it, so everything in it is ours -- including a self-hosted gateway URL, which no
+    value check could recognise."""
+    return (settings_path is not None
+            and settings_path.name == "unbound.json"
+            and settings_path.parent.name == "managed-settings.d")
+
+
 def _is_unbound_key_helper_setting(value, managed_dir) -> bool:
     """Whether settings.json's apiKeyHelper is one this setup writes: the per-user script
     or the managed one. Judged on the value alone, so a helper that has already been
     deleted cannot make somebody else's setting look like ours."""
     if not isinstance(value, str):
         return False
-    candidate = value.strip()
-    return candidate in ("~/.claude/anthropic_key.sh",
-                         str(Path.home() / ".claude" / "anthropic_key.sh"),
-                         str(managed_dir / "anthropic_key.sh"))
+    if value.strip() != str(managed_dir / "anthropic_key.sh"):
+        return False
+    # The path is a name anyone could choose, so the script there decides. Nothing there
+    # means our own removal already ran; a dangling helper is broken either way.
+    path = managed_dir / "anthropic_key.sh"
+    return not path.exists() or _is_unbound_key_helper_body(_read_text_or_none(path))
 
 
 def remove_env_var_from_user(username: str, home_dir: Path, var_name: str,
@@ -646,7 +667,11 @@ def remove_user_level_gateway_for_user(username: str, home_dir: Path) -> None:
                     settings = json.load(f)
                 if isinstance(settings, dict):
                     helper = settings.get("apiKeyHelper")
-                    if isinstance(helper, str) and helper in unbound_helpers:
+                    # The path is a name anyone could choose, so the script there decides.
+                    if (isinstance(helper, str) and helper in unbound_helpers
+                            and (not key_helper_path.exists()
+                                 or _is_unbound_key_helper_body(
+                                     _read_text_or_none(key_helper_path)))):
                         del settings["apiKeyHelper"]
                         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
                         fd = os.open(str(settings_path), flags, 0o644)
@@ -735,6 +760,7 @@ def setup_managed_settings(api_key: str = "", gateway_url: str = DEFAULT_GATEWAY
             }
         else:
             key_helper_path.parent.mkdir(parents=True, exist_ok=True)
+            # This body is what identifies the script as ours at removal time.
             key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
             os.chmod(key_helper_path, 0o755)
             debug_print(f"Created key helper script: {key_helper_path}")
@@ -810,18 +836,25 @@ def clear_managed_settings() -> str:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 changed = False
-                if _is_unbound_key_helper_setting(settings.get("apiKeyHelper"), managed_dir):
-                    del settings["apiKeyHelper"]
-                    changed = True
+                ours = _is_our_dropin(settings_path)
+                if (ours or _is_unbound_key_helper_setting(settings.get("apiKeyHelper"),
+                                                           managed_dir)):
+                    if "apiKeyHelper" in settings:
+                        del settings["apiKeyHelper"]
+                        changed = True
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
-                    # This setup writes the token and the base URL together, so the pair
-                    # goes together -- and only when the base URL is the one it writes.
-                    if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
-                        for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-                            if k in env:
-                                del env[k]
-                                changed = True
+                    # The token is a credential this setup wrote, and it is sent to
+                    # whatever ANTHROPIC_BASE_URL currently names, so it comes out however
+                    # that URL now reads. The URL itself is only ours to remove when it
+                    # still holds our gateway.
+                    if "ANTHROPIC_AUTH_TOKEN" in env:
+                        del env["ANTHROPIC_AUTH_TOKEN"]
+                        changed = True
+                    if ((ours or _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")))
+                            and "ANTHROPIC_BASE_URL" in env):
+                        del env["ANTHROPIC_BASE_URL"]
+                        changed = True
                     if not env:
                         del settings["env"]
                 if changed:

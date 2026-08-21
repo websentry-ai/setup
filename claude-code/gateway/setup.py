@@ -184,13 +184,15 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def _registry_value(output: str, var_name: str) -> str:
-    """The value `reg query` printed for var_name, or "" when it printed none."""
+def _registry_value(output: str, var_name: str):
+    """The value `reg query` printed for var_name, or None when its output held no line
+    for it. None is "could not tell", not "not ours" -- the caller reports failure rather
+    than silently leaving our own value behind."""
     for line in (output or "").splitlines():
         parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].lower() == var_name.lower():
-            return parts[2].strip()
-    return ""
+        if len(parts) >= 2 and parts[0].lower() == var_name.lower():
+            return parts[2].strip() if len(parts) == 3 else ""
+    return None
 
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
@@ -250,12 +252,26 @@ def _strip_unbound_hooks(settings: dict) -> None:
 
 
 def _is_unbound_key_helper_setting(value) -> bool:
-    """Whether settings.json's apiKeyHelper is the one this setup writes."""
-    return isinstance(value, str) and value.strip() == UNBOUND_KEY_HELPER_SETTING
+    """Whether settings.json's apiKeyHelper is the one this setup writes. The expanded
+    form counts too: the setup writes the ~ form, but a device may already carry the
+    expanded one."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if candidate not in (UNBOUND_KEY_HELPER_SETTING,
+                         str(Path.home() / ".claude" / "anthropic_key.sh")):
+        return False
+    # The path is a name anyone could choose, so the script there decides. Nothing there
+    # means our own removal already ran; a dangling helper is broken either way.
+    path = Path.home() / ".claude" / "anthropic_key.sh"
+    return not path.exists() or _is_unbound_key_helper_file(path)
 
 
 def _is_unbound_key_helper_file(path: Path) -> bool:
-    """Whether an anthropic_key.sh is the one this setup writes."""
+    """Whether an anthropic_key.sh is the one this setup writes. The compare is exact
+    against the body the gateway writer emits, apart from surrounding whitespace, so a
+    CRLF or a trailing newline still matches but a script with a shebang or an extra line
+    is somebody else's."""
     try:
         return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
     except (OSError, ValueError):
@@ -310,9 +326,14 @@ def remove_env_var_on_windows(var_name: str, only_if=None) -> str:
         )
         if query.returncode != 0:
             return "not_found"
-        if only_if is not None and not only_if(_registry_value(query.stdout, var_name)):
-            debug_print(f"{var_name} left in place: not set by this setup")
-            return "not_found"
+        if only_if is not None:
+            recorded = _registry_value(query.stdout, var_name)
+            if recorded is None:
+                debug_print(f"Could not read {var_name} from the registry")
+                return "failed"
+            if not only_if(recorded):
+                debug_print(f"{var_name} left in place: not set by this setup")
+                return "not_found"
         subprocess.run(
             ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
             check=True,
@@ -392,6 +413,7 @@ def setup_claude_key_helper() -> bool:
         claude_dir.mkdir(parents=True, exist_ok=True)
 
         # Write anthropic_key.sh
+        # This body is what identifies the script as ours at removal time.
         key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
         try:
             current_mode = key_helper_path.stat().st_mode
