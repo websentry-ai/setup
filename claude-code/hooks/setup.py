@@ -17,6 +17,7 @@ import http.server
 import socketserver
 import socket
 import json
+from urllib.parse import urlsplit
 import shlex
 
 
@@ -187,7 +188,7 @@ def remove_env_var_on_windows(var_name: str) -> str:
         if query.returncode != 0:
             return "not_found"
         subprocess.run(
-            ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
+            [_reg_exe(), "delete", "HKCU\\Environment", "/F", "/V", var_name],
             check=True,
             capture_output=True,
         )
@@ -320,44 +321,57 @@ UNBOUND_KEY_HELPER_TOKEN = "UNBOUND_API_KEY"
 UNBOUND_KEY_HELPER_NAME = "anthropic_key.sh"
 
 
+def _read_config_text(username, path):
+    """Read a recorded config. This setup runs as the user who owns it, so a plain read
+    is what it is; the MDM trees route the same call through a privilege drop."""
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def _url_host(value: str) -> str:
-    """The host a URL actually resolves to. A backslash separates like a slash here, so
-    evil.example\\.getunbound.ai reads as evil.example rather than as one of ours."""
-    remainder = value.split("://", 1)[-1].replace("\\", "/")
-    return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+    """The host a URL actually resolves to. Parsed rather than split by hand: a fragment,
+    a query or a backslash all end the authority, and each of them has been a way to make
+    a foreign host read as one of ours."""
+    try:
+        return (urlsplit(value.replace(chr(92), "/")).hostname or "").lower()
+    except ValueError:
+        return ""
 
-
-def _unbound_config(home_dir=None) -> dict:
+def _unbound_config(home_dir=None, username=None) -> dict:
     """The config recorded for a device. MDM work runs as root against another user's
     home, so the caller says whose home to read rather than letting Path.home() answer
     /root and quietly match nothing."""
     base = Path(home_dir) if home_dir else Path.home()
+    text = _read_config_text(username, base / ".unbound" / "config.json")
+    if not text:
+        return {}
     try:
-        return json.loads((base / ".unbound" / "config.json").read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError):
+        return json.loads(text) or {}
+    except ValueError:
         return {}
 
-
-def _is_unbound_base_url(value, home_dir=None) -> bool:
+def _is_unbound_base_url(value, home_dir=None, username=None) -> bool:
     """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
     this device, or one on our own host, counts -- someone pointing Claude Code at their
     own endpoint keeps it."""
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = value.strip().rstrip("/")
-    recorded = _unbound_config(home_dir).get("gateway_url")
+    recorded = _unbound_config(home_dir, username).get("gateway_url")
     if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
         return True
     host = _url_host(candidate)
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
 
 
-def _is_unbound_api_key(value, home_dir=None) -> bool:
+def _is_unbound_api_key(value, home_dir=None, username=None) -> bool:
     """Whether this credential is the one recorded for a device. With nothing recorded
     there is nothing to compare against, so the answer is no and the value stays."""
     if not isinstance(value, str) or not value.strip():
         return False
-    recorded = _unbound_config(home_dir).get("api_key")
+    recorded = _unbound_config(home_dir, username).get("api_key")
     return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 

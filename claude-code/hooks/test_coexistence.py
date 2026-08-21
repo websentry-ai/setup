@@ -217,11 +217,17 @@ class TestManagedEnvPairing(unittest.TestCase):
 class TestUrlHostParsing(unittest.TestCase):
     """A backslash separates like a slash, so a host that only looks like ours is not."""
 
-    def test_a_backslash_confused_lookalike(self):
-        self.assertEqual(setup._url_host("https://evil.example\\.getunbound.ai"),
-                         "evil.example")
-        self.assertFalse(
-            setup._is_unbound_base_url("https://evil.example\\.getunbound.ai"))
+    def test_every_way_the_authority_can_end(self):
+        # a backslash, a fragment and a query each end the host; all three were ways to
+        # make a foreign host read as one of ours
+        for url in ("https://evil.example\\.getunbound.ai",
+                    "https://evil.example#.getunbound.ai",
+                    "https://evil.example?.getunbound.ai"):
+            self.assertEqual(setup._url_host(url), "evil.example", url)
+            self.assertFalse(setup._is_unbound_base_url(url), url)
+
+    def test_case_is_not_significant(self):
+        self.assertTrue(setup._is_unbound_base_url("https://GETUNBOUND.AI"))
 
     def test_credentials_in_the_authority(self):
         self.assertEqual(setup._url_host("https://user:pw@api.getunbound.ai/v1"),
