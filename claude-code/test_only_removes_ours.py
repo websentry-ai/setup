@@ -111,6 +111,15 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
                 self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
                 self.assertTrue(mod._is_unbound_base_url(OURS), mod.__name__)
 
+    def test_a_windows_device_with_no_user_profiles_does_not_crash(self):
+        # get_all_user_homes() falls back to a single (None, None) entry on Windows;
+        # dereferencing that home aborted clear before the machine-wide state came out
+        for mod in MDM:
+            self.assertEqual(mod._recorded_gateway_url_for_user(None, None), "")
+            matcher = mod._unbound_base_url_matcher(None, None)
+            self.assertTrue(matcher(OURS), mod.__name__)
+            self.assertFalse(matcher(THEIRS), mod.__name__)
+
     def test_mdm_matches_it_for_that_user(self):
         home = self._home(self.CUSTOM)
         for mod in MDM:
@@ -523,6 +532,31 @@ class TestTheCredentialAlwaysComesOut(unittest.TestCase):
     def test_the_whole_pair_goes_when_the_url_is_ours(self):
         self.assertEqual(
             self._clear({"ANTHROPIC_BASE_URL": OURS, "ANTHROPIC_AUTH_TOKEN": "t"}), {})
+
+
+class TestEveryTreeRecordsWhatItRoutesAt(unittest.TestCase):
+    """The custom-endpoint check only works if the URL written to ANTHROPIC_BASE_URL and
+    the URL recorded in config.json are the same string. Each install normalises once and
+    uses that one value for both, so a reader comparing them can rely on it."""
+
+    CUSTOM_RAW = "unbound.acme-corp.internal/"
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def test_normalisation_makes_the_two_writes_agree(self):
+        for mod in (GATEWAY, GATEWAY_MDM):
+            self.assertEqual(mod.normalize_url(self.CUSTOM_RAW), self.CUSTOM,
+                             mod.__name__)
+
+    def test_a_recorded_url_is_accepted_however_it_was_written(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".unbound").mkdir()
+        (home / ".unbound" / "config.json").write_text(
+            json.dumps({"api_key": "k", "gateway_url": self.CUSTOM}))
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                # exactly as written, and with the trailing slash a shell export may carry
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM + "/"), mod.__name__)
 
 
 class TestGatewayMdmRecordsItsGateway(unittest.TestCase):

@@ -855,7 +855,11 @@ def main():
     print("Claude Code - Environment Setup")
     print("=" * 60)
 
-    # Flush previously set environment variables at start (including hooks setup var)
+    # Flush previously set environment variables at start (including hooks setup var).
+    # ANTHROPIC_BASE_URL is unconditional here and deliberately so: gateway mode exists to
+    # route Claude Code through us and sets this variable to our gateway a few lines
+    # below, so whatever it held is being replaced either way. Every other place that
+    # removes it is a teardown, and those take it only when it is ours.
     for var_name in [
         "ANTHROPIC_BASE_URL",
         "UNBOUND_API_KEY",

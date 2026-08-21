@@ -525,7 +525,12 @@ def _recorded_gateway_url_for_user(username, home_dir) -> str:
     """The gateway URL this install recorded for one user, read as that user. It says
     which endpoint we pointed *them* at, so it authorises removing *their* export and
     nothing else. Never consulted for the system-wide managed settings: one account's
-    record must not decide what comes out of a file the whole device shares."""
+    record must not decide what comes out of a file the whole device shares.
+
+    Windows falls back to a single (None, None) entry when it finds no user profiles, so
+    there may be no home to read; that answers "no record", not an error."""
+    if home_dir is None:
+        return ""
     config_file = home_dir / ".unbound" / "config.json"
 
     def _read():
