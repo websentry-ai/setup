@@ -131,6 +131,16 @@ class TestStopEventTurnAssembly(unittest.TestCase):
                          _log("Stop", FIRST_STOP)])
         self.assertEqual(out["ceiling"], FIRST_STOP)
 
+    def test_a_retained_stop_before_this_turn_is_the_floor(self):
+        # audit-log trimming can retain a Stop that precedes this turn's first prompt
+        out = self._run([_log("Stop", "2026-08-20T09:59:00Z"),
+                         _log("UserPromptSubmit", FIRST_PROMPT, prompt="first"),
+                         _log("UserPromptSubmit", SECOND_PROMPT, prompt="second"),
+                         _log("Stop", FIRST_STOP)])
+        self.assertEqual(out["floor"], "2026-08-20T09:59:00Z")
+        self.assertEqual(out["anchor"], FIRST_PROMPT)
+        self.assertEqual(_user_messages(out["exchange"]), ["first\n\nsecond"])
+
     def test_single_prompt_turn_is_unchanged(self):
         out = self._run([_log("UserPromptSubmit", FIRST_PROMPT, prompt="only"),
                          _bash_call(TOOL_CALL),
