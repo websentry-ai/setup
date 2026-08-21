@@ -41,6 +41,10 @@
 .PARAMETER Backfill
     Enable backfill of historical transcripts for Claude Code and Codex (opt-in, disabled by default)
 
+.PARAMETER SkipManagedSettings
+    Claude Code only: install the hook script but leave managed-settings.json alone,
+    for orgs whose Claude Code policy is managed remotely from the Anthropic admin console
+
 .PARAMETER Clear
     Remove MDM configuration for all four tools (no discovery scan, no backfill)
 
@@ -72,6 +76,7 @@ param(
     [string]$GatewayUrl,
     [string]$FrontendUrl,
     [switch]$Backfill,
+    [switch]$SkipManagedSettings,
     [switch]$Clear
 )
 
@@ -192,6 +197,11 @@ function Main {
         # Add backfill flag if explicitly requested (has no effect with -Clear)
         if ($Backfill -and -not $Clear) {
             $pythonArgs += "--backfill"
+        }
+
+        # Claude Code only; onboard.py routes it to that tool alone
+        if ($SkipManagedSettings -and -not $Clear) {
+            $pythonArgs += "--skip-managed-settings"
         }
 
         # Execute the Python script and capture exit code
