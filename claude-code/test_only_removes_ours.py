@@ -158,6 +158,44 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
             self.assertTrue(matcher(self.CUSTOM), mod.__name__)
             self.assertFalse(matcher(THEIRS), mod.__name__)
 
+    def _flat(self, content):
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        for mod in MDM:
+            with patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                yield mod, mod._unbound_base_url_matcher(None, None)
+
+    def test_the_flat_fallback_counts_when_it_is_exactly_what_we_write(self):
+        # the install replaces that whole file, so this shape is unambiguously ours
+        for mod, matcher in self._flat(
+                {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}):
+            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+
+    def test_an_administrators_flat_file_stays_theirs(self):
+        # any other top-level key means they wrote it, so the URL in it is not our record
+        for mod, matcher in self._flat(
+                {"permissions": {"allow": []},
+                 "env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}):
+            self.assertFalse(matcher(self.CUSTOM), mod.__name__)
+
+    def test_an_extra_env_key_also_means_theirs(self):
+        for mod, matcher in self._flat(
+                {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM,
+                         "HTTPS_PROXY": "http://corp:3128"}}):
+            self.assertFalse(matcher(self.CUSTOM), mod.__name__)
+
+    def test_the_drop_in_wins_over_the_flat_file(self):
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.d").mkdir(parents=True)
+        (managed / "managed-settings.d" / "unbound.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": self.CUSTOM}}))
+        (managed / "managed-settings.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": THEIRS}}))
+        for mod in MDM:
+            with patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                matcher = mod._unbound_base_url_matcher(None, None)
+            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+
     def test_the_machine_wide_route_is_recognised_from_our_own_drop_in(self):
         # a Windows MDM device with no user profiles has no per-account record; the
         # drop-in this setup writes is device-level state nothing else writes
@@ -707,6 +745,30 @@ class TestWindowsInstallToTeardownRoundTrip(unittest.TestCase):
         matcher = self._matcher(self._install(self.CUSTOM))
         self.assertTrue(matcher(self.CUSTOM))
         self.assertTrue(matcher(OURS))
+
+    def test_the_fallback_path_round_trips_too(self):
+        # when the drop-in directory cannot be created the install writes the flat file;
+        # teardown has to recognise the route from there or it stays on the device
+        managed = Path(tempfile.mkdtemp())
+        real_mkdir = Path.mkdir
+
+        def no_dropin(self, *a, **k):
+            if self.name == "managed-settings.d":
+                raise OSError("cannot create drop-in dir")
+            return real_mkdir(self, *a, **k)
+
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"), \
+             patch.object(Path, "mkdir", no_dropin):
+            self.assertTrue(GATEWAY_MDM.setup_managed_settings(
+                "org-token", gateway_url=self.CUSTOM))
+        self.assertFalse((managed / "managed-settings.d" / "unbound.json").exists())
+        self.assertTrue((managed / "managed-settings.json").exists())
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            matcher = GATEWAY_MDM._unbound_base_url_matcher(None, None)
+        self.assertTrue(matcher(self.CUSTOM))
+        self.assertFalse(matcher(THEIRS))
 
     def test_and_still_refuses_an_endpoint_we_did_not_install(self):
         matcher = self._matcher(self._install(self.CUSTOM))

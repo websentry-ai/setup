@@ -521,18 +521,11 @@ def _recorded_gateway_url_for_user(username, home_dir) -> str:
     return result or ""
 
 
-def _recorded_managed_gateway_url() -> str:
-    """The gateway URL recorded in the drop-in this setup writes. Device-level state we
-    own outright -- nothing else writes that file -- so unlike a per-account record it can
-    authorise removing the machine-wide route, which matters on a Windows device that has
-    no user profiles to read.
-
-    Only that drop-in. The install falls back to the shared managed-settings.json when it
-    cannot create the drop-in directory, but reading a URL out of the administrator's own
-    file would make their configuration look like ours, which is the deletion this whole
-    check exists to prevent; on that fallback a custom endpoint is left in place."""
+def _managed_settings_gateway_url(path, whole_file_must_be_ours: bool) -> str:
+    """The base URL in a managed settings file's env block. With whole_file_must_be_ours,
+    only a file whose entire content is what this setup writes counts -- the fallback file
+    is shared with the administrator, and any other key in it means it is theirs."""
     try:
-        path = get_managed_settings_dir() / "managed-settings.d" / "unbound.json"
         fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
         with os.fdopen(fd, 'r', encoding='utf-8') as handle:
             settings = json.loads(handle.read())
@@ -541,9 +534,33 @@ def _recorded_managed_gateway_url() -> str:
     if not isinstance(settings, dict):
         return ""
     env = settings.get("env")
-    recorded = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+    if not isinstance(env, dict):
+        return ""
+    if whole_file_must_be_ours and (
+            set(settings) != {"env"}
+            or set(env) != {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}):
+        return ""
+    recorded = env.get("ANTHROPIC_BASE_URL")
     return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
 
+
+def _recorded_managed_gateway_url() -> str:
+    """The gateway URL this setup recorded on the device. Device-level state we own, so
+    unlike a per-account record it can authorise removing the machine-wide route, which
+    matters on a Windows device that has no user profiles to read.
+
+    The drop-in first: nothing else writes that file. The install falls back to the shared
+    managed-settings.json when it cannot create the drop-in directory, and there it writes
+    the whole file, so that one counts only when its entire content is what the install
+    produces -- an administrator's own settings carry other keys and stay theirs."""
+    try:
+        managed_dir = get_managed_settings_dir()
+    except OSError:
+        return ""
+    return (_managed_settings_gateway_url(
+                managed_dir / "managed-settings.d" / "unbound.json", False)
+            or _managed_settings_gateway_url(
+                managed_dir / "managed-settings.json", True))
 
 def _unbound_base_url_matcher(username, home_dir):
     """Accepts our default gateway, or the one recorded for this user. The record is read
