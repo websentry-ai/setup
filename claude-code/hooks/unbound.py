@@ -664,6 +664,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     if not transcript_path or not os.path.exists(transcript_path):
         return conversation_data
 
+    queue_floor = subagent_floor or user_prompt_timestamp
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     usage_by_key: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
@@ -690,7 +691,10 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                         # leaves through 'popAll' and never ran, so it is not this turn's.
                         if entry.get('operation') != 'remove':
                             continue
-                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                        # Floored at the previous Stop, not at this turn's prompt: a queued
+                        # prompt consumed after the last turn closed and before this one was
+                        # typed would otherwise belong to neither.
+                        if queue_floor and not _ts_lt(queue_floor, entry_timestamp):
                             continue
                         if subagent_ceiling and _ts_lt(subagent_ceiling, entry_timestamp):
                             continue

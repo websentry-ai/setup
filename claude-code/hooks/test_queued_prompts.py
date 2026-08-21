@@ -240,6 +240,35 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
                                              subagent_ceiling=FIRST_STOP)
         self.assertEqual(data["queued_prompts"], [])
 
+    def test_a_prompt_consumed_between_turns_belongs_to_the_later_one(self):
+        # consumed after the previous turn closed and before this one was typed
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-08-20T10:00:05Z", "content": "between turns"},
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": "2026-08-20T10:00:40Z", "content": "between turns"},
+        ])
+        earlier = unbound.parse_transcript_file(
+            path, "2026-08-20T10:00:00Z", subagent_ceiling="2026-08-20T10:00:30Z")
+        later = unbound.parse_transcript_file(
+            path, "2026-08-20T10:01:00Z", subagent_floor="2026-08-20T10:00:30Z",
+            subagent_ceiling="2026-08-20T10:01:30Z")
+        self.assertEqual(earlier["queued_prompts"], [])
+        self.assertEqual(later["queued_prompts"], ["between turns"])
+
+    def test_consecutive_turns_claim_it_exactly_once(self):
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": "2026-08-20T10:00:10Z", "content": "inside"},
+        ])
+        earlier = unbound.parse_transcript_file(
+            path, "2026-08-20T10:00:00Z", subagent_ceiling="2026-08-20T10:00:30Z")
+        later = unbound.parse_transcript_file(
+            path, "2026-08-20T10:01:00Z", subagent_floor="2026-08-20T10:00:30Z",
+            subagent_ceiling="2026-08-20T10:01:30Z")
+        self.assertEqual((earlier["queued_prompts"], later["queued_prompts"]),
+                         (["inside"], []))
+
     def test_the_queued_prompt_is_joined_into_the_message(self):
         exchange = unbound.build_llm_exchange(
             [_log("UserPromptSubmit", FIRST_PROMPT, prompt="typed question")],
