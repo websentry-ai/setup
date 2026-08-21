@@ -127,6 +127,11 @@ SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
+# Repo-scope gate. Grace is session-scoped: an advisory nudge, not an audit trail.
+REPO_GATE_STATE_FILE = LOG_DIR / ".repo_gate_state.json"
+REPO_GATE_TURN_MEMORY = 20
+# _repo_gate_turn_id's unknown-turn answer, not an identity: never memoize it.
+REPO_GATE_UNKNOWN_TURN = '_session_turn'
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -454,7 +459,16 @@ def get_policy_check_failure_action():
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
-def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
+def get_repo_policies():
+    """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return []
+    policies = cache.get('repo_policies')
+    return policies if isinstance(policies, list) else []
+
+
+def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -463,15 +477,34 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None):
             tools_to_check = prior.get('tools_to_check', [])
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
+        if not isinstance(repo_policies, list):
+            repo_policies = get_repo_policies()
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
+            'repo_policies': repo_policies,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
         pass
+
+
+def _cache_policies_from_response(api_response):
+    """Without this a session never loads policies and the gate cannot fire."""
+    if not isinstance(api_response, dict):
+        return
+    if (
+        'tools_to_check' in api_response
+        or 'policy_check_failure_action' in api_response
+        or 'repo_policies' in api_response
+    ):
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+            repo_policies=api_response.get('repo_policies'),
+        )
 
 
 def is_cache_stale(cache):
@@ -1338,7 +1371,24 @@ def transform_response_for_copilot_prompt(api_response):
 
 
 def process_pre_tool_use(event, api_key):
-    """Process PreToolUse event - check policy before tool execution."""
+    """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them."""
+    gate = _repo_gate_evaluate(event)
+    if gate and gate['decision'] == 'deny':
+        return transform_response_for_copilot({
+            'decision': 'deny',
+            'reason': _repo_gate_block_reason(gate['repo']),
+            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        })
+    response = _evaluate_pre_tool_use_policies(event, api_key)
+    if gate:
+        return _with_repo_gate_context(
+            response, _repo_gate_warning(gate['repo'], gate['remaining'])
+        )
+    return response
+
+
+def _evaluate_pre_tool_use_policies(event, api_key):
+    """Run the gateway policy check for a PreToolUse event."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
     # VS Code can hand toolArgs over as a JSON string. Every reader below calls
     # tool_input.get(), so normalize once here — a raw str raised out of the hook, and a
@@ -1492,11 +1542,7 @@ def process_pre_tool_use(event, api_key):
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         approval_check = api_response.get('approvalCheck', {})
@@ -1521,10 +1567,13 @@ def process_pre_tool_use(event, api_key):
 
 
 def process_user_prompt_submit(event, api_key):
-    """Process UserPromptSubmit event for policy checking."""
+    """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
     model = get_session_start_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
+
+    cache = load_policy_cache()
+    need_pull_policies = cache is None or is_cache_stale(cache)
 
     request_body = {
         'conversation_id': session_id,
@@ -1533,8 +1582,11 @@ def process_user_prompt_submit(event, api_key):
         'event_name': 'user_prompt',
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
+    if need_pull_policies:
+        request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
+    _cache_policies_from_response(api_response)
     return transform_response_for_copilot_prompt(api_response)
 
 
@@ -1558,36 +1610,59 @@ def _github_remote_path(remote_url):
     return None
 
 
+def _git_origin_url(cwd):
+    """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
+    result = subprocess.run(
+        ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+
+def _remote_host(remote_url):
+    """Reject a host-less remote URL, so file:///srv/git/x is not org 'srv'."""
+    url = (remote_url or '').strip()
+    if '://' in url:
+        host = url.split('://', 1)[1].split('/', 1)[0]
+    elif ':' in url:
+        host = url.split(':', 1)[0]
+    else:
+        return None
+    host = host.rsplit('@', 1)[-1].split('?', 1)[0]
+    return host.lower() or None
+
+
+def _get_git_origin_org_repo(cwd):
+    """Lowercased (org, repo) of `cwd`'s origin; git failure propagates upward."""
+    url = _git_origin_url(cwd)
+    if not url or not _remote_host(url):
+        return (None, None)
+    path = _github_remote_path(url)
+    if not path:
+        return (None, None)
+    parts = path.split('/')
+    if len(parts) < 2:
+        return (None, None)
+    org = _strip_git_suffix(parts[0]).lower()
+    repo = _strip_git_suffix(parts[1]).lower()
+    return (org or None, repo or None)
+
 def _get_project(cwd):
-    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
-    requests for analytics. None when cwd is missing, not a git repo, has no
-    origin, or anything fails — fully fail-open (never raises)."""
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, for analytics; never raises."""
     try:
         if not cwd:
             return None
-        result = subprocess.run(
-            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return None
-        path = _github_remote_path(result.stdout.strip())
-        if not path:
-            return None
-        parts = path.split('/')
-        if len(parts) < 2:
-            return None
-        org = _strip_git_suffix(parts[0])
-        repo = _strip_git_suffix(parts[1])
-        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+        org, repo = _get_git_origin_org_repo(cwd)
+        return f"{org}/{repo}" if org and repo else None
     except Exception:
         return None
 
 
 def _find_git_root(path):
-    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
-    (directory, or file for linked worktrees). Pure filesystem stats — no
-    subprocess. None when outside any repo or on any error (fail-open)."""
+    """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
         p = Path(path)
         for parent in [p] + list(p.parents):
@@ -1601,11 +1676,8 @@ def _find_git_root(path):
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
-# Package-manager / OS checkouts that are real git clones but never the
-# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
-# so a command merely referencing /opt/homebrew/bin/… would otherwise
-# attribute the call to "homebrew/brew". Candidates under these roots are
-# skipped so resolution falls through to the shell's working directory.
+# Real git clones that are never the engineer's project: a path under
+# /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
     '/opt/homebrew',
     '/home/linuxbrew',
@@ -1629,11 +1701,86 @@ def _is_system_checkout_path(path):
 # the shell's working directory across the turn's shell commands.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
+_GIT_PATH_OPT_RE = re.compile(
+    r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
+)
+
+
+def _shell_segments(command):
+    """(segment, following-separator) pairs, sliced from the original so quoted paths survive."""
+    masked = _mask_quoted_runs(command)
+    out, last = [], 0
+    for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
+        out.append((command[last:m.start()].strip(), m.group(0).strip()))
+        last = m.end()
+    out.append((command[last:].strip(), ''))
+    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    return out
+
+
+def _merge_cwds(first, second):
+    """Ordered union, dropping duplicates and bounding the fan-out."""
+    out = list(first)
+    for c in second:
+        if c not in out:
+            out.append(c)
+    return out[:8]
+
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
+    targets = []
+    try:
+        cwds = [shell_dir]
+        # Where control lands if the current && chain short-circuits: `a && b || c`
+        # runs c when a failed (original cwd) or when b failed (a's cwd).
+        fallback = [shell_dir]
+        for segment, separator in _shell_segments(command):
+            words = _segment_words(segment)
+            # git only: `grep -C 3` is context lines, not a directory.
+            if words and os.path.basename(words[0]) == 'git':
+                for match in _GIT_PATH_OPT_RE.finditer(segment):
+                    raw = match.group(1) or match.group(2) or match.group(3)
+                    if not raw:
+                        continue
+                    for cwd in cwds:
+                        target = os.path.expanduser(raw) if raw.startswith('~') else raw
+                        if not target.startswith('/'):
+                            if not cwd:
+                                continue
+                            target = os.path.join(cwd, target)
+                        target = os.path.normpath(target)
+                        if _is_system_checkout_path(target) or target in targets:
+                            continue
+                        targets.append(target)
+            moved = [_next_shell_dir(segment, c) for c in cwds]
+            if separator == '&&':
+                # Next runs only if this one succeeded, so its cd took effect —
+                # but this segment may instead have failed, which a later || reaches.
+                fallback = _merge_cwds(fallback, cwds)
+                cwds = moved
+            elif separator == '||':
+                # Reached because something failed, so that cd did not apply.
+                cwds = _merge_cwds(cwds, fallback)
+                fallback = list(cwds)
+            elif separator in ('|', '&'):
+                # Subshell: a cd on the left never reaches the right-hand command.
+                pass
+            else:
+                # `;` or a newline: sequential, so the cd may or may not have taken.
+                cwds = _merge_cwds(moved, cwds)
+                fallback = list(cwds)
+            cwds = cwds[:8]
+    except Exception:
+        return targets
+    return targets
+
+
 
 def _next_shell_dir(command, shell_dir):
-    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
-    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
-    when the command has no cd or on any error."""
+    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
     try:
         target = None
         for m in _CD_TARGET_RE.finditer(command):
@@ -1651,6 +1798,91 @@ def _next_shell_dir(command, shell_dir):
         return shell_dir
     except Exception:
         return shell_dir
+
+
+# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+_QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Wrappers that stand in front of the real command word.
+_COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
+# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+
+# Shell commands that mutate the working tree, always a write whatever the flags:
+_SHELL_WRITE_COMMANDS = frozenset({
+    'rm', 'rmdir', 'unlink', 'shred',       # delete
+    'mv', 'cp', 'ln', 'install',            # create or relocate
+    'touch', 'mkdir',                       # create
+    'tee', 'truncate', 'patch',             # rewrite contents
+})
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
+_SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
+_INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
+
+
+def _mask_quoted_runs(command):
+    """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
+    return _QUOTED_RUN_RE.sub(
+        lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
+        command)
+
+
+def _segment_words(segment):
+    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    words = []
+    for word in segment.split():
+        word = word.strip('()`{}"\'')
+        if not words and (not word or word.startswith('-')
+                          or _ENV_ASSIGNMENT_RE.match(word)
+                          or word in _COMMAND_PREFIX_WORDS):
+            continue
+        words.append(word)
+    return words
+
+
+def _segment_writes(words):
+    """Whether a segment's command word plus its flags mutate the working tree."""
+    name = os.path.basename(words[0])
+    if name in _SHELL_WRITE_COMMANDS:
+        return True
+    if name in _SHELL_INPLACE_COMMANDS:
+        return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
+    if name == 'dd':
+        return any(w.startswith('of=') for w in words[1:])
+    return False
+
+
+def _is_git_command(command):
+    """Whether any segment of `command` directly invokes git; False on any error."""
+    try:
+        if not isinstance(command, str) or 'git' not in command:
+            return False
+        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+            words = _segment_words(segment)
+            if words and os.path.basename(words[0]) == 'git':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_shell_write_command(command):
+    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    try:
+        if not isinstance(command, str) or not command:
+            return False
+        masked = _mask_quoted_runs(command)
+        if _REDIRECT_RE.search(masked):
+            return True
+        for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
+            words = _segment_words(segment)
+            if words and _segment_writes(words):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _project_for_paths(candidates, root_projects):
@@ -1671,6 +1903,329 @@ def _project_for_paths(candidates, root_projects):
     except Exception:
         pass
     return None
+
+
+# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
+
+# Write tools, git commands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated. Names are canonical_tool_name output.
+_REPO_GATE_WRITE_TOOLS = frozenset({'Write', 'Edit'})
+_REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
+_REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
+REPO_GATE_BLOCK_CONTEXT = (
+    'This action was blocked by an organization repository-scope policy. Do not '
+    'attempt to achieve the same result using alternative tools, file operations, '
+    'or workarounds. Inform the user and stop.'
+)
+
+
+
+
+
+
+def _repo_gate_command(tool_input):
+    """The shell command a Bash call carries; Copilot spells the key four ways."""
+    if not isinstance(tool_input, dict):
+        return None
+    command = (tool_input.get('command') or tool_input.get('input')
+               or tool_input.get('text') or tool_input.get('value'))
+    return command if isinstance(command, str) else None
+
+
+def _repo_gate_applies(tool_name, command):
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        return _is_git_command(command) or _is_shell_write_command(command)
+    return tool_name in _REPO_GATE_WRITE_TOOLS
+
+
+def _repo_gate_block_policies(policies):
+    """Enforceable subset; a policy this hook cannot read is dropped, not guessed."""
+    enforceable = []
+    for policy in policies or []:
+        if not isinstance(policy, dict):
+            continue
+        grace = policy.get('grace_turns')
+        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
+            continue
+        org = policy.get('github_org')
+        if not isinstance(org, str) or not org.strip():
+            continue
+        enforceable.append(policy)
+    return enforceable
+
+
+def _repo_gate_scope_allows(policy, org, repo):
+    """Whether `org` matches this policy's allowed organization; both lowercased."""
+    return org == policy['github_org'].strip().lower()
+
+
+def _repo_gate_violating_repo(candidates, block_policies, root_projects):
+    """First candidate outside every scope; a git failure propagates to fail open."""
+    for candidate in candidates:
+        root = _find_git_root(candidate)
+        if not root:
+            continue
+        if root not in root_projects:
+            root_projects[root] = _get_git_origin_org_repo(root)
+        org, repo = root_projects[root]
+        if not org or not repo:
+            continue
+        if not any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+            return '%s/%s' % (org, repo)
+    return None
+
+
+def _repo_gate_candidates(canonical, tool_input, cwd):
+    """Paths a Copilot call works in; pathless file tools scan serialized input."""
+    tool_input = tool_input or {}
+    candidates = []
+    if canonical == 'Bash':
+        command = (tool_input.get('command') or tool_input.get('input')
+                   or tool_input.get('text') or tool_input.get('value') or '')
+        if isinstance(command, str) and command:
+            candidates.extend(
+                p for p in _ABS_PATH_RE.findall(command)
+                if not _is_system_checkout_path(p)
+            )
+            candidates.extend(_git_path_opt_targets(command, cwd))
+            cwd = _next_shell_dir(command, cwd)
+        if not candidates and cwd:
+            candidates.append(cwd)
+        return candidates
+    path = (tool_input.get('filePath') or tool_input.get('path')
+            or tool_input.get('file_path'))
+    # A relative path resolves against the cwd; unresolvable falls to the blob scan.
+    if isinstance(path, str) and path and not path.startswith('/') and cwd:
+        path = os.path.normpath(os.path.join(cwd, path))
+    if isinstance(path, str) and path.startswith('/'):
+        if not _is_system_checkout_path(path):
+            candidates.append(os.path.dirname(path))
+        return candidates
+    try:
+        blob = json.dumps(tool_input)
+    except (TypeError, ValueError):
+        blob = ''
+    candidates.extend(
+        p for p in _ABS_PATH_RE.findall(blob) if not _is_system_checkout_path(p)
+    )
+    return candidates
+
+
+def _repo_gate_session_id(event):
+    """Copilot sends the conversation id under either spelling."""
+    return event.get('session_id') or event.get('sessionId')
+
+
+def _repo_gate_turn_id(event):
+    """Turn identity so one turn burns one grace; the prompt's logged timestamp."""
+    started = get_last_user_prompt_timestamp_for_session(
+        _repo_gate_session_id(event))
+    if started:
+        return 't-%s' % started
+    return REPO_GATE_UNKNOWN_TURN
+
+
+def _load_repo_gate_state(session_id):
+    """Grace state, keyed on session; anything unreadable reads as unused grace."""
+    fresh = {'used': 0, 'turns': []}
+    try:
+        with open(REPO_GATE_STATE_FILE, 'r', encoding='utf-8') as f:
+            state = json.loads(f.read())
+        if not isinstance(state, dict) or state.get('session_id') != session_id:
+            return fresh
+        used = state.get('used')
+        turns = state.get('turns')
+        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
+            return fresh
+        if not isinstance(turns, list):
+            return fresh
+        return {'used': used, 'turns': [t for t in turns if isinstance(t, str)]}
+    except (OSError, ValueError):
+        return fresh
+
+
+def _save_repo_gate_state(session_id, state):
+    """Atomic replace, so parallel calls in one turn cannot leave a torn file."""
+    try:
+        REPO_GATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({
+            'session_id': session_id,
+            'used': state['used'],
+            'turns': state['turns'][-REPO_GATE_TURN_MEMORY:],
+        })
+        tmp = REPO_GATE_STATE_FILE.parent / ('.repo_gate.%d.tmp' % os.getpid())
+        tmp.write_text(payload, encoding='utf-8')
+        os.replace(str(tmp), str(REPO_GATE_STATE_FILE))
+    except Exception:
+        pass
+
+
+def _repo_gate_warning(repo, remaining):
+    if remaining <= 0:
+        tail = 'This is the final warning — the next turn touching an out-of-scope repository will be blocked.'
+    elif remaining == 1:
+        tail = '1 warning left before out-of-scope repositories are blocked.'
+    else:
+        tail = '%d warnings left before out-of-scope repositories are blocked.' % remaining
+    return (
+        'Unbound repository policy: this action works in "%s", which is outside '
+        'your organization\'s allowed repository scope. %s' % (repo, tail)
+    )
+
+
+def _repo_gate_block_reason(repo):
+    return (
+        'Blocked by organization policy. "%s" is outside your organization\'s '
+        'allowed repository scope.' % repo
+    )
+
+
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
+
+REPO_GATE_REPORT_MAX_CHARS = 2000
+_REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
+                         'path', 'notebook_path')
+
+
+def _repo_gate_clip(text):
+    """Cap one reported string, keeping the body inside curl's pipe buffer."""
+    if not isinstance(text, str) or not text:
+        return None
+    return text[:REPO_GATE_REPORT_MAX_CHARS]
+
+
+def _repo_gate_binding_policy(block_policies):
+    """The denying policy whose grace decided warn-vs-block."""
+    return min(block_policies, key=lambda p: p['grace_turns'])
+
+
+def _repo_gate_post(body, api_key):
+    """Never waited on, so the blocking path stays free of synchronous work."""
+    proc = subprocess.Popen(
+        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
+         '-H', 'Authorization: Bearer %s' % api_key,
+         '-H', 'Content-Type: application/json',
+         '--data-binary', '@-',
+         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(body.encode())
+    proc.stdin.close()
+
+
+def _repo_gate_report(gate, block_policies, context):
+    """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
+    try:
+        decision = (gate or {}).get('decision')
+        if decision not in ('warn', 'deny'):
+            return
+        # main() already resolved the key; the fallback covers entry points that skip it.
+        api_key = _cached_api_key or get_api_key()
+        if not api_key:
+            return
+        policy = _repo_gate_binding_policy(block_policies)
+        # WARN reports how far into the grace it got; BLOCK reports the whole grace.
+        grace = policy.get('grace_turns')
+        remaining = gate.get('remaining')
+        if isinstance(grace, bool) or not isinstance(grace, int):
+            turn = None
+        elif isinstance(remaining, int) and not isinstance(remaining, bool):
+            turn = grace - remaining
+        else:
+            turn = grace
+        # What the call was about: its shell command, or the path it names.
+        tool_input = context.get('tool_input')
+        if isinstance(tool_input, dict):
+            named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
+            tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        # The pretool envelope every other post uses; the verdict rides under repo_gate.
+        app_label = context.get('app_label')
+        _repo_gate_post(json.dumps({
+            'conversation_id': context.get('session_id'),
+            'event_name': 'RepoGate',
+            'unbound_app_label': app_label,
+            'repo_gate': {
+                'policy_id': policy.get('id'),
+                'repository': gate.get('repo'),
+                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                # Same value as the label above: the incidents page reads this one.
+                'agent': app_label,
+                'tool_name': context.get('tool_name'),
+                # Repeats conversation_id above: the analytics row digests this one.
+                'session_id': context.get('session_id'),
+                'turn': turn,
+                'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+                'tool_input': _repo_gate_clip(tool_input),
+            },
+        }), api_key)
+    except Exception:
+        pass
+
+
+def _repo_gate_evaluate(event):
+    """Verdict for one tool call: None allows, else deny or warn. Never raises."""
+    try:
+        canonical = canonical_tool_name(
+            event.get('tool_name') or event.get('toolName') or '')
+        tool_input = _normalize_arguments(
+            event.get('tool_input') or event.get('toolArgs') or {})
+        if not _repo_gate_applies(canonical, _repo_gate_command(tool_input)):
+            return None
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+
+        candidates = _repo_gate_candidates(
+            canonical, tool_input, event.get('cwd'))
+        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        gate = _repo_gate_decide(event, block_policies, repo)
+        _repo_gate_report(gate, block_policies, {
+            'app_label': 'copilot',
+            'session_id': event.get('session_id'),
+            'tool_name': canonical,
+            'tool_input': tool_input,
+        })
+        return gate
+    except Exception:
+        return None
+
+
+def _repo_gate_decide(event, block_policies, repo):
+    """One grace per turn; memoizing the unknown-turn sentinel freezes grace."""
+    if not repo:
+        return None
+    grace = min(p['grace_turns'] for p in block_policies)
+    session_id = _repo_gate_session_id(event)
+    state = _load_repo_gate_state(session_id)
+    turn_id = _repo_gate_turn_id(event)
+    known_turn = turn_id != REPO_GATE_UNKNOWN_TURN
+    if not known_turn or turn_id not in state['turns']:
+        if state['used'] >= grace:
+            return {'decision': 'deny', 'repo': repo}
+        state['used'] += 1
+        if known_turn:
+            state['turns'].append(turn_id)
+        _save_repo_gate_state(session_id, state)
+    return {
+        'decision': 'warn',
+        'repo': repo,
+        'remaining': max(0, grace - state['used']),
+    }
+
+
+def _with_repo_gate_context(response, context):
+    """Append the gate's warning; additive, so a real block is never downgraded."""
+    if not context:
+        return response
+    merged = dict(response or {})
+    hook_output = dict(merged.get('hookSpecificOutput') or {})
+    hook_output['hookEventName'] = 'PreToolUse'
+    existing = hook_output.get('additionalContext') or ''
+    hook_output['additionalContext'] = (
+        existing + '\n\n' + context if existing else context
+    )
+    merged['hookSpecificOutput'] = hook_output
+    return merged
 
 
 def _normalize_arguments(arguments):
@@ -1738,6 +2293,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         candidates = []
         if isinstance(command, str):
             candidates.extend(p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p))
+            candidates.extend(_git_path_opt_targets(command, shell_state.get('dir')))
             shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
         if not candidates and shell_state.get('dir'):
             candidates.append(shell_state['dir'])
@@ -2337,14 +2893,15 @@ def main():
             return
 
         if event_name == 'UserPromptSubmit':
+            # Logged before anything else: this timestamp IS the repo gate's turn id, and logging later would burn a second grace.
+            append_to_audit_log({
+                'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                'event': event,
+            })
+            # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
-            if response.get('decision') == 'block':
-                append_to_audit_log({
-                    'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
-                    'event': event,
-                })
-                print(json.dumps(response), flush=True)
-                return
+            print(json.dumps(response) if response else "{}", flush=True)
+            return
 
         # Create log entry with timestamp; the event already carries hook_event_name
         timestamp = datetime.now().astimezone().isoformat().replace('+00:00', 'Z')

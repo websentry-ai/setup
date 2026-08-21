@@ -41,6 +41,25 @@ def run(args) -> int:
     return 0
 
 
+def run_skills_sync(args) -> int:
+    """Reconcile the device's injected skills against the org (detached child of
+    the hook's SessionStart)."""
+    if not args or args[0] not in TOOLS:
+        return 0
+    try:
+        module = load_hook_module(args[0])
+        sync = getattr(module, "_sync_skills_once", None)
+        read_key = getattr(module, "get_api_key", None)
+        if sync is None or read_key is None:
+            return 0
+        api_key = read_key()
+        if api_key:
+            sync(api_key)
+    except Exception:
+        pass
+    return 0
+
+
 def run_mcp_diagnostic(args) -> int:
     """Build + upload the null-fingerprint diagnostic (env-driven, detached).
     Fail-open: never raises. Only tools whose module defines the entry run it."""

@@ -56,6 +56,7 @@ ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".augment" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
+# No REPO_GATE_STATE_FILE / REPO_GATE_TURN_MEMORY on purpose: Augment has no turn id, so a grace counter could never advance.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 AUDIT_LOG_TOTAL_LIMIT = 100
@@ -499,7 +500,16 @@ def get_policy_check_failure_action() -> str:
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
-def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None):
+def get_repo_policies() -> List[Dict]:
+    """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return []
+    policies = cache.get('repo_policies')
+    return policies if isinstance(policies, list) else []
+
+
+def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None, repo_policies: Optional[List[Dict]] = None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -508,15 +518,34 @@ def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_f
             tools_to_check = prior.get('tools_to_check', [])
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
+        if not isinstance(repo_policies, list):
+            repo_policies = get_repo_policies()
         cache = {
             'last_synced': _utc_now_z(),
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
+            'repo_policies': repo_policies,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
         pass
+
+
+def _cache_policies_from_response(api_response: Optional[Dict]):
+    """Without this a session never loads policies and the gate cannot fire."""
+    if not isinstance(api_response, dict):
+        return
+    if (
+        'tools_to_check' in api_response
+        or 'policy_check_failure_action' in api_response
+        or 'repo_policies' in api_response
+    ):
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+            repo_policies=api_response.get('repo_policies'),
+        )
 
 
 def is_cache_stale(cache: Dict) -> bool:
@@ -1432,7 +1461,27 @@ def _resolve_tool_use_id(event: Dict) -> str:
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
-    """Process PreToolUse event - DO NOT LOG."""
+    """PreToolUse entry point - DO NOT LOG. The gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for the native file tools; both Augment gates share one scope and deny from the first violating call, with no warning phase."""
+    if _repo_gate_gated_call(event):
+        workspace_repo = _repo_gate_session_repo(event, report=True)
+        if workspace_repo:
+            return transform_response_for_claude({
+                'decision': 'deny',
+                'reason': _repo_gate_workspace_block_reason(workspace_repo),
+                'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+            })
+    gate = _repo_gate_evaluate(event)
+    if gate:
+        return transform_response_for_claude({
+            'decision': 'deny',
+            'reason': _repo_gate_block_reason(gate['repo']),
+            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        })
+    return _evaluate_pre_tool_use_policies(event, api_key)
+
+
+def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
+    """Run the gateway policy check for a PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
     model = _augment_model(event, session_id)
     tool_name = event.get('tool_name', '')
@@ -1571,11 +1620,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         # FLAG (Phase 2): inert in Phase 1 — the gateway never returns
@@ -1613,28 +1658,53 @@ def _github_remote_path(remote_url: Optional[str]) -> Optional[str]:
     return None
 
 
+def _git_origin_url(cwd: str) -> Optional[str]:
+    """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
+    result = subprocess.run(
+        ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+
+def _remote_host(remote_url: Optional[str]) -> Optional[str]:
+    """Reject a host-less remote URL, so file:///srv/git/x is not org 'srv'."""
+    url = (remote_url or '').strip()
+    if '://' in url:
+        host = url.split('://', 1)[1].split('/', 1)[0]
+    elif ':' in url:
+        host = url.split(':', 1)[0]
+    else:
+        return None
+    host = host.rsplit('@', 1)[-1].split('?', 1)[0]
+    return host.lower() or None
+
+
+def _get_git_origin_org_repo(cwd: str) -> tuple:
+    """Lowercased (org, repo) of `cwd`'s origin; git failure propagates upward."""
+    url = _git_origin_url(cwd)
+    if not url or not _remote_host(url):
+        return (None, None)
+    path = _github_remote_path(url)
+    if not path:
+        return (None, None)
+    parts = path.split('/')
+    if len(parts) < 2:
+        return (None, None)
+    org = _strip_git_suffix(parts[0]).lower()
+    repo = _strip_git_suffix(parts[1]).lower()
+    return (org or None, repo or None)
+
 def _get_project(cwd: Optional[str]) -> Optional[str]:
-    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
-    requests for analytics. None when cwd is missing, not a git repo, has no
-    origin, or anything fails — fully fail-open (never raises)."""
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, for analytics; never raises."""
     try:
         if not cwd:
             return None
-        result = subprocess.run(
-            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return None
-        path = _github_remote_path(result.stdout.strip())
-        if not path:
-            return None
-        parts = path.split('/')
-        if len(parts) < 2:
-            return None
-        org = _strip_git_suffix(parts[0])
-        repo = _strip_git_suffix(parts[1])
-        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+        org, repo = _get_git_origin_org_repo(cwd)
+        return f"{org}/{repo}" if org and repo else None
     except Exception:
         return None
 
@@ -1643,15 +1713,11 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
 # path — used for per-tool-call project attribution on the Stop exchange.
 _FILE_TOOLS = {'Read', 'Write', 'Edit', 'Delete'}
 
-# Any absolute path inside a shell command (cd targets, git -C, pytest /x/…).
-# Left boundary required so the slash inside a relative token (tests/webapp/)
-# doesn't read as an absolute path.
+# Any absolute path inside a shell command; left boundary required so the
+# slash inside a relative token (tests/webapp/) doesn't read as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
-# Package-manager / OS checkouts that are real git clones but never the
-# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
-# so a command merely referencing /opt/homebrew/bin/… would otherwise
-# attribute the call to "homebrew/brew". Candidates under these roots are
-# skipped so resolution falls through to the shell's working directory.
+# Real git clones that are never the engineer's project: a path under
+# /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
     '/opt/homebrew',
     '/home/linuxbrew',
@@ -1675,11 +1741,86 @@ def _is_system_checkout_path(path: str) -> bool:
 # the shell's working directory across the turn's launch-process calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
+_GIT_PATH_OPT_RE = re.compile(
+    r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
+)
+
+
+def _shell_segments(command):
+    """(segment, following-separator) pairs, sliced from the original so quoted paths survive."""
+    masked = _mask_quoted_runs(command)
+    out, last = [], 0
+    for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
+        out.append((command[last:m.start()].strip(), m.group(0).strip()))
+        last = m.end()
+    out.append((command[last:].strip(), ''))
+    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    return out
+
+
+def _merge_cwds(first, second):
+    """Ordered union, dropping duplicates and bounding the fan-out."""
+    out = list(first)
+    for c in second:
+        if c not in out:
+            out.append(c)
+    return out[:8]
+
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
+    targets = []
+    try:
+        cwds = [shell_dir]
+        # Where control lands if the current && chain short-circuits: `a && b || c`
+        # runs c when a failed (original cwd) or when b failed (a's cwd).
+        fallback = [shell_dir]
+        for segment, separator in _shell_segments(command):
+            words = _segment_words(segment)
+            # git only: `grep -C 3` is context lines, not a directory.
+            if words and os.path.basename(words[0]) == 'git':
+                for match in _GIT_PATH_OPT_RE.finditer(segment):
+                    raw = match.group(1) or match.group(2) or match.group(3)
+                    if not raw:
+                        continue
+                    for cwd in cwds:
+                        target = os.path.expanduser(raw) if raw.startswith('~') else raw
+                        if not target.startswith('/'):
+                            if not cwd:
+                                continue
+                            target = os.path.join(cwd, target)
+                        target = os.path.normpath(target)
+                        if _is_system_checkout_path(target) or target in targets:
+                            continue
+                        targets.append(target)
+            moved = [_next_shell_dir(segment, c) for c in cwds]
+            if separator == '&&':
+                # Next runs only if this one succeeded, so its cd took effect —
+                # but this segment may instead have failed, which a later || reaches.
+                fallback = _merge_cwds(fallback, cwds)
+                cwds = moved
+            elif separator == '||':
+                # Reached because something failed, so that cd did not apply.
+                cwds = _merge_cwds(cwds, fallback)
+                fallback = list(cwds)
+            elif separator in ('|', '&'):
+                # Subshell: a cd on the left never reaches the right-hand command.
+                pass
+            else:
+                # `;` or a newline: sequential, so the cd may or may not have taken.
+                cwds = _merge_cwds(moved, cwds)
+                fallback = list(cwds)
+            cwds = cwds[:8]
+    except Exception:
+        return targets
+    return targets
+
+
 
 def _find_git_root(path: str) -> Optional[str]:
-    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
-    (directory, or file for linked worktrees). Pure filesystem stats — no
-    subprocess. None when outside any repo or on any error (fail-open)."""
+    """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
         p = Path(path)
         for parent in [p] + list(p.parents):
@@ -1691,9 +1832,7 @@ def _find_git_root(path: str) -> Optional[str]:
 
 
 def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
-    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
-    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
-    when the command has no cd or on any error."""
+    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
     try:
         target = None
         for m in _CD_TARGET_RE.finditer(command):
@@ -1739,6 +1878,7 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
                 candidates.extend(
                     p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
                 )
+                candidates.extend(_git_path_opt_targets(command, shell_dir))
                 shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)
@@ -1753,6 +1893,372 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
     except Exception:
         return None, shell_dir
+
+
+# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+_QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Wrappers that stand in front of the real command word.
+_COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
+# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+
+# Shell commands that mutate the working tree, always a write whatever the flags:
+_SHELL_WRITE_COMMANDS = frozenset({
+    'rm', 'rmdir', 'unlink', 'shred',       # delete
+    'mv', 'cp', 'ln', 'install',            # create or relocate
+    'touch', 'mkdir',                       # create
+    'tee', 'truncate', 'patch',             # rewrite contents
+})
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
+_SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
+_INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
+
+
+def _mask_quoted_runs(command):
+    """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
+    return _QUOTED_RUN_RE.sub(
+        lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
+        command)
+
+
+def _segment_words(segment):
+    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    words = []
+    for word in segment.split():
+        word = word.strip('()`{}"\'')
+        if not words and (not word or word.startswith('-')
+                          or _ENV_ASSIGNMENT_RE.match(word)
+                          or word in _COMMAND_PREFIX_WORDS):
+            continue
+        words.append(word)
+    return words
+
+
+def _segment_writes(words):
+    """Whether a segment's command word plus its flags mutate the working tree."""
+    name = os.path.basename(words[0])
+    if name in _SHELL_WRITE_COMMANDS:
+        return True
+    if name in _SHELL_INPLACE_COMMANDS:
+        return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
+    if name == 'dd':
+        return any(w.startswith('of=') for w in words[1:])
+    return False
+
+
+def _is_git_command(command):
+    """Whether any segment of `command` directly invokes git; False on any error."""
+    try:
+        if not isinstance(command, str) or 'git' not in command:
+            return False
+        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+            words = _segment_words(segment)
+            if words and os.path.basename(words[0]) == 'git':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_shell_write_command(command):
+    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    try:
+        if not isinstance(command, str) or not command:
+            return False
+        masked = _mask_quoted_runs(command)
+        if _REDIRECT_RE.search(masked):
+            return True
+        for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
+            words = _segment_words(segment)
+            if words and _segment_writes(words):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+# --- Repository-scope gate: blocks writes, git commands and shell writes outside the org's allowed scope; Augment (https://docs.augmentcode.com/cli/hooks) has no warning phase and denies from the first violating call ---
+
+# Write tools, git commands and shell writes only; the read tools (view, read-file) are ungated, remove-files is a write, and every other shell command (ls, cat, npm test) is ungated.
+_REPO_GATE_WRITE_TOOLS = frozenset({'str-replace-editor', 'save-file',
+                                    'remove-files'})
+_REPO_GATE_SHELL_TOOLS = frozenset({'launch-process'})
+_REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
+REPO_GATE_BLOCK_CONTEXT = (
+    'This action was blocked by an organization repository-scope policy. Do not '
+    'attempt to achieve the same result using alternative tools, file operations, '
+    'or workarounds. Inform the user and stop.'
+)
+
+
+
+
+
+
+def _repo_gate_command(tool_input):
+    """The shell command a launch-process call carries, in Augment's shape."""
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get('command') or tool_input.get('commandLine')
+    return command if isinstance(command, str) else None
+
+
+def _repo_gate_applies(tool_name, command):
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        return _is_git_command(command) or _is_shell_write_command(command)
+    return tool_name in _REPO_GATE_WRITE_TOOLS
+
+
+def _repo_gate_gated_call(event: Dict) -> bool:
+    """Whether this PreToolUse call is in the gate's scope at all; both Augment gates consult it, so reads and non-mutating shell commands pass either way."""
+    try:
+        if event.get('is_mcp_tool'):
+            return False
+        return _repo_gate_applies(
+            event.get('tool_name') or '',
+            _repo_gate_command(event.get('tool_input')))
+    except Exception:
+        return False
+
+
+def _repo_gate_block_policies(policies: Optional[List[Dict]]) -> List[Dict]:
+    """Enforceable subset; a policy this hook cannot read is dropped, not guessed."""
+    enforceable = []
+    for policy in policies or []:
+        if not isinstance(policy, dict):
+            continue
+        grace = policy.get('grace_turns')
+        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
+            continue
+        org = policy.get('github_org')
+        if not isinstance(org, str) or not org.strip():
+            continue
+        enforceable.append(policy)
+    return enforceable
+
+
+def _repo_gate_scope_allows(policy: Dict, org: str, repo: str) -> bool:
+    """Whether `org` matches this policy's allowed organization; both lowercased."""
+    return org == policy['github_org'].strip().lower()
+
+
+def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict], root_projects: Dict[str, tuple]) -> Optional[str]:
+    """First candidate outside every scope; a git failure propagates to fail open."""
+    for candidate in candidates:
+        root = _find_git_root(candidate)
+        if not root:
+            continue
+        if root not in root_projects:
+            root_projects[root] = _get_git_origin_org_repo(root)
+        org, repo = root_projects[root]
+        if not org or not repo:
+            continue
+        if not any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+            return '%s/%s' % (org, repo)
+    return None
+
+
+def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], cwd: Optional[str]) -> List[str]:
+    """Paths an Augment call works in; relative paths join the working dir."""
+    tool_input = tool_input if isinstance(tool_input, dict) else {}
+    candidates = []
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        command = tool_input.get('command') or tool_input.get('commandLine')
+        if isinstance(command, str) and command:
+            candidates.extend(
+                p for p in _ABS_PATH_RE.findall(command)
+                if not _is_system_checkout_path(p)
+            )
+            candidates.extend(_git_path_opt_targets(command, cwd))
+            cwd = _next_shell_dir(command, cwd)
+        if not candidates and cwd:
+            candidates.append(cwd)
+        return candidates
+    path = None
+    for key in ('path', 'file_path', 'filePath'):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value:
+            path = value
+            break
+    if not path:
+        return candidates
+    if not path.startswith('/') and cwd:
+        path = os.path.normpath(os.path.join(cwd, path))
+    if path.startswith('/') and not _is_system_checkout_path(path):
+        candidates.append(os.path.dirname(path))
+    return candidates
+
+
+def _repo_gate_block_reason(repo: str) -> str:
+    """Augment renders only permissionDecisionReason, so this carries it all."""
+    return (
+        'Blocked by organization policy. This action works in the repository '
+        '"%s", which is outside your organization\'s allowed repository scope. '
+        'Move this work to an in-scope repository.' % repo
+    )
+
+
+def _repo_gate_workspace_block_reason(repo: str) -> str:
+    """Augment renders only permissionDecisionReason, so this carries it all."""
+    return (
+        'Blocked by organization policy. This workspace is the repository "%s", '
+        'which is outside your organization\'s allowed repository scope, so every '
+        'tool call here is blocked. Move this work to an in-scope repository and '
+        'start a new session there.' % repo
+    )
+
+
+def _repo_gate_session_advisory(repo: str) -> str:
+    """SessionStart advisory text; SessionStart cannot block."""
+    return (
+        'Unbound repository policy: this workspace is the repository "%s", which '
+        'is outside your organization\'s allowed repository scope. Edits, file '
+        'writes and git commands in this workspace will be denied; reading is '
+        'allowed. Tell the user to move this work to an in-scope repository.'
+        % repo
+    )
+
+
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
+
+REPO_GATE_REPORT_MAX_CHARS = 2000
+_REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
+                         'path', 'notebook_path')
+
+
+def _repo_gate_clip(text):
+    """Cap one reported string, keeping the body inside curl's pipe buffer."""
+    if not isinstance(text, str) or not text:
+        return None
+    return text[:REPO_GATE_REPORT_MAX_CHARS]
+
+
+def _repo_gate_binding_policy(block_policies):
+    """Stable pick among denying policies; augment denies from the first call."""
+    return min(block_policies, key=lambda p: p['grace_turns'])
+
+
+def _repo_gate_post(body, api_key):
+    """Never waited on, so the blocking path stays free of synchronous work."""
+    proc = subprocess.Popen(
+        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
+         '-H', 'Authorization: Bearer %s' % api_key,
+         '-H', 'Content-Type: application/json',
+         '--data-binary', '@-',
+         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(body.encode())
+    proc.stdin.close()
+
+
+def _repo_gate_report(gate, block_policies, context):
+    """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
+    try:
+        decision = (gate or {}).get('decision')
+        if decision not in ('warn', 'deny'):
+            return
+        # main() already resolved the key; the fallback covers entry points that skip it.
+        api_key = _cached_api_key or get_api_key()
+        if not api_key:
+            return
+        policy = _repo_gate_binding_policy(block_policies)
+        # Augment keeps no grace counter and is sent no turn id, so there is no ordinal to report.
+        turn = None
+        # What the call was about: its shell command, or the path it names.
+        tool_input = context.get('tool_input')
+        if isinstance(tool_input, dict):
+            named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
+            tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        # The pretool envelope every other post uses; the verdict rides under repo_gate.
+        app_label = context.get('app_label')
+        _repo_gate_post(json.dumps({
+            'conversation_id': context.get('session_id'),
+            'event_name': 'RepoGate',
+            'unbound_app_label': app_label,
+            'repo_gate': {
+                'policy_id': policy.get('id'),
+                'repository': gate.get('repo'),
+                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                # Same value as the label above: the incidents page reads this one.
+                'agent': app_label,
+                'tool_name': context.get('tool_name'),
+                # Repeats conversation_id above: the analytics row digests this one.
+                'session_id': context.get('session_id'),
+                'turn': turn,
+                'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+                'tool_input': _repo_gate_clip(tool_input),
+            },
+        }), api_key)
+    except Exception:
+        pass
+
+
+def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
+    """Per-path deny; no grace, since Augment has no turn id to advance one."""
+    try:
+        if not _repo_gate_gated_call(event):
+            return None
+        tool_name = event.get('tool_name') or ''
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+
+        candidates = _repo_gate_candidates(
+            tool_name, event.get('tool_input'), event.get('cwd')
+        )
+        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        if not repo:
+            return None
+        gate = {'decision': 'deny', 'repo': repo}
+        _repo_gate_report(gate, block_policies, {
+            'app_label': 'augment_code',
+            'session_id': event.get('session_id'),
+            'tool_name': tool_name,
+            'tool_input': event.get('tool_input'),
+        })
+        return gate
+    except Exception:
+        return None
+
+
+def _repo_gate_session_repo(event: Dict, report: bool = False) -> Optional[str]:
+    """Out-of-scope repo at the workspace root; SessionStart advises, so no report."""
+    try:
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+        cwd = event.get('cwd') or _resolve_cwd(event)
+        if not cwd:
+            return None
+        repo = _repo_gate_violating_repo([cwd], block_policies, {})
+        if repo and report:
+            _repo_gate_report({'decision': 'deny', 'repo': repo}, block_policies, {
+                'app_label': 'augment_code',
+                'session_id': event.get('session_id'),
+                'tool_name': event.get('tool_name'),
+                'tool_input': event.get('tool_input'),
+            })
+        return repo
+    except Exception:
+        return None
+
+
+def _repo_gate_session_start_output(event: Dict) -> Dict:
+    """SessionStart advisory; cannot block, and never touches the grace counter."""
+    repo = _repo_gate_session_repo(event)
+    if not repo:
+        return {}
+    return {
+        'hookSpecificOutput': {
+            'hookEventName': 'SessionStart',
+            'additionalContext': _repo_gate_session_advisory(repo),
+        }
+    }
 
 
 def _augment_posttooluse_to_exchange(ev: Dict, mcp_servers: Optional[Dict] = None) -> Optional[Dict]:
@@ -2463,7 +2969,7 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
-            print("{}")
+            print(json.dumps(_repo_gate_session_start_output(event)), flush=True)
             return
         session_id = event.get('session_id')
 
