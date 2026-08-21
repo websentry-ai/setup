@@ -672,6 +672,7 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
             'hook_event_name': FORWARDED_TOOLS_EVENT,
             'session_id': session_id,
             'forwarded_tool_ids': sorted(merged),
+            'forwarded_prompt_ids': sorted(merged_prompts),
             'text_sig': text_sig,
         },
     })

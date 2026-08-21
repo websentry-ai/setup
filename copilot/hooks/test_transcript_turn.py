@@ -138,6 +138,35 @@ class TestReportedPromptWatermark(unittest.TestCase):
         self.assertEqual(tools, {"call-a"})
         self.assertEqual(prompts, set())
 
+    def test_prompt_ids_persist_across_stops(self):
+        # without this the watermark is always empty and every Stop resends the whole
+        # session's prompts, so a later turn carries the earlier turns' text
+        logs = []
+        with unittest.mock.patch.object(unbound, "load_existing_logs", lambda: list(logs)), \
+             unittest.mock.patch.object(unbound, "save_logs",
+                                        lambda x: (logs.clear(), logs.extend(x))):
+            unbound.record_forwarded_tool_ids(SESSION, {"call-a"}, "sig1", {"u1"})
+            unbound.record_forwarded_tool_ids(SESSION, {"call-b"}, "sig2", {"u2"})
+            tools, _sig, prompts = unbound.get_forwarded_state(SESSION)
+        self.assertEqual(tools, {"call-a", "call-b"})
+        self.assertEqual(prompts, {"u1", "u2"})
+
+    def test_a_second_turn_does_not_carry_the_first(self):
+        first = _transcript([
+            _entry("user.message", _id="u1", content="first question"),
+            _entry("assistant.message", content="the first answer"),
+        ])
+        _ex, _fwd, _sig, reported = unbound.build_exchange_from_transcript(first, SESSION)
+        second = _transcript([
+            _entry("user.message", _id="u1", content="first question"),
+            _entry("assistant.message", content="the first answer"),
+            _entry("user.message", _id="u2", content="second question"),
+            _entry("assistant.message", content="the second answer"),
+        ])
+        exchange, _f, _s, _p = unbound.build_exchange_from_transcript(
+            second, SESSION, already_prompted=reported)
+        self.assertEqual(_user_text(exchange), ["second question"])
+
     def test_no_session_id_is_empty_state(self):
         self.assertEqual(unbound.get_forwarded_state(None), (set(), None, set()))
 
