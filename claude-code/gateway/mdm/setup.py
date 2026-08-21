@@ -544,7 +544,13 @@ def _unbound_base_url_matcher(username, home_dir):
     """Accepts our default gateway, or the one recorded for this user. The record is read
     here rather than inside the predicate: the removal runs under a privilege drop, and a
     second drop nested in the first cannot call setgroups."""
-    recorded = _recorded_gateway_url_for_user(username, home_dir)
+    # On Windows this removal is not per user at all: remove_env_var_from_user deletes the
+    # machine-wide HKLM value, which the whole device shares. A record any account can
+    # write must not authorise that, so there it is ignored and only the default gateway
+    # and the drop-in this setup owns count. On Unix the removal edits that user's own rc
+    # files, where their own record is exactly the right authority.
+    recorded = ("" if platform.system().lower() == "windows"
+                else _recorded_gateway_url_for_user(username, home_dir))
     # Read before the managed settings are cleared: teardown sweeps the environment first,
     # and afterwards the drop-in holding this record is gone.
     managed = _recorded_managed_gateway_url()

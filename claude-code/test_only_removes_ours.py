@@ -120,6 +120,44 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
             self.assertTrue(matcher(OURS), mod.__name__)
             self.assertFalse(matcher(THEIRS), mod.__name__)
 
+    def test_on_windows_a_users_record_cannot_authorise_the_machine_wide_delete(self):
+        # remove_env_var_from_user deletes HKLM on Windows, which the device shares, so a
+        # config any account can write must not decide it -- otherwise a local user sets
+        # gateway_url to the org endpoint and the next privileged clear removes it
+        home = self._home(THEIRS)
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            with patch.object(mod.platform, "system", lambda: "Windows"), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed), \
+                 patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+                matcher = mod._unbound_base_url_matcher("mallory", home)
+            self.assertFalse(matcher(THEIRS), mod.__name__)
+            self.assertTrue(matcher(OURS), mod.__name__)
+
+    def test_on_unix_the_same_record_does_decide_that_users_own_rc(self):
+        home = self._home(self.CUSTOM)
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            with patch.object(mod.platform, "system", lambda: "Darwin"), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed), \
+                 patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+                matcher = mod._unbound_base_url_matcher("alice", home)
+            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+
+    def test_windows_still_recognises_a_custom_route_from_our_drop_in(self):
+        home = self._home(THEIRS)
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.d").mkdir(parents=True)
+        (managed / "managed-settings.d" / "unbound.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": self.CUSTOM}}))
+        for mod in MDM:
+            with patch.object(mod.platform, "system", lambda: "Windows"), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed), \
+                 patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+                matcher = mod._unbound_base_url_matcher("mallory", home)
+            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+            self.assertFalse(matcher(THEIRS), mod.__name__)
+
     def test_the_machine_wide_route_is_recognised_from_our_own_drop_in(self):
         # a Windows MDM device with no user profiles has no per-account record; the
         # drop-in this setup writes is device-level state nothing else writes
