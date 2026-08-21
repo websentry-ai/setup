@@ -497,6 +497,77 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
         return "failed"
 
 
+UNBOUND_GATEWAY_HOST = "getunbound.ai"
+
+
+def _is_unbound_key_helper(value) -> bool:
+    """Whether apiKeyHelper points at the script the gateway setup installs. One an
+    administrator pointed elsewhere is theirs and is left alone."""
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if stripped in {"~/.claude/anthropic_key.sh", str(Path.home() / ".claude" / "anthropic_key.sh")}:
+        return True
+    return stripped.endswith("/.claude/anthropic_key.sh")
+
+
+def _url_host(value: str) -> str:
+    remainder = value.split("://", 1)[-1]
+    return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
+    this device, or one on our own host, counts -- an organisation pointing Claude Code at
+    its own endpoint keeps it."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = value.strip().rstrip("/")
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("gateway_url")
+        if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
+            return True
+    except (OSError, ValueError):
+        pass
+    host = _url_host(candidate)
+    return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _user_env_value(home_dir: Path, var_name: str):
+    """The value a user's shell rc files persist for this variable, or None. Read so a
+    removal can check the value is ours before taking it away."""
+    system = platform.system().lower()
+    if system == "darwin":
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+    elif system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
+        return None
+    prefix = "export %s=" % var_name
+    found = None
+    for rc_file in rc_files:
+        try:
+            lines = rc_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                found = stripped[len(prefix):].strip().strip('"').strip("'")
+    return found
+
+
+def remove_unbound_base_url_from_user(username: str, home_dir: Path) -> str:
+    """Remove ANTHROPIC_BASE_URL for a user only when it still points at our gateway."""
+    current = _user_env_value(home_dir, "ANTHROPIC_BASE_URL")
+    if current is not None and not _is_unbound_base_url(current):
+        debug_print("ANTHROPIC_BASE_URL left in place for %s: %s is not an Unbound value"
+                    % (username, current))
+        return "not_found"
+    return remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+
+
 def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
     """Remove env var from user's shell rc files. Privilege-drops on Unix.
 
@@ -887,12 +958,15 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # Drop gateway MDM setup from the same file — leaving its apiKeyHelper
         # behind makes Claude Code run anthropic_key.sh, which echoes the now
         # removed UNBOUND_API_KEY and fails with "did not return a valid value".
-        if "apiKeyHelper" in settings:
+        if _is_unbound_key_helper(settings.get("apiKeyHelper")):
             del settings["apiKeyHelper"]
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
-            for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-                env.pop(k, None)
+            # ANTHROPIC_AUTH_TOKEN is set only by our gateway setup. The base URL is
+            # shared, so it goes only when it still holds our gateway.
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                env.pop("ANTHROPIC_BASE_URL", None)
             if not env:
                 del settings["env"]
 
@@ -1743,7 +1817,7 @@ def main():
     # Remove leftover gateway setup env vars
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
-        remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+        remove_unbound_base_url_from_user(username, home_dir)
 
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:

@@ -309,15 +309,115 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
         return False
 
 
-def remove_gateway_artifacts() -> None:
-    """Remove ~/.claude/anthropic_key.sh if present (leftover from gateway setup)."""
-    key_helper_path = Path.home() / ".claude" / "anthropic_key.sh"
-    if key_helper_path.exists():
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+UNBOUND_GATEWAY_HOST = "getunbound.ai"
+
+
+def _unbound_key_helper_paths():
+    """The apiKeyHelper values our gateway setup writes, in both spellings it uses."""
+    expanded = Path.home() / ".claude" / "anthropic_key.sh"
+    return {"~/.claude/anthropic_key.sh", str(expanded)}
+
+
+def _is_unbound_key_helper(value) -> bool:
+    """Whether apiKeyHelper points at the script our gateway setup installs. A helper
+    pointing anywhere else belongs to whoever put it there and is left alone."""
+    return isinstance(value, str) and value.strip() in _unbound_key_helper_paths()
+
+
+def _key_helper_file_is_ours(path: Path) -> bool:
+    """Whether ~/.claude/anthropic_key.sh is the one our gateway setup wrote. Checked by
+    content: the path is a name a user could also have chosen for their own helper."""
+    try:
+        return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
+    except OSError:
+        return False
+
+
+def _url_host(value: str) -> str:
+    remainder = value.split("://", 1)[-1]
+    return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL we recorded
+    for this device, or one on our own host, counts as ours -- a customer pointing Claude
+    Code at their own endpoint keeps it."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = value.strip().rstrip("/")
+    try:
+        config_path = Path.home() / ".unbound" / "config.json"
+        recorded = (json.loads(config_path.read_text(encoding="utf-8")) or {}).get("gateway_url")
+        if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
+            return True
+    except (OSError, ValueError):
+        pass
+    host = _url_host(candidate)
+    return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _persisted_env_value(var_name: str):
+    """The value this variable is persisted with, or None when it is not set. Read so a
+    removal can check the value belongs to us before taking it away."""
+    system = platform.system().lower()
+    if system == "windows":
         try:
-            key_helper_path.unlink()
-            debug_print(f"Removed {key_helper_path}")
-        except Exception as e:
-            debug_print(f"Failed to remove {key_helper_path}: {e}")
+            result = subprocess.run(
+                ["reg", "query", "HKCU\\Environment", "/V", var_name],
+                capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        for line in (result.stdout or "").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].lower() == var_name.lower():
+                return parts[2].strip()
+        return None
+    rc_file = get_shell_rc_file()
+    if rc_file is None:
+        return None
+    try:
+        lines = rc_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    prefix = "export %s=" % var_name
+    found = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            found = stripped[len(prefix):].strip().strip('"').strip("'")
+    return found
+
+
+def remove_unbound_env_var(var_name: str, is_ours) -> str:
+    """Remove the variable only when its persisted value is one we set. Returns
+    "cleared", "not_found", or "skipped" when the value belongs to someone else."""
+    value = _persisted_env_value(var_name)
+    if value is None:
+        return "not_found"
+    if not is_ours(value):
+        debug_print("%s left in place: %s is not an Unbound value" % (var_name, value))
+        return "skipped"
+    status, _ = remove_env_var(var_name)
+    return status
+
+
+def remove_gateway_artifacts() -> None:
+    """Remove ~/.claude/anthropic_key.sh when our gateway setup wrote it. A file of the
+    same name holding something else is somebody's own helper and is left alone."""
+    key_helper_path = Path.home() / ".claude" / "anthropic_key.sh"
+    if not key_helper_path.exists():
+        return
+    if not _key_helper_file_is_ours(key_helper_path):
+        debug_print(f"{key_helper_path} left in place: not written by Unbound")
+        return
+    try:
+        key_helper_path.unlink()
+        debug_print(f"Removed {key_helper_path}")
+    except Exception as e:
+        debug_print(f"Failed to remove {key_helper_path}: {e}")
 
 
 def download_file(url: str, dest_path: Path) -> bool:
@@ -407,8 +507,9 @@ def configure_claude_settings() -> bool:
             settings = {}
             settings_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Remove apiKeyHelper if present before adding hooks
-        if "apiKeyHelper" in settings:
+        # Our gateway's helper cannot stay while hooks drive Claude Code, but a helper
+        # pointing anywhere else is not ours to remove.
+        if _is_unbound_key_helper(settings.get("apiKeyHelper")):
             del settings["apiKeyHelper"]
         
         script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
@@ -1263,12 +1364,17 @@ def main():
 
     debug_print("API key received from callback")
 
-    # Remove gateway setup env vars and artifacts
-    for var_name in ["UNBOUND_API_KEY", "ANTHROPIC_BASE_URL"]:
-        try:
-            remove_env_var(var_name)
-        except Exception:
-            pass
+    # Remove gateway setup env vars and artifacts. UNBOUND_API_KEY is ours by name;
+    # ANTHROPIC_BASE_URL is shared, so it goes only when it points at our gateway --
+    # a custom Anthropic endpoint belongs to whoever configured it.
+    try:
+        remove_env_var("UNBOUND_API_KEY")
+    except Exception:
+        pass
+    try:
+        remove_unbound_env_var("ANTHROPIC_BASE_URL", _is_unbound_base_url)
+    except Exception:
+        pass
     remove_gateway_artifacts()
 
     debug_print("Setting UNBOUND_CLAUDE_API_KEY environment variable...")

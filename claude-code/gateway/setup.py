@@ -4,6 +4,7 @@ Claude Code - Environment Setup Script
 """
 
 import os
+import shlex
 import sys
 import platform
 import subprocess
@@ -294,6 +295,134 @@ def remove_hooks_unbound_script() -> None:
             debug_print(f"Failed to remove {script_path}: {e}")
 
 
+UNBOUND_GATEWAY_HOST = "getunbound.ai"
+
+
+def _is_unbound_key_helper(value) -> bool:
+    """Whether apiKeyHelper points at the script this setup installs. One pointing
+    anywhere else belongs to whoever put it there and is left alone."""
+    if not isinstance(value, str):
+        return False
+    return value.strip() in {"~/.claude/anthropic_key.sh",
+                             str(Path.home() / ".claude" / "anthropic_key.sh")}
+
+
+def _url_host(value: str) -> str:
+    remainder = value.split("://", 1)[-1]
+    return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
+    this device, or one on our own host, counts -- a customer pointing Claude Code at
+    their own endpoint keeps it."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = value.strip().rstrip("/")
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("gateway_url")
+        if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
+            return True
+    except (OSError, ValueError):
+        pass
+    host = _url_host(candidate)
+    return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _persisted_env_value(var_name: str):
+    """The value this variable is persisted with, or None when unset."""
+    if platform.system().lower() == "windows":
+        try:
+            result = subprocess.run(["reg", "query", "HKCU\\Environment", "/V", var_name],
+                                    capture_output=True, text=True)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        for line in (result.stdout or "").splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].lower() == var_name.lower():
+                return parts[2].strip()
+        return None
+    rc_file = get_shell_rc_file()
+    if rc_file is None:
+        return None
+    try:
+        lines = rc_file.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    prefix = "export %s=" % var_name
+    found = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            found = stripped[len(prefix):].strip().strip('"').strip("'")
+    return found
+
+
+def _command_targets_unbound_hook(command, script_path) -> bool:
+    """Whether a hooks.json command runs our own hook script. Compared on the resolved
+    path so a launcher prefix or quoting does not hide it, and so an administrator's own
+    hook pointing elsewhere is never mistaken for ours."""
+    if not isinstance(command, str) or not command.strip():
+        return False
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t.strip().strip('"').strip("'") for t in tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    target = os.path.normcase(os.path.normpath(str(script_path)))
+    return os.path.normcase(os.path.normpath(tokens[0])) == target
+
+
+def _strip_unbound_hooks(settings, script_path) -> bool:
+    """Drop only the hook entries that run our script. Someone else's hooks are the
+    reason this filters instead of deleting the table: installing the gateway must not
+    take away tooling we did not install. Returns whether anything was removed."""
+    events = settings.get("hooks")
+    if not isinstance(events, dict):
+        return False
+    removed = False
+    for event in list(events.keys()):
+        entries = events[event]
+        if not isinstance(entries, list):
+            continue  # not a hook list; leave whatever is there
+        kept_groups = []
+        for group in entries:
+            if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+                kept_groups.append(group)
+                continue
+            kept = [h for h in group["hooks"]
+                    if not (isinstance(h, dict)
+                            and _command_targets_unbound_hook(h.get("command"), script_path))]
+            if len(kept) != len(group["hooks"]):
+                removed = True
+            if kept:
+                group["hooks"] = kept
+                kept_groups.append(group)
+        if kept_groups:
+            events[event] = kept_groups
+        elif entries:
+            del events[event]
+            removed = True
+    if not events:
+        settings.pop("hooks", None)
+    return removed
+
+
 def setup_claude_key_helper() -> bool:
     """
     Create ~/.claude/anthropic_key.sh that echoes UNBOUND_API_KEY and
@@ -322,9 +451,9 @@ def setup_claude_key_helper() -> bool:
             except Exception:
                 settings = {}
 
-        # Remove hooks if present before adding apiKeyHelper
-        if "hooks" in settings:
-            del settings["hooks"]
+        # Our hook and the gateway cannot both drive Claude Code, so ours is removed here.
+        # Only ours: a hook someone else installed is not this setup's to take away.
+        _strip_unbound_hooks(settings, Path.home() / ".claude" / "hooks" / "unbound.py")
 
         # Update apiKeyHelper
         settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
@@ -441,6 +570,9 @@ def remove_api_key_helper_setting() -> str:
             settings = json.load(f)
         if "apiKeyHelper" not in settings:
             return "not_found"
+        if not _is_unbound_key_helper(settings.get("apiKeyHelper")):
+            debug_print("apiKeyHelper left in place: not installed by Unbound")
+            return "not_found"
         del settings["apiKeyHelper"]
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(settings, f, indent=2)
@@ -461,6 +593,13 @@ def clear_setup() -> bool:
     any_failed = False
 
     for var, label in {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}.items():
+        # ANTHROPIC_BASE_URL is shared with anyone pointing Claude Code elsewhere, so it
+        # goes only when it still holds the gateway we set. UNBOUND_API_KEY is ours by name.
+        if var == "ANTHROPIC_BASE_URL":
+            current = _persisted_env_value(var)
+            if current is not None and not _is_unbound_base_url(current):
+                debug_print(f"{var} left in place: {current} is not an Unbound value")
+                continue
         status, _ = remove_env_var(var)
         if status == "cleared":
             any_cleared = True

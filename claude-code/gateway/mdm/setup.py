@@ -752,15 +752,19 @@ def clear_managed_settings() -> str:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 changed = False
-                if "apiKeyHelper" in settings:
+                if _is_unbound_key_helper(settings.get("apiKeyHelper")):
                     del settings["apiKeyHelper"]
                     changed = True
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
-                    for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-                        if k in env:
-                            del env[k]
-                            changed = True
+                    # ANTHROPIC_AUTH_TOKEN is set only by this setup. The base URL is
+                    # shared, so it goes only when it still holds our gateway.
+                    if "ANTHROPIC_AUTH_TOKEN" in env:
+                        del env["ANTHROPIC_AUTH_TOKEN"]
+                        changed = True
+                    if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                        del env["ANTHROPIC_BASE_URL"]
+                        changed = True
                     if not env:
                         del settings["env"]
                 if changed:
@@ -789,6 +793,68 @@ def clear_managed_settings() -> str:
         return "failed"
 
 
+UNBOUND_GATEWAY_HOST = "getunbound.ai"
+
+
+def _is_unbound_key_helper(value) -> bool:
+    """Whether apiKeyHelper points at the script this setup installs. One an administrator
+    pointed elsewhere is theirs and is left alone."""
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if stripped in {"~/.claude/anthropic_key.sh", str(Path.home() / ".claude" / "anthropic_key.sh")}:
+        return True
+    return stripped.endswith("/.claude/anthropic_key.sh")
+
+
+def _url_host(value: str) -> str:
+    remainder = value.split("://", 1)[-1]
+    return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
+    this device, or one on our own host, counts -- an organisation pointing Claude Code at
+    its own endpoint keeps it."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    candidate = value.strip().rstrip("/")
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("gateway_url")
+        if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
+            return True
+    except (OSError, ValueError):
+        pass
+    host = _url_host(candidate)
+    return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _user_env_value(home_dir, var_name: str):
+    """The value a user's shell rc files persist for this variable, or None."""
+    system = platform.system().lower()
+    if home_dir is None:
+        return None
+    if system == "darwin":
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+    elif system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
+        return None
+    prefix = "export %s=" % var_name
+    found = None
+    for rc_file in rc_files:
+        try:
+            lines = rc_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                found = stripped[len(prefix):].strip().strip('"').strip("'")
+    return found
+
+
 def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
     """Remove var_name for all users. Returns (cleared, not_found, failed) counts."""
     _label = label or var_name
@@ -796,6 +862,13 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
     not_found = 0
     failed = 0
     for username, home_dir in user_homes:
+        if var_name == "ANTHROPIC_BASE_URL":
+            current = _user_env_value(home_dir, var_name)
+            if current is not None and not _is_unbound_base_url(current):
+                debug_print("%s left in place for %s: %s is not an Unbound value"
+                            % (var_name, username, current))
+                not_found += 1
+                continue
         status = remove_env_var_from_user(username, home_dir, var_name)
         if status == "cleared":
             cleared += 1
