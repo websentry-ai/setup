@@ -524,6 +524,19 @@ def _is_unbound_base_url(value) -> bool:
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
 
 
+def _is_unbound_api_key(value) -> bool:
+    """Whether this credential is the one recorded for this device. With no recorded key
+    there is nothing to compare against, so the answer is no and the value stays."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("api_key")
+    except (OSError, ValueError):
+        return False
+    return isinstance(recorded, str) and recorded.strip() == value.strip()
+
+
 def _key_helper_file_is_ours(path) -> bool:
     """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
@@ -576,11 +589,12 @@ def _user_env_value(home_dir: Path, var_name: str):
 
 
 def remove_unbound_base_url_from_user(username: str, home_dir: Path) -> str:
-    """Remove ANTHROPIC_BASE_URL for a user only when it still points at our gateway."""
-    current = _user_env_value(home_dir, "ANTHROPIC_BASE_URL")
-    if current is not None and not _is_unbound_base_url(current):
-        debug_print("ANTHROPIC_BASE_URL left in place for %s: %s is not an Unbound value"
-                    % (username, current))
+    """Remove ANTHROPIC_BASE_URL for a user only when our gateway set it, which means our
+    gateway URL alongside our API key. Read before UNBOUND_API_KEY is cleared."""
+    if not (_is_unbound_base_url(_user_env_value(home_dir, "ANTHROPIC_BASE_URL"))
+            and _is_unbound_api_key(_user_env_value(home_dir, "UNBOUND_API_KEY"))):
+        debug_print("ANTHROPIC_BASE_URL left in place for %s: not set by the Unbound gateway"
+                    % username)
         return "not_found"
     return remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
 
@@ -979,10 +993,11 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             del settings["apiKeyHelper"]
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
-            # Our gateway writes the token and the base URL together, so the URL is what
-            # identifies the pair. Taking the token from beside somebody else's URL would
-            # leave their endpoint with no credential, which is worse than leaving both.
-            if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+            # Our gateway writes the token and the base URL together, so both have to
+            # be ours before either goes. An endpoint or a credential we did not set
+            # belongs to whoever did, and half-clearing the pair would break them.
+            if (_is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
+                    and _is_unbound_api_key(env.get("ANTHROPIC_AUTH_TOKEN"))):
                 env.pop("ANTHROPIC_AUTH_TOKEN", None)
                 env.pop("ANTHROPIC_BASE_URL", None)
             if not env:
@@ -1834,8 +1849,9 @@ def main():
     print("\nSetting environment variables system-wide...")
     # Remove leftover gateway setup env vars
     for username, home_dir in get_all_user_homes():
-        remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
+        # Order matters: the base URL check reads UNBOUND_API_KEY, so it goes first.
         remove_unbound_base_url_from_user(username, home_dir)
+        remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
 
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:

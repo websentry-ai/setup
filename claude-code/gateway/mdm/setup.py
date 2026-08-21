@@ -757,10 +757,11 @@ def clear_managed_settings() -> str:
                     changed = True
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
-                    # This setup writes the token and the base URL together, so the URL is
-                    # what identifies the pair. Taking the token from beside somebody
-                    # else's URL would leave their endpoint with no credential.
-                    if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                    # This setup writes the token and the base URL together, so both have
+                    # to be ours before either goes. An endpoint or a credential we did not
+                    # set belongs to whoever did.
+                    if (_is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
+                            and _is_unbound_api_key(env.get("ANTHROPIC_AUTH_TOKEN"))):
                         env.pop("ANTHROPIC_AUTH_TOKEN", None)
                         del env["ANTHROPIC_BASE_URL"]
                         changed = True
@@ -817,6 +818,19 @@ def _is_unbound_base_url(value) -> bool:
         pass
     host = _url_host(candidate)
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _is_unbound_api_key(value) -> bool:
+    """Whether this credential is the one recorded for this device. With no recorded key
+    there is nothing to compare against, so the answer is no and the value stays."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("api_key")
+    except (OSError, ValueError):
+        return False
+    return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 
 def _key_helper_file_is_ours(path) -> bool:
@@ -879,10 +893,11 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
     failed = 0
     for username, home_dir in user_homes:
         if var_name == "ANTHROPIC_BASE_URL":
-            current = _user_env_value(home_dir, var_name)
-            if current is not None and not _is_unbound_base_url(current):
-                debug_print("%s left in place for %s: %s is not an Unbound value"
-                            % (var_name, username, current))
+            # Ours only when our gateway URL sits alongside our API key.
+            if not (_is_unbound_base_url(_user_env_value(home_dir, var_name))
+                    and _is_unbound_api_key(_user_env_value(home_dir, "UNBOUND_API_KEY"))):
+                debug_print("%s left in place for %s: not set by the Unbound gateway"
+                            % (var_name, username))
                 not_found += 1
                 continue
         status = remove_env_var_from_user(username, home_dir, var_name)

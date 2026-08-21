@@ -322,6 +322,19 @@ def _is_unbound_base_url(value) -> bool:
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
 
 
+def _is_unbound_api_key(value) -> bool:
+    """Whether this credential is the one recorded for this device. With no recorded key
+    there is nothing to compare against, so the answer is no and the value stays."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("api_key")
+    except (OSError, ValueError):
+        return False
+    return isinstance(recorded, str) and recorded.strip() == value.strip()
+
+
 def _key_helper_file_is_ours(path) -> bool:
     """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
@@ -610,14 +623,14 @@ def clear_setup() -> bool:
     any_cleared = False
     any_failed = False
 
+    # Read the pair before clearing either: ANTHROPIC_BASE_URL goes only when this setup
+    # wrote it, which means our gateway URL alongside our API key.
+    gateway_env_ours = (_is_unbound_base_url(_persisted_env_value("ANTHROPIC_BASE_URL"))
+                        and _is_unbound_api_key(_persisted_env_value("UNBOUND_API_KEY")))
     for var, label in {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}.items():
-        # ANTHROPIC_BASE_URL is shared with anyone pointing Claude Code elsewhere, so it
-        # goes only when it still holds the gateway we set. UNBOUND_API_KEY is ours by name.
-        if var == "ANTHROPIC_BASE_URL":
-            current = _persisted_env_value(var)
-            if current is not None and not _is_unbound_base_url(current):
-                debug_print(f"{var} left in place: {current} is not an Unbound value")
-                continue
+        if var == "ANTHROPIC_BASE_URL" and not gateway_env_ours:
+            debug_print(f"{var} left in place: not set by the Unbound gateway")
+            continue
         status, _ = remove_env_var(var)
         if status == "cleared":
             any_cleared = True

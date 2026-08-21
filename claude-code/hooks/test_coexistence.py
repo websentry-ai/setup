@@ -80,30 +80,42 @@ class TestBaseUrlIdentity(unittest.TestCase):
         self.assertFalse(setup._is_unbound_base_url(None))
 
 
-class TestConditionalEnvRemoval(unittest.TestCase):
-    def _remove(self, persisted):
-        removed = []
-        with patch.object(setup, "_persisted_env_value", lambda _n: persisted), \
-             patch.object(setup, "remove_env_var",
-                          lambda n: (removed.append(n), ("cleared", ""))[1]):
-            status = setup.remove_unbound_env_var(
-                "ANTHROPIC_BASE_URL", setup._is_unbound_base_url)
-        return status, removed
+class TestGatewayEnvIsOurs(unittest.TestCase):
+    """The Anthropic environment is only cleared when our gateway set it, which means our
+    gateway URL alongside our API key. Either belonging to somebody else leaves both."""
 
-    def test_a_customers_url_is_left_alone(self):
-        status, removed = self._remove("https://llm.acme-corp.internal")
-        self.assertEqual(status, "skipped")
-        self.assertEqual(removed, [])
+    def _judge(self, base_url, api_key, recorded_key="unbound-key"):
+        home = Path(tempfile.mkdtemp())
+        (home / ".unbound").mkdir(parents=True)
+        (home / ".unbound" / "config.json").write_text(json.dumps({
+            "gateway_url": "https://api.getunbound.ai", "api_key": recorded_key}))
+        values = {"ANTHROPIC_BASE_URL": base_url, "UNBOUND_API_KEY": api_key}
+        with patch.object(setup.Path, "home", staticmethod(lambda: home)), \
+             patch.object(setup, "_persisted_env_value", lambda n: values.get(n)):
+            return setup._gateway_env_is_ours()
 
-    def test_our_url_is_removed(self):
-        status, removed = self._remove("https://api.getunbound.ai")
-        self.assertEqual(status, "cleared")
-        self.assertEqual(removed, ["ANTHROPIC_BASE_URL"])
+    def test_our_url_and_our_key(self):
+        self.assertTrue(self._judge("https://api.getunbound.ai", "unbound-key"))
 
-    def test_an_unset_variable(self):
-        status, removed = self._remove(None)
-        self.assertEqual(status, "not_found")
-        self.assertEqual(removed, [])
+    def test_our_url_but_somebody_elses_key(self):
+        self.assertFalse(self._judge("https://api.getunbound.ai", "their-key"))
+
+    def test_their_url_but_our_key(self):
+        self.assertFalse(self._judge("https://llm.acme-corp.internal", "unbound-key"))
+
+    def test_neither_is_ours(self):
+        self.assertFalse(self._judge("https://llm.acme-corp.internal", "their-key"))
+
+    def test_no_key_set_at_all(self):
+        self.assertFalse(self._judge("https://api.getunbound.ai", None))
+
+    def test_nothing_recorded_to_compare_against(self):
+        home = Path(tempfile.mkdtemp())
+        values = {"ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
+                  "UNBOUND_API_KEY": "unbound-key"}
+        with patch.object(setup.Path, "home", staticmethod(lambda: home)), \
+             patch.object(setup, "_persisted_env_value", lambda n: values.get(n)):
+            self.assertFalse(setup._gateway_env_is_ours())
 
 
 class TestGatewayArtifactRemoval(unittest.TestCase):

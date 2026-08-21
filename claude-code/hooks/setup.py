@@ -342,6 +342,19 @@ def _is_unbound_base_url(value) -> bool:
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
 
 
+def _is_unbound_api_key(value) -> bool:
+    """Whether this credential is the one recorded for this device. With no recorded key
+    there is nothing to compare against, so the answer is no and the value stays."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("api_key")
+    except (OSError, ValueError):
+        return False
+    return isinstance(recorded, str) and recorded.strip() == value.strip()
+
+
 def _key_helper_file_is_ours(path) -> bool:
     """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
@@ -403,17 +416,12 @@ def _persisted_env_value(var_name: str):
     return found
 
 
-def remove_unbound_env_var(var_name: str, is_ours) -> str:
-    """Remove the variable only when its persisted value is one we set. Returns
-    "cleared", "not_found", or "skipped" when the value belongs to someone else."""
-    value = _persisted_env_value(var_name)
-    if value is None:
-        return "not_found"
-    if not is_ours(value):
-        debug_print("%s left in place: %s is not an Unbound value" % (var_name, value))
-        return "skipped"
-    status, _ = remove_env_var(var_name)
-    return status
+def _gateway_env_is_ours() -> bool:
+    """Whether the Anthropic environment on this device is the pair our gateway setup
+    wrote: our gateway URL alongside our API key. Either one belonging to somebody else
+    means the pair is theirs, and none of it is cleared."""
+    return (_is_unbound_base_url(_persisted_env_value("ANTHROPIC_BASE_URL"))
+            and _is_unbound_api_key(_persisted_env_value("UNBOUND_API_KEY")))
 
 
 def remove_gateway_artifacts() -> None:
@@ -1375,17 +1383,21 @@ def main():
 
     debug_print("API key received from callback")
 
-    # Remove gateway setup env vars and artifacts. UNBOUND_API_KEY is ours by name;
-    # ANTHROPIC_BASE_URL is shared, so it goes only when it points at our gateway --
-    # a custom Anthropic endpoint belongs to whoever configured it.
+    # Remove gateway setup env vars and artifacts. Read the pair before touching either:
+    # UNBOUND_API_KEY is ours by name and always goes, but ANTHROPIC_BASE_URL only goes
+    # when our gateway set it, and our API key is half of what says so.
+    gateway_env_ours = _gateway_env_is_ours()
     try:
         remove_env_var("UNBOUND_API_KEY")
     except Exception:
         pass
-    try:
-        remove_unbound_env_var("ANTHROPIC_BASE_URL", _is_unbound_base_url)
-    except Exception:
-        pass
+    if gateway_env_ours:
+        try:
+            remove_env_var("ANTHROPIC_BASE_URL")
+        except Exception:
+            pass
+    else:
+        debug_print("ANTHROPIC_BASE_URL left in place: not set by the Unbound gateway")
     remove_gateway_artifacts()
 
     debug_print("Setting UNBOUND_CLAUDE_API_KEY environment variable...")
