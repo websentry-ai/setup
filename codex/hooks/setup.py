@@ -1172,7 +1172,85 @@ def _backfill_session_id_from_filename(transcript_path: Path) -> Optional[str]:
     return m.group(1) if m else None
 
 
-def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
+def _backfill_remote_path(remote_url: str) -> Optional[str]:
+    """The 'ORG/repo' path of a git remote, SSH scp form or scheme form.
+
+    Mirrors unbound.py::_github_remote_path, host-agnostic so a self-hosted
+    GitHub Enterprise remote resolves like github.com. Duplicated rather than
+    imported: setup.py runs before the hook is installed.
+    """
+    if not remote_url:
+        return None
+    url = remote_url.strip()
+    if '://' in url:
+        after_scheme = url.split('://', 1)[1]
+        path = after_scheme.split('/', 1)[1] if '/' in after_scheme else ''
+    elif ':' in url:
+        path = url.split(':', 1)[1]
+    else:
+        return None
+    return path.strip('/') or None
+
+
+def _backfill_project_for_cwd(cwd: str) -> Optional[str]:
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, or None.
+
+    Resolved on this machine because the server cannot: a project comes from
+    git's origin remote, and by the time a session is replayed the backend is
+    nowhere near the checkout. Never raises -- a deleted directory, a folder
+    that was never a repo, or a remote without an org/repo pair simply yields
+    no project, and the record replays without one.
+    """
+    try:
+        result = subprocess.run(
+            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        path = _backfill_remote_path(result.stdout.strip())
+        if not path:
+            return None
+        parts = path.split('/')
+        if len(parts) < 2:
+            return None
+        org = parts[0][:-4] if parts[0].endswith('.git') else parts[0]
+        repo = parts[1][:-4] if parts[1].endswith('.git') else parts[1]
+        if not org or not repo:
+            return None
+        return f"{org.lower()}/{repo.lower()}"
+    except Exception:
+        return None
+
+
+def _backfill_resolve_projects(entries: List[Dict], cache: Dict[str, Optional[str]]) -> Dict[str, str]:
+    """cwd -> "org/repo" for every directory this session worked in.
+
+    One git call per distinct directory, cached across the whole run: a
+    developer reuses the same few checkouts, so a 5,000-session backfill costs
+    a handful of git invocations rather than thousands.
+    """
+    projects = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        # Claude Code puts cwd on the entry; Codex and Copilot nest their
+        # fields under payload / data. Mirrors the server's _entry_cwd.
+        cwd = None
+        for holder in (entry, entry.get('payload'), entry.get('data')):
+            if isinstance(holder, dict) and isinstance(holder.get('cwd'), str) and holder['cwd']:
+                cwd = holder['cwd']
+                break
+        if not cwd or cwd in projects:
+            continue
+        if cwd not in cache:
+            cache[cwd] = _backfill_project_for_cwd(cwd)
+        if cache[cwd]:
+            projects[cwd] = cache[cwd]
+    return projects
+
+
+def _backfill_collect_session(transcript_path: Path, project_cache: Optional[Dict] = None) -> Optional[Dict]:
     """Read a transcript and return {session_id, entries} for server-side parsing.
     The client only JSON-decodes lines and resolves a session id (preferring
     the session_meta payload, falling back to the rollout filename UUID). All
@@ -1211,7 +1289,14 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 
     if not session_id or not entries:
         return None
-    return {'session_id': session_id, 'entries': entries}
+    session = {'session_id': session_id, 'entries': entries}
+    # Omitted when nothing resolves, so an older backend and a session whose
+    # checkouts are gone look the same to the server: no map, no project.
+    projects = _backfill_resolve_projects(
+        entries, project_cache if project_cache is not None else {})
+    if projects:
+        session['projects'] = projects
+    return session
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1471,6 +1556,9 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         cutoff_mtime = _backfill_read_cutoff(home)
         sessions_root = home / '.codex' / 'sessions'
         sessions: List[Dict] = []
+        # Shared across every transcript: one git call per checkout
+        # per run, not per session.
+        project_cache: Dict[str, Optional[str]] = {}
         capped = False
         if sessions_root.exists():
             for transcript_path in sorted(_backfill_iter_transcripts(sessions_root, cutoff_mtime)):
@@ -1480,7 +1568,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
                     capped = True
                     debug_print(f"reached session cap {BACKFILL_MAX_SESSIONS_PER_RUN}; remaining skipped")
                     break
-                session = _backfill_collect_session(transcript_path)
+                session = _backfill_collect_session(transcript_path, project_cache)
                 if session:
                     sessions.append(session)
         if not sessions:

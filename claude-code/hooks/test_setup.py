@@ -219,6 +219,90 @@ class TestBackfillCutoffCache(unittest.TestCase):
         self.assertFalse(setup._backfill_state_path(self.home).exists())
 
 
+class TestBackfillProjectResolution(unittest.TestCase):
+    """The cwd -> "org/repo" map the backfill payload carries.
+
+    The server cannot work this out: a project comes from git's origin remote,
+    and by the time a session is replayed the backend is nowhere near the
+    checkout. Resolving it here is the only way a replayed session can be
+    attributed to a repository.
+    """
+
+    def test_remote_path_handles_ssh_https_and_enterprise(self):
+        """Host-agnostic, matching unbound.py::_github_remote_path, so a
+        self-hosted GitHub Enterprise remote resolves like github.com."""
+        import setup
+        cases = {
+            'git@github.com:Acme/API.git': 'Acme/API.git',
+            'https://github.com/acme/web': 'acme/web',
+            'https://ghe.corp.example.com/Team/Repo.git': 'Team/Repo.git',
+            'https://github.com/acme/web/': 'acme/web',
+        }
+        for url, expected in cases.items():
+            with self.subTest(url=url):
+                self.assertEqual(setup._backfill_remote_path(url), expected)
+
+    def test_remote_path_rejects_unparseable(self):
+        import setup
+        for url in ('not-a-url', '', None):
+            with self.subTest(url=url):
+                self.assertIsNone(setup._backfill_remote_path(url))
+
+    def test_project_is_lowercased_org_slash_repo(self):
+        """Same shape unbound.py::_get_project emits, so a replayed row is
+        comparable to a live one rather than merely similar."""
+        import setup
+        with patch.object(setup.subprocess, 'run') as run:
+            run.return_value = type('R', (), {
+                'returncode': 0, 'stdout': 'git@github.com:Acme/API.git\n'})()
+            self.assertEqual(setup._backfill_project_for_cwd('/x'), 'acme/api')
+
+    def test_a_directory_that_is_not_a_repo_yields_no_project(self):
+        """Not an error: plenty of real work happens in plain folders, and the
+        record must still replay."""
+        import setup
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsNone(setup._backfill_project_for_cwd(d))
+
+    def test_git_failure_never_raises(self):
+        """Backfill is best-effort; a broken git must not abort onboarding."""
+        import setup
+        with patch.object(setup.subprocess, 'run', side_effect=OSError('no git')):
+            self.assertIsNone(setup._backfill_project_for_cwd('/x'))
+
+    def test_resolve_projects_caches_one_git_call_per_directory(self):
+        """A 5,000-session run reuses a handful of checkouts; without the cache
+        it would shell out to git thousands of times."""
+        import setup
+        entries = [{'cwd': '/repo/a'}, {'cwd': '/repo/a'}, {'cwd': '/repo/b'}]
+        cache = {}
+        with patch.object(setup, '_backfill_project_for_cwd',
+                          side_effect=['acme/a', 'acme/b']) as resolve:
+            first = setup._backfill_resolve_projects(entries, cache)
+            second = setup._backfill_resolve_projects(entries, cache)
+
+        self.assertEqual(resolve.call_count, 2, 'one call per distinct cwd')
+        self.assertEqual(first, {'/repo/a': 'acme/a', '/repo/b': 'acme/b'})
+        self.assertEqual(second, first, 'second session served from cache')
+
+    def test_unresolvable_directories_are_cached_too(self):
+        """A deleted checkout must not be retried once per session."""
+        import setup
+        cache = {}
+        with patch.object(setup, '_backfill_project_for_cwd',
+                          return_value=None) as resolve:
+            setup._backfill_resolve_projects([{'cwd': '/gone'}], cache)
+            setup._backfill_resolve_projects([{'cwd': '/gone'}], cache)
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertIn('/gone', cache)
+
+    def test_malformed_entries_are_skipped(self):
+        import setup
+        self.assertEqual(
+            setup._backfill_resolve_projects(['junk', {}, {'cwd': ''}, 7], {}), {})
+
+
 class TestMdmBackfillCutoff(unittest.TestCase):
     """Tests for the multi-user MDM run_backfill: a user's cutoff must advance
     only when that user's transcripts were actually collected, so a failed
