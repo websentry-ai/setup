@@ -153,6 +153,7 @@ def _registry_value(output: str, var_name: str) -> str:
 
 UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
 UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+UNBOUND_KEY_HELPER_SETTING = "~/.claude/anthropic_key.sh"
 
 
 def _is_unbound_base_url(value) -> bool:
@@ -165,11 +166,20 @@ def _export_value(line: str, prefix: str) -> str:
     return line.strip()[len(prefix):].strip().strip('"').strip("'")
 
 
+def _is_unbound_key_helper_setting(value) -> bool:
+    """Whether settings.json's apiKeyHelper is the one the gateway setup writes."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    return candidate in (UNBOUND_KEY_HELPER_SETTING,
+                         str(Path.home() / ".claude" / "anthropic_key.sh"))
+
+
 def _is_unbound_key_helper_file(path: Path) -> bool:
     """Whether an anthropic_key.sh is the one this setup writes."""
     try:
         return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 
@@ -447,8 +457,9 @@ def configure_claude_settings() -> bool:
             settings = {}
             settings_path.parent.mkdir(parents=True, exist_ok=True)
         
-        # Remove apiKeyHelper if present before adding hooks
-        if "apiKeyHelper" in settings:
+        # Our hook and the gateway's key helper cannot both drive Claude Code, so ours
+        # goes before the hooks are added. Only ours: an org's own helper stays.
+        if _is_unbound_key_helper_setting(settings.get("apiKeyHelper")):
             del settings["apiKeyHelper"]
         
         script_path = Path.home() / ".claude" / "hooks" / "unbound.py"

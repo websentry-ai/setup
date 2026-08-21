@@ -531,7 +531,7 @@ def _registry_value(output: str, var_name: str) -> str:
 def _read_text_or_none(path):
     try:
         return path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):
         return None
 
 

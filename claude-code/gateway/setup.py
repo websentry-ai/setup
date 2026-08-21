@@ -258,7 +258,7 @@ def _is_unbound_key_helper_file(path: Path) -> bool:
     """Whether an anthropic_key.sh is the one this setup writes."""
     try:
         return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
-    except OSError:
+    except (OSError, ValueError):
         return False
 
 

@@ -165,6 +165,42 @@ class TestApiKeyHelperSetting(unittest.TestCase):
                 mod._is_unbound_key_helper_setting("~/.claude/anthropic_key.sh", managed))
 
 
+class TestHooksInstallKeepsTheirApiKeyHelper(unittest.TestCase):
+    """The mirror of the gateway case: installing hooks drops the gateway's key helper
+    setting, not an org's own."""
+
+    def _install_strip(self, value):
+        home = Path(tempfile.mkdtemp())
+        with patch.object(HOOKS.Path, "home", staticmethod(lambda: home)):
+            return HOOKS._is_unbound_key_helper_setting(value)
+
+    def test_their_helper_setting_is_not_ours(self):
+        self.assertFalse(self._install_strip("~/.claude/bedrock_key.sh"))
+        self.assertFalse(self._install_strip("/usr/local/bin/get-token"))
+        self.assertFalse(self._install_strip(None))
+
+    def test_the_setting_the_gateway_writes_is_ours(self):
+        self.assertTrue(self._install_strip("~/.claude/anthropic_key.sh"))
+
+
+class TestBodyCheckFailsOpen(unittest.TestCase):
+    """A helper we cannot decode is not ours, and must not raise -- setup sits between
+    the user and their editor."""
+
+    def test_a_binary_helper_is_not_ours(self):
+        path = Path(tempfile.mkdtemp()) / "anthropic_key.sh"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n\xff\xfe")
+        for mod in USER_LEVEL:
+            self.assertFalse(mod._is_unbound_key_helper_file(path))
+        for mod in MDM:
+            self.assertIsNone(mod._read_text_or_none(path))
+
+    def test_a_missing_helper_is_not_ours(self):
+        path = Path(tempfile.mkdtemp()) / "nope.sh"
+        for mod in USER_LEVEL:
+            self.assertFalse(mod._is_unbound_key_helper_file(path))
+
+
 class TestGatewayInstallKeepsTheirHooks(unittest.TestCase):
     """Installing the gateway drops the Unbound hook, not the user's own."""
 
