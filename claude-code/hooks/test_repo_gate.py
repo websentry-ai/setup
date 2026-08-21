@@ -30,7 +30,6 @@ ORG_POLICY = {
     'id': 12, 'name': 'Block Non-Unbound Repos',
     'github_org': 'unboundsec',
     'repositories': [], 'include_forks': False,
-    'grace_turns': 2,
 }
 
 
@@ -44,7 +43,6 @@ class RepoGateCase(unittest.TestCase):
         state_dir = self.tmp / 'state'
         state_dir.mkdir()
         self.cache_file = state_dir / '.policy_cache.json'
-        self.gate_file = state_dir / '.repo_gate_state.json'
         self.audit_log = state_dir / 'agent-audit.log'
         # The seam for incident reporting: _repo_gate_post is the only thing on
         # that path that touches the network, so patching it both records what
@@ -53,7 +51,6 @@ class RepoGateCase(unittest.TestCase):
         self.real_post = unbound._repo_gate_post
         self._patches = [
             patch.object(unbound, 'POLICY_CACHE_FILE', self.cache_file),
-            patch.object(unbound, 'REPO_GATE_STATE_FILE', self.gate_file),
             # main() audit-logs the prompt event; keep it off the real log.
             patch.object(unbound, 'AUDIT_LOG', self.audit_log),
             patch.object(unbound, 'ERROR_LOG', state_dir / 'error.log'),
@@ -178,28 +175,12 @@ class RepoGateCase(unittest.TestCase):
             self.assertEqual(report[key], value, report)
         return report
 
-    def grace_used(self):
-        """Grace burned so far, per the on-disk state file."""
-        if not self.gate_file.exists():
-            return 0
-        return json.loads(self.gate_file.read_text(encoding='utf-8'))['used']
-
     # -- assertions ------------------------------------------------------
 
     def assertAllowed(self, response):
         out = response.get('hookSpecificOutput') or {}
         self.assertNotIn('permissionDecision', out)
         self.assertNotIn('warning', json.dumps(response).lower())
-
-    def assertWarned(self, response, repo, remaining_phrase=None):
-        out = response.get('hookSpecificOutput') or {}
-        self.assertNotIn('permissionDecision', out)
-        context = out.get('additionalContext') or ''
-        self.assertIn(repo, context)
-        if remaining_phrase:
-            self.assertIn(remaining_phrase, context)
-        # The developer sees the warning too, not just the model.
-        self.assertIn(repo, response.get('systemMessage') or '')
 
     def assertBlocked(self, response, repo):
         out = response.get('hookSpecificOutput') or {}
@@ -211,42 +192,23 @@ class TestCoreDecisions(RepoGateCase):
     def test_path_inside_allowed_org_is_allowed(self):
         self.set_policies([ORG_POLICY])
         self.assertAllowed(self.write_file(self.in_scope))
-        self.assertEqual(self.grace_used(), 0)
 
-    def test_out_of_org_warns_warns_then_blocks(self):
-        self.set_policies([ORG_POLICY])  # grace_turns: 2
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t1'),
-                          'acme/widgets', '1 warning left')
-        self.assertEqual(self.grace_used(), 1)
+    def test_out_of_org_is_blocked_from_the_first_write(self):
+        """Reading anywhere stays fine, but the first write outside the allowed
+        org is blocked, and so is every one after it — same turn or a later
+        one."""
+        self.set_policies([ORG_POLICY])
+        for turn in ('t1', 't1', 't2', 't3'):
+            self.assertBlocked(self.write_file(self.out_scope, prompt_id=turn),
+                               'acme/widgets')
 
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t2'),
-                          'acme/widgets', 'final warning')
-        self.assertEqual(self.grace_used(), 2)
-
-        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t3'),
-                           'acme/widgets')
-        self.assertEqual(self.grace_used(), 2, 'a block must not burn grace')
-
-        # Still blocked on every later turn.
-        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t4'),
-                           'acme/widgets')
-
-    def test_many_violating_calls_in_one_turn_burn_one_grace(self):
+    def test_many_violating_calls_in_one_turn_are_each_blocked(self):
+        """No per-turn allowance for them to share."""
         self.set_policies([ORG_POLICY])
         for _ in range(20):
-            response = self.write_file(self.out_scope, prompt_id='same-turn')
-            self.assertWarned(response, 'acme/widgets')
-        self.assertEqual(self.grace_used(), 1)
-
-    def test_burned_turn_never_escalates_to_block_midway(self):
-        """A turn granted its last warning keeps it for all of its calls."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=1)])
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t1'),
-                          'acme/widgets')
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t1'),
-                          'acme/widgets')
-        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t2'),
-                           'acme/widgets')
+            self.assertBlocked(
+                self.write_file(self.out_scope, prompt_id='same-turn'),
+                'acme/widgets')
 
     # --- git's path-redirecting options (WEB-5456 / greptile P1) -------------
     # `git -C <dir>` and friends retarget git at another checkout. A relative
@@ -255,33 +217,33 @@ class TestCoreDecisions(RepoGateCase):
 
     def test_relative_dash_c_into_an_out_of_scope_repo_is_gated(self):
         """git -C ../widgets, run from an allowed repo, must not slip past."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('git -C ../widgets commit -am wip', cwd=str(self.in_scope)),
             'acme/widgets')
 
     def test_relative_git_dir_into_an_out_of_scope_repo_is_gated(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('git --git-dir=../widgets/.git commit -am wip',
                       cwd=str(self.in_scope)),
             'acme/widgets')
 
     def test_relative_work_tree_into_an_out_of_scope_repo_is_gated(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('git --work-tree ../widgets checkout .',
                       cwd=str(self.in_scope)),
             'acme/widgets')
 
     def test_quoted_dash_c_target_is_gated(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('git -C "../widgets" commit -am wip', cwd=str(self.in_scope)),
             'acme/widgets')
 
     def test_absolute_dash_c_into_an_out_of_scope_repo_is_gated(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash(f'git -C {self.out_scope} commit -am wip',
                       cwd=str(self.in_scope)),
@@ -291,21 +253,20 @@ class TestCoreDecisions(RepoGateCase):
     # allowed no matter where it was launched from.
 
     def test_dash_c_into_an_in_scope_repo_is_allowed(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash('git -C ../setup commit -am wip', cwd=str(self.in_scope)))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_dash_c_into_an_in_scope_repo_from_outside_is_allowed(self):
         """Nothing is written to the launch directory, so it is not the subject."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash(f'git -C {self.in_scope} commit -am wip',
                       cwd=str(self.out_scope)))
 
     def test_dash_c_into_a_non_git_directory_is_allowed(self):
         """Non-git folders stay exempt however git is pointed at them."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash(f'git -C {self.no_repo} init', cwd=str(self.in_scope)))
 
@@ -317,20 +278,20 @@ class TestCoreDecisions(RepoGateCase):
 
     def test_a_bare_dash_c_flag_on_another_command_is_not_a_path(self):
         """`grep -C 3` is context lines, not a directory — must not gate."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(self.bash('grep -C 3 needle README.md',
                                      cwd=str(self.in_scope)))
 
     def test_cd_then_relative_dash_c_resolves_against_the_new_cwd(self):
         """cd /elsewhere && git -C ../widgets — the target is relative to the cd, not the launch dir."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash(f'cd {self.in_scope} && git -C ../widgets commit -am wip',
                       cwd=str(self.no_repo)),
             'acme/widgets')
 
     def test_relative_cd_then_relative_dash_c_is_gated(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('cd src && git -C ../../widgets commit -am wip',
                       cwd=str(self.in_scope)),
@@ -340,27 +301,27 @@ class TestCoreDecisions(RepoGateCase):
         """The cd runs later, so ../setup resolves against the launch dir. Relative
         so the absolute-path scan (which has always matched any /path in a command,
         cd target included) is not what decides this."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash('git -C ../setup commit -am wip && cd ../widgets',
                       cwd=str(self.in_scope)))
 
     def test_chained_cds_use_the_last_one(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash(f'cd /tmp && cd {self.in_scope} && git -C ../widgets commit -am wip',
                       cwd=str(self.no_repo)),
             'acme/widgets')
 
     def test_cd_into_an_in_scope_repo_then_dash_c_in_scope_is_allowed(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash(f'cd {self.in_scope} && git -C . commit -am wip',
                       cwd=str(self.no_repo)))
 
     def test_a_failed_cd_before_a_relative_dash_c_is_gated(self):
         """cd /nonexistent || git -C ../widgets — the cd failed, so git runs in the original cwd."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('cd /nonexistent-dir || git -C ../widgets commit -am wip',
                       cwd=str(self.in_scope)),
@@ -368,7 +329,7 @@ class TestCoreDecisions(RepoGateCase):
 
     def test_an_or_after_a_successful_cd_still_resolves_from_the_original(self):
         """`||` only runs when the left side failed, so the cd must not be applied."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash(f'cd {self.no_repo} || git -C ../widgets commit -am wip',
                       cwd=str(self.in_scope)),
@@ -376,7 +337,7 @@ class TestCoreDecisions(RepoGateCase):
 
     def test_semicolon_covers_both_possible_cwds(self):
         """`;` runs regardless, so either resolution is reachable and both are gated."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash(f'cd {self.no_repo} ; git -C ../widgets commit -am wip',
                       cwd=str(self.in_scope)),
@@ -384,7 +345,7 @@ class TestCoreDecisions(RepoGateCase):
 
     def test_a_failed_and_chain_followed_by_or_still_resolves_from_the_original(self):
         """cd /nonexistent && true || git -C ../widgets — the chain short-circuited, so git runs where it started."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(
             self.bash('cd /nonexistent-dir && true || git -C ../widgets commit -am wip',
                       cwd=str(self.in_scope)),
@@ -394,12 +355,12 @@ class TestCoreDecisions(RepoGateCase):
         """A pipeline runs each side in its own subshell, so the cd never reaches git.
         Relative target: an absolute one is caught by the absolute-path scan, which
         has always matched any /path in a command and is not what this covers."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash('cd ../widgets | git -C . status', cwd=str(self.in_scope)))
 
     def test_a_backgrounded_cd_does_not_move_the_git_target(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(
             self.bash('cd ../widgets & git -C . commit -am wip', cwd=str(self.in_scope)))
 
@@ -409,79 +370,45 @@ class TestCoreDecisions(RepoGateCase):
             'Write', {'file_path': str(self.no_repo / 'deep' / 'todo.md'),
                       'content': 'x'})
         self.assertAllowed(response)
-        self.assertEqual(self.grace_used(), 0)
 
-    def test_grace_zero_blocks_immediately(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
-        self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
-        self.assertEqual(self.grace_used(), 0)
-
-    def test_new_session_resets_grace(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=1)])
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t1'),
-                          'acme/widgets')
-        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t2'),
+    def test_a_new_session_is_blocked_just_the_same(self):
+        """There is no allowance for a new session to refill."""
+        self.set_policies([ORG_POLICY])
+        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t1'),
                            'acme/widgets')
-        self.assertWarned(
+        self.assertBlocked(
             self.write_file(self.out_scope, prompt_id='t1', session_id='S2'),
             'acme/widgets')
 
     def test_write_and_edit_are_gated(self):
         self.set_policies([ORG_POLICY])
         target = str(self.out_scope / 'src' / 'main.py')
-        self.assertWarned(
+        self.assertBlocked(
             self.run_tool('Edit', {'file_path': target, 'old_string': 'x',
                                    'new_string': 'y'}, prompt_id='t1'),
             'acme/widgets')
-        self.assertWarned(
+        self.assertBlocked(
             self.run_tool('NotebookEdit',
                           {'notebook_path': str(self.out_scope / 'nb.ipynb')},
                           prompt_id='t2'),
             'acme/widgets')
 
-    def test_turn_identity_falls_back_to_user_prompt(self):
-        """Clients too old to send prompt_id still burn one grace per turn."""
+
+class TestATurnCannotBeIdentified(RepoGateCase):
+    """A client that sends no prompt_id and has no user prompt to hash leaves
+    the turn unidentifiable. The gate decides without needing to attribute the
+    call to a turn at all."""
+
+    def test_an_unidentifiable_turn_is_blocked_like_any_other(self):
         self.set_policies([ORG_POLICY])
         for _ in range(3):
-            self.write_file(self.out_scope, prompt_id=None, prompts=['fix the bug'])
-        self.assertEqual(self.grace_used(), 1)
-        self.write_file(self.out_scope, prompt_id=None, prompts=['now ship it'])
-        self.assertEqual(self.grace_used(), 2)
+            self.assertBlocked(self.write_file(self.out_scope, prompt_id=None),
+                               'acme/widgets')
 
-
-class TestUnidentifiableTurn(RepoGateCase):
-    """A client that sends no prompt_id and has no user prompt to hash leaves
-    the turn unidentifiable. REPO_GATE_UNKNOWN_TURN records that as an unknown,
-    not as an identity — memoizing it the way a real turn id is memoized would
-    create one bucket that is entered once and never left, freezing the counter
-    one short of the limit and warning forever. That is the defect that made
-    Copilot's tool calls never escalate; the arbitration is shared, so it is
-    pinned here too."""
-
-    def test_unknown_turn_escalates_per_call(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=2)])
-        for _ in range(2):
-            self.assertWarned(self.write_file(self.out_scope, prompt_id=None),
-                              'acme/widgets')
-        self.assertBlocked(self.write_file(self.out_scope, prompt_id=None),
-                           'acme/widgets')
-        self.assertEqual(self.grace_used(), 2)
-
-    def test_unknown_turn_is_never_recorded_as_a_turn(self):
-        self.set_policies([ORG_POLICY])
-        self.write_file(self.out_scope, prompt_id=None)
-        state = json.loads(self.gate_file.read_text(encoding='utf-8'))
-        self.assertEqual(state['turns'], [])
-        self.assertEqual(state['used'], 1)
-
-    def test_an_identifiable_turn_still_burns_exactly_one(self):
-        """Regression guard: per-call charging must apply ONLY to the unknown
-        case, never to a turn the client actually named."""
-        self.set_policies([ORG_POLICY])
-        for _ in range(5):
-            self.assertWarned(self.write_file(self.out_scope, prompt_id='t1'),
-                              'acme/widgets')
-        self.assertEqual(self.grace_used(), 1)
+    def test_no_turn_identity_is_computed_at_all(self):
+        """The helper is gone, not merely unused: a turn id is not something the
+        gate can ask for."""
+        self.assertFalse(hasattr(unbound, '_repo_gate_turn_id'))
 
 
 class TestPromptPathRefreshesThePolicyCache(RepoGateCase):
@@ -489,7 +416,7 @@ class TestPromptPathRefreshesThePolicyCache(RepoGateCase):
 
     def test_the_refresh_makes_the_first_tool_call_enforceable(self):
         self.assertFalse(self.cache_file.exists(), 'starts genuinely cold')
-        policy = dict(ORG_POLICY, grace_turns=0)
+        policy = ORG_POLICY
         gateway = {'decision': 'allow', 'tools_to_check': [],
                    'repo_policies': [policy]}
         self.assertPromptAllowed(
@@ -523,7 +450,7 @@ class TestPromptPathRefreshesThePolicyCache(RepoGateCase):
     def test_a_gate_block_still_costs_no_round_trip(self):
         """Ordering is the safety property: only this machine can resolve a path
         to a git root, so a blocked call must cost zero network round trips."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         api = MagicMock(return_value={})
         with patch.object(unbound, 'send_to_hook_api', api), \
              patch.object(unbound, 'report_error_to_gateway'), \
@@ -546,35 +473,29 @@ class TestConversationIsNeverGated(RepoGateCase):
     """The gate fires on work, not on talking: a conversation's own cwd is never the violation."""
 
     def test_conversation_in_out_of_scope_repo_is_allowed(self):
-        """grace_turns=0, so the old rule would have blocked the first prompt.
-        Three turns in a row are allowed instead."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        """Talking is not working: three turns in a row are allowed even though
+        a single write in the same repo would be blocked."""
+        self.set_policies([ORG_POLICY])
         for turn in ('t1', 't2', 't3'):
             self.assertPromptAllowed(
                 self.run_prompt(cwd=str(self.out_scope), prompt_id=turn))
 
-    def test_conversation_burns_no_grace(self):
-        """The grace a later write needs must still be there afterwards."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=1)])
+    def test_conversation_does_not_change_what_a_later_write_gets(self):
+        """The prompt reaches no verdict, and the write that follows is judged
+        on its own."""
+        self.set_policies([ORG_POLICY])
         for turn in ('t1', 't2'):
             self.run_prompt(cwd=str(self.out_scope), prompt_id=turn)
-        self.assertEqual(self.grace_used(), 0)
-        self.assertFalse(self.gate_file.exists(),
-                         'a prompt must not create the counter file')
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t3'),
-                          'acme/widgets')
+        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t3'),
+                           'acme/widgets')
 
     def test_conversation_in_allowed_org_is_allowed(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertPromptAllowed(self.run_prompt(cwd=str(self.in_scope)))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_conversation_with_no_git_root_is_allowed(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertPromptAllowed(self.run_prompt(cwd=str(self.no_repo)))
-        self.assertEqual(self.grace_used(), 0)
-        self.assertFalse(self.gate_file.exists(),
-                         'a non-repo cwd must not touch the counter')
 
     def test_the_session_gate_is_gone_from_the_module(self):
         for gone in ('_repo_gate_evaluate_session',
@@ -602,7 +523,7 @@ class TestConversationIsNeverGated(RepoGateCase):
         self.assertNotIn('acme/widgets', json.dumps(response))
 
     def test_an_allowed_prompt_is_audit_logged(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.run_prompt(cwd=str(self.out_scope))
         logged = self.audit_log.read_text(encoding='utf-8').strip().splitlines()
         self.assertEqual(len(logged), 1)
@@ -614,17 +535,15 @@ class TestReadsAreUngated(RepoGateCase):
     """Read/Grep/Glob are out of scope: a read names no intent to change anything."""
 
     def test_read_in_an_out_of_scope_repo_is_allowed(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(self.read_file(self.out_scope))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_grep_and_glob_in_an_out_of_scope_repo_are_allowed(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         for tool_name in ('Grep', 'Glob'):
             with self.subTest(tool=tool_name):
                 self.assertAllowed(self.run_tool(
                     tool_name, {'path': str(self.out_scope)}))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_reads_are_out_of_the_gate_scope_by_name(self):
         for tool_name in ('Read', 'Grep', 'Glob'):
@@ -633,10 +552,10 @@ class TestReadsAreUngated(RepoGateCase):
 
     def test_many_reads_never_escalate_a_later_write(self):
         """Reads must not quietly spend the grace a write still needs."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=1)])
+        self.set_policies([ORG_POLICY])
         for turn in ('t1', 't2', 't3'):
             self.assertAllowed(self.read_file(self.out_scope, prompt_id=turn))
-        self.assertWarned(self.write_file(self.out_scope, prompt_id='t4'),
+        self.assertBlocked(self.write_file(self.out_scope, prompt_id='t4'),
                           'acme/widgets')
 
 
@@ -647,24 +566,22 @@ class TestShellDirectoryChanges(RepoGateCase):
         self.set_policies([ORG_POLICY])
         for tail in ('git commit -m wip', 'rm README.md', 'echo x > out.txt'):
             with self.subTest(tail=tail):
-                self.gate_file.unlink(missing_ok=True)
-                self.assertWarned(
+                self.assertBlocked(
                     self.bash('cd %s && %s' % (self.out_scope, tail),
                               cwd=str(self.in_scope)),
                     'acme/widgets')
 
     def test_bare_cd_with_no_git_or_write_is_allowed(self):
         """Walking into an out-of-scope repo is not gated, and neither is reading once there."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         for command in ('cd %s', 'cd %s && cat README.md', 'cd %s && ls -la'):
             with self.subTest(command=command):
                 self.assertAllowed(self.bash(command % self.out_scope,
                                              cwd=str(self.in_scope)))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_relative_traversal_out_of_the_allowed_repo_is_caught(self):
         self.set_policies([ORG_POLICY])
-        self.assertWarned(
+        self.assertBlocked(
             self.bash('cd %s/../widgets && git commit -m wip' % self.in_scope,
                       cwd=str(self.in_scope)),
             'acme/widgets')
@@ -674,21 +591,19 @@ class TestShellDirectoryChanges(RepoGateCase):
         self.assertAllowed(
             self.bash('cd %s && git commit -m wip' % self.in_scope,
                       cwd=str(self.tmp)))
-        self.assertEqual(self.grace_used(), 0)
 
 
 class TestBashPaths(RepoGateCase):
     def test_absolute_path_in_a_gated_command_violates(self):
         self.set_policies([ORG_POLICY])
         command = 'rm %s/src/main.py' % self.out_scope
-        self.assertWarned(self.bash(command), 'acme/widgets')
+        self.assertBlocked(self.bash(command), 'acme/widgets')
 
     def test_gated_command_with_cwd_inside_out_of_scope_repo_violates(self):
         self.set_policies([ORG_POLICY])
         for command in ('git push', 'rm main.py', 'echo x > out.txt'):
             with self.subTest(command=command):
-                self.gate_file.unlink(missing_ok=True)
-                self.assertWarned(self.bash(command, cwd=str(self.out_scope)),
+                self.assertBlocked(self.bash(command, cwd=str(self.out_scope)),
                                   'acme/widgets')
 
     def test_gated_command_in_allowed_repo_is_allowed(self):
@@ -696,14 +611,12 @@ class TestBashPaths(RepoGateCase):
         for command in ('git push', 'rm main.py', 'echo x > out.txt'):
             with self.subTest(command=command):
                 self.assertAllowed(self.bash(command, cwd=str(self.in_scope)))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_gated_command_outside_any_repo_is_allowed(self):
         self.set_policies([ORG_POLICY])
         for command in ('git push', 'rm main.py', 'echo x > out.txt'):
             with self.subTest(command=command):
                 self.assertAllowed(self.bash(command, cwd=str(self.no_repo)))
-        self.assertEqual(self.grace_used(), 0)
 
 
 class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
@@ -729,17 +642,15 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
         self.set_policies([ORG_POLICY])
         for command in self.GATED:
             with self.subTest(command=command):
-                self.gate_file.unlink(missing_ok=True)
-                self.assertWarned(self.bash(command, cwd=str(self.out_scope)),
+                self.assertBlocked(self.bash(command, cwd=str(self.out_scope)),
                                   'acme/widgets')
 
     def test_ungated_commands_are_allowed_in_an_out_of_scope_repo(self):
         """grace_turns=0, so anything in scope would block outright."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         for command in self.UNGATED:
             with self.subTest(command=command):
                 self.assertAllowed(self.bash(command, cwd=str(self.out_scope)))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_a_2_to_1_redirect_is_not_a_write(self):
         """`2>&1` and `1>&2` move an existing stream; they create nothing."""
@@ -770,14 +681,22 @@ class TestOnlyGitAndShellWritesAreGated(RepoGateCase):
         self.assertAllowed(self.run_tool(
             'Bash', {'command': '/opt/homebrew/bin/jq . data.json'},
             cwd=str(self.in_scope)))
-        self.assertEqual(self.grace_used(), 0)
 
 
 class TestPolicySemantics(RepoGateCase):
     def test_stray_action_key_is_ignored(self):
         # Rows written before the action field was dropped must still enforce.
         self.set_policies([dict(ORG_POLICY, action='ALLOW')])
-        self.assertWarned(self.write_file(self.out_scope), 'acme/widgets')
+        self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
+
+    def test_a_stray_grace_turns_is_ignored(self):
+        """A gateway that has not deployed the removal still sends it; a policy
+        carrying one must enforce exactly as if it did not."""
+        for grace in (0, 3, 'three', None, -1):
+            with self.subTest(grace_turns=grace):
+                self.set_policies([dict(ORG_POLICY, grace_turns=grace)])
+                self.assertBlocked(self.write_file(self.out_scope),
+                                   'acme/widgets')
 
     def test_compliant_with_any_block_policy_is_compliant(self):
         """Multiple BLOCK policies: a path violates only if outside them all."""
@@ -787,14 +706,6 @@ class TestPolicySemantics(RepoGateCase):
         ])
         self.assertAllowed(self.write_file(self.in_scope))
         self.assertAllowed(self.write_file(self.out_scope))
-        self.assertEqual(self.grace_used(), 0)
-
-    def test_minimum_grace_across_block_policies_wins(self):
-        self.set_policies([
-            dict(ORG_POLICY, grace_turns=7),
-            dict(ORG_POLICY, id=13, grace_turns=0),
-        ])
-        self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
 
     def test_org_match_is_case_insensitive(self):
         self.set_policies([dict(ORG_POLICY, github_org='UnBoundSec')])
@@ -818,7 +729,10 @@ class TestPolicySemantics(RepoGateCase):
 
 
 class TestNeverDowngradesABlock(RepoGateCase):
-    def test_gateway_deny_survives_a_gate_warning(self):
+    def test_the_gate_decides_before_the_gateway_is_consulted(self):
+        """The gate resolves paths locally and denies without a round trip, so
+        its reason is what the caller sees. The call is denied either way — one
+        block replaced by another, never by an allow."""
         self.set_policies([ORG_POLICY], tools_to_check=['Bash'])
         gateway = {'decision': 'deny', 'reason': 'Blocked: secret exfiltration',
                    'additionalContext': 'Stop and tell the user.'}
@@ -827,13 +741,10 @@ class TestNeverDowngradesABlock(RepoGateCase):
             gateway=gateway)
         out = response['hookSpecificOutput']
         self.assertEqual(out['permissionDecision'], 'deny')
-        self.assertEqual(out['permissionDecisionReason'],
-                         'Blocked: secret exfiltration')
-        self.assertIn('Stop and tell the user.', out['additionalContext'])
-        self.assertIn('acme/widgets', out['additionalContext'])
+        self.assertIn('acme/widgets', out['permissionDecisionReason'])
 
     def test_gate_block_does_not_call_the_gateway(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)],
+        self.set_policies([ORG_POLICY],
                           tools_to_check=['Bash'])
         event = {
             'hook_event_name': 'PreToolUse', 'session_id': 'S1',
@@ -852,24 +763,21 @@ class TestFailsOpen(RepoGateCase):
     def test_cold_cache_allows(self):
         self.assertFalse(self.cache_file.exists())
         self.assertAllowed(self.write_file(self.out_scope))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_git_binary_missing_allows(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         with patch.object(unbound, '_git_origin_url',
                           side_effect=FileNotFoundError('git')):
             self.assertAllowed(self.write_file(self.out_scope))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_git_timeout_allows(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         timeout = subprocess.TimeoutExpired(cmd='git', timeout=10)
         with patch.object(unbound, '_git_origin_url', side_effect=timeout):
             self.assertAllowed(self.write_file(self.out_scope))
-        self.assertEqual(self.grace_used(), 0)
 
     def test_repo_without_origin_allows(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         bare = _make_repo(self.tmp / 'work' / 'local', 'origin')
         subprocess.run(['git', '-C', str(bare), 'remote', 'remove', 'origin'],
                        check=True, capture_output=True)
@@ -878,7 +786,7 @@ class TestFailsOpen(RepoGateCase):
     def test_hostless_origin_allows(self):
         """file:///srv/git/x parses as org "srv", repo "git" — a half-parse the
         gate must never judge against a GitHub org."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         weird = _make_repo(self.tmp / 'work' / 'weird', 'file:///srv/git/x')
         self.assertAllowed(self.write_file(weird))
 
@@ -897,16 +805,13 @@ class TestFailsOpen(RepoGateCase):
         self.set_policies([ORG_POLICY])
         ghe = _make_repo(self.tmp / 'work' / 'ghe',
                          'git@ghe.acme.com:acme/internal.git')
-        self.assertWarned(self.write_file(ghe), 'acme/internal')
+        self.assertBlocked(self.write_file(ghe), 'acme/internal')
 
     def test_malformed_repo_policies_allow(self):
         for policies in (
             'not-a-list',
             [None, 3, 'x'],
             [{}],
-            [dict(ORG_POLICY, grace_turns='three')],
-            [dict(ORG_POLICY, grace_turns=None)],
-            [dict(ORG_POLICY, grace_turns=-1)],
             [dict(ORG_POLICY, scope_mode='organization', github_org='')],
             [dict(ORG_POLICY, scope_mode='organization', github_org=None)],
         ):
@@ -917,30 +822,22 @@ class TestFailsOpen(RepoGateCase):
                     'repo_policies': policies,
                 }), encoding='utf-8')
                 self.assertAllowed(self.write_file(self.out_scope))
-                self.assertEqual(self.grace_used(), 0)
 
-    def test_corrupt_state_file_allows_and_is_treated_as_unused(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=1)])
-        for junk in ('', '{', 'null', '[]', '{"used": "many"}',
-                     '{"session_id": "S1", "used": -4, "turns": []}',
-                     '{"session_id": "S1", "used": 9, "turns": "t1"}'):
-            with self.subTest(junk=junk):
-                self.gate_file.write_text(junk, encoding='utf-8')
-                self.assertWarned(self.write_file(self.out_scope, prompt_id='t1'),
-                                  'acme/widgets')
-
-    def test_unwritable_state_dir_still_warns(self):
+    def test_the_gate_reads_no_state_file_to_be_corrupted(self):
+        """The gate reads no file to decide, so a corrupt one cannot change a
+        verdict."""
+        for gone in ('REPO_GATE_STATE_FILE', '_load_repo_gate_state',
+                     '_save_repo_gate_state'):
+            self.assertFalse(hasattr(unbound, gone), gone)
         self.set_policies([ORG_POLICY])
-        with patch.object(unbound, 'REPO_GATE_STATE_FILE',
-                          Path('/proc/nonexistent/.repo_gate_state.json')):
-            self.assertWarned(self.write_file(self.out_scope), 'acme/widgets')
+        self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
 
     def test_corrupt_policy_cache_allows(self):
         self.cache_file.write_text('{not json', encoding='utf-8')
         self.assertAllowed(self.write_file(self.out_scope))
 
     def test_ungated_tool_names_are_untouched(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         response = self.run_tool('WebFetch', {'url': 'https://example.com'})
         self.assertEqual(response, {})
 
@@ -952,16 +849,16 @@ if __name__ == '__main__':
 class TestIncidentReporting(RepoGateCase):
     """Exactly one report per non-allow verdict; the gate decides on-device, so an unreported verdict leaves no trace."""
 
-    def test_a_warned_tool_call_reports_one_warn(self):
+    def test_a_gated_tool_call_reports_one_block(self):
         self.set_policies([ORG_POLICY])
-        self.assertWarned(self.write_file(self.out_scope), 'acme/widgets')
+        self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
         report = self.assertOneReport(
-            'WARN', 'acme/widgets',
+            'BLOCK', 'acme/widgets',
             tool_name='Edit', session_id='S1', prompt_text=None)
         self.assertEqual(report['tool_input'],
                          str(self.out_scope / 'src' / 'main.py'))
-        # grace_turns is 2 and this call spent the first of them.
-        self.assertEqual(report['turn'], 1)
+        # Numbers the incident; the value is opaque, its uniqueness is not.
+        self.assertIsInstance(report['turn'], int)
 
     def test_a_blocked_tool_call_reports_one_block(self):
         self.set_policies([ORG_POLICY])
@@ -991,14 +888,14 @@ class TestIncidentReporting(RepoGateCase):
         self.assertNoReports()
 
     def test_a_read_reports_nothing(self):
-        """Reads left the gate, so they reach no verdict and file no
-        incident — including in an out-of-scope repo with grace spent."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        """Reads left the gate, so they reach no verdict and file no incident,
+        including in a repo whose writes are all blocked."""
+        self.set_policies([ORG_POLICY])
         self.assertAllowed(self.read_file(self.out_scope))
         self.assertNoReports()
 
     def test_an_ungated_shell_command_reports_nothing(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         for command in ('ls -la', 'cat README.md', 'npm test'):
             self.assertAllowed(self.bash(command, cwd=str(self.out_scope)))
         self.assertNoReports()
@@ -1007,7 +904,7 @@ class TestIncidentReporting(RepoGateCase):
         """No prompt ever reports, so every incident this hook files names a
         tool. `surface` is no longer sent at all: the server derives it from
         tool_name, and derives "tool" for exactly these reports."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         for cwd in (str(self.out_scope), str(self.in_scope), str(self.no_repo),
                     None):
             self.assertPromptAllowed(self.run_prompt(cwd=cwd))
@@ -1016,26 +913,25 @@ class TestIncidentReporting(RepoGateCase):
         self.assertNotIn("'surface'", source)
 
     def test_one_turn_of_violating_calls_files_one_report_each(self):
-        """The pinned cardinality: three calls, one burned grace, three
-        reports. The grace assertion is the semantics guard — reporting must
-        not have changed how grace is counted."""
+        """The pinned cardinality: three calls, three blocks, three reports —
+        each separately numbered, which is what stops the backend collapsing
+        them onto one record as redeliveries of the first."""
         self.set_policies([ORG_POLICY])
         for _ in range(3):
             self.write_file(self.out_scope, prompt_id='turn-1')
-        self.assertEqual(self.grace_used(), 1)
         reports = self.reports()
-        self.assertEqual([r['decision'] for r in reports], ['WARN'] * 3)
+        self.assertEqual([r['decision'] for r in reports], ['BLOCK'] * 3)
+        self.assertEqual(len({r['turn'] for r in reports}), 3, reports)
 
     def test_the_prompt_adds_nothing_to_a_turns_reports(self):
-        """The prompt of a turn is not a verdict any more, so only the turn's
-        gated tool calls report — and they still share the one grace."""
+        """The prompt of a turn is not a verdict, so only the turn's gated tool
+        calls report."""
         self.set_policies([ORG_POLICY])
         self.run_prompt(cwd=str(self.out_scope), prompt_id='turn-1')
         self.write_file(self.out_scope, prompt_id='turn-1')
         self.bash('git push', prompt_id='turn-1', cwd=str(self.out_scope))
-        self.assertEqual(self.grace_used(), 1)
         self.assertEqual([r['decision'] for r in self.reports()],
-                         ['WARN', 'WARN'])
+                         ['BLOCK', 'BLOCK'])
 
     # -- nothing about a report can reach a decision ----------------------
 
@@ -1070,12 +966,12 @@ class TestIncidentReporting(RepoGateCase):
                 self.real_post(body, api_key)
 
         self.post.side_effect = hung_post
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
         proc.stdin.close.assert_called_once_with()
 
     def test_a_raising_report_never_changes_the_decision(self):
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         for boom in (OSError('curl not found'),
                      subprocess.TimeoutExpired('curl', 10),
                      ValueError('malformed response'),
@@ -1090,13 +986,12 @@ class TestIncidentReporting(RepoGateCase):
     def test_a_raising_report_never_changes_a_warning(self):
         self.post.side_effect = RuntimeError('gateway down')
         self.set_policies([ORG_POLICY])
-        self.assertWarned(self.write_file(self.out_scope), 'acme/widgets')
-        self.assertEqual(self.grace_used(), 1)
+        self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
 
     def test_a_missing_api_key_still_blocks_and_files_nothing(self):
         """No key is not a reason to let the call through. It is only a reason
         for the incident to go unrecorded."""
-        self.set_policies([dict(ORG_POLICY, grace_turns=0)])
+        self.set_policies([ORG_POLICY])
         with patch.object(unbound, '_cached_api_key', None), \
              patch.object(unbound, 'get_api_key', return_value=None):
             self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
@@ -1167,11 +1062,12 @@ class TestIncidentReporting(RepoGateCase):
         self.assertLess(len(body), 16 * 1024)
         self.assertEqual(len(json.loads(body)['repo_gate']['tool_input']), cap)
 
-    def test_the_report_names_the_policy_whose_grace_governed(self):
-        """A repo outside every policy's scope is denied by all of them; the
-        report names the one whose grace decided warn-vs-block."""
-        strict = dict(ORG_POLICY, id=7, name='Strict', grace_turns=0)
-        lax = dict(ORG_POLICY, id=8, name='Lax', grace_turns=9)
-        self.set_policies([lax, strict])
+    def test_the_report_names_the_first_denying_policy(self):
+        """A repo outside every policy's scope is denied by all of them, and
+        there is nothing left to arbitrate between them, so the incident is
+        filed against the first."""
+        first = dict(ORG_POLICY, id=8, name='First')
+        second = dict(ORG_POLICY, id=7, name='Second')
+        self.set_policies([first, second])
         self.assertBlocked(self.write_file(self.out_scope), 'acme/widgets')
-        self.assertEqual(self.reports()[0]['policy_id'], 7)
+        self.assertEqual(self.reports()[0]['policy_id'], 8)
