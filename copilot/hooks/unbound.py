@@ -707,21 +707,28 @@ def get_session_start_model(session_id):
     return found
 
 
-def get_last_user_prompt_timestamp_for_session(session_id):
-    """Latest UserPromptSubmit audit-log timestamp; turn start."""
+def get_turn_start_timestamp_for_session(session_id):
+    """First UserPromptSubmit of the turn; turn start. Typing while Copilot is still
+    working adds prompts to the running turn, and anchoring on the last would start the
+    turn after work the earlier prompt had already caused. The Stop being handled is
+    already logged, so the turn it closed is reported through completed_start."""
     if not session_id:
         return None
-    found = None
+    turn_start = None
+    completed_start = None
     for log in load_existing_logs():
         event = log.get('event', {})
-        if event.get('hook_event_name') != 'UserPromptSubmit':
-            continue
         if event.get('session_id') != session_id:
             continue
-        ts = log.get('timestamp')
-        if ts:
-            found = ts
-    return found
+        name = event.get('hook_event_name')
+        if name == 'UserPromptSubmit':
+            if turn_start is None:
+                turn_start = log.get('timestamp')
+        elif name == 'Stop':
+            if turn_start is not None:
+                completed_start = turn_start
+            turn_start = None
+    return turn_start or completed_start
 
 
 def _build_user_prompt_payload(recent_user_prompts):
@@ -2018,7 +2025,7 @@ def _repo_gate_session_id(event):
 
 def _repo_gate_turn_id(event):
     """Turn identity so one turn burns one grace; the prompt's logged timestamp."""
-    started = get_last_user_prompt_timestamp_for_session(
+    started = get_turn_start_timestamp_for_session(
         _repo_gate_session_id(event))
     if started:
         return 't-%s' % started
@@ -2928,7 +2935,7 @@ def main():
             # (even with no new tools) is still sent and logged.
             if exchange and (forwarded_now or text_sig != last_text_sig):
                 # Turn boundaries from event-fire times
-                request_initialized = get_last_user_prompt_timestamp_for_session(session_id)
+                request_initialized = get_turn_start_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp

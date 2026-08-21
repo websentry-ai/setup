@@ -3569,9 +3569,9 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
 
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
     messages = []
+    user_prompts = []
     assistant_tool_uses = []
 
-    user_prompt = None
     prompt_cwd = None
     session_id = None
     permission_mode = None
@@ -3593,7 +3593,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
             if prompt:
-                user_prompt = prompt
+                user_prompts.append(prompt)
                 # The prompt's own cwd beats the session cwd for resolving a
                 # repo-level skill when the agent was opened at a parent dir.
                 prompt_cwd = event.get('cwd') or prompt_cwd
@@ -3634,8 +3634,10 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
-    if user_prompt and user_prompt.startswith('/'):
-        typed = user_prompt[1:].split(None, 1)
+    for typed_prompt in user_prompts:
+        if not typed_prompt.startswith('/'):
+            continue
+        typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
         typed_path = _resolve_skill_path(typed_skill, prompt_cwd or cwd)
@@ -3655,6 +3657,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'skill_path': typed_path,
             })
 
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
@@ -3781,6 +3785,8 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt_timestamp = None
     stop_timestamp = None
     previous_stop = None
+    submitted_prompts = []
+    prompt_opens_turn = True
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -3789,9 +3795,17 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                session_events = [log]
+                # Typing while Claude is still working produces one turn carrying several
+                # prompts. Only the first opens the turn; the rest join it, so neither their
+                # text nor the tool calls they already caused are discarded.
+                if prompt_opens_turn:
+                    session_events = []
+                    prompt_opens_turn = False
                 current_conversation_started = True
-                user_prompt_timestamp = log.get('timestamp')
+                session_events.append(log)
+                prompt_text = (log.get('event') or log).get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
             elif current_conversation_started:
                 session_events.append(log)
                 if event_name == 'Stop':
@@ -3799,6 +3813,16 @@ def process_stop_event(event: Dict, api_key: str):
                     # upload reported; subagent work landing between the two is this turn's.
                     previous_stop = stop_timestamp
                     stop_timestamp = log.get('timestamp')
+                    prompt_opens_turn = True
+
+    # Anchor on the first prompt of the turn: anchoring on the last would start the token
+    # window after work the earlier prompt had already caused.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
 
     transcript_assistant_messages = []
     transcript_usage = None
