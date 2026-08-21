@@ -631,6 +631,10 @@ def get_forwarded_state(session_id):
         sig = event.get('text_sig')
         if sig:
             last_sig = sig
+        # Advisory like the tool ids above, and with the same caveat: a local writer could
+        # seed these to keep prompt text out of an exchange. The hook already runs as the
+        # user, who can equally edit the transcript it reads, so this adds no exposure --
+        # the gateway's server-side record is the integrity backstop.
         prompt_ids = event.get('forwarded_prompt_ids')
         if isinstance(prompt_ids, list):
             prompted.update(prompt_ids)

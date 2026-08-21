@@ -3576,13 +3576,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     # that opened the turn, so it belongs at the end. Its queue record carries no directory,
     # so a repo-scoped skill in it is resolvable only when the turn used exactly one; where
     # they differ there is nothing to attribute it to and it is left unresolved.
-    turn_dirs = {directory for _, directory in user_prompts if directory}
-    if cwd:
-        turn_dirs.add(cwd)
-    queued_cwd = next(iter(turn_dirs)) if len(turn_dirs) == 1 else None
     first_queued = len(user_prompts)
     for queued in queued_prompts or []:
-        user_prompts.append((queued, queued_cwd))
+        user_prompts.append((queued, None))
 
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
@@ -3590,13 +3586,18 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     for index, (typed_prompt, typed_cwd) in enumerate(user_prompts):
         if not typed_prompt.startswith('/'):
             continue
-        if index >= first_queued and not typed_cwd:
-            # A queued prompt with no directory to attribute it to: leaving the skill
-            # unresolved beats naming a repository it may not have come from.
+        if index >= first_queued:
+            # A queued prompt's record names no directory, and every directory in reach
+            # belongs to some other event, so a repo-scoped skill here can only be guessed
+            # at. It is left unresolved: an absent skill_path is recoverable, a confidently
+            # wrong one is not. The prompt text still reaches the turn.
             continue
         typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
+        if '/' in typed_skill or '\\' in typed_skill or '..' in typed_skill:
+            # A skill name is a bare identifier; anything path-shaped is not one.
+            continue
         typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
         if typed_path:
             typed_key = '\x1f'.join((

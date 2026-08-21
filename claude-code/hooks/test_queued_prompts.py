@@ -290,21 +290,27 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
                                        cwd=cwd, queued_prompts=queued)
         return seen
 
-    def test_a_queued_skill_resolves_when_the_turn_used_one_directory(self):
+    def test_a_queued_prompt_never_resolves_a_skill(self):
+        # its record names no directory, so any directory would be borrowed from
+        # another event and could name the wrong repository
         seen = self._resolved_skills(
             [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one")],
             "/repo/one", ["/beta"])
         self.assertEqual(seen["alpha"], "/repo/one")
-        self.assertEqual(seen["beta"], "/repo/one")
-
-    def test_a_queued_skill_is_left_unresolved_when_directories_differ(self):
-        # the queue record carries no directory of its own, so borrowing one would
-        # attribute the skill to a repository the prompt may not have come from
-        seen = self._resolved_skills(
-            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/alpha", cwd="/repo/one")],
-            "/repo/two", ["/beta"])
-        self.assertEqual(seen["alpha"], "/repo/one")
         self.assertNotIn("beta", seen)
+
+    def test_a_path_shaped_skill_name_is_rejected(self):
+        seen = self._resolved_skills(
+            [_log("UserPromptSubmit", FIRST_PROMPT,
+                  prompt="/../../../etc/passwd", cwd="/repo/one")],
+            "/repo/one", [])
+        self.assertEqual(seen, {})
+
+    def test_a_plain_skill_name_still_resolves(self):
+        seen = self._resolved_skills(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="/deploy now", cwd="/repo/one")],
+            "/repo/one", [])
+        self.assertEqual(seen["deploy"], "/repo/one")
 
     def test_an_unresolved_queued_skill_still_reaches_the_message(self):
         with patch.object(unbound, "_resolve_skill_path", side_effect=lambda n, d: None):
