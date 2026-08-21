@@ -1912,7 +1912,7 @@ def build_llm_exchange(events, api_key=None):
     messages = []
     assistant_tool_uses = []
     
-    user_prompt = None
+    user_prompts = []
     assistant_response = None
     conversation_id = None
     generation_id = None
@@ -1951,8 +1951,14 @@ def build_llm_exchange(events, api_key=None):
             user_email = event.get('user_email')
 
         if hook_event_name == 'beforeSubmitPrompt':
-            user_prompt = event.get('prompt')
-            request_initialized = log_entry.get('timestamp')
+            # A generation can carry more than one prompt when the user types while Cursor is
+            # still working. Anchor on the first; keeping the last would start the turn after
+            # work the earlier prompt had already caused.
+            prompt = event.get('prompt')
+            if prompt:
+                user_prompts.append(prompt)
+            if request_initialized is None:
+                request_initialized = log_entry.get('timestamp')
 
         elif hook_event_name == 'stop':
             request_completed = log_entry.get('timestamp')
@@ -2070,6 +2076,8 @@ def build_llm_exchange(events, api_key=None):
             assistant_response = event.get('text')
             usage = _cursor_usage_from_event(event) or usage
     
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
