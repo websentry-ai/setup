@@ -556,6 +556,27 @@ jobs:
           ! pkgutil --pkg-info ai.getunbound.runtime >/dev/null 2>&1
           echo "onboard --clear OK"
 
+      - name: Test rendered onboard.sh accepts --skip-managed-settings
+        run: |
+          set -euo pipefail
+          # An unrecognized flag exits before any install work, so reaching the
+          # key check proves the case is wired through. The backend points at a
+          # dead local port so the EXIT trap's install-report cannot reach
+          # production from CI.
+          out=$(sudo bash out/onboard.sh --skip-managed-settings \
+                  --backend-url http://127.0.0.1:1 2>&1 || true)
+          if grep -q "Unknown argument" <<<"$out"; then
+            echo "::error::rendered onboard.sh rejects --skip-managed-settings"
+            echo "$out"; exit 1
+          fi
+          # Reaching preflight at all means the arg loop accepted the flag.
+          if ! grep -q "step=preflight" <<<"$out"; then
+            echo "::error::onboard.sh did not reach preflight"
+            echo "$out"; exit 1
+          fi
+          grep -q 'skip_managed_flag="--skip-managed-settings"' out/onboard.sh
+          echo "onboard --skip-managed-settings OK"
+
       - name: Package tar.gz + checksums
         env:
           TAR_NAME: ${{ steps.cfg.outputs.tar_name }}
