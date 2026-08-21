@@ -441,8 +441,9 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_on_windows_machine(var_name: str) -> str:
-    """Remove machine-wide (HKLM) env var on Windows.
+def remove_env_var_on_windows_machine(var_name: str, only_if=None) -> str:
+    """Remove machine-wide (HKLM) env var on Windows. With only_if, removes it only when
+    the recorded value is accepted.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -450,9 +451,12 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
     try:
         query = subprocess.run(
             ["reg", "query", reg_path, "/V", var_name],
-            capture_output=True, timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
         if query.returncode != 0:
+            return "not_found"
+        if only_if is not None and not only_if(_registry_value(query.stdout, var_name)):
+            debug_print(f"{var_name} left in place: not set by this setup")
             return "not_found"
         subprocess.run(
             ["reg", "delete", reg_path, "/F", "/V", var_name],
@@ -467,15 +471,64 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
+    the customer's own endpoint and is left alone."""
+    return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
+
+
+def _export_value(line: str, prefix: str) -> str:
+    return line.strip()[len(prefix):].strip().strip('"').strip("'")
+
+
+def _is_unbound_key_helper_body(text) -> bool:
+    return isinstance(text, str) and text.strip() == UNBOUND_KEY_HELPER_BODY
+
+
+def _registry_value(output: str, var_name: str) -> str:
+    """The value `reg query` printed for var_name, or "" when it printed none."""
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].lower() == var_name.lower():
+            return parts[2].strip()
+    return ""
+
+
+def _read_text_or_none(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _is_unbound_key_helper_setting(value, managed_dir) -> bool:
+    """Whether settings.json's apiKeyHelper is one this setup writes: the per-user script
+    or the managed one. Judged on the value alone, so a helper that has already been
+    deleted cannot make somebody else's setting look like ours."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    return candidate in ("~/.claude/anthropic_key.sh",
+                         str(Path.home() / ".claude" / "anthropic_key.sh"),
+                         str(managed_dir / "anthropic_key.sh"))
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str,
+                             only_if=None) -> str:
     """Remove env var from user's shell rc files. Privilege-drops on Unix.
+    With only_if, removes just the exports whose value it accepts -- a user may have their
+    own export of the same variable in the other startup file.
 
     Returns "cleared", "not_found", or "failed".
     """
     system = platform.system().lower()
 
     if system == "windows":
-        return remove_env_var_on_windows_machine(var_name)
+        return remove_env_var_on_windows_machine(var_name, only_if)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
@@ -495,7 +548,10 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
             try:
                 with open(rc_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
-                new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
+                new_lines = [l for l in lines
+                             if not (l.strip().startswith(export_prefix)
+                                     and (only_if is None
+                                          or only_if(_export_value(l, export_prefix))))]
                 if len(new_lines) < len(lines):
                     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
                     fd = os.open(str(rc_file), flags, 0o644)
@@ -601,7 +657,8 @@ def remove_user_level_gateway_for_user(username: str, home_dir: Path) -> None:
                 safe_to_unlink = False
                 debug_print(f"Failed to clean {settings_path}: {e}")
 
-        if safe_to_unlink and key_helper_path.exists():
+        if (safe_to_unlink and key_helper_path.exists()
+                and _is_unbound_key_helper_body(_read_text_or_none(key_helper_path))):
             try:
                 key_helper_path.unlink()
                 debug_print(f"Removed {key_helper_path}")
@@ -736,7 +793,8 @@ def clear_managed_settings() -> str:
         cleared_any = False
         had_error = False
 
-        if key_helper_path.exists():
+        if key_helper_path.exists() and _is_unbound_key_helper_body(
+                _read_text_or_none(key_helper_path)):
             try:
                 key_helper_path.unlink()
                 debug_print(f"Removed {key_helper_path}")
@@ -752,15 +810,18 @@ def clear_managed_settings() -> str:
                 with open(settings_path, "r", encoding="utf-8") as f:
                     settings = json.load(f)
                 changed = False
-                if "apiKeyHelper" in settings:
+                if _is_unbound_key_helper_setting(settings.get("apiKeyHelper"), managed_dir):
                     del settings["apiKeyHelper"]
                     changed = True
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
-                    for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-                        if k in env:
-                            del env[k]
-                            changed = True
+                    # This setup writes the token and the base URL together, so the pair
+                    # goes together -- and only when the base URL is the one it writes.
+                    if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                        for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                            if k in env:
+                                del env[k]
+                                changed = True
                     if not env:
                         del settings["env"]
                 if changed:
@@ -789,14 +850,15 @@ def clear_managed_settings() -> str:
         return "failed"
 
 
-def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) -> tuple:
+def _clear_env_var_across_users(var_name: str, user_homes, label: str = None,
+                                only_if=None) -> tuple:
     """Remove var_name for all users. Returns (cleared, not_found, failed) counts."""
     _label = label or var_name
     cleared = 0
     not_found = 0
     failed = 0
     for username, home_dir in user_homes:
-        status = remove_env_var_from_user(username, home_dir, var_name)
+        status = remove_env_var_from_user(username, home_dir, var_name, only_if)
         if status == "cleared":
             cleared += 1
         elif status == "not_found":
@@ -825,7 +887,10 @@ def clear_setup() -> bool:
         print("   No user home directories found")
     else:
         c1, n1, f1 = _clear_env_var_across_users("UNBOUND_API_KEY", user_homes, label="API_KEY")
-        c2, n2, f2 = _clear_env_var_across_users("ANTHROPIC_BASE_URL", user_homes, label="BASE_URL")
+        # ANTHROPIC_BASE_URL goes only where it holds our gateway.
+        c2, n2, f2 = _clear_env_var_across_users("ANTHROPIC_BASE_URL", user_homes,
+                                                 label="BASE_URL",
+                                                 only_if=_is_unbound_base_url)
         if c1 or c2:
             print(f"Cleared for {max(c1, c2)} user(s)")
         elif not (f1 or f2):

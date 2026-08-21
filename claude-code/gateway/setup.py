@@ -184,8 +184,87 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> str:
+def _registry_value(output: str, var_name: str) -> str:
+    """The value `reg query` printed for var_name, or "" when it printed none."""
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].lower() == var_name.lower():
+            return parts[2].strip()
+    return ""
+
+
+UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+UNBOUND_KEY_HELPER_SETTING = "~/.claude/anthropic_key.sh"
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
+    the customer's own endpoint and is left alone."""
+    return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
+
+
+def _export_value(line: str, prefix: str) -> str:
+    return line.strip()[len(prefix):].strip().strip('"').strip("'")
+
+
+def _is_unbound_hook_command(command) -> bool:
+    """Whether a settings.json hook entry runs the Unbound hook, as either the downloaded
+    script or the installed binary."""
+    if not isinstance(command, str):
+        return False
+    return ("/.claude/hooks/unbound.py" in command
+            or ("/opt/unbound/" in command and "unbound-hook" in command))
+
+
+def _strip_unbound_hooks(settings: dict) -> None:
+    """Drop the Unbound entries from settings["hooks"], leaving every other hook in place
+    and removing only the groups and the block our entries emptied."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    for event, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                kept_groups.append(group)
+                continue
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                kept_groups.append(group)
+                continue
+            kept = [e for e in entries
+                    if not (isinstance(e, dict) and _is_unbound_hook_command(e.get("command")))]
+            if not kept:
+                continue
+            group["hooks"] = kept
+            kept_groups.append(group)
+        if kept_groups:
+            hooks[event] = kept_groups
+        else:
+            del hooks[event]
+    if not hooks:
+        del settings["hooks"]
+
+
+def _is_unbound_key_helper_setting(value) -> bool:
+    """Whether settings.json's apiKeyHelper is the one this setup writes."""
+    return isinstance(value, str) and value.strip() == UNBOUND_KEY_HELPER_SETTING
+
+
+def _is_unbound_key_helper_file(path: Path) -> bool:
+    """Whether an anthropic_key.sh is the one this setup writes."""
+    try:
+        return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
+    except OSError:
+        return False
+
+
+def remove_env_var_on_unix(var_name: str, only_if=None) -> str:
     """Remove an environment variable export line from the user's shell rc file.
+    With only_if, removes just the exports whose value it accepts.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -202,6 +281,9 @@ def remove_env_var_on_unix(var_name: str) -> str:
         export_prefix = f"export {var_name}="
         for line in lines:
             if line.strip().startswith(export_prefix):
+                if only_if is not None and not only_if(_export_value(line, export_prefix)):
+                    new_lines.append(line)
+                    continue
                 removed = True
                 debug_print(f"Removing {var_name} from {rc_file}")
                 continue
@@ -216,7 +298,7 @@ def remove_env_var_on_unix(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> str:
+def remove_env_var_on_windows(var_name: str, only_if=None) -> str:
     """Remove a user environment variable on Windows.
 
     Returns "cleared", "not_found", or "failed".
@@ -224,9 +306,12 @@ def remove_env_var_on_windows(var_name: str) -> str:
     try:
         query = subprocess.run(
             ["reg", "query", "HKCU\\Environment", "/V", var_name],
-            capture_output=True,
+            capture_output=True, text=True,
         )
         if query.returncode != 0:
+            return "not_found"
+        if only_if is not None and not only_if(_registry_value(query.stdout, var_name)):
+            debug_print(f"{var_name} left in place: not set by this setup")
             return "not_found"
         subprocess.run(
             ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
@@ -242,7 +327,7 @@ def remove_env_var_on_windows(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[str, str]:
+def remove_env_var(var_name: str, only_if=None) -> Tuple[str, str]:
     """Remove an environment variable permanently across OS platforms.
 
     Returns (status, message) where status is "cleared", "not_found", "failed",
@@ -250,9 +335,9 @@ def remove_env_var(var_name: str) -> Tuple[str, str]:
     """
     system = platform.system().lower()
     if system == "windows":
-        return remove_env_var_on_windows(var_name), ""
+        return remove_env_var_on_windows(var_name, only_if), ""
     elif system in ["darwin", "linux"]:
-        return remove_env_var_on_unix(var_name), ""
+        return remove_env_var_on_unix(var_name, only_if), ""
     else:
         return "unsupported", f"Unsupported OS: {system}"
 
@@ -322,9 +407,9 @@ def setup_claude_key_helper() -> bool:
             except Exception:
                 settings = {}
 
-        # Remove hooks if present before adding apiKeyHelper
-        if "hooks" in settings:
-            del settings["hooks"]
+        # Our hook and the gateway cannot both drive Claude Code, so ours goes before
+        # apiKeyHelper is added. Only ours: a hook the user installed is not ours to drop.
+        _strip_unbound_hooks(settings)
 
         # Update apiKeyHelper
         settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
@@ -439,7 +524,7 @@ def remove_api_key_helper_setting() -> str:
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        if "apiKeyHelper" not in settings:
+        if not _is_unbound_key_helper_setting(settings.get("apiKeyHelper")):
             return "not_found"
         del settings["apiKeyHelper"]
         with open(settings_path, "w", encoding="utf-8") as f:
@@ -461,14 +546,18 @@ def clear_setup() -> bool:
     any_failed = False
 
     for var, label in {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}.items():
-        status, _ = remove_env_var(var)
+        # ANTHROPIC_BASE_URL goes only when it holds our gateway.
+        status, _ = remove_env_var(
+            var, _is_unbound_base_url if var == "ANTHROPIC_BASE_URL" else None)
         if status == "cleared":
             any_cleared = True
         elif status not in ("cleared", "not_found"):
             print(f"Failed to clear {label}")
             any_failed = True
 
-    _r = _clear_path(Path.home() / ".claude" / "anthropic_key.sh", "Claude anthropic_key.sh")
+    key_helper = Path.home() / ".claude" / "anthropic_key.sh"
+    _r = (_clear_path(key_helper, "Claude anthropic_key.sh")
+          if _is_unbound_key_helper_file(key_helper) else "not_found")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":

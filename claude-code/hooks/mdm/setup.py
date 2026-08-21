@@ -471,8 +471,9 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_on_windows_machine(var_name: str) -> str:
-    """Remove machine-wide (HKLM) env var on Windows.
+def remove_env_var_on_windows_machine(var_name: str, only_if=None) -> str:
+    """Remove machine-wide (HKLM) env var on Windows. With only_if, removes it only when
+    the recorded value is accepted.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -480,9 +481,12 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
     try:
         query = subprocess.run(
             ["reg", "query", reg_path, "/V", var_name],
-            capture_output=True, timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
         if query.returncode != 0:
+            return "not_found"
+        if only_if is not None and not only_if(_registry_value(query.stdout, var_name)):
+            debug_print(f"{var_name} left in place: not set by this setup")
             return "not_found"
         subprocess.run(
             ["reg", "delete", reg_path, "/F", "/V", var_name],
@@ -497,15 +501,64 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
+    the customer's own endpoint and is left alone."""
+    return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
+
+
+def _export_value(line: str, prefix: str) -> str:
+    return line.strip()[len(prefix):].strip().strip('"').strip("'")
+
+
+def _is_unbound_key_helper_body(text) -> bool:
+    return isinstance(text, str) and text.strip() == UNBOUND_KEY_HELPER_BODY
+
+
+def _registry_value(output: str, var_name: str) -> str:
+    """The value `reg query` printed for var_name, or "" when it printed none."""
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].lower() == var_name.lower():
+            return parts[2].strip()
+    return ""
+
+
+def _read_text_or_none(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _is_unbound_key_helper_setting(value, managed_dir) -> bool:
+    """Whether settings.json's apiKeyHelper is one this setup writes: the per-user script
+    or the managed one. Judged on the value alone, so a helper that has already been
+    deleted cannot make somebody else's setting look like ours."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    return candidate in ("~/.claude/anthropic_key.sh",
+                         str(Path.home() / ".claude" / "anthropic_key.sh"),
+                         str(managed_dir / "anthropic_key.sh"))
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str,
+                             only_if=None) -> str:
     """Remove env var from user's shell rc files. Privilege-drops on Unix.
+    With only_if, removes just the exports whose value it accepts -- a user may have their
+    own export of the same variable in the other startup file.
 
     Returns "cleared", "not_found", or "failed".
     """
     system = platform.system().lower()
 
     if system == "windows":
-        return remove_env_var_on_windows_machine(var_name)
+        return remove_env_var_on_windows_machine(var_name, only_if)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
@@ -525,7 +578,10 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
             try:
                 with open(rc_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
-                new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
+                new_lines = [l for l in lines
+                             if not (l.strip().startswith(export_prefix)
+                                     and (only_if is None
+                                          or only_if(_export_value(l, export_prefix))))]
                 if len(new_lines) < len(lines):
                     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
                     fd = os.open(str(rc_file), flags, 0o644)
@@ -637,6 +693,11 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 
     def _unlink():
         try:
+            # Read and unlink as the user: a helper of this name that we did not write
+            # belongs to whoever did.
+            if not _is_unbound_key_helper_body(
+                    key_helper_path.read_text(encoding="utf-8")):
+                return False
             key_helper_path.unlink()
             return True
         except Exception:
@@ -887,12 +948,16 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # Drop gateway MDM setup from the same file — leaving its apiKeyHelper
         # behind makes Claude Code run anthropic_key.sh, which echoes the now
         # removed UNBOUND_API_KEY and fails with "did not return a valid value".
-        if "apiKeyHelper" in settings:
+        if _is_unbound_key_helper_setting(settings.get("apiKeyHelper"),
+                                          get_managed_settings_dir()):
             del settings["apiKeyHelper"]
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
-            for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-                env.pop(k, None)
+            # The gateway writes the token and the base URL together, so the pair goes
+            # together -- and only when the base URL is the one it writes.
+            if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                    env.pop(k, None)
             if not env:
                 del settings["env"]
 
@@ -993,7 +1058,8 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # written, so a failed write never strands managed-settings.json
         # pointing at a now-missing apiKeyHelper script.
         gateway_key_helper = managed_dir / "anthropic_key.sh"
-        if gateway_key_helper.exists():
+        if gateway_key_helper.exists() and _is_unbound_key_helper_body(
+                _read_text_or_none(gateway_key_helper)):
             try:
                 gateway_key_helper.unlink()
                 debug_print(f"Removed gateway key helper {gateway_key_helper}")
@@ -1743,7 +1809,8 @@ def main():
     # Remove leftover gateway setup env vars
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
-        remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+        remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
+                                 _is_unbound_base_url)
 
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:

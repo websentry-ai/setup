@@ -142,8 +142,40 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> str:
+def _registry_value(output: str, var_name: str) -> str:
+    """The value `reg query` printed for var_name, or "" when it printed none."""
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].lower() == var_name.lower():
+            return parts[2].strip()
+    return ""
+
+
+UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
+    the customer's own endpoint and is left alone."""
+    return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
+
+
+def _export_value(line: str, prefix: str) -> str:
+    return line.strip()[len(prefix):].strip().strip('"').strip("'")
+
+
+def _is_unbound_key_helper_file(path: Path) -> bool:
+    """Whether an anthropic_key.sh is the one this setup writes."""
+    try:
+        return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
+    except OSError:
+        return False
+
+
+def remove_env_var_on_unix(var_name: str, only_if=None) -> str:
     """Remove an environment variable export line from the user's shell rc file.
+    With only_if, removes just the exports whose value it accepts.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -160,6 +192,9 @@ def remove_env_var_on_unix(var_name: str) -> str:
         export_prefix = f"export {var_name}="
         for line in lines:
             if line.strip().startswith(export_prefix):
+                if only_if is not None and not only_if(_export_value(line, export_prefix)):
+                    new_lines.append(line)
+                    continue
                 removed = True
                 debug_print(f"Removing {var_name} from {rc_file}")
                 continue
@@ -174,7 +209,7 @@ def remove_env_var_on_unix(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> str:
+def remove_env_var_on_windows(var_name: str, only_if=None) -> str:
     """Remove a user environment variable on Windows.
 
     Returns "cleared", "not_found", or "failed".
@@ -182,9 +217,12 @@ def remove_env_var_on_windows(var_name: str) -> str:
     try:
         query = subprocess.run(
             ["reg", "query", "HKCU\\Environment", "/V", var_name],
-            capture_output=True,
+            capture_output=True, text=True,
         )
         if query.returncode != 0:
+            return "not_found"
+        if only_if is not None and not only_if(_registry_value(query.stdout, var_name)):
+            debug_print(f"{var_name} left in place: not set by this setup")
             return "not_found"
         subprocess.run(
             ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
@@ -200,7 +238,7 @@ def remove_env_var_on_windows(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[str, str]:
+def remove_env_var(var_name: str, only_if=None) -> Tuple[str, str]:
     """Remove an environment variable permanently across OS platforms.
 
     Returns (status, message) where status is "cleared", "not_found", "failed",
@@ -208,9 +246,9 @@ def remove_env_var(var_name: str) -> Tuple[str, str]:
     """
     system = platform.system().lower()
     if system == "windows":
-        return remove_env_var_on_windows(var_name), ""
+        return remove_env_var_on_windows(var_name, only_if), ""
     elif system in ["darwin", "linux"]:
-        return remove_env_var_on_unix(var_name), ""
+        return remove_env_var_on_unix(var_name, only_if), ""
     else:
         return "unsupported", f"Unsupported OS: {system}"
 
@@ -310,9 +348,11 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
 
 
 def remove_gateway_artifacts() -> None:
-    """Remove ~/.claude/anthropic_key.sh if present (leftover from gateway setup)."""
+    """Remove ~/.claude/anthropic_key.sh if present (leftover from gateway setup).
+    Only the script our gateway wrote -- somebody else's helper of the same name is
+    theirs to keep."""
     key_helper_path = Path.home() / ".claude" / "anthropic_key.sh"
-    if key_helper_path.exists():
+    if key_helper_path.exists() and _is_unbound_key_helper_file(key_helper_path):
         try:
             key_helper_path.unlink()
             debug_print(f"Removed {key_helper_path}")
@@ -1263,10 +1303,12 @@ def main():
 
     debug_print("API key received from callback")
 
-    # Remove gateway setup env vars and artifacts
-    for var_name in ["UNBOUND_API_KEY", "ANTHROPIC_BASE_URL"]:
+    # Remove gateway setup env vars and artifacts. ANTHROPIC_BASE_URL is only ours when
+    # it holds our gateway; an org pointing Claude Code at their own endpoint keeps it.
+    for var_name, only_if in (("UNBOUND_API_KEY", None),
+                              ("ANTHROPIC_BASE_URL", _is_unbound_base_url)):
         try:
-            remove_env_var(var_name)
+            remove_env_var(var_name, only_if)
         except Exception:
             pass
     remove_gateway_artifacts()
