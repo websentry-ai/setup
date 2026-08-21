@@ -1196,7 +1196,7 @@ _HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
 _FEATURES_HEADER_RE = re.compile(r'^\[\s*(?:features|"features"|\'features\')\s*\]\s*(#.*)?$')
 
 # features as an inline table cannot take an appended header without redefining it.
-_FEATURES_INLINE_RE = re.compile(r'^features\s*=')
+_FEATURES_INLINE_RE = re.compile(r'^features\s*=\s*\{(.*)\}\s*$')
 
 
 def _is_features_header(stripped) -> bool:
@@ -1216,6 +1216,45 @@ def _features_hooks_flags(lines):
         if in_features and _HOOKS_FLAG_RE.match(stripped):
             found.append(stripped)
     return found
+
+
+try:
+    import tomllib
+except ImportError:  # system python older than 3.11
+    tomllib = None
+
+
+def _write_is_safe(text, want_enabled) -> bool:
+    """Whether text is a config Codex can load with the flag in the intended state. Every
+    edit is checked against this before it reaches disk, so a line-scan mistake is discarded
+    rather than written. Without tomllib the scan stands alone, as it did before."""
+    if tomllib is None:
+        return True
+    try:
+        features = tomllib.loads(text).get('features')
+    except Exception:
+        return False
+    if features is None:
+        features = {}
+    if not isinstance(features, dict) or 'codex_hooks' in features:
+        return False
+    return features.get('hooks') is True if want_enabled else 'hooks' not in features
+
+
+def _find_delim(text, delim, start=0) -> int:
+    """Index of the closing delimiter, skipping backslash escapes. Multi-line literal
+    strings take no escapes, so only the basic form needs the walk."""
+    if delim != '"""':
+        return text.find(delim, start)
+    i, n = start, len(text)
+    while i < n:
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text.startswith(delim, i):
+            return i
+        i += 1
+    return -1
 
 
 def _open_multiline(text):
@@ -1254,6 +1293,22 @@ def _open_multiline(text):
     return None
 
 
+def _inline_with_flag(stripped):
+    """An inline features table rewritten to carry hooks = true, or None when its values are
+    too complex to split on commas. Refusing there keeps a user from opting out of enforcement
+    by writing the table inline, without risking their values."""
+    match = _FEATURES_INLINE_RE.match(stripped)
+    if not match:
+        return None
+    inner = match.group(1)
+    if any(ch in inner for ch in '"\'{}[]'):
+        return None
+    entries = [part.strip() for part in inner.split(',')]
+    entries = [part for part in entries if part and not _HOOKS_FLAG_RE.match(part)]
+    entries.append('hooks = true')
+    return 'features = { ' + ', '.join(entries) + ' }\n'
+
+
 def _config_lines(lines):
     """Yield each line stripped, or None for the interior of a multi-line string, so a
     TOML-looking line inside a value is never read as a table header or as our flag."""
@@ -1261,7 +1316,7 @@ def _config_lines(lines):
     for line in lines:
         if delim is not None:
             yield None
-            end = line.find(delim)
+            end = _find_delim(line, delim)
             if end == -1:
                 continue
             delim = _open_multiline(line[end + 3:])
@@ -1311,13 +1366,24 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if features_idx is not None:
             lines.insert(features_idx + 1, 'hooks = true\n')
         else:
-            if any(s is not None and _FEATURES_INLINE_RE.match(s) for s in _config_lines(lines)):
-                print(f"features is an inline table in {username}'s config.toml; hooks not enforced")
-                return False
-            if lines and not lines[-1].endswith('\n'):
-                lines.append('\n')
-            lines.append('\n[features]\nhooks = true\n')
+            merged = False
+            for i, stripped in enumerate(_config_lines(lines)):
+                rewritten = _inline_with_flag(stripped) if stripped is not None else None
+                if rewritten:
+                    lines[i] = rewritten
+                    merged = True
+                    break
+                if stripped is not None and _FEATURES_INLINE_RE.match(stripped):
+                    print(f"features is an inline table in {username}'s config.toml; hooks not enforced")
+                    return False
+            if not merged:
+                if lines and not lines[-1].endswith('\n'):
+                    lines.append('\n')
+                lines.append('\n[features]\nhooks = true\n')
 
+        if not _write_is_safe(''.join(lines), True):
+            print(f"could not enable hooks in {username}'s config.toml without breaking it")
+            return False
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_path), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1338,33 +1404,37 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
 _HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 
-def _hooks_still_registered(hooks_path) -> bool:
-    """True when hooks.json still registers a command. The feature flag is one switch over
-    every hook a user has, so clearing it while somebody else's entry remains turns their
-    tooling off. Call this only after our own entries have been stripped."""
+def _hooks_still_registered(hooks_path):
+    """True when hooks.json still registers a command, False when none does, None when that
+    cannot be determined. The feature flag is one switch over every hook a user has, so
+    clearing it while somebody else's entry remains turns their tooling off; None keeps the
+    flag and marks the uninstall incomplete rather than guessing either way. Call this only
+    after our own entries have been stripped."""
     try:
         fd = os.open(str(hooks_path),
                      os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     except FileNotFoundError:
         return False
     except OSError:
-        # Includes a symlink refused by O_NOFOLLOW. Unreadable means a hook may be
-        # registered: keeping the flag set costs nothing, whereas clearing it on a bad
-        # read disables whatever the user runs.
-        return True
+        return None  # includes a symlink refused by O_NOFOLLOW
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOKS_JSON_MAX_BYTES:
             os.close(fd)
-            return True
+            return None
     except OSError:
         os.close(fd)
-        return True
+        return None
     try:
-        with os.fdopen(fd, 'r', encoding='utf-8') as f:
+        handle = os.fdopen(fd, 'r', encoding='utf-8')
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        with handle as f:
             config = json.load(f)
     except (OSError, ValueError):
-        return True
+        return None
     events = config.get('hooks')
     if not isinstance(events, dict):
         return False
@@ -1385,13 +1455,20 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     def _disable():
         # Runs after the privilege drop: reading a user-owned path as root invites a
         # symlink or FIFO pointed at a file only root can open.
-        if _hooks_still_registered(home_dir / ".codex" / "hooks.json"):
+        registered = _hooks_still_registered(home_dir / ".codex" / "hooks.json")
+        if registered is None:
+            print(f"could not read {username}'s hooks.json; hooks feature flag left set")
+            return False
+        if registered:
             debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
             return False
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
+            return False
+        if not _write_is_safe(''.join(new_lines), False):
+            print(f"could not clear the hooks flag in {username}'s config.toml; left unchanged")
             return False
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_path), flags, 0o600)

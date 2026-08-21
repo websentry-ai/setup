@@ -751,6 +751,45 @@ def _is_features_header(stripped) -> bool:
     return bool(_FEATURES_HEADER_RE.match(stripped))
 
 
+try:
+    import tomllib
+except ImportError:  # system python older than 3.11
+    tomllib = None
+
+
+def _write_is_safe(text, want_enabled) -> bool:
+    """Whether text is a config Codex can load with the flag in the intended state. Every
+    edit is checked against this before it reaches disk, so a line-scan mistake is discarded
+    rather than written. Without tomllib the scan stands alone, as it did before."""
+    if tomllib is None:
+        return True
+    try:
+        features = tomllib.loads(text).get('features')
+    except Exception:
+        return False
+    if features is None:
+        features = {}
+    if not isinstance(features, dict) or 'codex_hooks' in features:
+        return False
+    return features.get('hooks') is True if want_enabled else 'hooks' not in features
+
+
+def _find_delim(text, delim, start=0) -> int:
+    """Index of the closing delimiter, skipping backslash escapes. Multi-line literal
+    strings take no escapes, so only the basic form needs the walk."""
+    if delim != '"""':
+        return text.find(delim, start)
+    i, n = start, len(text)
+    while i < n:
+        if text[i] == '\\':
+            i += 2
+            continue
+        if text.startswith(delim, i):
+            return i
+        i += 1
+    return -1
+
+
 def _open_multiline(text):
     """The multi-line delimiter left unclosed at the end of `text`, or None. Walks the line
     so quotes inside comments, literal strings and escapes are not counted as delimiters."""
@@ -794,7 +833,7 @@ def _config_lines(lines):
     for line in lines:
         if delim is not None:
             yield None
-            end = line.find(delim)
+            end = _find_delim(line, delim)
             if end == -1:
                 continue
             delim = _open_multiline(line[end + 3:])
@@ -826,33 +865,37 @@ def _strip_hooks_flags(lines):
 _HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
 
 
-def _hooks_still_registered(hooks_path) -> bool:
-    """True when hooks.json still registers a command. The feature flag is one switch over
-    every hook a user has, so clearing it while somebody else's entry remains turns their
-    tooling off. Call this only after our own entries have been stripped."""
+def _hooks_still_registered(hooks_path):
+    """True when hooks.json still registers a command, False when none does, None when that
+    cannot be determined. The feature flag is one switch over every hook a user has, so
+    clearing it while somebody else's entry remains turns their tooling off; None keeps the
+    flag and marks the uninstall incomplete rather than guessing either way. Call this only
+    after our own entries have been stripped."""
     try:
         fd = os.open(str(hooks_path),
                      os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     except FileNotFoundError:
         return False
     except OSError:
-        # Includes a symlink refused by O_NOFOLLOW. Unreadable means a hook may be
-        # registered: keeping the flag set costs nothing, whereas clearing it on a bad
-        # read disables whatever the user runs.
-        return True
+        return None  # includes a symlink refused by O_NOFOLLOW
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOKS_JSON_MAX_BYTES:
             os.close(fd)
-            return True
+            return None
     except OSError:
         os.close(fd)
-        return True
+        return None
     try:
-        with os.fdopen(fd, 'r', encoding='utf-8') as f:
+        handle = os.fdopen(fd, 'r', encoding='utf-8')
+    except OSError:
+        os.close(fd)
+        return None
+    try:
+        with handle as f:
             config = json.load(f)
     except (OSError, ValueError):
-        return True
+        return None
     events = config.get('hooks')
     if not isinstance(events, dict):
         return False
@@ -873,13 +916,20 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     def _disable():
         # Runs after the privilege drop: reading a user-owned path as root invites a
         # symlink or FIFO pointed at a file only root can open.
-        if _hooks_still_registered(home_dir / ".codex" / "hooks.json"):
+        registered = _hooks_still_registered(home_dir / ".codex" / "hooks.json")
+        if registered is None:
+            print(f"could not read {username}'s hooks.json; hooks feature flag left set")
+            return False
+        if registered:
             debug_print(f"hooks feature flag kept for {username}: other hooks still registered")
             return False
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
+            return False
+        if not _write_is_safe(''.join(new_lines), False):
+            print(f"could not clear the hooks flag in {username}'s config.toml; left unchanged")
             return False
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_path), flags, 0o600)
