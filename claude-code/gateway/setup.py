@@ -224,7 +224,7 @@ def remove_env_var_on_windows(var_name: str) -> str:
     """
     try:
         query = subprocess.run(
-            ["reg", "query", "HKCU\\Environment", "/V", var_name],
+            [_reg_exe(), "query", "HKCU\\Environment", "/V", var_name],
             capture_output=True,
         )
         if query.returncode != 0:
@@ -297,46 +297,52 @@ def remove_hooks_unbound_script() -> None:
 
 UNBOUND_GATEWAY_HOST = "getunbound.ai"
 UNBOUND_KEY_HELPER_TOKEN = "UNBOUND_API_KEY"
+UNBOUND_KEY_HELPER_NAME = "anthropic_key.sh"
 
 
 def _url_host(value: str) -> str:
-    remainder = value.split("://", 1)[-1]
+    """The host a URL actually resolves to. A backslash separates like a slash here, so
+    evil.example\\.getunbound.ai reads as evil.example rather than as one of ours."""
+    remainder = value.split("://", 1)[-1].replace("\\", "/")
     return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
 
 
-def _is_unbound_base_url(value) -> bool:
+def _unbound_config(home_dir=None) -> dict:
+    """The config recorded for a device. MDM work runs as root against another user's
+    home, so the caller says whose home to read rather than letting Path.home() answer
+    /root and quietly match nothing."""
+    base = Path(home_dir) if home_dir else Path.home()
+    try:
+        return json.loads((base / ".unbound" / "config.json").read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _is_unbound_base_url(value, home_dir=None) -> bool:
     """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
     this device, or one on our own host, counts -- someone pointing Claude Code at their
     own endpoint keeps it."""
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = value.strip().rstrip("/")
-    try:
-        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
-                               .read_text(encoding="utf-8")) or {}).get("gateway_url")
-        if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
-            return True
-    except (OSError, ValueError):
-        pass
+    recorded = _unbound_config(home_dir).get("gateway_url")
+    if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
+        return True
     host = _url_host(candidate)
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
 
 
-def _is_unbound_api_key(value) -> bool:
-    """Whether this credential is the one recorded for this device. With no recorded key
+def _is_unbound_api_key(value, home_dir=None) -> bool:
+    """Whether this credential is the one recorded for a device. With nothing recorded
     there is nothing to compare against, so the answer is no and the value stays."""
     if not isinstance(value, str) or not value.strip():
         return False
-    try:
-        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
-                               .read_text(encoding="utf-8")) or {}).get("api_key")
-    except (OSError, ValueError):
-        return False
+    recorded = _unbound_config(home_dir).get("api_key")
     return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 
 def _key_helper_file_is_ours(path) -> bool:
-    """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
+    """Whether an anthropic_key.sh is one our setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
     newline does not disown a real install."""
     try:
@@ -345,28 +351,78 @@ def _key_helper_file_is_ours(path) -> bool:
         return False
 
 
-def _is_unbound_key_helper(value) -> bool:
-    """Whether apiKeyHelper points at the script our gateway setup installs. The path is
-    not enough on its own -- it is a name somebody could choose for their own helper -- so
-    where that file exists it must also read UNBOUND_API_KEY. Matched on the path's tail
-    so an install under another home still counts."""
+def _is_unbound_key_helper(value, extra_paths=()) -> bool:
+    """Whether apiKeyHelper points at a script our setup installs. Covers the per-user
+    path and any managed path the caller names, since MDM writes the helper outside a
+    home. The path is not enough on its own -- it is a name somebody could choose for
+    their own helper -- so where the file exists it must also read UNBOUND_API_KEY."""
     if not isinstance(value, str):
         return False
     candidate = value.strip()
-    if not (candidate == "~/.claude/anthropic_key.sh"
-            or candidate.endswith("/.claude/anthropic_key.sh")):
+    known = {str(p) for p in extra_paths}
+    at_our_path = (candidate in known
+                   or candidate == "~/." + "claude/" + UNBOUND_KEY_HELPER_NAME
+                   or candidate.endswith("/.claude/" + UNBOUND_KEY_HELPER_NAME))
+    if not at_our_path:
         return False
     expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
     if not expanded.exists():
-        return True  # a dangling pointer at our own path is ours to clear
+        return True  # a dangling pointer at one of our own paths is ours to clear
     return _key_helper_file_is_ours(expanded)
+
+
+def _reg_exe() -> str:
+    """reg.exe by absolute path: an elevated run must not pick one up from PATH or the
+    working directory."""
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    return str(Path(system_root) / "System32" / "reg.exe")
+
+
+def _remove_env_var_lines(var_name: str, is_ours) -> str:
+    """Remove only the exports of this variable whose value is ours. A shell rc can hold
+    more than one, and deciding from a single collapsed value would delete somebody
+    else's line alongside ours. Returns "cleared", "not_found", or "skipped"."""
+    if platform.system().lower() == "windows":
+        # The registry holds one value per name, so the collapsed read is the whole story.
+        value = _persisted_env_value(var_name)
+        if value is None:
+            return "not_found"
+        if not is_ours(value):
+            return "skipped"
+        status, _ = remove_env_var(var_name)
+        return status
+    rc_file = get_shell_rc_file()
+    if rc_file is None or not rc_file.exists():
+        return "not_found"
+    prefix = "export %s=" % var_name
+    try:
+        lines = rc_file.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError:
+        return "not_found"
+    kept, removed, skipped = [], False, False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            value = stripped[len(prefix):].strip().strip('"').strip("'")
+            if is_ours(value):
+                removed = True
+                continue
+            skipped = True
+        kept.append(line)
+    if not removed:
+        return "skipped" if skipped else "not_found"
+    try:
+        rc_file.write_text("".join(kept), encoding="utf-8")
+    except OSError:
+        return "failed"
+    return "cleared"
 
 
 def _persisted_env_value(var_name: str):
     """The value this variable is persisted with, or None when unset."""
     if platform.system().lower() == "windows":
         try:
-            result = subprocess.run(["reg", "query", "HKCU\\Environment", "/V", var_name],
+            result = subprocess.run([_reg_exe(), "query", "HKCU\\Environment", "/V", var_name],
                                     capture_output=True, text=True)
         except (OSError, subprocess.SubprocessError):
             return None
@@ -625,13 +681,18 @@ def clear_setup() -> bool:
 
     # Read the pair before clearing either: ANTHROPIC_BASE_URL goes only when this setup
     # wrote it, which means our gateway URL alongside our API key.
+    # UNBOUND_API_KEY is set by nothing but this setup, so its presence is the second
+    # signal; matching its value would break on key rotation.
     gateway_env_ours = (_is_unbound_base_url(_persisted_env_value("ANTHROPIC_BASE_URL"))
-                        and _is_unbound_api_key(_persisted_env_value("UNBOUND_API_KEY")))
+                        and _persisted_env_value("UNBOUND_API_KEY") is not None)
     for var, label in {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}.items():
-        if var == "ANTHROPIC_BASE_URL" and not gateway_env_ours:
-            debug_print(f"{var} left in place: not set by the Unbound gateway")
-            continue
-        status, _ = remove_env_var(var)
+        if var == "ANTHROPIC_BASE_URL":
+            if not gateway_env_ours:
+                debug_print(f"{var} left in place: not set by the Unbound gateway")
+                continue
+            status = _remove_env_var_lines(var, _is_unbound_base_url)
+        else:
+            status, _ = remove_env_var(var)
         if status == "cleared":
             any_cleared = True
         elif status not in ("cleared", "not_found"):

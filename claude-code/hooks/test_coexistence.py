@@ -97,25 +97,21 @@ class TestGatewayEnvIsOurs(unittest.TestCase):
     def test_our_url_and_our_key(self):
         self.assertTrue(self._judge("https://api.getunbound.ai", "unbound-key"))
 
-    def test_our_url_but_somebody_elses_key(self):
-        self.assertFalse(self._judge("https://api.getunbound.ai", "their-key"))
-
-    def test_their_url_but_our_key(self):
+    def test_their_url_even_with_our_key_present(self):
         self.assertFalse(self._judge("https://llm.acme-corp.internal", "unbound-key"))
 
-    def test_neither_is_ours(self):
-        self.assertFalse(self._judge("https://llm.acme-corp.internal", "their-key"))
-
-    def test_no_key_set_at_all(self):
+    def test_our_url_with_no_key_of_ours(self):
+        # somebody pointing Claude Code at a URL on our host without our setup
         self.assertFalse(self._judge("https://api.getunbound.ai", None))
 
-    def test_nothing_recorded_to_compare_against(self):
-        home = Path(tempfile.mkdtemp())
-        values = {"ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
-                  "UNBOUND_API_KEY": "unbound-key"}
-        with patch.object(setup.Path, "home", staticmethod(lambda: home)), \
-             patch.object(setup, "_persisted_env_value", lambda n: values.get(n)):
-            self.assertFalse(setup._gateway_env_is_ours())
+    def test_neither_is_ours(self):
+        self.assertFalse(self._judge("https://llm.acme-corp.internal", None))
+
+    def test_a_rotated_key_still_reads_as_ours(self):
+        # a later run rewrites the recorded key; the leftovers are still ours to clear,
+        # and refusing would strand Claude Code on our gateway with a dead credential
+        self.assertTrue(self._judge("https://api.getunbound.ai", "older-key",
+                                    recorded_key="newer-key"))
 
 
 class TestGatewayArtifactRemoval(unittest.TestCase):
@@ -216,6 +212,72 @@ class TestManagedEnvPairing(unittest.TestCase):
                            "ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
                            "HTTP_PROXY": "http://proxy:8080"})
         self.assertEqual(out, {"HTTP_PROXY": "http://proxy:8080"})
+
+
+class TestUrlHostParsing(unittest.TestCase):
+    """A backslash separates like a slash, so a host that only looks like ours is not."""
+
+    def test_a_backslash_confused_lookalike(self):
+        self.assertEqual(setup._url_host("https://evil.example\\.getunbound.ai"),
+                         "evil.example")
+        self.assertFalse(
+            setup._is_unbound_base_url("https://evil.example\\.getunbound.ai"))
+
+    def test_credentials_in_the_authority(self):
+        self.assertEqual(setup._url_host("https://user:pw@api.getunbound.ai/v1"),
+                         "api.getunbound.ai")
+
+    def test_a_port(self):
+        self.assertEqual(setup._url_host("https://api.getunbound.ai:8443"),
+                         "api.getunbound.ai")
+
+
+class TestPerLineEnvRemoval(unittest.TestCase):
+    """A shell rc can hold more than one export of a name. Deciding from a single
+    collapsed value would take somebody else's line away alongside ours."""
+
+    def _rc(self, body):
+        home = Path(tempfile.mkdtemp())
+        rc = home / ".bashrc"
+        rc.write_text(body)
+        return home, rc
+
+    def _remove(self, body):
+        home, rc = self._rc(body)
+        with patch.object(setup, "get_shell_rc_file", lambda: rc), \
+             patch.object(setup.platform, "system", lambda: "Darwin"):
+            status = setup._remove_env_var_lines(
+                "ANTHROPIC_BASE_URL", setup._is_unbound_base_url)
+        return status, rc.read_text()
+
+    def test_only_our_line_goes(self):
+        status, rest = self._remove(
+            'export ANTHROPIC_BASE_URL="https://llm.acme-corp.internal"\n'
+            'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n')
+        self.assertEqual(status, "cleared")
+        self.assertIn("llm.acme-corp.internal", rest)
+        self.assertNotIn("getunbound.ai", rest)
+
+    def test_ours_first_theirs_last(self):
+        status, rest = self._remove(
+            'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n'
+            'export ANTHROPIC_BASE_URL="https://llm.acme-corp.internal"\n')
+        self.assertEqual(status, "cleared")
+        self.assertIn("llm.acme-corp.internal", rest)
+        self.assertNotIn("getunbound.ai", rest)
+
+    def test_only_a_foreign_line(self):
+        status, rest = self._remove(
+            'export ANTHROPIC_BASE_URL="https://llm.acme-corp.internal"\n')
+        self.assertEqual(status, "skipped")
+        self.assertIn("llm.acme-corp.internal", rest)
+
+    def test_unrelated_lines_survive(self):
+        status, rest = self._remove(
+            'export PATH="$PATH:/opt/bin"\n'
+            'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n')
+        self.assertEqual(status, "cleared")
+        self.assertIn('export PATH="$PATH:/opt/bin"', rest)
 
 
 if __name__ == "__main__":

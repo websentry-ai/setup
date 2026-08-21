@@ -499,46 +499,52 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
 
 UNBOUND_GATEWAY_HOST = "getunbound.ai"
 UNBOUND_KEY_HELPER_TOKEN = "UNBOUND_API_KEY"
+UNBOUND_KEY_HELPER_NAME = "anthropic_key.sh"
 
 
 def _url_host(value: str) -> str:
-    remainder = value.split("://", 1)[-1]
+    """The host a URL actually resolves to. A backslash separates like a slash here, so
+    evil.example\\.getunbound.ai reads as evil.example rather than as one of ours."""
+    remainder = value.split("://", 1)[-1].replace("\\", "/")
     return remainder.split("/", 1)[0].split("@")[-1].split(":")[0].lower()
 
 
-def _is_unbound_base_url(value) -> bool:
+def _unbound_config(home_dir=None) -> dict:
+    """The config recorded for a device. MDM work runs as root against another user's
+    home, so the caller says whose home to read rather than letting Path.home() answer
+    /root and quietly match nothing."""
+    base = Path(home_dir) if home_dir else Path.home()
+    try:
+        return json.loads((base / ".unbound" / "config.json").read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _is_unbound_base_url(value, home_dir=None) -> bool:
     """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
     this device, or one on our own host, counts -- someone pointing Claude Code at their
     own endpoint keeps it."""
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = value.strip().rstrip("/")
-    try:
-        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
-                               .read_text(encoding="utf-8")) or {}).get("gateway_url")
-        if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
-            return True
-    except (OSError, ValueError):
-        pass
+    recorded = _unbound_config(home_dir).get("gateway_url")
+    if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
+        return True
     host = _url_host(candidate)
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
 
 
-def _is_unbound_api_key(value) -> bool:
-    """Whether this credential is the one recorded for this device. With no recorded key
+def _is_unbound_api_key(value, home_dir=None) -> bool:
+    """Whether this credential is the one recorded for a device. With nothing recorded
     there is nothing to compare against, so the answer is no and the value stays."""
     if not isinstance(value, str) or not value.strip():
         return False
-    try:
-        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
-                               .read_text(encoding="utf-8")) or {}).get("api_key")
-    except (OSError, ValueError):
-        return False
+    recorded = _unbound_config(home_dir).get("api_key")
     return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 
 def _key_helper_file_is_ours(path) -> bool:
-    """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
+    """Whether an anthropic_key.sh is one our setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
     newline does not disown a real install."""
     try:
@@ -547,27 +553,71 @@ def _key_helper_file_is_ours(path) -> bool:
         return False
 
 
-def _is_unbound_key_helper(value) -> bool:
-    """Whether apiKeyHelper points at the script our gateway setup installs. The path is
-    not enough on its own -- it is a name somebody could choose for their own helper -- so
-    where that file exists it must also read UNBOUND_API_KEY. Matched on the path's tail
-    so an install under another home still counts."""
+def _is_unbound_key_helper(value, extra_paths=()) -> bool:
+    """Whether apiKeyHelper points at a script our setup installs. Covers the per-user
+    path and any managed path the caller names, since MDM writes the helper outside a
+    home. The path is not enough on its own -- it is a name somebody could choose for
+    their own helper -- so where the file exists it must also read UNBOUND_API_KEY."""
     if not isinstance(value, str):
         return False
     candidate = value.strip()
-    if not (candidate == "~/.claude/anthropic_key.sh"
-            or candidate.endswith("/.claude/anthropic_key.sh")):
+    known = {str(p) for p in extra_paths}
+    at_our_path = (candidate in known
+                   or candidate == "~/." + "claude/" + UNBOUND_KEY_HELPER_NAME
+                   or candidate.endswith("/.claude/" + UNBOUND_KEY_HELPER_NAME))
+    if not at_our_path:
         return False
     expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
     if not expanded.exists():
-        return True  # a dangling pointer at our own path is ours to clear
+        return True  # a dangling pointer at one of our own paths is ours to clear
     return _key_helper_file_is_ours(expanded)
 
 
-def _user_env_value(home_dir: Path, var_name: str):
-    """The value a user's shell rc files persist for this variable, or None. Read so a
-    removal can check the value is ours before taking it away."""
+def _managed_key_helper_paths():
+    """The helper paths this MDM setup writes. The managed one lives outside any home, so
+    a matcher that only knows the per-user path would leave apiKeyHelper pointing at a
+    script teardown had already deleted."""
+    try:
+        return {str(get_managed_settings_dir() / "anthropic_key.sh")}
+    except OSError:
+        return set()
+
+
+def _is_unbound_api_key_any_user(value) -> bool:
+    """Whether this credential is the key recorded for any user on the device. MDM writes
+    the same key into every user's config, and the managed settings it appears in are
+    system-wide, so there is no single home to consult."""
+    for _username, home_dir in (get_all_user_homes() or []):
+        if home_dir is not None and _is_unbound_api_key(value, home_dir):
+            return True
+    return False
+
+
+def _read_user_file(username, path):
+    """Read a file inside a user's home as that user, refusing a symlink. MDM runs as
+    root, so opening a user-controlled path directly would follow a link they planted at
+    a file only root can read."""
+    def _read():
+        try:
+            fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        except OSError:
+            return None
+        try:
+            with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+                return handle.read()
+        except OSError:
+            return None
+    if username is None or platform.system().lower() == "windows":
+        return _read()
+    return _run_as_user(username, _read)
+
+
+def _user_env_value(home_dir, var_name: str, username=None):
+    """The value a user's shell rc files persist for this variable, or None. Read as that
+    user so a planted symlink cannot turn a root-side check into a disclosure."""
     system = platform.system().lower()
+    if home_dir is None:
+        return None
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
     elif system == "linux":
@@ -577,11 +627,10 @@ def _user_env_value(home_dir: Path, var_name: str):
     prefix = "export %s=" % var_name
     found = None
     for rc_file in rc_files:
-        try:
-            lines = rc_file.read_text(encoding="utf-8").splitlines()
-        except OSError:
+        text = _read_user_file(username, rc_file)
+        if not text:
             continue
-        for line in lines:
+        for line in text.splitlines():
             stripped = line.strip()
             if stripped.startswith(prefix):
                 found = stripped[len(prefix):].strip().strip('"').strip("'")
@@ -591,8 +640,9 @@ def _user_env_value(home_dir: Path, var_name: str):
 def remove_unbound_base_url_from_user(username: str, home_dir: Path) -> str:
     """Remove ANTHROPIC_BASE_URL for a user only when our gateway set it, which means our
     gateway URL alongside our API key. Read before UNBOUND_API_KEY is cleared."""
-    if not (_is_unbound_base_url(_user_env_value(home_dir, "ANTHROPIC_BASE_URL"))
-            and _is_unbound_api_key(_user_env_value(home_dir, "UNBOUND_API_KEY"))):
+    if not (_is_unbound_base_url(_user_env_value(home_dir, "ANTHROPIC_BASE_URL", username),
+                                 home_dir)
+            and _user_env_value(home_dir, "UNBOUND_API_KEY", username) is not None):
         debug_print("ANTHROPIC_BASE_URL left in place for %s: not set by the Unbound gateway"
                     % username)
         return "not_found"
@@ -989,7 +1039,8 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # Drop gateway MDM setup from the same file — leaving its apiKeyHelper
         # behind makes Claude Code run anthropic_key.sh, which echoes the now
         # removed UNBOUND_API_KEY and fails with "did not return a valid value".
-        if _is_unbound_key_helper(settings.get("apiKeyHelper")):
+        if _is_unbound_key_helper(settings.get("apiKeyHelper"),
+                                  _managed_key_helper_paths()):
             del settings["apiKeyHelper"]
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
@@ -997,7 +1048,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             # be ours before either goes. An endpoint or a credential we did not set
             # belongs to whoever did, and half-clearing the pair would break them.
             if (_is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
-                    and _is_unbound_api_key(env.get("ANTHROPIC_AUTH_TOKEN"))):
+                    and _is_unbound_api_key_any_user(env.get("ANTHROPIC_AUTH_TOKEN"))):
                 env.pop("ANTHROPIC_AUTH_TOKEN", None)
                 env.pop("ANTHROPIC_BASE_URL", None)
             if not env:
