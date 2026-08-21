@@ -78,11 +78,8 @@ SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
-# Repo-scope gate. Grace is session-scoped: an advisory nudge, not an audit trail.
-REPO_GATE_STATE_FILE = LOG_DIR / ".repo_gate_state.json"
-REPO_GATE_TURN_MEMORY = 20
-# _repo_gate_turn_id's unknown-turn answer, not an identity: never memoize it.
-REPO_GATE_UNKNOWN_TURN = '_session_turn'
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -754,14 +751,9 @@ def _resolve_tool_use_id(event):
 def process_pre_tool_use(event, api_key):
     """preToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for file tools when no policy covers them."""
     gate = _repo_gate_evaluate(event, event.get('tool_name', ''))
-    if gate and gate['decision'] == 'deny':
-        return _repo_gate_deny_response(gate['repo'])
-    response = _evaluate_pre_tool_use_policies(event, api_key)
     if gate:
-        return _with_repo_gate_context(
-            response, _repo_gate_warning(gate['repo'], gate['remaining'])
-        )
-    return response
+        return _repo_gate_deny_response(gate['repo'])
+    return _evaluate_pre_tool_use_policies(event, api_key)
 
 
 def _evaluate_pre_tool_use_policies(event, api_key):
@@ -1011,15 +1003,10 @@ def _read_mcp_server_config(server_name, config_path):
 def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
     """beforeShellExecution / beforeMCPExecution entry point; the gate runs first and applies to the shell event only, an MCP call names no local path to resolve."""
     gate = _repo_gate_evaluate(event, tool_name, command)
-    if gate and gate['decision'] == 'deny':
-        return _repo_gate_deny_response(gate['repo'])
-    response = _evaluate_pre_tool_use_execution_policies(
-        event, api_key, tool_name, command, mcp_server=mcp_server, mcp_tool=mcp_tool)
     if gate:
-        return _with_repo_gate_context(
-            response, _repo_gate_warning(gate['repo'], gate['remaining'])
-        )
-    return response
+        return _repo_gate_deny_response(gate['repo'])
+    return _evaluate_pre_tool_use_execution_policies(
+        event, api_key, tool_name, command, mcp_server=mcp_server, mcp_tool=mcp_tool)
 
 
 def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
@@ -1538,9 +1525,6 @@ def _repo_gate_block_policies(policies):
     for policy in policies or []:
         if not isinstance(policy, dict):
             continue
-        grace = policy.get('grace_turns')
-        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
-            continue
         org = policy.get('github_org')
         if not isinstance(org, str) or not org.strip():
             continue
@@ -1612,62 +1596,6 @@ def _repo_gate_candidates(event, tool_name, command):
     return []
 
 
-def _repo_gate_turn_id(event):
-    """Turn identity so one turn burns one grace; `generation_id`, else per call."""
-    generation_id = event.get('generation_id')
-    if generation_id:
-        return str(generation_id)
-    return REPO_GATE_UNKNOWN_TURN
-
-
-def _load_repo_gate_state(session_id):
-    """Grace state, keyed on session; anything unreadable reads as unused grace."""
-    fresh = {'used': 0, 'turns': []}
-    try:
-        with open(REPO_GATE_STATE_FILE, 'r', encoding='utf-8') as f:
-            state = json.loads(f.read())
-        if not isinstance(state, dict) or state.get('session_id') != session_id:
-            return fresh
-        used = state.get('used')
-        turns = state.get('turns')
-        if isinstance(used, bool) or not isinstance(used, int) or used < 0:
-            return fresh
-        if not isinstance(turns, list):
-            return fresh
-        return {'used': used, 'turns': [t for t in turns if isinstance(t, str)]}
-    except (OSError, ValueError):
-        return fresh
-
-
-def _save_repo_gate_state(session_id, state):
-    """Atomic replace, so parallel calls in one turn cannot leave a torn file."""
-    try:
-        REPO_GATE_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        payload = json.dumps({
-            'session_id': session_id,
-            'used': state['used'],
-            'turns': state['turns'][-REPO_GATE_TURN_MEMORY:],
-        })
-        tmp = REPO_GATE_STATE_FILE.parent / ('.repo_gate.%d.tmp' % os.getpid())
-        tmp.write_text(payload, encoding='utf-8')
-        os.replace(str(tmp), str(REPO_GATE_STATE_FILE))
-    except Exception:
-        pass
-
-
-def _repo_gate_warning(repo, remaining):
-    if remaining <= 0:
-        tail = 'This is the final warning — the next turn touching an out-of-scope repository will be blocked.'
-    elif remaining == 1:
-        tail = '1 warning left before out-of-scope repositories are blocked.'
-    else:
-        tail = '%d warnings left before out-of-scope repositories are blocked.' % remaining
-    return (
-        'Unbound repository policy: this action works in "%s", which is outside '
-        'your organization\'s allowed repository scope. %s' % (repo, tail)
-    )
-
-
 def _repo_gate_block_reason(repo):
     return (
         'Blocked by organization policy. "%s" is outside your organization\'s '
@@ -1690,8 +1618,35 @@ def _repo_gate_clip(text):
 
 
 def _repo_gate_binding_policy(block_policies):
-    """The denying policy whose grace decided warn-vs-block."""
-    return min(block_policies, key=lambda p: p['grace_turns'])
+    """The policy the incident is filed against; every match denies alike."""
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident, which the backend hashes into the
+    record's identity.
+
+    Read from the clock rather than a counter file, so the gate keeps no state
+    on disk. Redelivery still dedups: the value is stamped into the payload
+    once, so a resend carries the same one. The step below is what makes it
+    unique -- the clock resolves to about a microsecond, which two reports can
+    share, and a repeat reads downstream as a redelivery and loses the second
+    incident. Two SEPARATE hook processes in the same microsecond can still
+    collide; that needs genuinely concurrent tool calls and costs one merged
+    incident, which is why this is not worth a lock or a state file.
+    """
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
 
 
 def _repo_gate_post(body, api_key):
@@ -1711,23 +1666,16 @@ def _repo_gate_post(body, api_key):
 def _repo_gate_report(gate, block_policies, context):
     """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
     try:
-        decision = (gate or {}).get('decision')
-        if decision not in ('warn', 'deny'):
+        if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
         api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
-        # WARN reports how far into the grace it got; BLOCK reports the whole grace.
-        grace = policy.get('grace_turns')
-        remaining = gate.get('remaining')
-        if isinstance(grace, bool) or not isinstance(grace, int):
-            turn = None
-        elif isinstance(remaining, int) and not isinstance(remaining, bool):
-            turn = grace - remaining
-        else:
-            turn = grace
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
         # What the call was about: its shell command, or the path it names.
         tool_input = context.get('tool_input')
         if isinstance(tool_input, dict):
@@ -1742,7 +1690,7 @@ def _repo_gate_report(gate, block_policies, context):
             'repo_gate': {
                 'policy_id': policy.get('id'),
                 'repository': gate.get('repo'),
-                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                'decision': 'BLOCK',
                 # Same value as the label above: the incidents page reads this one.
                 'agent': app_label,
                 'tool_name': context.get('tool_name'),
@@ -1758,7 +1706,7 @@ def _repo_gate_report(gate, block_policies, context):
 
 
 def _repo_gate_evaluate(event, tool_name, command=''):
-    """Verdict for one tool call: None allows, else deny or warn. Never raises."""
+    """Verdict for one tool call: None allows, else deny. Never raises."""
     try:
         if not _repo_gate_applies(tool_name, command):
             return None
@@ -1768,7 +1716,7 @@ def _repo_gate_evaluate(event, tool_name, command=''):
 
         candidates = _repo_gate_candidates(event, tool_name, command)
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
-        gate = _repo_gate_decide(event, block_policies, repo)
+        gate = {'decision': 'deny', 'repo': repo} if repo else None
         _repo_gate_report(gate, block_policies, {
             'app_label': 'cursor',
             'session_id': event.get('conversation_id'),
@@ -1781,47 +1729,12 @@ def _repo_gate_evaluate(event, tool_name, command=''):
         return None
 
 
-def _repo_gate_decide(event, block_policies, repo):
-    """One grace per turn; memoizing the unknown-turn sentinel freezes grace."""
-    if not repo:
-        return None
-    grace = min(p['grace_turns'] for p in block_policies)
-    conversation_id = event.get('conversation_id')
-    state = _load_repo_gate_state(conversation_id)
-    turn_id = _repo_gate_turn_id(event)
-    known_turn = turn_id != REPO_GATE_UNKNOWN_TURN
-    if not known_turn or turn_id not in state['turns']:
-        if state['used'] >= grace:
-            return {'decision': 'deny', 'repo': repo}
-        state['used'] += 1
-        if known_turn:
-            state['turns'].append(turn_id)
-        _save_repo_gate_state(conversation_id, state)
-    return {
-        'decision': 'warn',
-        'repo': repo,
-        'remaining': max(0, grace - state['used']),
-    }
-
-
 def _repo_gate_deny_response(repo):
     return format_hook_response({
         'decision': 'deny',
         'reason': _repo_gate_block_reason(repo),
         'additionalContext': REPO_GATE_BLOCK_CONTEXT,
     })
-
-
-def _with_repo_gate_context(response, context):
-    """Append via `agent_message`; additive, so a real block is never downgraded."""
-    if not context:
-        return response
-    merged = dict(response or {})
-    existing = merged.get('agent_message') or ''
-    merged['agent_message'] = (
-        existing + '\n\n' + context if existing else context
-    )
-    return merged
 
 
 def _trusted_ancestors(start):

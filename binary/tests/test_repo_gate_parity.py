@@ -17,16 +17,9 @@ ALL_HOOKS = sorted(TOOL_PY)
 # (https://docs.augmentcode.com/cli/hooks lists PreToolUse, PostToolUse, Stop,
 # SessionStart, SessionEnd and nothing else).
 PROMPT_HOOKS = [h for h in ALL_HOOKS if h != 'augment']
-# The hooks that have a warning phase at all. Augment has no turn id and no
-# prompt event to derive one from, so it carries no grace machinery whatsoever
-# — no counter file, no _repo_gate_decide, no warning text. It denies from the
-# first violating call on both its gates. See the Augment section at the end.
-GRACE_HOOKS = PROMPT_HOOKS
-# Hooks whose PreToolUse payload carries a native turn identifier, so a tool
-# call can be attributed to the turn that issued it. Copilot's does not: it
-# dates the turn from the audit-logged prompt instead, and has no turn id at all
-# when the session has yet to log one.
-NATIVE_TURN_ID_HOOKS = ['claude-code', 'codex', 'cursor']
+# WEB-5523 removed the warning phase: every hook now denies from the first
+# violating call, which is what Augment always did. Nothing distinguishes the
+# hooks here any more, so the gate contract is asserted across ALL of them.
 
 # The app label each tree already sends on its ordinary posts; the gate report
 # must reuse it rather than coin an agent name of its own.
@@ -42,7 +35,6 @@ BLOCK_ORG = {
     'id': 12, 'name': 'Block Non-Unbound Repos',
     'github_org': 'unboundsec',
     'repositories': [], 'include_forks': False,
-    'grace_turns': 3,
 }
 
 
@@ -59,7 +51,7 @@ def _prepare(tool, tmp_path):
     """A hook module with every file it writes redirected onto a temp dir."""
     mod = _load(tool)
     mod.POLICY_CACHE_FILE = tmp_path / ".policy_cache.json"
-    mod.REPO_GATE_STATE_FILE = tmp_path / ".repo_gate_state.json"
+    mod.REPO_GATE_SEQ_FILE = tmp_path / ".repo_gate_seq.json"
     mod.AUDIT_LOG = tmp_path / "agent-audit.log"
     mod.ERROR_LOG = tmp_path / "error.log"
     mod.tool_name = tool
@@ -68,26 +60,13 @@ def _prepare(tool, tmp_path):
 
 @pytest.fixture(params=ALL_HOOKS)
 def hook(request, tmp_path):
-    """A hook module with its policy cache and gate state on a temp dir."""
+    """A hook module with its policy cache on a temp dir."""
     return _prepare(request.param, tmp_path)
 
 
 @pytest.fixture(params=PROMPT_HOOKS)
 def prompt_hook(request, tmp_path):
     """The same, for the four hooks that have a prompt-level event."""
-    return _prepare(request.param, tmp_path)
-
-
-@pytest.fixture(params=GRACE_HOOKS)
-def grace_hook(request, tmp_path):
-    """The same, for the four hooks that have a warning phase and a grace
-    counter. Augment is excluded because it has neither."""
-    return _prepare(request.param, tmp_path)
-
-
-@pytest.fixture(params=NATIVE_TURN_ID_HOOKS)
-def native_turn_hook(request, tmp_path):
-    """The same, for hooks whose tool payload names the turn it belongs to."""
     return _prepare(request.param, tmp_path)
 
 
@@ -108,10 +87,6 @@ def test_stray_action_key_ignored(hook):
     [],
     [None, 3, 'x'],
     [{}],
-    [dict(BLOCK_ORG, grace_turns='three')],
-    [dict(BLOCK_ORG, grace_turns=None)],
-    [dict(BLOCK_ORG, grace_turns=-1)],
-    [dict(BLOCK_ORG, grace_turns=True)],
     [dict(BLOCK_ORG, github_org='')],
     [dict(BLOCK_ORG, github_org=None)],
 ])
@@ -119,197 +94,48 @@ def test_malformed_policies_are_dropped(hook, policies):
     assert hook._repo_gate_block_policies(policies) == []
 
 
-def test_org_scope_matching_is_case_insensitive(hook):
-    policy = dict(BLOCK_ORG, github_org='UnBoundSec')
-    assert hook._repo_gate_scope_allows(policy, 'unboundsec', 'setup') is True
-    assert hook._repo_gate_scope_allows(policy, 'acme', 'widgets') is False
+@pytest.mark.parametrize("grace", ['three', None, -1, True, 99, 0])
+def test_a_grace_turns_from_an_older_gateway_is_inert(hook, grace):
+    """WEB-5523 removed the warning phase. grace_turns was load-bearing enough
+    that an unreadable one dropped the whole policy; a gateway that has not
+    deployed the change yet still sends it, and the gate must now ignore it
+    rather than let it decide anything -- github_org is the only key read."""
+    policies = [dict(BLOCK_ORG, grace_turns=grace)]
+    assert hook._repo_gate_block_policies(policies) == policies
 
 
-# -- remote parsing ---------------------------------------------------------
+# -- incident ordinal ------------------------------------------------------
 
-@pytest.mark.parametrize("url,host", [
-    ('git@github.com:org/repo.git', 'github.com'),
-    ('https://github.com/org/repo.git', 'github.com'),
-    ('ssh://git@ghe.acme.com/org/repo', 'ghe.acme.com'),
-    ('https://user:pw@github.com/org/repo', 'github.com'),
-    ('file:///srv/git/x', None),
-    ('/srv/git/x', None),
-    ('', None),
-    (None, None),
-])
-def test_remote_host(hook, url, host):
-    assert hook._remote_host(url) == host
+def test_ordinal_is_unique_per_incident(hook):
+    """WEB-5523: the ordinal is the only field that separates two incidents of
+    one session downstream, where it is hashed into the record identity. A
+    repeated value reads as a redelivery, and every report after the first is
+    silently dropped -- which is exactly how the warning phase used to lose
+    every block after the grace ran out."""
+    seen = [hook._repo_gate_incident_ordinal() for _ in range(50)]
+    assert len(set(seen)) == len(seen)
+    assert seen == sorted(seen), "must not go backwards within a session"
 
 
-def test_hostless_remote_is_never_judged(hook, tmp_path):
-    """file:///srv/git/x parses as org "srv", repo "git" — a half-parse that
-    must not be compared against a GitHub org."""
-    repo = tmp_path / "weird"
-    repo.mkdir()
-    subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin',
-                    'file:///srv/git/x'], check=True, capture_output=True)
-    assert hook._get_git_origin_org_repo(str(repo)) == (None, None)
+def test_ordinal_needs_no_state_on_disk(hook, tmp_path):
+    """It is read from the clock, so there is nothing to corrupt, migrate or
+    reset -- and nothing left over from the grace counter it replaced."""
+    before = {q.name for q in tmp_path.iterdir()}
+    hook._repo_gate_incident_ordinal()
+    assert {q.name for q in tmp_path.iterdir()} == before
 
 
-def test_github_remote_resolves(hook, tmp_path):
-    repo = tmp_path / "setup"
-    repo.mkdir()
-    subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin',
-                    'git@github.com:UnboundSec/Setup.git'], check=True,
-                   capture_output=True)
-    assert hook._get_git_origin_org_repo(str(repo)) == ('unboundsec', 'setup')
-
-
-def test_git_failure_propagates_for_fail_open(hook, monkeypatch):
-    """_get_git_origin_org_repo must NOT swallow a git-unavailable error — the
-    evaluate() layer catches it and allows. Swallowing it here would make an
-    unreadable repo look like a resolved one."""
-    def boom(_cwd):
-        raise FileNotFoundError('git')
-    monkeypatch.setattr(hook, '_git_origin_url', boom)
-    with pytest.raises(FileNotFoundError):
-        hook._get_git_origin_org_repo('/anywhere')
-
-
-# -- violation detection ----------------------------------------------------
-
-def test_no_git_root_never_violates(hook, tmp_path):
-    plain = tmp_path / "notes" / "deep"
-    plain.mkdir(parents=True)
-    assert hook._repo_gate_violating_repo([str(plain)], [BLOCK_ORG], {}) is None
-
-
-def test_out_of_scope_repo_violates(hook, tmp_path):
-    repo = tmp_path / "widgets"
-    repo.mkdir()
-    subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin',
-                    'https://github.com/acme/widgets.git'], check=True,
-                   capture_output=True)
-    assert hook._repo_gate_violating_repo(
-        [str(repo)], [BLOCK_ORG], {}) == 'acme/widgets'
-    # Compliant against at least one BLOCK policy ⇒ not a violation.
-    acme_ok = dict(BLOCK_ORG, github_org='acme')
-    assert hook._repo_gate_violating_repo(
-        [str(repo)], [BLOCK_ORG, acme_ok], {}) is None
-
-
-def test_origin_lookup_is_cached_per_root(hook, tmp_path, monkeypatch):
-    repo = tmp_path / "widgets"
-    repo.mkdir()
-    subprocess.run(['git', 'init', '-q', str(repo)], check=True, capture_output=True)
-    subprocess.run(['git', '-C', str(repo), 'remote', 'add', 'origin',
-                    'https://github.com/acme/widgets.git'], check=True,
-                   capture_output=True)
-    calls = []
-    real = hook._git_origin_url
-    monkeypatch.setattr(hook, '_git_origin_url',
-                        lambda c: (calls.append(c), real(c))[1])
-    cache = {}
-    for _ in range(5):
-        hook._repo_gate_violating_repo([str(repo)], [BLOCK_ORG], cache)
-    assert len(calls) == 1, "git must run at most once per repo root"
-
-
-def test_system_checkout_roots_are_shared(hook):
-    """WEB-5433: a Homebrew path must never resolve as work in homebrew/brew."""
-    assert hook._is_system_checkout_path('/opt/homebrew/bin/jq') is True
-    assert hook._is_system_checkout_path('/nix/store/x') is True
-    assert hook._is_system_checkout_path('/Users/me/project') is False
-
-
-# -- grace bookkeeping ------------------------------------------------------
-
-def test_state_round_trip_and_session_scoping(grace_hook):
-    grace_hook._save_repo_gate_state('S1', {'used': 2, 'turns': ['t1', 't2']})
-    assert grace_hook._load_repo_gate_state('S1') == {'used': 2, 'turns': ['t1', 't2']}
-    # A different session starts with full grace — this is the reset.
-    assert grace_hook._load_repo_gate_state('S2') == {'used': 0, 'turns': []}
-
-
-def test_state_turn_list_is_bounded(grace_hook):
-    turns = ['t%d' % i for i in range(100)]
-    grace_hook._save_repo_gate_state('S1', {'used': 100, 'turns': turns})
-    loaded = grace_hook._load_repo_gate_state('S1')
-    assert loaded['used'] == 100
-    assert len(loaded['turns']) == grace_hook.REPO_GATE_TURN_MEMORY
-    assert loaded['turns'][-1] == 't99'
-
-
-@pytest.mark.parametrize("junk", [
-    '', '{', 'null', '[]', 'true', '"str"',
-    '{"used": "many"}',
-    '{"session_id": "S1", "used": -4, "turns": []}',
-    '{"session_id": "S1", "used": true, "turns": []}',
-    '{"session_id": "S1", "used": 9, "turns": "t1"}',
-])
-def test_corrupt_state_reads_as_unused_grace(grace_hook, junk):
-    grace_hook.REPO_GATE_STATE_FILE.write_text(junk, encoding='utf-8')
-    assert grace_hook._load_repo_gate_state('S1') == {'used': 0, 'turns': []}
-
-
-def test_missing_state_reads_as_unused_grace(grace_hook):
-    assert not grace_hook.REPO_GATE_STATE_FILE.exists()
-    assert grace_hook._load_repo_gate_state('S1') == {'used': 0, 'turns': []}
-
-
-def test_unwritable_state_dir_is_survivable(grace_hook):
-    grace_hook.REPO_GATE_STATE_FILE = grace_hook.REPO_GATE_STATE_FILE.parent / "nope" / "x" / "s.json"
-    grace_hook.REPO_GATE_STATE_FILE.parent.parent.write_text("i am a file", encoding='utf-8')
-    grace_hook._save_repo_gate_state('S1', {'used': 1, 'turns': ['t1']})  # must not raise
-    assert grace_hook._load_repo_gate_state('S1') == {'used': 0, 'turns': []}
-
-
-# -- policy cache plumbing --------------------------------------------------
-
-def test_repo_policies_round_trip_and_survive_partial_writes(hook):
-    hook.save_policy_cache(tools_to_check=['Bash'], repo_policies=[BLOCK_ORG])
-    assert hook.get_repo_policies() == [BLOCK_ORG]
-    # A later write that omits repo_policies must not silently drop them.
-    hook.save_policy_cache(tools_to_check=['Bash', 'Read'])
-    assert hook.get_repo_policies() == [BLOCK_ORG]
-    # An explicit empty list clears them (policy removed server-side).
-    hook.save_policy_cache(repo_policies=[])
-    assert hook.get_repo_policies() == []
-
-
-def test_cold_and_corrupt_cache_yield_no_policies(hook):
-    assert hook.get_repo_policies() == []
-    hook.POLICY_CACHE_FILE.write_text('{not json', encoding='utf-8')
-    assert hook.get_repo_policies() == []
-    hook.POLICY_CACHE_FILE.write_text('{"repo_policies": "nope"}', encoding='utf-8')
-    assert hook.get_repo_policies() == []
-
-
-def test_block_context_never_downgrades_a_deny(grace_hook):
-    denied = {'hookSpecificOutput': {'hookEventName': 'PreToolUse',
-                                     'permissionDecision': 'deny',
-                                     'permissionDecisionReason': 'secret leak',
-                                     'additionalContext': 'stop'}}
-    if grace_hook.tool_name == 'cursor':
-        denied = {'permission': 'deny', 'user_message': 'secret leak',
-                  'agent_message': 'stop'}
-    merged = grace_hook._with_repo_gate_context(denied, 'repo warning')
-    if grace_hook.tool_name == 'cursor':
-        assert merged['permission'] == 'deny'
-        assert merged['user_message'] == 'secret leak'
-        assert 'stop' in merged['agent_message']
-        assert 'repo warning' in merged['agent_message']
-    else:
-        out = merged['hookSpecificOutput']
-        assert out['permissionDecision'] == 'deny'
-        assert out['permissionDecisionReason'] == 'secret leak'
-        assert 'stop' in out['additionalContext']
-        assert 'repo warning' in out['additionalContext']
-
-
-def test_warning_text_names_repo_and_remaining(grace_hook):
-    assert 'acme/widgets' in grace_hook._repo_gate_warning('acme/widgets', 2)
-    assert '2 warnings left' in grace_hook._repo_gate_warning('acme/widgets', 2)
-    assert '1 warning left' in grace_hook._repo_gate_warning('acme/widgets', 1)
-    assert 'final warning' in grace_hook._repo_gate_warning('acme/widgets', 0)
+def test_no_hook_can_warn_any_more(hook):
+    """WEB-5523, pinned as a deletion. The warning phase left nothing behind:
+    no advisory copy, no grace ledger, no per-turn arbitration to re-grow. A
+    straying write is blocked, and there is no path that softens that."""
+    for gone in ('_repo_gate_warning', '_repo_gate_decide', '_repo_gate_turn_id',
+                 '_load_repo_gate_state', '_save_repo_gate_state',
+                 '_with_repo_gate_context', 'REPO_GATE_STATE_FILE',
+                 'REPO_GATE_TURN_MEMORY', 'REPO_GATE_UNKNOWN_TURN'):
+        assert not hasattr(hook, gone), gone
+    source = TOOL_PY[hook.tool_name].read_text(encoding='utf-8')
+    assert 'grace' not in source.lower().replace('gracefully', '')
 
 
 def test_block_reason_names_the_repo(hook):
@@ -350,13 +176,6 @@ def repos(tmp_path):
 
 def _set_policies(hook, policies):
     hook.save_policy_cache(tools_to_check=[], repo_policies=policies)
-
-
-def _grace_used(hook):
-    if not hook.REPO_GATE_STATE_FILE.exists():
-        return 0
-    return json.loads(
-        hook.REPO_GATE_STATE_FILE.read_text(encoding='utf-8'))['used']
 
 
 def _stubs(hook, api, posts=None, real_post=False, bodies=None):
@@ -530,16 +349,6 @@ def _assert_prompt_allowed(out, repo='acme/widgets'):
     assert repo not in json.dumps(out)
 
 
-def _assert_tool_warned(hook, response, repo):
-    if hook.tool_name == 'cursor':
-        assert response.get('permission') != 'deny'
-        assert repo in (response.get('agent_message') or '')
-    else:
-        out = response.get('hookSpecificOutput') or {}
-        assert out.get('permissionDecision') != 'deny'
-        assert repo in (out.get('additionalContext') or '')
-
-
 def _assert_tool_denied(hook, response, repo):
     if hook.tool_name == 'cursor':
         assert response.get('permission') == 'deny'
@@ -556,7 +365,7 @@ def _assert_tool_allowed(response, repo='acme/widgets'):
 
 def test_conversation_in_out_of_scope_repo_is_allowed(prompt_hook, repos):
     """A conversation inside an out-of-scope repo is not a violation: talking is not working."""
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(prompt_hook, [BLOCK_ORG])
     for turn in ('t1', 't2', 't3'):
         out, code, _ = _run_main(
             prompt_hook,
@@ -565,37 +374,32 @@ def test_conversation_in_out_of_scope_repo_is_allowed(prompt_hook, repos):
         assert code == 0, "no hook may exit non-zero for a conversation"
 
 
-def test_conversation_in_out_of_scope_repo_burns_no_grace(prompt_hook, repos):
-    """The grace a later write or git command needs must still be there: the
-    prompt event must not touch the counter at all."""
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=1)])
+def test_conversation_in_out_of_scope_repo_files_no_incident(prompt_hook, repos):
+    """Talking in an out-of-scope repo is not working in it, so the prompt event
+    reaches no verdict and reports nothing. The write that follows still does."""
+    _set_policies(prompt_hook, [BLOCK_ORG])
     for turn in ('t1', 't2'):
-        _run_main(prompt_hook,
-                  _prompt_event(prompt_hook.tool_name, repos.out_scope, turn))
-    assert _grace_used(prompt_hook) == 0
-    assert not prompt_hook.REPO_GATE_STATE_FILE.exists(), \
-        "a prompt must not create the counter file"
-    # The grace is intact, so the first gated tool call still gets its warning.
+        _, reports = _reported_prompt(
+            prompt_hook, _prompt_event(prompt_hook.tool_name, repos.out_scope, turn))
+        assert reports == []
+
     response = _run_tool(
         prompt_hook, _tool_event(prompt_hook.tool_name, repos.out_scope, 't3'))
-    _assert_tool_warned(prompt_hook, response, 'acme/widgets')
+    _assert_tool_denied(prompt_hook, response, 'acme/widgets')
 
 
 def test_conversation_in_the_allowed_org_is_allowed(prompt_hook, repos):
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(prompt_hook, [BLOCK_ORG])
     out, _, _ = _run_main(prompt_hook,
                           _prompt_event(prompt_hook.tool_name, repos.in_scope))
     _assert_prompt_allowed(out)
-    assert _grace_used(prompt_hook) == 0
 
 
 def test_conversation_under_no_git_root_is_allowed(prompt_hook, repos):
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(prompt_hook, [BLOCK_ORG])
     out, _, _ = _run_main(prompt_hook,
                           _prompt_event(prompt_hook.tool_name, repos.plain))
     _assert_prompt_allowed(out)
-    assert not prompt_hook.REPO_GATE_STATE_FILE.exists(), \
-        "a cwd under no repo must not touch the counter"
 
 
 def test_no_hook_carries_a_conversation_gate_any_more(hook):
@@ -644,7 +448,7 @@ def test_a_gateway_prompt_block_still_blocks(prompt_hook, repos):
     None,
     'not-a-list',
     [{}],
-    [dict(BLOCK_ORG, grace_turns='three')],
+    [dict(BLOCK_ORG, github_org=None)],
 ])
 def test_tool_gate_fails_open_on_malformed_policies(hook, repos, policies):
     hook.POLICY_CACHE_FILE.write_text(
@@ -652,19 +456,17 @@ def test_tool_gate_fails_open_on_malformed_policies(hook, repos, policies):
         encoding='utf-8')
     response = _run_tool(hook, _tool_event(hook.tool_name, repos.out_scope))
     _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
 def test_tool_gate_fails_open_without_a_cwd(hook):
     """No cwd and no path in the command: nothing resolves, so nothing is
     judged."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     _assert_tool_allowed(_run_tool(hook, _tool_event(hook.tool_name, None)))
-    assert _grace_used(hook) == 0
 
 
 def test_tool_gate_fails_open_when_git_is_unavailable(hook, repos):
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     for boom in (FileNotFoundError('git'),
                  subprocess.TimeoutExpired(cmd='git', timeout=10)):
         original = hook._git_origin_url
@@ -674,23 +476,24 @@ def test_tool_gate_fails_open_when_git_is_unavailable(hook, repos):
         finally:
             hook._git_origin_url = original
         _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
-@pytest.mark.parametrize("junk", ['', '{', 'null', '{"used": "many"}'])
-def test_tool_gate_survives_corrupt_state(grace_hook, repos, junk):
-    """Unreadable state reads as unused grace, so the call is warned, not
-    blocked."""
-    _set_policies(grace_hook, [dict(BLOCK_ORG, grace_turns=1)])
-    grace_hook.REPO_GATE_STATE_FILE.write_text(junk, encoding='utf-8')
-    response = _run_tool(grace_hook, _tool_event(grace_hook.tool_name, repos.out_scope))
-    _assert_tool_warned(grace_hook, response, 'acme/widgets')
+def test_the_gate_keeps_no_state_on_disk(hook, repos):
+    """WEB-5523: the grace counter was the gate's only persistent state, and it
+    is gone. Nothing the gate does may leave a file behind to be corrupted,
+    migrated or reset -- a blocked call is decided from the policy alone."""
+    _set_policies(hook, [BLOCK_ORG])
+    before = {p.name for p in hook.POLICY_CACHE_FILE.parent.iterdir()}
+    _run_tool(hook, _tool_event(hook.tool_name, repos.out_scope))
+    _run_tool(hook, _tool_event(hook.tool_name, repos.out_scope, 't2'))
+    new = {p.name for p in hook.POLICY_CACHE_FILE.parent.iterdir()} - before
+    assert not any('repo_gate' in name for name in new), new
 
 
 def test_tool_block_never_calls_the_gateway(hook, repos):
     """Only this machine can resolve a path to a git root, so the decision is
     already final — and a blocked call must not cost a round trip."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     api = MagicMock(return_value={})
     stack = _stubs(hook, api)
     with _started(stack):
@@ -699,26 +502,16 @@ def test_tool_block_never_calls_the_gateway(hook, repos):
     api.assert_not_called()
 
 
-def test_tool_gate_never_downgrades_a_gateway_block(grace_hook, repos):
-    """A warn rides on top of whatever the gateway said; it never replaces a
-    real deny with an advisory. Augment is excluded because it has no warning
-    phase to downgrade anything into — see the test below."""
-    _set_policies(grace_hook, [dict(BLOCK_ORG, grace_turns=3)])
+def test_tool_gate_never_downgrades_a_gateway_block(hook, repos):
+    """The gate decides before the gateway is ever consulted, so its deny is
+    what the caller sees. Either way the call is denied — one block replaced by
+    another, never by an allow."""
+    _set_policies(hook, [BLOCK_ORG])
     gateway = {'decision': 'deny', 'reason': 'Blocked: command leaks a secret'}
-    response = _run_tool(grace_hook,
-                         _tool_event(grace_hook.tool_name, repos.out_scope),
+    response = _run_tool(hook,
+                         _tool_event(hook.tool_name, repos.out_scope),
                          gateway=gateway)
-    _assert_tool_denied(grace_hook, response, 'command leaks a secret')
-
-
-def test_augment_gate_deny_still_denies_a_gateway_blocked_call(augment, repos):
-    """Augment's gate denies from the first violating call, so it decides before
-    the gateway is ever consulted. The call is still denied — a block replaced
-    by a different block, never by an allow."""
-    _set_policies(augment, [BLOCK_ORG])
-    gateway = {'decision': 'deny', 'reason': 'Blocked: command leaks a secret'}
-    response = _run_tool(augment, _augment_event(repos.out_scope), gateway=gateway)
-    _assert_tool_denied(augment, response, 'acme/widgets')
+    _assert_tool_denied(hook, response, 'acme/widgets')
 
 
 # ===========================================================================
@@ -738,14 +531,14 @@ def test_prompt_refresh_makes_the_first_tool_call_enforceable(prompt_hook, repos
     tool = prompt_hook.tool_name
     assert _cache(prompt_hook) is None, "starts genuinely cold"
     gateway = {'decision': 'allow', 'tools_to_check': [],
-               'repo_policies': [dict(BLOCK_ORG, grace_turns=0)]}
+               'repo_policies': [BLOCK_ORG]}
 
     out, _, api = _run_main(prompt_hook, _prompt_event(tool, repos.out_scope, 't1'),
                             gateway=gateway)
     _assert_prompt_allowed(out)
     assert api.call_args[0][0].get('pull_policies') is True, \
         "a cold cache must ask the gateway for policies"
-    assert _cache(prompt_hook)['repo_policies'] == [dict(BLOCK_ORG, grace_turns=0)]
+    assert _cache(prompt_hook)['repo_policies'] == [BLOCK_ORG]
 
     # Same turn, first tool call — enforced, because the prompt warmed the cache.
     response = _run_tool(prompt_hook, _tool_event(tool, repos.out_scope, 't1'))
@@ -756,7 +549,7 @@ def test_prompt_path_respects_the_cache_ttl(prompt_hook, repos):
     """A fresh cache is not re-pulled; a stale one is. Without the TTL check a
     cold cache would re-pull on every single prompt."""
     tool = prompt_hook.tool_name
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=9)])
+    _set_policies(prompt_hook, [BLOCK_ORG])
     _, _, api = _run_main(prompt_hook, _prompt_event(tool, repos.in_scope, 't1'))
     assert 'pull_policies' not in api.call_args[0][0], "fresh cache must not re-pull"
 
@@ -771,10 +564,10 @@ def test_prompt_refresh_does_not_clobber_policies_on_a_bare_response(
         prompt_hook, repos):
     """A gateway reply carrying no policy fields must leave the cache alone,
     not blank it."""
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=9)])
+    _set_policies(prompt_hook, [BLOCK_ORG])
     _run_main(prompt_hook, _prompt_event(prompt_hook.tool_name, repos.in_scope),
               gateway={'decision': 'allow'})
-    assert _cache(prompt_hook)['repo_policies'] == [dict(BLOCK_ORG, grace_turns=9)]
+    assert _cache(prompt_hook)['repo_policies'] == [BLOCK_ORG]
 
 
 def test_tool_path_still_caches_policies(hook, repos):
@@ -793,58 +586,24 @@ def test_cache_helper_ignores_a_missing_or_non_dict_response(hook):
     assert hook.get_repo_policies() == []
 
 
-# -- shared grace arbitration ------------------------------------------------
+# -- the verdict -------------------------------------------------------------
 
-def test_decide_is_a_no_op_without_a_violating_repo(grace_hook):
-    event = _tool_event(grace_hook.tool_name, None)
-    assert grace_hook._repo_gate_decide(event, [BLOCK_ORG], None) is None
-    assert _grace_used(grace_hook) == 0
-
-
-def test_decide_burns_one_grace_per_turn(native_turn_hook):
-    """Called twice for the same turn — as the session gate and the tool gate
-    both do — it burns exactly one. Only meaningful where the payload names the
-    turn; see test_decide_charges_per_call_when_the_turn_is_unknown."""
-    event = _tool_event(native_turn_hook.tool_name, None, 't1')
-    first = native_turn_hook._repo_gate_decide(event, [BLOCK_ORG], 'acme/widgets')
-    second = native_turn_hook._repo_gate_decide(event, [BLOCK_ORG], 'acme/widgets')
-    assert first['decision'] == second['decision'] == 'warn'
-    assert first['remaining'] == second['remaining'] == 2
-    assert _grace_used(native_turn_hook) == 1
+def test_an_in_scope_repo_reaches_no_verdict(hook):
+    """Nothing to judge, so nothing is decided and nothing is reported."""
+    event = _tool_event(hook.tool_name, None)
+    assert hook._repo_gate_evaluate(event) is None if hook.tool_name != 'cursor' \
+        else hook._repo_gate_evaluate(event, hook.tool_name) is None
 
 
-def test_decide_denies_once_grace_is_spent(grace_hook):
-    policies = [dict(BLOCK_ORG, grace_turns=0)]
-    verdict = grace_hook._repo_gate_decide(
-        _tool_event(grace_hook.tool_name, None), policies, 'acme/widgets')
-    assert verdict == {'decision': 'deny', 'repo': 'acme/widgets'}
-    assert _grace_used(grace_hook) == 0, "a deny must not burn grace"
-
-
-def test_unknown_turn_is_never_memoized_as_an_identity(grace_hook):
-    """REPO_GATE_UNKNOWN_TURN means "which turn is this?", not "turn X".
-
-    Recording it in state['turns'] the way a real turn id is recorded would
-    create one bucket that is entered once and never left: `used` freezes one
-    short of `grace` and the gate warns forever, leaving the policy configured
-    but permanently unenforced. This is the defect that made Copilot's tool
-    calls never escalate."""
-    event = {}  # no turn id under any hook's spelling
-    assert grace_hook._repo_gate_turn_id(event) == grace_hook.REPO_GATE_UNKNOWN_TURN
-    grace_hook._repo_gate_decide(event, [BLOCK_ORG], 'acme/widgets')
-    assert grace_hook.REPO_GATE_UNKNOWN_TURN not in \
-        grace_hook._load_repo_gate_state(None)['turns']
-
-
-def test_decide_charges_per_call_when_the_turn_is_unknown(grace_hook):
-    """An unidentifiable turn is charged per CALL — stricter than per turn, but
-    it escalates, which a frozen counter never does."""
-    policies = [dict(BLOCK_ORG, grace_turns=2)]
-    event = {}
-    verdicts = [grace_hook._repo_gate_decide(event, policies, 'acme/widgets')
-                for _ in range(4)]
-    assert [v['decision'] for v in verdicts] == ['warn', 'warn', 'deny', 'deny']
-    assert _grace_used(grace_hook) == 2
+def test_every_call_into_an_out_of_scope_repo_denies(hook, repos):
+    """WEB-5523: no warning phase, no escalation, no per-turn arbitration. The
+    first straying write is blocked and so is every one after it, in the same
+    turn or a later one."""
+    _set_policies(hook, [BLOCK_ORG])
+    for turn in ('t1', 't1', 't2', 't3'):
+        response = _run_tool(
+            hook, _tool_event(hook.tool_name, repos.out_scope, turn))
+        _assert_tool_denied(hook, response, 'acme/widgets')
 
 
 # ===========================================================================
@@ -977,7 +736,7 @@ def _assert_cd_caught(hook, response, repo='acme/widgets'):
     if hook.tool_name == 'augment':
         _assert_tool_denied(hook, response, repo)
     else:
-        _assert_tool_warned(hook, response, repo)
+        _assert_tool_denied(hook, response, repo)
 
 
 @pytest.mark.parametrize("command", ['cd %s && git commit -m wip',
@@ -992,12 +751,11 @@ def test_cd_into_an_out_of_scope_repo_is_caught(hook, repos, command):
 
 def test_bare_cd_with_no_git_or_write_is_allowed(hook, repos):
     """Walking into an out-of-scope repo is not gated; only writing or running git there is."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     for command in ('cd %s', 'cd %s && cat README.md', 'cd %s && ls -la'):
         response = _run_tool(hook, _tool_event(
             hook.tool_name, repos.in_scope, 't1', command % repos.out_scope))
         _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
 def test_relative_traversal_out_of_the_allowed_repo_is_caught(hook, repos):
@@ -1014,20 +772,19 @@ def test_cd_within_the_allowed_repo_is_allowed(hook, repos):
         hook.tool_name, repos.plain, 't1',
         'cd %s && git commit -m wip' % repos.in_scope))
     _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
-def test_cd_escape_escalates_to_a_block_on_the_next_turn(native_turn_hook, repos):
+def test_a_cd_escape_is_blocked(hook, repos):
     """Regression guard for Codex and Cursor: their `cd` handling is correct and
     must stay that way — warn once, then block, driven by the native turn id."""
-    _set_policies(native_turn_hook, [dict(BLOCK_ORG, grace_turns=1)])
+    _set_policies(hook, [BLOCK_ORG])
     command = 'cd %s && git commit -m wip' % repos.out_scope
-    first = _run_tool(native_turn_hook, _tool_event(
-        native_turn_hook.tool_name, repos.in_scope, 't1', command))
-    _assert_tool_warned(native_turn_hook, first, 'acme/widgets')
-    second = _run_tool(native_turn_hook, _tool_event(
-        native_turn_hook.tool_name, repos.in_scope, 't2', command))
-    _assert_tool_denied(native_turn_hook, second, 'acme/widgets')
+    first = _run_tool(hook, _tool_event(
+        hook.tool_name, repos.in_scope, 't1', command))
+    _assert_tool_denied(hook, first, 'acme/widgets')
+    second = _run_tool(hook, _tool_event(
+        hook.tool_name, repos.in_scope, 't2', command))
+    _assert_tool_denied(hook, second, 'acme/widgets')
 
 
 # ===========================================================================
@@ -1043,25 +800,24 @@ def test_cd_escape_escalates_to_a_block_on_the_next_turn(native_turn_hook, repos
 
 @pytest.mark.parametrize("command", [GATED_COMMAND, 'git push', 'rm notes.txt',
                                      'mv a b', 'echo x > out.txt'])
-def test_gated_commands_in_an_out_of_scope_repo_warn_then_block(grace_hook, repos,
+def test_gated_commands_in_an_out_of_scope_repo_are_blocked(hook, repos,
                                                                 command):
-    _set_policies(grace_hook, [dict(BLOCK_ORG, grace_turns=1)])
-    tool = grace_hook.tool_name
-    first = _run_tool(grace_hook, _tool_event(tool, repos.out_scope, 't1', command))
-    _assert_tool_warned(grace_hook, first, 'acme/widgets')
-    second = _run_tool(grace_hook, _tool_event(tool, repos.out_scope, 't2', command))
-    _assert_tool_denied(grace_hook, second, 'acme/widgets')
+    _set_policies(hook, [BLOCK_ORG])
+    tool = hook.tool_name
+    first = _run_tool(hook, _tool_event(tool, repos.out_scope, 't1', command))
+    _assert_tool_denied(hook, first, 'acme/widgets')
+    second = _run_tool(hook, _tool_event(tool, repos.out_scope, 't2', command))
+    _assert_tool_denied(hook, second, 'acme/widgets')
 
 
 @pytest.mark.parametrize("command", UNGATED_COMMANDS)
 def test_ungated_commands_in_an_out_of_scope_repo_are_allowed(hook, repos, command):
     """grace_turns=0, so anything the gate is in scope for would block outright.
     These do not, and they leave the counter untouched."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     response = _run_tool(hook, _tool_event(
         hook.tool_name, repos.out_scope, 't1', command))
     _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
 @pytest.mark.parametrize("command", ['git push', 'rm notes.txt',
@@ -1069,41 +825,38 @@ def test_ungated_commands_in_an_out_of_scope_repo_are_allowed(hook, repos, comma
 def test_gated_commands_in_a_non_git_directory_are_allowed(hook, repos, command):
     """A directory under no git root has no origin to judge, so there is nothing
     to be outside of."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     response = _run_tool(hook, _tool_event(
         hook.tool_name, repos.plain, 't1', command))
     _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
 @pytest.mark.parametrize("command", ['git push', 'rm notes.txt',
                                      'echo x > out.txt'])
 def test_gated_commands_inside_the_allowed_org_are_allowed(hook, repos, command):
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     response = _run_tool(hook, _tool_event(
         hook.tool_name, repos.in_scope, 't1', command))
     _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
-def test_a_write_tool_in_an_out_of_scope_repo_warns_then_blocks(grace_hook, repos):
-    _set_policies(grace_hook, [dict(BLOCK_ORG, grace_turns=1)])
-    tool = grace_hook.tool_name
-    _assert_tool_warned(
-        grace_hook, _run_tool(grace_hook, _file_event(tool, repos.out_scope, 't1')),
+def test_a_write_tool_in_an_out_of_scope_repo_is_blocked(hook, repos):
+    _set_policies(hook, [BLOCK_ORG])
+    tool = hook.tool_name
+    _assert_tool_denied(
+        hook, _run_tool(hook, _file_event(tool, repos.out_scope, 't1')),
         'acme/widgets')
     _assert_tool_denied(
-        grace_hook, _run_tool(grace_hook, _file_event(tool, repos.out_scope, 't2')),
+        hook, _run_tool(hook, _file_event(tool, repos.out_scope, 't2')),
         'acme/widgets')
 
 
 def test_a_write_tool_is_allowed_in_scope_and_under_no_repo(hook, repos):
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     for where in ('in_scope', 'plain'):
         response = _run_tool(hook, _file_event(hook.tool_name,
                                                getattr(repos, where)))
         _assert_tool_allowed(response)
-    assert _grace_used(hook) == 0
 
 
 # -- relative write paths ---------------------------------------------------
@@ -1118,7 +871,7 @@ RELATIVE_TARGET = 'src/main.py'
 def test_a_relative_write_path_is_judged_in_the_repo_it_resolves_in(hook, repos):
     """The bypass itself: a relative path in an out-of-scope repo must be
     resolved against the call's own directory, not discarded."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     event = _file_event(hook.tool_name, repos.out_scope, target=RELATIVE_TARGET)
     _assert_tool_denied(hook, _run_tool(hook, event), 'acme/widgets')
 
@@ -1126,16 +879,15 @@ def test_a_relative_write_path_is_judged_in_the_repo_it_resolves_in(hook, repos)
 def test_a_relative_write_path_in_scope_is_still_allowed(hook, repos):
     """Resolving must not invent a violation: the same relative path inside an
     allowed repo stays allowed and spends no grace."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     event = _file_event(hook.tool_name, repos.in_scope, target=RELATIVE_TARGET)
     _assert_tool_allowed(_run_tool(hook, event))
-    assert _grace_used(hook) == 0
 
 
 def test_a_relative_write_path_with_nothing_to_resolve_against_allows(hook, repos):
     """Fail-open is absolute. With no cwd the path names no repository, so the
     gate has nothing to judge and must allow rather than block."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     event = _file_event(hook.tool_name, repos.out_scope, target=RELATIVE_TARGET)
     event.pop('cwd', None)
     event.pop('workspace_roots', None)
@@ -1148,17 +900,17 @@ def test_a_read_tool_in_an_out_of_scope_repo_is_allowed(hook, repos):
     event = _file_event(hook.tool_name, repos.out_scope, table=_READ_TOOL)
     if event is None:
         pytest.skip('%s has no read tool the gate ever saw' % hook.tool_name)
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     _assert_tool_allowed(_run_tool(hook, event))
-    assert _grace_used(hook) == 0
 
 
-def test_grace_is_spent_once_per_turn_across_several_gated_calls(native_turn_hook,
+def test_several_gated_calls_in_one_turn_are_each_blocked(hook,
                                                                  repos):
-    """Four gated calls of one turn — a git command, a shell write and two write
-    tools — cost one grace between them, not four."""
-    _set_policies(native_turn_hook, [dict(BLOCK_ORG, grace_turns=2)])
-    tool = native_turn_hook.tool_name
+    """Four gated calls of one turn — a git command, a shell write and two
+    write tools. Each is judged on its own; there is no per-turn allowance for
+    them to share, so all four are blocked."""
+    _set_policies(hook, [BLOCK_ORG])
+    tool = hook.tool_name
     events = [
         _tool_event(tool, repos.out_scope, 't1', 'git push'),
         _tool_event(tool, repos.out_scope, 't1', 'rm notes.txt'),
@@ -1166,17 +918,17 @@ def test_grace_is_spent_once_per_turn_across_several_gated_calls(native_turn_hoo
         _file_event(tool, repos.out_scope, 't1'),
     ]
     for event in events:
-        _assert_tool_warned(native_turn_hook, _run_tool(native_turn_hook, event),
+        _assert_tool_denied(hook, _run_tool(hook, event),
                             'acme/widgets')
-    assert _grace_used(native_turn_hook) == 1
 
 
-def test_copilot_successive_tool_calls_escalate_to_a_block(repos, tmp_path):
-    """Copilot has no turn id, so memoizing the unknown-turn sentinel would warn forever and never block."""
+def test_copilot_tool_calls_are_blocked_from_the_first(repos, tmp_path):
+    """Copilot has no turn id at all, which used to be the hard case for a
+    per-turn allowance. Without one to keep, it simply blocks like the rest."""
     hook = _prepare('copilot', tmp_path)
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=1)])
+    _set_policies(hook, [BLOCK_ORG])
     event = _tool_event('copilot', repos.out_scope, 't1')
-    _assert_tool_warned(hook, _run_tool(hook, event), 'acme/widgets')
+    _assert_tool_denied(hook, _run_tool(hook, event), 'acme/widgets')
     for _ in range(3):
         _assert_tool_denied(hook, _run_tool(hook, event), 'acme/widgets')
 
@@ -1184,10 +936,10 @@ def test_copilot_successive_tool_calls_escalate_to_a_block(repos, tmp_path):
 def test_copilot_cd_into_an_out_of_scope_repo_blocks(repos, tmp_path):
     """The same escalation, reached by walking out of an in-scope workspace."""
     hook = _prepare('copilot', tmp_path)
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=1)])
+    _set_policies(hook, [BLOCK_ORG])
     event = _tool_event('copilot', repos.in_scope, 't1',
                         'cd %s && git commit -m wip' % repos.out_scope)
-    _assert_tool_warned(hook, _run_tool(hook, event), 'acme/widgets')
+    _assert_tool_denied(hook, _run_tool(hook, event), 'acme/widgets')
     _assert_tool_denied(hook, _run_tool(hook, event), 'acme/widgets')
 
 
@@ -1267,29 +1019,21 @@ def test_augment_out_of_scope_workspace_allows_ungated_tools(augment, repos,
 
 
 @pytest.mark.parametrize("grace", [0, 1, 3, None])
-def test_augment_workspace_deny_ignores_grace_turns(augment, repos, grace):
-    """No turn id means a counter that can never advance, so a warning phase
-    would leave the policy configured but never enforcing. It denies from the
-    first call whatever grace_turns says."""
+def test_augment_workspace_deny_ignores_a_stray_grace_turns(augment, repos, grace):
+    """A gateway that has not deployed WEB-5523 yet still sends grace_turns, and
+    one that has sends none. The workspace gate denies from the first call
+    either way -- it used to drop a policy that carried no grace at all."""
     policy = dict(BLOCK_ORG)
-    if grace is None:
-        policy.pop('grace_turns')
-        # A policy with no grace at all is malformed and drops out entirely.
-        _set_policies(augment, [policy])
-        _assert_tool_allowed(_run_tool(augment, _augment_event(repos.out_scope)))
-        return
-    policy['grace_turns'] = grace
+    if grace is not None:
+        policy['grace_turns'] = grace
     _set_policies(augment, [policy])
     response = _run_tool(augment, _augment_event(repos.out_scope))
     _assert_tool_denied(augment, response, 'acme/widgets')
-    assert _grace_used(augment) == 0
-    assert not augment.REPO_GATE_STATE_FILE.exists(), \
-        "the workspace gate must not read or write the grace counter"
 
 
 def test_augment_in_scope_workspace_still_gates_individual_paths(augment, repos):
     """The per-path gate governs individual paths when the workspace itself is
-    in scope — and denies, because Augment has no warning phase."""
+    in scope — and denies, because no hook has a warning phase."""
     _set_policies(augment, [BLOCK_ORG])
     response = _run_tool(augment, _augment_event(
         repos.in_scope, 'save-file', {'path': '%s/notes.txt' % repos.out_scope}))
@@ -1350,21 +1094,18 @@ def test_augment_denies_on_the_first_call_whatever_grace_says(
     _assert_tool_denied(augment, _run_tool(augment, event), 'acme/widgets')
 
 
-def test_augment_carries_no_grace_machinery_at_all(augment):
-    """The absence is the design, not an omission: with no turn id and no prompt
-    event, a counter could never advance, so there is none to drift or corrupt."""
-    for absent in ('_repo_gate_decide', '_repo_gate_warning', '_repo_gate_turn_id',
-                   '_load_repo_gate_state', '_save_repo_gate_state',
-                   '_with_repo_gate_context', 'REPO_GATE_TURN_MEMORY'):
-        assert not hasattr(augment, absent), absent
-    source = TOOL_PY['augment'].read_text(encoding='utf-8')
-    assert "'decision': 'warn'" not in source
+def test_no_hook_can_produce_a_warn_verdict(augment):
+    """The report side of the deletion: WARN is not a decision any hook can
+    reach, so nothing downstream can be handed one."""
+    for tool, path in TOOL_PY.items():
+        source = path.read_text(encoding='utf-8')
+        assert "'decision': 'warn'" not in source, tool
+        assert "'WARN'" not in source, tool
 
 
 def test_augment_never_writes_a_grace_counter_file(augment, repos, tmp_path):
     """Whatever the path taken, no state file is created — there is nothing to
-    count. _prepare still points REPO_GATE_STATE_FILE at the temp dir, so this
-    would catch any reintroduced write."""
+    count, and the gate is decided from the policy alone."""
     _set_policies(augment, [BLOCK_ORG])
     for event in (_augment_event(repos.out_scope),
                   _augment_event(repos.in_scope, 'launch-process',
@@ -1376,15 +1117,14 @@ def test_augment_never_writes_a_grace_counter_file(augment, repos, tmp_path):
 
 
 def test_augment_workspace_without_a_git_origin_allows_everything(augment, repos):
-    _set_policies(augment, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(augment, [BLOCK_ORG])
     for tool_name in ('launch-process', 'view', 'save-file', 'mcp__x__y'):
         response = _run_tool(augment, _augment_event(repos.plain, tool_name, {}))
         _assert_tool_allowed(response)
-    assert _grace_used(augment) == 0
 
 
 def test_augment_in_scope_workspace_allows(augment, repos):
-    _set_policies(augment, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(augment, [BLOCK_ORG])
     _assert_tool_allowed(_run_tool(augment, _augment_event(repos.in_scope)))
 
 
@@ -1409,7 +1149,6 @@ def test_augment_session_start_advises_in_an_out_of_scope_workspace(augment, rep
     assert out['hookSpecificOutput']['hookEventName'] == 'SessionStart'
     assert 'acme/widgets' in context
     assert 'systemMessage' not in out, "not documented for SessionStart"
-    assert _grace_used(augment) == 0
 
 
 def test_augment_session_start_is_silent_when_in_scope(augment, repos, monkeypatch):
@@ -1495,7 +1234,7 @@ def test_the_report_rides_the_standard_pretool_envelope(hook, repos):
     """One envelope per tree, carrying that tree's own app label at the top
     level where the gateway reads it. A copy-paste that left claude-code's label
     on another hook would silently mis-attribute every incident it files."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     bodies = []
     _run_tool(hook, _violating_event(hook, repos.out_scope), bodies=bodies)
     assert len(bodies) == 1, bodies
@@ -1512,13 +1251,13 @@ def test_the_report_rides_the_standard_pretool_envelope(hook, repos):
         'session_id', 'tool_input', 'tool_name', 'turn']
 
 
-def test_tool_warn_reports_one_incident(grace_hook, repos):
-    _set_policies(grace_hook, [dict(BLOCK_ORG, grace_turns=1)])
-    event = _violating_event(grace_hook, repos.out_scope)
-    response, reports = _reported_tool(grace_hook, event)
-    _assert_tool_warned(grace_hook, response, 'acme/widgets')
+def test_a_blocked_tool_call_reports_one_incident(hook, repos):
+    _set_policies(hook, [BLOCK_ORG])
+    event = _violating_event(hook, repos.out_scope)
+    response, reports = _reported_tool(hook, event)
+    _assert_tool_denied(hook, response, 'acme/widgets')
     assert len(reports) == 1, reports
-    _assert_report(reports[0], grace_hook, 'WARN')
+    _assert_report(reports[0], hook, 'BLOCK')
     assert reports[0]['tool_input'] == GATED_COMMAND
     assert reports[0]['prompt_text'] is None
 
@@ -1526,7 +1265,7 @@ def test_tool_warn_reports_one_incident(grace_hook, repos):
 def test_tool_block_reports_one_incident(hook, repos):
     """grace_turns=0 blocks from the first violating call on every hook,
     including Augment, which has no warning phase at all."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     response, reports = _reported_tool(hook, _violating_event(hook, repos.out_scope))
     _assert_tool_denied(hook, response, 'acme/widgets')
     assert len(reports) == 1, reports
@@ -1537,7 +1276,7 @@ def test_tool_block_reports_one_incident(hook, repos):
 def test_an_allowed_call_reports_nothing(hook, repos, where):
     """A compliant repo and a path under no git root are both ALLOW, and an
     ALLOW is not an incident."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     event = _violating_event(hook, getattr(repos, where))
     response, reports = _reported_tool(hook, event)
     _assert_tool_allowed(response)
@@ -1555,7 +1294,7 @@ def test_a_prompt_never_reports_an_incident(prompt_hook, repos):
     producer of surface="prompt", so that value of the server's enum is
     unreachable from any hook. A prompt in an out-of-scope repo is an ALLOW, and
     an ALLOW is not an incident."""
-    _set_policies(prompt_hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(prompt_hook, [BLOCK_ORG])
     for cwd in (repos.out_scope, repos.in_scope, repos.plain):
         out, reports = _reported_prompt(
             prompt_hook, _prompt_event(prompt_hook.tool_name, cwd))
@@ -1567,7 +1306,7 @@ def test_no_hook_can_emit_the_prompt_surface(hook, repos):
     """`surface` is no longer sent: the server derives it from tool_name. Every
     report any hook can still file names a tool, so that derivation yields
     "tool" and the prompt surface stays unreachable from any hook."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     posts = []
     for command in ('git push', 'rm notes.txt'):
         _run_tool(hook, _tool_event(hook.tool_name, repos.out_scope, 't1', command),
@@ -1583,7 +1322,7 @@ def test_one_turn_of_violating_calls_reports_once_per_call(hook, repos):
     verdicts and so file three reports — one per verdict, never a duplicate
     pair per call, and never a storm beyond what the decisions themselves
     produce."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=1)])
+    _set_policies(hook, [BLOCK_ORG])
     posts = []
     for _ in range(3):
         _run_tool(hook, _violating_event(hook, repos.out_scope, turn='t1'),
@@ -1591,20 +1330,19 @@ def test_one_turn_of_violating_calls_reports_once_per_call(hook, repos):
     assert len(posts) == 3, posts
 
 
-def test_a_warned_turn_reports_a_warn_for_every_one_of_its_calls(native_turn_hook,
-                                                                 repos):
-    """Grace is still burned once per turn, so all three calls of a warned turn
-    are warns and all three reports say so. Copilot is excluded: without a
-    native turn id it charges grace per call, and escalates to BLOCK partway —
-    which is the existing documented behaviour, reported faithfully."""
-    _set_policies(native_turn_hook, [dict(BLOCK_ORG, grace_turns=1)])
+def test_every_blocked_call_of_a_turn_reports_its_own_incident(hook, repos):
+    """Three gated calls of one turn are three blocks and three incidents, each
+    separately numbered. They used to share a turn's allowance and report one
+    verdict between them; nothing is shared now, and the ordinals are what stop
+    the three collapsing onto one record downstream."""
+    _set_policies(hook, [BLOCK_ORG])
     posts = []
     for _ in range(3):
-        _run_tool(native_turn_hook,
-                  _violating_event(native_turn_hook, repos.out_scope, turn='t1'),
+        _run_tool(hook,
+                  _violating_event(hook, repos.out_scope, turn='t1'),
                   posts=posts)
-    assert _grace_used(native_turn_hook) == 1
-    assert [p['decision'] for p in posts] == ['WARN'] * 3
+    assert [p['decision'] for p in posts] == ['BLOCK'] * 3
+    assert len({p['turn'] for p in posts}) == 3, posts
 
 
 # -- nothing about a report can reach a decision ----------------------------
@@ -1633,7 +1371,7 @@ def test_a_hung_gateway_still_returns_the_deny(hook, repos):
     Popen patch is scoped to the dispatch alone because the gate resolves git
     roots through subprocess too, and patching it wholesale would fail the gate
     open and prove nothing."""
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     proc = MagicMock()
     proc.communicate.side_effect = AssertionError('the decision path waited')
     proc.wait.side_effect = AssertionError('the decision path waited')
@@ -1658,7 +1396,7 @@ def test_a_hung_gateway_still_returns_the_deny(hook, repos):
     RuntimeError('gateway down'),
 ])
 def test_a_failing_report_never_changes_the_decision(hook, repos, boom):
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     stack = _stubs(hook, MagicMock(return_value={}), real_post=True)
     stack.append(patch.object(hook, '_repo_gate_post', MagicMock(side_effect=boom)))
     with _started(stack):
@@ -1673,7 +1411,7 @@ def test_a_missing_api_key_still_denies_and_files_nothing(hook, repos, monkeypat
                 'UNBOUND_COPILOT_API_KEY', 'UNBOUND_CODEX_API_KEY',
                 'UNBOUND_AUGMENT_API_KEY'):
         monkeypatch.delenv(var, raising=False)
-    _set_policies(hook, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(hook, [BLOCK_ORG])
     posts = []
     stack = _stubs(hook, MagicMock(return_value={}), posts)
     stack.append(patch.object(hook, '_cached_api_key', None))
@@ -1733,15 +1471,16 @@ def test_long_fields_are_capped_so_the_body_fits_the_pipe(hook):
     assert len(payload['tool_input']) == cap
 
 
-def test_binding_policy_is_the_one_that_governed_the_timing(hook):
-    """A repo outside every policy's scope is denied by all of them; the report
-    names the one whose grace decided warn-vs-block, which is the same `min`
-    the verdict itself took."""
-    strict = dict(BLOCK_ORG, id=7, name='Strict', grace_turns=0)
-    lax = dict(BLOCK_ORG, id=8, name='Lax', grace_turns=9)
-    assert hook._repo_gate_binding_policy([lax, strict])['id'] == 7
-    assert hook._repo_gate_binding_policy([strict, lax])['id'] == 7
-    assert hook._repo_gate_binding_policy([lax])['id'] == 8
+def test_binding_policy_is_the_first_denying_policy(hook):
+    """A repo outside every policy's scope is denied by all of them, so there is
+    no arbitration left to do: the incident is filed against the first. This
+    used to pick the policy whose grace was smallest, which is the last thing
+    grace decided anywhere."""
+    first = dict(BLOCK_ORG, id=8, name='First')
+    second = dict(BLOCK_ORG, id=7, name='Second')
+    assert hook._repo_gate_binding_policy([first, second])['id'] == 8
+    assert hook._repo_gate_binding_policy([second, first])['id'] == 7
+    assert hook._repo_gate_binding_policy([first])['id'] == 8
 
 
 def test_augment_session_start_advisory_files_no_incident(augment, repos, monkeypatch):
@@ -1760,13 +1499,14 @@ def test_augment_session_start_advisory_files_no_incident(augment, repos, monkey
     assert posts == []
 
 
-def test_augment_reports_no_turn_ordinal(augment, repos):
-    """Augment keeps no grace counter and is sent no turn id, so there is no
-    turn to report and grace_turns describes nothing it enforced."""
+def test_augment_reports_an_incident_ordinal(augment, repos):
+    """Augment has no turn id and never had one, which is why its reports used
+    to carry no ordinal at all -- and why every incident of a session collapsed
+    onto the first downstream. It now numbers them like every other hook."""
     _set_policies(augment, [BLOCK_ORG])
     _, reports = _reported_tool(augment, _augment_event(repos.out_scope))
     assert len(reports) == 1
-    assert reports[0]['turn'] is None
+    assert isinstance(reports[0]['turn'], int)
 
 
 def test_augment_reports_the_path_gate_and_the_workspace_gate_once_each(augment, repos):
@@ -1787,7 +1527,7 @@ def test_cursor_file_tool_reports_the_path_it_names(tmp_path, repos):
     names its path on the event itself rather than under tool_input, so the
     report has to fall back to the event to say what was blocked."""
     cursor = _prepare('cursor', tmp_path)
-    _set_policies(cursor, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(cursor, [BLOCK_ORG])
     target = '%s/README.md' % repos.out_scope
     event = {'hook_event_name': 'preToolUse', 'conversation_id': 'S1',
              'generation_id': 't1', 'tool_name': 'Write', 'file_path': target,
@@ -1806,7 +1546,7 @@ def test_cursor_file_tool_reports_the_path_it_names(tmp_path, repos):
 def test_cursor_read_tool_is_no_longer_gated(tmp_path, repos):
     """The same entry point with Cursor's read tool: allowed, and silent."""
     cursor = _prepare('cursor', tmp_path)
-    _set_policies(cursor, [dict(BLOCK_ORG, grace_turns=0)])
+    _set_policies(cursor, [BLOCK_ORG])
     event = {'hook_event_name': 'preToolUse', 'conversation_id': 'S1',
              'generation_id': 't1', 'tool_name': 'Read',
              'file_path': '%s/README.md' % repos.out_scope,

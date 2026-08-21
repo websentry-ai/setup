@@ -56,7 +56,8 @@ ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".augment" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
-# No REPO_GATE_STATE_FILE / REPO_GATE_TURN_MEMORY on purpose: Augment has no turn id, so a grace counter could never advance.
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 AUDIT_LOG_TOTAL_LIMIT = 100
@@ -2031,9 +2032,6 @@ def _repo_gate_block_policies(policies: Optional[List[Dict]]) -> List[Dict]:
     for policy in policies or []:
         if not isinstance(policy, dict):
             continue
-        grace = policy.get('grace_turns')
-        if isinstance(grace, bool) or not isinstance(grace, int) or grace < 0:
-            continue
         org = policy.get('github_org')
         if not isinstance(org, str) or not org.strip():
             continue
@@ -2139,7 +2137,34 @@ def _repo_gate_clip(text):
 
 def _repo_gate_binding_policy(block_policies):
     """Stable pick among denying policies; augment denies from the first call."""
-    return min(block_policies, key=lambda p: p['grace_turns'])
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident, which the backend hashes into the
+    record's identity.
+
+    Read from the clock rather than a counter file, so the gate keeps no state
+    on disk. Redelivery still dedups: the value is stamped into the payload
+    once, so a resend carries the same one. The step below is what makes it
+    unique -- the clock resolves to about a microsecond, which two reports can
+    share, and a repeat reads downstream as a redelivery and loses the second
+    incident. Two SEPARATE hook processes in the same microsecond can still
+    collide; that needs genuinely concurrent tool calls and costs one merged
+    incident, which is why this is not worth a lock or a state file.
+    """
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
 
 
 def _repo_gate_post(body, api_key):
@@ -2159,16 +2184,16 @@ def _repo_gate_post(body, api_key):
 def _repo_gate_report(gate, block_policies, context):
     """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
     try:
-        decision = (gate or {}).get('decision')
-        if decision not in ('warn', 'deny'):
+        if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
         api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
-        # Augment keeps no grace counter and is sent no turn id, so there is no ordinal to report.
-        turn = None
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
         # What the call was about: its shell command, or the path it names.
         tool_input = context.get('tool_input')
         if isinstance(tool_input, dict):
@@ -2183,7 +2208,7 @@ def _repo_gate_report(gate, block_policies, context):
             'repo_gate': {
                 'policy_id': policy.get('id'),
                 'repository': gate.get('repo'),
-                'decision': 'BLOCK' if decision == 'deny' else 'WARN',
+                'decision': 'BLOCK',
                 # Same value as the label above: the incidents page reads this one.
                 'agent': app_label,
                 'tool_name': context.get('tool_name'),
@@ -2199,7 +2224,7 @@ def _repo_gate_report(gate, block_policies, context):
 
 
 def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
-    """Per-path deny; no grace, since Augment has no turn id to advance one."""
+    """Per-path deny: straying outside the allowed org is blocked outright."""
     try:
         if not _repo_gate_gated_call(event):
             return None
@@ -2249,7 +2274,7 @@ def _repo_gate_session_repo(event: Dict, report: bool = False) -> Optional[str]:
 
 
 def _repo_gate_session_start_output(event: Dict) -> Dict:
-    """SessionStart advisory; cannot block, and never touches the grace counter."""
+    """SessionStart advisory; cannot block, so it files no incident."""
     repo = _repo_gate_session_repo(event)
     if not repo:
         return {}
