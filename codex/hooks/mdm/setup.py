@@ -1191,9 +1191,12 @@ def clear_managed_hooks() -> str:
 _HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
 
 
-# A table header may carry a trailing comment, so an exact string match would walk past
-# [features] and both strip the wrong lines and append a duplicate table.
-_FEATURES_HEADER_RE = re.compile(r'^\[features\]\s*(#.*)?$')
+# TOML spells this header several ways and allows a trailing comment. Missing one both
+# strips the wrong lines and appends a second [features], which TOML rejects outright.
+_FEATURES_HEADER_RE = re.compile(r'^\[\s*(?:features|"features"|\'features\')\s*\]\s*(#.*)?$')
+
+# features as an inline table cannot take an appended header without redefining it.
+_FEATURES_INLINE_RE = re.compile(r'^features\s*=')
 
 
 def _is_features_header(stripped) -> bool:
@@ -1204,8 +1207,9 @@ def _features_hooks_flags(lines):
     """The hooks feature flag lines present inside [features], in either spelling. Scoped to
     that table: a hooks key in some other table is not this flag and must not be read as one."""
     found, in_features = [], False
-    for line in lines:
-        stripped = line.strip()
+    for stripped in _config_lines(lines):
+        if stripped is None:
+            continue
         if stripped.startswith('['):
             in_features = _is_features_header(stripped)
             continue
@@ -1214,12 +1218,32 @@ def _features_hooks_flags(lines):
     return found
 
 
+def _config_lines(lines):
+    """Yield each line stripped, or None for the interior of a multi-line string, so a
+    TOML-looking line inside a value is never read as a table header or as our flag."""
+    in_string = False
+    for line in lines:
+        odd = (line.count('"""') + line.count("'''")) % 2 == 1
+        if in_string:
+            if odd:
+                in_string = False
+            yield None
+            continue
+        if odd:
+            in_string = True
+            yield None
+            continue
+        yield line.strip()
+
+
 def _strip_hooks_flags(lines):
     """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
     and scoped to that table so [hooks.state] and its entries are left alone."""
     out, in_features = [], False
-    for line in lines:
-        stripped = line.strip()
+    for line, stripped in zip(lines, _config_lines(lines)):
+        if stripped is None:
+            out.append(line)
+            continue
         if stripped.startswith('['):
             in_features = _is_features_header(stripped)
             out.append(line)
@@ -1248,10 +1272,14 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
             return False  # already exactly right
 
         lines = _strip_hooks_flags(lines)
-        features_idx = next((i for i, l in enumerate(lines) if _is_features_header(l.strip())), None)
+        features_idx = next((i for i, s in enumerate(_config_lines(lines))
+                             if s is not None and _is_features_header(s)), None)
         if features_idx is not None:
             lines.insert(features_idx + 1, 'hooks = true\n')
         else:
+            if any(s is not None and _FEATURES_INLINE_RE.match(s) for s in _config_lines(lines)):
+                debug_print(f"hooks feature flag skipped for {username}: features is an inline table")
+                return False
             if lines and not lines[-1].endswith('\n'):
                 lines.append('\n')
             lines.append('\n[features]\nhooks = true\n')
