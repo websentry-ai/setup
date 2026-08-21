@@ -3580,23 +3580,24 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     if cwd:
         turn_dirs.add(cwd)
     queued_cwd = next(iter(turn_dirs)) if len(turn_dirs) == 1 else None
+    first_queued = len(user_prompts)
     for queued in queued_prompts or []:
         user_prompts.append((queued, queued_cwd))
 
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
-    for typed_prompt, typed_cwd in user_prompts:
+    for index, (typed_prompt, typed_cwd) in enumerate(user_prompts):
         if not typed_prompt.startswith('/'):
             continue
-        if not typed_cwd:
-            # Nothing to resolve against; leaving the skill unresolved beats attributing it
-            # to a repository the prompt may not have come from.
+        if index >= first_queued and not typed_cwd:
+            # A queued prompt with no directory to attribute it to: leaving the skill
+            # unresolved beats naming a repository it may not have come from.
             continue
         typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
-        typed_path = _resolve_skill_path(typed_skill, typed_cwd)
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,
