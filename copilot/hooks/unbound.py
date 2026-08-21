@@ -2390,7 +2390,11 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         p = Path(transcript_path)
         conversation_id = p.parent.name if p.stem == 'events' else p.stem
     model = None
-    last_user_index = -1
+    turn_start_index = -1
+    turn_prompts = []
+    # A prompt only opens a turn when the previous one has been answered; typing while
+    # Copilot is still working appends to the running turn instead.
+    turn_answered = True
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -2406,24 +2410,33 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             if new_model:
                 model = new_model
         elif entry_type == 'user.message':
-            last_user_index = i
+            if turn_answered:
+                turn_start_index = i
+                turn_prompts = []
+                turn_answered = False
+            content = data.get('content')
+            if content:
+                turn_prompts.append(content)
+        elif entry_type == 'assistant.message' and (data.get('content') or '').strip():
+            turn_answered = True
 
-    if last_user_index < 0:
+    if turn_start_index < 0:
         return None, set(), None
 
-    user_prompt = (entries[last_user_index].get('data') or {}).get('content')
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(turn_prompts) or None
     # Envelope id of this turn's user message: unique even when two turns
     # carry identical text, unlike a hash of that text.
-    turn_id = entries[last_user_index].get('id') or ''
+    turn_id = entries[turn_start_index].get('id') or ''
     if not turn_id:
         # text_sig grows as assistant text accumulates, so it changes between
         # Stops of one turn and would defeat the watermark. The user prompt does
         # not change mid-turn, so hash that instead.
-        # last_user_index is the turn's position in the session: fixed while a
+        # turn_start_index is the turn's position in the session: fixed while a
         # turn's assistant text grows, and different for a later turn even when
         # its prompt is identical.
         turn_id = hashlib.sha256(
-            ('%s\x1f%s\x1f%s' % (conversation_id or '', last_user_index, user_prompt or '')
+            ('%s\x1f%s\x1f%s' % (conversation_id or '', turn_start_index, user_prompt or '')
              ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
@@ -2437,7 +2450,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             tool_calls.append(call_id)
         return tool_data[call_id]
 
-    for entry in entries[last_user_index + 1:]:
+    for entry in entries[turn_start_index + 1:]:
         if not isinstance(entry, dict):
             continue
         entry_type = entry.get('type')

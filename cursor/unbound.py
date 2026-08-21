@@ -1907,12 +1907,63 @@ def _project_for_paths(candidates, root_projects):
     return None
 
 
+def _cursor_user_query(text):
+    """The typed text of a Cursor transcript user entry. Cursor wraps it in <user_query>
+    alongside a <timestamp> preamble; anything unwrapped is returned as-is."""
+    if not isinstance(text, str):
+        return ''
+    start = text.find('<user_query>')
+    if start == -1:
+        return text.strip()
+    end = text.find('</user_query>', start)
+    if end == -1:
+        return text[start + len('<user_query>'):].strip()
+    return text[start + len('<user_query>'):end].strip()
+
+
+def _cursor_turn_prompts(transcript_path):
+    """Every prompt the current turn carries, from Cursor's own transcript. A prompt typed
+    while the agent is working joins the running generation without firing
+    beforeSubmitPrompt, so the hook events alone see only the first one."""
+    if not transcript_path or not os.path.exists(transcript_path):
+        return []
+    current, completed = [], []
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if entry.get('type') == 'turn_ended':
+                    completed = current
+                    current = []
+                    continue
+                if entry.get('role') != 'user':
+                    continue
+                content = (entry.get('message') or {}).get('content')
+                blocks = content if isinstance(content, list) else []
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get('type') != 'text':
+                        continue
+                    typed = _cursor_user_query(block.get('text'))
+                    if typed:
+                        current.append(typed)
+    except OSError:
+        return []
+    return current or completed
+
+
 def build_llm_exchange(events, api_key=None):
     """Build standard LLM exchange format from events."""
     messages = []
     assistant_tool_uses = []
     
     user_prompts = []
+    transcript_path = None
     assistant_response = None
     conversation_id = None
     generation_id = None
@@ -1963,6 +2014,7 @@ def build_llm_exchange(events, api_key=None):
         elif hook_event_name == 'stop':
             request_completed = log_entry.get('timestamp')
             usage = _cursor_usage_from_event(event) or usage
+            transcript_path = event.get('transcript_path') or transcript_path
 
         elif hook_event_name == 'beforeReadFile':
             file_path = event.get('file_path')
@@ -2076,6 +2128,12 @@ def build_llm_exchange(events, api_key=None):
             assistant_response = event.get('text')
             usage = _cursor_usage_from_event(event) or usage
     
+    # Cursor's transcript carries every prompt of the turn, including one typed while the
+    # agent was working; the hook events see only those that fired beforeSubmitPrompt.
+    transcript_prompts = _cursor_turn_prompts(transcript_path)
+    if len(transcript_prompts) > len(user_prompts):
+        user_prompts = transcript_prompts
+
     # One message, not one per prompt: the backend keeps only the last user message.
     user_prompt = '\n\n'.join(user_prompts)
     if user_prompt:

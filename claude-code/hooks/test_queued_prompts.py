@@ -174,5 +174,58 @@ class TestStopEventTurnAssembly(unittest.TestCase):
         self.assertEqual(_user_messages(out["exchange"]), ["only"])
 
 
+class TestQueuedPromptFromTranscript(unittest.TestCase):
+    """Claude Code consumes a prompt typed mid-turn from a queue: it never becomes a user
+    message and never fires UserPromptSubmit, so the queue-operation record is its only
+    trace and the turn must pick it up from there."""
+
+    def _transcript(self, entries):
+        import json as _json
+        import tempfile as _tempfile
+        from pathlib import Path as _Path
+        path = _Path(_tempfile.mkdtemp()) / "session.jsonl"
+        with open(path, "w", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(_json.dumps(entry) + "\n")
+        return str(path)
+
+    def test_an_enqueued_prompt_joins_the_turn(self):
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": SECOND_PROMPT, "content": "queued question"},
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": FIRST_STOP, "content": "queued question"},
+        ])
+        data = unbound.parse_transcript_file(path, FIRST_PROMPT)
+        self.assertEqual(data["queued_prompts"], ["queued question"])
+
+    def test_only_enqueue_is_taken(self):
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": SECOND_PROMPT, "content": "queued question"},
+        ])
+        data = unbound.parse_transcript_file(path, FIRST_PROMPT)
+        self.assertEqual(data["queued_prompts"], [])
+
+    def test_a_queue_outside_the_turn_is_ignored(self):
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-08-20T09:00:00Z", "content": "earlier turn"},
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-08-20T11:00:00Z", "content": "later turn"},
+        ])
+        data = unbound.parse_transcript_file(path, FIRST_PROMPT,
+                                             subagent_ceiling=FIRST_STOP)
+        self.assertEqual(data["queued_prompts"], [])
+
+    def test_the_queued_prompt_is_joined_into_the_message(self):
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="typed question")],
+            stop_assistant_message="done",
+            queued_prompts=["queued question"])
+        self.assertEqual(_user_messages(exchange),
+                         ["typed question\n\nqueued question"])
+
+
 if __name__ == "__main__":
     unittest.main()

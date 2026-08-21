@@ -659,6 +659,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
         'user_messages': [],
         'assistant_messages': [],
         'tool_uses': [],
+        'queued_prompts': [],
         'usage': None,
         'model': None,
     }
@@ -684,7 +685,21 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
 
-                    if entry_type == 'user':
+                    if entry_type == 'queue-operation':
+                        # Typing while Claude is working enqueues the prompt and consumes it
+                        # into the running turn; it never becomes a user message and never
+                        # fires UserPromptSubmit, so this record is the only trace of it.
+                        if entry.get('operation') != 'enqueue':
+                            continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
+                        if subagent_ceiling and _ts_lt(subagent_ceiling, entry_timestamp):
+                            continue
+                        queued = entry.get('content')
+                        if queued:
+                            conversation_data['queued_prompts'].append(queued)
+
+                    elif entry_type == 'user':
                         typed = _typed_user_text(entry)
                         if typed:
                             conversation_data['user_messages'].append({
@@ -3587,7 +3602,7 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
     assistant_tool_uses = []
@@ -3652,6 +3667,12 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     tool_use_entry['skill_path'] = skill_path
             assistant_tool_uses.append(tool_use_entry)
     
+    # A queued prompt is consumed into this turn without its own submit event, so it is
+    # carried here rather than read from the events above. It was typed after the prompt
+    # that opened the turn, so it belongs at the end.
+    for queued in queued_prompts or []:
+        user_prompts.append((queued, prompt_cwd))
+
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
@@ -3867,6 +3888,7 @@ def process_stop_event(event: Dict, api_key: str):
         user_prompt_timestamp = turn_prompts[0][0]
 
     transcript_assistant_messages = []
+    transcript_queued_prompts = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
@@ -3877,6 +3899,7 @@ def process_stop_event(event: Dict, api_key: str):
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
         ]
+        transcript_queued_prompts = transcript_data.get('queued_prompts') or []
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
 
@@ -3896,6 +3919,7 @@ def process_stop_event(event: Dict, api_key: str):
         request_initialized=user_prompt_timestamp,
         request_completed=request_completed,
         cwd=event.get('cwd'),
+        queued_prompts=transcript_queued_prompts,
     )
 
     if exchange:
