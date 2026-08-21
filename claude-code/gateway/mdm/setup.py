@@ -525,7 +525,12 @@ def _recorded_managed_gateway_url() -> str:
     """The gateway URL recorded in the drop-in this setup writes. Device-level state we
     own outright -- nothing else writes that file -- so unlike a per-account record it can
     authorise removing the machine-wide route, which matters on a Windows device that has
-    no user profiles to read."""
+    no user profiles to read.
+
+    Only that drop-in. The install falls back to the shared managed-settings.json when it
+    cannot create the drop-in directory, but reading a URL out of the administrator's own
+    file would make their configuration look like ours, which is the deletion this whole
+    check exists to prevent; on that fallback a custom endpoint is left in place."""
     try:
         path = get_managed_settings_dir() / "managed-settings.d" / "unbound.json"
         fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))

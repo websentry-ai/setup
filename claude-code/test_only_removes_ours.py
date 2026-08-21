@@ -676,6 +676,44 @@ class TestEveryTreeRecordsWhatItRoutesAt(unittest.TestCase):
                 self.assertTrue(mod._is_unbound_base_url(self.CUSTOM + "/"), mod.__name__)
 
 
+class TestWindowsInstallToTeardownRoundTrip(unittest.TestCase):
+    """The whole point, end to end and through the real installer: a Windows MDM device
+    with no user profiles installs a custom gateway, and teardown recognises it as ours
+    without consulting any account."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def _install(self, gateway_url):
+        managed = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            self.assertTrue(GATEWAY_MDM.setup_managed_settings("org-token",
+                                                               gateway_url=gateway_url))
+        return managed
+
+    def _matcher(self, managed):
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            return GATEWAY_MDM._unbound_base_url_matcher(None, None)
+
+    def test_the_installer_records_the_custom_gateway(self):
+        managed = self._install(self.CUSTOM)
+        dropin = managed / "managed-settings.d" / "unbound.json"
+        self.assertTrue(dropin.exists())
+        self.assertEqual(json.loads(dropin.read_text())["env"]["ANTHROPIC_BASE_URL"],
+                         self.CUSTOM)
+
+    def test_teardown_recognises_it_with_no_user_profiles(self):
+        matcher = self._matcher(self._install(self.CUSTOM))
+        self.assertTrue(matcher(self.CUSTOM))
+        self.assertTrue(matcher(OURS))
+
+    def test_and_still_refuses_an_endpoint_we_did_not_install(self):
+        matcher = self._matcher(self._install(self.CUSTOM))
+        self.assertFalse(matcher(THEIRS))
+        self.assertFalse(matcher("https://bedrock.us-east-1.amazonaws.com"))
+
+
 class TestGatewayMdmRecordsItsGateway(unittest.TestCase):
     """Teardown recognises a custom endpoint from the URL recorded for a user, so the
     gateway MDM install has to write one -- the hooks MDM tree already did."""
