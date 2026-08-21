@@ -355,7 +355,7 @@ def _is_unbound_api_key(value, home_dir=None, username=None) -> bool:
     return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 
-def _key_helper_file_is_ours(path) -> bool:
+def _key_helper_file_is_ours(path, username=None) -> bool:
     """Whether an anthropic_key.sh is one our setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
     newline does not disown a real install."""
@@ -365,7 +365,7 @@ def _key_helper_file_is_ours(path) -> bool:
         return False
 
 
-def _is_unbound_key_helper(value, extra_paths=()) -> bool:
+def _is_unbound_key_helper(value, extra_paths=(), username=None) -> bool:
     """Whether apiKeyHelper points at a script our setup installs. Covers the per-user
     path and any managed path the caller names, since MDM writes the helper outside a
     home. The path is not enough on its own -- it is a name somebody could choose for
@@ -382,14 +382,14 @@ def _is_unbound_key_helper(value, extra_paths=()) -> bool:
     expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
     if not expanded.exists():
         return True  # a dangling pointer at one of our own paths is ours to clear
-    return _key_helper_file_is_ours(expanded)
+    return _key_helper_file_is_ours(expanded, username)
 
 
 def _reg_exe() -> str:
     """reg.exe by absolute path: an elevated run must not pick one up from PATH or the
     working directory."""
-    system_root = os.environ.get("SystemRoot", r"C:\Windows")
-    return str(Path(system_root) / "System32" / "reg.exe")
+    # Not from os.environ: an elevation can inherit a SystemRoot the caller chose.
+    return r"C:\Windows\System32\reg.exe"
 
 
 def _remove_env_var_lines(var_name: str, is_ours) -> str:
@@ -693,12 +693,11 @@ def clear_setup() -> bool:
     any_cleared = False
     any_failed = False
 
-    # Read the pair before clearing either: ANTHROPIC_BASE_URL goes only when this setup
-    # wrote it, which means our gateway URL alongside our API key.
-    # UNBOUND_API_KEY is set by nothing but this setup, so its presence is the second
-    # signal; matching its value would break on key rotation.
-    gateway_env_ours = (_is_unbound_base_url(_persisted_env_value("ANTHROPIC_BASE_URL"))
-                        and _persisted_env_value("UNBOUND_API_KEY") is not None)
+    # Read before clearing either: ANTHROPIC_BASE_URL goes only where this setup wrote it.
+    # UNBOUND_API_KEY is set by nothing but this setup, so its presence is the signal;
+    # matching its value would break on key rotation. Which exports are ours is then
+    # decided line by line, since a foreign one may sit in the other startup file.
+    gateway_env_ours = _persisted_env_value("UNBOUND_API_KEY") is not None
     for var, label in {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}.items():
         if var == "ANTHROPIC_BASE_URL":
             if not gateway_env_ours:
@@ -709,7 +708,7 @@ def clear_setup() -> bool:
             status, _ = remove_env_var(var)
         if status == "cleared":
             any_cleared = True
-        elif status not in ("cleared", "not_found"):
+        elif status not in ("cleared", "not_found", "skipped"):
             print(f"Failed to clear {label}")
             any_failed = True
 

@@ -852,17 +852,34 @@ def _is_unbound_api_key(value, home_dir=None, username=None) -> bool:
     return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 
-def _key_helper_file_is_ours(path) -> bool:
+def _home_owner_of(path):
+    """The user whose home holds this path, or None for a system location. A helper
+    named in managed settings may live in a home, and reading it as root there would
+    follow whatever that user put in its place."""
+    try:
+        resolved = Path(path).expanduser()
+    except (OSError, ValueError):
+        return None
+    for username, home_dir in (get_all_user_homes() or []):
+        if home_dir is None:
+            continue
+        try:
+            resolved.relative_to(home_dir)
+        except ValueError:
+            continue
+        return username
+    return None
+
+
+def _key_helper_file_is_ours(path, username=None) -> bool:
     """Whether an anthropic_key.sh is one our setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
     newline does not disown a real install."""
-    try:
-        return UNBOUND_KEY_HELPER_TOKEN in Path(path).read_text(encoding="utf-8")
-    except OSError:
-        return False
+    text = _read_user_file(username or _home_owner_of(path), path)
+    return bool(text) and UNBOUND_KEY_HELPER_TOKEN in text
 
 
-def _is_unbound_key_helper(value, extra_paths=()) -> bool:
+def _is_unbound_key_helper(value, extra_paths=(), username=None) -> bool:
     """Whether apiKeyHelper points at a script our setup installs. Covers the per-user
     path and any managed path the caller names, since MDM writes the helper outside a
     home. The path is not enough on its own -- it is a name somebody could choose for
@@ -879,7 +896,105 @@ def _is_unbound_key_helper(value, extra_paths=()) -> bool:
     expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
     if not expanded.exists():
         return True  # a dangling pointer at one of our own paths is ours to clear
-    return _key_helper_file_is_ours(expanded)
+    return _key_helper_file_is_ours(expanded, username)
+
+
+WINDOWS_MACHINE_ENV_KEY = ("HKLM\\SYSTEM\\CurrentControlSet\\Control\\"
+                           "Session Manager\\Environment")
+
+
+def _machine_env_value(var_name: str):
+    """The machine-wide value of a variable on Windows, or None. MDM writes there, so an
+    ownership check that only knows shell rc files would answer None and skip every
+    Windows device."""
+    try:
+        result = subprocess.run([_reg_exe(), "query", WINDOWS_MACHINE_ENV_KEY, "/V", var_name],
+                                capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].lower() == var_name.lower():
+            return parts[2].strip()
+    return None
+
+
+def _owned_env_value(home_dir, var_name: str, username=None):
+    """The persisted value to judge ownership from, wherever this platform keeps it."""
+    if platform.system().lower() == "windows":
+        return _machine_env_value(var_name)
+    return _user_env_value(home_dir, var_name, username)
+
+
+def _remove_env_var_lines_for_user(username, home_dir, var_name: str, is_ours) -> str:
+    """Remove only the exports of this variable whose value is ours. A user has two
+    startup files and either may hold an export, so judging from one collapsed value and
+    then deleting every matching line would take a foreign endpoint away with ours.
+
+    Ownership is decided here, outside the privilege drop: is_ours reads the user's
+    recorded config, which drops privileges itself, and a second drop nested inside the
+    first cannot call setgroups and would answer "not ours" for everything."""
+    system = platform.system().lower()
+    if system == "windows":
+        value = _machine_env_value(var_name)
+        if value is None:
+            return "not_found"
+        if not is_ours(value):
+            return "skipped"
+        return remove_env_var_on_windows_machine(var_name)
+    if system == "darwin":
+        rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
+    elif system == "linux":
+        rc_files = [home_dir / ".zshrc", home_dir / ".bashrc"]
+    else:
+        return "failed"
+    prefix = "export %s=" % var_name
+    cleared = False
+    skipped = False
+    for rc_file in rc_files:
+        text = _read_user_file(username, rc_file)
+        if not text:
+            continue
+        kept = []
+        changed = False
+        for line in text.splitlines(True):
+            stripped = line.strip()
+            if stripped.startswith(prefix):
+                value = stripped[len(prefix):].strip().strip('"').strip("'")
+                if is_ours(value):
+                    changed = True
+                    continue
+                skipped = True
+            kept.append(line)
+        if not changed:
+            continue
+        if _write_user_file(username, rc_file, "".join(kept)) is not True:
+            return "failed"
+        cleared = True
+    if cleared:
+        return "cleared"
+    return "skipped" if skipped else "not_found"
+
+
+def _write_user_file(username, path, text) -> bool:
+    """Replace a file inside a user's home as that user, refusing a symlink."""
+    def _write():
+        try:
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+            fd = os.open(str(path), flags, 0o644)
+        except OSError:
+            return False
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+                handle.write(text)
+            return True
+        except OSError:
+            return False
+    if username is None or platform.system().lower() == "windows":
+        return _write()
+    return _run_as_user(username, _write)
 
 
 def _managed_key_helper_paths():
@@ -897,7 +1012,7 @@ def _is_unbound_api_key_any_user(value) -> bool:
     the same key into every user's config, and the managed settings it appears in are
     system-wide, so there is no single home to consult."""
     for _username, home_dir in (get_all_user_homes() or []):
-        if home_dir is not None and _is_unbound_api_key(value, home_dir):
+        if home_dir is not None and _is_unbound_api_key(value, home_dir, _username):
             return True
     return False
 
@@ -905,8 +1020,8 @@ def _is_unbound_api_key_any_user(value) -> bool:
 def _reg_exe() -> str:
     """reg.exe by absolute path: an elevated run must not pick one up from PATH or the
     working directory."""
-    system_root = os.environ.get("SystemRoot", r"C:\Windows")
-    return str(Path(system_root) / "System32" / "reg.exe")
+    # Not from os.environ: an elevation can inherit a SystemRoot the caller chose.
+    return r"C:\Windows\System32\reg.exe"
 
 
 def _read_user_file(username, path):
@@ -961,18 +1076,22 @@ def _clear_env_var_across_users(var_name: str, user_homes, label: str = None) ->
     failed = 0
     for username, home_dir in user_homes:
         if var_name == "ANTHROPIC_BASE_URL":
-            # Ours only when our gateway URL sits alongside our API key.
-            if not (_is_unbound_base_url(_user_env_value(home_dir, var_name, username),
-                                         home_dir, username)
-                    and _user_env_value(home_dir, "UNBOUND_API_KEY", username) is not None):
-                debug_print("%s left in place for %s: not set by the Unbound gateway"
+            # Ours only when our own key sits beside it, so this reads the key before
+            # the UNBOUND_API_KEY sweep clears it.
+            if _owned_env_value(home_dir, "UNBOUND_API_KEY", username) is None:
+                debug_print("%s left in place for %s: no Unbound key beside it"
                             % (var_name, username))
                 not_found += 1
                 continue
-        status = remove_env_var_from_user(username, home_dir, var_name)
+            status = _remove_env_var_lines_for_user(
+                username, home_dir, var_name,
+                lambda value: _is_unbound_base_url(value, home_dir, username))
+        else:
+            status = remove_env_var_from_user(username, home_dir, var_name)
         if status == "cleared":
             cleared += 1
-        elif status == "not_found":
+        elif status in ("not_found", "skipped"):
+            # "skipped" is a foreign export left in place, which is the correct outcome
             not_found += 1
         else:
             failed += 1
@@ -997,8 +1116,9 @@ def clear_setup() -> bool:
     if not user_homes:
         print("   No user home directories found")
     else:
-        c1, n1, f1 = _clear_env_var_across_users("UNBOUND_API_KEY", user_homes, label="API_KEY")
+        # The base URL gate reads UNBOUND_API_KEY, so it runs before that key is cleared.
         c2, n2, f2 = _clear_env_var_across_users("ANTHROPIC_BASE_URL", user_homes, label="BASE_URL")
+        c1, n1, f1 = _clear_env_var_across_users("UNBOUND_API_KEY", user_homes, label="API_KEY")
         if c1 or c2:
             print(f"Cleared for {max(c1, c2)} user(s)")
         elif not (f1 or f2):

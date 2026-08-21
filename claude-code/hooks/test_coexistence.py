@@ -81,8 +81,9 @@ class TestBaseUrlIdentity(unittest.TestCase):
 
 
 class TestGatewayEnvIsOurs(unittest.TestCase):
-    """The Anthropic environment is only cleared when our gateway set it, which means our
-    gateway URL alongside our API key. Either belonging to somebody else leaves both."""
+    """Our gateway is the only thing that writes UNBOUND_API_KEY, so its presence says
+    our gateway ran here. Which base URL exports get removed is then judged one line at a
+    time, so a customer's own endpoint survives even when ours sits beside it."""
 
     def _judge(self, base_url, api_key, recorded_key="unbound-key"):
         home = Path(tempfile.mkdtemp())
@@ -97,8 +98,10 @@ class TestGatewayEnvIsOurs(unittest.TestCase):
     def test_our_url_and_our_key(self):
         self.assertTrue(self._judge("https://api.getunbound.ai", "unbound-key"))
 
-    def test_their_url_even_with_our_key_present(self):
-        self.assertFalse(self._judge("https://llm.acme-corp.internal", "unbound-key"))
+    def test_our_key_beside_their_url(self):
+        # our gateway ran here, so its own exports are in scope; theirs is filtered out
+        # line by line rather than by refusing the whole cleanup
+        self.assertTrue(self._judge("https://llm.acme-corp.internal", "unbound-key"))
 
     def test_our_url_with_no_key_of_ours(self):
         # somebody pointing Claude Code at a URL on our host without our setup
@@ -284,6 +287,68 @@ class TestPerLineEnvRemoval(unittest.TestCase):
             'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n')
         self.assertEqual(status, "cleared")
         self.assertIn('export PATH="$PATH:/opt/bin"', rest)
+
+
+class TestInstallingHooksOverAnotherSetup(unittest.TestCase):
+    """The requirement end to end: installing hooks clears the gateway we installed and
+    nothing else. Both halves matter — being too cautious would strand Claude Code on our
+    own leftovers."""
+
+    def _home(self, helper_body, rc_lines, api_key="unbound-key"):
+        home = Path(tempfile.mkdtemp())
+        (home / ".claude" / "hooks").mkdir(parents=True)
+        (home / ".claude" / "anthropic_key.sh").write_text(helper_body)
+        (home / ".bashrc").write_text(rc_lines)
+        (home / ".unbound").mkdir()
+        (home / ".unbound" / "config.json").write_text(json.dumps(
+            {"gateway_url": "https://api.getunbound.ai", "api_key": api_key}))
+        return home
+
+    def _run(self, home):
+        with patch.object(setup.Path, "home", staticmethod(lambda: home)), \
+             patch.object(setup, "get_shell_rc_file", lambda: home / ".bashrc"), \
+             patch.object(setup.platform, "system", lambda: "Darwin"):
+            ours = setup._gateway_env_is_ours()
+            if ours:
+                setup._remove_env_var_lines("ANTHROPIC_BASE_URL",
+                                            setup._is_unbound_base_url)
+            setup.remove_gateway_artifacts()
+            return ours
+
+    def test_somebody_elses_endpoint_survives(self):
+        home = self._home("echo $MY_COMPANY_KEY",
+                          'export ANTHROPIC_BASE_URL="https://llm.acme-corp.internal"\n')
+        self.assertFalse(self._run(home))
+        self.assertTrue((home / ".claude" / "anthropic_key.sh").exists())
+        self.assertIn("acme-corp", (home / ".bashrc").read_text())
+
+    def test_our_own_gateway_is_cleaned_up(self):
+        home = self._home("echo $UNBOUND_API_KEY",
+                          'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n'
+                          'export UNBOUND_API_KEY="unbound-key"\n')
+        self.assertTrue(self._run(home))
+        self.assertFalse((home / ".claude" / "anthropic_key.sh").exists())
+        self.assertNotIn("getunbound", (home / ".bashrc").read_text())
+
+    def test_both_endpoints_present_leaves_only_theirs(self):
+        # judging ownership from one collapsed value would answer "theirs" here and skip
+        # the whole cleanup, leaving our own export behind
+        home = self._home("echo $UNBOUND_API_KEY",
+                          'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n'
+                          'export ANTHROPIC_BASE_URL="https://llm.acme-corp.internal"\n'
+                          'export UNBOUND_API_KEY="unbound-key"\n')
+        self.assertTrue(self._run(home))
+        rc = (home / ".bashrc").read_text()
+        self.assertIn("acme-corp", rc)
+        self.assertNotIn("getunbound", rc)
+
+    def test_our_gateway_leftovers_go_even_after_the_key_rotated(self):
+        home = self._home("echo $UNBOUND_API_KEY",
+                          'export ANTHROPIC_BASE_URL="https://api.getunbound.ai"\n'
+                          'export UNBOUND_API_KEY="older-key"\n',
+                          api_key="newer-key")
+        self.assertTrue(self._run(home))
+        self.assertNotIn("getunbound", (home / ".bashrc").read_text())
 
 
 if __name__ == "__main__":

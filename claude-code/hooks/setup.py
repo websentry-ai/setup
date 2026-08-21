@@ -375,7 +375,7 @@ def _is_unbound_api_key(value, home_dir=None, username=None) -> bool:
     return isinstance(recorded, str) and recorded.strip() == value.strip()
 
 
-def _key_helper_file_is_ours(path) -> bool:
+def _key_helper_file_is_ours(path, username=None) -> bool:
     """Whether an anthropic_key.sh is one our setup wrote. Identified by the
     UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
     newline does not disown a real install."""
@@ -385,7 +385,7 @@ def _key_helper_file_is_ours(path) -> bool:
         return False
 
 
-def _is_unbound_key_helper(value, extra_paths=()) -> bool:
+def _is_unbound_key_helper(value, extra_paths=(), username=None) -> bool:
     """Whether apiKeyHelper points at a script our setup installs. Covers the per-user
     path and any managed path the caller names, since MDM writes the helper outside a
     home. The path is not enough on its own -- it is a name somebody could choose for
@@ -402,14 +402,14 @@ def _is_unbound_key_helper(value, extra_paths=()) -> bool:
     expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
     if not expanded.exists():
         return True  # a dangling pointer at one of our own paths is ours to clear
-    return _key_helper_file_is_ours(expanded)
+    return _key_helper_file_is_ours(expanded, username)
 
 
 def _reg_exe() -> str:
     """reg.exe by absolute path: an elevated run must not pick one up from PATH or the
     working directory."""
-    system_root = os.environ.get("SystemRoot", r"C:\Windows")
-    return str(Path(system_root) / "System32" / "reg.exe")
+    # Not from os.environ: an elevation can inherit a SystemRoot the caller chose.
+    return r"C:\Windows\System32\reg.exe"
 
 
 def _remove_env_var_lines(var_name: str, is_ours) -> str:
@@ -487,15 +487,13 @@ def _persisted_env_value(var_name: str):
 
 
 def _gateway_env_is_ours() -> bool:
-    """Whether the Anthropic environment on this device is the pair our gateway setup
-    wrote: our gateway URL alongside our API key. Either one belonging to somebody else
-    means the pair is theirs, and none of it is cleared."""
-    # UNBOUND_API_KEY is set by nothing but our own gateway setup, so its presence is the
-    # second signal. Comparing its value against the recorded key would instead break on
-    # rotation: a later run rewrites that record, and we would then refuse to clear our own
-    # stale gateway env, leaving Claude Code pointed at us with a dead credential.
-    return (_is_unbound_base_url(_persisted_env_value("ANTHROPIC_BASE_URL"))
-            and _persisted_env_value("UNBOUND_API_KEY") is not None)
+    """Whether our gateway setup wrote any of the Anthropic environment on this device.
+    UNBOUND_API_KEY is set by nothing else, so its presence is the signal. Comparing its
+    value against the recorded key would instead break on rotation: a later run rewrites
+    that record, and we would then refuse to clear our own stale gateway env, leaving
+    Claude Code pointed at us with a dead credential. Which ANTHROPIC_BASE_URL exports are
+    ours is decided one line at a time, so a customer's own endpoint stays."""
+    return _persisted_env_value("UNBOUND_API_KEY") is not None
 
 
 def remove_gateway_artifacts() -> None:
