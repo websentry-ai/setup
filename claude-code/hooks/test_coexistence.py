@@ -131,5 +131,42 @@ class TestGatewayArtifactRemoval(unittest.TestCase):
         self.assertFalse(helper.exists())
 
 
+class TestHelperIdentityUsesBothPathAndBody(unittest.TestCase):
+    """The path alone cannot decide: anthropic_key.sh is a name somebody could pick for
+    their own helper, which this setup now leaves in place."""
+
+    def _helper(self, body):
+        home = Path(tempfile.mkdtemp())
+        (home / ".claude").mkdir(parents=True)
+        path = home / ".claude" / "anthropic_key.sh"
+        if body is not None:
+            path.write_text(body)
+        return path
+
+    def test_a_foreign_helper_at_our_path_is_not_ours(self):
+        path = self._helper("echo $MY_COMPANY_KEY")
+        self.assertFalse(setup._is_unbound_key_helper(str(path)))
+
+    def test_our_helper_at_that_path_is_ours(self):
+        path = self._helper("echo $UNBOUND_API_KEY")
+        self.assertTrue(setup._is_unbound_key_helper(str(path)))
+
+    def test_a_shebang_does_not_disown_a_real_install(self):
+        path = self._helper("#!/bin/sh\necho $UNBOUND_API_KEY\n")
+        self.assertTrue(setup._is_unbound_key_helper(str(path)))
+
+    def test_a_dangling_pointer_at_our_path_is_ours_to_clear(self):
+        path = self._helper(None)
+        self.assertTrue(setup._is_unbound_key_helper(str(path)))
+
+    def test_an_install_under_another_home_still_counts(self):
+        self.assertTrue(
+            setup._is_unbound_key_helper("/Users/someone/.claude/anthropic_key.sh"))
+
+    def test_a_path_that_is_not_ours_at_all(self):
+        self.assertFalse(setup._is_unbound_key_helper("~/bin/my_own_key.sh"))
+        self.assertFalse(setup._is_unbound_key_helper("~/.claude/anthropic_key.sh.bak"))
+
+
 if __name__ == "__main__":
     unittest.main()

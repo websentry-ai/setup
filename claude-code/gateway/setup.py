@@ -296,15 +296,7 @@ def remove_hooks_unbound_script() -> None:
 
 
 UNBOUND_GATEWAY_HOST = "getunbound.ai"
-
-
-def _is_unbound_key_helper(value) -> bool:
-    """Whether apiKeyHelper points at the script this setup installs. One pointing
-    anywhere else belongs to whoever put it there and is left alone."""
-    if not isinstance(value, str):
-        return False
-    return value.strip() in {"~/.claude/anthropic_key.sh",
-                             str(Path.home() / ".claude" / "anthropic_key.sh")}
+UNBOUND_KEY_HELPER_TOKEN = "UNBOUND_API_KEY"
 
 
 def _url_host(value: str) -> str:
@@ -314,8 +306,8 @@ def _url_host(value: str) -> str:
 
 def _is_unbound_base_url(value) -> bool:
     """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
-    this device, or one on our own host, counts -- a customer pointing Claude Code at
-    their own endpoint keeps it."""
+    this device, or one on our own host, counts -- someone pointing Claude Code at their
+    own endpoint keeps it."""
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = value.strip().rstrip("/")
@@ -328,6 +320,33 @@ def _is_unbound_base_url(value) -> bool:
         pass
     host = _url_host(candidate)
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _key_helper_file_is_ours(path) -> bool:
+    """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
+    UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
+    newline does not disown a real install."""
+    try:
+        return UNBOUND_KEY_HELPER_TOKEN in Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _is_unbound_key_helper(value) -> bool:
+    """Whether apiKeyHelper points at the script our gateway setup installs. The path is
+    not enough on its own -- it is a name somebody could choose for their own helper -- so
+    where that file exists it must also read UNBOUND_API_KEY. Matched on the path's tail
+    so an install under another home still counts."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not (candidate == "~/.claude/anthropic_key.sh"
+            or candidate.endswith("/.claude/anthropic_key.sh")):
+        return False
+    expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
+    if not expanded.exists():
+        return True  # a dangling pointer at our own path is ours to clear
+    return _key_helper_file_is_ours(expanded)
 
 
 def _persisted_env_value(var_name: str):
@@ -542,7 +561,6 @@ def run_one_shot_callback_server(frontend_url: str) -> Optional[Dict[str, any]]:
     except Exception as e:
         print(f"❌ Failed to run callback server: {e}")
         return None
-
 
 
 def _clear_path(path: Path, label: str) -> str:

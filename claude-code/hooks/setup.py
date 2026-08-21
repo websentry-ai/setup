@@ -309,29 +309,14 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
         return False
 
 
-UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
-UNBOUND_GATEWAY_HOST = "getunbound.ai"
-
-
 def _unbound_key_helper_paths():
     """The apiKeyHelper values our gateway setup writes, in both spellings it uses."""
     expanded = Path.home() / ".claude" / "anthropic_key.sh"
     return {"~/.claude/anthropic_key.sh", str(expanded)}
 
 
-def _is_unbound_key_helper(value) -> bool:
-    """Whether apiKeyHelper points at the script our gateway setup installs. A helper
-    pointing anywhere else belongs to whoever put it there and is left alone."""
-    return isinstance(value, str) and value.strip() in _unbound_key_helper_paths()
-
-
-def _key_helper_file_is_ours(path: Path) -> bool:
-    """Whether ~/.claude/anthropic_key.sh is the one our gateway setup wrote. Checked by
-    content: the path is a name a user could also have chosen for their own helper."""
-    try:
-        return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
-    except OSError:
-        return False
+UNBOUND_GATEWAY_HOST = "getunbound.ai"
+UNBOUND_KEY_HELPER_TOKEN = "UNBOUND_API_KEY"
 
 
 def _url_host(value: str) -> str:
@@ -340,21 +325,48 @@ def _url_host(value: str) -> str:
 
 
 def _is_unbound_base_url(value) -> bool:
-    """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL we recorded
-    for this device, or one on our own host, counts as ours -- a customer pointing Claude
-    Code at their own endpoint keeps it."""
+    """Whether ANTHROPIC_BASE_URL points at the Unbound gateway. Only a URL recorded for
+    this device, or one on our own host, counts -- someone pointing Claude Code at their
+    own endpoint keeps it."""
     if not isinstance(value, str) or not value.strip():
         return False
     candidate = value.strip().rstrip("/")
     try:
-        config_path = Path.home() / ".unbound" / "config.json"
-        recorded = (json.loads(config_path.read_text(encoding="utf-8")) or {}).get("gateway_url")
+        recorded = (json.loads((Path.home() / ".unbound" / "config.json")
+                               .read_text(encoding="utf-8")) or {}).get("gateway_url")
         if isinstance(recorded, str) and recorded.strip().rstrip("/") == candidate:
             return True
     except (OSError, ValueError):
         pass
     host = _url_host(candidate)
     return host == UNBOUND_GATEWAY_HOST or host.endswith("." + UNBOUND_GATEWAY_HOST)
+
+
+def _key_helper_file_is_ours(path) -> bool:
+    """Whether an anthropic_key.sh is the one our gateway setup wrote. Identified by the
+    UNBOUND_API_KEY it echoes rather than by the whole body, so a shebang or a trailing
+    newline does not disown a real install."""
+    try:
+        return UNBOUND_KEY_HELPER_TOKEN in Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return False
+
+
+def _is_unbound_key_helper(value) -> bool:
+    """Whether apiKeyHelper points at the script our gateway setup installs. The path is
+    not enough on its own -- it is a name somebody could choose for their own helper -- so
+    where that file exists it must also read UNBOUND_API_KEY. Matched on the path's tail
+    so an install under another home still counts."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if not (candidate == "~/.claude/anthropic_key.sh"
+            or candidate.endswith("/.claude/anthropic_key.sh")):
+        return False
+    expanded = Path(str(Path.home()) + candidate[1:]) if candidate.startswith("~") else Path(candidate)
+    if not expanded.exists():
+        return True  # a dangling pointer at our own path is ours to clear
+    return _key_helper_file_is_ours(expanded)
 
 
 def _persisted_env_value(var_name: str):
@@ -698,7 +710,6 @@ def remove_hooks_from_settings() -> str:
     except Exception as e:
         print(f"Failed to update settings.json: {e}")
         return "failed"
-
 
 
 def _clear_path(path: Path, label: str) -> str:
