@@ -507,13 +507,37 @@ def _recorded_gateway_url_for_user(username, home_dir) -> str:
         try:
             fd = os.open(str(config_file), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
             with os.fdopen(fd, 'r', encoding='utf-8') as handle:
-                recorded = json.loads(handle.read()).get("gateway_url")
+                config = json.loads(handle.read())
         except (OSError, ValueError):
             return ""
+        # A config that is not an object has no gateway to report; .get would raise, and
+        # this runs on the install path where anything raising aborts the setup.
+        if not isinstance(config, dict):
+            return ""
+        recorded = config.get("gateway_url")
         return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
 
     result = _run_as_user(username, _read) if username else _read()
     return result or ""
+
+
+def _recorded_managed_gateway_url() -> str:
+    """The gateway URL recorded in the drop-in this setup writes. Device-level state we
+    own outright -- nothing else writes that file -- so unlike a per-account record it can
+    authorise removing the machine-wide route, which matters on a Windows device that has
+    no user profiles to read."""
+    try:
+        path = get_managed_settings_dir() / "managed-settings.d" / "unbound.json"
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+            settings = json.loads(handle.read())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(settings, dict):
+        return ""
+    env = settings.get("env")
+    recorded = env.get("ANTHROPIC_BASE_URL") if isinstance(env, dict) else None
+    return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
 
 
 def _unbound_base_url_matcher(username, home_dir):
@@ -521,12 +545,18 @@ def _unbound_base_url_matcher(username, home_dir):
     here rather than inside the predicate: the removal runs under a privilege drop, and a
     second drop nested in the first cannot call setgroups."""
     recorded = _recorded_gateway_url_for_user(username, home_dir)
+    # Read before the managed settings are cleared: teardown sweeps the environment first,
+    # and afterwards the drop-in holding this record is gone.
+    managed = _recorded_managed_gateway_url()
 
     def _matches(value):
         if _is_unbound_base_url(value):
             return True
-        return (bool(recorded) and isinstance(value, str)
-                and value.strip().rstrip("/") == recorded)
+        if not isinstance(value, str):
+            return False
+        candidate = value.strip().rstrip("/")
+        return ((bool(recorded) and candidate == recorded)
+                or (bool(managed) and candidate == managed))
 
     return _matches
 

@@ -207,9 +207,14 @@ def _recorded_gateway_url() -> str:
     can authorise removing their own export and nothing else."""
     try:
         text = (Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8")
-        recorded = json.loads(text).get("gateway_url")
+        config = json.loads(text)
     except (OSError, ValueError):
         return ""
+    # A config that is not an object has no gateway to report; .get would raise, and this
+    # runs on the install path where anything raising aborts the setup.
+    if not isinstance(config, dict):
+        return ""
+    recorded = config.get("gateway_url")
     return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
 
 

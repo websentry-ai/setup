@@ -120,6 +120,41 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
             self.assertTrue(matcher(OURS), mod.__name__)
             self.assertFalse(matcher(THEIRS), mod.__name__)
 
+    def test_the_machine_wide_route_is_recognised_from_our_own_drop_in(self):
+        # a Windows MDM device with no user profiles has no per-account record; the
+        # drop-in this setup writes is device-level state nothing else writes
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.d").mkdir(parents=True)
+        (managed / "managed-settings.d" / "unbound.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": self.CUSTOM, "ANTHROPIC_AUTH_TOKEN": "t"}}))
+        for mod in MDM:
+            with patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                matcher = mod._unbound_base_url_matcher(None, None)
+            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+            self.assertTrue(matcher(OURS), mod.__name__)
+            self.assertFalse(matcher(THEIRS), mod.__name__)
+
+    def test_no_drop_in_leaves_the_default_gateway_only(self):
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            with patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                matcher = mod._unbound_base_url_matcher(None, None)
+            self.assertTrue(matcher(OURS), mod.__name__)
+            self.assertFalse(matcher(self.CUSTOM), mod.__name__)
+
+    def test_a_malformed_drop_in_does_not_raise(self):
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.d").mkdir(parents=True)
+        target = managed / "managed-settings.d" / "unbound.json"
+        for junk in ("[]", "not json", "", "null", '{"env": 5}', '{"env": {}}',
+                     '{"env": {"ANTHROPIC_BASE_URL": 5}}'):
+            target.write_text(junk)
+            for mod in MDM:
+                with patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                    matcher = mod._unbound_base_url_matcher(None, None)
+                self.assertTrue(matcher(OURS), "%s %r" % (mod.__name__, junk))
+                self.assertFalse(matcher(self.CUSTOM), "%s %r" % (mod.__name__, junk))
+
     def test_mdm_matches_it_for_that_user(self):
         home = self._home(self.CUSTOM)
         for mod in MDM:
@@ -148,6 +183,50 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
             GATEWAY_MDM.clear_managed_settings()
         env = json.loads((managed / "managed-settings.json").read_text())["env"]
         self.assertEqual(env, {"ANTHROPIC_BASE_URL": self.CUSTOM})
+
+
+class TestTheOwnershipCheckNeverRaises(unittest.TestCase):
+    """This runs on the install path, where anything that raises aborts the setup. A
+    config that is not a JSON object is the case that bites: .get() on a list raises
+    AttributeError, which is neither OSError nor ValueError."""
+
+    MALFORMED = ['{"gateway_url": null}', '{"gateway_url": 5}', '{"gateway_url": ""}',
+                 '{"gateway_url": "  "}', '{}', 'not json', '', '[]', '[1,2,3]',
+                 '"a string"', '123', 'null', 'true']
+    HOSTILE = [None, "", " ", "/", "https://", 5, [], {}, "\x00", "a" * 10000,
+               "https://evil.com#api.getunbound.ai"]
+
+    def test_user_level_survives_any_config_and_any_value(self):
+        for cfg in self.MALFORMED:
+            home = Path(tempfile.mkdtemp())
+            (home / ".unbound").mkdir()
+            (home / ".unbound" / "config.json").write_text(cfg)
+            for mod in USER_LEVEL:
+                with patch.object(mod.Path, "home", staticmethod(lambda h=home: h)):
+                    for value in self.HOSTILE:
+                        self.assertFalse(mod._is_unbound_base_url(value),
+                                         "%s %r %r" % (mod.__name__, cfg, value))
+
+    def test_mdm_survives_any_config_and_any_value(self):
+        for cfg in self.MALFORMED:
+            home = Path(tempfile.mkdtemp())
+            (home / ".unbound").mkdir()
+            (home / ".unbound" / "config.json").write_text(cfg)
+            for mod in MDM:
+                with patch.object(mod, "_run_as_user",
+                                  lambda _u, fn, *a, **k: fn(*a, **k)):
+                    matcher = mod._unbound_base_url_matcher("alice", home)
+                for value in self.HOSTILE:
+                    self.assertFalse(matcher(value),
+                                     "%s %r %r" % (mod.__name__, cfg, value))
+
+    def test_a_malformed_config_still_leaves_the_default_recognised(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".unbound").mkdir()
+        (home / ".unbound" / "config.json").write_text("[1,2,3]")
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                self.assertTrue(mod._is_unbound_base_url(OURS), mod.__name__)
 
 
 class TestEnvRemovalKeepsTheirs(unittest.TestCase):
