@@ -689,7 +689,9 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                         # Typing while Claude is working enqueues the prompt and consumes it
                         # into the running turn; it never becomes a user message and never
                         # fires UserPromptSubmit, so this record is the only trace of it.
-                        if entry.get('operation') != 'enqueue':
+                        # 'remove' is the consumption: a prompt taken back out for editing
+                        # leaves through 'popAll' and never ran, so it is not this turn's.
+                        if entry.get('operation') != 'remove':
                             continue
                         if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
                             continue

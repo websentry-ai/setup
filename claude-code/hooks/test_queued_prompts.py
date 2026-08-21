@@ -189,7 +189,7 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
                 f.write(_json.dumps(entry) + "\n")
         return str(path)
 
-    def test_an_enqueued_prompt_joins_the_turn(self):
+    def test_a_consumed_prompt_joins_the_turn(self):
         path = self._transcript([
             {"type": "queue-operation", "operation": "enqueue",
              "timestamp": SECOND_PROMPT, "content": "queued question"},
@@ -199,19 +199,41 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
         data = unbound.parse_transcript_file(path, FIRST_PROMPT)
         self.assertEqual(data["queued_prompts"], ["queued question"])
 
-    def test_only_enqueue_is_taken(self):
+    def test_a_prompt_taken_back_for_editing_never_ran(self):
+        # pulling a queued prompt back out to edit it leaves through popAll
         path = self._transcript([
-            {"type": "queue-operation", "operation": "remove",
-             "timestamp": SECOND_PROMPT, "content": "queued question"},
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": SECOND_PROMPT, "content": "never sent"},
+            {"type": "queue-operation", "operation": "popAll",
+             "timestamp": FIRST_STOP, "content": "never sent"},
+        ])
+        data = unbound.parse_transcript_file(path, FIRST_PROMPT)
+        self.assertEqual(data["queued_prompts"], [])
+
+    def test_an_interrupted_queue_drain_is_not_this_turns(self):
+        # interrupting drains the queue as a contentless dequeue
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": SECOND_PROMPT, "content": "interrupted"},
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": FIRST_STOP, "content": ""},
+        ])
+        data = unbound.parse_transcript_file(path, FIRST_PROMPT)
+        self.assertEqual(data["queued_prompts"], [])
+
+    def test_enqueue_alone_is_not_enough(self):
+        path = self._transcript([
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": SECOND_PROMPT, "content": "still queued"},
         ])
         data = unbound.parse_transcript_file(path, FIRST_PROMPT)
         self.assertEqual(data["queued_prompts"], [])
 
     def test_a_queue_outside_the_turn_is_ignored(self):
         path = self._transcript([
-            {"type": "queue-operation", "operation": "enqueue",
+            {"type": "queue-operation", "operation": "remove",
              "timestamp": "2026-08-20T09:00:00Z", "content": "earlier turn"},
-            {"type": "queue-operation", "operation": "enqueue",
+            {"type": "queue-operation", "operation": "remove",
              "timestamp": "2026-08-20T11:00:00Z", "content": "later turn"},
         ])
         data = unbound.parse_transcript_file(path, FIRST_PROMPT,

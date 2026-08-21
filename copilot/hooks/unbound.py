@@ -619,9 +619,9 @@ def get_forwarded_state(session_id):
     the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
     the integrity backstop. Keyed on bare ids only for that reason (never trusted for
     enforcement)."""
-    sent, last_sig = set(), None
+    sent, last_sig, prompted = set(), None, set()
     if not session_id:
-        return sent, last_sig
+        return sent, last_sig, prompted
     for log in load_existing_logs():
         event = log.get('event', {})
         if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
@@ -634,10 +634,13 @@ def get_forwarded_state(session_id):
         sig = event.get('text_sig')
         if sig:
             last_sig = sig
-    return sent, last_sig
+        prompt_ids = event.get('forwarded_prompt_ids')
+        if isinstance(prompt_ids, list):
+            prompted.update(prompt_ids)
+    return sent, last_sig, prompted
 
 
-def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -647,6 +650,7 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
     if not session_id:
         return
     merged = set(tool_ids or ())
+    merged_prompts = set(prompt_ids or ())
     kept = []
     for log in load_existing_logs():
         ev = log.get('event', {})
@@ -655,6 +659,9 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None):
             ids = ev.get('forwarded_tool_ids')
             if isinstance(ids, list):
                 merged.update(ids)
+            old_prompts = ev.get('forwarded_prompt_ids')
+            if isinstance(old_prompts, list):
+                merged_prompts.update(old_prompts)
             if text_sig is None:
                 text_sig = ev.get('text_sig')  # carry forward the last known text sig
             continue  # drop the old marker; a fresh consolidated one is appended below
@@ -2349,7 +2356,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
 
 
 def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None,
-                                   cwd=None, already_forwarded=None):
+                                   cwd=None, already_forwarded=None, already_prompted=None):
     """Parse a Copilot JSONL transcript into a cursor-style LLM exchange.
 
     `cwd` (the hook event's working directory) seeds shell-dir tracking for
@@ -2365,8 +2372,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     toolCallIds included this time and text_sig fingerprints the turn's text — the caller
     records them only after a successful send, so a failed send simply retries."""
     already_forwarded = already_forwarded or set()
+    already_prompted = already_prompted or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None, set(), None
+        return None, set(), None, set()
 
     entries = []
     try:
@@ -2380,7 +2388,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None, set(), None
+        return None, set(), None, set()
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -2392,9 +2400,11 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     model = None
     turn_start_index = -1
     turn_prompts = []
-    # A prompt only opens a turn when the previous one has been answered; typing while
-    # Copilot is still working appends to the running turn instead.
-    turn_answered = True
+    turn_prompt_ids = set()
+    # The turn is every prompt not yet reported. Position in the transcript cannot decide
+    # this: a prompt typed mid-turn lands inside the open agent turn in the CLI and outside
+    # it in VS Code, and Copilot narrates progress as assistant text, so neither the agent
+    # turn nor the assistant messages mark a boundary.
 
     for i, entry in enumerate(entries):
         if not isinstance(entry, dict):
@@ -2410,18 +2420,19 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             if new_model:
                 model = new_model
         elif entry_type == 'user.message':
-            if turn_answered:
+            message_id = entry.get('id') or ''
+            if message_id and message_id in already_prompted:
+                continue
+            if turn_start_index < 0:
                 turn_start_index = i
-                turn_prompts = []
-                turn_answered = False
             content = data.get('content')
             if content:
                 turn_prompts.append(content)
-        elif entry_type == 'assistant.message' and (data.get('content') or '').strip():
-            turn_answered = True
+            if message_id:
+                turn_prompt_ids.add(message_id)
 
     if turn_start_index < 0:
-        return None, set(), None
+        return None, set(), None, set()
 
     # One message, not one per prompt: the backend keeps only the last user message.
     user_prompt = '\n\n'.join(turn_prompts) or None
@@ -2560,7 +2571,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None, set(), None
+        return None, set(), None, set()
 
     return {
         'conversation_id': conversation_id,
@@ -2570,7 +2581,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-    }, forwarded_now, text_sig
+    }, forwarded_now, text_sig, turn_prompt_ids
 
 
 def send_to_api(exchange, api_key):
@@ -2936,12 +2947,13 @@ def main():
             # Watermark key mirrors the exchange's session fallback, so get/record stay
             # consistent even when the Stop payload omits session_id.
             wm_key = stop_session_key(event)
-            already_forwarded, last_text_sig = get_forwarded_state(wm_key)
-            exchange, forwarded_now, text_sig = build_exchange_from_transcript(
+            already_forwarded, last_text_sig, already_prompted = get_forwarded_state(wm_key)
+            exchange, forwarded_now, text_sig, prompts_now = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
                 cwd=event.get('cwd'),
                 already_forwarded=already_forwarded,
+                already_prompted=already_prompted,
             )
             # Send only when there is something new -- new tool calls OR new assistant
             # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
@@ -2956,7 +2968,7 @@ def main():
                 # (the backend dedups). Updates the text signature too, even with no new
                 # tools, so an unchanged later Stop becomes a no-op.
                 if send_to_api(exchange, api_key):
-                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig)
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
