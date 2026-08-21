@@ -571,10 +571,14 @@ def _subagent_dir(transcript_path: str) -> Optional[str]:
     return None
 
 
-def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
+def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict,
+                         subagent_floor: Optional[str] = None) -> None:
     """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to a
     subagents/ dir, never the main transcript the Stop event points at, so their tokens
-    would otherwise be dropped. Same per-turn scope + dedup."""
+    would otherwise be dropped. Scoped from the previous Stop rather than this turn's
+    prompt: a subagent outlives the turn that launched it, and what it spends between the
+    two belongs to neither turn under a prompt-anchored floor."""
+    floor = subagent_floor or user_prompt_timestamp
     try:
         subdir = _subagent_dir(transcript_path)
         names = []
@@ -600,7 +604,7 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                         continue
                     ts = entry.get('timestamp')
                     # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
-                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, ts):
+                    if floor and not _ts_lt(floor, ts):
                         continue
                     _record_usage(entry, entry.get('message') or {}, usage_by_key)
         except Exception as e:
@@ -630,7 +634,8 @@ def _typed_user_text(entry: Dict) -> str:
     return ''
 
 
-def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None, include_usage: bool = True) -> Dict:
+def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
+                          include_usage: bool = True, subagent_floor: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
         'assistant_messages': [],
@@ -698,7 +703,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
     if include_usage:
         try:
-            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key)
+            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor)
             for msg_usage, _ in usage_by_key.values():
                 for k in usage:
                     usage[k] += _usage_value(msg_usage, k)
@@ -3775,6 +3780,7 @@ def process_stop_event(event: Dict, api_key: str):
     current_conversation_started = False
     user_prompt_timestamp = None
     stop_timestamp = None
+    previous_stop = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -3789,13 +3795,17 @@ def process_stop_event(event: Dict, api_key: str):
             elif current_conversation_started:
                 session_events.append(log)
                 if event_name == 'Stop':
+                    # This Stop is already logged, so the one before it marks how far the last
+                    # upload reported; subagent work landing between the two is this turn's.
+                    previous_stop = stop_timestamp
                     stop_timestamp = log.get('timestamp')
 
     transcript_assistant_messages = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
-        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
+        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
+                                                subagent_floor=previous_stop)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
