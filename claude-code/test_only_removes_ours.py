@@ -230,6 +230,31 @@ class TestTheSettingIsJudgedByTheScriptItNames(unittest.TestCase):
                 str(managed / "acme_key.sh"), managed))
 
 
+class TestTheInstallOrderHoldsTheSettingCheckUp(unittest.TestCase):
+    """The install removes our helper file first, then strips the setting. The strip
+    reads "nothing there" as our own removal having just run, so reordering the two would
+    start deleting a dangling setting that belongs to somebody else."""
+
+    def _install(self, body):
+        home = Path(tempfile.mkdtemp())
+        (home / ".claude").mkdir()
+        (home / ".claude" / "anthropic_key.sh").write_text(body)
+        with patch.object(HOOKS.Path, "home", staticmethod(lambda: home)):
+            HOOKS.remove_gateway_artifacts()
+            ours = HOOKS._is_unbound_key_helper_setting("~/.claude/anthropic_key.sh")
+        return (home / ".claude" / "anthropic_key.sh").exists(), ours
+
+    def test_our_helper_leaves_and_the_setting_follows_it(self):
+        exists, setting_is_ours = self._install(OUR_HELPER)
+        self.assertFalse(exists)
+        self.assertTrue(setting_is_ours)
+
+    def test_their_helper_stays_and_so_does_the_setting(self):
+        exists, setting_is_ours = self._install("aws bedrock get-token --profile prod")
+        self.assertTrue(exists)
+        self.assertFalse(setting_is_ours)
+
+
 class TestBodyCheckFailsOpen(unittest.TestCase):
     """A helper we cannot decode is not ours, and must not raise -- setup sits between
     the user and their editor."""
@@ -255,18 +280,51 @@ class TestGatewayInstallKeepsTheirHooks(unittest.TestCase):
               "hooks": [{"type": "command", "command": "/usr/local/bin/audit.sh"}]}
 
     @staticmethod
-    def _ours(command="~/.claude/hooks/unbound.py"):
+    def _ours(command):
         return {"matcher": "*", "hooks": [{"type": "command", "command": command}]}
 
+    def setUp(self):
+        self.home = Path(tempfile.mkdtemp())
+        self.our_cmd = str(self.home / ".claude" / "hooks" / "unbound.py")
+        patcher = patch.object(GATEWAY.Path, "home", staticmethod(lambda: self.home))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_their_hook_survives_and_ours_goes(self):
-        settings = {"hooks": {"PreToolUse": [self.THEIRS, self._ours()]}}
+        settings = {"hooks": {"PreToolUse": [self.THEIRS, self._ours(self.our_cmd)]}}
         GATEWAY._strip_unbound_hooks(settings)
         self.assertEqual(settings["hooks"], {"PreToolUse": [self.THEIRS]})
 
     def test_the_block_goes_when_only_ours_was_there(self):
-        settings = {"hooks": {"PreToolUse": [self._ours()], "Stop": [self._ours()]}}
+        settings = {"hooks": {"PreToolUse": [self._ours(self.our_cmd)],
+                              "Stop": [self._ours(self.our_cmd)]}}
         GATEWAY._strip_unbound_hooks(settings)
         self.assertNotIn("hooks", settings)
+
+    def test_the_launcher_form_the_windows_installer_writes_is_ours(self):
+        # Windows registers `py -3 "<path>"`. The launcher and its flags are stripped and
+        # the path compared through os.path.normcase/normpath, which is what makes the
+        # separators that platform writes match; a substring match would not.
+        cmd = 'py -3 "%s"' % self.our_cmd
+        settings = {"hooks": {"Stop": [self._ours(cmd)]}}
+        GATEWAY._strip_unbound_hooks(settings)
+        self.assertNotIn("hooks", settings)
+
+    def test_a_python_launcher_without_flags_is_ours(self):
+        home = Path(tempfile.mkdtemp())
+        cmd = 'python3 "%s"' % (home / ".claude" / "hooks" / "unbound.py")
+        with patch.object(GATEWAY.Path, "home", staticmethod(lambda: home)):
+            settings = {"hooks": {"Stop": [self._ours(cmd)]}}
+            GATEWAY._strip_unbound_hooks(settings)
+        self.assertNotIn("hooks", settings)
+
+    def test_a_foreign_script_merely_named_unbound_is_not_ours(self):
+        home = Path(tempfile.mkdtemp())
+        cmd = 'python3 /opt/acme/unbound.py'
+        with patch.object(GATEWAY.Path, "home", staticmethod(lambda: home)):
+            settings = {"hooks": {"Stop": [self._ours(cmd)]}}
+            GATEWAY._strip_unbound_hooks(settings)
+        self.assertIn("hooks", settings)
 
     def test_the_binary_form_is_ours_too(self):
         settings = {"hooks": {"Stop": [

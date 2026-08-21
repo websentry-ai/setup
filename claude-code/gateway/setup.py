@@ -4,6 +4,7 @@ Claude Code - Environment Setup Script
 """
 
 import os
+import shlex
 import sys
 import platform
 import subprocess
@@ -202,7 +203,13 @@ UNBOUND_KEY_HELPER_SETTING = "~/.claude/anthropic_key.sh"
 
 def _is_unbound_base_url(value) -> bool:
     """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
-    the customer's own endpoint and is left alone."""
+    the customer's own endpoint and is left alone.
+
+    The default gateway only. A URL supplied through --gateway-url is not recognised
+    here and is therefore left in place: guessing wrong removes an endpoint the customer
+    configured, which is the failure this check exists to prevent. Managed settings do
+    not depend on this -- the drop-in written by this setup is identified by being that
+    file, not by the value inside it."""
     return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
 
 
@@ -210,13 +217,41 @@ def _export_value(line: str, prefix: str) -> str:
     return line.strip()[len(prefix):].strip().strip('"').strip("'")
 
 
-def _is_unbound_hook_command(command) -> bool:
-    """Whether a settings.json hook entry runs the Unbound hook, as either the downloaded
-    script or the installed binary."""
-    if not isinstance(command, str):
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
         return False
-    return ("/.claude/hooks/unbound.py" in command
-            or ("/opt/unbound/" in command and "unbound-hook" in command))
+    # Binary install: command invokes the /opt/unbound hook binary (require both
+    # the prefix and the binary name so a foreign hook merely mentioning the path
+    # isn't matched). Mirrors the managed _is_unbound_hook_command matcher.
+    if "/opt/unbound/" in command and "unbound-hook" in command:
+        return True
+    try:
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t.strip().strip('"').strip("'") for t in tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
+
+
+def _is_unbound_hook_command(command) -> bool:
+    """Whether a settings.json hook entry runs the Unbound hook. The hooks installer
+    writes the interpreter, quoting and separators of the platform it ran on, so the
+    command is tokenised and the path compared rather than matched as a substring."""
+    return isinstance(command, str) and _command_targets_hook(
+        command, Path.home() / ".claude" / "hooks" / "unbound.py")
 
 
 def _strip_unbound_hooks(settings: dict) -> None:

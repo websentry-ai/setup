@@ -160,7 +160,13 @@ UNBOUND_KEY_HELPER_SETTING = "~/.claude/anthropic_key.sh"
 
 def _is_unbound_base_url(value) -> bool:
     """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
-    the customer's own endpoint and is left alone."""
+    the customer's own endpoint and is left alone.
+
+    The default gateway only. A URL supplied through --gateway-url is not recognised
+    here and is therefore left in place: guessing wrong removes an endpoint the customer
+    configured, which is the failure this check exists to prevent. Managed settings do
+    not depend on this -- the drop-in written by this setup is identified by being that
+    file, not by the value inside it."""
     return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
 
 
