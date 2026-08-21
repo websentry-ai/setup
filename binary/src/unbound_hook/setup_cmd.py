@@ -40,7 +40,7 @@ USAGE = (
     "Usage: unbound-hook setup --api-key <admin_key> [--discovery-key <key>]\n"
     "           [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]\n"
     "           [--app_name <name>] [--backfill] [--tools t1,t2,...]\n"
-    "           [--skip-managed-settings]\n"
+    "           [--skip-managed-settings]   # claude-code only\n"
 )
 
 
@@ -74,6 +74,8 @@ def _parse_args(argv):
         elif a == "--backfill":
             opts["backfill"] = True; i += 1
         elif a == "--skip-managed-settings":
+            # Read by the claude-code adapter alone; the other tools' managed
+            # configs are unrelated to the Claude Code remote policy.
             opts["skip_managed_settings"] = True; i += 1
         elif a == "--tools" and i + 1 < len(argv):
             opts["tools"] = [t.strip() for t in argv[i + 1].split(",") if t.strip()]
