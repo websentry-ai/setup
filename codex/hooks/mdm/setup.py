@@ -1191,14 +1191,37 @@ def clear_managed_hooks() -> str:
 _HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
 
 
+# A table header may carry a trailing comment, so an exact string match would walk past
+# [features] and both strip the wrong lines and append a duplicate table.
+_FEATURES_HEADER_RE = re.compile(r'^\[features\]\s*(#.*)?$')
+
+
+def _is_features_header(stripped) -> bool:
+    return bool(_FEATURES_HEADER_RE.match(stripped))
+
+
+def _features_hooks_flags(lines):
+    """The hooks feature flag lines present inside [features], in either spelling. Scoped to
+    that table: a hooks key in some other table is not this flag and must not be read as one."""
+    found, in_features = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_features = _is_features_header(stripped)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            found.append(stripped)
+    return found
+
+
 def _strip_hooks_flags(lines):
-    """Drop the hooks feature flag from [features], in either spelling. Anchored and scoped to
-    that table so [hooks.state] and its entries are left alone."""
+    """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
+    and scoped to that table so [hooks.state] and its entries are left alone."""
     out, in_features = [], False
     for line in lines:
         stripped = line.strip()
         if stripped.startswith('['):
-            in_features = stripped == '[features]'
+            in_features = _is_features_header(stripped)
             out.append(line)
             continue
         if in_features and _HOOKS_FLAG_RE.match(stripped):
@@ -1218,15 +1241,14 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if config_path.exists():
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-        # Strip first, then decide. This runs from a daily cron, so a machine still carrying
-        # the old spelling has to be migrated on the next run rather than skipped for already
-        # having the new one alongside it.
-        cleaned = _strip_hooks_flags(lines)
-        if len(lines) - len(cleaned) == 1 and any(l.strip() == 'hooks = true' for l in lines):
+        # This runs from a daily cron, so a machine still carrying the old spelling has to be
+        # migrated rather than skipped for having the new one alongside it. The check is scoped
+        # to [features]: a hooks key in another table is an unrelated setting.
+        if _features_hooks_flags(lines) == ['hooks = true']:
             return False  # already exactly right
 
-        lines = cleaned
-        features_idx = next((i for i, l in enumerate(lines) if l.strip() == '[features]'), None)
+        lines = _strip_hooks_flags(lines)
+        features_idx = next((i for i, l in enumerate(lines) if _is_features_header(l.strip())), None)
         if features_idx is not None:
             lines.insert(features_idx + 1, 'hooks = true\n')
         else:
@@ -1256,8 +1278,12 @@ def _hooks_still_registered(hooks_path) -> bool:
     try:
         with open(hooks_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return False
+    except (OSError, ValueError):
+        # Unreadable or malformed: assume a hook may be registered. Keeping the flag set
+        # costs nothing, whereas clearing it on a bad read disables whatever the user runs.
+        return True
     events = config.get('hooks')
     if not isinstance(events, dict):
         return False
@@ -1269,7 +1295,7 @@ def _hooks_still_registered(hooks_path) -> bool:
 
 
 def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
-    """Remove only the codex_hooks line from user's ~/.codex/config.toml.
+    """Remove the hooks feature flag, in either spelling, from user's ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
     config_path = home_dir / ".codex" / "config.toml"
     if not config_path.exists():
@@ -1291,7 +1317,7 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         return True
 
     if _run_as_user(username, _disable):
-        debug_print(f"Removed codex_hooks feature for {username}")
+        debug_print(f"Removed hooks feature flag for {username}")
 
 
 def clear_setup() -> bool:
@@ -1328,6 +1354,11 @@ def clear_setup() -> bool:
                 failed += 1
             # Per-user codex config — skip when falling through on Windows.
             if home_dir is not None:
+                # Setup registers our hook in the user's own hooks.json, so uninstall has to
+                # take it out there too; leaving it points a live entry at a deleted script.
+                # It also has to happen before the flag is cleared, since the flag is kept
+                # whenever a hook is still registered.
+                remove_user_level_hooks_for_user(username, home_dir)
                 disable_codex_hooks_feature_for_user(username, home_dir)
 
         if cleared:

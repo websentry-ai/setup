@@ -525,14 +525,23 @@ def remove_hooks_from_codex_config() -> None:
 _HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
 
 
+# A table header may carry a trailing comment, so an exact string match would walk past
+# [features] and both strip the wrong lines and append a duplicate table.
+_FEATURES_HEADER_RE = re.compile(r'^\[features\]\s*(#.*)?$')
+
+
+def _is_features_header(stripped) -> bool:
+    return bool(_FEATURES_HEADER_RE.match(stripped))
+
+
 def _strip_hooks_flags(lines):
-    """Drop the hooks feature flag from [features], in either spelling. Anchored and scoped to
-    that table so [hooks.state] and its entries are left alone."""
+    """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
+    and scoped to that table so [hooks.state] and its entries are left alone."""
     out, in_features = [], False
     for line in lines:
         stripped = line.strip()
         if stripped.startswith('['):
-            in_features = stripped == '[features]'
+            in_features = _is_features_header(stripped)
             out.append(line)
             continue
         if in_features and _HOOKS_FLAG_RE.match(stripped):
@@ -548,8 +557,12 @@ def _hooks_still_registered(hooks_path) -> bool:
     try:
         with open(hooks_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return False
+    except (OSError, ValueError):
+        # Unreadable or malformed: assume a hook may be registered. Keeping the flag set
+        # costs nothing, whereas clearing it on a bad read disables whatever the user runs.
+        return True
     events = config.get('hooks')
     if not isinstance(events, dict):
         return False
@@ -579,9 +592,9 @@ def disable_codex_hooks_feature() -> None:
         if len(new_lines) != len(lines):
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
-            debug_print("Removed codex_hooks feature flag from config.toml")
+            debug_print("Removed hooks feature flag from config.toml")
     except Exception as e:
-        debug_print(f"Failed to remove codex_hooks feature: {e}")
+        debug_print(f"Failed to remove hooks feature flag: {e}")
 
 
 def get_device_identifier() -> Optional[str]:

@@ -589,8 +589,12 @@ def _hooks_still_registered(hooks_path) -> bool:
     try:
         with open(hooks_path, 'r', encoding='utf-8') as f:
             config = json.load(f)
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return False
+    except (OSError, ValueError):
+        # Unreadable or malformed: assume a hook may be registered. Keeping the flag set
+        # costs nothing, whereas clearing it on a bad read disables whatever the user runs.
+        return True
     events = config.get('hooks')
     if not isinstance(events, dict):
         return False
@@ -602,7 +606,7 @@ def _hooks_still_registered(hooks_path) -> bool:
 
 
 def disable_codex_hooks_feature_status() -> str:
-    """Remove the codex_hooks line from ~/.codex/config.toml.
+    """Remove the hooks feature flag, in either spelling, from ~/.codex/config.toml.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -620,10 +624,10 @@ def disable_codex_hooks_feature_status() -> str:
             return "not_found"
         with open(config_path, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
-        debug_print("Removed codex_hooks feature flag from config.toml")
+        debug_print("Removed hooks feature flag from config.toml")
         return "cleared"
     except Exception as e:
-        print(f"Failed to remove codex_hooks feature: {e}")
+        print(f"Failed to remove hooks feature flag: {e}")
         return "failed"
 
 
@@ -683,7 +687,7 @@ def clear_setup() -> bool:
     if feature_status == "cleared":
         any_cleared = True
     elif feature_status == "failed":
-        print("Failed to clear codex_hooks feature flag")
+        print("Failed to clear hooks feature flag")
         any_failed = True
 
     if any_cleared:
@@ -700,6 +704,29 @@ def clear_setup() -> bool:
 _HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
 
 
+# A table header may carry a trailing comment, so an exact string match would walk past
+# [features] and both strip the wrong lines and append a duplicate table.
+_FEATURES_HEADER_RE = re.compile(r'^\[features\]\s*(#.*)?$')
+
+
+def _is_features_header(stripped) -> bool:
+    return bool(_FEATURES_HEADER_RE.match(stripped))
+
+
+def _features_hooks_flags(lines):
+    """The hooks feature flag lines present inside [features], in either spelling. Scoped to
+    that table: a hooks key in some other table is not this flag and must not be read as one."""
+    found, in_features = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_features = _is_features_header(stripped)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            found.append(stripped)
+    return found
+
+
 def _strip_hooks_flags(lines):
     """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
     and scoped to that table so [hooks.state] and its entries are left alone."""
@@ -707,7 +734,7 @@ def _strip_hooks_flags(lines):
     for line in lines:
         stripped = line.strip()
         if stripped.startswith('['):
-            in_features = stripped == '[features]'
+            in_features = _is_features_header(stripped)
             out.append(line)
             continue
         if in_features and _HOOKS_FLAG_RE.match(stripped):
@@ -730,17 +757,16 @@ def enable_codex_hooks_feature() -> bool:
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-        cleaned = _strip_hooks_flags(lines)
-        # Already correct only when the one flag present was the current spelling; a leftover
-        # codex_hooks means a second line was stripped and the file still needs rewriting.
-        if len(lines) - len(cleaned) == 1 and any(l.strip() == 'hooks = true' for l in lines):
+        # Already correct only when [features] holds exactly the current spelling. A hooks key
+        # in another table is an unrelated setting and must not be read as this flag.
+        if _features_hooks_flags(lines) == ['hooks = true']:
             debug_print("hooks feature flag already enabled")
             return True
 
-        lines = cleaned
+        lines = _strip_hooks_flags(lines)
         features_idx = None
         for i, line in enumerate(lines):
-            if line.strip() == '[features]':
+            if _is_features_header(line.strip()):
                 features_idx = i
                 break
 
@@ -762,10 +788,13 @@ def enable_codex_hooks_feature() -> bool:
 
 
 def disable_codex_hooks_feature() -> None:
-    """Remove only the codex_hooks line from ~/.codex/config.toml.
+    """Remove the hooks feature flag, in either spelling, from ~/.codex/config.toml.
     Preserves the [features] section and any other flags within it."""
     config_path = Path.home() / ".codex" / "config.toml"
     if not config_path.exists():
+        return
+    if _hooks_still_registered(Path.home() / ".codex" / "hooks.json"):
+        debug_print("hooks feature flag kept: other hooks are still registered")
         return
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
@@ -775,9 +804,9 @@ def disable_codex_hooks_feature() -> None:
         if len(new_lines) != len(lines):
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
-            debug_print("Removed codex_hooks feature flag from config.toml")
+            debug_print("Removed hooks feature flag from config.toml")
     except Exception as e:
-        debug_print(f"Failed to remove codex_hooks feature: {e}")
+        debug_print(f"Failed to remove hooks feature flag: {e}")
 
 
 def get_device_identifier() -> Optional[str]:
@@ -1421,9 +1450,9 @@ def main():
         return False
     debug_print("Codex hooks configured successfully")
 
-    debug_print("Enabling codex_hooks feature flag...")
+    debug_print("Enabling hooks feature flag...")
     if not enable_codex_hooks_feature():
-        print("Failed to enable codex_hooks feature flag")
+        print("Failed to enable hooks feature flag")
         return False
 
     print("API key verified and added")
