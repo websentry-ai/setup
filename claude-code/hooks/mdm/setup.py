@@ -979,10 +979,11 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             del settings["apiKeyHelper"]
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
-            # ANTHROPIC_AUTH_TOKEN is set only by our gateway setup. The base URL is
-            # shared, so it goes only when it still holds our gateway.
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            # Our gateway writes the token and the base URL together, so the URL is what
+            # identifies the pair. Taking the token from beside somebody else's URL would
+            # leave their endpoint with no credential, which is worse than leaving both.
             if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                env.pop("ANTHROPIC_AUTH_TOKEN", None)
                 env.pop("ANTHROPIC_BASE_URL", None)
             if not env:
                 del settings["env"]

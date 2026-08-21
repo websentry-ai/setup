@@ -168,5 +168,43 @@ class TestHelperIdentityUsesBothPathAndBody(unittest.TestCase):
         self.assertFalse(setup._is_unbound_key_helper("~/.claude/anthropic_key.sh.bak"))
 
 
+class TestManagedEnvPairing(unittest.TestCase):
+    """The gateway writes ANTHROPIC_AUTH_TOKEN and ANTHROPIC_BASE_URL together, so the
+    URL identifies the pair. Taking the token from beside somebody else's URL would leave
+    their endpoint with no credential."""
+
+    @staticmethod
+    def _strip(env):
+        settings = {"env": dict(env)}
+        block = settings["env"]
+        if setup._is_unbound_base_url(block.get("ANTHROPIC_BASE_URL")):
+            block.pop("ANTHROPIC_AUTH_TOKEN", None)
+            block.pop("ANTHROPIC_BASE_URL", None)
+        if not block:
+            del settings["env"]
+        return settings.get("env", {})
+
+    def test_an_administrators_endpoint_and_credential_both_survive(self):
+        out = self._strip({"ANTHROPIC_AUTH_TOKEN": "their-secret",
+                           "ANTHROPIC_BASE_URL": "https://llm.acme-corp.internal"})
+        self.assertEqual(out, {"ANTHROPIC_AUTH_TOKEN": "their-secret",
+                               "ANTHROPIC_BASE_URL": "https://llm.acme-corp.internal"})
+
+    def test_our_own_pair_is_removed_together(self):
+        out = self._strip({"ANTHROPIC_AUTH_TOKEN": "unbound-key",
+                           "ANTHROPIC_BASE_URL": "https://api.getunbound.ai"})
+        self.assertEqual(out, {})
+
+    def test_a_token_with_no_base_url_beside_it_is_left_alone(self):
+        out = self._strip({"ANTHROPIC_AUTH_TOKEN": "lonely"})
+        self.assertEqual(out, {"ANTHROPIC_AUTH_TOKEN": "lonely"})
+
+    def test_unrelated_env_survives(self):
+        out = self._strip({"ANTHROPIC_AUTH_TOKEN": "unbound-key",
+                           "ANTHROPIC_BASE_URL": "https://api.getunbound.ai",
+                           "HTTP_PROXY": "http://proxy:8080"})
+        self.assertEqual(out, {"HTTP_PROXY": "http://proxy:8080"})
+
+
 if __name__ == "__main__":
     unittest.main()

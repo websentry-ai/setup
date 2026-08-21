@@ -757,12 +757,11 @@ def clear_managed_settings() -> str:
                     changed = True
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
-                    # ANTHROPIC_AUTH_TOKEN is set only by this setup. The base URL is
-                    # shared, so it goes only when it still holds our gateway.
-                    if "ANTHROPIC_AUTH_TOKEN" in env:
-                        del env["ANTHROPIC_AUTH_TOKEN"]
-                        changed = True
+                    # This setup writes the token and the base URL together, so the URL is
+                    # what identifies the pair. Taking the token from beside somebody
+                    # else's URL would leave their endpoint with no credential.
                     if _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                        env.pop("ANTHROPIC_AUTH_TOKEN", None)
                         del env["ANTHROPIC_BASE_URL"]
                         changed = True
                     if not env:
