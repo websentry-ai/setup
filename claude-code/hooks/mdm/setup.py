@@ -710,6 +710,16 @@ def _managed_key_helper_paths():
         return set()
 
 
+def _is_unbound_base_url_any_user(value) -> bool:
+    """Whether this endpoint is the gateway recorded for any user on the device. A
+    self-hosted gateway is not on our host, so the recorded URL is the only thing that
+    identifies it, and managed settings are system-wide with no single home to consult."""
+    for _username, home_dir in (get_all_user_homes() or []):
+        if home_dir is not None and _is_unbound_base_url(value, home_dir, _username):
+            return True
+    return False
+
+
 def _is_unbound_api_key_any_user(value) -> bool:
     """Whether this credential is the key recorded for any user on the device. MDM writes
     the same key into every user's config, and the managed settings it appears in are
@@ -1181,7 +1191,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             # Our gateway writes the token and the base URL together, so both have to
             # be ours before either goes. An endpoint or a credential we did not set
             # belongs to whoever did, and half-clearing the pair would break them.
-            if (_is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
+            if (_is_unbound_base_url_any_user(env.get("ANTHROPIC_BASE_URL"))
                     and _is_unbound_api_key_any_user(env.get("ANTHROPIC_AUTH_TOKEN"))):
                 env.pop("ANTHROPIC_AUTH_TOKEN", None)
                 env.pop("ANTHROPIC_BASE_URL", None)

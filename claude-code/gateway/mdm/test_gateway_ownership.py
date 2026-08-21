@@ -97,13 +97,75 @@ class TestSweepOrder(unittest.TestCase):
         self.assertEqual(seen[:2], ["ANTHROPIC_BASE_URL", "UNBOUND_API_KEY"])
 
 
+class TestManagedEnvBlock(unittest.TestCase):
+    """The managed env pair goes only when it is the one this setup wrote. A self-hosted
+    gateway is identified by the URL recorded for a user, not by our host name."""
+
+    SELF_HOSTED = "https://ai.acme-corp.internal"
+
+    def setUp(self):
+        # the privilege drop has its own tests; here it only has to not need a real user
+        patcher = patch.object(setup, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _clear(self, env, homes):
+        managed = Path(tempfile.mkdtemp())
+        dropin = managed / "managed-settings.d"
+        dropin.mkdir(parents=True)
+        (dropin / "unbound.json").write_text(json.dumps({"env": env}))
+        with patch.object(setup, "get_managed_settings_dir", lambda: managed), \
+             patch.object(setup, "get_all_user_homes", lambda: homes):
+            setup.clear_managed_settings()
+        path = dropin / "unbound.json"
+        return json.loads(path.read_text()).get("env", {}) if path.exists() else {}
+
+    def test_our_self_hosted_pair_is_removed(self):
+        homes = [("alice", _home(gateway_url=self.SELF_HOSTED, api_key="ub-key"))]
+        left = self._clear({"ANTHROPIC_BASE_URL": self.SELF_HOSTED,
+                            "ANTHROPIC_AUTH_TOKEN": "ub-key"}, homes)
+        self.assertEqual(left, {})
+
+    def test_an_administrators_own_pair_survives(self):
+        homes = [("alice", _home(gateway_url=self.SELF_HOSTED, api_key="ub-key"))]
+        env = {"ANTHROPIC_BASE_URL": "https://llm.someone-else.internal",
+               "ANTHROPIC_AUTH_TOKEN": "their-token"}
+        self.assertEqual(self._clear(env, homes), env)
+
+    def test_unrelated_managed_env_survives(self):
+        homes = [("alice", _home(gateway_url=self.SELF_HOSTED, api_key="ub-key"))]
+        left = self._clear({"ANTHROPIC_BASE_URL": self.SELF_HOSTED,
+                            "ANTHROPIC_AUTH_TOKEN": "ub-key",
+                            "HTTPS_PROXY": "http://corp-proxy:3128"}, homes)
+        self.assertEqual(left, {"HTTPS_PROXY": "http://corp-proxy:3128"})
+
+
+class TestPerUserConfigRecordsTheGateway(unittest.TestCase):
+    def test_the_gateway_url_is_written_beside_the_key(self):
+        home = Path(tempfile.mkdtemp())
+        with patch.object(setup, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+            setup.write_unbound_config_for_user(
+                "alice", home, "ub-key", "https://ai.acme-corp.internal/")
+        config = json.loads((home / ".unbound" / "config.json").read_text())
+        self.assertEqual(config["api_key"], "ub-key")
+        self.assertEqual(config["gateway_url"], "https://ai.acme-corp.internal")
+
+    def test_no_gateway_url_leaves_the_key_alone(self):
+        home = Path(tempfile.mkdtemp())
+        with patch.object(setup, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+            setup.write_unbound_config_for_user("alice", home, "ub-key")
+        config = json.loads((home / ".unbound" / "config.json").read_text())
+        self.assertEqual(config, {"api_key": "ub-key"})
+
+
 class TestOwnershipHelpersMatchTheHooksTree(unittest.TestCase):
     """Both MDM trees answer the same ownership questions; a fix in one that misses the
     other is how a device ends up with two different ideas of what belongs to us."""
 
     SHARED = ["_machine_env_value", "_owned_env_value", "_remove_env_var_lines_for_user",
               "_write_user_file", "_read_user_file", "_user_env_value", "_home_owner_of",
-              "_key_helper_file_is_ours", "_is_unbound_api_key_any_user"]
+              "_key_helper_file_is_ours", "_is_unbound_api_key_any_user",
+              "_is_unbound_base_url_any_user"]
 
     @staticmethod
     def _sources(path):

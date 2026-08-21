@@ -519,7 +519,8 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
     return "failed"
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
+                                  gateway_url: str = None) -> None:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -537,6 +538,8 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if gateway_url:
+            config['gateway_url'] = normalize_url(gateway_url)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -762,7 +765,7 @@ def clear_managed_settings() -> str:
                     # This setup writes the token and the base URL together, so both have
                     # to be ours before either goes. An endpoint or a credential we did not
                     # set belongs to whoever did.
-                    if (_is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
+                    if (_is_unbound_base_url_any_user(env.get("ANTHROPIC_BASE_URL"))
                             and _is_unbound_api_key_any_user(env.get("ANTHROPIC_AUTH_TOKEN"))):
                         env.pop("ANTHROPIC_AUTH_TOKEN", None)
                         del env["ANTHROPIC_BASE_URL"]
@@ -1005,6 +1008,16 @@ def _managed_key_helper_paths():
         return {str(get_managed_settings_dir() / "anthropic_key.sh")}
     except OSError:
         return set()
+
+
+def _is_unbound_base_url_any_user(value) -> bool:
+    """Whether this endpoint is the gateway recorded for any user on the device. A
+    self-hosted gateway is not on our host, so the recorded URL is the only thing that
+    identifies it, and managed settings are system-wide with no single home to consult."""
+    for _username, home_dir in (get_all_user_homes() or []):
+        if home_dir is not None and _is_unbound_base_url(value, home_dir, _username):
+            return True
+    return False
 
 
 def _is_unbound_api_key_any_user(value) -> bool:
@@ -1288,7 +1301,7 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_hooks_unbound_script_for_user(username, home_dir)
         remove_user_level_gateway_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, claude_api_key)
+        write_unbound_config_for_user(username, home_dir, claude_api_key, gateway_url)
 
     print("\n🔧 Configuring Claude managed settings...")
     if setup_managed_settings(claude_api_key, gateway_url=gateway_url):

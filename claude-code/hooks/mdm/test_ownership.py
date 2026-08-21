@@ -356,3 +356,38 @@ class TestOwnershipIsDecidedOutsideThePrivilegeDrop(unittest.TestCase):
         self.assertEqual(status, "cleared")
         self.assertTrue(deepest, "the privilege drop was never used")
         self.assertEqual(max(deepest), 1)
+
+
+class TestSelfHostedGatewayIsRecognised(unittest.TestCase):
+    """A self-hosted gateway is not on our host, so the URL recorded for a user is the
+    only thing that identifies it. Managed settings are system-wide, so no single home
+    answers the question."""
+
+    SELF_HOSTED = "https://ai.acme-corp.internal"
+
+    def setUp(self):
+        # the privilege drop has its own tests; here it only has to not need a real user
+        patcher = patch.object(setup, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_a_recorded_self_hosted_gateway_is_ours(self):
+        home = _home_with_config(gateway_url=self.SELF_HOSTED)
+        with patch.object(setup, "get_all_user_homes", lambda: [("alice", home)]):
+            self.assertTrue(setup._is_unbound_base_url_any_user(self.SELF_HOSTED))
+
+    def test_an_endpoint_nobody_recorded_is_not_ours(self):
+        home = _home_with_config(gateway_url=self.SELF_HOSTED)
+        with patch.object(setup, "get_all_user_homes", lambda: [("alice", home)]):
+            self.assertFalse(
+                setup._is_unbound_base_url_any_user("https://llm.someone-else.internal"))
+
+    def test_any_user_on_the_device_can_answer_it(self):
+        homes = [("alice", _home_with_config(gateway_url="https://other.getunbound.ai")),
+                 ("bob", _home_with_config(gateway_url=self.SELF_HOSTED))]
+        with patch.object(setup, "get_all_user_homes", lambda: homes):
+            self.assertTrue(setup._is_unbound_base_url_any_user(self.SELF_HOSTED))
+
+    def test_no_users_at_all(self):
+        with patch.object(setup, "get_all_user_homes", lambda: []):
+            self.assertFalse(setup._is_unbound_base_url_any_user(self.SELF_HOSTED))
