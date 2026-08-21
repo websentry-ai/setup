@@ -4,6 +4,7 @@ Codex CLI - Environment Setup Script
 """
 
 import os
+import re
 import sys
 import platform
 import subprocess
@@ -521,15 +522,38 @@ def remove_hooks_from_codex_config() -> None:
         debug_print(f"Failed to update hooks.json: {e}")
 
 
+_HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
+
+
+def _strip_hooks_flags(lines):
+    """Drop the hooks feature flag from [features], in either spelling. Anchored and scoped to
+    that table so [hooks.state] and its entries are left alone."""
+    out, in_features = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_features = stripped == '[features]'
+            out.append(line)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            continue
+        out.append(line)
+    return out
+
+
 def disable_codex_hooks_feature() -> None:
-    """Remove codex_hooks feature flag from ~/.codex/config.toml (leftover from hooks setup)."""
+    """Remove the hooks feature flag from ~/.codex/config.toml (leftover from hooks setup).
+
+    Both spellings are cleared: Codex renamed codex_hooks to hooks, so removing only the old
+    one would leave gateway installs still running the hooks. Matching is anchored and scoped
+    to [features] so [hooks.state] and its entries are untouched."""
     config_path = Path.home() / ".codex" / "config.toml"
     if not config_path.exists():
         return
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) != len(lines):
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)

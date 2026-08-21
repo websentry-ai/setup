@@ -2204,13 +2204,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            print('{}', flush=True)
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            print('{}', flush=True)
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -2225,7 +2225,6 @@ def main():
         session_id = event.get('session_id')
 
         # Handle PreToolUse - return immediately after decision is made
-        # Note: Codex PreToolUse does not support suppressOutput
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
@@ -2242,21 +2241,18 @@ def main():
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                response["suppressOutput"] = True
                 print(json.dumps(response), flush=True)
                 return
 
             # Allowed but with hook output to emit (e.g. the spend-limit
             # alert-threshold warning riding additionalContext/systemMessage):
-            # log the event, then print the response instead of the default
-            # suppressOutput so Codex surfaces the warning.
+            # log the event, then print the response so Codex surfaces the warning.
             if response:
                 append_to_audit_log({
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                response["suppressOutput"] = True
                 print(json.dumps(response), flush=True)
                 return
 
@@ -2276,12 +2272,14 @@ def main():
 
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
+        # Codex parses suppressOutput but does not implement it, and PostToolUse reports it as
+        # unsupported and marks the hook failed. An empty object is accepted on every event.
+        print('{}', flush=True)
 
     except Exception as e:
-        # Still return empty JSON object to Codex to indicate completion
+        # Still acknowledge so Codex sees the hook complete.
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        print('{}', flush=True)
 
 
 if __name__ == '__main__':

@@ -1188,6 +1188,25 @@ def clear_managed_hooks() -> str:
         return "failed"
 
 
+_HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
+
+
+def _strip_hooks_flags(lines):
+    """Drop the hooks feature flag from [features], in either spelling. Anchored and scoped to
+    that table so [hooks.state] and its entries are left alone."""
+    out, in_features = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_features = stripped == '[features]'
+            out.append(line)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            continue
+        out.append(line)
+    return out
+
+
 def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     """Enable codex_hooks feature flag in user's ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
@@ -1199,16 +1218,17 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
         if config_path.exists():
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-        if 'codex_hooks = true' in ''.join(lines):
+        if any(l.strip() == 'hooks = true' for l in lines):
             return False  # already enabled
 
+        lines = _strip_hooks_flags(lines)
         features_idx = next((i for i, l in enumerate(lines) if l.strip() == '[features]'), None)
         if features_idx is not None:
-            lines.insert(features_idx + 1, 'codex_hooks = true\n')
+            lines.insert(features_idx + 1, 'hooks = true\n')
         else:
             if lines and not lines[-1].endswith('\n'):
                 lines.append('\n')
-            lines.append('\n[features]\ncodex_hooks = true\n')
+            lines.append('\n[features]\nhooks = true\n')
 
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_path), flags, 0o600)
@@ -1235,7 +1255,7 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     def _disable():
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return False
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)

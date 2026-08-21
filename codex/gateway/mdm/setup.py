@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import re
 import sys
 import platform
 import subprocess
@@ -737,6 +738,25 @@ def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
         debug_print(f"Removed {script_path} for {username}")
 
 
+_HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
+
+
+def _strip_hooks_flags(lines):
+    """Drop the hooks feature flag from [features], in either spelling. Anchored and scoped to
+    that table so [hooks.state] and its entries are left alone."""
+    out, in_features = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_features = stripped == '[features]'
+            out.append(line)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            continue
+        out.append(line)
+    return out
+
+
 def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     """Remove codex_hooks feature flag from user's ~/.codex/config.toml.
     Privilege-drops to the target user before any FS op."""
@@ -747,7 +767,7 @@ def disable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
     def _disable():
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return False
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)

@@ -593,7 +593,7 @@ def disable_codex_hooks_feature_status() -> str:
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return "not_found"
         with open(config_path, 'w', encoding='utf-8') as f:
@@ -675,10 +675,30 @@ def clear_setup() -> bool:
     return not any_failed
 
 
+_HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
+
+
+def _strip_hooks_flags(lines):
+    """Drop the hooks feature flag from [features], in either spelling. Matching is anchored
+    and scoped to that table so [hooks.state] and its entries are left alone."""
+    out, in_features = [], False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('['):
+            in_features = stripped == '[features]'
+            out.append(line)
+            continue
+        if in_features and _HOOKS_FLAG_RE.match(stripped):
+            continue
+        out.append(line)
+    return out
+
+
 def enable_codex_hooks_feature() -> bool:
-    """Enable the codex_hooks feature flag in ~/.codex/config.toml.
-    If [features] section exists, adds the key under it.
-    Otherwise appends a new [features] section at the end of the file."""
+    """Enable the hooks feature flag in ~/.codex/config.toml.
+
+    Codex renamed this flag from codex_hooks to hooks and warns on every start while the old
+    spelling is present, so an existing one is replaced rather than left beside the new one."""
     config_path = Path.home() / ".codex" / "config.toml"
     try:
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -688,13 +708,14 @@ def enable_codex_hooks_feature() -> bool:
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-        # Check if already enabled
-        content = ''.join(lines)
-        if 'codex_hooks = true' in content:
-            debug_print("codex_hooks feature flag already enabled")
+        cleaned = _strip_hooks_flags(lines)
+        # Already correct only when the one flag present was the current spelling; a leftover
+        # codex_hooks means a second line was stripped and the file still needs rewriting.
+        if len(lines) - len(cleaned) == 1 and any(l.strip() == 'hooks = true' for l in lines):
+            debug_print("hooks feature flag already enabled")
             return True
 
-        # Check if [features] section already exists
+        lines = cleaned
         features_idx = None
         for i, line in enumerate(lines):
             if line.strip() == '[features]':
@@ -702,21 +723,19 @@ def enable_codex_hooks_feature() -> bool:
                 break
 
         if features_idx is not None:
-            # Insert codex_hooks = true right after [features] header
-            lines.insert(features_idx + 1, 'codex_hooks = true\n')
+            lines.insert(features_idx + 1, 'hooks = true\n')
         else:
-            # Append new [features] section at the end
             if lines and not lines[-1].endswith('\n'):
                 lines.append('\n')
-            lines.append('\n[features]\ncodex_hooks = true\n')
+            lines.append('\n[features]\nhooks = true\n')
 
         with open(config_path, 'w', encoding='utf-8') as f:
             f.writelines(lines)
 
-        debug_print("Enabled codex_hooks feature flag in config.toml")
+        debug_print("Enabled hooks feature flag in config.toml")
         return True
     except Exception as e:
-        debug_print(f"Failed to enable codex_hooks feature: {e}")
+        debug_print(f"Failed to enable hooks feature: {e}")
         return False
 
 
@@ -730,7 +749,7 @@ def disable_codex_hooks_feature() -> None:
         with open(config_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
 
-        new_lines = [line for line in lines if not line.strip().startswith('codex_hooks')]
+        new_lines = _strip_hooks_flags(lines)
         if len(new_lines) != len(lines):
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
