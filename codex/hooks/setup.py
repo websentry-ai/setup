@@ -739,7 +739,7 @@ _HOOKS_FLAG_RE = re.compile(r'^(codex_hooks|hooks)\s*=')
 _FEATURES_HEADER_RE = re.compile(r'^\[\s*(?:features|"features"|\'features\')\s*\]\s*(#.*)?$')
 
 # features as an inline table cannot take an appended header without redefining it.
-_FEATURES_INLINE_RE = re.compile(r'^features\s*=\s*\{(.*)\}\s*$')
+_FEATURES_INLINE_RE = re.compile(r'^features\s*=\s*\{(.*?)\}\s*(#.*)?$')
 
 
 def _is_features_header(stripped) -> bool:
@@ -824,7 +824,8 @@ def _inline_with_flag(stripped):
     entries = [part.strip() for part in inner.split(',')]
     entries = [part for part in entries if part and not _HOOKS_FLAG_RE.match(part)]
     entries.append('hooks = true')
-    return 'features = { ' + ', '.join(entries) + ' }\n'
+    comment = match.group(2)
+    return 'features = { ' + ', '.join(entries) + ' }' + ('  ' + comment if comment else '') + '\n'
 
 
 def _scan_code(text):
@@ -884,7 +885,7 @@ def _config_lines(lines):
             continue
         if depth > 0:
             yield None
-            _, extra = _scan_code(line)
+            delim, extra = _scan_code(line)
             depth += extra
             continue
         yield line.strip()

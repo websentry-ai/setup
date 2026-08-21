@@ -858,7 +858,7 @@ def _config_lines(lines):
             continue
         if depth > 0:
             yield None
-            _, extra = _scan_code(line)
+            delim, extra = _scan_code(line)
             depth += extra
             continue
         yield line.strip()
