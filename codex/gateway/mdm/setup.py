@@ -762,9 +762,17 @@ def _write_is_safe(text, want_enabled) -> bool:
     edit is checked against this before it reaches disk, so a line-scan mistake is discarded
     rather than written."""
     if tomllib is None:
-        # No parser to check the result with, so only edit files without the one construct
-        # the line scan can misread. A config left alone beats a config written blind.
-        return '"""' not in text and "'''" not in text
+        # No parser to check the result with, so only edit files without the constructs the
+        # line scan can misread. A config left alone beats a config written blind.
+        if '"""' in text or "'''" in text:
+            return False
+        depth = 0
+        for line in text.splitlines():
+            _, extra = _scan_code(line)
+            depth += extra
+            if depth:
+                return False  # a multi-line array
+        return True
     try:
         features = tomllib.loads(text).get('features')
     except Exception:
@@ -793,19 +801,20 @@ def _find_delim(text, delim, start=0) -> int:
     return -1
 
 
-def _open_multiline(text):
-    """The multi-line delimiter left unclosed at the end of `text`, or None. Walks the line
-    so quotes inside comments, literal strings and escapes are not counted as delimiters."""
-    i, n = 0, len(text)
+def _scan_code(text):
+    """(unclosed multi-line delimiter, net bracket depth change) for the code on one line.
+    Brackets and quotes inside comments or strings are not counted, and the same-line close
+    of a triple-quoted value skips escapes so it cannot end on an escaped quote."""
+    i, n, depth = 0, len(text), 0
     while i < n:
         ch = text[i]
         if ch == '#':
-            return None
+            break
         if text.startswith('"""', i) or text.startswith("'''", i):
             delim = text[i:i + 3]
-            end = text.find(delim, i + 3)
+            end = _find_delim(text, delim, i + 3)
             if end == -1:
-                return delim
+                return delim, depth
             i = end + 3
             continue
         if ch == '"':
@@ -822,27 +831,39 @@ def _open_multiline(text):
         if ch == "'":
             end = text.find("'", i + 1)
             if end == -1:
-                return None
+                break
             i = end + 1
             continue
+        if ch == '[':
+            depth += 1
+        elif ch == ']':
+            depth -= 1
         i += 1
-    return None
+    return None, depth
 
 
 def _config_lines(lines):
-    """Yield each line stripped, or None for the interior of a multi-line string, so a
-    TOML-looking line inside a value is never read as a table header or as our flag."""
-    delim = None
+    """Yield each line stripped, or None for anything that is not a statement of its own:
+    the interior of a multi-line string and the continuation lines of a multi-line array.
+    Either one can hold text that looks like a table header or like our flag."""
+    delim, depth = None, 0
     for line in lines:
         if delim is not None:
             yield None
             end = _find_delim(line, delim)
             if end == -1:
                 continue
-            delim = _open_multiline(line[end + 3:])
+            delim, extra = _scan_code(line[end + 3:])
+            depth += extra
+            continue
+        if depth > 0:
+            yield None
+            _, extra = _scan_code(line)
+            depth += extra
             continue
         yield line.strip()
-        delim = _open_multiline(line)
+        delim, extra = _scan_code(line)
+        depth += extra
 
 
 def _strip_hooks_flags(lines):
