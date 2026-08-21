@@ -760,9 +760,11 @@ except ImportError:  # system python older than 3.11
 def _write_is_safe(text, want_enabled) -> bool:
     """Whether text is a config Codex can load with the flag in the intended state. Every
     edit is checked against this before it reaches disk, so a line-scan mistake is discarded
-    rather than written. Without tomllib the scan stands alone, as it did before."""
+    rather than written."""
     if tomllib is None:
-        return True
+        # No parser to check the result with, so only edit files without the one construct
+        # the line scan can misread. A config left alone beats a config written blind.
+        return '"""' not in text and "'''" not in text
     try:
         features = tomllib.loads(text).get('features')
     except Exception:
@@ -775,8 +777,9 @@ def _write_is_safe(text, want_enabled) -> bool:
 
 
 def _find_delim(text, delim, start=0) -> int:
-    """Index of the closing delimiter, skipping backslash escapes. Multi-line literal
-    strings take no escapes, so only the basic form needs the walk."""
+    """Index of the closing delimiter, skipping backslash escapes. A backslash consumes the
+    character after it, so an escaped quote can never be read as part of a terminator.
+    Multi-line literal strings take no escapes, so only the basic form needs the walk."""
     if delim != '"""':
         return text.find(delim, start)
     i, n = start, len(text)
