@@ -463,6 +463,9 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     if not command:
         return False
     try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a home
+        # directory containing spaces stays one token; only the quotes it leaves behind
+        # are stripped below.
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return False
@@ -1353,6 +1356,9 @@ def main():
 
     # Remove gateway setup env vars and artifacts. ANTHROPIC_BASE_URL is only ours when
     # it holds our gateway; an org pointing Claude Code at their own endpoint keeps it.
+    # Runs before write_unbound_config below, which rewrites the recorded gateway_url the
+    # ownership check reads -- afterwards it would answer for this install, not the one
+    # being removed.
     for var_name, only_if in (("UNBOUND_API_KEY", None),
                               ("ANTHROPIC_BASE_URL", _is_unbound_base_url)):
         try:

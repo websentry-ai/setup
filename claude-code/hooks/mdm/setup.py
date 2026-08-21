@@ -511,14 +511,13 @@ UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
 
 
 def _is_unbound_base_url(value) -> bool:
-    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
-    the customer's own endpoint and is left alone.
+    """Whether ANTHROPIC_BASE_URL is the default Unbound gateway.
 
-    The default gateway only. A URL supplied through --gateway-url is not recognised
-    here and is therefore left in place: guessing wrong removes an endpoint the customer
-    configured, which is the failure this check exists to prevent. Managed settings do
-    not depend on this -- the drop-in written by this setup is identified by being that
-    file, not by the value inside it."""
+    Device-wide scope, so it consults no per-account record on purpose: this decides what
+    comes out of managed settings the whole device shares, and one user's config must not
+    be able to authorise that. A --gateway-url endpoint is still recognised, per user and
+    only for that user's own export, by _unbound_base_url_matcher; and the drop-in this
+    setup writes is identified by being that file rather than by the value inside it."""
     return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
 
 
@@ -778,6 +777,9 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     if "/opt/unbound/" in command and "unbound-hook" in command:
         return True
     try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a home
+        # directory containing spaces stays one token; only the quotes it leaves behind
+        # are stripped below.
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return False
@@ -1871,7 +1873,9 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
-    # Remove leftover gateway setup env vars
+    # Remove leftover gateway setup env vars. Runs before write_unbound_config_for_user
+    # below, which rewrites the recorded gateway_url the ownership check reads --
+    # afterwards it would answer for this install, not the one being removed.
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
         remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",

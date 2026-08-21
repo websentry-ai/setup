@@ -481,14 +481,13 @@ UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
 
 
 def _is_unbound_base_url(value) -> bool:
-    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
-    the customer's own endpoint and is left alone.
+    """Whether ANTHROPIC_BASE_URL is the default Unbound gateway.
 
-    The default gateway only. A URL supplied through --gateway-url is not recognised
-    here and is therefore left in place: guessing wrong removes an endpoint the customer
-    configured, which is the failure this check exists to prevent. Managed settings do
-    not depend on this -- the drop-in written by this setup is identified by being that
-    file, not by the value inside it."""
+    Device-wide scope, so it consults no per-account record on purpose: this decides what
+    comes out of managed settings the whole device shares, and one user's config must not
+    be able to authorise that. A --gateway-url endpoint is still recognised, per user and
+    only for that user's own export, by _unbound_base_url_matcher; and the drop-in this
+    setup writes is identified by being that file rather than by the value inside it."""
     return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
 
 
@@ -636,7 +635,8 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str,
     return "failed"
 
 
-def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -> None:
+def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
+                                  gateway_url: str = None) -> None:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -654,6 +654,10 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
             except (json.JSONDecodeError, OSError):
                 config = {}
         config['api_key'] = api_key
+        if gateway_url:
+            # Recorded so teardown can recognise a custom endpoint as ours later; without
+            # it a --gateway-url install leaves its own routing behind.
+            config['gateway_url'] = normalize_url(gateway_url)
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1134,7 +1138,7 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_hooks_unbound_script_for_user(username, home_dir)
         remove_user_level_gateway_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, claude_api_key)
+        write_unbound_config_for_user(username, home_dir, claude_api_key, gateway_url)
 
     print("\n🔧 Configuring Claude managed settings...")
     if setup_managed_settings(claude_api_key, gateway_url=gateway_url):

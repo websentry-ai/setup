@@ -242,6 +242,9 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     if "/opt/unbound/" in command and "unbound-hook" in command:
         return True
     try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a home
+        # directory containing spaces stays one token; only the quotes it leaves behind
+        # are stripped below.
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return False

@@ -89,6 +89,19 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
                 self.assertTrue(mod._is_unbound_base_url(OURS), mod.__name__)
                 self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
 
+    def test_the_record_read_is_whatever_is_on_disk_at_that_moment(self):
+        # the install rewrites gateway_url later in the run; the removal has to read the
+        # record the *previous* install left, so it must run before that rewrite
+        home = self._home(self.CUSTOM)
+        config = home / ".unbound" / "config.json"
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+                config.write_text(json.dumps({"api_key": "k", "gateway_url": OURS}))
+                self.assertFalse(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+                config.write_text(json.dumps({"api_key": "k",
+                                              "gateway_url": self.CUSTOM}))
+
     def test_a_corrupt_record_is_not_a_match(self):
         home = Path(tempfile.mkdtemp())
         (home / ".unbound").mkdir()
@@ -386,6 +399,24 @@ class TestGatewayInstallKeepsTheirHooks(unittest.TestCase):
         GATEWAY._strip_unbound_hooks(settings)
         self.assertNotIn("hooks", settings)
 
+    def test_a_quoted_home_with_spaces_stays_one_token(self):
+        # `py -3 "C:\Users\Jane Doe\..."` — shlex groups the quoted argument even with
+        # posix=False, so the space in the home directory does not split the path
+        import shlex as _shlex
+        cmd = 'py -3 "C:\\Users\\Jane Doe\\.claude\\hooks\\unbound.py"'
+        tokens = [t.strip().strip('"') for t in _shlex.split(cmd, posix=False)]
+        self.assertEqual(tokens,
+                         ["py", "-3", "C:\\Users\\Jane Doe\\.claude\\hooks\\unbound.py"])
+
+    def test_a_native_path_with_spaces_is_matched(self):
+        home = Path(tempfile.mkdtemp()) / "Jane Doe"
+        home.mkdir()
+        cmd = 'python3 "%s"' % (home / ".claude" / "hooks" / "unbound.py")
+        with patch.object(GATEWAY.Path, "home", staticmethod(lambda: home)):
+            settings = {"hooks": {"Stop": [self._ours(cmd)]}}
+            GATEWAY._strip_unbound_hooks(settings)
+        self.assertNotIn("hooks", settings)
+
     def test_a_python_launcher_without_flags_is_ours(self):
         home = Path(tempfile.mkdtemp())
         cmd = 'python3 "%s"' % (home / ".claude" / "hooks" / "unbound.py")
@@ -492,6 +523,37 @@ class TestTheCredentialAlwaysComesOut(unittest.TestCase):
     def test_the_whole_pair_goes_when_the_url_is_ours(self):
         self.assertEqual(
             self._clear({"ANTHROPIC_BASE_URL": OURS, "ANTHROPIC_AUTH_TOKEN": "t"}), {})
+
+
+class TestGatewayMdmRecordsItsGateway(unittest.TestCase):
+    """Teardown recognises a custom endpoint from the URL recorded for a user, so the
+    gateway MDM install has to write one -- the hooks MDM tree already did."""
+
+    def _write(self, gateway_url=None):
+        home = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+            if gateway_url is None:
+                GATEWAY_MDM.write_unbound_config_for_user("alice", home, "ub-key")
+            else:
+                GATEWAY_MDM.write_unbound_config_for_user("alice", home, "ub-key", gateway_url)
+        return json.loads((home / ".unbound" / "config.json").read_text())
+
+    def test_a_custom_gateway_is_recorded(self):
+        config = self._write("https://unbound.acme-corp.internal/")
+        self.assertEqual(config["gateway_url"], "https://unbound.acme-corp.internal")
+        self.assertEqual(config["api_key"], "ub-key")
+
+    def test_no_gateway_url_records_only_the_key(self):
+        self.assertEqual(self._write(), {"api_key": "ub-key"})
+
+    def test_what_it_records_is_what_the_matcher_accepts(self):
+        custom = "https://unbound.acme-corp.internal"
+        home = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+            GATEWAY_MDM.write_unbound_config_for_user("alice", home, "ub-key", custom)
+            matcher = GATEWAY_MDM._unbound_base_url_matcher("alice", home)
+        self.assertTrue(matcher(custom))
+        self.assertFalse(matcher(THEIRS))
 
 
 class TestTheWriterAndTheReaderAgree(unittest.TestCase):
