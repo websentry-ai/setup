@@ -551,6 +551,19 @@ def _recorded_gateway_url_for_user(username, home_dir) -> str:
     return result or ""
 
 
+def _machine_env_is_set(var_name: str) -> bool:
+    """Whether the machine-wide environment holds this variable. UNBOUND_API_KEY is
+    written by nothing but this setup, so its presence is proof the setup ran on this
+    device -- device-level evidence, unlike a per-account record."""
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+    try:
+        result = subprocess.run(["reg", "query", reg_path, "/V", var_name],
+                                capture_output=True, timeout=10)
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
 def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
     """Whether a managed settings file is the one this setup writes on the fallback path.
 
@@ -560,9 +573,13 @@ def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
 
     The drop-in must be absent. The install prefers managed-settings.d/unbound.json
     exactly so it does not touch a sibling flat file, so a drop-in on disk means the flat
-    file beside it belongs to somebody else whatever it contains. And the endpoint must be
-    one we recognise: on the fallback path there is no record to identify a custom gateway
-    by, and guessing there would delete an organisation's own routing and credential."""
+    file beside it belongs to somebody else whatever it contains.
+
+    And this setup must actually have run on the device, which UNBOUND_API_KEY in the
+    machine environment proves because nothing else writes it. That is what lets a custom
+    gateway be recognised here without the endpoint vouching for itself: an organisation's
+    own Bedrock settings sit on a device that has no such key. This shape only ever occurs
+    on Windows; the Unix install writes an apiKeyHelper, not an env block."""
     if (managed_dir / "managed-settings.d" / "unbound.json").exists():
         return False
     if not isinstance(settings, dict) or set(settings) != {"env"}:
@@ -571,7 +588,7 @@ def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
     if not (isinstance(env, dict)
             and set(env) == {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}):
         return False
-    return _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
+    return _machine_env_is_set("UNBOUND_API_KEY")
 
 
 def _managed_settings_gateway_url(path) -> str:
@@ -605,11 +622,20 @@ def _recorded_managed_gateway_url() -> str:
         managed_dir = get_managed_settings_dir()
     except OSError:
         return ""
-    # The drop-in only. The install writes the flat file instead when it cannot create
-    # the drop-in directory, but nothing there identifies a custom endpoint as ours, and
-    # that same shape is what an organisation writes for their own gateway.
-    return _managed_settings_gateway_url(
+    dropin = _managed_settings_gateway_url(
         managed_dir / "managed-settings.d" / "unbound.json")
+    if dropin:
+        return dropin
+    # The install writes the flat file instead when it cannot create the drop-in
+    # directory. It counts only under the same proof teardown uses for that file.
+    flat = managed_dir / "managed-settings.json"
+    try:
+        settings = json.loads(flat.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not _managed_settings_is_exactly_ours(settings, managed_dir):
+        return ""
+    return _managed_settings_gateway_url(flat)
 
 def _unbound_base_url_matcher(username, home_dir):
     """Accepts our default gateway, or the one recorded for this user. The record is read

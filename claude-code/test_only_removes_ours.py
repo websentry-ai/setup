@@ -861,12 +861,31 @@ class TestOneVerdictPerFile(unittest.TestCase):
             GATEWAY_MDM.clear_managed_settings()
         self.assertFalse(dropin.exists())
 
-    def test_a_custom_endpoint_in_that_shape_is_left_alone(self):
-        # deliberate: on the fallback path nothing identifies a custom gateway as ours,
-        # and guessing deletes an organisation's own routing
+    def test_a_custom_endpoint_without_the_device_proof_is_left_alone(self):
+        # an organisation's own env-only settings sit on a device this setup never ran on,
+        # so there is no machine-wide UNBOUND_API_KEY to vouch for the file
         content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
                            "ANTHROPIC_BASE_URL": self.CUSTOM}}
-        self.assertEqual(self._clear_flat(content), content)
+        with patch.object(GATEWAY_MDM, "_machine_env_is_set", lambda _v: False):
+            self.assertEqual(self._clear_flat(content), content)
+
+    def test_a_custom_endpoint_with_the_device_proof_is_cleared(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        with patch.object(GATEWAY_MDM, "_machine_env_is_set", lambda _v: True):
+            self.assertEqual(self._clear_flat(content), {})
+
+    def test_the_device_proof_does_not_override_a_present_drop_in(self):
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.d").mkdir(parents=True)
+        (managed / "managed-settings.d" / "unbound.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": OURS}}))
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        for mod in MDM:
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True):
+                self.assertFalse(
+                    mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
 
     def test_a_drop_in_on_disk_means_the_flat_file_is_not_ours(self):
         # the install prefers the drop-in exactly so it leaves a sibling flat file alone
@@ -880,15 +899,31 @@ class TestOneVerdictPerFile(unittest.TestCase):
                 mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
 
     def test_the_sweep_and_the_clearing_agree(self):
-        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}}
+        # a custom endpoint, so the sweep can only say yes by way of the same record the
+        # clearing reads -- the default gateway would match by value either way
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}
         managed = Path(tempfile.mkdtemp())
         (managed / "managed-settings.json").write_text(json.dumps(content))
         with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM, "_machine_env_is_set", lambda _v: True), \
              patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
-            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(OURS)
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
             clearing_says_ours = GATEWAY_MDM._managed_settings_is_exactly_ours(
                 content, managed)
         self.assertTrue(sweep_says_ours)
+        self.assertEqual(sweep_says_ours, clearing_says_ours)
+
+    def test_they_agree_that_it_is_not_ours_without_the_device_proof(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM, "_machine_env_is_set", lambda _v: False), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
+            clearing_says_ours = GATEWAY_MDM._managed_settings_is_exactly_ours(
+                content, managed)
+        self.assertFalse(sweep_says_ours)
         self.assertEqual(sweep_says_ours, clearing_says_ours)
 
     def test_an_administrators_file_is_left_to_them_by_both(self):
