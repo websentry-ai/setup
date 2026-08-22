@@ -902,22 +902,24 @@ def main():
     print("API Key Verified ✅")
     debug_print("API key verification successful")
 
+    # Record the endpoint before anything is written to the machine. Clearing this setup
+    # identifies a non-default gateway by the URL recorded here, so installing first and
+    # failing to record would leave a route teardown cannot tell from the customer's own.
+    # Nothing has been set at this point, so refusing here leaves the device untouched
+    # rather than holding a key with no route to use it on.
+    _config_written = write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
+    if not _config_written and args.gateway_url != UNBOUND_GATEWAY_URL:
+        print(f"❌ Could not record the gateway URL in {Path.home() / '.unbound' / 'config.json'}.")
+        print(f"   Nothing was installed: clearing this setup could not have removed "
+              f"ANTHROPIC_BASE_URL={args.gateway_url} afterwards.")
+        return False
+
     debug_print("Setting UNBOUND_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_API_KEY", api_key)
     if not success:
         print(f"❌ Failed to configure UNBOUND_API_KEY: {message}")
         return False
     debug_print("UNBOUND_API_KEY set successfully")
-
-    # Record the endpoint before routing anything at it. Clearing this setup identifies a
-    # non-default gateway by the URL recorded here, so setting the route first and failing
-    # to record it would leave one that teardown cannot tell from the customer's own.
-    _config_written = write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
-    if not _config_written and args.gateway_url != UNBOUND_GATEWAY_URL:
-        print(f"❌ Could not record the gateway URL in {Path.home() / '.unbound' / 'config.json'}.")
-        print(f"   Not setting ANTHROPIC_BASE_URL={args.gateway_url}: clearing this setup "
-              f"could not remove it afterwards.")
-        return False
 
     debug_print("Setting ANTHROPIC_BASE_URL environment variable...")
     success, message = set_env_var("ANTHROPIC_BASE_URL", args.gateway_url)

@@ -750,6 +750,15 @@ class TestAFailedRecordIsNotSilent(unittest.TestCase):
 
     CUSTOM = "https://unbound.acme-corp.internal"
 
+    def test_nothing_is_written_before_the_record_guard(self):
+        # aborting after the key is set leaves UNBOUND_API_KEY on the device with no route
+        # to use it on, while the operator is told nothing was installed
+        src = (ROOT / "gateway" / "setup.py").read_text()
+        guard = src.index("_config_written = write_unbound_config(api_key")
+        for written in ('set_env_var("UNBOUND_API_KEY", api_key)',
+                        'set_env_var("ANTHROPIC_BASE_URL", args.gateway_url)'):
+            self.assertLess(guard, src.index(written), written)
+
     def test_the_route_is_recorded_before_it_is_set(self):
         # setting ANTHROPIC_BASE_URL first and then failing to record it would leave a
         # custom endpoint teardown cannot tell from the customer's own; the order is the
@@ -830,6 +839,27 @@ class TestOneVerdictPerFile(unittest.TestCase):
         left = self._clear_flat(
             {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}})
         self.assertEqual(left, {})
+
+    def test_the_shared_file_is_emptied_rather_than_deleted(self):
+        # the fleet's tooling may expect that path; only our own drop-in is removed
+        managed = Path(tempfile.mkdtemp())
+        flat = managed / "managed-settings.json"
+        flat.write_text(json.dumps(
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}}))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed):
+            GATEWAY_MDM.clear_managed_settings()
+        self.assertTrue(flat.exists())
+        self.assertEqual(json.loads(flat.read_text()), {})
+
+    def test_our_own_drop_in_is_removed_outright(self):
+        managed = Path(tempfile.mkdtemp())
+        dropin = managed / "managed-settings.d" / "unbound.json"
+        dropin.parent.mkdir(parents=True)
+        dropin.write_text(json.dumps(
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}}))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed):
+            GATEWAY_MDM.clear_managed_settings()
+        self.assertFalse(dropin.exists())
 
     def test_a_custom_endpoint_in_that_shape_is_left_alone(self):
         # deliberate: on the fallback path nothing identifies a custom gateway as ours,

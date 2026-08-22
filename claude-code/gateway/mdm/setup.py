@@ -996,7 +996,9 @@ def clear_managed_settings() -> str:
                     if not env:
                         del settings["env"]
                 if changed:
-                    if ours and not settings:
+                    # Only our own drop-in is removed outright. The shared file is a path
+                    # the fleet's tooling may expect to exist, so it is emptied instead.
+                    if _is_our_dropin(settings_path) and not settings:
                         settings_path.unlink()
                         debug_print(f"Removed empty drop-in {settings_path}")
                     else:
