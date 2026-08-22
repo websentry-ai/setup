@@ -1095,12 +1095,14 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             settings.pop("apiKeyHelper", None)
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
-            # The token is a credential the gateway setup wrote, and it is sent to
-            # whatever ANTHROPIC_BASE_URL currently names, so it comes out however that
-            # URL now reads. The URL itself is only ours to remove when it still holds
-            # our gateway.
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            # The gateway writes the token and the base URL together, so they go
+            # together, and only out of a file that setup wrote or a pair it recognises.
+            # A token in somebody else's file is their credential, not ours to delete.
+            # Inside our own file the URL may since have been repointed; the credential
+            # still comes out, because it would otherwise be sent to whatever that URL
+            # now names.
             if ours or _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                env.pop("ANTHROPIC_AUTH_TOKEN", None)
                 env.pop("ANTHROPIC_BASE_URL", None)
             if not env:
                 del settings["env"]

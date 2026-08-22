@@ -973,17 +973,17 @@ def clear_managed_settings() -> str:
                         changed = True
                 env = settings.get("env") if isinstance(settings.get("env"), dict) else None
                 if env:
-                    # The token is a credential this setup wrote, and it is sent to
-                    # whatever ANTHROPIC_BASE_URL currently names, so it comes out however
-                    # that URL now reads. The URL itself is only ours to remove when it
-                    # still holds our gateway.
-                    if "ANTHROPIC_AUTH_TOKEN" in env:
-                        del env["ANTHROPIC_AUTH_TOKEN"]
-                        changed = True
-                    if ((ours or _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")))
-                            and "ANTHROPIC_BASE_URL" in env):
-                        del env["ANTHROPIC_BASE_URL"]
-                        changed = True
+                    # The token and the base URL are written together, so they go
+                    # together, and only out of a file this setup wrote or a pair it
+                    # recognises. A token in somebody else's file is their credential,
+                    # not ours to delete. Inside our own file the URL may since have been
+                    # repointed; the credential still comes out, because it would
+                    # otherwise be sent to whatever that URL now names.
+                    if ours or _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                        for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                            if k in env:
+                                del env[k]
+                                changed = True
                     if not env:
                         del settings["env"]
                 if changed:
