@@ -541,7 +541,13 @@ def _freeze_ownership_evidence(managed_dir=None) -> None:
     """Freeze what teardown judges ownership by, before teardown removes the very things
     that evidence consists of. Clearing sweeps UNBOUND_API_KEY out of the machine
     environment and unlinks the drop-in part-way through its own run, so reading either
-    one live means the same file gets a different verdict depending on when it is asked."""
+    one live means the same file gets a different verdict depending on when it is asked.
+
+    The first freeze of a run wins. A later call would re-read state this run has already
+    changed -- hooks mode freezes, deletes the key, then enters the managed-settings step
+    and would freeze again from a machine it has just altered."""
+    if _OWNERSHIP_EVIDENCE:
+        return
     try:
         if managed_dir is None:
             managed_dir = get_managed_settings_dir()

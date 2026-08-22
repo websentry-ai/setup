@@ -832,6 +832,38 @@ class TestTeardownDoesNotEatItsOwnEvidence(unittest.TestCase):
             mod._OWNERSHIP_EVIDENCE.clear()
             self.addCleanup(mod._OWNERSHIP_EVIDENCE.clear)
 
+    def test_a_later_freeze_does_not_overwrite_the_first(self):
+        # hooks mode freezes, deletes the key, then enters the managed-settings step and
+        # freezes again; a snapshot that re-snapshots is not one
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            mod._OWNERSHIP_EVIDENCE.clear()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                mod._freeze_ownership_evidence()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: False), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                mod._freeze_ownership_evidence()
+            self.assertTrue(mod._OWNERSHIP_EVIDENCE["installed_here"], mod.__name__)
+
+    def test_the_transition_still_retires_a_custom_flat_gateway(self):
+        # gateway installed through the fallback, then a switch to hooks mode: the key is
+        # gone by the time the managed settings are merged, so only the first freeze can
+        # still identify that file as ours
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            mod._OWNERSHIP_EVIDENCE.clear()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                mod._freeze_ownership_evidence()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: False), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                mod._freeze_ownership_evidence()
+                self.assertTrue(
+                    mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
+
     def test_the_frozen_key_survives_the_sweep_that_removes_it(self):
         content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}
         managed = Path(tempfile.mkdtemp())
