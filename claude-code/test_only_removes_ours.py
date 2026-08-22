@@ -261,6 +261,7 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
              patch.object(GATEWAY_MDM, "get_all_user_homes", lambda: [("mallory", home)]):
             GATEWAY_MDM.clear_managed_settings()
         env = json.loads((managed / "managed-settings.json").read_text())["env"]
+        # neither half is ours: their file, and a token this setup did not write there
         self.assertEqual(env, {"ANTHROPIC_BASE_URL": self.CUSTOM,
                                "ANTHROPIC_AUTH_TOKEN": "t"})
 
@@ -714,6 +715,239 @@ class TestTheCredentialComesOutOfOurFiles(unittest.TestCase):
                             "env": {"ANTHROPIC_BASE_URL": OURS,
                                     "ANTHROPIC_AUTH_TOKEN": "org-token"}})
         self.assertEqual(left, {"permissions": {"allow": []}})
+
+
+class TestEveryTreeRecordsWhatItRoutesAt(unittest.TestCase):
+    """The custom-endpoint check only works if the URL written to ANTHROPIC_BASE_URL and
+    the URL recorded in config.json are the same string. Each install normalises once and
+    uses that one value for both, so a reader comparing them can rely on it."""
+
+    CUSTOM_RAW = "unbound.acme-corp.internal/"
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def test_normalisation_makes_the_two_writes_agree(self):
+        for mod in (GATEWAY, GATEWAY_MDM):
+            self.assertEqual(mod.normalize_url(self.CUSTOM_RAW), self.CUSTOM,
+                             mod.__name__)
+
+    def test_a_recorded_url_is_accepted_however_it_was_written(self):
+        home = Path(tempfile.mkdtemp())
+        (home / ".unbound").mkdir()
+        (home / ".unbound" / "config.json").write_text(
+            json.dumps({"api_key": "k", "gateway_url": self.CUSTOM}))
+        for mod in USER_LEVEL:
+            with patch.object(mod.Path, "home", staticmethod(lambda: home)):
+                # exactly as written, and with the trailing slash a shell export may carry
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
+                self.assertTrue(mod._is_unbound_base_url(self.CUSTOM + "/"), mod.__name__)
+
+
+class TestAFailedRecordIsNotSilent(unittest.TestCase):
+    """Teardown identifies a non-default gateway only by the URL the install recorded. If
+    that write fails the route becomes unremovable, so the run has to say so rather than
+    report a clean install."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def test_the_route_is_recorded_before_it_is_set(self):
+        # setting ANTHROPIC_BASE_URL first and then failing to record it would leave a
+        # custom endpoint teardown cannot tell from the customer's own; the order is the
+        # fix, a warning afterwards is not
+        src = (ROOT / "gateway" / "setup.py").read_text()
+        record = src.index("_config_written = write_unbound_config(api_key")
+        route = src.index('set_env_var("ANTHROPIC_BASE_URL", args.gateway_url)')
+        self.assertLess(record, route)
+
+    def test_an_unrecordable_custom_gateway_is_refused_outright(self):
+        src = (ROOT / "gateway" / "setup.py").read_text()
+        block = src[src.index("_config_written = write_unbound_config(api_key"):
+                    src.index('set_env_var("ANTHROPIC_BASE_URL", args.gateway_url)')]
+        self.assertIn("return False", block)
+        self.assertIn("!= UNBOUND_GATEWAY_URL", block)
+
+    def test_the_mdm_writer_warns_when_it_cannot_record_a_custom_gateway(self):
+        out = []
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda *a, **k: None), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "Darwin"), \
+             patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            GATEWAY_MDM.write_unbound_config_for_user(
+                "alice", Path(tempfile.mkdtemp()), "k", self.CUSTOM)
+        self.assertTrue(any(self.CUSTOM in line for line in out), out)
+
+    def test_it_stays_quiet_for_the_default_gateway(self):
+        out = []
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda *a, **k: None), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "Darwin"), \
+             patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            GATEWAY_MDM.write_unbound_config_for_user(
+                "alice", Path(tempfile.mkdtemp()), "k", OURS)
+        self.assertEqual(out, [])
+
+    def test_the_writer_reports_success_so_failure_can_be_told_apart(self):
+        # _run_as_user returns None both for "fn returned None" and "the drop failed",
+        # so a writer that returns nothing reads as failed on every successful run
+        home = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            with patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)), \
+                 patch.object(mod.platform, "system", lambda: "Darwin"):
+                if mod is GATEWAY_MDM:
+                    mod.write_unbound_config_for_user("alice", home, "k", self.CUSTOM)
+                else:
+                    mod.write_unbound_config_for_user("alice", home, "k")
+            self.assertTrue((home / ".unbound" / "config.json").exists(), mod.__name__)
+
+    def test_a_successful_write_says_nothing(self):
+        out = []
+        home = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "_run_as_user",
+                          lambda _u, fn, *a, **k: fn(*a, **k)), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "Darwin"), \
+             patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            GATEWAY_MDM.write_unbound_config_for_user("alice", home, "k", self.CUSTOM)
+        self.assertEqual(out, [])
+        self.assertEqual(
+            json.loads((home / ".unbound" / "config.json").read_text())["gateway_url"],
+            self.CUSTOM)
+
+
+class TestOneVerdictPerFile(unittest.TestCase):
+    """The env sweep and the file clearing must agree about the same file. When they
+    disagreed, the token came out of the flat fallback and its custom base URL stayed,
+    leaving Claude Code routed at a retired gateway with no credential."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def _clear_flat(self, content):
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed):
+            GATEWAY_MDM.clear_managed_settings()
+        path = managed / "managed-settings.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def test_our_own_signature_is_cleared_whole(self):
+        left = self._clear_flat(
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}})
+        self.assertEqual(left, {})
+
+    def test_the_sweep_and_the_clearing_agree(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
+            clearing_says_ours = GATEWAY_MDM._managed_settings_is_exactly_ours(content)
+        self.assertTrue(sweep_says_ours)
+        self.assertEqual(sweep_says_ours, clearing_says_ours)
+
+    def test_an_administrators_file_is_left_to_them_by_both(self):
+        content = {"permissions": {"allow": []},
+                   "env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
+        self.assertFalse(sweep_says_ours)
+        self.assertFalse(GATEWAY_MDM._managed_settings_is_exactly_ours(content))
+        # their file, so neither half is ours to touch
+        self.assertEqual(self._clear_flat(content), content)
+
+
+class TestWindowsInstallToTeardownRoundTrip(unittest.TestCase):
+    """The whole point, end to end and through the real installer: a Windows MDM device
+    with no user profiles installs a custom gateway, and teardown recognises it as ours
+    without consulting any account."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def _install(self, gateway_url):
+        managed = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            self.assertTrue(GATEWAY_MDM.setup_managed_settings("org-token",
+                                                               gateway_url=gateway_url))
+        return managed
+
+    def _matcher(self, managed):
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            return GATEWAY_MDM._unbound_base_url_matcher(None, None)
+
+    def test_the_installer_records_the_custom_gateway(self):
+        managed = self._install(self.CUSTOM)
+        dropin = managed / "managed-settings.d" / "unbound.json"
+        self.assertTrue(dropin.exists())
+        self.assertEqual(json.loads(dropin.read_text())["env"]["ANTHROPIC_BASE_URL"],
+                         self.CUSTOM)
+
+    def test_teardown_recognises_it_with_no_user_profiles(self):
+        matcher = self._matcher(self._install(self.CUSTOM))
+        self.assertTrue(matcher(self.CUSTOM))
+        self.assertTrue(matcher(OURS))
+
+    def test_the_fallback_path_round_trips_too(self):
+        # when the drop-in directory cannot be created the install writes the flat file;
+        # teardown has to recognise the route from there or it stays on the device
+        managed = Path(tempfile.mkdtemp())
+        real_mkdir = Path.mkdir
+
+        def no_dropin(self, *a, **k):
+            if self.name == "managed-settings.d":
+                raise OSError("cannot create drop-in dir")
+            return real_mkdir(self, *a, **k)
+
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"), \
+             patch.object(Path, "mkdir", no_dropin):
+            self.assertTrue(GATEWAY_MDM.setup_managed_settings(
+                "org-token", gateway_url=self.CUSTOM))
+        self.assertFalse((managed / "managed-settings.d" / "unbound.json").exists())
+        self.assertTrue((managed / "managed-settings.json").exists())
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            matcher = GATEWAY_MDM._unbound_base_url_matcher(None, None)
+        self.assertTrue(matcher(self.CUSTOM))
+        self.assertFalse(matcher(THEIRS))
+
+    def test_and_still_refuses_an_endpoint_we_did_not_install(self):
+        matcher = self._matcher(self._install(self.CUSTOM))
+        self.assertFalse(matcher(THEIRS))
+        self.assertFalse(matcher("https://bedrock.us-east-1.amazonaws.com"))
+
+
+class TestGatewayMdmRecordsItsGateway(unittest.TestCase):
+    """Teardown recognises a custom endpoint from the URL recorded for a user, so the
+    gateway MDM install has to write one -- the hooks MDM tree already did."""
+
+    def _write(self, gateway_url=None):
+        home = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+            if gateway_url is None:
+                GATEWAY_MDM.write_unbound_config_for_user("alice", home, "ub-key")
+            else:
+                GATEWAY_MDM.write_unbound_config_for_user("alice", home, "ub-key", gateway_url)
+        return json.loads((home / ".unbound" / "config.json").read_text())
+
+    def test_a_custom_gateway_is_recorded(self):
+        config = self._write("https://unbound.acme-corp.internal/")
+        self.assertEqual(config["gateway_url"], "https://unbound.acme-corp.internal")
+        self.assertEqual(config["api_key"], "ub-key")
+
+    def test_no_gateway_url_records_only_the_key(self):
+        self.assertEqual(self._write(), {"api_key": "ub-key"})
+
+    def test_what_it_records_is_what_the_matcher_accepts(self):
+        custom = "https://unbound.acme-corp.internal"
+        home = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)):
+            GATEWAY_MDM.write_unbound_config_for_user("alice", home, "ub-key", custom)
+            matcher = GATEWAY_MDM._unbound_base_url_matcher("alice", home)
+        self.assertTrue(matcher(custom))
+        self.assertFalse(matcher(THEIRS))
 
 
 class TestTheWriterAndTheReaderAgree(unittest.TestCase):
