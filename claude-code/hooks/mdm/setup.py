@@ -551,22 +551,31 @@ def _recorded_gateway_url_for_user(username, home_dir) -> str:
     return result or ""
 
 
-def _managed_settings_is_exactly_ours(settings) -> bool:
-    """Whether a managed settings file's whole content is what this setup writes on the
-    fallback path: one env block holding the token and the base URL and nothing else. The
-    install replaces that file outright, so this shape identifies it; an administrator's
-    settings carry other keys and are not ours to touch."""
+def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
+    """Whether a managed settings file is the one this setup writes on the fallback path.
+
+    Three things have to hold, because the shape alone proves nothing: an env block
+    holding just the token and the base URL is also the ordinary env-only managed layout
+    an organisation writes for Bedrock or their own gateway.
+
+    The drop-in must be absent. The install prefers managed-settings.d/unbound.json
+    exactly so it does not touch a sibling flat file, so a drop-in on disk means the flat
+    file beside it belongs to somebody else whatever it contains. And the endpoint must be
+    one we recognise: on the fallback path there is no record to identify a custom gateway
+    by, and guessing there would delete an organisation's own routing and credential."""
+    if (managed_dir / "managed-settings.d" / "unbound.json").exists():
+        return False
     if not isinstance(settings, dict) or set(settings) != {"env"}:
         return False
     env = settings.get("env")
-    return (isinstance(env, dict)
-            and set(env) == {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"})
+    if not (isinstance(env, dict)
+            and set(env) == {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}):
+        return False
+    return _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL"))
 
 
-def _managed_settings_gateway_url(path, whole_file_must_be_ours: bool) -> str:
-    """The base URL in a managed settings file's env block. With whole_file_must_be_ours,
-    only a file whose entire content is what this setup writes counts -- the fallback file
-    is shared with the administrator, and any other key in it means it is theirs."""
+def _managed_settings_gateway_url(path) -> str:
+    """The base URL in a managed settings file's env block, or ""."""
     try:
         fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
         with os.fdopen(fd, 'r', encoding='utf-8') as handle:
@@ -575,13 +584,12 @@ def _managed_settings_gateway_url(path, whole_file_must_be_ours: bool) -> str:
         return ""
     if not isinstance(settings, dict):
         return ""
-    if whole_file_must_be_ours and not _managed_settings_is_exactly_ours(settings):
-        return ""
     env = settings.get("env")
     if not isinstance(env, dict):
         return ""
     recorded = env.get("ANTHROPIC_BASE_URL")
     return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
 
 
 def _recorded_managed_gateway_url() -> str:
@@ -597,10 +605,11 @@ def _recorded_managed_gateway_url() -> str:
         managed_dir = get_managed_settings_dir()
     except OSError:
         return ""
-    return (_managed_settings_gateway_url(
-                managed_dir / "managed-settings.d" / "unbound.json", False)
-            or _managed_settings_gateway_url(
-                managed_dir / "managed-settings.json", True))
+    # The drop-in only. The install writes the flat file instead when it cannot create
+    # the drop-in directory, but nothing there identifies a custom endpoint as ours, and
+    # that same shape is what an organisation writes for their own gateway.
+    return _managed_settings_gateway_url(
+        managed_dir / "managed-settings.d" / "unbound.json")
 
 def _unbound_base_url_matcher(username, home_dir):
     """Accepts our default gateway, or the one recorded for this user. The record is read
@@ -1089,7 +1098,7 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # shape as ours, and stripping it must agree or the base URL stays behind while
         # its credential goes.
         ours = (_is_our_dropin(settings_path)
-                or _managed_settings_is_exactly_ours(settings))
+                or _managed_settings_is_exactly_ours(settings, get_managed_settings_dir()))
         if (ours or _is_unbound_key_helper_setting(settings.get("apiKeyHelper"),
                                                    get_managed_settings_dir())):
             settings.pop("apiKeyHelper", None)

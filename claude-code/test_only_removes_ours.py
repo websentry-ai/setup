@@ -165,11 +165,12 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
             with patch.object(mod, "get_managed_settings_dir", lambda: managed):
                 yield mod, mod._unbound_base_url_matcher(None, None)
 
-    def test_the_flat_fallback_counts_when_it_is_exactly_what_we_write(self):
-        # the install replaces that whole file, so this shape is unambiguously ours
+    def test_a_custom_endpoint_in_the_flat_file_is_not_ours(self):
+        # that shape is also the ordinary env-only managed layout an org writes for
+        # Bedrock or their own gateway, so it cannot vouch for an endpoint by itself
         for mod, matcher in self._flat(
                 {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}):
-            self.assertTrue(matcher(self.CUSTOM), mod.__name__)
+            self.assertFalse(matcher(self.CUSTOM), mod.__name__)
 
     def test_an_administrators_flat_file_stays_theirs(self):
         # any other top-level key means they wrote it, so the URL in it is not our record
@@ -825,20 +826,38 @@ class TestOneVerdictPerFile(unittest.TestCase):
         path = managed / "managed-settings.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
-    def test_our_own_signature_is_cleared_whole(self):
+    def test_our_own_fallback_file_is_cleared_whole(self):
         left = self._clear_flat(
-            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}})
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}})
         self.assertEqual(left, {})
 
-    def test_the_sweep_and_the_clearing_agree(self):
+    def test_a_custom_endpoint_in_that_shape_is_left_alone(self):
+        # deliberate: on the fallback path nothing identifies a custom gateway as ours,
+        # and guessing deletes an organisation's own routing
         content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
                            "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        self.assertEqual(self._clear_flat(content), content)
+
+    def test_a_drop_in_on_disk_means_the_flat_file_is_not_ours(self):
+        # the install prefers the drop-in exactly so it leaves a sibling flat file alone
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.d").mkdir(parents=True)
+        (managed / "managed-settings.d" / "unbound.json").write_text(json.dumps(
+            {"env": {"ANTHROPIC_BASE_URL": OURS}}))
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}}
+        for mod in MDM:
+            self.assertFalse(
+                mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
+
+    def test_the_sweep_and_the_clearing_agree(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": OURS}}
         managed = Path(tempfile.mkdtemp())
         (managed / "managed-settings.json").write_text(json.dumps(content))
         with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
              patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
-            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
-            clearing_says_ours = GATEWAY_MDM._managed_settings_is_exactly_ours(content)
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(OURS)
+            clearing_says_ours = GATEWAY_MDM._managed_settings_is_exactly_ours(
+                content, managed)
         self.assertTrue(sweep_says_ours)
         self.assertEqual(sweep_says_ours, clearing_says_ours)
 
@@ -852,7 +871,7 @@ class TestOneVerdictPerFile(unittest.TestCase):
              patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
             sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
         self.assertFalse(sweep_says_ours)
-        self.assertFalse(GATEWAY_MDM._managed_settings_is_exactly_ours(content))
+        self.assertFalse(GATEWAY_MDM._managed_settings_is_exactly_ours(content, managed))
         # their file, so neither half is ours to touch
         self.assertEqual(self._clear_flat(content), content)
 
@@ -910,7 +929,9 @@ class TestWindowsInstallToTeardownRoundTrip(unittest.TestCase):
         with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
              patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
             matcher = GATEWAY_MDM._unbound_base_url_matcher(None, None)
-        self.assertTrue(matcher(self.CUSTOM))
+        # a custom endpoint written to the flat file stays: nothing there tells it from
+        # an organisation's own, and removing it on a guess is the worse failure
+        self.assertFalse(matcher(self.CUSTOM))
         self.assertFalse(matcher(THEIRS))
 
     def test_and_still_refuses_an_endpoint_we_did_not_install(self):
