@@ -919,7 +919,14 @@ def main():
     _install_state = detect_install_state()
     _device_id = get_device_identifier()
 
-    write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
+    _config_written = write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
+    if not _config_written and args.gateway_url != UNBOUND_GATEWAY_URL:
+        # Clearing this setup identifies a non-default gateway by the URL recorded here.
+        # Without it the endpoint is indistinguishable from one the customer configured,
+        # so it is left in place rather than removed on a guess.
+        print(f"⚠️  Could not record the gateway URL, so clearing this setup will not "
+              f"remove ANTHROPIC_BASE_URL={args.gateway_url}.")
+        print("   Remove that export by hand if you uninstall.")
 
     # Configure Claude Code helper files
     debug_print("Setting up Claude key helper...")

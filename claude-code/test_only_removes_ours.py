@@ -723,6 +723,58 @@ class TestEveryTreeRecordsWhatItRoutesAt(unittest.TestCase):
                 self.assertTrue(mod._is_unbound_base_url(self.CUSTOM + "/"), mod.__name__)
 
 
+class TestAFailedRecordIsNotSilent(unittest.TestCase):
+    """Teardown identifies a non-default gateway only by the URL the install recorded. If
+    that write fails the route becomes unremovable, so the run has to say so rather than
+    report a clean install."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def test_the_mdm_writer_warns_when_it_cannot_record_a_custom_gateway(self):
+        out = []
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda *a, **k: None), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "Darwin"), \
+             patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            GATEWAY_MDM.write_unbound_config_for_user(
+                "alice", Path(tempfile.mkdtemp()), "k", self.CUSTOM)
+        self.assertTrue(any(self.CUSTOM in line for line in out), out)
+
+    def test_it_stays_quiet_for_the_default_gateway(self):
+        out = []
+        with patch.object(GATEWAY_MDM, "_run_as_user", lambda *a, **k: None), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "Darwin"), \
+             patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            GATEWAY_MDM.write_unbound_config_for_user(
+                "alice", Path(tempfile.mkdtemp()), "k", OURS)
+        self.assertEqual(out, [])
+
+    def test_the_writer_reports_success_so_failure_can_be_told_apart(self):
+        # _run_as_user returns None both for "fn returned None" and "the drop failed",
+        # so a writer that returns nothing reads as failed on every successful run
+        home = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            with patch.object(mod, "_run_as_user", lambda _u, fn, *a, **k: fn(*a, **k)), \
+                 patch.object(mod.platform, "system", lambda: "Darwin"):
+                if mod is GATEWAY_MDM:
+                    mod.write_unbound_config_for_user("alice", home, "k", self.CUSTOM)
+                else:
+                    mod.write_unbound_config_for_user("alice", home, "k")
+            self.assertTrue((home / ".unbound" / "config.json").exists(), mod.__name__)
+
+    def test_a_successful_write_says_nothing(self):
+        out = []
+        home = Path(tempfile.mkdtemp())
+        with patch.object(GATEWAY_MDM, "_run_as_user",
+                          lambda _u, fn, *a, **k: fn(*a, **k)), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "Darwin"), \
+             patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
+            GATEWAY_MDM.write_unbound_config_for_user("alice", home, "k", self.CUSTOM)
+        self.assertEqual(out, [])
+        self.assertEqual(
+            json.loads((home / ".unbound" / "config.json").read_text())["gateway_url"],
+            self.CUSTOM)
+
+
 class TestOneVerdictPerFile(unittest.TestCase):
     """The env sweep and the file clearing must agree about the same file. When they
     disagreed, the token came out of the flat fallback and its custom base URL stayed,

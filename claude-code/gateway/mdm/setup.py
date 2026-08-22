@@ -735,9 +735,16 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(json.dumps(config, indent=2))
+        # _run_as_user cannot tell a None return from a failed drop, so success says so.
+        return True
 
     if _run_as_user(username, _write) is None and platform.system().lower() != "windows":
         debug_print(f"Could not write config for {username}")
+        if gateway_url and normalize_url(gateway_url) != DEFAULT_GATEWAY_URL:
+            # On Unix this record is the only thing identifying a non-default gateway at
+            # teardown: the managed drop-in carries the key helper, not the endpoint.
+            print(f"⚠️  Could not record the gateway URL for {username}, so clearing this "
+                  f"setup will not remove their ANTHROPIC_BASE_URL={gateway_url}.")
 
 
 def remove_hooks_unbound_script_for_user(username: str, home_dir: Path) -> None:
