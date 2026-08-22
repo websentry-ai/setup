@@ -551,6 +551,18 @@ def _recorded_gateway_url_for_user(username, home_dir) -> str:
     return result or ""
 
 
+def _managed_settings_is_exactly_ours(settings) -> bool:
+    """Whether a managed settings file's whole content is what this setup writes on the
+    fallback path: one env block holding the token and the base URL and nothing else. The
+    install replaces that file outright, so this shape identifies it; an administrator's
+    settings carry other keys and are not ours to touch."""
+    if not isinstance(settings, dict) or set(settings) != {"env"}:
+        return False
+    env = settings.get("env")
+    return (isinstance(env, dict)
+            and set(env) == {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"})
+
+
 def _managed_settings_gateway_url(path, whole_file_must_be_ours: bool) -> str:
     """The base URL in a managed settings file's env block. With whole_file_must_be_ours,
     only a file whose entire content is what this setup writes counts -- the fallback file
@@ -563,12 +575,10 @@ def _managed_settings_gateway_url(path, whole_file_must_be_ours: bool) -> str:
         return ""
     if not isinstance(settings, dict):
         return ""
+    if whole_file_must_be_ours and not _managed_settings_is_exactly_ours(settings):
+        return ""
     env = settings.get("env")
     if not isinstance(env, dict):
-        return ""
-    if whole_file_must_be_ours and (
-            set(settings) != {"env"}
-            or set(env) != {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}):
         return ""
     recorded = env.get("ANTHROPIC_BASE_URL")
     return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
@@ -1075,7 +1085,11 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # Drop gateway MDM setup from the same file — leaving its apiKeyHelper
         # behind makes Claude Code run anthropic_key.sh, which echoes the now
         # removed UNBOUND_API_KEY and fails with "did not return a valid value".
-        ours = _is_our_dropin(settings_path)
+        # One verdict per file: the env sweep already treats a flat file of exactly this
+        # shape as ours, and stripping it must agree or the base URL stays behind while
+        # its credential goes.
+        ours = (_is_our_dropin(settings_path)
+                or _managed_settings_is_exactly_ours(settings))
         if (ours or _is_unbound_key_helper_setting(settings.get("apiKeyHelper"),
                                                    get_managed_settings_dir())):
             settings.pop("apiKeyHelper", None)

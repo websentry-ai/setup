@@ -252,8 +252,11 @@ class TestARecordedCustomGatewayIsOurs(unittest.TestCase):
     def test_the_managed_env_block_still_ignores_a_users_record(self):
         home = self._home(self.CUSTOM)
         managed = Path(tempfile.mkdtemp())
+        # an extra key makes it unmistakably the administrator's file, so the only thing
+        # that could authorise clearing it is mallory's record -- which must not
         (managed / "managed-settings.json").write_text(json.dumps(
-            {"env": {"ANTHROPIC_BASE_URL": self.CUSTOM, "ANTHROPIC_AUTH_TOKEN": "t"}}))
+            {"permissions": {"allow": []},
+             "env": {"ANTHROPIC_BASE_URL": self.CUSTOM, "ANTHROPIC_AUTH_TOKEN": "t"}}))
         with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
              patch.object(GATEWAY_MDM, "get_all_user_homes", lambda: [("mallory", home)]):
             GATEWAY_MDM.clear_managed_settings()
@@ -615,11 +618,13 @@ class TestOurOwnDropInIsOursByConstruction(unittest.TestCase):
 
     SELF_HOSTED = "https://ai.acme-corp.internal"
 
-    def _clear(self, filename, parent, env):
+    def _clear(self, filename, parent, env, extra=None):
         managed = Path(tempfile.mkdtemp())
         target = managed / parent if parent else managed
         target.mkdir(parents=True, exist_ok=True)
-        (target / filename).write_text(json.dumps({"env": dict(env)}))
+        content = {"env": dict(env)}
+        content.update(extra or {})
+        (target / filename).write_text(json.dumps(content))
         with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed):
             GATEWAY_MDM.clear_managed_settings()
         path = target / filename
@@ -636,7 +641,8 @@ class TestOurOwnDropInIsOursByConstruction(unittest.TestCase):
         # credential beside it is ours and comes out either way
         left = self._clear("managed-settings.json", None,
                            {"ANTHROPIC_BASE_URL": self.SELF_HOSTED,
-                            "ANTHROPIC_AUTH_TOKEN": "org-token"})
+                            "ANTHROPIC_AUTH_TOKEN": "org-token"},
+                           extra={"permissions": {"allow": []}})
         self.assertEqual(left, {"ANTHROPIC_BASE_URL": self.SELF_HOSTED})
 
     def test_our_gateway_in_the_shared_file_is_cleared(self):
@@ -665,7 +671,10 @@ class TestTheCredentialAlwaysComesOut(unittest.TestCase):
     def _clear(self, env):
         managed = Path(tempfile.mkdtemp())
         managed.mkdir(parents=True, exist_ok=True)
-        (managed / "managed-settings.json").write_text(json.dumps({"env": dict(env)}))
+        # the administrator's file: an extra key keeps it from matching our own signature,
+        # so this isolates what happens to the credential rather than to the whole file
+        (managed / "managed-settings.json").write_text(json.dumps(
+            {"permissions": {"allow": []}, "env": dict(env)}))
         with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed):
             GATEWAY_MDM.clear_managed_settings()
         path = managed / "managed-settings.json"
@@ -712,6 +721,54 @@ class TestEveryTreeRecordsWhatItRoutesAt(unittest.TestCase):
                 # exactly as written, and with the trailing slash a shell export may carry
                 self.assertTrue(mod._is_unbound_base_url(self.CUSTOM), mod.__name__)
                 self.assertTrue(mod._is_unbound_base_url(self.CUSTOM + "/"), mod.__name__)
+
+
+class TestOneVerdictPerFile(unittest.TestCase):
+    """The env sweep and the file clearing must agree about the same file. When they
+    disagreed, the token came out of the flat fallback and its custom base URL stayed,
+    leaving Claude Code routed at a retired gateway with no credential."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def _clear_flat(self, content):
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed):
+            GATEWAY_MDM.clear_managed_settings()
+        path = managed / "managed-settings.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def test_our_own_signature_is_cleared_whole(self):
+        left = self._clear_flat(
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}})
+        self.assertEqual(left, {})
+
+    def test_the_sweep_and_the_clearing_agree(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
+            clearing_says_ours = GATEWAY_MDM._managed_settings_is_exactly_ours(content)
+        self.assertTrue(sweep_says_ours)
+        self.assertEqual(sweep_says_ours, clearing_says_ours)
+
+    def test_an_administrators_file_is_left_to_them_by_both(self):
+        content = {"permissions": {"allow": []},
+                   "env": {"ANTHROPIC_AUTH_TOKEN": "t",
+                           "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        (managed / "managed-settings.json").write_text(json.dumps(content))
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM.platform, "system", lambda: "windows"):
+            sweep_says_ours = GATEWAY_MDM._unbound_base_url_matcher(None, None)(self.CUSTOM)
+        self.assertFalse(sweep_says_ours)
+        self.assertFalse(GATEWAY_MDM._managed_settings_is_exactly_ours(content))
+        # their base URL survives; only the credential we wrote comes out
+        left = self._clear_flat(content)
+        self.assertEqual(left["env"], {"ANTHROPIC_BASE_URL": self.CUSTOM})
 
 
 class TestWindowsInstallToTeardownRoundTrip(unittest.TestCase):
