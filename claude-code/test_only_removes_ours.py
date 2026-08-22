@@ -820,6 +820,79 @@ class TestAFailedRecordIsNotSilent(unittest.TestCase):
             self.CUSTOM)
 
 
+class TestTeardownDoesNotEatItsOwnEvidence(unittest.TestCase):
+    """Clearing sweeps the machine key and unlinks the drop-in part-way through its own
+    run, and both are what its ownership checks read. Judged live, the same file gets a
+    different verdict depending on when it is asked."""
+
+    CUSTOM = "https://unbound.acme-corp.internal"
+
+    def setUp(self):
+        for mod in MDM:
+            mod._OWNERSHIP_EVIDENCE.clear()
+            self.addCleanup(mod._OWNERSHIP_EVIDENCE.clear)
+
+    def test_the_frozen_key_survives_the_sweep_that_removes_it(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            mod._OWNERSHIP_EVIDENCE.clear()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                mod._freeze_ownership_evidence()
+            # the sweep has since removed the key from the machine environment
+            with patch.object(mod, "_machine_env_is_set", lambda _v: False):
+                self.assertTrue(
+                    mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
+
+    def test_an_unlinked_drop_in_does_not_make_a_sibling_ours(self):
+        # clear_managed_settings removes the drop-in first, then reaches the flat file
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        dropin = managed / "managed-settings.d" / "unbound.json"
+        dropin.parent.mkdir(parents=True)
+        dropin.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": OURS}}))
+        for mod in MDM:
+            mod._OWNERSHIP_EVIDENCE.clear()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True), \
+                 patch.object(mod, "get_managed_settings_dir", lambda: managed):
+                mod._freeze_ownership_evidence()
+            dropin.unlink()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True):
+                self.assertFalse(
+                    mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
+            dropin.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": OURS}}))
+
+    def test_without_a_snapshot_it_still_reads_live(self):
+        content = {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}
+        managed = Path(tempfile.mkdtemp())
+        for mod in MDM:
+            mod._OWNERSHIP_EVIDENCE.clear()
+            with patch.object(mod, "_machine_env_is_set", lambda _v: True):
+                self.assertTrue(
+                    mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
+            with patch.object(mod, "_machine_env_is_set", lambda _v: False):
+                self.assertFalse(
+                    mod._managed_settings_is_exactly_ours(content, managed), mod.__name__)
+
+    def test_a_full_clear_retires_a_custom_fallback_route(self):
+        managed = Path(tempfile.mkdtemp())
+        flat = managed / "managed-settings.json"
+        flat.write_text(json.dumps(
+            {"env": {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": self.CUSTOM}}))
+        GATEWAY_MDM._OWNERSHIP_EVIDENCE.clear()
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM, "_machine_env_is_set", lambda _v: True):
+            GATEWAY_MDM._freeze_ownership_evidence()
+        # the key sweep has already run by the time the managed settings are cleared
+        with patch.object(GATEWAY_MDM, "get_managed_settings_dir", lambda: managed), \
+             patch.object(GATEWAY_MDM, "_machine_env_is_set", lambda _v: False):
+            GATEWAY_MDM.clear_managed_settings()
+            matcher = GATEWAY_MDM._unbound_base_url_matcher(None, None)
+        self.assertEqual(json.loads(flat.read_text()), {})
+        self.assertTrue(matcher(self.CUSTOM))
+
+
 class TestOneVerdictPerFile(unittest.TestCase):
     """The env sweep and the file clearing must agree about the same file. When they
     disagreed, the token came out of the flat fallback and its custom base URL stayed,

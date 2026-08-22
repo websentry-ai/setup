@@ -564,6 +564,37 @@ def _machine_env_is_set(var_name: str) -> bool:
     return result.returncode == 0
 
 
+_OWNERSHIP_EVIDENCE = {}
+
+
+def _freeze_ownership_evidence(managed_dir=None) -> None:
+    """Freeze what teardown judges ownership by, before teardown removes the very things
+    that evidence consists of. Clearing sweeps UNBOUND_API_KEY out of the machine
+    environment and unlinks the drop-in part-way through its own run, so reading either
+    one live means the same file gets a different verdict depending on when it is asked."""
+    try:
+        if managed_dir is None:
+            managed_dir = get_managed_settings_dir()
+    except OSError:
+        return
+    _OWNERSHIP_EVIDENCE["installed_here"] = _machine_env_is_set("UNBOUND_API_KEY")
+    _OWNERSHIP_EVIDENCE["dropin_present"] = (
+        managed_dir / "managed-settings.d" / "unbound.json").exists()
+    _OWNERSHIP_EVIDENCE["gateway_url"] = _read_managed_gateway_url()
+
+
+def _installed_here() -> bool:
+    if "installed_here" in _OWNERSHIP_EVIDENCE:
+        return _OWNERSHIP_EVIDENCE["installed_here"]
+    return _machine_env_is_set("UNBOUND_API_KEY")
+
+
+def _dropin_present(managed_dir) -> bool:
+    if "dropin_present" in _OWNERSHIP_EVIDENCE:
+        return _OWNERSHIP_EVIDENCE["dropin_present"]
+    return (managed_dir / "managed-settings.d" / "unbound.json").exists()
+
+
 def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
     """Whether a managed settings file is the one this setup writes on the fallback path.
 
@@ -580,7 +611,7 @@ def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
     gateway be recognised here without the endpoint vouching for itself: an organisation's
     own Bedrock settings sit on a device that has no such key. This shape only ever occurs
     on Windows; the Unix install writes an apiKeyHelper, not an env block."""
-    if (managed_dir / "managed-settings.d" / "unbound.json").exists():
+    if _dropin_present(managed_dir):
         return False
     if not isinstance(settings, dict) or set(settings) != {"env"}:
         return False
@@ -588,7 +619,7 @@ def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
     if not (isinstance(env, dict)
             and set(env) == {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}):
         return False
-    return _machine_env_is_set("UNBOUND_API_KEY")
+    return _installed_here()
 
 
 def _managed_settings_gateway_url(path) -> str:
@@ -609,7 +640,7 @@ def _managed_settings_gateway_url(path) -> str:
 
 
 
-def _recorded_managed_gateway_url() -> str:
+def _read_managed_gateway_url() -> str:
     """The gateway URL this setup recorded on the device. Device-level state we own, so
     unlike a per-account record it can authorise removing the machine-wide route, which
     matters on a Windows device that has no user profiles to read.
@@ -636,6 +667,14 @@ def _recorded_managed_gateway_url() -> str:
     if not _managed_settings_is_exactly_ours(settings, managed_dir):
         return ""
     return _managed_settings_gateway_url(flat)
+
+def _recorded_managed_gateway_url() -> str:
+    """The recorded gateway, from the snapshot when teardown has frozen one. The record
+    lives in files this run also clears, so reading it live afterwards loses it."""
+    if "gateway_url" in _OWNERSHIP_EVIDENCE:
+        return _OWNERSHIP_EVIDENCE["gateway_url"]
+    return _read_managed_gateway_url()
+
 
 def _unbound_base_url_matcher(username, home_dir):
     """Accepts our default gateway, or the one recorded for this user. The record is read
@@ -1060,6 +1099,9 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         managed_dir = get_managed_settings_dir()
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
+        # Before this run removes the gateway's leftovers, which are what its ownership
+        # checks read.
+        _freeze_ownership_evidence(managed_dir)
 
         if skip_settings:
             settings_path = None
@@ -1987,6 +2029,8 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
+    _freeze_ownership_evidence()
+
     # Remove leftover gateway setup env vars. Runs before write_unbound_config_for_user
     # below, which rewrites the recorded gateway_url the ownership check reads --
     # afterwards it would answer for this install, not the one being removed.
