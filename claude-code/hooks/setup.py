@@ -1228,6 +1228,13 @@ def main():
         debug_print("Debug mode enabled")
 
     config_dir = _resolve_claude_config_dir(sys.argv)
+    # Claude Code picks its config dir from the environment alone. An install
+    # aimed somewhere else by --config-dir is one it will never read, so say so
+    # rather than reporting success over a set of hooks that cannot fire.
+    if "--config-dir" in sys.argv and not (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip():
+        print(f"\n⚠️  --config-dir set to {config_dir} but CLAUDE_CONFIG_DIR is not set in the "
+              "environment. Claude Code reads only the environment variable, so it will not load "
+              "these hooks. Export CLAUDE_CONFIG_DIR to the same path.")
 
     if clear_mode:
         return clear_setup(config_dir)

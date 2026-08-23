@@ -422,6 +422,15 @@ class TestResolveClaudeConfigDir(unittest.TestCase):
             result = setup._resolve_claude_config_dir(["x"])
         self.assertEqual(result, Path.home() / ".claude")
 
+    def test_arg_without_env_still_resolves_to_the_arg(self):
+        # The install honours --config-dir, but Claude Code keys off the env var
+        # alone, so main() warns that these hooks will not be read.
+        import setup
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
+        self.assertEqual(result, Path(os.path.abspath("/arg/cc")))
+
 
 class TestInstallUnderResolvedDir(unittest.TestCase):
     """Hooks + settings + baked command must land under the resolved config dir."""
