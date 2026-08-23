@@ -66,6 +66,12 @@ def _resolve_claude_config_dir(argv) -> Path:
     value = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
     if not value:
         for i, arg in enumerate(argv):
+            # Both spellings: --config-dir VALUE and --config-dir=VALUE. Missing
+            # the second would silently fall back to ~/.claude, which is the very
+            # wrong-directory install this is meant to prevent.
+            if arg.startswith("--config-dir="):
+                value = arg.split("=", 1)[1].strip() or None
+                break
             if arg == "--config-dir" and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
                 value = argv[i + 1].strip() or None
                 break
@@ -1231,7 +1237,8 @@ def main():
     # Claude Code picks its config dir from the environment alone. An install
     # aimed somewhere else by --config-dir is one it will never read, so say so
     # rather than reporting success over a set of hooks that cannot fire.
-    if "--config-dir" in sys.argv and not (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip():
+    _arg_dir_given = any(a == "--config-dir" or a.startswith("--config-dir=") for a in sys.argv)
+    if _arg_dir_given and not (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip():
         print(f"\n⚠️  --config-dir set to {config_dir} but CLAUDE_CONFIG_DIR is not set in the "
               "environment. Claude Code reads only the environment variable, so it will not load "
               "these hooks. Export CLAUDE_CONFIG_DIR to the same path.")
