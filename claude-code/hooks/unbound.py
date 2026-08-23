@@ -60,7 +60,11 @@ COWORK_BUILTIN_MCP_SERVERS = frozenset({
 # Claude keeps .claude.json beside the config dir when relocated, and directly
 # in the home dir otherwise — it is not nested under the default ~/.claude.
 CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if _env_config_dir else (Path.home() / ".claude.json")
-CLAUDE_PLUGIN_CACHE_DIR = _CONFIG_DIR / "plugins" / "cache"
+# Claude Code lets CLAUDE_CODE_PLUGIN_CACHE_DIR override the plugin root outright,
+# and falls back to <config dir>/plugins otherwise.
+_env_plugin_dir = (os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or "").strip()
+_PLUGIN_ROOT = Path(os.path.abspath(_env_plugin_dir)) if _env_plugin_dir else _CONFIG_DIR / "plugins"
+CLAUDE_PLUGIN_CACHE_DIR = _PLUGIN_ROOT / "cache"
 POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
