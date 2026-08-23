@@ -71,7 +71,8 @@ def _resolve_claude_config_dir(argv) -> Path:
                 break
     if not value:
         return Path.home() / ".claude"
-    return Path(value).expanduser().resolve()
+    # Verbatim, as Claude Code reads it: a literal "~" must not be expanded.
+    return Path(os.path.abspath(value))
 
 
 def get_shell_rc_file() -> Path:

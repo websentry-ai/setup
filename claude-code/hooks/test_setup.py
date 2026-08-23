@@ -380,20 +380,20 @@ class TestResolveClaudeConfigDir(unittest.TestCase):
         import setup
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
             result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
-        self.assertEqual(result, Path("/env/cc").resolve())
+        self.assertEqual(result, Path(os.path.abspath("/env/cc")))
 
     def test_arg_used_when_no_env(self):
         import setup
         env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
         with patch.dict(os.environ, env, clear=True):
             result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
-        self.assertEqual(result, Path("/arg/cc").resolve())
+        self.assertEqual(result, Path(os.path.abspath("/arg/cc")))
 
     def test_env_used_when_no_arg(self):
         import setup
         with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
             result = setup._resolve_claude_config_dir(["x"])
-        self.assertEqual(result, Path("/env/cc").resolve())
+        self.assertEqual(result, Path(os.path.abspath("/env/cc")))
 
     def test_home_default_when_arg_and_env_absent(self):
         import setup
@@ -405,7 +405,22 @@ class TestResolveClaudeConfigDir(unittest.TestCase):
     def test_relative_value_is_absolutized(self):
         import setup
         result = setup._resolve_claude_config_dir(["x", "--config-dir", "rel/cc"])
-        self.assertEqual(result, Path("rel/cc").resolve())
+        self.assertEqual(result, Path(os.path.abspath("rel/cc")))
+
+    def test_leading_tilde_stays_literal(self):
+        # Claude Code creates a literal "~" directory rather than expanding it,
+        # so expanding here would install where Claude never looks.
+        import setup
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "~/cc"}):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path(os.path.abspath("~/cc")))
+        self.assertNotEqual(result, Path.home() / "cc")
+
+    def test_blank_env_falls_back_to_home(self):
+        import setup
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "   "}):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path.home() / ".claude")
 
 
 class TestInstallUnderResolvedDir(unittest.TestCase):

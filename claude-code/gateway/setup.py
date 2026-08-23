@@ -291,7 +291,8 @@ def _resolve_claude_config_dir(config_dir_arg: Optional[str] = None) -> Path:
         value = config_dir_arg.strip() or None
     if not value:
         return Path.home() / ".claude"
-    return Path(value).expanduser().resolve()
+    # Verbatim, as Claude Code reads it: a literal "~" must not be expanded.
+    return Path(os.path.abspath(value))
 
 
 def remove_hooks_unbound_script(config_dir: Path = None) -> None:

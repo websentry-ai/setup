@@ -18,17 +18,17 @@ class TestResolveClaudeConfigDir(unittest.TestCase):
     def test_env_wins(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
-                self.assertEqual(gw._resolve_claude_config_dir(None), Path(d).resolve())
+                self.assertEqual(gw._resolve_claude_config_dir(None), Path(os.path.abspath(d)))
 
     def test_env_takes_precedence_over_arg(self):
         with tempfile.TemporaryDirectory() as d:
             with mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": d}):
-                self.assertEqual(gw._resolve_claude_config_dir("/other/dir"), Path(d).resolve())
+                self.assertEqual(gw._resolve_claude_config_dir("/other/dir"), Path(os.path.abspath(d)))
 
     def test_arg_used_when_env_absent(self):
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CLAUDE_CONFIG_DIR", None)
-            self.assertEqual(gw._resolve_claude_config_dir("/opt/cc"), Path("/opt/cc").resolve())
+            self.assertEqual(gw._resolve_claude_config_dir("/opt/cc"), Path(os.path.abspath("/opt/cc")))
 
     def test_default_fallback(self):
         with mock.patch.dict(os.environ, {}, clear=False):

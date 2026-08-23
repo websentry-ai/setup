@@ -20,9 +20,12 @@ from urllib.parse import urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
+# Claude Code reads CLAUDE_CONFIG_DIR verbatim and resolves it against the cwd;
+# it does not expand a leading "~". Expanding it here would put the hook's files
+# under $HOME while Claude read a literal "~" directory, so keep it literal.
+# A blank value is treated as unset so nothing lands in the cwd.
 _env_config_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
-_config_dir_is_default = not _env_config_dir
-_CONFIG_DIR = Path(_env_config_dir or (Path.home() / ".claude")).expanduser().resolve()
+_CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Path.home() / ".claude"
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
@@ -48,23 +51,16 @@ SKILL_LOADED_WINDOW = 10
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
 
-def _relocated_or_legacy(relocated: Path, legacy: Path) -> Path:
-    # Whether Claude relocates .claude.json / plugins under CLAUDE_CONFIG_DIR is
-    # version-dependent, so read from the relocated dir when it actually has the
-    # artifact, else the default ~/.claude location. Keeps both paths consistent.
-    if not _config_dir_is_default and relocated.exists():
-        return relocated
-    return legacy
-
-
 # CoWork built-in tools that are exposed under mcp__
 COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'workspace', 'cowork', 'cowork-onboarding', 'visualize',
     'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
 })
 
-CLAUDE_MCP_CONFIG_PATH = _relocated_or_legacy(_CONFIG_DIR / ".claude.json", Path.home() / ".claude.json")
-CLAUDE_PLUGIN_CACHE_DIR = _relocated_or_legacy(_CONFIG_DIR / "plugins" / "cache", Path.home() / ".claude" / "plugins" / "cache")
+# Claude keeps .claude.json beside the config dir when relocated, and directly
+# in the home dir otherwise — it is not nested under the default ~/.claude.
+CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if _env_config_dir else (Path.home() / ".claude.json")
+CLAUDE_PLUGIN_CACHE_DIR = _CONFIG_DIR / "plugins" / "cache"
 POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
