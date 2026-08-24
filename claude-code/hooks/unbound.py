@@ -3494,20 +3494,25 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
             roots = _trusted_ancestors(Path(cwd))
         roots.append(Path.home())
 
-        for root in roots:
-            for skill_dir in SKILL_SEARCH_DIRS:
-                base = root.joinpath(*nested, *skill_dir)
-                candidate = base / name / 'SKILL.md'
-                if candidate.is_file():
-                    return str(candidate)
-                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
-                # Several bundles sharing a name is ambiguous, so resolve
-                # nothing rather than attach the wrong path to a join key.
-                matches = sorted(base.glob('*/%s/SKILL.md' % name))
-                if len(matches) > 1:
-                    return None
-                if matches:
-                    return str(matches[0])
+        bases = [root.joinpath(*nested, *skill_dir)
+                 for root in roots for skill_dir in SKILL_SEARCH_DIRS]
+        # User-level skills live in <config dir>/skills, which is where the sync
+        # writes them and where Claude Code reads them; the home-rooted entry above
+        # only finds them while the config dir is still the default one.
+        bases.append(CLAUDE_SKILLS_ROOT.joinpath(*nested))
+
+        for base in bases:
+            candidate = base / name / 'SKILL.md'
+            if candidate.is_file():
+                return str(candidate)
+            # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+            # Several bundles sharing a name is ambiguous, so resolve
+            # nothing rather than attach the wrong path to a join key.
+            matches = sorted(base.glob('*/%s/SKILL.md' % name))
+            if len(matches) > 1:
+                return None
+            if matches:
+                return str(matches[0])
         return None
     except Exception:
         return None

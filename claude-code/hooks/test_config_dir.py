@@ -120,3 +120,26 @@ class TestGatewayHelperRemovedUnderCustomDir(unittest.TestCase):
             self.assertFalse(hooks_setup._is_unbound_key_helper_setting(
                 str(cc / "somebody_else.sh"), cc))
 
+
+class TestSkillResolutionFollowsConfigDir(unittest.TestCase):
+    """The sync writes managed skills to <config dir>/skills, so resolution has to
+    look there — otherwise every Unbound skill silently fails to resolve on a
+    relocated install."""
+
+    def test_user_skill_resolves_under_a_relocated_dir(self):
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            skill = cc / "skills" / "unbound-review" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("# review")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+            self.assertEqual(m._resolve_skill_path("unbound-review", None), str(skill))
+
+    def test_default_dir_resolution_is_unchanged(self):
+        with tempfile.TemporaryDirectory() as home:
+            skill = Path(home) / ".claude" / "skills" / "unbound-review" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("# review")
+            m = _reload(HOME=home)
+            self.assertEqual(m._resolve_skill_path("unbound-review", None), str(skill))
+
