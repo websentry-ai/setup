@@ -318,15 +318,20 @@ def _is_unbound_key_helper_setting(value, config_dir: Path = None) -> bool:
     config_dir = config_dir or (Path.home() / ".claude")
     if not isinstance(value, str):
         return False
-    helper = config_dir / "anthropic_key.sh"
+    default_helper = Path.home() / ".claude" / "anthropic_key.sh"
+    active_helper = config_dir / "anthropic_key.sh"
     candidate = value.strip()
-    if candidate not in (UNBOUND_KEY_HELPER_SETTING,
-                         str(Path.home() / ".claude" / "anthropic_key.sh"),
-                         str(helper)):
+    # Judge the file the setting actually names, not the active dir's — a portable
+    # ~ form left over from a default install points at ~/.claude either way.
+    if candidate in (UNBOUND_KEY_HELPER_SETTING, str(default_helper)):
+        target = default_helper
+    elif candidate == str(active_helper):
+        target = active_helper
+    else:
         return False
     # The path is a name anyone could choose, so the script there decides. Nothing there
     # means our own removal already ran; a dangling helper is broken either way.
-    return not helper.exists() or _is_unbound_key_helper_file(helper)
+    return not target.exists() or _is_unbound_key_helper_file(target)
 
 
 def _is_unbound_key_helper_file(path: Path) -> bool:

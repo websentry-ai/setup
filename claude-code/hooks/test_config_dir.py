@@ -95,8 +95,6 @@ class TestPluginCacheDir(unittest.TestCase):
         self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, Path('/opt/cc/plugins/cache'))
 
 
-if __name__ == '__main__':
-    unittest.main()
 
 
 class TestGatewayHelperRemovedUnderCustomDir(unittest.TestCase):
@@ -111,6 +109,23 @@ class TestGatewayHelperRemovedUnderCustomDir(unittest.TestCase):
             (cc / "anthropic_key.sh").write_text(hooks_setup.UNBOUND_KEY_HELPER_BODY)
             self.assertTrue(hooks_setup._is_unbound_key_helper_setting(
                 str(cc / "anthropic_key.sh"), cc))
+
+    def test_portable_form_is_judged_against_the_default_dir(self):
+        # A ~ form left over from a default install names ~/.claude, so the script
+        # there decides — not whatever sits in the relocated dir.
+        import setup as hooks_setup
+        with tempfile.TemporaryDirectory() as home:
+            with patch.object(hooks_setup.Path, "home", staticmethod(lambda: Path(home))):
+                default = Path(home) / ".claude"
+                default.mkdir(parents=True)
+                (default / "anthropic_key.sh").write_text("echo $SOMEONE_ELSES_KEY")
+                cc = Path(home) / "cc"
+                cc.mkdir(parents=True)
+                (cc / "anthropic_key.sh").write_text(hooks_setup.UNBOUND_KEY_HELPER_BODY)
+                self.assertFalse(
+                    hooks_setup._is_unbound_key_helper_setting(
+                        hooks_setup.UNBOUND_KEY_HELPER_SETTING, cc),
+                    "the relocated dir's helper must not vouch for the default one")
 
     def test_a_foreign_helper_setting_is_not_ours(self):
         import setup as hooks_setup
@@ -143,3 +158,6 @@ class TestSkillResolutionFollowsConfigDir(unittest.TestCase):
             m = _reload(HOME=home)
             self.assertEqual(m._resolve_skill_path("unbound-review", None), str(skill))
 
+
+if __name__ == '__main__':
+    unittest.main()
