@@ -1234,6 +1234,14 @@ def main():
         debug_print("Debug mode enabled")
 
     config_dir = _resolve_claude_config_dir(sys.argv)
+    # Claude Code resolves CLAUDE_CONFIG_DIR against the current directory when it
+    # is set but empty, instead of falling back to ~/.claude. Installing to the
+    # default would then be invisible to it, so refuse to do that quietly.
+    _raw_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _raw_cfg is not None and not _raw_cfg.strip():
+        print("\n\u26a0\ufe0f  CLAUDE_CONFIG_DIR is set but empty. Claude Code reads that as a path "
+              "relative to the current directory, not as ~/.claude, so it will not load hooks "
+              "installed here. Unset the variable, or point it at a real directory.")
     # Claude Code picks its config dir from the environment alone. An install
     # aimed somewhere else by --config-dir is one it will never read, so say so
     # rather than reporting success over a set of hooks that cannot fire.

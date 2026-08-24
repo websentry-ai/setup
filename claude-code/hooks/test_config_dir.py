@@ -45,6 +45,12 @@ class TestConfigDirResolution(unittest.TestCase):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='   ')
         self.assertEqual(m._CONFIG_DIR, Path('/home/jane/.claude'))
 
+    def test_empty_env_also_falls_back_to_home(self):
+        # Claude Code would use the cwd here; we deliberately do not follow it
+        # there, and the installer warns instead. See the note in setup.py main().
+        m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='')
+        self.assertEqual(m._CONFIG_DIR, Path('/home/jane/.claude'))
+
     def test_enforcement_paths_follow_the_relocated_dir(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc')
         self.assertEqual(m.AUDIT_LOG, Path('/opt/cc/hooks/agent-audit.log'))
