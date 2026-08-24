@@ -20,10 +20,9 @@ from urllib.parse import urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-# Claude Code reads CLAUDE_CONFIG_DIR verbatim and resolves it against the cwd;
-# it does not expand a leading "~". Expanding it here would put the hook's files
-# under $HOME while Claude read a literal "~" directory, so keep it literal.
-# A blank value is treated as unset so nothing lands in the cwd.
+# Claude Code reads CLAUDE_CONFIG_DIR verbatim and resolves it against the cwd,
+# without expanding a leading "~". Expanding it here would put the hook's files
+# under $HOME while Claude read a literal "~" dir. Blank is treated as unset.
 _env_config_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
 _CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Path.home() / ".claude"
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
