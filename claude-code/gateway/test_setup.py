@@ -81,7 +81,7 @@ class TestClearSweepsLegacyDir(unittest.TestCase):
             with mock.patch.object(gw.Path, "home", staticmethod(lambda: home)):
                 legacy = home / ".claude"
                 legacy.mkdir(parents=True)
-                (legacy / "anthropic_key.sh").write_text("echo x")
+                (legacy / "anthropic_key.sh").write_text(gw.UNBOUND_KEY_HELPER_BODY)
                 (legacy / "settings.json").write_text(json.dumps({"apiKeyHelper": "~/.claude/anthropic_key.sh"}))
                 cc = home / "cc"
                 gw.setup_claude_key_helper(cc)
@@ -91,6 +91,23 @@ class TestClearSweepsLegacyDir(unittest.TestCase):
                 # legacy ~/.claude swept too
                 self.assertFalse((legacy / "anthropic_key.sh").exists())
                 self.assertNotIn("apiKeyHelper", json.loads((legacy / "settings.json").read_text()))
+
+    def test_clear_relocated_leaves_a_foreign_legacy_helper_alone(self):
+        """A helper of the same name that we did not write is not ours to delete,
+        and the legacy sweep must honour that as the primary path does."""
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            with mock.patch.object(gw.Path, "home", staticmethod(lambda: home)):
+                legacy = home / ".claude"
+                legacy.mkdir(parents=True)
+                foreign = legacy / "anthropic_key.sh"
+                foreign.write_text("echo $MY_COMPANY_KEY")
+                cc = home / "cc"
+                gw.setup_claude_key_helper(cc)
+                gw.clear_setup(cc)
+                self.assertFalse((cc / "anthropic_key.sh").exists(), "our own install is cleared")
+                self.assertTrue(foreign.exists(), "someone else's helper survives the sweep")
+                self.assertEqual(foreign.read_text(), "echo $MY_COMPANY_KEY")
 
     def test_clear_default_dir_does_not_double_sweep(self):
         with tempfile.TemporaryDirectory() as home:

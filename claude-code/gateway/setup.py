@@ -673,7 +673,11 @@ def clear_setup(config_dir: Path = None) -> bool:
     # without CLAUDE_CONFIG_DIR set.
     default_dir = Path.home() / ".claude"
     if config_dir.resolve() != default_dir.resolve():
-        if _clear_path(default_dir / "anthropic_key.sh", "Claude anthropic_key.sh (~/.claude)") == "cleared":
+        # Same ownership check the primary path uses: a helper of this name that we
+        # did not write belongs to whoever did, and clearing must not delete it.
+        legacy_helper = default_dir / "anthropic_key.sh"
+        if (_is_unbound_key_helper_file(legacy_helper)
+                and _clear_path(legacy_helper, "Claude anthropic_key.sh (~/.claude)") == "cleared"):
             any_cleared = True
         if remove_api_key_helper_setting(default_dir) == "cleared":
             any_cleared = True
