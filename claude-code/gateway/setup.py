@@ -4,6 +4,7 @@ Claude Code - Environment Setup Script
 """
 
 import os
+import shlex
 import sys
 import platform
 import subprocess
@@ -184,8 +185,161 @@ def set_env_var(var_name: str, value: str) -> Tuple[bool, str]:
         return False, f"Unsupported OS: {system}"
 
 
-def remove_env_var_on_unix(var_name: str) -> str:
+def _registry_value(output: str, var_name: str):
+    """The value `reg query` printed for var_name, or None when its output held no line
+    for it. None is "could not tell", not "not ours" -- the caller reports failure rather
+    than silently leaving our own value behind."""
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].lower() == var_name.lower():
+            return parts[2].strip() if len(parts) == 3 else ""
+    return None
+
+
+UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+UNBOUND_KEY_HELPER_SETTING = "~/.claude/anthropic_key.sh"
+
+
+def _recorded_gateway_url() -> str:
+    """The gateway URL this install recorded for the current user, or "". Read from the
+    user's own config as that user -- it says which endpoint we pointed them at, so it
+    can authorise removing their own export and nothing else."""
+    try:
+        text = (Path.home() / ".unbound" / "config.json").read_text(encoding="utf-8")
+        config = json.loads(text)
+    except (OSError, ValueError):
+        return ""
+    # A config that is not an object has no gateway to report; .get would raise, and this
+    # runs on the install path where anything raising aborts the setup.
+    if not isinstance(config, dict):
+        return ""
+    recorded = config.get("gateway_url")
+    return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL holds the gateway this setup writes. Anything else is
+    the customer's own endpoint and is left alone.
+
+    Our default gateway, or the one this install recorded for this user. A URL that is
+    neither is the customer's and stays: guessing wrong removes an endpoint they
+    configured, which is the failure this check exists to prevent."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip().rstrip("/")
+    if candidate == UNBOUND_GATEWAY_URL:
+        return True
+    recorded = _recorded_gateway_url()
+    return bool(recorded) and candidate == recorded
+
+
+def _export_value(line: str, prefix: str) -> str:
+    return line.strip()[len(prefix):].strip().strip('"').strip("'")
+
+
+def _command_targets_hook(command: str, target: Path) -> bool:
+    if not command:
+        return False
+    # Binary install: command invokes the /opt/unbound hook binary (require both
+    # the prefix and the binary name so a foreign hook merely mentioning the path
+    # isn't matched). Mirrors the managed _is_unbound_hook_command matcher.
+    if "/opt/unbound/" in command and "unbound-hook" in command:
+        return True
+    try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a home
+        # directory containing spaces stays one token; only the quotes it leaves behind
+        # are stripped below.
+        tokens = shlex.split(command, posix=(os.name != "nt"))
+    except ValueError:
+        return False
+    tokens = [t.strip().strip('"').strip("'") for t in tokens]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    launcher = os.path.basename(tokens[0]).lower()
+    if launcher.endswith(".exe"):
+        launcher = launcher[:-4]
+    if launcher in ("py", "python", "python2", "python3"):
+        tokens = tokens[1:]
+        while tokens and tokens[0].startswith("-"):
+            tokens = tokens[1:]
+    if not tokens:
+        return False
+    normalized_target = os.path.normcase(os.path.normpath(str(target)))
+    return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
+
+
+def _is_unbound_hook_command(command) -> bool:
+    """Whether a settings.json hook entry runs the Unbound hook. The hooks installer
+    writes the interpreter, quoting and separators of the platform it ran on, so the
+    command is tokenised and the path compared rather than matched as a substring."""
+    return isinstance(command, str) and _command_targets_hook(
+        command, Path.home() / ".claude" / "hooks" / "unbound.py")
+
+
+def _strip_unbound_hooks(settings: dict) -> None:
+    """Drop the Unbound entries from settings["hooks"], leaving every other hook in place
+    and removing only the groups and the block our entries emptied."""
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+    for event, groups in list(hooks.items()):
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        for group in groups:
+            if not isinstance(group, dict):
+                kept_groups.append(group)
+                continue
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                kept_groups.append(group)
+                continue
+            kept = [e for e in entries
+                    if not (isinstance(e, dict) and _is_unbound_hook_command(e.get("command")))]
+            if not kept:
+                continue
+            group["hooks"] = kept
+            kept_groups.append(group)
+        if kept_groups:
+            hooks[event] = kept_groups
+        else:
+            del hooks[event]
+    if not hooks:
+        del settings["hooks"]
+
+
+def _is_unbound_key_helper_setting(value) -> bool:
+    """Whether settings.json's apiKeyHelper is the one this setup writes. The expanded
+    form counts too: the setup writes the ~ form, but a device may already carry the
+    expanded one."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if candidate not in (UNBOUND_KEY_HELPER_SETTING,
+                         str(Path.home() / ".claude" / "anthropic_key.sh")):
+        return False
+    # The path is a name anyone could choose, so the script there decides. Nothing there
+    # means our own removal already ran; a dangling helper is broken either way.
+    path = Path.home() / ".claude" / "anthropic_key.sh"
+    return not path.exists() or _is_unbound_key_helper_file(path)
+
+
+def _is_unbound_key_helper_file(path: Path) -> bool:
+    """Whether an anthropic_key.sh is the one this setup writes. The compare is exact
+    against the body the gateway writer emits, apart from surrounding whitespace, so a
+    CRLF or a trailing newline still matches but a script with a shebang or an extra line
+    is somebody else's."""
+    try:
+        return path.read_text(encoding="utf-8").strip() == UNBOUND_KEY_HELPER_BODY
+    except (OSError, ValueError):
+        return False
+
+
+def remove_env_var_on_unix(var_name: str, only_if=None) -> str:
     """Remove an environment variable export line from the user's shell rc file.
+    With only_if, removes just the exports whose value it accepts.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -202,6 +356,9 @@ def remove_env_var_on_unix(var_name: str) -> str:
         export_prefix = f"export {var_name}="
         for line in lines:
             if line.strip().startswith(export_prefix):
+                if only_if is not None and not only_if(_export_value(line, export_prefix)):
+                    new_lines.append(line)
+                    continue
                 removed = True
                 debug_print(f"Removing {var_name} from {rc_file}")
                 continue
@@ -216,7 +373,7 @@ def remove_env_var_on_unix(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var_on_windows(var_name: str) -> str:
+def remove_env_var_on_windows(var_name: str, only_if=None) -> str:
     """Remove a user environment variable on Windows.
 
     Returns "cleared", "not_found", or "failed".
@@ -224,10 +381,18 @@ def remove_env_var_on_windows(var_name: str) -> str:
     try:
         query = subprocess.run(
             ["reg", "query", "HKCU\\Environment", "/V", var_name],
-            capture_output=True,
+            capture_output=True, text=True,
         )
         if query.returncode != 0:
             return "not_found"
+        if only_if is not None:
+            recorded = _registry_value(query.stdout, var_name)
+            if recorded is None:
+                debug_print(f"Could not read {var_name} from the registry")
+                return "failed"
+            if not only_if(recorded):
+                debug_print(f"{var_name} left in place: not set by this setup")
+                return "not_found"
         subprocess.run(
             ["reg", "delete", "HKCU\\Environment", "/F", "/V", var_name],
             check=True,
@@ -242,7 +407,7 @@ def remove_env_var_on_windows(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var(var_name: str) -> Tuple[str, str]:
+def remove_env_var(var_name: str, only_if=None) -> Tuple[str, str]:
     """Remove an environment variable permanently across OS platforms.
 
     Returns (status, message) where status is "cleared", "not_found", "failed",
@@ -250,9 +415,9 @@ def remove_env_var(var_name: str) -> Tuple[str, str]:
     """
     system = platform.system().lower()
     if system == "windows":
-        return remove_env_var_on_windows(var_name), ""
+        return remove_env_var_on_windows(var_name, only_if), ""
     elif system in ["darwin", "linux"]:
-        return remove_env_var_on_unix(var_name), ""
+        return remove_env_var_on_unix(var_name, only_if), ""
     else:
         return "unsupported", f"Unsupported OS: {system}"
 
@@ -320,6 +485,7 @@ def setup_claude_key_helper(config_dir: Path = None) -> bool:
         claude_dir.mkdir(parents=True, exist_ok=True)
 
         # Write anthropic_key.sh
+        # This body is what identifies the script as ours at removal time.
         key_helper_path.write_text("echo $UNBOUND_API_KEY", encoding="utf-8")
         try:
             current_mode = key_helper_path.stat().st_mode
@@ -335,9 +501,9 @@ def setup_claude_key_helper(config_dir: Path = None) -> bool:
             except Exception:
                 settings = {}
 
-        # Remove hooks if present before adding apiKeyHelper
-        if "hooks" in settings:
-            del settings["hooks"]
+        # Our hook and the gateway cannot both drive Claude Code, so ours goes before
+        # apiKeyHelper is added. Only ours: a hook the user installed is not ours to drop.
+        _strip_unbound_hooks(settings)
 
         if claude_dir.resolve() == (Path.home() / ".claude").resolve():
             settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
@@ -455,7 +621,7 @@ def remove_api_key_helper_setting(config_dir: Path = None) -> str:
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        if "apiKeyHelper" not in settings:
+        if not _is_unbound_key_helper_setting(settings.get("apiKeyHelper")):
             return "not_found"
         del settings["apiKeyHelper"]
         with open(settings_path, "w", encoding="utf-8") as f:
@@ -478,14 +644,18 @@ def clear_setup(config_dir: Path = None) -> bool:
     any_failed = False
 
     for var, label in {"UNBOUND_API_KEY": "API_KEY", "ANTHROPIC_BASE_URL": "BASE_URL"}.items():
-        status, _ = remove_env_var(var)
+        # ANTHROPIC_BASE_URL goes only when it holds our gateway.
+        status, _ = remove_env_var(
+            var, _is_unbound_base_url if var == "ANTHROPIC_BASE_URL" else None)
         if status == "cleared":
             any_cleared = True
         elif status not in ("cleared", "not_found"):
             print(f"Failed to clear {label}")
             any_failed = True
 
-    _r = _clear_path(config_dir / "anthropic_key.sh", "Claude anthropic_key.sh")
+    key_helper = config_dir / "anthropic_key.sh"
+    _r = (_clear_path(key_helper, "Claude anthropic_key.sh")
+          if _is_unbound_key_helper_file(key_helper) else "not_found")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
@@ -729,7 +899,11 @@ def main():
     print("Claude Code - Environment Setup")
     print("=" * 60)
 
-    # Flush previously set environment variables at start (including hooks setup var)
+    # Flush previously set environment variables at start (including hooks setup var).
+    # ANTHROPIC_BASE_URL is unconditional here and deliberately so: gateway mode exists to
+    # route Claude Code through us and sets this variable to our gateway a few lines
+    # below, so whatever it held is being replaced either way. Every other place that
+    # removes it is a teardown, and those take it only when it is ours.
     for var_name in [
         "ANTHROPIC_BASE_URL",
         "UNBOUND_API_KEY",
@@ -767,6 +941,18 @@ def main():
     print("API Key Verified ✅")
     debug_print("API key verification successful")
 
+    # Record the endpoint before anything is written to the machine. Clearing this setup
+    # identifies a non-default gateway by the URL recorded here, so installing first and
+    # failing to record would leave a route teardown cannot tell from the customer's own.
+    # Nothing has been set at this point, so refusing here leaves the device untouched
+    # rather than holding a key with no route to use it on.
+    _config_written = write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
+    if not _config_written and args.gateway_url != UNBOUND_GATEWAY_URL:
+        print(f"❌ Could not record the gateway URL in {Path.home() / '.unbound' / 'config.json'}.")
+        print(f"   Nothing was installed: clearing this setup could not have removed "
+              f"ANTHROPIC_BASE_URL={args.gateway_url} afterwards.")
+        return False
+
     debug_print("Setting UNBOUND_API_KEY environment variable...")
     success, message = set_env_var("UNBOUND_API_KEY", api_key)
     if not success:
@@ -783,8 +969,6 @@ def main():
 
     _install_state = detect_install_state(config_dir)
     _device_id = get_device_identifier()
-
-    write_unbound_config(api_key, urls={"base_url": args.backend_url, "gateway_url": args.gateway_url, "frontend_url": normalize_url(args.domain) if args.domain else None})
 
     # Configure Claude Code helper files
     debug_print("Setting up Claude key helper...")
