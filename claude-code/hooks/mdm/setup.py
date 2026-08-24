@@ -471,8 +471,9 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
         return None
 
 
-def remove_env_var_on_windows_machine(var_name: str) -> str:
-    """Remove machine-wide (HKLM) env var on Windows.
+def remove_env_var_on_windows_machine(var_name: str, only_if=None) -> str:
+    """Remove machine-wide (HKLM) env var on Windows. With only_if, removes it only when
+    the recorded value is accepted.
 
     Returns "cleared", "not_found", or "failed".
     """
@@ -480,10 +481,18 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
     try:
         query = subprocess.run(
             ["reg", "query", reg_path, "/V", var_name],
-            capture_output=True, timeout=10,
+            capture_output=True, text=True, timeout=10,
         )
         if query.returncode != 0:
             return "not_found"
+        if only_if is not None:
+            recorded = _registry_value(query.stdout, var_name)
+            if recorded is None:
+                debug_print(f"Could not read {var_name} from the registry")
+                return "failed"
+            if not only_if(recorded):
+                debug_print(f"{var_name} left in place: not set by this setup")
+                return "not_found"
         subprocess.run(
             ["reg", "delete", reg_path, "/F", "/V", var_name],
             check=True, capture_output=True, timeout=10,
@@ -497,15 +506,273 @@ def remove_env_var_on_windows_machine(var_name: str) -> str:
         return "failed"
 
 
-def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> str:
+UNBOUND_GATEWAY_URL = "https://api.getunbound.ai"
+UNBOUND_KEY_HELPER_BODY = "echo $UNBOUND_API_KEY"
+
+
+def _is_unbound_base_url(value) -> bool:
+    """Whether ANTHROPIC_BASE_URL is the default Unbound gateway.
+
+    Device-wide scope, so it consults no per-account record on purpose: this decides what
+    comes out of managed settings the whole device shares, and one user's config must not
+    be able to authorise that. A --gateway-url endpoint is still recognised, per user and
+    only for that user's own export, by _unbound_base_url_matcher; and the drop-in this
+    setup writes is identified by being that file rather than by the value inside it."""
+    return isinstance(value, str) and value.strip().rstrip("/") == UNBOUND_GATEWAY_URL
+
+
+def _recorded_gateway_url_for_user(username, home_dir) -> str:
+    """The gateway URL this install recorded for one user, read as that user. It says
+    which endpoint we pointed *them* at, so it authorises removing *their* export and
+    nothing else. Never consulted for the system-wide managed settings: one account's
+    record must not decide what comes out of a file the whole device shares.
+
+    Windows falls back to a single (None, None) entry when it finds no user profiles, so
+    there may be no home to read; that answers "no record", not an error."""
+    if home_dir is None:
+        return ""
+    config_file = home_dir / ".unbound" / "config.json"
+
+    def _read():
+        try:
+            fd = os.open(str(config_file), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+                config = json.loads(handle.read())
+        except (OSError, ValueError):
+            return ""
+        # A config that is not an object has no gateway to report; .get would raise, and
+        # this runs on the install path where anything raising aborts the setup.
+        if not isinstance(config, dict):
+            return ""
+        recorded = config.get("gateway_url")
+        return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
+    result = _run_as_user(username, _read) if username else _read()
+    return result or ""
+
+
+def _machine_env_is_set(var_name: str) -> bool:
+    """Whether the machine-wide environment holds this variable. UNBOUND_API_KEY is
+    written by nothing but this setup, so its presence is proof the setup ran on this
+    device -- device-level evidence, unlike a per-account record."""
+    reg_path = "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
+    try:
+        result = subprocess.run(["reg", "query", reg_path, "/V", var_name],
+                                capture_output=True, timeout=10)
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+_OWNERSHIP_EVIDENCE = {}
+
+
+def _freeze_ownership_evidence(managed_dir=None) -> None:
+    """Freeze what teardown judges ownership by, before teardown removes the very things
+    that evidence consists of. Clearing sweeps UNBOUND_API_KEY out of the machine
+    environment and unlinks the drop-in part-way through its own run, so reading either
+    one live means the same file gets a different verdict depending on when it is asked.
+
+    The first freeze of a run wins. A later call would re-read state this run has already
+    changed -- hooks mode freezes, deletes the key, then enters the managed-settings step
+    and would freeze again from a machine it has just altered."""
+    if _OWNERSHIP_EVIDENCE:
+        return
+    try:
+        if managed_dir is None:
+            managed_dir = get_managed_settings_dir()
+    except OSError:
+        return
+    _OWNERSHIP_EVIDENCE["installed_here"] = _machine_env_is_set("UNBOUND_API_KEY")
+    _OWNERSHIP_EVIDENCE["dropin_present"] = (
+        managed_dir / "managed-settings.d" / "unbound.json").exists()
+    _OWNERSHIP_EVIDENCE["gateway_url"] = _read_managed_gateway_url()
+
+
+def _installed_here() -> bool:
+    if "installed_here" in _OWNERSHIP_EVIDENCE:
+        return _OWNERSHIP_EVIDENCE["installed_here"]
+    return _machine_env_is_set("UNBOUND_API_KEY")
+
+
+def _dropin_present(managed_dir) -> bool:
+    if "dropin_present" in _OWNERSHIP_EVIDENCE:
+        return _OWNERSHIP_EVIDENCE["dropin_present"]
+    return (managed_dir / "managed-settings.d" / "unbound.json").exists()
+
+
+def _managed_settings_is_exactly_ours(settings, managed_dir) -> bool:
+    """Whether a managed settings file is the one this setup writes on the fallback path.
+
+    Three things have to hold, because the shape alone proves nothing: an env block
+    holding just the token and the base URL is also the ordinary env-only managed layout
+    an organisation writes for Bedrock or their own gateway.
+
+    The drop-in must be absent. The install prefers managed-settings.d/unbound.json
+    exactly so it does not touch a sibling flat file, so a drop-in on disk means the flat
+    file beside it belongs to somebody else whatever it contains.
+
+    And this setup must actually have run on the device, which UNBOUND_API_KEY in the
+    machine environment proves because nothing else writes it. That is what lets a custom
+    gateway be recognised here without the endpoint vouching for itself: an organisation's
+    own Bedrock settings sit on a device that has no such key. This shape only ever occurs
+    on Windows; the Unix install writes an apiKeyHelper, not an env block."""
+    if _dropin_present(managed_dir):
+        return False
+    if not isinstance(settings, dict) or set(settings) != {"env"}:
+        return False
+    env = settings.get("env")
+    if not (isinstance(env, dict)
+            and set(env) == {"ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"}):
+        return False
+    return _installed_here()
+
+
+def _managed_settings_gateway_url(path) -> str:
+    """The base URL in a managed settings file's env block, or ""."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+            settings = json.loads(handle.read())
+    except (OSError, ValueError):
+        return ""
+    if not isinstance(settings, dict):
+        return ""
+    env = settings.get("env")
+    if not isinstance(env, dict):
+        return ""
+    recorded = env.get("ANTHROPIC_BASE_URL")
+    return recorded.strip().rstrip("/") if isinstance(recorded, str) else ""
+
+
+
+def _read_managed_gateway_url() -> str:
+    """The gateway URL this setup recorded on the device. Device-level state we own, so
+    unlike a per-account record it can authorise removing the machine-wide route, which
+    matters on a Windows device that has no user profiles to read.
+
+    The drop-in first: nothing else writes that file. The install falls back to the shared
+    managed-settings.json when it cannot create the drop-in directory, and there it writes
+    the whole file, so that one counts only when its entire content is what the install
+    produces -- an administrator's own settings carry other keys and stay theirs."""
+    try:
+        managed_dir = get_managed_settings_dir()
+    except OSError:
+        return ""
+    dropin = _managed_settings_gateway_url(
+        managed_dir / "managed-settings.d" / "unbound.json")
+    if dropin:
+        return dropin
+    # The install writes the flat file instead when it cannot create the drop-in
+    # directory. It counts only under the same proof teardown uses for that file.
+    flat = managed_dir / "managed-settings.json"
+    try:
+        settings = json.loads(flat.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    if not _managed_settings_is_exactly_ours(settings, managed_dir):
+        return ""
+    return _managed_settings_gateway_url(flat)
+
+def _recorded_managed_gateway_url() -> str:
+    """The recorded gateway, from the snapshot when teardown has frozen one. The record
+    lives in files this run also clears, so reading it live afterwards loses it."""
+    if "gateway_url" in _OWNERSHIP_EVIDENCE:
+        return _OWNERSHIP_EVIDENCE["gateway_url"]
+    return _read_managed_gateway_url()
+
+
+def _unbound_base_url_matcher(username, home_dir):
+    """Accepts our default gateway, or the one recorded for this user. The record is read
+    here rather than inside the predicate: the removal runs under a privilege drop, and a
+    second drop nested in the first cannot call setgroups."""
+    # On Windows this removal is not per user at all: remove_env_var_from_user deletes the
+    # machine-wide HKLM value, which the whole device shares. A record any account can
+    # write must not authorise that, so there it is ignored and only the default gateway
+    # and the drop-in this setup owns count. On Unix the removal edits that user's own rc
+    # files, where their own record is exactly the right authority.
+    recorded = ("" if platform.system().lower() == "windows"
+                else _recorded_gateway_url_for_user(username, home_dir))
+    # Read before the managed settings are cleared: teardown sweeps the environment first,
+    # and afterwards the drop-in holding this record is gone.
+    managed = _recorded_managed_gateway_url()
+
+    def _matches(value):
+        if _is_unbound_base_url(value):
+            return True
+        if not isinstance(value, str):
+            return False
+        candidate = value.strip().rstrip("/")
+        return ((bool(recorded) and candidate == recorded)
+                or (bool(managed) and candidate == managed))
+
+    return _matches
+
+
+def _export_value(line: str, prefix: str) -> str:
+    return line.strip()[len(prefix):].strip().strip('"').strip("'")
+
+
+def _is_unbound_key_helper_body(text) -> bool:
+    """Exact against the body the gateway writer emits, apart from surrounding whitespace,
+    so a CRLF or a trailing newline still matches but a script carrying anything else is
+    somebody else's."""
+    return isinstance(text, str) and text.strip() == UNBOUND_KEY_HELPER_BODY
+
+
+def _registry_value(output: str, var_name: str):
+    """The value `reg query` printed for var_name, or None when its output held no line
+    for it. None is "could not tell", not "not ours" -- the caller reports failure rather
+    than silently leaving our own value behind."""
+    for line in (output or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) >= 2 and parts[0].lower() == var_name.lower():
+            return parts[2].strip() if len(parts) == 3 else ""
+    return None
+
+
+def _read_text_or_none(path):
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+
+
+def _is_our_dropin(settings_path) -> bool:
+    """Whether this settings file is the drop-in this setup creates. Nothing else writes
+    it, so everything in it is ours -- including a self-hosted gateway URL, which no
+    value check could recognise."""
+    return (settings_path is not None
+            and settings_path.name == "unbound.json"
+            and settings_path.parent.name == "managed-settings.d")
+
+
+def _is_unbound_key_helper_setting(value, managed_dir) -> bool:
+    """Whether settings.json's apiKeyHelper is one this setup writes: the per-user script
+    or the managed one. Judged on the value alone, so a helper that has already been
+    deleted cannot make somebody else's setting look like ours."""
+    if not isinstance(value, str):
+        return False
+    if value.strip() != str(managed_dir / "anthropic_key.sh"):
+        return False
+    # The path is a name anyone could choose, so the script there decides. Nothing there
+    # means our own removal already ran; a dangling helper is broken either way.
+    path = managed_dir / "anthropic_key.sh"
+    return not path.exists() or _is_unbound_key_helper_body(_read_text_or_none(path))
+
+
+def remove_env_var_from_user(username: str, home_dir: Path, var_name: str,
+                             only_if=None) -> str:
     """Remove env var from user's shell rc files. Privilege-drops on Unix.
+    With only_if, removes just the exports whose value it accepts -- a user may have their
+    own export of the same variable in the other startup file.
 
     Returns "cleared", "not_found", or "failed".
     """
     system = platform.system().lower()
 
     if system == "windows":
-        return remove_env_var_on_windows_machine(var_name)
+        return remove_env_var_on_windows_machine(var_name, only_if)
 
     if system == "darwin":
         rc_files = [home_dir / ".zprofile", home_dir / ".bash_profile"]
@@ -525,7 +792,10 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str) -> st
             try:
                 with open(rc_file, 'r', encoding='utf-8') as f:
                     lines = f.readlines()
-                new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
+                new_lines = [l for l in lines
+                             if not (l.strip().startswith(export_prefix)
+                                     and (only_if is None
+                                          or only_if(_export_value(l, export_prefix))))]
                 if len(new_lines) < len(lines):
                     flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
                     fd = os.open(str(rc_file), flags, 0o644)
@@ -637,6 +907,11 @@ def remove_gateway_artifacts_for_user(username: str, home_dir: Path) -> None:
 
     def _unlink():
         try:
+            # Read and unlink as the user: a helper of this name that we did not write
+            # belongs to whoever did.
+            if not _is_unbound_key_helper_body(
+                    key_helper_path.read_text(encoding="utf-8")):
+                return False
             key_helper_path.unlink()
             return True
         except Exception:
@@ -655,6 +930,9 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     if "/opt/unbound/" in command and "unbound-hook" in command:
         return True
     try:
+        # posix=False on Windows: shlex still groups a quoted argument, so a home
+        # directory containing spaces stays one token; only the quotes it leaves behind
+        # are stripped below.
         tokens = shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return False
@@ -827,6 +1105,9 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         managed_dir = get_managed_settings_dir()
         hooks_dir = managed_dir / "hooks"
         script_path = hooks_dir / "unbound.py"
+        # Before this run removes the gateway's leftovers, which are what its ownership
+        # checks read.
+        _freeze_ownership_evidence(managed_dir)
 
         if skip_settings:
             settings_path = None
@@ -887,12 +1168,25 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # Drop gateway MDM setup from the same file — leaving its apiKeyHelper
         # behind makes Claude Code run anthropic_key.sh, which echoes the now
         # removed UNBOUND_API_KEY and fails with "did not return a valid value".
-        if "apiKeyHelper" in settings:
-            del settings["apiKeyHelper"]
+        # One verdict per file: the env sweep already treats a flat file of exactly this
+        # shape as ours, and stripping it must agree or the base URL stays behind while
+        # its credential goes.
+        ours = (_is_our_dropin(settings_path)
+                or _managed_settings_is_exactly_ours(settings, get_managed_settings_dir()))
+        if (ours or _is_unbound_key_helper_setting(settings.get("apiKeyHelper"),
+                                                   get_managed_settings_dir())):
+            settings.pop("apiKeyHelper", None)
         env = settings.get("env") if isinstance(settings.get("env"), dict) else None
         if env:
-            for k in ("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
-                env.pop(k, None)
+            # The gateway writes the token and the base URL together, so they go
+            # together, and only out of a file that setup wrote or a pair it recognises.
+            # A token in somebody else's file is their credential, not ours to delete.
+            # Inside our own file the URL may since have been repointed; the credential
+            # still comes out, because it would otherwise be sent to whatever that URL
+            # now names.
+            if ours or _is_unbound_base_url(env.get("ANTHROPIC_BASE_URL")):
+                env.pop("ANTHROPIC_AUTH_TOKEN", None)
+                env.pop("ANTHROPIC_BASE_URL", None)
             if not env:
                 del settings["env"]
 
@@ -993,7 +1287,8 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         # written, so a failed write never strands managed-settings.json
         # pointing at a now-missing apiKeyHelper script.
         gateway_key_helper = managed_dir / "anthropic_key.sh"
-        if gateway_key_helper.exists():
+        if gateway_key_helper.exists() and _is_unbound_key_helper_body(
+                _read_text_or_none(gateway_key_helper)):
             try:
                 gateway_key_helper.unlink()
                 debug_print(f"Removed gateway key helper {gateway_key_helper}")
@@ -1740,10 +2035,15 @@ def main():
     print("API key received")
 
     print("\nSetting environment variables system-wide...")
-    # Remove leftover gateway setup env vars
+    _freeze_ownership_evidence()
+
+    # Remove leftover gateway setup env vars. Runs before write_unbound_config_for_user
+    # below, which rewrites the recorded gateway_url the ownership check reads --
+    # afterwards it would answer for this install, not the one being removed.
     for username, home_dir in get_all_user_homes():
         remove_env_var_from_user(username, home_dir, "UNBOUND_API_KEY")
-        remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL")
+        remove_env_var_from_user(username, home_dir, "ANTHROPIC_BASE_URL",
+                                 _unbound_base_url_matcher(username, home_dir))
 
     success, _ = set_env_var_system_wide("UNBOUND_CLAUDE_API_KEY", api_key)
     if not success:
