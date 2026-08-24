@@ -74,6 +74,40 @@ class TestKeyHelperUnderConfigDir(unittest.TestCase):
                 self.assertEqual(settings["apiKeyHelper"], "~/.claude/anthropic_key.sh")
 
 
+class TestRelocatedClearRemovesTheSetting(unittest.TestCase):
+    def test_clear_removes_apikeyhelper_written_for_a_custom_dir(self):
+        """A relocated install writes apiKeyHelper as an absolute path. If clear does
+        not recognise that form it leaves Claude pointing at a deleted script, and
+        every API call then fails."""
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            with mock.patch.object(gw.Path, "home", staticmethod(lambda: home)):
+                cc = home / "cc"
+                gw.setup_claude_key_helper(cc)
+                settings = json.loads((cc / "settings.json").read_text())
+                self.assertEqual(settings["apiKeyHelper"], str(cc / "anthropic_key.sh"))
+                gw.clear_setup(cc)
+                after = json.loads((cc / "settings.json").read_text())
+                self.assertNotIn("apiKeyHelper", after, "no dangling pointer left behind")
+                self.assertFalse((cc / "anthropic_key.sh").exists())
+
+    def test_strip_hooks_finds_hooks_under_a_custom_dir(self):
+        """Switching from hooks mode to gateway mode must drop the hook entries, or
+        both enforcement paths fire at once."""
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            with mock.patch.object(gw.Path, "home", staticmethod(lambda: home)):
+                cc = home / "cc"
+                hook = cc / "hooks" / "unbound.py"
+                hook.parent.mkdir(parents=True)
+                hook.write_text("# unbound")
+                (cc / "settings.json").write_text(json.dumps(
+                    {"hooks": {"PreToolUse": [{"hooks": [{"command": str(hook)}]}]}}))
+                gw.setup_claude_key_helper(cc)
+                after = json.loads((cc / "settings.json").read_text())
+                self.assertNotIn("PreToolUse", after.get("hooks", {}))
+
+
 class TestClearSweepsLegacyDir(unittest.TestCase):
     def test_clear_relocated_also_clears_default_claude(self):
         with tempfile.TemporaryDirectory() as home:

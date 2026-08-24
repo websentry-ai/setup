@@ -7,6 +7,7 @@ these assertions mirror the resolver in the shipped Claude Code bundle.
 
 import importlib
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -96,3 +97,26 @@ class TestPluginCacheDir(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class TestGatewayHelperRemovedUnderCustomDir(unittest.TestCase):
+    """Installing hooks must drop the gateway's apiKeyHelper, including the absolute
+    form it writes for a relocated dir — otherwise both drive Claude at once."""
+
+    def test_absolute_helper_setting_is_recognised(self):
+        import setup as hooks_setup
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            cc.mkdir(parents=True)
+            (cc / "anthropic_key.sh").write_text(hooks_setup.UNBOUND_KEY_HELPER_BODY)
+            self.assertTrue(hooks_setup._is_unbound_key_helper_setting(
+                str(cc / "anthropic_key.sh"), cc))
+
+    def test_a_foreign_helper_setting_is_not_ours(self):
+        import setup as hooks_setup
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            cc.mkdir(parents=True)
+            self.assertFalse(hooks_setup._is_unbound_key_helper_setting(
+                str(cc / "somebody_else.sh"), cc))
+

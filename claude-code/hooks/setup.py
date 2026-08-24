@@ -214,17 +214,22 @@ def _export_value(line: str, prefix: str) -> str:
     return line.strip()[len(prefix):].strip().strip('"').strip("'")
 
 
-def _is_unbound_key_helper_setting(value) -> bool:
-    """Whether settings.json's apiKeyHelper is the one the gateway setup writes."""
+def _is_unbound_key_helper_setting(value, config_dir: Path = None) -> bool:
+    """Whether settings.json's apiKeyHelper is the one the gateway setup writes. It
+    writes the portable ~ form for the default dir and an absolute path for a relocated
+    one, so both count — otherwise the helper survives here and drives Claude alongside
+    the hooks we are about to install."""
+    config_dir = config_dir or (Path.home() / ".claude")
     if not isinstance(value, str):
         return False
+    path = config_dir / "anthropic_key.sh"
     candidate = value.strip()
     if candidate not in (UNBOUND_KEY_HELPER_SETTING,
-                         str(Path.home() / ".claude" / "anthropic_key.sh")):
+                         str(Path.home() / ".claude" / "anthropic_key.sh"),
+                         str(path)):
         return False
     # The path is a name anyone could choose, so the script there decides. Nothing there
     # means our own removal already ran; a dangling helper is broken either way.
-    path = Path.home() / ".claude" / "anthropic_key.sh"
     return not path.exists() or _is_unbound_key_helper_file(path)
 
 
@@ -526,7 +531,7 @@ def configure_claude_settings(config_dir: Path = None) -> bool:
         
         # Our hook and the gateway's key helper cannot both drive Claude Code, so ours
         # goes before the hooks are added. Only ours: an org's own helper stays.
-        if _is_unbound_key_helper_setting(settings.get("apiKeyHelper")):
+        if _is_unbound_key_helper_setting(settings.get("apiKeyHelper"), config_dir):
             del settings["apiKeyHelper"]
         
         script_path = config_dir / "hooks" / "unbound.py"

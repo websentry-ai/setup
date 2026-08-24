@@ -270,15 +270,16 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
 
 
-def _is_unbound_hook_command(command) -> bool:
+def _is_unbound_hook_command(command, config_dir: Path = None) -> bool:
     """Whether a settings.json hook entry runs the Unbound hook. The hooks installer
     writes the interpreter, quoting and separators of the platform it ran on, so the
     command is tokenised and the path compared rather than matched as a substring."""
+    config_dir = config_dir or (Path.home() / ".claude")
     return isinstance(command, str) and _command_targets_hook(
-        command, Path.home() / ".claude" / "hooks" / "unbound.py")
+        command, config_dir / "hooks" / "unbound.py")
 
 
-def _strip_unbound_hooks(settings: dict) -> None:
+def _strip_unbound_hooks(settings: dict, config_dir: Path = None) -> None:
     """Drop the Unbound entries from settings["hooks"], leaving every other hook in place
     and removing only the groups and the block our entries emptied."""
     hooks = settings.get("hooks")
@@ -297,7 +298,7 @@ def _strip_unbound_hooks(settings: dict) -> None:
                 kept_groups.append(group)
                 continue
             kept = [e for e in entries
-                    if not (isinstance(e, dict) and _is_unbound_hook_command(e.get("command")))]
+                    if not (isinstance(e, dict) and _is_unbound_hook_command(e.get("command"), config_dir))]
             if not kept:
                 continue
             group["hooks"] = kept
@@ -310,20 +311,22 @@ def _strip_unbound_hooks(settings: dict) -> None:
         del settings["hooks"]
 
 
-def _is_unbound_key_helper_setting(value) -> bool:
-    """Whether settings.json's apiKeyHelper is the one this setup writes. The expanded
-    form counts too: the setup writes the ~ form, but a device may already carry the
-    expanded one."""
+def _is_unbound_key_helper_setting(value, config_dir: Path = None) -> bool:
+    """Whether settings.json's apiKeyHelper is the one this setup writes. The setup
+    writes the portable ~ form for the default dir and an absolute path for a relocated
+    one, and a device may already carry the expanded default; all three count."""
+    config_dir = config_dir or (Path.home() / ".claude")
     if not isinstance(value, str):
         return False
+    helper = config_dir / "anthropic_key.sh"
     candidate = value.strip()
     if candidate not in (UNBOUND_KEY_HELPER_SETTING,
-                         str(Path.home() / ".claude" / "anthropic_key.sh")):
+                         str(Path.home() / ".claude" / "anthropic_key.sh"),
+                         str(helper)):
         return False
     # The path is a name anyone could choose, so the script there decides. Nothing there
     # means our own removal already ran; a dangling helper is broken either way.
-    path = Path.home() / ".claude" / "anthropic_key.sh"
-    return not path.exists() or _is_unbound_key_helper_file(path)
+    return not helper.exists() or _is_unbound_key_helper_file(helper)
 
 
 def _is_unbound_key_helper_file(path: Path) -> bool:
@@ -503,7 +506,7 @@ def setup_claude_key_helper(config_dir: Path = None) -> bool:
 
         # Our hook and the gateway cannot both drive Claude Code, so ours goes before
         # apiKeyHelper is added. Only ours: a hook the user installed is not ours to drop.
-        _strip_unbound_hooks(settings)
+        _strip_unbound_hooks(settings, claude_dir)
 
         if claude_dir.resolve() == (Path.home() / ".claude").resolve():
             settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
@@ -621,7 +624,7 @@ def remove_api_key_helper_setting(config_dir: Path = None) -> str:
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        if not _is_unbound_key_helper_setting(settings.get("apiKeyHelper")):
+        if not _is_unbound_key_helper_setting(settings.get("apiKeyHelper"), config_dir):
             return "not_found"
         del settings["apiKeyHelper"]
         with open(settings_path, "w", encoding="utf-8") as f:
