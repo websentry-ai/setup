@@ -530,6 +530,16 @@ class TestUnboundAppLabel(unittest.TestCase):
             with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
                 self.assertEqual(unbound._unbound_app_label({}), "cowork")
 
+    def test_any_cowork_entrypoint_variant_is_cowork(self):
+        for val in ("remote_cowork_v2", "cowork", "REMOTE_COWORK", " remote_cowork "):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "cowork")
+
+    def test_remote_entrypoint_without_cowork_is_claude_code(self):
+        for val in ("remote", "remote_headless", "remote_ci"):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+
     def test_unrecognized_entrypoint_is_claude_code(self):
         for val in ("cli", "desktop", "vscode", ""):
             with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):

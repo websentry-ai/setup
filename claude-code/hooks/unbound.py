@@ -2176,9 +2176,10 @@ def _unbound_app_label(event: Dict) -> str:
     try:
         if os.environ.get('CLAUDE_CODE_IS_COWORK') == '1':
             return 'cowork'
-        if os.environ.get('CLAUDE_CODE_ENTRYPOINT') in (
-            'local-agent', 'local_agent', 'remote_cowork'
-        ):
+        entrypoint = (os.environ.get('CLAUDE_CODE_ENTRYPOINT') or '').strip().lower()
+        # remote_cowork is one member of an open remote_* family, so match the
+        # surface by name; a bare remote_ prefix would also catch headless CLI.
+        if entrypoint in ('local-agent', 'local_agent') or 'cowork' in entrypoint:
             return 'cowork'
     except Exception:
         pass
