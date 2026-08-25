@@ -1448,7 +1448,11 @@ def test_long_fields_are_capped_so_the_body_fits_the_pipe(hook):
     assert hook._repo_gate_clip('') is None
     assert hook._repo_gate_clip(None) is None
     post = MagicMock()
-    with patch.object(hook, '_repo_gate_post', post):
+    # Each tool resolves the key differently (codex reads its own env var), and
+    # every one of them prefers the cached key, so cache it rather than teaching
+    # this test each tool's lookup.
+    with patch.object(hook, '_repo_gate_post', post), \
+         patch.object(hook, '_cached_api_key', 'KEY'):
         hook._repo_gate_report(
             {'decision': 'deny', 'repo': 'acme/thing'}, [BLOCK_ORG],
             {'app_label': 'x', 'prompt_text': 'p' * 99999,
