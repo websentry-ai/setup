@@ -3490,16 +3490,14 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         # A prefixed skill never falls back to the bare name — "slack:standup"
         # and a personal "standup" are different skills.
         nested = segments
-        roots = []
-        if cwd:
-            roots = _trusted_ancestors(Path(cwd))
-        roots.append(Path.home())
+        roots = _trusted_ancestors(Path(cwd)) if cwd else []
 
         bases = [root.joinpath(*nested, *skill_dir)
                  for root in roots for skill_dir in SKILL_SEARCH_DIRS]
-        # User-level skills live in <config dir>/skills, which is where the sync
-        # writes them and where Claude Code reads them; the home-rooted entry above
-        # only finds them while the config dir is still the default one.
+        # User-level skills live in <config dir>/skills — where the sync writes them
+        # and where Claude Code reads them. It stands in for ~/.claude/skills rather
+        # than following it: after a move the sync stops refreshing the old copy, so
+        # searching there first would pin resolution to whatever it last held.
         bases.append(CLAUDE_SKILLS_ROOT.joinpath(*nested))
 
         for base in bases:

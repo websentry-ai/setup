@@ -171,6 +171,20 @@ class TestSkillResolutionFollowsConfigDir(unittest.TestCase):
             m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
             self.assertEqual(m._resolve_skill_path("unbound-review", None), str(skill))
 
+    def test_a_stale_copy_in_the_old_home_dir_does_not_win(self):
+        """After a move the sync stops refreshing ~/.claude/skills, so anything left
+        there is frozen at whatever it last held. Resolution must not prefer it."""
+        with tempfile.TemporaryDirectory() as home:
+            stale = Path(home) / ".claude" / "skills" / "unbound-review" / "SKILL.md"
+            stale.parent.mkdir(parents=True)
+            stale.write_text("# stale")
+            cc = Path(home) / "cc"
+            fresh = cc / "skills" / "unbound-review" / "SKILL.md"
+            fresh.parent.mkdir(parents=True)
+            fresh.write_text("# fresh")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+            self.assertEqual(m._resolve_skill_path("unbound-review", None), str(fresh))
+
     def test_default_dir_resolution_is_unchanged(self):
         with tempfile.TemporaryDirectory() as home:
             skill = Path(home) / ".claude" / "skills" / "unbound-review" / "SKILL.md"
