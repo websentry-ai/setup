@@ -46,7 +46,9 @@ class TestCallbackHandler(unittest.TestCase):
             time.sleep(0.05)
 
             try:
-                resp = urllib.request.urlopen(target)
+                # Bounded: an unanswered loopback exchange would otherwise hang the
+                # test thread past the server's own wait, and CI with it.
+                resp = urllib.request.urlopen(target, timeout=30)
                 http_response["code"] = resp.getcode()
                 http_response["body"] = resp.read().decode()
             except urllib.error.HTTPError as e:

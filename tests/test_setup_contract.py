@@ -36,6 +36,15 @@ def test_the_inventory_is_not_empty():
     assert CLEARABLE, "no installer exposes clear_setup"
 
 
+def test_every_installer_offering_clear_is_actually_covered():
+    """CLEARABLE is derived by reading source, so a rename would quietly shrink the
+    teardown coverage instead of failing. Tie it to the flag the installer advertises."""
+    advertises = [s for s in SETUPS if '"--clear"' in (REPO / s).read_text()
+                  or "'--clear'" in (REPO / s).read_text()]
+    missing = sorted(set(advertises) - set(CLEARABLE))
+    assert not missing, "advertise --clear but expose no clear_setup: %s" % missing
+
+
 @pytest.mark.parametrize("relpath", SETUPS)
 class TestEveryInstaller:
     def test_it_imports_without_side_effects(self, relpath):
@@ -45,7 +54,7 @@ class TestEveryInstaller:
 
     def test_it_compiles(self, relpath):
         r = subprocess.run([sys.executable, "-m", "py_compile", str(REPO / relpath)],
-                           capture_output=True, text=True)
+                           capture_output=True, text=True, timeout=60)
         assert r.returncode == 0, r.stderr
 
     def test_it_declares_the_gateway_it_defaults_to(self, relpath):
