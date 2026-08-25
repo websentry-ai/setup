@@ -895,6 +895,13 @@ def main():
         print("\n\u26a0\ufe0f  CLAUDE_CONFIG_DIR is set but empty. Claude Code reads that as a path "
               "relative to the current directory, not as ~/.claude, so it will not load this "
               "install. Unset the variable, or point it at a real directory.")
+    # Claude Code picks its config dir from the environment alone. An install aimed
+    # somewhere else by --config-dir is one it will never read, so say so rather than
+    # reporting success over a key helper that cannot be found.
+    if args.config_dir and not (_raw_cfg or "").strip():
+        print(f"\n\u26a0\ufe0f  --config-dir set to {config_dir} but CLAUDE_CONFIG_DIR is not set in the "
+              "environment. Claude Code reads only the environment variable, so it will not load "
+              "this install. Export CLAUDE_CONFIG_DIR to the same path.")
 
     if args.debug:
         DEBUG = True
