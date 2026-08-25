@@ -15,11 +15,23 @@ from unittest.mock import patch
 import unbound
 
 
+def _abs(p):
+    """The absolute form of a test path. Windows prepends the current drive to a
+    root-relative path, which is what the code under test stores, so expectations
+    have to go through the same call to compare on either platform."""
+    return Path(os.path.abspath(p))
+
+
 def _reload(**env):
     """Reload unbound with `env` applied, since the paths resolve at import."""
     base = {k: v for k, v in os.environ.items()
             if k not in ('CLAUDE_CONFIG_DIR', 'CLAUDE_CODE_PLUGIN_CACHE_DIR')}
     base.update({k: v for k, v in env.items() if v is not None})
+    # expanduser reads USERPROFILE on Windows and HOME on POSIX; set both so a
+    # fake home takes effect either way.
+    if 'HOME' in base:
+        base.setdefault('USERPROFILE', base['HOME'])
+        base['USERPROFILE'] = base['HOME']
     with patch.dict(os.environ, base, clear=True):
         return importlib.reload(unbound)
 
@@ -34,7 +46,7 @@ class TestConfigDirResolution(unittest.TestCase):
 
     def test_relocated_when_env_set(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc')
-        self.assertEqual(m._CONFIG_DIR, Path('/opt/cc'))
+        self.assertEqual(m._CONFIG_DIR, _abs('/opt/cc'))
 
     def test_leading_tilde_is_not_expanded(self):
         # Claude Code reads the value verbatim and makes a literal "~" directory.
@@ -54,10 +66,10 @@ class TestConfigDirResolution(unittest.TestCase):
 
     def test_enforcement_paths_follow_the_relocated_dir(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc')
-        self.assertEqual(m.AUDIT_LOG, Path('/opt/cc/hooks/agent-audit.log'))
-        self.assertEqual(m.POLICY_CACHE_FILE, Path('/opt/cc/hooks/.policy_cache.json'))
-        self.assertEqual(m.SELF_SCRIPT_PATH, Path('/opt/cc/hooks/unbound.py'))
-        self.assertEqual(m.CLAUDE_SKILLS_ROOT, Path('/opt/cc/skills'))
+        self.assertEqual(m.AUDIT_LOG, _abs('/opt/cc/hooks/agent-audit.log'))
+        self.assertEqual(m.POLICY_CACHE_FILE, _abs('/opt/cc/hooks/.policy_cache.json'))
+        self.assertEqual(m.SELF_SCRIPT_PATH, _abs('/opt/cc/hooks/unbound.py'))
+        self.assertEqual(m.CLAUDE_SKILLS_ROOT, _abs('/opt/cc/skills'))
 
 
 class TestClaudeJsonLocation(unittest.TestCase):
@@ -73,7 +85,7 @@ class TestClaudeJsonLocation(unittest.TestCase):
 
     def test_moves_into_the_relocated_dir(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc')
-        self.assertEqual(m.CLAUDE_MCP_CONFIG_PATH, Path('/opt/cc/.claude.json'))
+        self.assertEqual(m.CLAUDE_MCP_CONFIG_PATH, _abs('/opt/cc/.claude.json'))
 
 
 class TestPluginCacheDir(unittest.TestCase):
@@ -82,17 +94,17 @@ class TestPluginCacheDir(unittest.TestCase):
 
     def test_defaults_under_the_config_dir(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc')
-        self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, Path('/opt/cc/plugins/cache'))
+        self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, _abs('/opt/cc/plugins/cache'))
 
     def test_env_override_wins_over_the_config_dir(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc',
                     CLAUDE_CODE_PLUGIN_CACHE_DIR='/var/pcache')
-        self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, Path('/var/pcache/cache'))
+        self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, _abs('/var/pcache/cache'))
 
     def test_blank_override_is_ignored(self):
         m = _reload(HOME='/home/jane', CLAUDE_CONFIG_DIR='/opt/cc',
                     CLAUDE_CODE_PLUGIN_CACHE_DIR='  ')
-        self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, Path('/opt/cc/plugins/cache'))
+        self.assertEqual(m.CLAUDE_PLUGIN_CACHE_DIR, _abs('/opt/cc/plugins/cache'))
 
 
 
