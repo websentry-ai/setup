@@ -1,9 +1,9 @@
 name: static-checks
 
-# Guards the setup scripts against the bug class that shipped in WEB-4622:
-# a function referenced but never defined (NameError) only surfaced when a
-# user ran the command. These scripts have no other test coverage, so we
-# fail the PR on any syntax error or undefined name across every *.py.
+# Guards every *.py against the bug class where a function is referenced but
+# never defined: a NameError that only surfaces when a user runs the command.
+# This is the syntax gate and runs across the whole tree, including files the
+# suite does not import. Behaviour is gated separately by test.yml.
 
 on:
   pull_request:
