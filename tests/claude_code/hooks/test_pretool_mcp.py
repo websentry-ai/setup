@@ -1,0 +1,1213 @@
+"""
+Tests for Claude Code plugin-MCP + claude.ai connector resolution in
+claude-code/hooks/unbound.py. Plugin servers surface as
+`mcp__plugin_<plugin>_<server>__<tool>` (name `plugin_slack_slack`) and
+claude.ai connectors as `mcp__claude_ai_<Name>__<tool>` (name `claude_ai_Slack`);
+neither has a config-file `mcpServers` entry, so the hook must rebuild a config
+to give the gateway a non-null fingerprint.
+"""
+
+import json
+import os
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+from tests.conftest import tool_module
+
+unbound = tool_module("claude-code/hooks")
+def _write_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data))
+
+
+def _make_plugin(cache_dir, marketplace, plugin, version, files, in_use=False):
+    """files: {".mcp.json": {...}, ".claude-plugin/plugin.json": {...}, "rel.json": {...}}"""
+    ver_dir = cache_dir / marketplace / plugin / version
+    ver_dir.mkdir(parents=True, exist_ok=True)
+    for rel, data in files.items():
+        _write_json(ver_dir / rel, data)
+    if in_use:
+        (ver_dir / ".in_use").write_text("")
+    return ver_dir
+
+
+class TestResolvePluginMcpConfig(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cache = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_mangle_token(self):
+        self.assertEqual(unbound._mangle_mcp_token("monday.com"), "monday_com")
+        self.assertEqual(unbound._mangle_mcp_token("my-plugin"), "my-plugin")
+        self.assertEqual(unbound._mangle_mcp_token(None), "")
+
+    def test_mcp_json_hit(self):
+        _make_plugin(
+            self.cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://mcp.slack.com/mcp", "type": "http"})
+
+    def test_inline_plugin_json_hit(self):
+        _make_plugin(
+            self.cache, "mkt", "stripe", "2.1.0",
+            {".claude-plugin/plugin.json": {
+                "mcpServers": {"stripe": {"command": "npx", "args": ["@stripe/mcp"]}}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_stripe_stripe", cache_dir=self.cache)
+        self.assertEqual(cfg, {"command": "npx", "args": ["@stripe/mcp"]})
+
+    def test_unwrapped_root_map_mcp_json_hit(self):
+        # Playwright ships {"playwright": {...}} at the root, no mcpServers wrapper.
+        _make_plugin(
+            self.cache, "claude-plugins-official", "playwright", "1.0.0",
+            {".mcp.json": {"playwright": {"command": "npx", "args": ["@playwright/mcp@latest"]}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_playwright_playwright", cache_dir=self.cache)
+        self.assertEqual(cfg, {"command": "npx", "args": ["@playwright/mcp@latest"]})
+
+    def test_unwrapped_root_ignores_non_server_entries(self):
+        # A plugin.json-style root (no command/url) must not be read as servers.
+        _make_plugin(
+            self.cache, "mkt", "noserver", "1.0.0",
+            {".mcp.json": {"name": "noserver", "author": {"name": "acme"}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_noserver_name", cache_dir=self.cache)
+        self.assertIsNone(cfg)
+
+    def test_string_form_relative_path_hit(self):
+        _make_plugin(
+            self.cache, "mkt", "vercel", "3.0.0",
+            {
+                ".claude-plugin/plugin.json": {"mcpServers": ".mcp.json"},
+                ".mcp.json": {"mcpServers": {"vercel": {"url": "https://mcp.vercel.com"}}},
+            },
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_vercel_vercel", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://mcp.vercel.com"})
+
+    def test_multiple_in_use_picks_newest_deterministically(self):
+        import os
+        _make_plugin(
+            self.cache, "mkt", "demo", "1.0.0",
+            {".mcp.json": {"mcpServers": {"demo": {"url": "https://old.example/mcp", "type": "http"}}}},
+            in_use=True,
+        )
+        _make_plugin(
+            self.cache, "mkt", "demo", "2.0.0",
+            {".mcp.json": {"mcpServers": {"demo": {"url": "https://new.example/mcp", "type": "http"}}}},
+            in_use=True,
+        )
+        base = self.cache / "mkt" / "demo"
+        os.utime(base / "1.0.0", (1000, 1000))
+        os.utime(base / "2.0.0", (2000, 2000))
+        cfg = unbound._resolve_plugin_mcp_config("plugin_demo_demo", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://new.example/mcp", "type": "http"})
+
+    def test_string_form_within_version_dir_hit(self):
+        # A relative path that stays inside the version dir resolves normally.
+        _make_plugin(
+            self.cache, "mkt", "linear", "1.0.0",
+            {
+                ".claude-plugin/plugin.json": {"mcpServers": "servers.json"},
+                "servers.json": {"mcpServers": {"linear": {"url": "https://mcp.linear.app"}}},
+            },
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_linear_linear", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://mcp.linear.app"})
+
+    def test_string_form_traversal_escape_rejected(self):
+        # `../` traversal must not read a file outside the version dir.
+        ver_dir = _make_plugin(
+            self.cache, "mkt", "evilplug", "1.0.0",
+            {".claude-plugin/plugin.json": {"mcpServers": "../../../evil.json"}},
+        )
+        # The escape target exists and would resolve to a real file if uncontained.
+        outside = ver_dir.parent.parent.parent / "evil.json"
+        _write_json(outside, {"mcpServers": {"evil": {"url": "https://evil.example/mcp"}}})
+        cfg = unbound._resolve_plugin_mcp_config("plugin_evilplug_evil", cache_dir=self.cache)
+        self.assertIsNone(cfg)
+
+    def test_string_form_absolute_path_rejected(self):
+        # An absolute path must be rejected (pathlib would otherwise replace the
+        # base, reading an arbitrary file). Point it at a real file to prove the
+        # containment check, not a missing file, is what stops the read.
+        outside = Path(self._tmp.name) / "abs_evil.json"
+        _write_json(outside, {"mcpServers": {"evil": {"url": "https://abs.example/mcp"}}})
+        _make_plugin(
+            self.cache, "mkt", "absplug", "1.0.0",
+            {".claude-plugin/plugin.json": {"mcpServers": str(outside)}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_absplug_evil", cache_dir=self.cache)
+        self.assertIsNone(cfg)
+
+    def test_identical_config_collision_resolves(self):
+        # Two distinct (plugin, server) pairs mangle to the same candidate AND
+        # share the SAME config -> one distinct entry -> resolves (benign).
+        _make_plugin(
+            self.cache, "mkt", "a_b", "1.0.0",
+            {".mcp.json": {"mcpServers": {"c": {"url": "https://same.example/mcp"}}}},
+        )
+        _make_plugin(
+            self.cache, "mkt", "a", "1.0.0",
+            {".mcp.json": {"mcpServers": {"b_c": {"url": "https://same.example/mcp"}}}},
+        )
+        # both -> plugin_a_b_c
+        cfg = unbound._resolve_plugin_mcp_config("plugin_a_b_c", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://same.example/mcp"})
+
+    def test_multi_version_prefers_in_use(self):
+        _make_plugin(
+            self.cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://old.example/mcp"}}}},
+        )
+        _make_plugin(
+            self.cache, "mkt", "slack", "2.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://current.example/mcp"}}}},
+            in_use=True,
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://current.example/mcp"})
+
+    def test_multi_version_prefers_newest_when_no_in_use(self):
+        old = _make_plugin(
+            self.cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://old.example/mcp"}}}},
+        )
+        new = _make_plugin(
+            self.cache, "mkt", "slack", "2.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://newest.example/mcp"}}}},
+        )
+        import os
+        os.utime(old, (1000, 1000))
+        os.utime(new, (2000, 2000))
+        cfg = unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://newest.example/mcp"})
+
+    def test_underscore_in_names_disambiguates(self):
+        # plugin dir `my_plugin`, server key `my_server` => plugin_my_plugin_my_server
+        _make_plugin(
+            self.cache, "mkt", "my_plugin", "1.0.0",
+            {".mcp.json": {"mcpServers": {"my_server": {"url": "https://my.example/mcp"}}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_my_plugin_my_server", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://my.example/mcp"})
+
+    def test_ambiguous_different_configs_returns_none(self):
+        # Two distinct (plugin, server) pairs both mangle to the same candidate
+        # name but carry DIFFERENT configs -> ambiguous -> None (no guessing).
+        _make_plugin(
+            self.cache, "mkt", "a_b", "1.0.0",
+            {".mcp.json": {"mcpServers": {"c": {"url": "https://a.example/mcp"}}}},
+        )
+        _make_plugin(
+            self.cache, "mkt", "a", "1.0.0",
+            {".mcp.json": {"mcpServers": {"b_c": {"url": "https://b.example/mcp"}}}},
+        )
+        # both -> plugin_a_b_c
+        cfg = unbound._resolve_plugin_mcp_config("plugin_a_b_c", cache_dir=self.cache)
+        self.assertIsNone(cfg)
+
+    def test_secret_stripping(self):
+        _make_plugin(
+            self.cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {
+                "url": "https://mcp.slack.com/mcp",
+                "type": "http",
+                "oauth": {"client_secret": "shh"},
+                "env": {"TOKEN": "xoxb-secret"},
+                "headers": {"Authorization": "Bearer secret"},
+            }}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=self.cache)
+        self.assertEqual(set(cfg.keys()), {"url", "type"})
+        self.assertNotIn("oauth", cfg)
+        self.assertNotIn("env", cfg)
+        self.assertNotIn("headers", cfg)
+
+    def test_missing_cache_dir_returns_none_no_raise(self):
+        missing = Path(self._tmp.name) / "does" / "not" / "exist"
+        self.assertIsNone(unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=missing))
+
+    def test_non_plugin_name_returns_none(self):
+        self.assertIsNone(unbound._resolve_plugin_mcp_config("slack", cache_dir=self.cache))
+
+    def test_miss_returns_none(self):
+        _make_plugin(
+            self.cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp"}}}},
+        )
+        self.assertIsNone(
+            unbound._resolve_plugin_mcp_config("plugin_other_other", cache_dir=self.cache))
+
+    def test_corrupt_sibling_plugin_does_not_abort_scan(self):
+        # A plugin with a corrupt .mcp.json must not deny every plugin call:
+        # the valid sibling still resolves, and the corrupt plugin's own name
+        # misses (returns None) without raising.
+        corrupt_dir = _make_plugin(self.cache, "mkt", "broken", "1.0.0", {})
+        (corrupt_dir / ".mcp.json").write_text("{ broken")
+        _make_plugin(
+            self.cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_slack_slack", cache_dir=self.cache)
+        self.assertEqual(cfg, {"url": "https://mcp.slack.com/mcp", "type": "http"})
+        self.assertIsNone(
+            unbound._resolve_plugin_mcp_config("plugin_broken_broken", cache_dir=self.cache))
+
+
+class TestResolveClaudeAiConnector(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.cfg_path = Path(self._tmp.name) / ".claude.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_connector_hit(self):
+        _write_json(self.cfg_path, {"claudeAiMcpEverConnected": ["claude.ai Slack", "claude.ai Notion"]})
+        result = unbound._resolve_claude_ai_connector("claude_ai_Slack", config_path=self.cfg_path)
+        self.assertEqual(result, ("claude.ai Slack", {"additional_data": {"scope": "claudeai"}}))
+
+    def test_connector_dotted_mangle(self):
+        _write_json(self.cfg_path, {"claudeAiMcpEverConnected": ["claude.ai monday.com"]})
+        result = unbound._resolve_claude_ai_connector("claude_ai_monday_com", config_path=self.cfg_path)
+        self.assertEqual(result, ("claude.ai monday.com", {"additional_data": {"scope": "claudeai"}}))
+
+    def test_connector_not_in_list_returns_none(self):
+        _write_json(self.cfg_path, {"claudeAiMcpEverConnected": ["claude.ai Notion"]})
+        self.assertIsNone(
+            unbound._resolve_claude_ai_connector("claude_ai_Slack", config_path=self.cfg_path))
+
+    def test_missing_config_returns_none_no_raise(self):
+        missing = Path(self._tmp.name) / "nope.json"
+        self.assertIsNone(
+            unbound._resolve_claude_ai_connector("claude_ai_Slack", config_path=missing))
+
+    def test_corrupt_config_returns_none_no_raise(self):
+        self.cfg_path.write_text("{ this is not json")
+        self.assertIsNone(
+            unbound._resolve_claude_ai_connector("claude_ai_Slack", config_path=self.cfg_path))
+
+    def test_non_connector_name_returns_none(self):
+        _write_json(self.cfg_path, {"claudeAiMcpEverConnected": ["claude.ai Slack"]})
+        self.assertIsNone(
+            unbound._resolve_claude_ai_connector("plugin_slack_slack", config_path=self.cfg_path))
+
+    def test_never_copies_other_fields(self):
+        _write_json(self.cfg_path, {
+            "claudeAiMcpEverConnected": ["claude.ai Slack"],
+            "oauthAccount": {"accessToken": "secret"},
+        })
+        result = unbound._resolve_claude_ai_connector("claude_ai_Slack", config_path=self.cfg_path)
+        self.assertEqual(result[1], {"additional_data": {"scope": "claudeai"}})
+
+    def test_ambiguous_distinct_displays_returns_none(self):
+        # Two distinct display names mangle to the same server_name -> fail-secure
+        # (no guessing which dotted identity to inject).
+        _write_json(self.cfg_path, {
+            "claudeAiMcpEverConnected": ["claude.ai monday.com", "claude.ai monday_com"]})
+        self.assertIsNone(
+            unbound._resolve_claude_ai_connector("claude_ai_monday_com", config_path=self.cfg_path))
+
+    def test_single_match_resolves(self):
+        # Control: a single matching display resolves to its dotted identity.
+        _write_json(self.cfg_path, {"claudeAiMcpEverConnected": ["claude.ai monday.com"]})
+        result = unbound._resolve_claude_ai_connector("claude_ai_monday_com", config_path=self.cfg_path)
+        self.assertEqual(result, ("claude.ai monday.com", {"additional_data": {"scope": "claudeai"}}))
+
+
+class ProcessPreToolUseBase(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        # Empty config so _read_mcp_server_config finds nothing -> resolvers run.
+        self.claude_json = self.root / ".claude.json"
+        _write_json(self.claude_json, {"mcpServers": {}})
+        self.plugin_cache = self.root / "plugins" / "cache"
+        self.plugin_cache.mkdir(parents=True, exist_ok=True)
+        self.dispatch_diag = MagicMock()
+        self._patchers = [
+            patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", self.claude_json),
+            patch.object(unbound, "CLAUDE_PLUGIN_CACHE_DIR", self.plugin_cache),
+            patch.object(unbound, "load_policy_cache", lambda: {"tools_to_check": [], "ts": 0}),
+            patch.object(unbound, "is_cache_stale", lambda c: False),
+            patch.object(unbound, "get_recent_user_prompts_for_session", lambda *a, **k: []),
+            patch.object(unbound, "_get_session_model", lambda *a, **k: "auto"),
+            patch.object(unbound, "_is_approval_retry", lambda *a, **k: False),
+            patch.object(unbound, "build_account_identity", lambda *a, **k: {}),
+            patch.object(unbound, "report_error_to_gateway", lambda *a, **k: None),
+            patch.object(unbound, "_dispatch_mcp_server_scan", lambda *a, **k: None),
+            patch.object(unbound, "_dispatch_mcp_diagnostic", self.dispatch_diag),
+        ]
+        for p in self._patchers:
+            p.start()
+        self.cwd = str(self.root)
+
+    def tearDown(self):
+        for p in self._patchers:
+            p.stop()
+        self._tmp.cleanup()
+
+    def run_capture(self, raw_tool):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["md"] = request_body["pre_tool_use_data"]["metadata"]
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": raw_tool,
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        return captured.get("md", {})
+
+
+class TestProcessPreToolUseEndToEnd(ProcessPreToolUseBase):
+    def test_plugin_call_forwards_slack_url(self):
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        md = self.run_capture("mcp__plugin_slack_slack__post_message")
+        self.assertEqual(md.get("mcp_server"), "plugin_slack_slack")  # unchanged for plugins
+        self.assertEqual(md.get("mcp_tool"), "post_message")  # tool half preserved
+        self.assertEqual(
+            md.get("mcp_server_config"),
+            {"url": "https://mcp.slack.com/mcp", "type": "http"},
+        )
+
+    def test_connector_call_rewrites_server_name(self):
+        _write_json(self.claude_json, {
+            "mcpServers": {},
+            "claudeAiMcpEverConnected": ["claude.ai Slack"],
+        })
+        md = self.run_capture("mcp__claude_ai_Slack__send_message")
+        self.assertEqual(md.get("mcp_server"), "claude.ai Slack")
+        self.assertEqual(md.get("mcp_tool"), "send_message")  # tool half preserved through rewrite
+        self.assertEqual(md.get("mcp_server_config"), {"additional_data": {"scope": "claudeai"}})
+
+    def test_client_entrypoint_forwarded_from_env(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        with patch.object(unbound, "send_to_hook_api", capturing_gw), \
+             patch.dict(os.environ, {"CLAUDE_CODE_ENTRYPOINT": "sdk-cli"}):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(captured["body"].get("client_entrypoint"), "sdk-cli")
+
+    def test_client_entrypoint_defaults_to_cli_when_unset(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}},
+        )
+        env_without_entrypoint = {k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_ENTRYPOINT"}
+        with patch.object(unbound, "send_to_hook_api", capturing_gw), \
+             patch.dict(os.environ, env_without_entrypoint, clear=True):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertEqual(captured["body"].get("client_entrypoint"), "cli")
+
+    def test_unresolved_mcp_carries_no_config(self):
+        md = self.run_capture("mcp__plugin_unknown_unknown__do_thing")
+        self.assertEqual(md.get("mcp_server"), "plugin_unknown_unknown")  # unchanged
+        self.assertNotIn("mcp_server_config", md)
+
+    def test_null_fingerprint_dispatches_diagnostic_without_unknown_hint(self):
+        # Regression: a null fingerprint yields a plain allow (the gateway never
+        # sets unknown_mcp_server for it), yet the diagnostic MUST still fire off
+        # the hook's own no-config result. The old code gated it on
+        # unknown_mcp_server, so it never ran for the exact case it's built for.
+        md = self.run_capture("mcp__mystery_server__do_thing")
+        self.assertNotIn("mcp_server_config", md)
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "mystery_server")
+
+    def test_resolved_config_does_not_dispatch_diagnostic(self):
+        _make_plugin(
+            self.plugin_cache, "anthropics", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp"}}}},
+        )
+        md = self.run_capture("mcp__plugin_slack_slack__post_message")
+        self.assertIn("mcp_server_config", md)
+        self.dispatch_diag.assert_not_called()
+
+    def test_null_fingerprint_dispatches_diagnostic_on_deny(self):
+        # The real case: a null-fp MCP server the org policy DENIES (e.g. the
+        # blocked computer-use server, pretool_blocked=true). The deny path has no
+        # early return before the trigger, so the diagnostic must still dispatch.
+        def deny_gw(request_body, api_key):
+            return {"decision": "deny", "reason": "blocked", "pretool_blocked": True}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__computer-use__request_access",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api", deny_gw):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.dispatch_diag.assert_called_once()
+        self.assertEqual(self.dispatch_diag.call_args[0][0], "computer-use")
+
+    def test_config_file_server_takes_precedence_over_resolvers(self):
+        # A real config-file entry must win; resolvers must not run/override it.
+        _write_json(self.claude_json, {
+            "mcpServers": {"plugin_slack_slack": {"url": "https://configfile.example/mcp"}},
+        })
+        _make_plugin(
+            self.plugin_cache, "mkt", "slack", "1.0.0",
+            {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp"}}}},
+        )
+        md = self.run_capture("mcp__plugin_slack_slack__post_message")
+        self.assertEqual(md.get("mcp_server_config"), {"url": "https://configfile.example/mcp"})
+
+
+class TestUnboundAppLabel(unittest.TestCase):
+    """_unbound_app_label reports Cowork via the desktop env markers, with the
+    local-agent-mode-sessions sandbox path as a fallback; everything else is
+    claude-code. Verified against real captured events from all three surfaces."""
+
+    def setUp(self):
+        # neutralize any ambient Cowork env so path-based cases are deterministic
+        self._env = patch.dict("os.environ", {}, clear=True)
+        self._env.start()
+        self.addCleanup(self._env.stop)
+
+    def test_claude_code_cli(self):
+        ev = {"cwd": "/Users/x/Documents/proj",
+              "transcript_path": "/Users/x/.claude/projects/-Users-x-Documents-proj/s.jsonl"}
+        self.assertEqual(unbound._unbound_app_label(ev), "claude-code")
+
+    def test_claude_code_desktop(self):
+        ev = {"cwd": "/Users/x/Downloads",
+              "transcript_path": "/Users/x/.claude/projects/-Users-x-Downloads/s.jsonl"}
+        self.assertEqual(unbound._unbound_app_label(ev), "claude-code")
+
+    def test_cowork_env_is_cowork_flag(self):
+        # env wins even when the path looks like plain Claude Code
+        with patch.dict("os.environ", {"CLAUDE_CODE_IS_COWORK": "1"}):
+            self.assertEqual(unbound._unbound_app_label({"cwd": "/Users/x/proj"}), "cowork")
+
+    def test_cowork_env_entrypoint_values(self):
+        for val in ("local-agent", "local_agent", "remote_cowork"):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "cowork")
+
+    def test_any_cowork_entrypoint_variant_is_cowork(self):
+        for val in ("remote_cowork_v2", "cowork", "REMOTE_COWORK", " remote_cowork "):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "cowork")
+
+    def test_remote_entrypoint_without_cowork_is_claude_code(self):
+        for val in ("remote", "remote_headless", "remote_ci"):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+
+    def test_unrecognized_entrypoint_is_claude_code(self):
+        for val in ("cli", "desktop", "vscode", ""):
+            with patch.dict("os.environ", {"CLAUDE_CODE_ENTRYPOINT": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+
+    def test_is_cowork_flag_non_1_is_claude_code(self):
+        for val in ("0", "true", ""):
+            with patch.dict("os.environ", {"CLAUDE_CODE_IS_COWORK": val}):
+                self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+
+    def test_cowork_path_fallback_cwd(self):
+        ev = {"cwd": "/Users/x/Library/Application Support/Claude/local-agent-mode-sessions/a/b/local_c/outputs"}
+        self.assertEqual(unbound._unbound_app_label(ev), "cowork")
+
+    def test_cowork_path_fallback_transcript_only(self):
+        # cowork transcript lives in a tmpdir but the sanitized project name keeps the marker
+        ev = {"cwd": "/private/tmp",
+              "transcript_path": "/var/folders/x/T/claude-hostloop-plugins/h/projects/-Users-x-Library-Application-Support-Claude-local-agent-mode-sessions-a-b-local-c-outputs/s.jsonl"}
+        self.assertEqual(unbound._unbound_app_label(ev), "cowork")
+
+    def test_missing_fields_default_to_claude_code(self):
+        self.assertEqual(unbound._unbound_app_label({}), "claude-code")
+        self.assertEqual(unbound._unbound_app_label({"cwd": None, "transcript_path": None}), "claude-code")
+
+
+class TestResolvePluginMcpConfigRegistry(unittest.TestCase):
+    """Registry-driven resolution: the hook must read a plugin's .mcp.json from
+    where Claude loads it (installed_plugins.json + known_marketplaces.json), which
+    for a `directory` marketplace is the live clone -- not the lagging cache snapshot.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.plugins_root = self.root / "plugins"
+        self.cache = self.plugins_root / "cache"
+        self.cache.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _registries(self, installed, marketplaces):
+        _write_json(self.plugins_root / "installed_plugins.json", {"version": 2, "plugins": installed})
+        _write_json(self.plugins_root / "known_marketplaces.json", marketplaces)
+
+    @staticmethod
+    def _http(url):
+        return {"type": "http", "url": url}
+
+    def test_directory_marketplace_resolves_server_absent_from_cache(self):
+        # The exact reported scenario, structurally: installPath -> a stale cache
+        # snapshot missing a server; the live source (installLocation/plugins/<plugin>)
+        # has it. Resolves via the conventional layout, no marketplace.json needed.
+        _make_plugin(
+            self.cache, "localmkt", "toolkit", "0.1.0",
+            {".mcp.json": {"mcpServers": {"alpha-mcp": self._http("https://proxy.example.com/rpc?f=alpha")}}},
+            in_use=True,
+        )
+        install_path = self.cache / "localmkt" / "toolkit" / "0.1.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "toolkit" / ".mcp.json", {"mcpServers": {
+            "alpha-mcp": self._http("https://proxy.example.com/rpc?f=alpha"),
+            "beta-mcp": self._http("https://proxy.example.com/rpc?f=beta"),
+        }})
+        self._registries(
+            {"toolkit@localmkt": [{"scope": "user", "installPath": str(install_path)}]},
+            {"localmkt": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}},
+        )
+        cfg = unbound._resolve_plugin_mcp_config("plugin_toolkit_beta-mcp", cache_dir=self.cache)
+        self.assertEqual(cfg, self._http("https://proxy.example.com/rpc?f=beta"))
+        # legacy cache-only path still misses it (proves the fix is what closed the gap)
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_from_cache(
+            "plugin_toolkit_beta-mcp", cache_dir=self.cache))
+
+    def test_directory_marketplace_multiple_plugins_selects_correct_one(self):
+        # Mirrors a real directory marketplace with several sibling plugins (as in
+        # the reported case). Cache snapshots are stale; the live clone is complete.
+        clone = self.root / "clone"
+        installed = {}
+        for name, servers in (("coding", {"c1-mcp": "coding/c1"}),
+                              ("toolkit", {"alpha-mcp": "toolkit/alpha"}),
+                              ("search", {"s1-mcp": "search/s1"})):
+            _make_plugin(self.cache, "localmkt", name, "0.1.0",
+                         {".mcp.json": {"mcpServers": {k: self._http("https://x/%s" % v) for k, v in servers.items()}}},
+                         in_use=True)
+            installed["%s@localmkt" % name] = [{"installPath": str(self.cache / "localmkt" / name / "0.1.0")}]
+        # live clone: toolkit gains a beta-mcp that never made it into the cache
+        _write_json(clone / "plugins" / "coding" / ".mcp.json", {"mcpServers": {"c1-mcp": self._http("https://x/coding/c1")}})
+        _write_json(clone / "plugins" / "toolkit" / ".mcp.json", {"mcpServers": {
+            "alpha-mcp": self._http("https://x/toolkit/alpha"), "beta-mcp": self._http("https://x/toolkit/beta")}})
+        _write_json(clone / "plugins" / "search" / ".mcp.json", {"mcpServers": {"s1-mcp": self._http("https://x/search/s1")}})
+        self._registries(installed,
+                         {"localmkt": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        # the cache-absent server resolves to the RIGHT plugin
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_toolkit_beta-mcp", cache_dir=self.cache),
+                         self._http("https://x/toolkit/beta"))
+        # a sibling plugin's server still resolves (no cross-contamination)
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_search_s1-mcp", cache_dir=self.cache),
+                         self._http("https://x/search/s1"))
+
+    def test_directory_marketplace_manifest_declared_path(self):
+        # Non-standard layout: plugin source is declared in marketplace.json, and
+        # there is NO conventional plugins/<plugin> dir -> the manifest path resolves.
+        clone = self.root / "clone"
+        _write_json(clone / "custom" / "loc" / ".mcp.json",
+                    {"mcpServers": {"s": self._http("https://declared.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "custom/loc"}}]})
+        self._registries({"p@mk": [{"installPath": str(self.cache / "mk" / "p" / "0.1.0")}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://declared.example/mcp"))
+
+    def test_conventional_dir_missing_server_does_not_stop_search(self):
+        # The conventional plugins/<plugin> dir exists but holds OTHER servers, not
+        # the requested one; the manifest-declared path defines it and the cache
+        # lacks it. Resolution must not stop at the first populated dir.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"other": self._http("https://other.example/mcp")}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json",
+                    {"mcpServers": {"other": self._http("https://other.example/mcp")}})
+        _write_json(clone / "custom" / "loc" / ".mcp.json",
+                    {"mcpServers": {"wanted": self._http("https://wanted.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "custom/loc"}}]})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_wanted", cache_dir=self.cache),
+                         self._http("https://wanted.example/mcp"))
+
+    def test_entry_with_no_forwardable_fields_does_not_stop_search(self):
+        # An earlier candidate has the server key but nothing to forward
+        # (`_extract_mcp_server_fields` returns None). A later candidate (manifest-
+        # declared) defines it and the cache lacks it, so resolution keeps looking.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"s": {"headers": {"x": "y"}}}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json", {"mcpServers": {"s": {"headers": {"x": "y"}}}})
+        _write_json(clone / "custom" / "loc" / ".mcp.json",
+                    {"mcpServers": {"s": self._http("https://declared.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "custom/loc"}}]})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://declared.example/mcp"))
+
+    def test_colliding_keys_in_one_dir_is_ambiguous(self):
+        # Two server keys in ONE .mcp.json mangle to the same candidate with different
+        # configs. All keys are considered (like the cache path) -> ambiguous -> None.
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json", {"mcpServers": {
+            "s.x": self._http("https://a.example/mcp"),  # -> plugin_p_s_x
+            "s_x": self._http("https://b.example/mcp"),  # -> plugin_p_s_x
+        }})
+        self._registries({"p@mk": [{"installPath": str(self.cache / "none")}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config("plugin_p_s_x", cache_dir=self.cache))
+
+    def test_registry_ambiguous_candidate_returns_none(self):
+        # Two (plugin, server) pairs mangle to the same candidate with DIFFERENT
+        # configs -> ambiguous -> None (never guess).
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "a_b" / ".mcp.json", {"mcpServers": {"c": self._http("https://a.example/mcp")}})
+        _write_json(clone / "plugins" / "a" / ".mcp.json", {"mcpServers": {"b_c": self._http("https://b.example/mcp")}})
+        self._registries(
+            {"a_b@mk": [{"installPath": str(self.cache / "z1")}], "a@mk": [{"installPath": str(self.cache / "z2")}]},
+            {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config("plugin_a_b_c", cache_dir=self.cache))
+
+    def test_prefers_live_source_over_stale_cache_same_key(self):
+        # No manifest -> exercises the conventional plugins/<plugin> fallback layout.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"s": self._http("https://old.example/mcp")}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        _write_json(clone / "plugins" / "p" / ".mcp.json", {"mcpServers": {"s": self._http("https://new.example/mcp")}})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://new.example/mcp"))
+
+    def test_github_marketplace_reads_installpath(self):
+        _make_plugin(self.cache, "official", "ghp", "unknown",
+                     {".mcp.json": {"mcpServers": {"ghp": self._http("https://gh.example/mcp")}}})
+        install_path = self.cache / "official" / "ghp" / "unknown"
+        self._registries({"ghp@official": [{"installPath": str(install_path)}]},
+                         {"official": {"source": {"source": "github", "repo": "x/y"},
+                                       "installLocation": str(self.plugins_root / "marketplaces" / "official")}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_ghp_ghp", cache_dir=self.cache),
+                         self._http("https://gh.example/mcp"))
+
+    def test_manifest_source_path_traversal_rejected(self):
+        # marketplace.json points the plugin source outside installLocation: reject
+        # the escape and fall back to the safe installPath copy, never read evil.
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"s": self._http("https://safe.example/mcp")}}}, in_use=True)
+        install_path = self.cache / "mk" / "p" / "1.0.0"
+        clone = self.root / "clone"
+        clone.mkdir(parents=True)
+        _write_json(self.root / "evil" / "plugins" / "p" / ".mcp.json",
+                    {"mcpServers": {"s": self._http("https://evil.example/mcp")}})
+        _write_json(clone / ".claude-plugin" / "marketplace.json", {"name": "mk", "plugins": [
+            {"name": "p", "source": {"source": "directory", "path": "../evil/plugins/p"}}]})
+        self._registries({"p@mk": [{"installPath": str(install_path)}]},
+                         {"mk": {"source": {"source": "directory", "path": str(clone)}, "installLocation": str(clone)}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_s", cache_dir=self.cache),
+                         self._http("https://safe.example/mcp"))
+
+    def test_plugin_in_cache_but_not_registry_falls_back(self):
+        _make_plugin(self.cache, "mk", "orphan", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"orphan": self._http("https://orphan.example/mcp")}}}, in_use=True)
+        self._registries({"other@mk": [{"installPath": str(self.cache / "mk" / "other" / "1.0.0")}]},
+                         {"mk": {"source": {"source": "github", "repo": "x/y"}, "installLocation": "/x"}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_orphan_orphan", cache_dir=self.cache),
+                         self._http("https://orphan.example/mcp"))
+
+    def test_registries_absent_uses_cache(self):
+        _make_plugin(self.cache, "mk", "p", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"p": self._http("https://c.example/mcp")}}}, in_use=True)
+        self.assertEqual(unbound._resolve_plugin_mcp_config("plugin_p_p", cache_dir=self.cache),
+                         self._http("https://c.example/mcp"))
+
+
+class TestResolveLaunchMcpConfig(unittest.TestCase):
+    """Launch-time --mcp-config resolution: headless/SDK Claude Code passes MCP
+    servers on the CLI (inline JSON or a file path) instead of ~/.claude.json."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _resolve(self, argv, server="toolchain", cwd=None):
+        # Simulate `argv` being the Claude CLI, the hook's nearest ancestor.
+        with patch.object(unbound, "_process_argv", return_value=argv), \
+             patch.object(unbound, "_parent_pid", return_value=None), \
+             patch.object(unbound, "_proc_cwd", return_value=cwd):
+            return unbound._resolve_launch_mcp_config(server)
+
+    def test_inline_json_hit(self):
+        argv = ["claude", "--permission-mode", "dontAsk", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://cyber.example/mcp","type":"http"}}}']
+        self.assertEqual(self._resolve(argv),
+                         {"url": "https://cyber.example/mcp", "type": "http"})
+
+    def test_config_file_path_hit(self):
+        cfg = self.dir / "mcp.json"
+        _write_json(cfg, {"mcpServers": {"toolchain": {"url": "https://file.example/mcp", "type": "http"}}})
+        argv = ["claude", "--mcp-config", str(cfg)]
+        self.assertEqual(self._resolve(argv),
+                         {"url": "https://file.example/mcp", "type": "http"})
+
+    def test_relative_file_resolved_against_launcher_cwd(self):
+        _write_json(self.dir / "mcp.json",
+                    {"mcpServers": {"toolchain": {"url": "https://rel.example/mcp", "type": "http"}}})
+        argv = ["claude", "--mcp-config", "./mcp.json"]
+        self.assertEqual(self._resolve(argv, cwd=str(self.dir)),
+                         {"url": "https://rel.example/mcp", "type": "http"})
+
+    def test_relative_file_without_launcher_cwd_fails_closed(self):
+        _write_json(self.dir / "mcp.json",
+                    {"mcpServers": {"toolchain": {"url": "https://x", "type": "http"}}})
+        argv = ["claude", "--mcp-config", "./mcp.json"]
+        self.assertIsNone(self._resolve(argv, cwd=None))
+
+    def test_stdio_command_gets_script_hash(self):
+        script = self.dir / "server.py"
+        script.write_text("print('hi')\n")
+        argv = ["claude", "--mcp-config",
+                json.dumps({"mcpServers": {"toolchain": {"command": "python3", "args": [str(script)]}}})]
+        cfg = self._resolve(argv)
+        self.assertEqual(cfg["command"], "python3")
+        self.assertIn("scriptHash", cfg)
+
+    def test_variadic_values_last_wins(self):
+        argv = ["claude", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://OLD","type":"http"}}}',
+                '{"mcpServers":{"toolchain":{"url":"https://NEW","type":"http"}}}',
+                "--permission-mode", "x"]
+        self.assertEqual(self._resolve(argv), {"url": "https://NEW", "type": "http"})
+
+    def test_variadic_mixes_file_and_inline(self):
+        base = self.dir / "base.json"
+        _write_json(base, {"mcpServers": {"other": {"url": "https://other", "type": "http"}}})
+        argv = ["claude", "--mcp-config", str(base),
+                '{"mcpServers":{"toolchain":{"url":"https://inline","type":"http"}}}']
+        self.assertEqual(self._resolve(argv), {"url": "https://inline", "type": "http"})
+        self.assertEqual(self._resolve(argv, server="other"), {"url": "https://other", "type": "http"})
+
+    def test_equals_form_hit(self):
+        argv = ["claude", '--mcp-config={"mcpServers":{"toolchain":{"url":"https://eq","type":"http"}}}']
+        self.assertEqual(self._resolve(argv), {"url": "https://eq", "type": "http"})
+
+    def test_non_claude_ancestor_is_not_trusted(self):
+        # A wrapper process carrying a decoy config must never be treated as the source.
+        argv = ["python3", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://decoy","type":"http"}}}']
+        self.assertIsNone(self._resolve(argv))
+
+    def test_claude_exe_accepted(self):
+        argv = ["claude.exe", "--mcp-config",
+                '{"mcpServers":{"toolchain":{"url":"https://winsrv","type":"http"}}}']
+        self.assertEqual(self._resolve(argv), {"url": "https://winsrv", "type": "http"})
+
+    def test_no_mcp_config_flag_returns_none(self):
+        self.assertIsNone(self._resolve(["claude", "--permission-mode", "x"]))
+
+    def test_server_absent_returns_none(self):
+        argv = ["claude", "--mcp-config", '{"mcpServers":{"other":{"url":"https://o","type":"http"}}}']
+        self.assertIsNone(self._resolve(argv))
+
+    def test_malformed_inline_json_returns_none(self):
+        self.assertIsNone(self._resolve(["claude", "--mcp-config", '{"mcpServers": OOPS']))
+
+    def test_is_claude_cli(self):
+        self.assertTrue(unbound._is_claude_cli(["claude", "x"]))
+        self.assertTrue(unbound._is_claude_cli(["/usr/local/bin/claude"]))
+        self.assertTrue(unbound._is_claude_cli(["claude.exe"]))
+        self.assertFalse(unbound._is_claude_cli(["node", "cli.js"]))
+        self.assertFalse(unbound._is_claude_cli(["python3"]))
+        self.assertFalse(unbound._is_claude_cli([]))
+
+    def test_values_from_argv_variadic_and_equals(self):
+        argv = ["claude", "--mcp-config", "a.json", "b.json", "--other", "--mcp-config=c.json"]
+        self.assertEqual(unbound._mcp_config_values_from_argv(argv), ["a.json", "b.json", "c.json"])
+
+
+class TestArgvPluginFlags(unittest.TestCase):
+    def test_plugin_dir_variadic_and_equals(self):
+        argv = ["claude", "--plugin-dir", "/a", "/b", "--other", "--plugin-dir=/c"]
+        self.assertEqual(unbound._argv_flag_values(argv, "--plugin-dir"), ["/a", "/b", "/c"])
+
+    def test_mcp_config_still_parses(self):
+        argv = ["claude", "--mcp-config", "a.json", "b.json", "--other", "--mcp-config=c.json"]
+        self.assertEqual(unbound._mcp_config_values_from_argv(argv), ["a.json", "b.json", "c.json"])
+
+    def test_claude_plugin_launch_values(self):
+        argv = ["claude", "--plugin-dir", "/abs/p", "rel/p",
+                "--plugin-url", "https://plug.example/x.zip"]
+        with patch.object(unbound, "_process_argv", return_value=argv), \
+             patch.object(unbound, "_parent_pid", return_value=None), \
+             patch.object(unbound, "_proc_cwd", return_value="/launch/cwd"):
+            dirs, urls = unbound._claude_plugin_launch_values()
+        self.assertEqual(dirs, [Path("/abs/p"), Path("/launch/cwd/rel/p")])
+        self.assertEqual(urls, ["https://plug.example/x.zip"])
+
+    def test_non_claude_ancestor_yields_nothing(self):
+        with patch.object(unbound, "_process_argv", return_value=["python3", "--plugin-dir", "/p"]), \
+             patch.object(unbound, "_parent_pid", return_value=None):
+            self.assertEqual(unbound._claude_plugin_launch_values(), ([], []))
+
+
+class TestResolvePluginMcpConfigByServerKey(unittest.TestCase):
+    """Suffix fallback for opaque plugin IDs (WEB-5335): a dynamically loaded
+    plugin surfaces as plugin_1693077056_toolchain -- a plugin segment no
+    registry/cache dir name matches -- so the server half (mangled server key)
+    is matched as a suffix across every known plugin instead."""
+
+    TOOLCHAIN = {"url": "https://toolchain-internal.frdstr.com/mcp/v1/rpc", "type": "http"}
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.plugins_root = self.root / "plugins"
+        self.cache = self.plugins_root / "cache"
+        self.cache.mkdir(parents=True)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _install(self, plugin="cyber-rnd-toolset", marketplace="forter-claude-code", servers=None):
+        install_path = self.root / "install" / plugin
+        _write_json(install_path / ".mcp.json", {"mcpServers": servers or {"toolchain": self.TOOLCHAIN}})
+        _write_json(self.plugins_root / "installed_plugins.json", {"version": 2, "plugins": {
+            "%s@%s" % (plugin, marketplace): [{"scope": "user", "installPath": str(install_path)}]}})
+        return install_path
+
+    def test_numeric_id_resolves_via_installed_registry(self):
+        self._install()
+        # the normal prefix-matching resolver misses (the reported bug) ...
+        self.assertIsNone(
+            unbound._resolve_plugin_mcp_config("plugin_1693077056_toolchain", cache_dir=self.cache))
+        # ... and the suffix fallback closes the gap
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache)
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_numeric_id_resolves_from_cache_tree(self):
+        _make_plugin(self.cache, "mkt", "toolset", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": self.TOOLCHAIN}}}, in_use=True)
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache)
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_plugin_dir_root_resolves(self):
+        pd = self.root / "plugroot"
+        _write_json(pd / ".claude-plugin" / "plugin.json", {"name": "toolset"})
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, extra_dirs=[pd])
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_plugin_dir_of_roots_resolves(self):
+        # --plugin-dir pointing at a directory OF plugin roots: children are scanned.
+        parent = self.root / "many"
+        _write_json(parent / "toolset" / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        _write_json(parent / "other" / ".mcp.json", {"mcpServers": {"other": {"url": "https://o.example/mcp"}}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, extra_dirs=[parent])
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_ambiguous_two_plugins_same_key_returns_none(self):
+        _make_plugin(self.cache, "mkt", "p1", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://a.example/mcp"}}}})
+        _make_plugin(self.cache, "mkt", "p2", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://b.example/mcp"}}}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache))
+
+    def test_identical_configs_across_plugins_resolve(self):
+        # Same key AND same config in two plugins -> one distinct entry -> benign.
+        _make_plugin(self.cache, "mkt", "p1", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": self.TOOLCHAIN}}})
+        _make_plugin(self.cache, "mkt", "p2", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": self.TOOLCHAIN}}})
+        self.assertEqual(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache), self.TOOLCHAIN)
+
+    def test_empty_plugin_segment_does_not_match(self):
+        self._install()
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin__toolchain", cache_dir=self.cache))
+
+    def test_partial_segment_suffix_does_not_match(self):
+        # Key "api" must not bind inside "internal_api": plugin half not all digits.
+        self._install(servers={"api": {"url": "https://api.example/mcp", "type": "http"}})
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_internal_api", cache_dir=self.cache))
+        # positive control: the true all-digit half still resolves
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config_by_server_key(
+                "plugin_1693077056_api", cache_dir=self.cache),
+            {"url": "https://api.example/mcp", "type": "http"})
+
+    def test_non_numeric_plugin_half_does_not_match(self):
+        self._install()
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_someother_toolchain", cache_dir=self.cache))
+
+    def test_exact_identity_from_dir_basename(self):
+        # A dir literally named 1693077056 reconstructs the full name: verified identity.
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, extra_dirs=[pd])
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_exact_identity_survives_suffix_guess_disabled(self):
+        # Reviewer scenario: an unrelated --plugin-url must not strip a verifiable
+        # local plugin of its identity -- exact stage runs even with guessing off.
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache,
+            extra_dirs=[pd], allow_suffix_guess=False)
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_suffix_guess_disabled_blocks_unverified_match(self):
+        # With guessing off, a same-key plugin whose dir name does NOT reconstruct
+        # the server name stays unresolved (the P1 fail-closed path).
+        self._install()
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, allow_suffix_guess=False))
+
+    def test_exact_identity_beats_suffix_guess(self):
+        # Exact reconstruction wins over a would-be suffix match in another plugin.
+        self._install(servers={"toolchain": {"url": "https://other.example/mcp"}})
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        cfg = unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_toolchain", cache_dir=self.cache, extra_dirs=[pd])
+        self.assertEqual(cfg, self.TOOLCHAIN)
+
+    def test_registry_tier_beats_stale_cache_tier(self):
+        # Registry (authoritative) and a stale cache copy disagree: registry wins, no false ambiguity.
+        self._install()
+        _make_plugin(self.cache, "mkt", "stale-toolset", "0.0.9",
+                     {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://stale.example/mcp"}}}})
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config_by_server_key(
+                "plugin_1693077056_toolchain", cache_dir=self.cache),
+            self.TOOLCHAIN)
+
+    def test_first_authoritative_dir_wins_within_plugin(self):
+        # Directory-marketplace live dir and the plugin's stale installPath disagree:
+        # the first authoritative dir defining the key wins (mirrors the prefix resolver).
+        live = self.root / "clone" / "plugins" / "toolset"
+        _write_json(live / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        stale_install = self.root / "install" / "toolset"
+        _write_json(stale_install / ".mcp.json",
+                    {"mcpServers": {"toolchain": {"url": "https://stale.example/mcp"}}})
+        _write_json(self.plugins_root / "known_marketplaces.json", {"forter-datastores": {
+            "source": {"source": "directory", "path": str(self.root / "clone")},
+            "installLocation": str(self.root / "clone")}})
+        _write_json(self.plugins_root / "installed_plugins.json", {"version": 2, "plugins": {
+            "toolset@forter-datastores": [{"scope": "user", "installPath": str(stale_install)}]}})
+        self.assertEqual(
+            unbound._resolve_plugin_mcp_config_by_server_key(
+                "plugin_1693077056_toolchain", cache_dir=self.cache),
+            self.TOOLCHAIN)
+
+    def test_no_match_returns_none(self):
+        self._install()
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "plugin_1693077056_other", cache_dir=self.cache))
+
+    def test_non_plugin_name_returns_none(self):
+        self.assertIsNone(unbound._resolve_plugin_mcp_config_by_server_key(
+            "toolchain", cache_dir=self.cache))
+
+
+class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
+    """WEB-5335 end-to-end: numeric plugin IDs and --plugin-dir plugins must
+    still forward a config; unresolved misses must log loudly, not silently."""
+
+    TOOLCHAIN = {"url": "https://toolchain-internal.frdstr.com/mcp/v1/rpc", "type": "http"}
+
+    def _patch_claude_argv(self, argv):
+        for p in (patch.object(unbound, "_process_argv", return_value=argv),
+                  patch.object(unbound, "_parent_pid", return_value=None),
+                  patch.object(unbound, "_proc_cwd", return_value=None)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_numeric_plugin_id_resolves_via_registry(self):
+        self._patch_claude_argv(["python3"])  # no claude ancestor: registry path only
+        install_path = self.root / "toolset"
+        _write_json(install_path / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        _write_json(self.root / "plugins" / "installed_plugins.json", {"version": 2, "plugins": {
+            "cyber-rnd-toolset@forter-claude-code": [{"scope": "user", "installPath": str(install_path)}]}})
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
+        self.assertEqual(md.get("mcp_server"), "plugin_1693077056_toolchain")
+        self.assertEqual(md.get("mcp_tool"), "glean-search")
+        self.assertEqual(md.get("mcp_server_config"), self.TOOLCHAIN)
+
+    def test_plugin_dir_argv_resolves(self):
+        pd = self.root / "dynplugin"
+        _write_json(pd / ".claude-plugin" / "plugin.json", {"name": "toolset"})
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        self._patch_claude_argv(["claude", "--plugin-dir", str(pd)])
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__github-search-code")
+        self.assertEqual(md.get("mcp_server_config"), self.TOOLCHAIN)
+
+    def test_ambiguous_suffix_carries_no_config(self):
+        self._patch_claude_argv(["python3"])
+        _make_plugin(self.plugin_cache, "mkt", "p1", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://a.example/mcp"}}}})
+        _make_plugin(self.plugin_cache, "mkt", "p2", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": {"url": "https://b.example/mcp"}}}})
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
+        self.assertNotIn("mcp_server_config", md)
+
+    def test_plugin_url_argv_skips_suffix_guess(self):
+        # --plugin-url plugins have no verifiable local files: the suffix GUESS
+        # fails closed even when an installed plugin's key would match.
+        _make_plugin(self.plugin_cache, "mkt", "toolset", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"toolchain": self.TOOLCHAIN}}}, in_use=True)
+        self._patch_claude_argv(["claude", "--plugin-url", "https://plugins.example/tool.zip"])
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
+        self.assertNotIn("mcp_server_config", md)
+
+    def test_plugin_url_does_not_break_exact_identity(self):
+        # Mixed launch: unrelated --plugin-url alongside a --plugin-dir whose dir
+        # basename reconstructs the name -- verified identity still resolves.
+        pd = self.root / "1693077056"
+        _write_json(pd / ".mcp.json", {"mcpServers": {"toolchain": self.TOOLCHAIN}})
+        self._patch_claude_argv(["claude", "--plugin-dir", str(pd),
+                                 "--plugin-url", "https://plugins.example/tool.zip"])
+        md = self.run_capture("mcp__plugin_1693077056_toolchain__glean-search")
+        self.assertEqual(md.get("mcp_server_config"), self.TOOLCHAIN)
+
+    def test_redact_url_schemeless_credential_fails_safe(self):
+        # urlparse reads 'svc:TOKEN@host/x' as scheme='svc' with no netloc; the
+        # redactor must not echo the raw string back.
+        for raw in ("svc-account:AKIA_SECRET@internal.example/pkg.zip",
+                    "not a url at all"):
+            self.assertEqual(unbound._redact_url(raw), "<unparseable-url>")
+        self.assertEqual(unbound._redact_url("https://u:p@h.example:8443/a/b?t=s#f"),
+                         "https://h.example:8443/a/b")
+
+    def test_miss_log_redacts_plugin_url_secrets(self):
+        self._patch_claude_argv(["claude", "--plugin-url",
+                                 "https://user:hunter2@plugins.example/tool.zip?token=SECRET#frag"])
+        logged = []
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_1693077056_toolchain__glean-search",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api",
+                          lambda body, key: {"decision": "deny", "unknown_mcp_server": True}), \
+             patch.object(unbound, "log_error",
+                          lambda msg, cat='general': logged.append((msg, cat))):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        miss = [m for m, _ in logged if m.startswith("unknown mcp server with no resolvable config")]
+        self.assertEqual(len(miss), 1)
+        self.assertIn("https://plugins.example/tool.zip", miss[0])
+        for secret in ("hunter2", "user:", "token=SECRET", "#frag"):
+            self.assertNotIn(secret, miss[0])
+
+    def test_named_plugin_still_prefers_prefix_resolution(self):
+        # regression: normal named-plugin resolution is unaffected by the fallback
+        _make_plugin(self.plugin_cache, "anthropics", "slack", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}})
+        self._patch_claude_argv(["python3"])
+        md = self.run_capture("mcp__plugin_slack_slack__post_message")
+        self.assertEqual(md.get("mcp_server_config"), {"url": "https://mcp.slack.com/mcp", "type": "http"})
+
+    def test_unresolved_unknown_server_logs_the_miss(self):
+        self._patch_claude_argv(["claude", "--plugin-dir", "/nonexistent/dir",
+                                 "--plugin-url", "https://plugins.example/tool.zip"])
+        logged = []
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_1693077056_toolchain__glean-search",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api",
+                          lambda body, key: {"decision": "deny", "unknown_mcp_server": True}), \
+             patch.object(unbound, "log_error",
+                          lambda msg, cat='general': logged.append((msg, cat))):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        miss = [m for m, _ in logged if m.startswith("unknown mcp server with no resolvable config")]
+        self.assertEqual(len(miss), 1)
+        self.assertIn("plugin_1693077056_toolchain", miss[0])
+        self.assertIn("/nonexistent/dir", miss[0])
+        self.assertIn("https://plugins.example/tool.zip", miss[0])
+
+    def test_resolved_unknown_server_does_not_log_the_miss(self):
+        self._patch_claude_argv(["python3"])
+        _make_plugin(self.plugin_cache, "anthropics", "slack", "1.0.0",
+                     {".mcp.json": {"mcpServers": {"slack": {"url": "https://mcp.slack.com/mcp", "type": "http"}}}})
+        logged = []
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp__plugin_slack_slack__post_message",
+            "tool_input": {"q": "x"},
+            "cwd": self.cwd,
+            "session_id": "sess",
+        }
+        with patch.object(unbound, "send_to_hook_api",
+                          lambda body, key: {"decision": "allow", "unknown_mcp_server": True}), \
+             patch.object(unbound, "log_error",
+                          lambda msg, cat='general': logged.append((msg, cat))):
+            unbound.process_pre_tool_use(event, "API_KEY")
+        self.assertFalse([m for m, _ in logged
+                          if m.startswith("unknown mcp server with no resolvable config")])
+
+
+if __name__ == "__main__":
+    unittest.main()

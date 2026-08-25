@@ -1,0 +1,38 @@
+name: Run Tests
+
+# The suite is the gate on behaviour; static-checks.yml is the gate on syntax.
+# Both run on every PR into staging or main.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches:
+      - main
+      - staging
+  push:
+    branches: [staging, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: pip install pytest==9.0.2
+
+      # The repo-gate fixtures run `git init` in a temp dir; nothing commits, so
+      # no identity is needed. This only silences the default-branch hint.
+      - name: Quiet the git default-branch hint
+        run: git config --global init.defaultBranch main
+
+      # Runs `tests` and `binary/tests` per pytest.ini. The binary parity cases
+      # skip themselves when no signed binary is present, which is the case here;
+      # the release workflow runs them against the real build.
+      - name: Run the test suite
+        run: python -m pytest -q
