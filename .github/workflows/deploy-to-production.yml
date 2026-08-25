@@ -61,8 +61,8 @@ jobs:
       with:
         python-version: '3.12'
 
-    - name: Install pyflakes
-      run: pip install pyflakes==3.4.0
+    - name: Install pyflakes and pytest
+      run: pip install pyflakes==3.4.0 pytest==9.0.2
 
     # Configure Git for merge commits
     - name: Configure Git
@@ -96,6 +96,12 @@ jobs:
           exit 1
         fi
         echo "Static checks passed."
+
+    # The merge result must pass the suite before it can reach production. Runs
+    # after the static checks and before the push, so a red suite leaves main
+    # untouched.
+    - name: Run post-merge tests
+      run: python -m pytest -q
 
     # Push to main - this will trigger CICD deployment
     - name: Push to main
