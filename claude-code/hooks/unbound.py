@@ -11,6 +11,7 @@ from typing import Dict, List, Optional
 import time
 import hashlib
 import re
+import shutil
 import tempfile
 import platform
 from urllib.parse import urlparse
@@ -32,6 +33,17 @@ MCP_TOOL_PREFIX = 'mcp__'
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
 
+UNBOUND_SKILL_PREFIX = 'unbound-'
+CLAUDE_SKILLS_ROOT = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude')) / 'skills'
+UNBOUND_SKILL_MARKER = '.unbound-managed'
+INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn'
+SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
+SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
+SKILLS_SYNC_TIMEOUT_SECONDS = 20
+SKILL_LOADED_WINDOW = 10
+# unbound-<slug> is the skill name, so the slug carries the spec's name rules.
+_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
+
 # CoWork built-in tools that are exposed under mcp__
 COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'workspace', 'cowork', 'cowork-onboarding', 'visualize',
@@ -47,6 +59,8 @@ CLAUDE_MCP_CONFIG_PATH = (
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -209,7 +223,16 @@ def get_policy_check_failure_action() -> str:
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
-def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None):
+def get_repo_policies() -> List[Dict]:
+    """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return []
+    policies = cache.get('repo_policies')
+    return policies if isinstance(policies, list) else []
+
+
+def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None, repo_policies: Optional[List[Dict]] = None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -218,15 +241,34 @@ def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_f
             tools_to_check = prior.get('tools_to_check', [])
         if policy_check_failure_action not in ('allow', 'block'):
             policy_check_failure_action = get_policy_check_failure_action()
+        if not isinstance(repo_policies, list):
+            repo_policies = get_repo_policies()
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
+            'repo_policies': repo_policies,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
         pass
+
+
+def _cache_policies_from_response(api_response: Optional[Dict]):
+    """Without this a session never loads policies and the gate cannot fire."""
+    if not isinstance(api_response, dict):
+        return
+    if (
+        'tools_to_check' in api_response
+        or 'policy_check_failure_action' in api_response
+        or 'repo_policies' in api_response
+    ):
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+            repo_policies=api_response.get('repo_policies'),
+        )
 
 
 def is_cache_stale(cache: Dict) -> bool:
@@ -404,46 +446,154 @@ def _get_session_model(session_id: str) -> Optional[str]:
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
-def _usage_total(usage: Dict) -> int:
-    total = 0
-    for k in _USAGE_FIELDS:
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
         try:
-            total += int(usage.get(k) or 0)
-        except (TypeError, ValueError):
-            pass
-    return total
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _ts_lt(earlier, later) -> bool:
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
+
+
+def _cache_creation_tokens(usage: Dict) -> int:
+    """Cache-creation is reported either as a flat count or split across ephemeral TTLs."""
+    block = usage.get('cache_creation')
+    if isinstance(block, dict):
+        total = 0
+        for k in ('ephemeral_5m_input_tokens', 'ephemeral_1h_input_tokens'):
+            try:
+                total += int(block.get(k) or 0)
+            except (TypeError, ValueError):
+                pass
+        return total
+    try:
+        return int(usage.get('cache_creation_input_tokens') or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_value(usage: Dict, field: str) -> int:
+    if field == 'cache_creation_input_tokens':
+        return _cache_creation_tokens(usage)
+    try:
+        return int(usage.get(field) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_total(usage: Dict) -> int:
+    return sum(_usage_value(usage, k) for k in _USAGE_FIELDS)
+
+
+def _advisor_usages(message: Dict) -> List[Dict]:
+    """Advisor turns ride inside usage.iterations as flattened token blocks under their own
+    model. Iterations of type 'message' are already inside the top-level usage."""
+    usage = message.get('usage')
+    if not isinstance(usage, dict):
+        return []
+    iterations = usage.get('iterations')
+    if not isinstance(iterations, list):
+        return []
+    return [
+        it for it in iterations
+        if isinstance(it, dict) and it.get('type') == 'advisor_message' and it.get('model')
+    ]
+
+
+def _agent_progress_entry(entry: Dict) -> Optional[Dict]:
+    """Agent-progress lines wrap the assistant record one level deeper, so the outer type is
+    not 'assistant'. The wrapper also carries user and tool-result records, which have no
+    role either, so the inner usage block is what identifies a model response."""
+    data = entry.get('data')
+    inner = data.get('message') if isinstance(data, dict) else None
+    if not isinstance(inner, dict):
+        return None
+    message = inner.get('message')
+    if isinstance(message, dict) and isinstance(message.get('usage'), dict):
+        return inner
+    return None
 
 
 def _record_usage(entry: Dict, message: Dict, usage_by_key: Dict) -> None:
-    """Store a message's usage keyed by (message.id, requestId). Claude Code writes the
-    same assistant message as several streamed lines under one id; keep the highest-total
-    line (the completed message, whose output has finished growing) so tokens aren't over-
-    or under-counted. Mirrors ccusage's dedup. Entries missing either id are kept individually."""
+    """Store a message's usage keyed by message.id. Claude Code writes the same assistant
+    message as several streamed lines, and a replay can carry a new requestId, so the id
+    alone is the identity. Prefer the non-sidechain line, then the highest total (the
+    completed message, whose output has finished growing). Mirrors ccusage's dedup.
+    Entries without an id are kept individually."""
     msg_usage = message.get('usage')
-    if not isinstance(msg_usage, dict) or not msg_usage:
-        return
-    mid, rid = message.get('id'), entry.get('requestId')
-    key = (mid, rid) if (mid and rid) else ('', len(usage_by_key))
+    sidechain = entry.get('isSidechain') is True
+    mid = message.get('id')
+
+    if isinstance(msg_usage, dict) and msg_usage:
+        _keep_usage(usage_by_key, mid or ('', len(usage_by_key)), msg_usage, sidechain)
+
+    for index, advisor in enumerate(_advisor_usages(message)):
+        key = (mid, 'advisor', index) if mid else ('', len(usage_by_key))
+        _keep_usage(usage_by_key, key, advisor, sidechain)
+
+
+def _keep_usage(usage_by_key: Dict, key, msg_usage: Dict, sidechain: bool) -> None:
     prev = usage_by_key.get(key)
-    if prev is None or _usage_total(msg_usage) > _usage_total(prev):
-        usage_by_key[key] = msg_usage
+    if prev is None:
+        usage_by_key[key] = (msg_usage, sidechain)
+        return
+    prev_usage, prev_sidechain = prev
+    if sidechain != prev_sidechain:
+        if prev_sidechain:
+            usage_by_key[key] = (msg_usage, sidechain)
+        return
+    if _usage_total(msg_usage) > _usage_total(prev_usage):
+        usage_by_key[key] = (msg_usage, sidechain)
 
 
-def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict) -> None:
-    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to
-    <transcript_dir>/<session>/subagents/*.jsonl, never the main transcript the Stop event
-    points at, so their tokens would otherwise be dropped. Same per-turn scope + dedup."""
+def _subagent_dir(transcript_path: str) -> Optional[str]:
+    """subagents/ sits beside the session's JSONL: under {session}/ in the flat layout,
+    alongside the transcript in the nested one."""
+    for candidate in (os.path.join(os.path.splitext(transcript_path)[0], 'subagents'),
+                      os.path.join(os.path.dirname(transcript_path), 'subagents')):
+        if os.path.isdir(candidate):
+            return candidate
+    return None
+
+
+def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[str], usage_by_key: Dict,
+                         subagent_floor: Optional[str] = None, subagent_ceiling: Optional[str] = None) -> None:
+    """Fold subagent (Task) usage into usage_by_key. Subagent turns are written to a
+    subagents/ dir, never the main transcript the Stop event points at, so their tokens
+    would otherwise be dropped. Scoped from the previous Stop rather than this turn's
+    prompt: a subagent outlives the turn that launched it, and what it spends between the
+    two belongs to neither turn under a prompt-anchored floor. Bounded above by this turn's
+    Stop, which is the next turn's floor, so an entry flushed just after it is billed once."""
+    floor = subagent_floor or user_prompt_timestamp
+    # A streamed assistant message is written as several lines under one id, and its usage
+    # grows with each. Window it on its first line so a message spanning a Stop is billed to
+    # one turn instead of counted whole by both.
+    collected = []
+    first_seen = {}
     try:
-        subdir = os.path.join(os.path.splitext(transcript_path)[0], 'subagents')
-        names = os.listdir(subdir) if os.path.isdir(subdir) else []
+        subdir = _subagent_dir(transcript_path)
+        names = []
+        if subdir:
+            for root, _dirs, files in os.walk(subdir):
+                names.extend(os.path.join(root, n) for n in files if n.endswith('.jsonl'))
     except Exception as e:
         log_error(f"subagent usage: cannot list dir for {transcript_path}: {e}", 'usage')
         return
     for name in names:
-        if not name.endswith('.jsonl'):
-            continue
         try:
-            with open(os.path.join(subdir, name), 'r', encoding='utf-8') as f:
+            with open(name, 'r', encoding='utf-8') as f:
                 for line in f:
                     if not line.strip():
                         continue
@@ -451,23 +601,62 @@ def _fold_subagent_usage(transcript_path: str, user_prompt_timestamp: Optional[s
                         entry = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if entry.get('type') != 'assistant':
+                    progress = _agent_progress_entry(entry)
+                    entry = progress or entry
+                    if progress is None and entry.get('type') != 'assistant':
                         continue
+                    message = entry.get('message') or {}
                     ts = entry.get('timestamp')
-                    # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
-                    if user_prompt_timestamp and (not ts or ts <= user_prompt_timestamp):
-                        continue
-                    _record_usage(entry, entry.get('message') or {}, usage_by_key)
+                    message_id = message.get('id')
+                    if message_id:
+                        earliest = first_seen.get(message_id)
+                        if earliest is None or _ts_lt(ts, earliest):
+                            first_seen[message_id] = ts
+                    collected.append((message_id, ts, entry, message))
         except Exception as e:
             log_error(f"subagent usage: failed reading {name}: {e}", 'usage')
             continue
 
+    for message_id, ts, entry, message in collected:
+        anchor = first_seen.get(message_id, ts) if message_id else ts
+        # exclude a timestamp-less entry when scoping, else it re-folds every later Stop
+        if floor and not _ts_lt(floor, anchor):
+            continue
+        if subagent_ceiling and _ts_lt(subagent_ceiling, anchor):
+            continue
+        _record_usage(entry, message, usage_by_key)
 
-def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None, include_usage: bool = True) -> Dict:
+
+def _typed_user_text(entry: Dict) -> str:
+    """The typed text of a transcript entry, forwarded verbatim so DLP scans what
+    the user wrote. Only text blocks are prompt text: tool results, meta entries
+    and images are not, and yield '' so the caller skips the entry."""
+    if 'toolUseResult' in entry or entry.get('isMeta'):
+        return ''
+    message = entry.get('message') or {}
+    if message.get('role') != 'user':
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content if content.strip() else ''
+    if isinstance(content, list):
+        texts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        joined = '\n'.join(t for t in texts if isinstance(t, str))
+        return joined if joined.strip() else ''
+    return ''
+
+
+def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
+                          include_usage: bool = True, subagent_floor: Optional[str] = None,
+                          subagent_ceiling: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
         'assistant_messages': [],
         'tool_uses': [],
+        'queued_prompts': [],
         'usage': None,
         'model': None,
     }
@@ -475,6 +664,7 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
     if not transcript_path or not os.path.exists(transcript_path):
         return conversation_data
 
+    queue_floor = subagent_floor or user_prompt_timestamp
     usage = {'input_tokens': 0, 'output_tokens': 0, 'cache_read_input_tokens': 0, 'cache_creation_input_tokens': 0}
     usage_by_key: Dict = {}
     turn_model = None  # model that handled this turn; user_prompt_timestamp filter guarantees only this turn's lines are scanned
@@ -487,26 +677,46 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
                 try:
                     entry = json.loads(line)
-                    entry_type = entry.get('type', '')
+                    progress = _agent_progress_entry(entry)
+                    if progress is not None:
+                        entry = progress
+                    entry_type = 'assistant' if progress is not None else entry.get('type', '')
                     entry_timestamp = entry.get('timestamp')
 
-                    if entry_type == 'user':
-                        message = entry.get('message', {})
-                        if message.get('role') == 'user':
-                            content = message.get('content', '')
-                            if content:
-                                conversation_data['user_messages'].append({
-                                    'content': content,
-                                    'timestamp': entry_timestamp
-                                })
+                    if entry_type == 'queue-operation':
+                        # Typing while Claude is working enqueues the prompt and consumes it
+                        # into the running turn; it never becomes a user message and never
+                        # fires UserPromptSubmit, so this record is the only trace of it.
+                        # 'remove' is the consumption: a prompt taken back out for editing
+                        # leaves through 'popAll' and never ran, so it is not this turn's.
+                        if entry.get('operation') != 'remove':
+                            continue
+                        # Floored at the previous Stop, not at this turn's prompt: a queued
+                        # prompt consumed after the last turn closed and before this one was
+                        # typed would otherwise belong to neither.
+                        if queue_floor and not _ts_lt(queue_floor, entry_timestamp):
+                            continue
+                        if subagent_ceiling and _ts_lt(subagent_ceiling, entry_timestamp):
+                            continue
+                        queued = entry.get('content')
+                        if queued:
+                            conversation_data['queued_prompts'].append(queued)
+
+                    elif entry_type == 'user':
+                        typed = _typed_user_text(entry)
+                        if typed:
+                            conversation_data['user_messages'].append({
+                                'content': typed,
+                                'timestamp': entry_timestamp
+                            })
 
                     elif entry_type == 'assistant':
-                        if user_prompt_timestamp and entry_timestamp:
-                            if entry_timestamp <= user_prompt_timestamp:
-                                continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
 
                         message = entry.get('message', {})
-                        if message.get('role') == 'assistant':
+                        # Agent-progress records carry usage without a role field.
+                        if message.get('role') == 'assistant' or progress is not None:
                             for content_item in message.get('content', []):
                                 if isinstance(content_item, dict) and content_item.get('type') == 'text':
                                     text_content = content_item.get('text', '')
@@ -530,10 +740,11 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
 
     if include_usage:
         try:
-            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key)
-            for msg_usage in usage_by_key.values():
+            _fold_subagent_usage(transcript_path, user_prompt_timestamp, usage_by_key, subagent_floor,
+                                 subagent_ceiling)
+            for msg_usage, _ in usage_by_key.values():
                 for k in usage:
-                    usage[k] += int(msg_usage.get(k) or 0)
+                    usage[k] += _usage_value(msg_usage, k)
         except Exception as e:
             log_error(f"usage aggregation failed for {transcript_path}: {e}", 'usage')
 
@@ -780,9 +991,8 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
             },
         }
 
-    # Allowed with injected context (e.g. the spend-limit alert-threshold
-    # warning "you've used $X of your $Y limit"): additionalContext feeds it
-    # to the model, systemMessage shows the same text to the user.
+    # additionalContext feeds the model; the user sees user_notice when the gateway
+    # sends one (a skill instruction's admin message), else the same text (spend-limit path).
     additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
@@ -790,7 +1000,7 @@ def transform_response_for_claude_prompt(api_response: Dict) -> Dict:
                 'hookEventName': 'UserPromptSubmit',
                 'additionalContext': additional_context,
             },
-            'systemMessage': additional_context,
+            'systemMessage': api_response.get('user_notice') or additional_context,
         }
 
     return {}
@@ -2076,9 +2286,10 @@ def _unbound_app_label(event: Dict) -> str:
     try:
         if os.environ.get('CLAUDE_CODE_IS_COWORK') == '1':
             return 'cowork'
-        if os.environ.get('CLAUDE_CODE_ENTRYPOINT') in (
-            'local-agent', 'local_agent', 'remote_cowork'
-        ):
+        entrypoint = (os.environ.get('CLAUDE_CODE_ENTRYPOINT') or '').strip().lower()
+        # remote_cowork is one member of an open remote_* family, so match the
+        # surface by name; a bare remote_ prefix would also catch headless CLI.
+        if entrypoint in ('local-agent', 'local_agent') or 'cowork' in entrypoint:
             return 'cowork'
     except Exception:
         pass
@@ -2088,8 +2299,358 @@ def _unbound_app_label(event: Dict) -> str:
     return 'claude-code'
 
 
+def read_skill_facts(transcript_path: Optional[str]) -> Dict:
+    """`loaded` is in-window and pre-compaction; `session_count` ignores both."""
+    facts = {'loaded': set(), 'session_count': 0}
+    if not transcript_path:
+        return facts
+    try:
+        with open(transcript_path, 'rb') as f:
+            lines = f.read().split(b'\n')
+    except OSError:
+        return facts
+
+    session_names = set()
+    seen_turn_keys = set()
+    turns = 0
+    in_window = True
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(entry, dict) or entry.get('isSidechain'):
+            continue
+        entry_type = entry.get('type')
+        if entry_type == 'system' and entry.get('subtype') == 'compact_boundary':
+            in_window = False
+            continue
+        if entry_type == 'assistant':
+            # One assistant message arrives as several streamed lines under one id, so
+            # counting lines would shrink the window to a fraction of the turns it names.
+            message = entry.get('message') or {}
+            mid, rid = message.get('id'), entry.get('requestId')
+            key = (mid, rid) if (mid and rid) else ('', len(seen_turn_keys))
+            if key not in seen_turn_keys:
+                seen_turn_keys.add(key)
+                turns += 1
+            if turns > SKILL_LOADED_WINDOW:
+                in_window = False
+            continue
+        if entry_type != 'user':
+            continue
+        result = entry.get('toolUseResult')
+        if not isinstance(result, dict) or result.get('success') is not True:
+            continue
+        name = result.get('commandName')
+        if not isinstance(name, str) or not name.startswith(UNBOUND_SKILL_PREFIX):
+            continue
+        session_names.add(name)
+        if in_window:
+            facts['loaded'].add(name[len(UNBOUND_SKILL_PREFIX):])
+
+    facts['session_count'] = len(session_names)
+    return facts
+
+
+def _managed_skill_dirs() -> List[Path]:
+    # Marker, not prefix, so the prefix can change without orphaning older installs.
+    try:
+        found = []
+        for entry in CLAUDE_SKILLS_ROOT.iterdir():
+            try:
+                if entry.is_dir() and (entry / UNBOUND_SKILL_MARKER).exists():
+                    found.append(entry)
+            except OSError:
+                continue
+        return sorted(found, key=lambda p: p.name)
+    except Exception:
+        return []
+
+
+def _slug_of(directory: Path) -> Optional[str]:
+    name = directory.name
+    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    return slug if _SLUG_RE.match(slug) else None
+
+
+def _turn_guard_path(session_id) -> Path:
+    safe = re.sub(r'[^A-Za-z0-9._-]', '', str(session_id or ''))[:64]
+    return INJECTION_TURN_GUARD_DIR / (safe or 'default')
+
+
+def _turn_guard_read(session_id) -> str:
+    try:
+        return _turn_guard_path(session_id).read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def _turn_guard_write(session_id, prompt_id: str) -> None:
+    try:
+        # Pre-39fac10 hooks kept the guard as ONE file at this path; mkdir raises on it
+        # forever and the OSError pass kills the guard silently. Migrate it away.
+        if INJECTION_TURN_GUARD_DIR.exists() and not INJECTION_TURN_GUARD_DIR.is_dir():
+            INJECTION_TURN_GUARD_DIR.unlink()
+        INJECTION_TURN_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+        _turn_guard_path(session_id).write_text(prompt_id, encoding='utf-8')
+        cutoff = time.time() - 7 * 24 * 3600
+        for stale in INJECTION_TURN_GUARD_DIR.iterdir():
+            if stale.is_file() and stale.stat().st_mtime < cutoff:
+                stale.unlink()
+    except OSError:
+        pass
+
+
+def _inject_skill_slugs(inject_skills) -> List[str]:
+    if not isinstance(inject_skills, list):
+        return []
+    return [
+        entry['slug'] for entry in inject_skills
+        if isinstance(entry, dict) and isinstance(entry.get('slug'), str) and entry['slug']
+    ]
+
+
+def installed_skill_report() -> List[Dict]:
+    report = []
+    for directory in _managed_skill_dirs():
+        slug = _slug_of(directory)
+        if not slug:
+            continue
+        try:
+            digest = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+        except OSError:
+            continue
+        report.append({'slug': slug, 'sha256': digest})
+    return report
+
+
+def _attach_skill_facts(metadata: Dict, transcript_path: Optional[str]) -> None:
+    """`installed_skills` is what the device will DELETE, so it is marker-managed only.
+    `loaded_skills` also counts a developer's own unbound-<slug>: excluding it would
+    re-inject on every turn for a slug we are never allowed to overwrite."""
+    installed_skills = installed_skill_report()
+    if not installed_skills:
+        # Nothing installed means nothing to suppress or count, so skip the read.
+        return
+    metadata['installed_skills'] = installed_skills
+    facts = read_skill_facts(transcript_path)
+    if facts['loaded']:
+        metadata['loaded_skills'] = sorted(facts['loaded'])
+    metadata['skills_loaded_this_session'] = facts['session_count']
+
+
+def _skill_dir_state(slug: str) -> Dict:
+    directory = CLAUDE_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+    state = {'path': directory, 'exists': False, 'managed': False, 'content_hash': None}
+    try:
+        state['exists'] = directory.is_dir()
+        if state['exists']:
+            state['managed'] = (directory / UNBOUND_SKILL_MARKER).exists()
+            state['content_hash'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+    except Exception:
+        pass
+    return state
+
+
+def install_injected_skills(inject_skills) -> None:
+    try:
+        for entry in inject_skills or []:
+            slug = entry.get('slug') if isinstance(entry, dict) else None
+            try:
+                if not isinstance(entry, dict):
+                    log_error(f"skill injection entry is not an object: {type(entry).__name__}", 'skill_injection')
+                    continue
+                content = entry.get('content')
+                if not isinstance(slug, str) or not _safe_skill_segment(slug) or not _SLUG_RE.match(slug):
+                    log_error(f"skill injection rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                if not isinstance(content, str) or not content:
+                    log_error(f"skill injection rejected empty content for slug: {slug}", 'skill_injection')
+                    continue
+
+                data = content.encode('utf-8')
+                # Hash what gets written: a wrong wire hash would pin stale content.
+                expected = hashlib.sha256(data).hexdigest()
+                wire_hash = entry.get('sha256')
+                if isinstance(wire_hash, str) and wire_hash and wire_hash.lower() != expected:
+                    log_error(
+                        f"skill injection hash mismatch for {slug}: wire={wire_hash} computed={expected}",
+                        'skill_injection',
+                    )
+
+                state = _skill_dir_state(slug)
+                directory = state['path']
+                if state['exists'] and not state['managed']:
+                    log_error(f"skill dir not unbound-managed, skipping install: {directory}", 'skill_injection')
+                    continue
+                if state['exists'] and state['managed'] and state['content_hash'] == expected:
+                    continue
+
+                created = not state['exists']
+                directory.mkdir(parents=True, exist_ok=True)
+                try:
+                    # Marker first: a marked dir with a stale body is rewritten next run.
+                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
+                except OSError:
+                    # A later reconcile reads an unmarked dir as the developer's own
+                    # skill and skips it forever, so drop the empty one we just made.
+                    if created:
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
+                    raise
+
+                # '.SKILL.' hides the partial file from a scan; the fd closes before the
+                # rename because Windows will not replace an open file.
+                fd, tmp = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(data)
+                    os.replace(tmp, str(directory / 'SKILL.md'))
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as e:
+                log_error(f"skill injection failed for {str(slug)[:64]}: {e}", 'skill_injection')
+    except Exception as e:
+        log_error(f"skill injection failed: {e}", 'skill_injection')
+
+
+def _skills_lock_acquire():
+    try:
+        SKILLS_SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - SKILLS_SYNC_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = SKILLS_SYNC_STALE_LOCK_SECONDS + 1
+            if age < SKILLS_SYNC_STALE_LOCK_SECONDS:
+                return None
+            try:
+                SKILLS_SYNC_LOCK_PATH.unlink()
+                return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except OSError:
+                return None
+    except OSError:
+        return None
+
+
+def _skills_lock_release(lock_fd) -> None:
+    if lock_fd is None:
+        return
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+    try:
+        SKILLS_SYNC_LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _sync_skills_once(api_key: str) -> None:
+    lock_fd = _skills_lock_acquire()
+    if lock_fd is None:
+        return
+    try:
+        payload = json.dumps({'installed': installed_skill_report()})
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", f"{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync"],
+            input=payload.encode(), capture_output=True, timeout=SKILLS_SYNC_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return
+        plan = json.loads(result.stdout.decode('utf-8'))
+        if not isinstance(plan, dict):
+            return
+        prune_injected_skills(plan.get('remove'))
+        install_injected_skills(plan.get('install'))
+    except Exception as e:
+        log_error(f"skills sync failed: {e}", 'skill_injection')
+    finally:
+        _skills_lock_release(lock_fd)
+
+
+def _dispatch_skills_sync(api_key: str) -> None:
+    # Detached: the blocking PreToolUse path must not wait on a reconcile.
+    try:
+        if not api_key:
+            return
+        if RUNNING_FROZEN:
+            # sys.executable is the frozen unbound-hook binary itself.
+            cmd = [sys.executable, 'sync-skills',
+                   os.environ.get('UNBOUND_HOOK_TOOL') or 'claude-code']
+        else:
+            # The running file, not SELF_SCRIPT_PATH: under MDM the hook executes from an
+            # admin-managed directory and that user-level path does not exist.
+            script = os.path.abspath(__file__)
+            if not os.path.isfile(script):
+                log_error(f"skills sync skipped: script not found at {script}", 'skill_injection')
+                return
+            cmd = [sys.executable, script, '--sync-skills']
+        popen_kwargs = {
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL,
+            'close_fds': True,
+            'env': {**os.environ, 'UNBOUND_CLAUDE_API_KEY': api_key},
+        }
+        if os.name == 'nt':
+            popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as e:
+        log_error(f"skills sync dispatch failed: {e}", 'skill_injection')
+
+
+def prune_injected_skills(remove_skills) -> None:
+    # Only ever deletes a directory we marked, even if the gateway names another.
+    try:
+        for slug in remove_skills or []:
+            try:
+                if not isinstance(slug, str) or not _safe_skill_segment(slug) or not _SLUG_RE.match(slug):
+                    log_error(f"skill prune rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                directory = CLAUDE_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+                if not directory.is_dir():
+                    continue
+                if directory.is_symlink() or not (directory / UNBOUND_SKILL_MARKER).exists():
+                    log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
+                    continue
+                shutil.rmtree(directory)
+            except Exception as e:
+                log_error(f"skill prune failed for {str(slug)[:64]}: {e}", 'skill_injection')
+    except Exception as e:
+        log_error(f"skill prune failed: {e}", 'skill_injection')
+
+
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
-    """Process PreToolUse event - DO NOT LOG."""
+    """PreToolUse entry point - DO NOT LOG. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Write/Edit when no terminal-command policy covers them."""
+    gate = _repo_gate_evaluate(event)
+    if gate:
+        return transform_response_for_claude({
+            'decision': 'deny',
+            'reason': _repo_gate_block_reason(gate['repo']),
+            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        })
+    return _evaluate_pre_tool_use_policies(event, api_key)
+
+
+def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
+    """Run the gateway policy check for a PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
     model = event.get('model') or _get_session_model(session_id) or 'auto'
     transcript_path = event.get('transcript_path')
@@ -2124,6 +2685,11 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
     tool_input = event.get('tool_input') or {}
     if 'file_path' in tool_input:
         metadata['file_path'] = tool_input['file_path']
+
+    _attach_skill_facts(metadata, transcript_path)
+    prompt_id = event.get('prompt_id')
+    if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
+        metadata['already_injected_this_turn'] = True
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -2260,11 +2826,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         return _handle_approval_required_response(api_response, approval_key)
@@ -2287,6 +2849,21 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
             'mcp_server',
         )
         _dispatch_mcp_diagnostic(metadata.get('mcp_server', ''), metadata.get('cwd'), api_key)
+
+    if api_response.get('decision') == 'deny' and api_response.get('inject_skills'):
+        # The gateway only denies for a skill this device already reported current, so
+        # there is nothing to install here — just remember the turn.
+        if event.get('prompt_id'):
+            _turn_guard_write(event.get('session_id'), event['prompt_id'])
+    if api_response.get('remove_skills'):
+        prune_lock = _skills_lock_acquire()
+        if prune_lock is not None:
+            try:
+                prune_injected_skills(api_response.get('remove_skills'))
+            finally:
+                _skills_lock_release(prune_lock)
+    if api_response.get('sync_skills'):
+        _dispatch_skills_sync(api_key)
 
     return transform_response_for_claude(api_response)
 
@@ -2339,28 +2916,42 @@ def _parse_github_repo(remote_url: str) -> Optional[str]:
     return repo or None
 
 
-def _get_git_origin_org_repo(cwd: str) -> tuple:
-    """Lowercased (org, repo) of `cwd`'s `origin` remote, or (None, None) when
-    `cwd` is not a git repo or has no `origin` (a clean non-zero git exit). Raises
-    only when git cannot be executed at all (missing binary / timeout) so the
-    caller can tell an honest 'non-compliant' apart from an internal failure and
-    fail-open."""
+def _remote_host(remote_url: Optional[str]) -> Optional[str]:
+    """Reject a host-less remote URL, so file:///srv/git/x is not org 'srv'."""
+    url = (remote_url or '').strip()
+    if '://' in url:
+        host = url.split('://', 1)[1].split('/', 1)[0]
+    elif ':' in url:
+        host = url.split(':', 1)[0]
+    else:
+        return None
+    host = host.rsplit('@', 1)[-1].split('?', 1)[0]
+    return host.lower() or None
+
+
+def _git_origin_url(cwd: str) -> Optional[str]:
+    """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
     result = subprocess.run(
         ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
         capture_output=True, text=True, timeout=10,
     )
     if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _get_git_origin_org_repo(cwd: str) -> tuple:
+    """Lowercased (org, repo) of `cwd`'s origin; git failure propagates upward."""
+    url = _git_origin_url(cwd)
+    if not url or not _remote_host(url):
         return (None, None)
-    url = result.stdout.strip()
     org = _parse_github_org(url)
     repo = _parse_github_repo(url)
     return (org.lower() if org else None, repo.lower() if repo else None)
 
 
 def _get_project(cwd: Optional[str]) -> Optional[str]:
-    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
-    requests for analytics. None when cwd is missing, not a git repo, has no
-    origin, or anything fails — fully fail-open (never raises)."""
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, for analytics; never raises."""
     try:
         if not cwd:
             return None
@@ -2376,15 +2967,11 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
 _WRITE_TOOLS = {'Edit', 'Write', 'NotebookEdit'}
 _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 
-# Any absolute path inside a Bash command (cd targets, git -C, pytest /x/…).
-# Left boundary required so the slash inside a relative token (tests/webapp/)
-# doesn't read as an absolute path.
+# Absolute paths inside a Bash command; the left boundary stops a relative
+# token like tests/webapp/ reading as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
-# Package-manager / OS checkouts that are real git clones but never the
-# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
-# so a command merely referencing /opt/homebrew/bin/… would otherwise
-# attribute the call to "homebrew/brew". Candidates under these roots are
-# skipped so resolution falls through to the shell's working directory.
+# Real git clones that are never the engineer's project: a path under
+# /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
     '/opt/homebrew',
     '/home/linuxbrew',
@@ -2408,11 +2995,86 @@ def _is_system_checkout_path(path: str) -> bool:
 # the persistent shell's working directory across the turn's Bash calls.
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
+_GIT_PATH_OPT_RE = re.compile(
+    r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
+)
+
+
+def _shell_segments(command):
+    """(segment, following-separator) pairs, sliced from the original so quoted paths survive."""
+    masked = _mask_quoted_runs(command)
+    out, last = [], 0
+    for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
+        out.append((command[last:m.start()].strip(), m.group(0).strip()))
+        last = m.end()
+    out.append((command[last:].strip(), ''))
+    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    return out
+
+
+def _merge_cwds(first, second):
+    """Ordered union, dropping duplicates and bounding the fan-out."""
+    out = list(first)
+    for c in second:
+        if c not in out:
+            out.append(c)
+    return out[:8]
+
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
+    targets = []
+    try:
+        cwds = [shell_dir]
+        # Where control lands if the current && chain short-circuits: `a && b || c`
+        # runs c when a failed (original cwd) or when b failed (a's cwd).
+        fallback = [shell_dir]
+        for segment, separator in _shell_segments(command):
+            words = _segment_words(segment)
+            # git only: `grep -C 3` is context lines, not a directory.
+            if words and os.path.basename(words[0]) == 'git':
+                for match in _GIT_PATH_OPT_RE.finditer(segment):
+                    raw = match.group(1) or match.group(2) or match.group(3)
+                    if not raw:
+                        continue
+                    for cwd in cwds:
+                        target = os.path.expanduser(raw) if raw.startswith('~') else raw
+                        if not target.startswith('/'):
+                            if not cwd:
+                                continue
+                            target = os.path.join(cwd, target)
+                        target = os.path.normpath(target)
+                        if _is_system_checkout_path(target) or target in targets:
+                            continue
+                        targets.append(target)
+            moved = [_next_shell_dir(segment, c) for c in cwds]
+            if separator == '&&':
+                # Next runs only if this one succeeded, so its cd took effect —
+                # but this segment may instead have failed, which a later || reaches.
+                fallback = _merge_cwds(fallback, cwds)
+                cwds = moved
+            elif separator == '||':
+                # Reached because something failed, so that cd did not apply.
+                cwds = _merge_cwds(cwds, fallback)
+                fallback = list(cwds)
+            elif separator in ('|', '&'):
+                # Subshell: a cd on the left never reaches the right-hand command.
+                pass
+            else:
+                # `;` or a newline: sequential, so the cd may or may not have taken.
+                cwds = _merge_cwds(moved, cwds)
+                fallback = list(cwds)
+            cwds = cwds[:8]
+    except Exception:
+        return targets
+    return targets
+
+
 
 def _find_git_root(path: str) -> Optional[str]:
-    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
-    (directory, or file for linked worktrees). Pure filesystem stats — no
-    subprocess. None when outside any repo or on any error (fail-open)."""
+    """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
         p = Path(path)
         for parent in [p] + list(p.parents):
@@ -2424,8 +3086,7 @@ def _find_git_root(path: str) -> Optional[str]:
 
 
 def _git_worktree_roots(path: str) -> List[str]:
-    """Worktree roots of the repo containing `path`, main checkout first.
-    Pure file reads, no git subprocess; [] outside a repo or on any error."""
+    """Worktree roots containing `path`, main checkout first; [] on any error."""
     try:
         root = _find_git_root(path)
         if not root:
@@ -2464,10 +3125,7 @@ def _git_worktree_roots(path: str) -> List[str]:
 
 
 def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
-    """Follow the last `cd` in `command` from `shell_dir`, mirroring the
-    persistent shell's directory between Bash calls. Absolute and ~-rooted
-    targets replace the dir; relative ones join onto it. Unchanged when the
-    command has no cd or on any error."""
+    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
     try:
         target = None
         for m in _CD_TARGET_RE.finditer(command):
@@ -2487,6 +3145,120 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
 
 
+# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+_QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Wrappers that stand in front of the real command word.
+_COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
+# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+
+# Shell commands that mutate the working tree, always a write whatever the flags:
+_SHELL_WRITE_COMMANDS = frozenset({
+    'rm', 'rmdir', 'unlink', 'shred',       # delete
+    'mv', 'cp', 'ln', 'install',            # create or relocate
+    'touch', 'mkdir',                       # create
+    'tee', 'truncate', 'patch',             # rewrite contents
+})
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
+_SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
+_INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
+
+
+def _mask_quoted_runs(command):
+    """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
+    return _QUOTED_RUN_RE.sub(
+        lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
+        command)
+
+
+def _segment_words(segment):
+    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    words = []
+    for word in segment.split():
+        word = word.strip('()`{}"\'')
+        if not words and (not word or word.startswith('-')
+                          or _ENV_ASSIGNMENT_RE.match(word)
+                          or word in _COMMAND_PREFIX_WORDS):
+            continue
+        words.append(word)
+    return words
+
+
+def _segment_writes(words):
+    """Whether a segment's command word plus its flags mutate the working tree."""
+    name = os.path.basename(words[0])
+    if name in _SHELL_WRITE_COMMANDS:
+        return True
+    if name in _SHELL_INPLACE_COMMANDS:
+        return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
+    if name == 'dd':
+        return any(w.startswith('of=') for w in words[1:])
+    return False
+
+
+def _is_git_command(command):
+    """Whether any segment of `command` directly invokes git; False on any error."""
+    try:
+        if not isinstance(command, str) or 'git' not in command:
+            return False
+        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+            words = _segment_words(segment)
+            if words and os.path.basename(words[0]) == 'git':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_shell_write_command(command):
+    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    try:
+        if not isinstance(command, str) or not command:
+            return False
+        masked = _mask_quoted_runs(command)
+        if _REDIRECT_RE.search(masked):
+            return True
+        for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
+            words = _segment_words(segment)
+            if words and _segment_writes(words):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _tool_use_path_candidates(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str]) -> tuple:
+    """Paths one call works in; shared by attribution and the gate (WEB-5433)."""
+    tool_input = tool_input or {}
+    candidates = []
+    if tool_name in _WRITE_TOOLS:
+        path = tool_input.get('file_path') or tool_input.get('notebook_path')
+        if isinstance(path, str) and path:
+            # A relative path resolves against the cwd, or the gate sees nothing.
+            if not path.startswith('/') and shell_dir:
+                path = os.path.normpath(os.path.join(shell_dir, path))
+            if path.startswith('/') and not _is_system_checkout_path(path):
+                candidates.append(os.path.dirname(path))
+    elif tool_name in _READ_TOOLS:
+        path = tool_input.get('file_path') or tool_input.get('path')
+        if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
+            candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
+    elif tool_name == 'Bash':
+        command = tool_input.get('command')
+        if isinstance(command, str):
+            candidates.extend(
+                p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
+            )
+            candidates.extend(_git_path_opt_targets(command, shell_dir))
+            shell_dir = _next_shell_dir(command, shell_dir)
+            if not candidates and shell_dir:
+                candidates.append(shell_dir)
+    return candidates, shell_dir
+
+
 def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], shell_dir: Optional[str], root_projects: Dict[str, Optional[str]]) -> tuple:
     """Resolve the git project ("<org>/<repo>") a single tool call worked in.
     Writes/reads resolve from the tool's file path; Bash resolves from the
@@ -2496,25 +3268,7 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
     origin lookup so `git remote get-url` runs at most once per distinct repo.
     (None, shell_dir) when nothing resolves (fail-open)."""
     try:
-        tool_input = tool_input or {}
-        candidates = []
-        if tool_name in _WRITE_TOOLS:
-            path = tool_input.get('file_path') or tool_input.get('notebook_path')
-            if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
-                candidates.append(os.path.dirname(path))
-        elif tool_name in _READ_TOOLS:
-            path = tool_input.get('file_path') or tool_input.get('path')
-            if isinstance(path, str) and path.startswith('/') and not _is_system_checkout_path(path):
-                candidates.append(os.path.dirname(path) if tool_name == 'Read' else path)
-        elif tool_name == 'Bash':
-            command = tool_input.get('command')
-            if isinstance(command, str):
-                candidates.extend(
-                    p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
-                )
-                shell_dir = _next_shell_dir(command, shell_dir)
-                if not candidates and shell_dir:
-                    candidates.append(shell_dir)
+        candidates, shell_dir = _tool_use_path_candidates(tool_name, tool_input, shell_dir)
         for candidate in candidates:
             root = _find_git_root(candidate)
             if not root:
@@ -2528,11 +3282,243 @@ def _project_for_tool_use(tool_name: Optional[str], tool_input: Optional[Dict], 
         return None, shell_dir
 
 
+# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
+
+# Write tools, git commands and shell writes only; reads, conversation and every other shell command (ls, cat, npm test) are ungated.
+_REPO_GATE_WRITE_TOOLS = frozenset(_WRITE_TOOLS)
+_REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
+_REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
+REPO_GATE_BLOCK_CONTEXT = (
+    'This action was blocked by an organization repository-scope policy. Do not '
+    'attempt to achieve the same result using alternative tools, file operations, '
+    'or workarounds. Inform the user and stop.'
+)
+
+
+def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
+    """The shell command a Bash call carries, in this hook's payload shape."""
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get('command')
+    return command if isinstance(command, str) else None
+
+
+def _repo_gate_applies(tool_name, command):
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        return _is_git_command(command) or _is_shell_write_command(command)
+    return tool_name in _REPO_GATE_WRITE_TOOLS
+
+
+def _repo_gate_block_policies(policies: Optional[List[Dict]]) -> List[Dict]:
+    """Enforceable subset; a policy this hook cannot read is dropped, not guessed."""
+    enforceable = []
+    for policy in policies or []:
+        if not isinstance(policy, dict):
+            continue
+        org = policy.get('github_org')
+        if not isinstance(org, str) or not org.strip():
+            continue
+        enforceable.append(policy)
+    return enforceable
+
+
+def _repo_gate_scope_allows(policy: Dict, org: str, repo: str) -> bool:
+    """Whether `org` matches this policy's allowed organization; both lowercased."""
+    return org == policy['github_org'].strip().lower()
+
+
+def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict], root_projects: Dict[str, tuple]) -> Optional[str]:
+    """First candidate outside every scope; a git failure propagates to fail open."""
+    for candidate in candidates:
+        root = _find_git_root(candidate)
+        if not root:
+            continue
+        if root not in root_projects:
+            root_projects[root] = _get_git_origin_org_repo(root)
+        org, repo = root_projects[root]
+        if not org or not repo:
+            continue
+        if not any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+            return '%s/%s' % (org, repo)
+    return None
+
+
+def _repo_gate_block_reason(repo: str) -> str:
+    return (
+        'Blocked by organization policy. "%s" is outside your organization\'s '
+        'allowed repository scope.' % repo
+    )
+
+
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
+
+REPO_GATE_REPORT_MAX_CHARS = 2000
+_REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
+                         'path', 'notebook_path')
+
+
+def _repo_gate_clip(text: Optional[str]) -> Optional[str]:
+    """Cap one reported string, keeping the body inside curl's pipe buffer."""
+    if not isinstance(text, str) or not text:
+        return None
+    return text[:REPO_GATE_REPORT_MAX_CHARS]
+
+
+def _repo_gate_binding_policy(block_policies: List[Dict]) -> Dict:
+    """The policy the incident is filed against; every match denies alike."""
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident; the backend hashes it into the record's
+    identity, so a repeat is read as a redelivery and dropped. The step past the
+    last value is what guarantees that: the clock resolves to about a
+    microsecond, which two reports of one process can share."""
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
+
+
+def _repo_gate_post(body: str, api_key: str):
+    """Never waited on, so the blocking path stays free of synchronous work."""
+    proc = subprocess.Popen(
+        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
+         '-H', 'Authorization: Bearer %s' % api_key,
+         '-H', 'Content-Type: application/json',
+         '--data-binary', '@-',
+         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(body.encode())
+    proc.stdin.close()
+
+
+def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context: Dict):
+    """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
+    try:
+        if (gate or {}).get('decision') != 'deny':
+            return
+        # main() already resolved the key; the fallback covers entry points that skip it.
+        api_key = _cached_api_key or get_api_key()
+        if not api_key:
+            return
+        policy = _repo_gate_binding_policy(block_policies)
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
+        # What the call was about: its shell command, or the path it names.
+        tool_input = context.get('tool_input')
+        if isinstance(tool_input, dict):
+            named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
+            tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        # The pretool envelope every other post uses; the verdict rides under repo_gate.
+        app_label = context.get('app_label')
+        _repo_gate_post(json.dumps({
+            'conversation_id': context.get('session_id'),
+            'event_name': 'RepoGate',
+            'unbound_app_label': app_label,
+            'repo_gate': {
+                'policy_id': policy.get('id'),
+                'repository': gate.get('repo'),
+                'decision': 'BLOCK',
+                # Same value as the label above: the incidents page reads this one.
+                'agent': app_label,
+                'tool_name': context.get('tool_name'),
+                # Repeats conversation_id above: the analytics row digests this one.
+                'session_id': context.get('session_id'),
+                'turn': turn,
+                'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+                'tool_input': _repo_gate_clip(tool_input),
+            },
+        }), api_key)
+    except Exception:
+        pass
+
+
+def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
+    """Verdict for one tool call: None allows, else deny. Never raises."""
+    try:
+        tool_name = event.get('tool_name') or ''
+        tool_input = event.get('tool_input')
+        if not _repo_gate_applies(tool_name, _repo_gate_command(tool_input)):
+            return None
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+
+        candidates, _ = _tool_use_path_candidates(
+            tool_name, event.get('tool_input'), event.get('cwd')
+        )
+        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        gate = {'decision': 'deny', 'repo': repo} if repo else None
+        _repo_gate_report(gate, block_policies, {
+            'app_label': _unbound_app_label(event),
+            'session_id': event.get('session_id'),
+            'tool_name': tool_name,
+            'tool_input': event.get('tool_input'),
+        })
+        return gate
+    except Exception:
+        return None
+
+
+def _prompt_injection_metadata(event: Dict) -> Dict:
+    """Facts a USER_PROMPT skill policy is decided against. Nothing in here may
+    raise: a prompt submission must not fail over a marker file."""
+    metadata = {}
+    try:
+        cwd = event.get('cwd')
+        if cwd:
+            metadata['cwd'] = cwd
+        _attach_skill_facts(metadata, event.get('transcript_path'))
+        prompt_id = event.get('prompt_id')
+        if prompt_id and _turn_guard_read(event.get('session_id')) == prompt_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"prompt injection metadata failed: {exc}", 'skill_injection')
+    return metadata
+
+
+def _apply_prompt_skill_actions(event: Dict, api_response, api_key: str) -> None:
+    """An allow carrying inject_skills is the in-turn skill instruction; it claims the
+    turn so a TOOL_USE injection cannot fire a second time inside it."""
+    if not isinstance(api_response, dict):
+        return
+    try:
+        instructed_slugs = _inject_skill_slugs(api_response.get('inject_skills'))
+        if instructed_slugs and api_response.get('decision') != 'deny' and event.get('prompt_id'):
+            _turn_guard_write(event.get('session_id'), event['prompt_id'])
+        if api_response.get('remove_skills'):
+            prune_lock = _skills_lock_acquire()
+            if prune_lock is not None:
+                try:
+                    prune_injected_skills(api_response.get('remove_skills'))
+                finally:
+                    _skills_lock_release(prune_lock)
+        if api_response.get('sync_skills'):
+            _dispatch_skills_sync(api_key)
+    except Exception as exc:
+        log_error(f"prompt skill actions failed: {exc}", 'skill_injection')
+
+
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
-    """Process UserPromptSubmit event for policy checking."""
+    """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
     model = event.get('model') or _get_session_model(session_id) or 'auto'
     prompt = event.get('prompt', '')
+
+    cache = load_policy_cache()
+    need_pull_policies = cache is None or is_cache_stale(cache)
 
     request_body = {
         'conversation_id': session_id,
@@ -2540,12 +3526,20 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
-        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
+        'pre_tool_use_data': {
+            'tool_name': '',
+            'command': '',
+            'metadata': _prompt_injection_metadata(event),
+        },
     }
+    if need_pull_policies:
+        request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
-    response = transform_response_for_claude_prompt(api_response)
-    return response
+    _cache_policies_from_response(api_response)
+    _apply_prompt_skill_actions(event, api_response, api_key)
+    return transform_response_for_claude_prompt(api_response)
 
 
 def _trusted_ancestors(start):
@@ -2632,11 +3626,11 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         return None
 
 
-def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None) -> Optional[Dict]:
+def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
+    user_prompts = []
     assistant_tool_uses = []
 
-    user_prompt = None
     prompt_cwd = None
     session_id = None
     permission_mode = None
@@ -2658,10 +3652,11 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         if hook_event_name == 'UserPromptSubmit':
             prompt = event.get('prompt')
             if prompt:
-                user_prompt = prompt
                 # The prompt's own cwd beats the session cwd for resolving a
-                # repo-level skill when the agent was opened at a parent dir.
+                # repo-level skill when the agent was opened at a parent dir. Held per
+                # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
+                user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
@@ -2696,14 +3691,34 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     tool_use_entry['skill_path'] = skill_path
             assistant_tool_uses.append(tool_use_entry)
     
+    # A queued prompt is consumed into this turn without its own submit event, so it is
+    # carried here rather than read from the events above. It was typed after the prompt
+    # that opened the turn, so it belongs at the end. Its queue record carries no directory,
+    # so a repo-scoped skill in it is resolvable only when the turn used exactly one; where
+    # they differ there is nothing to attribute it to and it is left unresolved.
+    first_queued = len(user_prompts)
+    for queued in queued_prompts or []:
+        user_prompts.append((queued, None))
+
     # A typed `/name` is expanded by Claude Code itself and never reaches the
     # Skill tool, so recover it from the prompt. Resolving on disk is what
     # keeps built-ins like /clear and /help out.
-    if user_prompt and user_prompt.startswith('/'):
-        typed = user_prompt[1:].split(None, 1)
+    for index, (typed_prompt, typed_cwd) in enumerate(user_prompts):
+        if not typed_prompt.startswith('/'):
+            continue
+        if index >= first_queued:
+            # A queued prompt's record names no directory, and every directory in reach
+            # belongs to some other event, so a repo-scoped skill here can only be guessed
+            # at. It is left unresolved: an absent skill_path is recoverable, a confidently
+            # wrong one is not. The prompt text still reaches the turn.
+            continue
+        typed = typed_prompt[1:].split(None, 1)
         typed_skill = typed[0] if typed else ''
         typed_args = typed[1] if len(typed) > 1 else ''
-        typed_path = _resolve_skill_path(typed_skill, prompt_cwd or cwd)
+        if '/' in typed_skill or '\\' in typed_skill or '..' in typed_skill:
+            # A skill name is a bare identifier; anything path-shaped is not one.
+            continue
+        typed_path = _resolve_skill_path(typed_skill, typed_cwd or cwd)
         if typed_path:
             typed_key = '\x1f'.join((
                 str(session_id or ''), typed_skill, typed_args,
@@ -2720,6 +3735,8 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 'skill_path': typed_path,
             })
 
+    # One message, not one per prompt: the backend keeps only the last user message.
+    user_prompt = '\n\n'.join(text for text, _ in user_prompts)
     if user_prompt:
         messages.append({'role': 'user', 'content': user_prompt})
     
@@ -2808,6 +3825,24 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
     return False
 
 
+def _keep_latest_stop(logs: List[Dict], kept: List[Dict]) -> List[Dict]:
+    """Re-attach each session's most recent Stop when trimming dropped it. That Stop is the
+    next turn's accounting floor, and losing it silently reopens the gap it closes."""
+    have = {id(log) for log in kept}
+    restored = []
+    for session_id in {log.get('session_id') for log in kept if log.get('session_id')}:
+        latest = None
+        for log in logs:
+            if log.get('session_id') != session_id:
+                continue
+            name = (log.get('event') or {}).get('hook_event_name') or log.get('hook_event_name')
+            if name == 'Stop':
+                latest = log
+        if latest is not None and id(latest) not in have:
+            restored.append(latest)
+    return restored + kept if restored else kept
+
+
 def cleanup_old_logs():
     logs = load_existing_logs()
 
@@ -2829,9 +3864,9 @@ def cleanup_old_logs():
             log for log in logs
             if log.get('session_id') == most_recent_session
         ]
-        save_logs(kept_logs)
+        save_logs(_keep_latest_stop(logs, kept_logs))
     elif len(logs) > AUDIT_LOG_TOTAL_LIMIT:
-        save_logs(logs[-AUDIT_LOG_TOTAL_LIMIT:])
+        save_logs(_keep_latest_stop(logs, logs[-AUDIT_LOG_TOTAL_LIMIT:]))
 
 
 def process_stop_event(event: Dict, api_key: str):
@@ -2845,6 +3880,9 @@ def process_stop_event(event: Dict, api_key: str):
     current_conversation_started = False
     user_prompt_timestamp = None
     stop_timestamp = None
+    previous_stop = None
+    submitted_prompts = []
+    prompt_opens_turn = True
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -2853,23 +3891,51 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log.get('event', {}).get('hook_event_name') if 'event' in log else log.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                session_events = [log]
+                # Typing while Claude is still working produces one turn carrying several
+                # prompts. Only the first opens the turn; the rest join it, so neither their
+                # text nor the tool calls they already caused are discarded.
+                if prompt_opens_turn:
+                    session_events = []
+                    prompt_opens_turn = False
                 current_conversation_started = True
-                user_prompt_timestamp = log.get('timestamp')
-            elif current_conversation_started:
                 session_events.append(log)
+                prompt_text = (log.get('event') or log).get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
+            else:
+                if current_conversation_started:
+                    session_events.append(log)
+                # Tracked whether or not a turn is open: a Stop retained past log trimming
+                # arrives before this turn's prompt and is still the boundary. This Stop is
+                # already logged, so the one before it marks how far the last upload
+                # reported; subagent work landing between the two is this turn's.
                 if event_name == 'Stop':
+                    previous_stop = stop_timestamp
                     stop_timestamp = log.get('timestamp')
+                    prompt_opens_turn = True
+
+    # Anchor on the first prompt of the turn: anchoring on the last would start the token
+    # window after work the earlier prompt had already caused.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
 
     transcript_assistant_messages = []
+    transcript_queued_prompts = []
     transcript_usage = None
     transcript_model = None
     if transcript_path and transcript_path != 'undefined' and user_prompt_timestamp:
-        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp)
+        transcript_data = parse_transcript_file(transcript_path, user_prompt_timestamp,
+                                                subagent_floor=previous_stop,
+                                                subagent_ceiling=stop_timestamp)
         transcript_assistant_messages = [
             msg['content'] for msg in transcript_data.get('assistant_messages', [])
             if msg.get('content')
         ]
+        transcript_queued_prompts = transcript_data.get('queued_prompts') or []
         transcript_usage = transcript_data.get('usage')
         transcript_model = transcript_data.get('model')
 
@@ -2889,6 +3955,7 @@ def process_stop_event(event: Dict, api_key: str):
         request_initialized=user_prompt_timestamp,
         request_completed=request_completed,
         cwd=event.get('cwd'),
+        queued_prompts=transcript_queued_prompts,
     )
 
     if exchange:
@@ -4153,6 +5220,10 @@ def main():
         _run_mcp_diagnostic_cli()
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
+        _sync_skills_once(api_key)
+        return
+
     try:
         input_data = sys.stdin.read().strip()
 
@@ -4174,6 +5245,7 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
+            _dispatch_skills_sync(api_key)
             print("{}")
             return
         session_id = event.get('session_id')
@@ -4187,6 +5259,7 @@ def main():
 
         # Handle UserPromptSubmit - check policy before processing
         if hook_event_name == 'UserPromptSubmit':
+            # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
 
             # If denied (response has decision: block), log the event then return

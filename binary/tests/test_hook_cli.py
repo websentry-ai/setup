@@ -212,3 +212,22 @@ def test_mcp_diagnostic_subcommand_fails_open(sandbox_home):
 def test_mcp_diagnostic_unknown_tool_is_noop(sandbox_home):
     res = run_cli_dev(["mcp-diagnostic", "not-a-tool"], None, sandbox_home, stdin_close=True)
     assert res.returncode == 0
+
+
+def test_sync_skills_subcommand_fails_open(sandbox_home):
+    res = run_cli_dev(
+        ["sync-skills", "claude-code"], None, sandbox_home,
+        extra_env={"UNBOUND_CLAUDE_API_KEY": "test-key"}, stdin_close=True,
+    )
+    assert res.returncode == 0
+
+
+def test_sync_skills_unknown_tool_is_noop(sandbox_home):
+    res = run_cli_dev(["sync-skills", "not-a-tool"], None, sandbox_home, stdin_close=True)
+    assert res.returncode == 0
+
+
+def test_sync_skills_without_a_key_is_noop(sandbox_home):
+    res = run_cli_dev(["sync-skills", "claude-code"], None, sandbox_home, stdin_close=True)
+    assert res.returncode == 0
+    assert not (sandbox_home / ".claude" / "skills").exists()

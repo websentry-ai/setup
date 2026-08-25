@@ -34,6 +34,8 @@ SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
+# Repo-scope gate. Straying outside the allowed org is blocked on the first
+# write, and the gate keeps no state on disk at all.
 POLICY_CHECK_FAILURE_DEFAULT = 'allow'
 POLICY_CHECK_FAILURE_BLOCK_REASON = 'policy engine unavailable — please retry'
 PRETOOL_USER_MESSAGES_LIMIT = 5
@@ -189,7 +191,16 @@ def get_policy_check_failure_action() -> str:
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
-def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None):
+def get_repo_policies() -> List[Dict]:
+    """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return []
+    policies = cache.get('repo_policies')
+    return policies if isinstance(policies, list) else []
+
+
+def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_failure_action: Optional[str] = None, repo_policies: Optional[List[Dict]] = None):
     """Merge supplied fields into the cache. Fields passed as None are left untouched.
     last_synced is refreshed only when tools_to_check is being updated."""
     try:
@@ -200,10 +211,28 @@ def save_policy_cache(tools_to_check: Optional[List[str]] = None, policy_check_f
             cache['last_synced'] = datetime.utcnow().isoformat() + 'Z'
         if policy_check_failure_action in ('allow', 'block'):
             cache['policy_check_failure_action'] = policy_check_failure_action
+        if isinstance(repo_policies, list):
+            cache['repo_policies'] = repo_policies
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
         pass
+
+
+def _cache_policies_from_response(api_response: Optional[Dict]):
+    """Without this a session never loads policies and the gate cannot fire."""
+    if not isinstance(api_response, dict):
+        return
+    if (
+        'tools_to_check' in api_response
+        or 'policy_check_failure_action' in api_response
+        or 'repo_policies' in api_response
+    ):
+        save_policy_cache(
+            tools_to_check=api_response.get('tools_to_check'),
+            policy_check_failure_action=api_response.get('policy_check_failure_action'),
+            repo_policies=api_response.get('repo_policies'),
+        )
 
 
 def is_cache_stale(cache: Dict) -> bool:
@@ -384,6 +413,49 @@ def append_to_audit_log(event_data: Dict):
         pass
 
 
+def _typed_user_text(entry: Dict) -> str:
+    """The typed text of a transcript entry, forwarded verbatim so DLP scans what
+    the user wrote. Only text blocks are prompt text: tool results, meta entries
+    and images are not, and yield '' so the caller skips the entry."""
+    if 'toolUseResult' in entry or entry.get('isMeta'):
+        return ''
+    message = entry.get('message') or {}
+    if message.get('role') != 'user':
+        return ''
+    content = message.get('content')
+    if isinstance(content, str):
+        return content if content.strip() else ''
+    if isinstance(content, list):
+        texts = [
+            block.get('text') for block in content
+            if isinstance(block, dict) and block.get('type') == 'text'
+        ]
+        joined = '\n'.join(t for t in texts if isinstance(t, str))
+        return joined if joined.strip() else ''
+    return ''
+
+
+def _ts_key(value) -> Optional[str]:
+    """Comparable form of a transcript timestamp. Numeric timestamps are epoch seconds or
+    milliseconds and normalize to the same ISO form the string ones already use."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        seconds = value / 1000.0 if value > 10_000_000_000 else float(value)
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace('+00:00', 'Z')
+        except (OverflowError, OSError, ValueError):
+            return None
+    return None
+
+
+def _ts_lt(earlier, later) -> bool:
+    """Ordering that never raises on an unexpected timestamp type. Callers decide what an
+    unorderable value means; this only reports a proven ordering."""
+    a, b = _ts_key(earlier), _ts_key(later)
+    return a is not None and b is not None and a < b
+
+
 def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Dict:
     conversation_data = {
         'user_messages': [],
@@ -406,19 +478,16 @@ def parse_transcript_file(transcript_path: str, user_prompt_timestamp: Optional[
                     entry_timestamp = entry.get('timestamp')
 
                     if entry_type == 'user':
-                        message = entry.get('message', {})
-                        if message.get('role') == 'user':
-                            content = message.get('content', '')
-                            if content:
-                                conversation_data['user_messages'].append({
-                                    'content': content,
-                                    'timestamp': entry_timestamp
-                                })
+                        typed = _typed_user_text(entry)
+                        if typed:
+                            conversation_data['user_messages'].append({
+                                'content': typed,
+                                'timestamp': entry_timestamp
+                            })
 
                     elif entry_type == 'assistant':
-                        if user_prompt_timestamp and entry_timestamp:
-                            if entry_timestamp <= user_prompt_timestamp:
-                                continue
+                        if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
+                            continue
 
                         message = entry.get('message', {})
                         if message.get('role') == 'assistant':
@@ -458,6 +527,10 @@ def get_recent_user_prompts_for_session(
             continue
         event = log.get('event', {})
         if event.get('hook_event_name') != 'UserPromptSubmit':
+            continue
+        # Delegated subagent prompts arrive under the parent's session id; they are not
+        # things the user typed, so they do not belong in the user's recent history.
+        if event.get('agent_id'):
             continue
         prompt = event.get('prompt')
         if prompt:
@@ -977,7 +1050,19 @@ def build_account_identity() -> Dict:
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
-    """Process PreToolUse event - DO NOT LOG."""
+    """PreToolUse entry point - DO NOT LOG. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for apply_patch when no policy covers it."""
+    gate = _repo_gate_evaluate(event)
+    if gate:
+        return transform_response_for_codex({
+            'decision': 'deny',
+            'reason': _repo_gate_block_reason(gate['repo']),
+            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        })
+    return _evaluate_pre_tool_use_policies(event, api_key)
+
+
+def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
+    """Run the gateway policy check for a PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
     model = event.get('model') or 'auto'
     transcript_path = event.get('transcript_path')
@@ -1095,11 +1180,7 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
         )
         return {}
 
-    if 'tools_to_check' in api_response or 'policy_check_failure_action' in api_response:
-        save_policy_cache(
-            tools_to_check=api_response.get('tools_to_check'),
-            policy_check_failure_action=api_response.get('policy_check_failure_action'),
-        )
+    _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
         return _handle_approval_required_codex_response(api_response, approval_key)
@@ -1114,10 +1195,13 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 
 
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
-    """Process UserPromptSubmit event for policy checking."""
+    """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
     model = event.get('model') or 'auto'
     prompt = event.get('prompt', '')
+
+    cache = load_policy_cache()
+    need_pull_policies = cache is None or is_cache_stale(cache)
 
     request_body = {
         'conversation_id': session_id,
@@ -1127,8 +1211,11 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else []
     }
+    if need_pull_policies:
+        request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
+    _cache_policies_from_response(api_response)
     return transform_response_for_codex_prompt(api_response)
 
 
@@ -1215,36 +1302,59 @@ def _github_remote_path(remote_url: str) -> Optional[str]:
     return None
 
 
+def _git_origin_url(cwd: str) -> Optional[str]:
+    """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
+    result = subprocess.run(
+        ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip()
+
+
+def _remote_host(remote_url: Optional[str]) -> Optional[str]:
+    """Reject a host-less remote URL, so file:///srv/git/x is not org 'srv'."""
+    url = (remote_url or '').strip()
+    if '://' in url:
+        host = url.split('://', 1)[1].split('/', 1)[0]
+    elif ':' in url:
+        host = url.split(':', 1)[0]
+    else:
+        return None
+    host = host.rsplit('@', 1)[-1].split('?', 1)[0]
+    return host.lower() or None
+
+
+def _get_git_origin_org_repo(cwd: str) -> tuple:
+    """Lowercased (org, repo) of `cwd`'s origin; git failure propagates upward."""
+    url = _git_origin_url(cwd)
+    if not url or not _remote_host(url):
+        return (None, None)
+    path = _github_remote_path(url)
+    if not path:
+        return (None, None)
+    parts = path.split('/')
+    if len(parts) < 2:
+        return (None, None)
+    org = _strip_git_suffix(parts[0]).lower()
+    repo = _strip_git_suffix(parts[1]).lower()
+    return (org or None, repo or None)
+
+
 def _get_project(cwd: Optional[str]) -> Optional[str]:
-    """Lowercased "<org>/<repo>" for `cwd`'s git origin, attached to hook
-    requests for analytics. None when cwd is missing, not a git repo, has no
-    origin, or anything fails — fully fail-open (never raises)."""
+    """Lowercased "<org>/<repo>" for `cwd`'s origin, for analytics; never raises."""
     try:
         if not cwd:
             return None
-        result = subprocess.run(
-            ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode != 0:
-            return None
-        path = _github_remote_path(result.stdout.strip())
-        if not path:
-            return None
-        parts = path.split('/')
-        if len(parts) < 2:
-            return None
-        org = _strip_git_suffix(parts[0])
-        repo = _strip_git_suffix(parts[1])
-        return f"{org.lower()}/{repo.lower()}" if org and repo else None
+        org, repo = _get_git_origin_org_repo(cwd)
+        return f"{org}/{repo}" if org and repo else None
     except Exception:
         return None
 
 
 def _find_git_root(path: str) -> Optional[str]:
-    """Nearest ancestor of `path` (inclusive) containing a `.git` entry
-    (directory, or file for linked worktrees). Pure filesystem stats — no
-    subprocess. None when outside any repo or on any error (fail-open)."""
+    """Nearest ancestor of `path` holding a `.git`; None on any error."""
     try:
         p = Path(path)
         for parent in [p] + list(p.parents):
@@ -1258,11 +1368,8 @@ def _find_git_root(path: str) -> Optional[str]:
 # Any absolute path inside a shell command; left boundary required so the
 # slash inside a relative token (tests/webapp/) doesn't read as absolute.
 _ABS_PATH_RE = re.compile(r'(?:^|[\s"\'=(])(/[^\s"\';|&<>()]+)')
-# Package-manager / OS checkouts that are real git clones but never the
-# engineer's project — Homebrew installs itself as a clone of Homebrew/brew,
-# so a command merely referencing /opt/homebrew/bin/… would otherwise
-# attribute the call to "homebrew/brew". Candidates under these roots are
-# skipped so resolution falls through to the shell's working directory.
+# Real git clones that are never the engineer's project: a path under
+# /opt/homebrew must not attribute the call to "homebrew/brew" (WEB-5433).
 _SYSTEM_CHECKOUT_ROOTS = (
     '/opt/homebrew',
     '/home/linuxbrew',
@@ -1287,10 +1394,85 @@ def _is_system_checkout_path(path: str) -> bool:
 _CD_TARGET_RE = re.compile(r'(?:^|[;&|\n]\s*|\bthen\s+|\bdo\s+)cd\s+(["\']?)([^\s"\';|&]+)\1')
 
 
+# `git -C <dir>`, `--git-dir=<dir>`, `--work-tree=<dir>` retarget git at another checkout; a relative target is invisible to _ABS_PATH_RE.
+_GIT_PATH_OPT_RE = re.compile(
+    r'(?:^|\s)(?:-C\s*|--git-dir[=\s]|--work-tree[=\s])\s*'
+    r'(?:"([^"]+)"|\'([^\']+)\'|([^\s"\';|&<>()]+))'
+)
+
+
+def _shell_segments(command):
+    """(segment, following-separator) pairs, sliced from the original so quoted paths survive."""
+    masked = _mask_quoted_runs(command)
+    out, last = [], 0
+    for m in _SHELL_SEGMENT_SEP_RE.finditer(masked):
+        out.append((command[last:m.start()].strip(), m.group(0).strip()))
+        last = m.end()
+    out.append((command[last:].strip(), ''))
+    # Stripped: _CD_TARGET_RE anchors on ^ or a separator, so a leading space hides the cd.
+    return out
+
+
+def _merge_cwds(first, second):
+    """Ordered union, dropping duplicates and bounding the fan-out."""
+    out = list(first)
+    for c in second:
+        if c not in out:
+            out.append(c)
+    return out[:8]
+
+
+def _git_path_opt_targets(command, shell_dir):
+    """Directories a git invocation redirects itself at, resolved against every cwd the shell could be in there."""
+    targets = []
+    try:
+        cwds = [shell_dir]
+        # Where control lands if the current && chain short-circuits: `a && b || c`
+        # runs c when a failed (original cwd) or when b failed (a's cwd).
+        fallback = [shell_dir]
+        for segment, separator in _shell_segments(command):
+            words = _segment_words(segment)
+            # git only: `grep -C 3` is context lines, not a directory.
+            if words and os.path.basename(words[0]) == 'git':
+                for match in _GIT_PATH_OPT_RE.finditer(segment):
+                    raw = match.group(1) or match.group(2) or match.group(3)
+                    if not raw:
+                        continue
+                    for cwd in cwds:
+                        target = os.path.expanduser(raw) if raw.startswith('~') else raw
+                        if not target.startswith('/'):
+                            if not cwd:
+                                continue
+                            target = os.path.join(cwd, target)
+                        target = os.path.normpath(target)
+                        if _is_system_checkout_path(target) or target in targets:
+                            continue
+                        targets.append(target)
+            moved = [_next_shell_dir(segment, c) for c in cwds]
+            if separator == '&&':
+                # Next runs only if this one succeeded, so its cd took effect —
+                # but this segment may instead have failed, which a later || reaches.
+                fallback = _merge_cwds(fallback, cwds)
+                cwds = moved
+            elif separator == '||':
+                # Reached because something failed, so that cd did not apply.
+                cwds = _merge_cwds(cwds, fallback)
+                fallback = list(cwds)
+            elif separator in ('|', '&'):
+                # Subshell: a cd on the left never reaches the right-hand command.
+                pass
+            else:
+                # `;` or a newline: sequential, so the cd may or may not have taken.
+                cwds = _merge_cwds(moved, cwds)
+                fallback = list(cwds)
+            cwds = cwds[:8]
+    except Exception:
+        return targets
+    return targets
+
+
 def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
-    """Follow the last `cd` in `command` from `shell_dir`. Absolute and
-    ~-rooted targets replace the dir; relative ones join onto it. Unchanged
-    when the command has no cd or on any error."""
+    """Follow the last `cd` in `command`; unchanged on no cd or any error."""
     try:
         target = None
         for m in _CD_TARGET_RE.finditer(command):
@@ -1308,6 +1490,91 @@ def _next_shell_dir(command: str, shell_dir: Optional[str]) -> Optional[str]:
         return shell_dir
     except Exception:
         return shell_dir
+
+
+# --- Bash calls in scope for the repo gate: a segment's command word invokes git or writes the working tree; anything unclassifiable is not gated ---
+_QUOTED_RUN_RE = re.compile(r'"[^"]*"|\'[^\']*\'')
+_SHELL_SEGMENT_SEP_RE = re.compile(r'\|\||&&|[;|&\n]')
+_ENV_ASSIGNMENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+# Wrappers that stand in front of the real command word.
+_COMMAND_PREFIX_WORDS = frozenset({'sudo', 'env', 'command'})
+# Creating or appending redirect; the lookahead drops `2>&1`, the lookbehind keeps `>>` from counting twice.
+_REDIRECT_RE = re.compile(r'(?<!>)>>?(?![&>])')
+
+# Shell commands that mutate the working tree, always a write whatever the flags:
+_SHELL_WRITE_COMMANDS = frozenset({
+    'rm', 'rmdir', 'unlink', 'shred',       # delete
+    'mv', 'cp', 'ln', 'install',            # create or relocate
+    'touch', 'mkdir',                       # create
+    'tee', 'truncate', 'patch',             # rewrite contents
+})
+# A write only with the right flag: `sed 's/a/b/' f` and `dd if=f` only read.
+_SHELL_INPLACE_COMMANDS = frozenset({'sed', 'perl'})
+_INPLACE_FLAG_RE = re.compile(r'^(?:--in-place|-[A-Za-z]*i)')
+# DELIBERATELY NOT WRITES: chmod and chown change metadata, not repository content.
+
+
+def _mask_quoted_runs(command):
+    """Blank the inside of quoted runs, preserving length; an unbalanced quote leaves its tail untouched."""
+    return _QUOTED_RUN_RE.sub(
+        lambda m: m.group(0)[0] + ' ' * (len(m.group(0)) - 2) + m.group(0)[0],
+        command)
+
+
+def _segment_words(segment):
+    """A segment's words from its command word on, dropping env assignments and any sudo/env/command wrapper."""
+    words = []
+    for word in segment.split():
+        word = word.strip('()`{}"\'')
+        if not words and (not word or word.startswith('-')
+                          or _ENV_ASSIGNMENT_RE.match(word)
+                          or word in _COMMAND_PREFIX_WORDS):
+            continue
+        words.append(word)
+    return words
+
+
+def _segment_writes(words):
+    """Whether a segment's command word plus its flags mutate the working tree."""
+    name = os.path.basename(words[0])
+    if name in _SHELL_WRITE_COMMANDS:
+        return True
+    if name in _SHELL_INPLACE_COMMANDS:
+        return any(_INPLACE_FLAG_RE.match(w) for w in words[1:])
+    if name == 'dd':
+        return any(w.startswith('of=') for w in words[1:])
+    return False
+
+
+def _is_git_command(command):
+    """Whether any segment of `command` directly invokes git; False on any error."""
+    try:
+        if not isinstance(command, str) or 'git' not in command:
+            return False
+        for segment in _SHELL_SEGMENT_SEP_RE.split(_mask_quoted_runs(command)):
+            words = _segment_words(segment)
+            if words and os.path.basename(words[0]) == 'git':
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _is_shell_write_command(command):
+    """Whether `command` mutates the working tree: a write command word in any segment, or a creating/appending redirect. False on any error."""
+    try:
+        if not isinstance(command, str) or not command:
+            return False
+        masked = _mask_quoted_runs(command)
+        if _REDIRECT_RE.search(masked):
+            return True
+        for segment in _SHELL_SEGMENT_SEP_RE.split(masked):
+            words = _segment_words(segment)
+            if words and _segment_writes(words):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str, Optional[str]]) -> Optional[str]:
@@ -1328,6 +1595,223 @@ def _project_for_paths(candidates: List[Optional[str]], root_projects: Dict[str,
     except Exception:
         pass
     return None
+
+
+# --- Repository-scope gate: blocks writes, git commands and shell writes in repos outside the org's allowed scope, decided on-device and fail-open ---
+
+# Write tools, git commands and shell writes only; apply_patch is Codex's only write tool, and conversation and every other shell command (ls, cat, npm test) are ungated.
+_REPO_GATE_WRITE_TOOLS = frozenset({'apply_patch'})
+_REPO_GATE_SHELL_TOOLS = frozenset({'Bash'})
+_REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
+REPO_GATE_BLOCK_CONTEXT = (
+    'This action was blocked by an organization repository-scope policy. Do not '
+    'attempt to achieve the same result using alternative tools, file operations, '
+    'or workarounds. Inform the user and stop.'
+)
+
+
+def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
+    """The shell command a Bash call carries, in this hook's payload shape."""
+    if not isinstance(tool_input, dict):
+        return None
+    command = tool_input.get('command')
+    return command if isinstance(command, str) else None
+
+
+def _repo_gate_applies(tool_name, command):
+    """Whether this call is in the gate's scope: a write tool always, a shell call only when it invokes git or writes."""
+    if tool_name in _REPO_GATE_SHELL_TOOLS:
+        return _is_git_command(command) or _is_shell_write_command(command)
+    return tool_name in _REPO_GATE_WRITE_TOOLS
+
+
+def _repo_gate_block_policies(policies: Optional[List[Dict]]) -> List[Dict]:
+    """Enforceable subset; a policy this hook cannot read is dropped, not guessed."""
+    enforceable = []
+    for policy in policies or []:
+        if not isinstance(policy, dict):
+            continue
+        org = policy.get('github_org')
+        if not isinstance(org, str) or not org.strip():
+            continue
+        enforceable.append(policy)
+    return enforceable
+
+
+def _repo_gate_scope_allows(policy: Dict, org: str, repo: str) -> bool:
+    """Whether `org` matches this policy's allowed organization; both lowercased."""
+    return org == policy['github_org'].strip().lower()
+
+
+def _repo_gate_violating_repo(candidates: List[str], block_policies: List[Dict], root_projects: Dict[str, tuple]) -> Optional[str]:
+    """First candidate outside every scope; a git failure propagates to fail open."""
+    for candidate in candidates:
+        root = _find_git_root(candidate)
+        if not root:
+            continue
+        if root not in root_projects:
+            root_projects[root] = _get_git_origin_org_repo(root)
+        org, repo = root_projects[root]
+        if not org or not repo:
+            continue
+        if not any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+            return '%s/%s' % (org, repo)
+    return None
+
+
+def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], cwd: Optional[str]) -> List[str]:
+    """Paths a Codex call works in; apply_patch hides them in the patch body."""
+    tool_input = tool_input or {}
+    candidates = []
+    if tool_name == 'Bash':
+        command = tool_input.get('command')
+        if isinstance(command, str):
+            candidates.extend(
+                p for p in _ABS_PATH_RE.findall(command)
+                if not _is_system_checkout_path(p)
+            )
+            candidates.extend(_git_path_opt_targets(command, cwd))
+            cwd = _next_shell_dir(command, cwd)
+    else:
+        try:
+            blob = json.dumps(tool_input)
+        except (TypeError, ValueError):
+            blob = ''
+        candidates.extend(
+            p for p in _ABS_PATH_RE.findall(blob)
+            if not _is_system_checkout_path(p)
+        )
+    if not candidates and cwd:
+        candidates.append(cwd)
+    return candidates
+
+
+def _repo_gate_block_reason(repo: str) -> str:
+    return (
+        'Blocked by organization policy. "%s" is outside your organization\'s '
+        'allowed repository scope.' % repo
+    )
+
+
+# --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
+
+REPO_GATE_REPORT_MAX_CHARS = 2000
+_REPO_GATE_INPUT_KEYS = ('command', 'commandLine', 'file_path', 'filePath',
+                         'path', 'notebook_path')
+
+
+def _repo_gate_clip(text: Optional[str]) -> Optional[str]:
+    """Cap one reported string, keeping the body inside curl's pipe buffer."""
+    if not isinstance(text, str) or not text:
+        return None
+    return text[:REPO_GATE_REPORT_MAX_CHARS]
+
+
+def _repo_gate_binding_policy(block_policies: List[Dict]) -> Dict:
+    """The policy the incident is filed against; every match denies alike."""
+    return block_policies[0]
+
+
+# Last ordinal this process handed out; the clock alone repeats under a burst.
+_REPO_GATE_LAST_ORDINAL = [0]
+
+
+def _repo_gate_incident_ordinal():
+    """A value unique to this incident; the backend hashes it into the record's
+    identity, so a repeat is read as a redelivery and dropped. The step past the
+    last value is what guarantees that: the clock resolves to about a
+    microsecond, which two reports of one process can share."""
+    try:
+        value = time.time_ns() // 1000
+        if value <= _REPO_GATE_LAST_ORDINAL[0]:
+            value = _REPO_GATE_LAST_ORDINAL[0] + 1
+        _REPO_GATE_LAST_ORDINAL[0] = value
+        return value
+    except Exception:
+        return None
+
+
+def _repo_gate_post(body: str, api_key: str):
+    """Never waited on, so the blocking path stays free of synchronous work."""
+    proc = subprocess.Popen(
+        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
+         '-H', 'Authorization: Bearer %s' % api_key,
+         '-H', 'Content-Type: application/json',
+         '--data-binary', '@-',
+         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc.stdin.write(body.encode())
+    proc.stdin.close()
+
+
+def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context: Dict):
+    """Report one WARN or BLOCK, fire and forget; never raises, never blocks."""
+    try:
+        if (gate or {}).get('decision') != 'deny':
+            return
+        # main() already resolved the key; the fallback covers entry points that skip it.
+        api_key = _cached_api_key or os.getenv('UNBOUND_CODEX_API_KEY')
+        if not api_key:
+            return
+        policy = _repo_gate_binding_policy(block_policies)
+        # Numbers this incident within the session. It is the only field that
+        # tells two incidents apart downstream, so it must advance per report.
+        turn = _repo_gate_incident_ordinal()
+        # What the call was about: its shell command, or the path it names.
+        tool_input = context.get('tool_input')
+        if isinstance(tool_input, dict):
+            named = [tool_input.get(k) for k in _REPO_GATE_INPUT_KEYS]
+            tool_input = next((v for v in named if isinstance(v, str) and v), None)
+        # The pretool envelope every other post uses; the verdict rides under repo_gate.
+        app_label = context.get('app_label')
+        _repo_gate_post(json.dumps({
+            'conversation_id': context.get('session_id'),
+            'event_name': 'RepoGate',
+            'unbound_app_label': app_label,
+            'repo_gate': {
+                'policy_id': policy.get('id'),
+                'repository': gate.get('repo'),
+                'decision': 'BLOCK',
+                # Same value as the label above: the incidents page reads this one.
+                'agent': app_label,
+                'tool_name': context.get('tool_name'),
+                # Repeats conversation_id above: the analytics row digests this one.
+                'session_id': context.get('session_id'),
+                'turn': turn,
+                'prompt_text': _repo_gate_clip(context.get('prompt_text')),
+                'tool_input': _repo_gate_clip(tool_input),
+            },
+        }), api_key)
+    except Exception:
+        pass
+
+
+def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
+    """Verdict for one tool call: None allows, else deny. Never raises."""
+    try:
+        tool_name = event.get('tool_name') or ''
+        tool_input = event.get('tool_input')
+        if not _repo_gate_applies(tool_name, _repo_gate_command(tool_input)):
+            return None
+        block_policies = _repo_gate_block_policies(get_repo_policies())
+        if not block_policies:
+            return None
+
+        candidates = _repo_gate_candidates(
+            tool_name, tool_input, event.get('cwd')
+        )
+        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        gate = {'decision': 'deny', 'repo': repo} if repo else None
+        _repo_gate_report(gate, block_policies, {
+            'app_label': 'codex',
+            'session_id': event.get('session_id'),
+            'tool_name': tool_name,
+            'tool_input': event.get('tool_input'),
+        })
+        return gate
+    except Exception:
+        return None
 
 
 def _trusted_ancestors(start):
@@ -1458,7 +1942,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     payload = entry.get('payload', {})
 
                     # Skip entries before user prompt if timestamp provided
-                    if user_prompt_timestamp and entry_timestamp and entry_timestamp <= user_prompt_timestamp:
+                    if user_prompt_timestamp and not _ts_lt(user_prompt_timestamp, entry_timestamp):
                         continue
 
                     if entry_type == 'response_item':
@@ -1513,6 +1997,7 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
                     candidates.extend(
                         p for p in _ABS_PATH_RE.findall(command) if not _is_system_checkout_path(p)
                     )
+                    candidates.extend(_git_path_opt_targets(command, shell_dir))
                     shell_dir = _next_shell_dir(command, shell_dir)
                 if not candidates and shell_dir:
                     candidates.append(shell_dir)
@@ -1558,40 +2043,255 @@ def parse_codex_transcript_for_tools(transcript_path: str, user_prompt_timestamp
     return tool_uses
 
 
-def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None) -> Optional[Dict]:
-    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489)."""
+_CODEX_TOKEN_ALIASES = {
+    'input_tokens': ('input_tokens', 'prompt_tokens', 'input'),
+    'cached_input_tokens': ('cached_input_tokens', 'cache_read_input_tokens', 'cached_tokens'),
+    'output_tokens': ('output_tokens', 'completion_tokens', 'output'),
+}
+
+
+def _codex_token(usage: Dict, field: str) -> int:
+    for name in _CODEX_TOKEN_ALIASES[field]:
+        value = usage.get(name)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+    return 0
+
+
+_SUBAGENT_SCAN_WINDOW_SECONDS = 24 * 3600
+
+
+def _codex_session_meta(transcript_path: str) -> Dict:
+    """A rollout opens with a session_meta line carrying its id, the thread it was spawned
+    from, and the fork time."""
+    try:
+        with open(transcript_path, 'r', encoding='utf-8') as f:
+            entry = json.loads(f.readline() or '{}')
+    except (OSError, ValueError):
+        return {}
+    if entry.get('type') != 'session_meta':
+        return {}
+    payload = entry.get('payload')
+    if not isinstance(payload, dict):
+        return {}
+
+    def nested(value, *keys):
+        for key in keys:
+            if not isinstance(value, dict):
+                return {}
+            value = value.get(key)
+        return value if isinstance(value, dict) else {}
+
+    # source is a plain string ("cli") on ordinary rollouts and a mapping on spawned ones,
+    # where subagent is itself either a bare label ({"subagent": "review"}, carrying no
+    # lineage at all) or a mapping naming the thread that spawned it.
+    source = payload.get('source')
+    spawn = nested(payload, 'source', 'subagent', 'thread_spawn')
+    parent_id = (payload.get('forked_from_id')
+                 or payload.get('parent_thread_id')
+                 or spawn.get('parent_thread_id'))
+    # forked_from_id is also how an ordinary `codex fork` or resume records its origin, and
+    # such a session reports its own usage on its own Stop. Folding one into the parent would
+    # bill it twice, so lineage counts only when the rollout also declares itself a subagent.
+    is_subagent = isinstance(source, dict) and 'subagent' in source
+    return {
+        'id': payload.get('id'),
+        'parent_id': parent_id if is_subagent and isinstance(parent_id, str) and parent_id else None,
+        'forked_at': entry.get('timestamp'),
+    }
+
+
+def _codex_sessions_root(transcript_path: str) -> Optional[str]:
+    path = os.path.abspath(transcript_path)
+    while True:
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        if os.path.basename(parent) == 'sessions':
+            return parent
+        path = parent
+    default = Path.home() / '.codex' / 'sessions'
+    return str(default) if default.is_dir() else None
+
+
+def _codex_subagent_rollouts(transcript_path: str, user_prompt_timestamp: str) -> List[tuple]:
+    """Rollouts this session spawned. Codex writes every subagent to its own file, so the
+    parent transcript carries none of their usage."""
+    session_id = _codex_session_meta(transcript_path).get('id')
+    root = _codex_sessions_root(transcript_path)
+    if not session_id or not root:
+        return []
+    parent_real = os.path.realpath(transcript_path)
+    cutoff = time.time() - _SUBAGENT_SCAN_WINDOW_SECONDS
+    found = []
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith('.jsonl'):
+                continue
+            path = os.path.join(dirpath, name)
+            try:
+                # Recency keeps the scan off historical rollouts. mtime is compared against
+                # the same clock, never against a transcript timestamp, so skew cannot drop
+                # a live child; the window is wide enough that only stale files are pruned.
+                if os.path.realpath(path) == parent_real or os.path.getmtime(path) < cutoff:
+                    continue
+            except OSError:
+                continue
+            meta = _codex_session_meta(path)
+            # A rollout that declares itself a subagent but records no lineage cannot be tied
+            # to a parent by id at all. Matching it on cwd and timing instead would bill another
+            # session's spend against this turn, so it is left out rather than guessed at.
+            if meta.get('parent_id') != session_id:
+                continue
+            # Fork time does not include or exclude a child: a subagent can outlive the turn
+            # that spawned it, so what matters is the spend inside this turn. It is carried
+            # anyway, to bound which parent snapshots a replay may match.
+            found.append((path, meta.get('forked_at')))
+    return found
+
+
+def _codex_snapshot_total(snapshot: Dict) -> int:
+    """How far a cumulative snapshot has advanced, across every field we count."""
+    return sum(_codex_token(snapshot, field) for field in _CODEX_TOKEN_ALIASES)
+
+
+def _codex_same_totals(left: Dict, right: Dict) -> bool:
+    """Two cumulative snapshots describing the same point in a session."""
+    if not left or not right:
+        return False
+    return all(_codex_token(left, f) == _codex_token(right, f) for f in _CODEX_TOKEN_ALIASES)
+
+
+def _codex_all_totals(transcript_path: str, until: Optional[str] = None) -> List[Dict]:
+    """Every cumulative snapshot in a rollout, in file order, optionally only those at or
+    before a given instant."""
+    totals = []
+    with open(transcript_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get('payload') or {}
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            total = (payload.get('info') or {}).get('total_token_usage')
+            if total and not (until and _ts_lt(until, entry.get('timestamp'))):
+                totals.append(total)
+    return totals
+
+
+def _codex_totals_around(transcript_path: str, anchor: Optional[str]) -> tuple:
+    """Last cumulative snapshot at or before the anchor, and the last one after it."""
+    before, after = {}, {}
+    with open(transcript_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = entry.get('payload') or {}
+            if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
+                continue
+            # Cumulative totals only: last_token_usage is a sticky snapshot re-emitted on
+            # later events, so summing double-bills; estimating a turn beats over-billing it.
+            total = (payload.get('info') or {}).get('total_token_usage')
+            if not total:
+                continue
+            # An unorderable timestamp is treated as the pre-anchor baseline: a cumulative
+            # snapshot we cannot place is far likelier to predate the anchor than to follow it,
+            # and guessing the other way bills earlier spend against this turn.
+            stamp = entry.get('timestamp')
+            if _ts_key(stamp) is None or _ts_lt(stamp, anchor):
+                before = total
+            else:
+                after = total
+    return before, after
+
+
+def _codex_usage_delta(before: Dict, after: Dict) -> tuple:
+    def field(name):
+        return max(_codex_token(after, name) - _codex_token(before, name), 0)
+
+    input_tokens = field('input_tokens')
+    # Codex input_tokens includes cached_input_tokens; clamp before subtracting so cache
+    # isn't billed at the base rate and can never exceed the input it came from.
+    cache_read = min(field('cached_input_tokens'), input_tokens)
+    # reasoning_output_tokens is a subset of output_tokens, not an addition to it.
+    return input_tokens - cache_read, field('output_tokens'), cache_read
+
+
+def parse_codex_transcript_for_usage(transcript_path: str, user_prompt_timestamp: Optional[str] = None,
+                                     subagent_floor: Optional[str] = None) -> Optional[Dict]:
+    """Per-turn token usage via total_token_usage deltas (last_token_usage re-emits across turns; openai/codex#14489),
+    plus the same delta over any subagent rollout this turn spawned."""
     if not transcript_path or not os.path.exists(transcript_path) or not user_prompt_timestamp:
         return None
 
-    before, after = {}, {}
     try:
-        with open(transcript_path, 'r', encoding='utf-8') as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                payload = entry.get('payload') or {}
-                if entry.get('type') != 'event_msg' or payload.get('type') != 'token_count':
-                    continue
-                total = (payload.get('info') or {}).get('total_token_usage')
-                if not total:
-                    continue
-                if entry.get('timestamp', '') < user_prompt_timestamp:
-                    before = total
-                else:
-                    after = total
+        before, after = _codex_totals_around(transcript_path, user_prompt_timestamp)
+        prompt, completion, cache_read = _codex_usage_delta(before, after) if after else (0, 0, 0)
 
-        if not after:
-            return None
+        try:
+            children = _codex_subagent_rollouts(transcript_path, user_prompt_timestamp)
+            parent_totals = _codex_all_totals(transcript_path) if children else []
+        except Exception as e:
+            # The parent's own usage is already computed; never trade it for the children.
+            log_error(f"subagent usage: cannot enumerate for {transcript_path}: {e}", 'usage')
+            children = []
+            parent_totals = []
 
-        delta = lambda k: max(int(after.get(k) or 0) - int(before.get(k) or 0), 0)
-        # Codex input_tokens includes cached_input_tokens; subtract so cache isn't billed at the base rate too.
-        prompt = max(delta('input_tokens') - delta('cached_input_tokens'), 0)
-        completion = delta('output_tokens') + delta('reasoning_output_tokens')
-        cache_read = delta('cached_input_tokens')
+        for child_path, forked_at in children:
+            try:
+                # A child opens with the parent's history replayed under the spawn instant, so
+                # its own timestamps cannot separate inherited totals from new spend. The
+                # baseline is taken from the parent at the fork instead, where the timestamps
+                # are the parent's own and were never rewritten.
+                child_totals = _codex_all_totals(child_path)
+                if not child_totals:
+                    continue
+                # A replay is a prefix of the parent's own stream, so the inherited snapshot is
+                # the last leading entry the parent also recorded. Magnitude cannot decide this:
+                # a subagent that starts clean can still outspend the parent, and subtracting
+                # from that one erases its work instead of isolating it.
+                # parent_totals is the parent's whole stream as of this Stop and snapshots are
+                # only ever appended, so it is a superset of anything the child could have
+                # replayed: a leading entry matching nothing was never replayed.
+                # Only snapshots the parent had reached by the fork can have been replayed.
+                # Matching against later ones lets a child's own total coincide with a parent
+                # total it never inherited, which would subtract spend the child really made.
+                replayable = _codex_all_totals(transcript_path, until=forked_at) if forked_at else parent_totals
+                inherited = {}
+                for total in child_totals:
+                    if not any(_codex_same_totals(total, seen) for seen in replayable):
+                        break
+                    inherited = total
+                # Spend already uploaded is excluded by the child's own snapshot at the floor,
+                # which is the previous Stop rather than this turn's prompt so that work
+                # finishing between the two is still counted once. Cumulative totals only
+                # climb, so the larger of the two lower bounds is the tighter one, and a child
+                # that finished before the floor lands on its final total and adds nothing.
+                at_anchor, _ = _codex_totals_around(child_path, subagent_floor or user_prompt_timestamp)
+                # Compared across every counted field, not input alone: a snapshot can advance
+                # on output or cache with input unchanged, and picking the looser bound then
+                # re-adds spend the previous Stop already uploaded.
+                if _codex_snapshot_total(at_anchor) > _codex_snapshot_total(inherited):
+                    inherited = at_anchor
+                child = _codex_usage_delta(inherited, child_totals[-1])
+            except Exception as e:
+                log_error(f"subagent usage: failed reading {child_path}: {e}", 'usage')
+                continue
+            prompt += child[0]
+            completion += child[1]
+            cache_read += child[2]
     except Exception:
         return None
 
@@ -1618,7 +2318,9 @@ def process_stop_event(event: Dict, api_key: str):
     user_prompt = None
     user_prompt_timestamp = None
     permission_mode = None
+    submitted_prompts = []
     stop_timestamp = None
+    previous_stop = None
 
     for log in logs:
         log_session_id = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -1628,15 +2330,38 @@ def process_stop_event(event: Dict, api_key: str):
             event_name = log_event.get('hook_event_name')
 
             if event_name == 'UserPromptSubmit':
-                user_prompt = log_event.get('prompt')
-                user_prompt_timestamp = log.get('timestamp')
+                # A spawned subagent's delegated prompt is reported under the parent's session
+                # id and would otherwise be taken for the user's, pairing the child's
+                # instructions with the parent's reply and anchoring the turn at the spawn.
+                if log_event.get('agent_id'):
+                    continue
+                prompt_text = log_event.get('prompt')
+                if prompt_text:
+                    submitted_prompts.append((log.get('timestamp'), prompt_text))
                 permission_mode = log_event.get('permission_mode', 'default')
             elif event_name == 'Stop':
+                # This Stop is already logged, so the one before it marks how far the last
+                # upload reported. Subagent work landing between the two belongs to nobody
+                # otherwise, and a subagent routinely outlives the turn that spawned it.
+                previous_stop = stop_timestamp
                 stop_timestamp = log.get('timestamp')
+
+    # Codex closes one turn for every prompt typed while it was still working, so a turn can
+    # carry more than one. Keeping only the last drops what the user actually asked first, and
+    # anchoring on it would start the token window after work already done.
+    turn_prompts = [(ts, text) for ts, text in submitted_prompts
+                    if not previous_stop or not _ts_lt(ts, previous_stop)]
+    if not turn_prompts:
+        turn_prompts = submitted_prompts[-1:]
+    if turn_prompts:
+        user_prompt_timestamp = turn_prompts[0][0]
+        user_prompt = '\n\n'.join(text for _, text in turn_prompts)
 
     if not user_prompt:
         return
 
+    # One message, not one per prompt: the backend keeps the last user message, so several
+    # would silently discard everything the user typed before the final one.
     messages = [{'role': 'user', 'content': user_prompt}]
 
     # Parse tool uses from Codex transcript (function_call/function_call_output
@@ -1677,7 +2402,8 @@ def process_stop_event(event: Dict, api_key: str):
         'project': _get_project(cwd)
     }
 
-    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp)
+    usage = parse_codex_transcript_for_usage(transcript_path, user_prompt_timestamp,
+                                             subagent_floor=previous_stop)
     if usage:
         exchange['usage'] = usage
 
@@ -2036,13 +2762,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            print('{}', flush=True)
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            print('{}', flush=True)
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -2057,7 +2783,6 @@ def main():
         session_id = event.get('session_id')
 
         # Handle PreToolUse - return immediately after decision is made
-        # Note: Codex PreToolUse does not support suppressOutput
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
@@ -2065,6 +2790,7 @@ def main():
 
         # Handle UserPromptSubmit - check policy before processing
         if hook_event_name == 'UserPromptSubmit':
+            # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
 
             # If denied (response has decision: block), log the event then return
@@ -2074,21 +2800,18 @@ def main():
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                response["suppressOutput"] = True
                 print(json.dumps(response), flush=True)
                 return
 
             # Allowed but with hook output to emit (e.g. the spend-limit
             # alert-threshold warning riding additionalContext/systemMessage):
-            # log the event, then print the response instead of the default
-            # suppressOutput so Codex surfaces the warning.
+            # log the event, then print the response so Codex surfaces the warning.
             if response:
                 append_to_audit_log({
                     'timestamp': datetime.utcnow().isoformat() + 'Z',
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                response["suppressOutput"] = True
                 print(json.dumps(response), flush=True)
                 return
 
@@ -2108,12 +2831,14 @@ def main():
 
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
+        # Codex parses suppressOutput but does not implement it, and PostToolUse reports it as
+        # unsupported and marks the hook failed. An empty object is accepted on every event.
+        print('{}', flush=True)
 
     except Exception as e:
-        # Still return empty JSON object to Codex to indicate completion
+        # Still acknowledge so Codex sees the hook complete.
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        print('{}', flush=True)
 
 
 if __name__ == '__main__':
