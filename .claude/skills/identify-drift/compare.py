@@ -327,14 +327,23 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
     # An explicit interval when one is given, so the audit direction can ask about the
     # hours its log still covers instead of the whole window. Comparing a few audited
     # hours against fourteen stored days lets an older row cancel a recent loss.
+    # A row is placed by its own created_at, not by when the request that produced it
+    # began. A turn that started before the audit log's first retained entry still
+    # writes rows inside the audited interval, and bounding the parent excluded them,
+    # so the audit entries for them read as uploads that never arrived.
+    bounds = ["gm.request_initialized_at >= now() - (:'days' || ' days')::interval"]
+    child = []
     if since:
         params["since"] = since
-        bounds = ["gm.request_initialized_at >= :'since'::timestamptz"]
-    else:
-        bounds = ["gm.request_initialized_at >= now() - (:'days' || ' days')::interval"]
+        child.append("%s.created_at >= :'since'::timestamptz")
     if until:
         params["until"] = until
-        bounds.append("gm.request_initialized_at <= :'until'::timestamptz")
+        child.append("%s.created_at <= :'until'::timestamptz")
+
+    def within(alias):
+        """The interval clause for a child table, empty when the whole window is asked
+        for."""
+        return "".join("\n          AND " + c % alias for c in child)
     where = """
         FROM gateway_metrics gm
         JOIN applications app ON app.id = gm.application_id
@@ -359,39 +368,39 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
     threads = psql(dsn, """
         SELECT DISTINCT pa.thread_id
         FROM prompt_analytics pa
-        WHERE pa.thread_id IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+        WHERE pa.thread_id IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
         LIMIT :'cap'
-    """ % where, params)
+    """ % (where, within("pa")), params)
 
     tools = psql(dsn, """
         SELECT pa.tool_name, count(*) AS n,
                count(*) FILTER (WHERE pa.parameters ? 'tool_use_id') AS with_id
         FROM prompt_analytics pa
-        WHERE pa.tool_name IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+        WHERE pa.tool_name IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
         GROUP BY pa.tool_name
         LIMIT :'cap'
-    """ % where, params)
+    """ % (where, within("pa")), params)
 
     call_ids = psql(dsn, """
         SELECT DISTINCT pa.parameters->>'tool_use_id' AS call_id
         FROM prompt_analytics pa
         WHERE pa.parameters ? 'tool_use_id'
-          AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+          AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
         LIMIT :'cap'
-    """ % where, params)
+    """ % (where, within("pa")), params)
 
     digests = psql(dsn, """
         SELECT role, h, count(*) AS n FROM (
           SELECT 'user' AS role, %s AS h
-          FROM prompts p WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
+          FROM prompts p WHERE p.gateway_metrics_id IN (SELECT gm.id %s)%s
           UNION ALL
           SELECT 'assistant', %s
-          FROM prompts p WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
+          FROM prompts p WHERE p.gateway_metrics_id IN (SELECT gm.id %s)%s
         ) x WHERE h IS NOT NULL
         GROUP BY role, h
         LIMIT :'cap'
-    """ % (norm % "p.prompt->>'user_prompt'", where,
-           norm % "p.prompt->>'assistant_prompt'", where), params)
+    """ % (norm % "p.prompt->>'user_prompt'", where, within("p"),
+           norm % "p.prompt->>'assistant_prompt'", where, within("p")), params)
 
     threads, threads_capped = _capped(threads)
     tools, tools_capped = _capped(tools)

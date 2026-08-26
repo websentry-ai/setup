@@ -822,6 +822,33 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
         self.assertIn("User prompts recorded locally are absent from the database", got)
         self.assertIn("Tool calls made locally are under-recorded (by count)", got)
 
+    def test_an_interval_bounds_the_rows_not_the_request_that_made_them(self):
+        """A turn that began before the audit log's first retained entry still writes
+        rows inside the audited interval. Bounding the parent dropped them, so the
+        audit entries for them read as uploads that never arrived."""
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.fetch_db("postgres://bob@127.0.0.1/t", "a@b.c", "claude-code",
+                                 14, since="2026-08-01T00:00:00+00:00",
+                                 until="2026-08-05T00:00:00+00:00")
+        bounded = [c[1]["input"] for c in run.call_args_list
+                   if "prompt_analytics" in c[1]["input"] or "prompts p" in c[1]["input"]]
+        self.assertTrue(bounded, "expected the child queries")
+        for statement in bounded:
+            self.assertRegex(statement, r"(pa|p)\.created_at >=")
+            self.assertNotRegex(statement, r"request_initialized_at >= \$drift")
+
+    def test_the_whole_window_needs_no_interval_clause(self):
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.fetch_db("postgres://bob@127.0.0.1/t", "a@b.c", "claude-code", 14)
+        for call in run.call_args_list:
+            self.assertNotIn("created_at >=", call[1]["input"])
+
     def test_the_query_accepts_an_explicit_interval(self):
         import inspect
         sig = inspect.signature(compare.fetch_db)
