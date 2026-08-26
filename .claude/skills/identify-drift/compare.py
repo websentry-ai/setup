@@ -331,27 +331,30 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
     # began. A turn that started before the audit log's first retained entry still
     # writes rows inside the audited interval, and bounding the parent excluded them,
     # so the audit entries for them read as uploads that never arrived.
-    bounds = ["gm.request_initialized_at >= now() - (:'days' || ' days')::interval"]
-    child = []
+    child = ["%s.created_at >= now() - (:'days' || ' days')::interval"]
     if since:
         params["since"] = since
-        child.append("%s.created_at >= :'since'::timestamptz")
+        child = ["%s.created_at >= :'since'::timestamptz"]
     if until:
         params["until"] = until
         child.append("%s.created_at <= :'until'::timestamptz")
 
     def within(alias):
-        """The interval clause for a child table, empty when the whole window is asked
-        for."""
+        """The interval clause for a child table. Every row query is bounded here and
+        nowhere else, because a request that began outside the window still writes rows
+        inside it, and the skew between the two reaches weeks."""
         return "".join("\n          AND " + c % alias for c in child)
-    where = """
+    owned = """
         FROM gateway_metrics gm
         JOIN applications app ON app.id = gm.application_id
         JOIN gateway_users u ON u.id = app.owner_user_id
         WHERE lower(u.email) = lower(:'email')
           AND gm.app_label = :'label'
-          AND %s
-    """ % "\n          AND ".join(bounds)
+    """
+    # Tokens belong to a request, so those are counted by when the request ran.
+    where = owned + ("""      AND gm.request_initialized_at
+                             >= now() - (:'days' || ' days')::interval
+    """)
     # The same trim, collapse and fold _norm applies, then a digest, so the two sides
     # are comparable without carrying the text across. Whole text, no prefix: distinct
     # prompts sharing an opening would otherwise reconcile against each other.
@@ -360,6 +363,7 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
 
     totals = psql(dsn, """
         SELECT count(*) AS metrics_rows,
+               min(gm.request_initialized_at)::text AS first_stored_at,
                coalesce(sum(gm.input_token_size), 0) AS input_tokens,
                coalesce(sum(gm.output_token_size), 0) AS output_tokens
         %s
@@ -370,16 +374,17 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
         FROM prompt_analytics pa
         WHERE pa.thread_id IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
         LIMIT :'cap'
-    """ % (where, within("pa")), params)
+    """ % (owned, within("pa")), params)
 
     tools = psql(dsn, """
         SELECT pa.tool_name, count(*) AS n,
+               count(*) FILTER (WHERE pa.thread_id IS NOT NULL) AS with_thread,
                count(*) FILTER (WHERE pa.parameters ? 'tool_use_id') AS with_id
         FROM prompt_analytics pa
         WHERE pa.tool_name IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
         GROUP BY pa.tool_name
         LIMIT :'cap'
-    """ % (where, within("pa")), params)
+    """ % (owned, within("pa")), params)
 
     call_ids = psql(dsn, """
         SELECT DISTINCT pa.parameters->>'tool_use_id' AS call_id
@@ -387,7 +392,7 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
         WHERE pa.parameters ? 'tool_use_id'
           AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
         LIMIT :'cap'
-    """ % (where, within("pa")), params)
+    """ % (owned, within("pa")), params)
 
     digests = psql(dsn, """
         SELECT role, h, count(*) AS n FROM (
@@ -399,8 +404,8 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
         ) x WHERE h IS NOT NULL
         GROUP BY role, h
         LIMIT :'cap'
-    """ % (norm % "p.prompt->>'user_prompt'", where, within("p"),
-           norm % "p.prompt->>'assistant_prompt'", where, within("p")), params)
+    """ % (norm % "p.prompt->>'user_prompt'", owned, within("p"),
+           norm % "p.prompt->>'assistant_prompt'", owned, within("p")), params)
 
     threads, threads_capped = _capped(threads)
     tools, tools_capped = _capped(tools)
@@ -410,9 +415,13 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
     row = totals[0] if totals else {}
     tool_counts = {r["tool_name"]: int(r["n"]) for r in tools}
     with_id = sum(int(r["with_id"]) for r in tools)
+    with_thread = sum(int(r["with_thread"]) for r in tools)
     stored_calls = sum(tool_counts.values())
     return {
         "metrics_rows": int(row.get("metrics_rows") or 0),
+        # When this tool first uploaded anything for this user. Local activity older
+        # than that ran before the integration existed, so it cannot have been lost.
+        "first_stored_at": row.get("first_stored_at"),
         "input_tokens": int(row.get("input_tokens") or 0),
         "output_tokens": int(row.get("output_tokens") or 0),
         "threads": {r["thread_id"] for r in threads},
@@ -422,6 +431,11 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
         # this the rows predate the id being recorded and only counts are available.
         "ids_are_representative": bool(stored_calls) and with_id >= stored_calls * ID_COVERAGE,
         "rows_with_call_id": with_id,
+        # Whether stored rows name their session often enough to decide what is in
+        # scope. Most do not for some tools, and scoping on a sparse set would put a
+        # tracked session out of scope and hide real loss.
+        "threads_are_representative": bool(stored_calls)
+                                      and with_thread >= stored_calls * ID_COVERAGE,
         "user_digests": Counter({r["h"]: int(r["n"]) for r in digests
                                  if r["role"] == "user"}),
         "assistant_digests": Counter({r["h"]: int(r["n"]) for r in digests
@@ -547,25 +561,76 @@ def compare(tool, local, db, days, db_audit=None):
                    "filed under. Confirm both before reading this as data loss.",
         }]
 
-    # ---- sessions ------------------------------------------------------
+    # ---- scope: only the sessions the database knows about --------------
+    # A tool runs whether or not anybody installed the integration, so a machine can
+    # hold months of transcripts the gateway was never told about. Comparing those
+    # would report every prompt in them as lost. The database decides what is in
+    # scope; a session it has never heard of is either uninstrumented or a total
+    # upload failure, and the audit log below says which.
+    audited_sessions = {r.get("session") for r in local["audit"] if r.get("session")}
+    # Only when the stored rows name their sessions. Below that the set is a sample,
+    # and excluding everything outside a sample would hide loss rather than reveal it.
+    in_scope = set(db["threads"]) if db.get("threads_are_representative") else set()
     local_sessions = set(local["sessions_transcript"]) | set(local["sessions_audit"])
+    # Only meaningful when scoping is available. With an empty scope every session
+    # looks unknown, which would report all of them as lost.
+    unknown = {s for s in local_sessions
+               if s and s not in in_scope} if in_scope else set()
+    never_instrumented = unknown - audited_sessions
+
+    if in_scope:
+        # Records belonging to a session the database never saw cannot say anything
+        # about drift, so they do not reach the comparisons below.
+        for kind in by_kind:
+            by_kind[kind] = [r for r in by_kind[kind]
+                             if not r.get("session") or r["session"] in in_scope]
+
+    # A floor for the tools whose stored rows do not name their session often enough
+    # to scope by it. Nothing this tool ever uploaded for this user predates the first
+    # stored row, so local activity older than that ran before the hook existed.
+    floor = _parse(db.get("first_stored_at")) if not in_scope else None
+    if floor:
+        before = sum(1 for records in by_kind.values() for r in records
+                     if _parse(r.get("at")) and _parse(r["at"]) < floor)
+        if before:
+            for kind in by_kind:
+                by_kind[kind] = [r for r in by_kind[kind]
+                                 if not _parse(r.get("at")) or _parse(r["at"]) >= floor]
+            findings.append({
+                "title": "Local activity predates anything this tool ever uploaded",
+                "where": "%s transcripts" % tool,
+                "evidence": "%d record(s) older than the first stored row, %s"
+                            % (before, db["first_stored_at"][:19]),
+                "why": "The tool ran before the hook was installed, so there is nothing "
+                       "to compare. They are excluded rather than counted as loss.",
+            })
+
+    if never_instrumented:
+        findings.append({
+            "title": "Some local sessions were never instrumented",
+            "where": "%s transcripts" % tool,
+            "evidence": "%d of %d local session(s) have neither a stored row nor an "
+                        "audit entry" % (len(never_instrumented), len(local_sessions)),
+            "why": "The tool ran without the hook installed, so there is nothing to "
+                   "compare. They are excluded from everything below rather than "
+                   "counted as loss.",
+        })
+
+    lost_wholesale = sorted(unknown & audited_sessions)
+    if lost_wholesale:
+        findings.append({
+            "title": "The hook logged sessions the database has no record of",
+            "where": "%s -> prompt_analytics.thread_id" % local["audit_log"],
+            "evidence": "%d session(s), first %s"
+                        % (len(lost_wholesale), _ident(lost_wholesale[0])),
+            "why": "The hook ran for these and not one row arrived, so the whole "
+                   "session was lost on the way up rather than part of it.",
+        })
+
+    # ---- sessions ------------------------------------------------------
     if "sessions" in db["truncated"] and local_sessions:
         findings.append(_cannot_check("Sessions", "%s -> prompt_analytics.thread_id"
                                       % tool, "sessions"))
-        missing_sessions = []
-    else:
-        missing_sessions = sorted(s for s in local_sessions
-                                  if s and s not in db["threads"])
-    if missing_sessions and db["threads"]:
-        findings.append({
-            "title": "Sessions present locally are absent from the database",
-            "where": "%s -> prompt_analytics.thread_id" % tool,
-            "evidence": "%d of %d local sessions have no row. First: %s"
-                        % (len(missing_sessions), len(local_sessions),
-                           ", ".join(_ident(s) for s in missing_sessions[:3])),
-            "why": "Either the hook never fired for these sessions, or every upload "
-                   "for them failed. Check the audit log for one of the ids.",
-        })
 
     # ---- prompts -------------------------------------------------------
     prompts_capped = "prompts" in db["truncated"]

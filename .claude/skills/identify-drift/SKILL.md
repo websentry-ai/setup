@@ -183,6 +183,21 @@ Direction tells you where to look:
 | in audit log, not in the database | the upload lost it, ingest or network |
 | in the database, not locally | duplicate, or attributed to the wrong user |
 
+**The database decides what is in scope.** A tool runs whether or not anyone
+installed the integration, so a machine can hold months of transcripts the gateway was
+never told about. Comparing those would report every prompt in them as lost.
+
+Where the stored rows name their sessions, sessions the database has never heard of
+are excluded from every comparison. The audit log separates the two reasons: a session
+with audit entries and no stored rows lost everything on the way up and is reported;
+a session with neither was never instrumented and is not.
+
+Most stored rows carry no `thread_id` for some tools, so that scoping is not always
+available. When it is not, the first stored row for the tool is the floor instead:
+nothing older than it was ever uploaded, so local activity older than it cannot have
+been lost. Either way the report says how much was excluded and why, rather than
+quietly dropping it.
+
 Some findings are structural, not faults. Expect them, say so once, and do not
 investigate them:
 
@@ -193,6 +208,8 @@ investigate them:
 | augment: no transcript to compare | it keeps none, so only the upload direction is checkable |
 | any tool: could not be checked for this window | an aggregate hit the row cap. Re-run over fewer days |
 | any tool: audit log is full | it holds a hundred entries, so absence from it is not evidence |
+| any tool: sessions were never instrumented | the tool ran before the hook was installed. Not a loss |
+| any tool: activity predates the first upload | same, for tools whose rows do not name their session |
 
 A token difference under 5% is not reported. Above it, the usual cause is work billed
 to no turn: subagent messages outside the turn window, or turns that never uploaded.

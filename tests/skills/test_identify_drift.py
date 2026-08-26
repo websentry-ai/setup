@@ -60,7 +60,8 @@ MATCHED_TRANSCRIPT = [
 def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
        tool_counts=None, user_texts=("hello there",), assistant_texts=("hi back",),
        call_ids=("c1",), ids_are_representative=True, truncated=(),
-       rows_with_call_id=None):
+       rows_with_call_id=None, threads_are_representative=True,
+       first_stored_at=None):
     """The aggregated shape fetch_db returns. Everything is a count, a sum, a digest or
     an id, because selecting the rows themselves does not fit in memory. Prompts are a
     multiset so a repeated prompt stored once still reads as a loss."""
@@ -74,6 +75,8 @@ def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
         "ids_are_representative": ids_are_representative,
         "rows_with_call_id": (len(call_ids) if rows_with_call_id is None
                               else rows_with_call_id),
+        "threads_are_representative": threads_are_representative,
+        "first_stored_at": first_stored_at,
         "user_digests": Counter(compare._digest(t) for t in user_texts),
         "assistant_digests": Counter(compare._digest(t) for t in assistant_texts),
         "truncated": list(truncated),
@@ -126,12 +129,56 @@ class TestRealGapsAreFound(unittest.TestCase):
         got = titles(compare.compare("claude-code", local(t), MATCHED_DB, 3))
         self.assertIn("Tool calls made locally are absent from the database", got)
 
-    def test_a_session_absent_from_the_database(self):
+    def test_a_session_the_hook_logged_but_nothing_reached(self):
+        """A session the hook saw and the database has no row for lost every one of
+        its turns, which is worse than losing some of them."""
         t = MATCHED_TRANSCRIPT + [rec("tool_call", session="S2", tool="Bash", call_id="c3")]
+        a = MATCHING_AUDIT + [rec("tool_call", session="S2", tool="Bash", call_id="c3")]
+        got = titles(compare.compare("claude-code",
+                                     local(t, a, sessions_transcript=["S1", "S2"],
+                                           sessions_audit=["S1", "S2"]),
+                                     MATCHED_DB, 3))
+        self.assertIn("The hook logged sessions the database has no record of", got)
+
+    def test_activity_predating_the_first_upload_is_not_a_loss(self):
+        """Most stored rows carry no thread_id for some tools, so scoping by session
+        is unavailable there. The first stored row is the floor instead: nothing older
+        than it was ever uploaded, so it cannot have been lost."""
+        old = [rec("user_prompt", at="2026-01-01T00:00:00+00:00", text="p%d" % i)
+               for i in range(50)]
+        d = db(metrics_rows=500, threads_are_representative=False, threads=(),
+               user_texts=(), first_stored_at="2026-08-01 00:00:00+00")
+        got = titles(compare.compare("claude-code", local(old), d, 14))
+        self.assertIn("Local activity predates anything this tool ever uploaded", got)
+        self.assertNotIn("User prompts recorded locally are absent from the database",
+                         got)
+
+    def test_activity_after_the_first_upload_still_counts(self):
+        recent = [rec("user_prompt", text="never sent")]
+        d = db(metrics_rows=500, threads_are_representative=False, threads=(),
+               user_texts=(), first_stored_at="2026-08-01 00:00:00+00")
+        got = titles(compare.compare("claude-code", local(recent), d, 14))
+        self.assertIn("User prompts recorded locally are absent from the database", got)
+
+    def test_no_scoping_finding_when_scoping_is_unavailable(self):
+        """An empty scope must not make every session look unknown."""
+        got = titles(compare.compare("claude-code",
+                                     local(MATCHED_TRANSCRIPT, MATCHING_AUDIT),
+                                     db(threads_are_representative=False, threads=()),
+                                     3))
+        self.assertNotIn("The hook logged sessions the database has no record of", got)
+        self.assertNotIn("Some local sessions were never instrumented", got)
+
+    def test_a_session_nobody_instrumented_is_not_a_loss(self):
+        """A tool runs whether or not the integration was installed, so a machine can
+        hold months of transcripts the gateway was never told about."""
+        t = MATCHED_TRANSCRIPT + [rec("user_prompt", session="S2", text="never sent")]
         got = titles(compare.compare("claude-code",
                                      local(t, sessions_transcript=["S1", "S2"]),
                                      MATCHED_DB, 3))
-        self.assertIn("Sessions present locally are absent from the database", got)
+        self.assertIn("Some local sessions were never instrumented", got)
+        self.assertNotIn("User prompts recorded locally are absent from the database",
+                         got)
 
 
 class TestTheLossIsLocalised(unittest.TestCase):
@@ -333,7 +380,7 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
         a = [rec("user_prompt", text=secret + " three"),
              rec("tool_call", tool="Bash", call_id=secret + "-audit")]
         loc = local(t, a, sessions_transcript=[secret + "-session"])
-        empty = db(threads=("somewhere-else",), tool_counts={}, call_ids=(),
+        empty = db(threads=("S1",), tool_counts={}, call_ids=(),
                    user_texts=(), assistant_texts=(), rows_with_call_id=10)
         try:
             compare.REDACT = True
@@ -352,7 +399,7 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
              rec("tool_call", tool="Bash", call_id=secret + "-call"),
              rec("usage", input=100, output=50)]
         loc = local(t, sessions_transcript=[secret + "-session"])
-        empty = db(threads=("somewhere-else",), tool_counts={}, call_ids=(),
+        empty = db(threads=("S1",), tool_counts={}, call_ids=(),
                    user_texts=(), assistant_texts=(), rows_with_call_id=10)
         found = compare.compare("claude-code", loc, empty, 14, empty)
         self.assertIn(secret, _json.dumps(found))
@@ -815,7 +862,7 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
         self.assertNotIn("Prompts could not be checked for this window", got)
 
     def test_an_uncapped_full_window_still_reports_the_real_losses(self):
-        empty = db(threads=("elsewhere",), tool_counts={}, call_ids=(), user_texts=(),
+        empty = db(threads=("S1",), tool_counts={}, call_ids=(), user_texts=(),
                    assistant_texts=(), ids_are_representative=False)
         got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
                                      empty, 14))
@@ -840,14 +887,32 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
             self.assertRegex(statement, r"(pa|p)\.created_at >=")
             self.assertNotRegex(statement, r"request_initialized_at >= \$drift")
 
-    def test_the_whole_window_needs_no_interval_clause(self):
+    def test_the_whole_window_is_bounded_by_row_time_too(self):
+        """The requested window has the same skew problem as the audit one: a request
+        that began before it still writes rows inside it."""
         import subprocess
         done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
         with unittest.mock.patch("subprocess.run", return_value=done) as run:
             with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
                 compare.fetch_db("postgres://bob@127.0.0.1/t", "a@b.c", "claude-code", 14)
-        for call in run.call_args_list:
-            self.assertNotIn("created_at >=", call[1]["input"])
+        rows = [c[1]["input"] for c in run.call_args_list
+                if "prompt_analytics" in c[1]["input"] or "prompts p" in c[1]["input"]]
+        self.assertTrue(rows)
+        for statement in rows:
+            self.assertRegex(statement, r"(pa|p)\.created_at >= now\(\)")
+            self.assertNotIn("request_initialized_at", statement)
+
+    def test_tokens_are_still_counted_by_when_the_request_ran(self):
+        """A token belongs to a request, so that one is bounded by request time."""
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.fetch_db("postgres://bob@127.0.0.1/t", "a@b.c", "claude-code", 14)
+        totals = [c[1]["input"] for c in run.call_args_list
+                  if "input_token_size" in c[1]["input"]]
+        self.assertTrue(totals)
+        self.assertIn("request_initialized_at", totals[0])
 
     def test_the_query_accepts_an_explicit_interval(self):
         import inspect
@@ -1476,7 +1541,7 @@ class TestEveryFindingCanBeRendered(unittest.TestCase):
             loc = local(t, a, audit_log_present=present,
                         audit_entries=100 if saturated else 5)
             yield loc, db(metrics_rows=50, input_tokens=999999, output_tokens=1,
-                          threads=("somewhere-else",), tool_counts={"Write": 3},
+                          threads=("S1",), tool_counts={"Write": 3},
                           call_ids=("zzz",), ids_are_representative=ids,
                           user_texts=(), assistant_texts=(), truncated=trunc)
 
