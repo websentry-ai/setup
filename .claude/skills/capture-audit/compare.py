@@ -16,9 +16,12 @@ is not evidence of anything.
 import argparse
 import json
 import os
+import hashlib
+import os
 import subprocess
 import sys
 from datetime import datetime
+from urllib.parse import unquote, urlsplit
 from collections import Counter, defaultdict
 
 # The database's own name for each tool, and the label the hook stamps on a payload.
@@ -26,16 +29,60 @@ APP_LABEL = {"claude-code": "claude-code", "cursor": "cursor", "copilot": "copil
              "codex": "codex", "augment": "augment_code"}
 
 
-def psql(dsn, sql):
+def _connection_env(dsn):
+    """Split a DSN into libpq environment variables.
+
+    A connection string passed as an argument is readable by every account on the
+    machine through the process list, so a password in one leaks the moment a query
+    runs. The environment is not world-readable, so the parts travel there instead
+    and psql is invoked with no connection details in its arguments at all.
+    """
+    parts = urlsplit(dsn)
+    if parts.scheme not in ("postgres", "postgresql"):
+        sys.exit("dsn must be a postgres:// or postgresql:// URL")
+    env = dict(os.environ)
+    env.pop("PGPASSWORD", None)
+    if parts.hostname:
+        env["PGHOST"] = parts.hostname
+    if parts.port:
+        env["PGPORT"] = str(parts.port)
+    if parts.username:
+        env["PGUSER"] = unquote(parts.username)
+    if parts.password:
+        env["PGPASSWORD"] = unquote(parts.password)
+    database = parts.path.lstrip("/")
+    if database:
+        env["PGDATABASE"] = database
+    return env
+
+
+def _scrub(text, dsn):
+    """Never echo the connection back: psql quotes it in several of its errors."""
+    out = (text or "").replace(dsn, "<dsn>")
+    parts = urlsplit(dsn)
+    if parts.password:
+        out = out.replace(unquote(parts.password), "<redacted>")
+    return out
+
+
+def psql(dsn, sql, params=None):
     """One query, JSON out. Read-only by construction: the role this connects with
-    has no write grant, so a mistake here cannot change anything."""
-    result = subprocess.run(
-        ["psql", dsn, "-At", "-c",
-         "SELECT coalesce(json_agg(t), '[]') FROM (%s) t" % sql.rstrip().rstrip(";")],
-        capture_output=True, text=True, timeout=180,
-    )
+    has no write grant, so a mistake here cannot change anything.
+
+    Values are bound through psql variables and referenced as :'name', which applies
+    literal quoting on psql's side. Nothing the caller supplies is pasted into SQL.
+    """
+    command = ["psql", "-At", "-v", "ON_ERROR_STOP=1"]
+    for name, value in (params or {}).items():
+        command += ["-v", "%s=%s" % (name, value)]
+    # Fed on stdin, not through -c: psql only expands :'name' in what it reads as
+    # input, so -c would send the placeholder to the server verbatim.
+    statement = ("SELECT coalesce(json_agg(t), '[]') FROM (%s) t;"
+                 % sql.rstrip().rstrip(";"))
+    result = subprocess.run(command, input=statement, capture_output=True, text=True,
+                            timeout=180, env=_connection_env(dsn))
     if result.returncode != 0:
-        sys.exit("psql failed: %s" % result.stderr.strip()[:500])
+        sys.exit("psql failed: %s" % _scrub(result.stderr, dsn).strip()[:500])
     return json.loads(result.stdout.strip() or "[]")
 
 
@@ -45,20 +92,22 @@ def fetch_db(dsn, email, app_label, days):
     The join is email -> application -> gateway_metrics; prompt and prompt_analytics
     hang off the metrics row by request_id.
     """
+    # No caller value is pasted into the SQL: psql binds and quotes each one.
+    params = {"email": email, "label": app_label, "days": int(days)}
     common = """
         FROM gateway_metrics gm
         JOIN applications app ON app.id = gm.application_id
         JOIN gateway_users u ON u.id = app.owner_user_id
-        WHERE lower(u.email) = lower('%s')
-          AND gm.app_label = '%s'
-          AND gm.request_initialized_at >= now() - interval '%d days'
-    """ % (email.replace("'", "''"), app_label, days)
+        WHERE lower(u.email) = lower(:'email')
+          AND gm.app_label = :'label'
+          AND gm.request_initialized_at >= now() - (:'days' || ' days')::interval
+    """
 
     metrics = psql(dsn, """
         SELECT gm.request_id, gm.input_token_size, gm.output_token_size,
                gm.cache_read_token_size, gm.status_code, gm.request_initialized_at
         %s
-    """ % common)
+    """ % common, params)
 
     prompts = psql(dsn, """
         SELECT p.request_id, p.prompt, p.created_at
@@ -66,7 +115,7 @@ def fetch_db(dsn, email, app_label, days):
         WHERE p.gateway_metrics_id IN (
             SELECT gm.id %s
         )
-    """ % common)
+    """ % common, params)
 
     tools = psql(dsn, """
         SELECT pa.tool_name, pa.thread_id, pa.parameters, pa.created_at
@@ -74,7 +123,7 @@ def fetch_db(dsn, email, app_label, days):
         WHERE pa.gateway_metrics_id IN (
             SELECT gm.id %s
         )
-    """ % common)
+    """ % common, params)
     return {"metrics": metrics, "prompts": prompts, "tool_calls": tools}
 
 
@@ -86,6 +135,18 @@ def _parse(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+REDACT = False
+
+
+def _excerpt(text):
+    """What a finding shows of a prompt. Enough to find it again, and on production
+    that is somebody's data, so --redact replaces it with a digest instead."""
+    if REDACT:
+        return "sha256:%s (%d chars)" % (
+            hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12], len(text or ""))
+    return repr((text or "")[:60])
 
 
 def _norm(text):
@@ -185,8 +246,8 @@ def compare(tool, local, db, days):
                 "title": "%s recorded locally are absent from the database"
                          % label.capitalize(),
                 "where": "%s transcripts -> prompts.prompt" % tool,
-                "evidence": "%d of %d missing. First: %r"
-                            % (len(missing), len(local_texts), missing[0][:90]),
+                "evidence": "%d of %d missing. First: %s"
+                            % (len(missing), len(local_texts), _excerpt(missing[0])),
                 "why": "The hook either did not capture these, or captured them into a "
                        "turn that was never uploaded.",
             })
@@ -282,7 +343,12 @@ def main():
     ap.add_argument("--dsn", required=True)
     ap.add_argument("--email", required=True)
     ap.add_argument("--environment", required=True)
+    ap.add_argument("--redact", action="store_true",
+                    help="show a digest instead of prompt text; use on production")
     args = ap.parse_args()
+
+    global REDACT
+    REDACT = args.redact or args.environment.lower() == "production"
 
     local_all = json.load(sys.stdin if args.local == "-" else open(args.local))
     days = local_all["days"]

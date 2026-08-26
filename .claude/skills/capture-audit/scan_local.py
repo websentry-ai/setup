@@ -266,6 +266,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tools", required=True, help="comma separated: %s" % ",".join(TOOLS))
     ap.add_argument("--days", type=int, required=True)
+    ap.add_argument("--out", help="write here with owner-only permissions instead of "
+                                  "stdout; the output quotes transcripts verbatim")
     args = ap.parse_args()
 
     if not 1 <= args.days <= 14:
@@ -296,7 +298,15 @@ def main():
             "sessions_transcript": sorted({r["session"] for r in transcript if r["session"]}),
             "sessions_audit": sorted({r["session"] for r in audit if r["session"]}),
         }
-    json.dump(out, sys.stdout, indent=2)
+    if args.out:
+        # Every prompt and reply the window covers ends up in here. A shell redirect
+        # would create it with the default umask, which on a shared machine is
+        # world-readable, so the file is opened with owner-only permissions instead.
+        fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(out, handle, indent=2)
+    else:
+        json.dump(out, sys.stdout, indent=2)
 
 
 if __name__ == "__main__":

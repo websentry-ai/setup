@@ -7,6 +7,7 @@ log's hundred-entry cap is not.
 
 import json
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 
 from tests.conftest import load_module
@@ -184,6 +185,60 @@ class TestNoiseIsSuppressedWithoutHidingRealLoss(unittest.TestCase):
         got = titles(compare.compare(
             "claude-code", local(t, audit_entries=12, audit_limit=100), MATCHED_DB, 3))
         self.assertIn("The hook never saw some tool calls it should have", got)
+
+
+class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
+    """This reads every prompt a user typed and can be pointed at production."""
+
+    def test_the_connection_never_reaches_the_process_list(self):
+        """A DSN passed as an argument is readable by every account on the machine."""
+        env = compare._connection_env("postgres://bob:hunter2@db.example:6000/things")
+        self.assertEqual(env["PGPASSWORD"], "hunter2")
+        self.assertEqual(env["PGUSER"], "bob")
+        self.assertEqual(env["PGHOST"], "db.example")
+        self.assertEqual(env["PGPORT"], "6000")
+        self.assertEqual(env["PGDATABASE"], "things")
+
+    def test_a_stale_password_in_the_environment_is_dropped(self):
+        with unittest.mock.patch.dict("os.environ", {"PGPASSWORD": "leftover"}):
+            env = compare._connection_env("postgres://bob@db.example/things")
+        self.assertNotIn("PGPASSWORD", env)
+
+    def test_errors_never_echo_the_connection_back(self):
+        dsn = "postgres://bob:hunter2@db.example/things"
+        scrubbed = compare._scrub("could not connect to %s: hunter2 rejected" % dsn, dsn)
+        self.assertNotIn("hunter2", scrubbed)
+        self.assertNotIn("db.example", scrubbed)
+
+    def test_a_non_postgres_dsn_is_refused(self):
+        with self.assertRaises(SystemExit):
+            compare._connection_env("file:///etc/passwd")
+
+    def test_production_shows_a_digest_instead_of_the_prompt(self):
+        try:
+            compare.REDACT = True
+            shown = compare._excerpt("something a customer typed")
+            self.assertNotIn("customer", shown)
+            self.assertTrue(shown.startswith("sha256:"))
+        finally:
+            compare.REDACT = False
+
+    def test_elsewhere_it_shows_enough_to_find_the_prompt(self):
+        self.assertIn("customer", compare._excerpt("something a customer typed"))
+
+    def test_the_scan_file_is_owner_only(self):
+        """It holds every prompt in the window; a shell redirect would use the umask."""
+        import subprocess, sys, tempfile, os, stat
+        from pathlib import Path
+        from tests.conftest import REPO
+        out = Path(tempfile.mkdtemp()) / "local.json"
+        subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/capture-audit/scan_local.py"),
+             "--tools", "claude-code", "--days", "1", "--out", str(out)],
+            capture_output=True, text=True, timeout=300, check=True)
+        mode = os.stat(out).st_mode
+        self.assertFalse(mode & stat.S_IROTH, "world-readable")
+        self.assertFalse(mode & stat.S_IRGRP, "group-readable")
 
 
 class TestTheScannerReadsEveryFormat(unittest.TestCase):

@@ -55,12 +55,24 @@ few characters a finding needs to be actionable.
 ## 3. Run the scan
 
 ```bash
-python3 .claude/skills/capture-audit/scan_local.py --tools <tools> --days <n> > /tmp/local.json
+WORK=$(mktemp -d)                       # not /tmp directly: the scan quotes transcripts
+trap 'rm -rf "$WORK"' EXIT              # and there is no reason to leave them behind
+
+python3 .claude/skills/capture-audit/scan_local.py \
+  --tools <tools> --days <n> --out "$WORK/local.json"
+
 python3 .claude/skills/capture-audit/compare.py \
-  --local /tmp/local.json --dsn "${CAPTURE_AUDIT_DSN:?set it or pass --dsn}" \
+  --local "$WORK/local.json" --dsn "${CAPTURE_AUDIT_DSN:?set it or pass --dsn}" \
   --email "<email>" --environment "<env>" \
-  > /tmp/drift.json
+  > "$WORK/report.json"
 ```
+
+`--out` creates the scan file owner-only. It holds every prompt and reply in the
+window, so do not redirect it into a shared directory and do not keep it after the
+report is written.
+
+On production the report shows a digest instead of prompt text. `--redact` forces the
+same on any environment.
 
 `scan_local.py` reads each tool's transcripts and our audit log. `compare.py` queries
 the database and diffs the three.
