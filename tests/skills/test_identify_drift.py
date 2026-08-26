@@ -1464,6 +1464,31 @@ class TestTheOutputCannotBeSiphoned(unittest.TestCase):
                  "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1:5432/d"})
         self.assertNotEqual(r.returncode, 0)
 
+    def test_a_pipe_among_the_transcripts_is_skipped(self):
+        """Reading one waits for a writer that never comes, so the scan would hang
+        instead of finishing. The real file beside it must still be read."""
+        import json as _json, os as _os, subprocess, sys, tempfile
+        from datetime import datetime, timezone
+        from pathlib import Path
+        from tests.conftest import REPO
+        home = Path(tempfile.mkdtemp())
+        project = home / ".claude/projects/p"
+        project.mkdir(parents=True)
+        _os.mkfifo(project / "hang.jsonl")
+        (project / "good.jsonl").write_text(_json.dumps({
+            "type": "user",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "message": {"content": [{"type": "text", "text": "real prompt"}]}}) + "\n")
+        env = dict(_os.environ)
+        env["HOME"] = str(home)
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
+             "--tools", "claude-code", "--days", "1"],
+            capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        records = _json.loads(r.stdout)["tools"]["claude-code"]["transcript"]
+        self.assertEqual([x.get("text") for x in records], ["real prompt"])
+
     def test_a_pipe_with_no_reader_fails_rather_than_waiting(self):
         """Opening one for writing otherwise blocks until somebody reads, which would
         hang the run instead of ending it."""

@@ -64,9 +64,25 @@ def _ts(value):
 
 
 def _lines(path):
-    """JSONL, tolerant: a half-written last line is normal on a live session."""
+    """JSONL, tolerant: a half-written last line is normal on a live session.
+
+    Only regular files. Reading a pipe left in a transcript directory would wait for
+    a writer that never comes, and the scan would hang rather than finish. Checked on
+    the descriptor so the answer cannot change after the look.
+    """
     try:
-        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return
+    except OSError:
+        os.close(fd)
+        return
+    try:
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 line = line.strip()
                 if not line:
