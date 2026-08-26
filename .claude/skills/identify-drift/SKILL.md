@@ -75,15 +75,18 @@ export IDENTIFY_DRIFT_DSN="<passwordless dsn>"      # never on the command line:
 python3 .claude/skills/identify-drift/compare.py \
   --local "$WORK/local.json" \
   --email "<email>" --environment "<env>" \
-  > "$WORK/report.json"
+  --out "$WORK/report.json"                        # not a shell redirect: that
+                                                   # would use the umask
 ```
 
-`--out` creates the scan file owner-only. It holds every prompt and reply in the
-window, so do not redirect it into a shared directory and do not keep it after the
-report is written.
+`--out` creates both files owner-only, and refuses a symlink at the destination. The
+scan holds every prompt and reply in the window and the report quotes excerpts from
+it, so do not put either in a shared directory and do not keep them after the report
+is read.
 
-On production the report shows a digest instead of prompt text. `--redact` forces the
-same on any environment.
+Only `development` shows prompt text. `staging` and `production` show a digest, and
+`--redact` forces the same anywhere. `--environment` accepts those three spellings
+only, so a typo cannot quietly turn redaction off.
 
 `scan_local.py` reads each tool's transcripts and our audit log. `compare.py` queries
 the database and diffs the three.

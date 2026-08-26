@@ -302,7 +302,13 @@ def main():
         # Every prompt and reply the window covers ends up in here. A shell redirect
         # would create it with the default umask, which on a shared machine is
         # world-readable, so the file is opened with owner-only permissions instead.
-        fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # O_NOFOLLOW: a symlink planted at this path would otherwise redirect the
+        # truncate onto whatever it points at.
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+        try:
+            fd = os.open(args.out, flags, 0o600)
+        except OSError as error:
+            sys.exit("cannot write %s: %s" % (args.out, error.strerror))
         # The mode argument only applies when the file is created, so an existing
         # destination would keep whatever permissions it already had.
         os.fchmod(fd, 0o600)

@@ -17,15 +17,35 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 from datetime import datetime
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 from collections import Counter, defaultdict
 
 # The database's own name for each tool, and the label the hook stamps on a payload.
 APP_LABEL = {"claude-code": "claude-code", "cursor": "cursor", "copilot": "copilot",
              "codex": "codex", "augment": "augment_code"}
+
+
+# Long enough for a fourteen-day window on a busy account, short enough that a
+# pathological one fails with an answer instead of hanging.
+STATEMENT_TIMEOUT_MS = 120000
+
+# The connection options a DSN may carry, and the libpq variable each becomes.
+# Anything outside this map is refused rather than dropped, so a TLS setting cannot
+# go missing without the operator hearing about it. "password" is absent on purpose.
+LIBPQ_OPTIONS = {
+    "sslmode": "PGSSLMODE", "sslrootcert": "PGSSLROOTCERT", "sslcert": "PGSSLCERT",
+    "sslkey": "PGSSLKEY", "sslcrl": "PGSSLCRL", "passfile": "PGPASSFILE",
+    "connect_timeout": "PGCONNECT_TIMEOUT", "application_name": "PGAPPNAME",
+}
+
+LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", None, ""}
+
+# The libpq modes that permit a plaintext or unauthenticated session.
+UNENCRYPTED_SSLMODES = {"disable", "allow", "prefer"}
 
 
 def _connection_env(dsn):
@@ -39,15 +59,24 @@ def _connection_env(dsn):
     parts = urlsplit(dsn)
     if parts.scheme not in ("postgres", "postgresql"):
         sys.exit("dsn must be a postgres:// or postgresql:// URL")
-    if parts.password:
+    options = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if parts.password or "password" in options:
         # No route into this tool carries a password, including the environment. The
         # command that would set one is itself captured by the hooks this compares,
         # so the secret would land in the transcripts, the audit log and the stored
         # prompts. libpq reads a password file that stays out of both.
         sys.exit("the dsn carries a password: remove it and let libpq read one from "
                  "PGPASSFILE or ~/.pgpass, which this never sees")
+    unknown = sorted(set(options) - set(LIBPQ_OPTIONS))
+    if unknown:
+        # Silently dropping a connection option is how a verify-full DSN ends up
+        # negotiating an unverified one.
+        sys.exit("unsupported connection option(s): %s" % ", ".join(unknown))
     env = dict(os.environ)
     env.pop("PGPASSWORD", None)
+    # A read-only report is never worth holding a connection open for minutes. This
+    # is the server-side bound; the subprocess timeout is only the outer backstop.
+    env["PGOPTIONS"] = "-c statement_timeout=%d" % STATEMENT_TIMEOUT_MS
     if parts.hostname:
         env["PGHOST"] = parts.hostname
     if parts.port:
@@ -57,6 +86,20 @@ def _connection_env(dsn):
     database = parts.path.lstrip("/")
     if database:
         env["PGDATABASE"] = database
+    for key, value in options.items():
+        # A path is not a secret, so passfile travels; the password it points at is
+        # read by libpq and never enters this process.
+        env[LIBPQ_OPTIONS[key]] = value
+    if parts.hostname not in LOCAL_HOSTS:
+        # libpq defaults to prefer, which accepts an unverified or plaintext session.
+        # A tunnel terminates on the loopback and is exempt; anything else must
+        # encrypt, whether by omission or by asking for a weaker mode outright.
+        mode = options.get("sslmode", "require")
+        if mode in UNENCRYPTED_SSLMODES:
+            sys.exit("sslmode=%s would send customer data over an unencrypted or "
+                     "unverified connection to %s; use require or stronger"
+                     % (mode, parts.hostname))
+        env["PGSSLMODE"] = mode
     return env
 
 
@@ -69,6 +112,15 @@ def _scrub(text, dsn):
     return out
 
 
+def _psql_binary():
+    """An absolute psql, resolved once. A writable directory earlier on PATH would
+    otherwise receive the connection and every row this reads."""
+    found = shutil.which("psql")
+    if not found or not os.path.isabs(found):
+        sys.exit("psql not found on PATH")
+    return found
+
+
 def psql(dsn, sql, params=None):
     """One query, JSON out. Read-only by construction: the role this connects with
     has no write grant, so a mistake here cannot change anything.
@@ -76,7 +128,7 @@ def psql(dsn, sql, params=None):
     Values are bound through psql variables and referenced as :'name', which applies
     literal quoting on psql's side. Nothing the caller supplies is pasted into SQL.
     """
-    command = ["psql", "-At", "-v", "ON_ERROR_STOP=1"]
+    command = [_psql_binary(), "-At", "-v", "ON_ERROR_STOP=1"]
     for name, value in (params or {}).items():
         command += ["-v", "%s=%s" % (name, value)]
     # Fed on stdin, not through -c: psql only expands :'name' in what it reads as
@@ -88,7 +140,15 @@ def psql(dsn, sql, params=None):
     result = subprocess.run(command, input=statement, capture_output=True, text=True,
                             timeout=180, env=_connection_env(dsn))
     if result.returncode != 0:
-        sys.exit("psql failed: %s" % _scrub(result.stderr, dsn).strip()[:500])
+        error = _scrub(result.stderr, dsn).strip()
+        if "statement timeout" in error.lower():
+            # The row cap bounds what comes back, not what the server does to produce
+            # it: a GROUP BY computes every group before any LIMIT applies. Narrowing
+            # the window is the only thing that shrinks the work.
+            sys.exit("the database gave up on this window after %ds. Re-run over "
+                     "fewer days, or one tool at a time."
+                     % (STATEMENT_TIMEOUT_MS // 1000))
+        sys.exit("psql failed: %s" % error[:500])
     return json.loads(result.stdout.strip() or "[]")
 
 
@@ -98,10 +158,10 @@ def psql(dsn, sql, params=None):
 ROW_CAP = 50000
 
 
-def _capped(rows, what):
+def _capped(rows):
     """Rows plus whether the cap swallowed any. A silent truncation would turn every
     unreturned row into a false 'absent from the database'."""
-    return rows[:ROW_CAP], len(rows) > ROW_CAP, what
+    return rows[:ROW_CAP], len(rows) > ROW_CAP
 
 
 def fetch_db(dsn, email, app_label, days):
@@ -125,9 +185,11 @@ def fetch_db(dsn, email, app_label, days):
           AND gm.app_label = :'label'
           AND gm.request_initialized_at >= now() - (:'days' || ' days')::interval
     """
-    # The same trim, collapse, truncate and fold _norm applies, then a digest, so the
-    # two sides are comparable without carrying the text across.
-    norm = ("md5(left(lower(btrim(regexp_replace(%s, '\s+', ' ', 'g'))), 200))")
+    # The same trim, collapse and fold _norm applies, then a digest, so the two sides
+    # are comparable without carrying the text across. Whole text, no prefix: distinct
+    # prompts sharing an opening would otherwise reconcile against each other.
+    norm = (r"encode(sha256(convert_to("
+            r"lower(btrim(regexp_replace(%s, '\s+', ' ', 'g'))), 'UTF8')), 'hex')")
 
     totals = psql(dsn, """
         SELECT count(*) AS metrics_rows,
@@ -173,9 +235,10 @@ def fetch_db(dsn, email, app_label, days):
     """ % (norm % "p.prompt->>'user_prompt'", where,
            norm % "p.prompt->>'assistant_prompt'", where), params)
 
-    threads, threads_capped, _ = _capped(threads, "sessions")
-    call_ids, ids_capped, _ = _capped(call_ids, "tool call ids")
-    digests, digests_capped, _ = _capped(digests, "prompts")
+    threads, threads_capped = _capped(threads)
+    tools, tools_capped = _capped(tools)
+    call_ids, ids_capped = _capped(call_ids)
+    digests, digests_capped = _capped(digests)
 
     row = totals[0] if totals else {}
     tool_counts = {r["tool_name"]: int(r["n"]) for r in tools}
@@ -191,13 +254,15 @@ def fetch_db(dsn, email, app_label, days):
         # Whether ids cover enough of the stored rows to reconcile by identity. Below
         # this the rows predate the id being recorded and only counts are available.
         "ids_are_representative": bool(stored_calls) and with_id >= stored_calls * 0.9,
+        "rows_with_call_id": with_id,
         "user_digests": Counter({r["h"]: int(r["n"]) for r in digests
                                  if r["role"] == "user"}),
         "assistant_digests": Counter({r["h"]: int(r["n"]) for r in digests
                                       if r["role"] == "assistant"}),
         "truncated": [what for flag, what in
-                      ((threads_capped, "sessions"), (ids_capped, "tool call ids"),
-                       (digests_capped, "prompts")) if flag],
+                      ((threads_capped, "sessions"), (tools_capped, "tool names"),
+                       (ids_capped, "tool call ids"), (digests_capped, "prompts"))
+                      if flag],
     }
 
 
@@ -226,12 +291,14 @@ def _excerpt(text):
 def _digest(text):
     """The same value the query computes, so the two sides compare without the text
     ever leaving the database."""
-    return hashlib.md5(_norm(text).encode("utf-8")).hexdigest()
+    return hashlib.sha256(_norm(text).encode("utf-8")).hexdigest()
 
 
 def _norm(text):
-    """Compare prompts on their shape, not their bytes: the gateway may redact or clip."""
-    return " ".join((text or "").split())[:200].lower()
+    """Compare prompts on their shape, not their bytes: the gateway may redact or clip.
+    Whitespace and case only. Truncating here would make two prompts sharing a prefix
+    interchangeable, which is a real collision in stored data, not a hypothetical."""
+    return " ".join((text or "").split()).lower()
 
 
 def compare(tool, local, db, days):
@@ -337,6 +404,18 @@ def compare(tool, local, db, days):
                        "handle.",
             })
     else:
+        if local_tools and db["metrics_rows"]:
+            # Otherwise an all-clear here would read as "every call is accounted for",
+            # when counting cannot tell one call from another of the same name.
+            findings.append({
+                "title": "Tool calls could only be reconciled by count",
+                "where": "%s -> prompt_analytics.parameters->>'tool_use_id'" % tool,
+                "evidence": "%d of %d stored row(s) carry a tool_use_id"
+                            % (db["rows_with_call_id"], sum(db["tool_counts"].values())),
+                "why": "A lost call is invisible here whenever another call of the same "
+                       "name was stored in its place. Findings below are counts, and a "
+                       "clean result is not proof that every call arrived.",
+            })
         short = {name: local_tools[name] - db["tool_counts"].get(name, 0)
                  for name in local_tools
                  if local_tools[name] > db["tool_counts"].get(name, 0)}
@@ -481,7 +560,10 @@ def main():
                                   "to every account on the machine through ps. No "
                                   "password in either; libpq reads one from PGPASSFILE")
     ap.add_argument("--email", required=True)
-    ap.add_argument("--environment", required=True)
+    ap.add_argument("--environment", required=True,
+                    choices=("development", "staging", "production"))
+    ap.add_argument("--out", help="write the report here, owner-only. A shell "
+                                  "redirect would use the umask instead")
     ap.add_argument("--redact", action="store_true",
                     help="show a digest instead of prompt text; use on production")
     args = ap.parse_args()
@@ -495,7 +577,9 @@ def main():
     _connection_env(dsn)
 
     global REDACT
-    REDACT = args.redact or args.environment.lower() == "production"
+    # Staging carries customer data too, so development is the only environment that
+    # shows prompt text and a mistyped one cannot silently opt out of redaction.
+    REDACT = args.redact or args.environment != "development"
 
     local_all = json.load(sys.stdin if args.local == "-" else open(args.local))
     days = local_all["days"]
@@ -531,7 +615,20 @@ def main():
                 "truncated": db["truncated"],
             },
         }
-    json.dump(report, sys.stdout, indent=2)
+    if args.out:
+        # Same handling as the scan file: findings quote prompt excerpts, session ids
+        # and tool names, and O_NOFOLLOW keeps a planted symlink from redirecting the
+        # truncate onto another file.
+        try:
+            fd = os.open(args.out,
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        except OSError as error:
+            sys.exit("cannot write %s: %s" % (args.out, error.strerror))
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=2)
+    else:
+        json.dump(report, sys.stdout, indent=2)
 
 
 if __name__ == "__main__":

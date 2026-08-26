@@ -6,6 +6,7 @@ log's hundred-entry cap is not.
 """
 
 import json
+import os
 import unittest
 from collections import Counter
 import unittest.mock
@@ -58,7 +59,8 @@ MATCHED_TRANSCRIPT = [
 ]
 def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
        tool_counts=None, user_texts=("hello there",), assistant_texts=("hi back",),
-       call_ids=("c1",), ids_are_representative=True, truncated=()):
+       call_ids=("c1",), ids_are_representative=True, truncated=(),
+       rows_with_call_id=None):
     """The aggregated shape fetch_db returns. Everything is a count, a sum, a digest or
     an id, because selecting the rows themselves does not fit in memory. Prompts are a
     multiset so a repeated prompt stored once still reads as a loss."""
@@ -70,6 +72,8 @@ def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
         "tool_counts": dict(tool_counts if tool_counts is not None else {"Bash": 1}),
         "call_ids": set(call_ids),
         "ids_are_representative": ids_are_representative,
+        "rows_with_call_id": (len(call_ids) if rows_with_call_id is None
+                              else rows_with_call_id),
         "user_digests": Counter(compare._digest(t) for t in user_texts),
         "assistant_digests": Counter(compare._digest(t) for t in assistant_texts),
         "truncated": list(truncated),
@@ -220,8 +224,9 @@ class TestItReadsTheStoredPromptShape(unittest.TestCase):
                               ("TABS\there", "tabs here")]:
             self.assertEqual(compare._norm(raw), expected)
 
-    def test_it_truncates_at_the_same_length_as_the_query(self):
-        self.assertEqual(len(compare._norm("x" * 500)), 200)
+    def test_it_does_not_truncate_the_way_the_query_no_longer_does(self):
+        """A prefix digest made two prompts sharing an opening interchangeable."""
+        self.assertEqual(len(compare._norm("x" * 500)), 500)
 
 
 class TestNoiseIsSuppressedWithoutHidingRealLoss(unittest.TestCase):
@@ -457,7 +462,7 @@ class TestReconciliationDistinguishesIndividualEvents(unittest.TestCase):
         t = MATCHED_TRANSCRIPT + [rec("tool_call", tool="Write", call_id="c2")]
         d = db(ids_are_representative=False, call_ids=())
         got = compare.compare("claude-code", local(t), d, 3)
-        why = next(f["why"] for f in got if "by count" in f["title"])
+        why = next(f["why"] for f in got if f["title"].endswith("under-recorded (by count)"))
         self.assertIn("counts them instead", why)
 
     def test_a_truncated_id_set_falls_back_rather_than_inventing_losses(self):
@@ -490,14 +495,246 @@ class TestRetrievalIsBounded(unittest.TestCase):
         self.assertGreater(compare.ROW_CAP, 0)
 
     def test_over_the_cap_is_reported_as_truncated(self):
-        rows, capped, _ = compare._capped(list(range(compare.ROW_CAP + 5)), "prompts")
+        rows, capped = compare._capped(list(range(compare.ROW_CAP + 5)))
         self.assertTrue(capped)
         self.assertEqual(len(rows), compare.ROW_CAP)
 
     def test_under_the_cap_is_not_reported_as_truncated(self):
-        rows, capped, _ = compare._capped([1, 2, 3], "prompts")
+        rows, capped = compare._capped([1, 2, 3])
         self.assertFalse(capped)
         self.assertEqual(rows, [1, 2, 3])
+
+    def test_the_audit_direction_also_matches_by_id(self):
+        """Both directions must distinguish events, not just the transcript one."""
+        a = MATCHING_AUDIT + [rec("tool_call", tool="Bash", call_id="logged-only")]
+        d = db(tool_counts={"Bash": 2}, call_ids=("c1", "stored-only"))
+        got = compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a), d, 3)
+        self.assertIn("The hook logged tool calls the database never received",
+                      titles(got))
+        self.assertIn("logged-only", " ".join(f["evidence"] for f in got))
+
+    def test_the_audit_direction_falls_back_to_counting_too(self):
+        a = MATCHING_AUDIT + [rec("tool_call", tool="Write", call_id="w1")]
+        d = db(ids_are_representative=False, call_ids=())
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a), d, 3))
+        self.assertIn("The hook logged tool calls the database never received "
+                      "(by count)", got)
+
+
+class TestTheServerSideCostIsBoundedToo(unittest.TestCase):
+    """The row cap bounds what comes back. It does not bound what the server does to
+    produce it, because a GROUP BY computes every group before any LIMIT applies."""
+
+    def test_every_connection_carries_a_statement_timeout(self):
+        env = compare._connection_env("postgres://bob@db.example/things")
+        self.assertIn("statement_timeout=%d" % compare.STATEMENT_TIMEOUT_MS,
+                      env["PGOPTIONS"])
+
+    def test_a_timeout_says_what_to_do_rather_than_dumping_the_error(self):
+        import subprocess
+        done = subprocess.CompletedProcess(
+            args=[], returncode=1,
+            stdout="", stderr="ERROR:  canceling statement due to statement timeout")
+        with unittest.mock.patch("subprocess.run", return_value=done):
+            with self.assertRaises(SystemExit) as e:
+                compare.psql("postgres://bob@db.example/things", "SELECT 1")
+        self.assertIn("fewer days", str(e.exception))
+
+    def test_other_errors_are_still_reported_verbatim(self):
+        import subprocess
+        done = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout="", stderr='ERROR:  relation "nope" does not exist')
+        with unittest.mock.patch("subprocess.run", return_value=done):
+            with self.assertRaises(SystemExit) as e:
+                compare.psql("postgres://bob@db.example/things", "SELECT 1")
+        self.assertIn("does not exist", str(e.exception))
+
+
+class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
+    """A connection option that is dropped rather than honoured is how a verify-full
+    DSN ends up negotiating an unverified session."""
+
+    def test_tls_options_are_carried_not_discarded(self):
+        env = compare._connection_env(
+            "postgres://bob@db.example/things?sslmode=verify-full&sslrootcert=/ca.pem")
+        self.assertEqual(env["PGSSLMODE"], "verify-full")
+        self.assertEqual(env["PGSSLROOTCERT"], "/ca.pem")
+
+    def test_a_remote_host_encrypts_even_when_the_dsn_is_silent(self):
+        env = compare._connection_env("postgres://bob@db.example/things")
+        self.assertEqual(env["PGSSLMODE"], "require")
+
+    def test_a_remote_host_cannot_ask_for_plaintext(self):
+        for mode in ("disable", "allow", "prefer"):
+            with self.subTest(mode=mode):
+                with self.assertRaises(SystemExit):
+                    compare._connection_env(
+                        "postgres://bob@db.example/things?sslmode=%s" % mode)
+
+    def test_a_loopback_tunnel_is_exempt(self):
+        """The tunnel already authenticated and terminates on this machine."""
+        for host in ("127.0.0.1", "localhost"):
+            with self.subTest(host=host):
+                env = compare._connection_env("postgres://bob@%s:15433/things" % host)
+                self.assertNotIn("PGSSLMODE", env)
+
+    def test_a_password_in_the_query_string_is_refused_too(self):
+        """urlsplit().password does not see it, so checking only that leaves the
+        credential in argv."""
+        with self.assertRaises(SystemExit) as e:
+            compare._connection_env("postgres://bob@db.example/things?password=hunter2")
+        self.assertNotIn("hunter2", str(e.exception))
+
+    def test_a_passfile_path_is_allowed(self):
+        """A path is not a secret; libpq reads the password this never sees."""
+        env = compare._connection_env(
+            "postgres://bob@db.example/things?passfile=/home/me/.pgpass")
+        self.assertEqual(env["PGPASSFILE"], "/home/me/.pgpass")
+
+    def test_an_unrecognised_option_is_refused_rather_than_ignored(self):
+        with self.assertRaises(SystemExit) as e:
+            compare._connection_env("postgres://bob@db.example/things?madeup=1")
+        self.assertIn("madeup", str(e.exception))
+
+    def test_psql_is_resolved_to_an_absolute_path(self):
+        """A writable directory earlier on PATH would otherwise receive every row."""
+        self.assertTrue(os.path.isabs(compare._psql_binary()))
+
+    def test_psql_missing_from_path_is_an_error_not_a_relative_call(self):
+        with unittest.mock.patch("shutil.which", return_value=None):
+            with self.assertRaises(SystemExit):
+                compare._psql_binary()
+
+
+class TestOnlyDevelopmentShowsPromptText(unittest.TestCase):
+    def test_staging_redacts(self):
+        self.assertEqual(_redaction_for("staging"), True)
+
+    def test_production_redacts(self):
+        self.assertEqual(_redaction_for("production"), True)
+
+    def test_development_does_not(self):
+        self.assertEqual(_redaction_for("development"), False)
+
+    def test_an_environment_outside_the_three_is_refused(self):
+        """A typo must not be a silent opt-out of redaction."""
+        import subprocess, sys, tempfile
+        from pathlib import Path
+        from tests.conftest import REPO
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/compare.py"),
+             "--local", "/dev/null", "--email", "a@b.c", "--environment", "prod"],
+            capture_output=True, text=True, timeout=60,
+            env={"PATH": "/usr/bin:/bin", "HOME": tempfile.mkdtemp(),
+                 "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1/d"})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("invalid choice", r.stderr)
+
+
+def _redaction_for(environment):
+    """What main() would set REDACT to, without running a query."""
+    return environment != "development"
+
+
+class TestTheScanFileCannotBeRedirected(unittest.TestCase):
+    def test_a_symlink_at_the_destination_is_refused(self):
+        """O_TRUNC through a symlink would truncate whatever it points at."""
+        import subprocess, sys, tempfile
+        from pathlib import Path
+        from tests.conftest import REPO
+        work = Path(tempfile.mkdtemp())
+        victim = work / "victim"
+        victim.write_text("do not truncate me")
+        (work / "out.json").symlink_to(victim)
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
+             "--tools", "claude-code", "--days", "1", "--out", str(work / "out.json")],
+            capture_output=True, text=True, timeout=300)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(victim.read_text(), "do not truncate me")
+
+
+class TestTheDigestIdentifiesOnePromptOnly(unittest.TestCase):
+    """Truncating before hashing made two prompts sharing an opening interchangeable.
+    That is a real collision in stored data, not a hypothetical."""
+
+    def test_prompts_differing_only_past_two_hundred_characters_differ(self):
+        base = "x" * 250
+        self.assertNotEqual(compare._digest(base + "alpha"), compare._digest(base + "beta"))
+
+    def test_whitespace_and_case_still_normalise(self):
+        self.assertEqual(compare._digest("  Hello   THERE  "), compare._digest("hello there"))
+
+    def test_the_whole_text_is_hashed(self):
+        import hashlib
+        self.assertEqual(compare._digest("hello there"),
+                         hashlib.sha256(b"hello there").hexdigest())
+
+
+class TestACountOnlyRunSaysSo(unittest.TestCase):
+    """A clean report from the count fallback must not read as 'every call arrived'."""
+
+    def test_the_caveat_is_raised_when_counting_is_all_there_is(self):
+        d = db(ids_are_representative=False, call_ids=())
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT), d, 3))
+        self.assertIn("Tool calls could only be reconciled by count", got)
+
+    def test_the_caveat_says_a_clean_result_is_not_proof(self):
+        d = db(ids_are_representative=False, call_ids=())
+        got = compare.compare("claude-code", local(MATCHED_TRANSCRIPT), d, 3)
+        why = next(f["why"] for f in got if "only be reconciled" in f["title"])
+        self.assertIn("not proof", why)
+
+    def test_no_caveat_when_the_ids_did_the_work(self):
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
+                                     MATCHED_DB, 3))
+        self.assertNotIn("Tool calls could only be reconciled by count", got)
+
+
+class TestTheReportFileIsProtectedLikeTheScan(unittest.TestCase):
+    def _run(self, out, extra_env=None):
+        import json as _json, subprocess, sys, tempfile
+        from pathlib import Path
+        from tests.conftest import REPO
+        work = Path(tempfile.mkdtemp())
+        (work / "local.json").write_text(_json.dumps({
+            "since": "2026-08-01T00:00:00+00:00", "days": 3, "tools": {}}))
+        fake = work / "psql"
+        fake.write_text("#!/bin/sh\necho '[]'\n")
+        fake.chmod(0o755)
+        env = {"PATH": "%s:/usr/bin:/bin" % work, "HOME": str(work),
+               "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1:5432/d"}
+        env.update(extra_env or {})
+        return subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/compare.py"),
+             "--local", str(work / "local.json"), "--email", "a@b.c",
+             "--environment", "development", "--out", str(out)],
+            capture_output=True, text=True, timeout=120, env=env)
+
+    def test_the_report_is_owner_only_whatever_the_umask(self):
+        import os as _os, stat, tempfile
+        from pathlib import Path
+        out = Path(tempfile.mkdtemp()) / "report.json"
+        old = _os.umask(0o000)
+        try:
+            r = self._run(out)
+        finally:
+            _os.umask(old)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        mode = _os.stat(out).st_mode
+        self.assertFalse(mode & stat.S_IROTH, "world-readable")
+        self.assertFalse(mode & stat.S_IRGRP, "group-readable")
+
+    def test_a_symlink_at_the_report_path_is_refused(self):
+        import tempfile
+        from pathlib import Path
+        work = Path(tempfile.mkdtemp())
+        victim = work / "victim"
+        victim.write_text("do not truncate me")
+        (work / "report.json").symlink_to(victim)
+        r = self._run(work / "report.json")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(victim.read_text(), "do not truncate me")
 
 
 if __name__ == "__main__":
