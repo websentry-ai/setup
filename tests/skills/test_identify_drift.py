@@ -285,7 +285,7 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
         with self.assertRaises(SystemExit) as e:
             compare._connection_env("postgres://bob:hunter2@db.example/things")
         self.assertNotIn("hunter2", str(e.exception))
-        self.assertIn("PGPASSFILE", str(e.exception))
+        self.assertIn("~/.pgpass", str(e.exception))
 
     def test_a_stale_password_in_the_environment_is_dropped(self):
         with unittest.mock.patch.dict("os.environ", {"PGPASSWORD": "leftover"}):
@@ -427,6 +427,22 @@ class TestTheWindowIsBounded(unittest.TestCase):
             capture_output=True, text=True, timeout=60)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("between 1 and 14", r.stderr)
+
+    def test_the_comparer_enforces_the_bound_too(self):
+        """The scanner's flag check does not protect the query: the file between them
+        carries the day count."""
+        r = _run_compare({"since": "2026-01-01T00:00:00+00:00", "days": 365,
+                          "tools": {}})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("the limit is %d" % compare.MAX_DAYS, r.stderr)
+
+    def test_a_scan_file_with_no_day_count_is_refused(self):
+        r = _run_compare({"since": "2026-01-01T00:00:00+00:00", "tools": {}})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no usable day count", r.stderr)
+
+    def test_both_halves_share_one_bound(self):
+        self.assertEqual(compare.MAX_DAYS, scan.MAX_DAYS)
 
     def test_an_unknown_tool_is_refused(self):
         import subprocess, sys
@@ -570,6 +586,50 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     compare._connection_env(
                         "postgres://bob@db.example/things?sslmode=%s" % mode)
+
+    def test_a_weak_sslmode_cannot_hide_in_mixed_case(self):
+        """libpq spells its keywords lower case; comparing without folding lets
+        sslmode=Disable walk past the check."""
+        for dsn in ("postgres://bob@db.example/t?sslmode=Disable",
+                    "postgres://bob@db.example/t?sslmode=PREFER",
+                    "postgres://bob@db.example/t?SSLMODE=disable"):
+            with self.subTest(dsn=dsn):
+                with self.assertRaises(SystemExit):
+                    compare._connection_env(dsn)
+
+    def test_a_mixed_case_password_key_is_refused_too(self):
+        with self.assertRaises(SystemExit) as e:
+            compare._connection_env("postgres://bob@db.example/t?PASSWORD=hunter2")
+        self.assertNotIn("hunter2", str(e.exception))
+
+    def test_a_strong_sslmode_survives_mixed_case(self):
+        env = compare._connection_env(
+            "postgres://bob@db.example/t?SSLMODE=Verify-Full")
+        self.assertEqual(env["PGSSLMODE"], "verify-full")
+
+    def test_no_libpq_state_is_inherited_from_the_environment(self):
+        """Otherwise the destination and the policy come from different places: a
+        hostless DSN takes PGHOST from the environment and is still judged local."""
+        stray = {"PGHOST": "elsewhere.example", "PGPORT": "9999",
+                 "PGSSLMODE": "disable", "PGSERVICE": "elsewhere",
+                 "PGPASSWORD": "leftover", "PGDATABASE": "other"}
+        with unittest.mock.patch.dict("os.environ", stray):
+            env = compare._connection_env("postgres:///things")
+        self.assertNotIn("PGHOST", env)
+        self.assertNotIn("PGSERVICE", env)
+        self.assertNotIn("PGPASSWORD", env)
+        self.assertNotIn("PGSSLMODE", env)
+        self.assertEqual(env["PGDATABASE"], "things")
+
+    def test_an_inherited_sslmode_cannot_survive_a_remote_dsn(self):
+        with unittest.mock.patch.dict("os.environ", {"PGSSLMODE": "disable"}):
+            env = compare._connection_env("postgres://bob@db.example/things")
+        self.assertEqual(env["PGSSLMODE"], "require")
+
+    def test_the_rest_of_the_environment_is_left_alone(self):
+        with unittest.mock.patch.dict("os.environ", {"HOME": "/home/bob"}):
+            env = compare._connection_env("postgres://bob@127.0.0.1/things")
+        self.assertEqual(env["HOME"], "/home/bob")
 
     def test_a_loopback_tunnel_is_exempt(self):
         """The tunnel already authenticated and terminates on this machine."""
@@ -735,6 +795,22 @@ class TestTheReportFileIsProtectedLikeTheScan(unittest.TestCase):
         r = self._run(work / "report.json")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(victim.read_text(), "do not truncate me")
+
+
+def _run_compare(local_document):
+    """compare.py over a scan file we control, with no database behind it."""
+    import json as _json, subprocess, sys, tempfile
+    from pathlib import Path
+    from tests.conftest import REPO
+    work = Path(tempfile.mkdtemp())
+    (work / "local.json").write_text(_json.dumps(local_document))
+    return subprocess.run(
+        [sys.executable, str(REPO / ".claude/skills/identify-drift/compare.py"),
+         "--local", str(work / "local.json"), "--email", "a@b.c",
+         "--environment", "development"],
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(work),
+             "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1:5432/d"})
 
 
 if __name__ == "__main__":

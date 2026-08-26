@@ -33,6 +33,9 @@ APP_LABEL = {"claude-code": "claude-code", "cursor": "cursor", "copilot": "copil
 # pathological one fails with an answer instead of hanging.
 STATEMENT_TIMEOUT_MS = 120000
 
+# The widest window either half of the skill will look at.
+MAX_DAYS = 14
+
 # The connection options a DSN may carry, and the libpq variable each becomes.
 # Anything outside this map is refused rather than dropped, so a TLS setting cannot
 # go missing without the operator hearing about it. "password" is absent on purpose.
@@ -59,21 +62,29 @@ def _connection_env(dsn):
     parts = urlsplit(dsn)
     if parts.scheme not in ("postgres", "postgresql"):
         sys.exit("dsn must be a postgres:// or postgresql:// URL")
-    options = dict(parse_qsl(parts.query, keep_blank_values=True))
+    # Keys folded because libpq spells them lower case, and folding the recognised
+    # ones is what routes a weak sslmode into the check below rather than past it.
+    options = {k.lower(): v for k, v in parse_qsl(parts.query, keep_blank_values=True)}
+    if "sslmode" in options:
+        options["sslmode"] = options["sslmode"].lower()
     if parts.password or "password" in options:
         # No route into this tool carries a password, including the environment. The
         # command that would set one is itself captured by the hooks this compares,
         # so the secret would land in the transcripts, the audit log and the stored
         # prompts. libpq reads a password file that stays out of both.
         sys.exit("the dsn carries a password: remove it and let libpq read one from "
-                 "PGPASSFILE or ~/.pgpass, which this never sees")
+                 "~/.pgpass, or name a file with ?passfile=, either of which this "
+                 "never reads")
     unknown = sorted(set(options) - set(LIBPQ_OPTIONS))
     if unknown:
         # Silently dropping a connection option is how a verify-full DSN ends up
         # negotiating an unverified one.
         sys.exit("unsupported connection option(s): %s" % ", ".join(unknown))
-    env = dict(os.environ)
-    env.pop("PGPASSWORD", None)
+    # Start from an environment with no libpq state at all. Inheriting it lets the
+    # destination and the policy come from different places: a hostless DSN would
+    # take PGHOST from the environment and still be judged local, and an inherited
+    # PGSSLMODE or PGSERVICE would outlive every check below.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
     # A read-only report is never worth holding a connection open for minutes. This
     # is the server-side bound; the subprocess timeout is only the outer backstop.
     env["PGOPTIONS"] = "-c statement_timeout=%d" % STATEMENT_TIMEOUT_MS
@@ -558,7 +569,7 @@ def main():
     ap.add_argument("--local", required=True, help="scan_local.py output, or - for stdin")
     ap.add_argument("--dsn", help="prefer IDENTIFY_DRIFT_DSN: an argument is visible "
                                   "to every account on the machine through ps. No "
-                                  "password in either; libpq reads one from PGPASSFILE")
+                                  "password in either; libpq reads one from ~/.pgpass")
     ap.add_argument("--email", required=True)
     ap.add_argument("--environment", required=True,
                     choices=("development", "staging", "production"))
@@ -582,7 +593,14 @@ def main():
     REDACT = args.redact or args.environment != "development"
 
     local_all = json.load(sys.stdin if args.local == "-" else open(args.local))
-    days = local_all["days"]
+    try:
+        days = int(local_all["days"])
+    except (KeyError, TypeError, ValueError):
+        sys.exit("the scan file has no usable day count; re-run scan_local.py")
+    # The window is bounded here as well as in the scanner, so the file that reaches
+    # this cannot widen the query beyond what the scan was allowed to cover.
+    if not 1 <= days <= MAX_DAYS:
+        sys.exit("the scan file covers %d days; the limit is %d" % (days, MAX_DAYS))
 
     report = {"environment": args.environment, "email": args.email,
               "days": days, "since": local_all["since"], "tools": {}}

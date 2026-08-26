@@ -42,9 +42,15 @@ normal audited access path.
 checking: what you put in a prompt or a Bash command is captured into the transcripts,
 the audit log and the stored prompt rows that the comparison then reads. A password
 handled here would be sitting in the very data being audited. `compare.py` refuses a
-DSN that carries one, on every route. If a connection needs a password, the operator
-puts it in their libpq password file (`PGPASSFILE`, or `~/.pgpass`, which libpq
-requires be owner-only) and the DSN stays passwordless.
+DSN that carries one, in the userinfo and in the query string alike. If a connection
+needs a password, the operator puts it in `~/.pgpass` (which libpq requires be
+owner-only) or names a file with `?passfile=`, and the DSN stays passwordless.
+
+The DSN is the only thing that decides where this connects and how. `compare.py`
+starts psql from an environment stripped of every `PG*` variable, so an inherited
+`PGHOST`, `PGSSLMODE` or `PGSERVICE` cannot send it somewhere the DSN did not name.
+Anything but a loopback host must encrypt: pass `?sslmode=verify-full` and
+`?sslrootcert=` in the DSN itself.
 
 **development** — a local Postgres. Read the database name, user, host and port from
 `ai-gateway-data/.env` (`DATABASE_NAME`, `DATABASE_USER`, `DATABASE_HOST`,

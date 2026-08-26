@@ -29,6 +29,9 @@ HOME = Path.home()
 # At the cap the log has rotated, and absence from it proves nothing.
 AUDIT_LOG_TOTAL_LIMIT = 100
 
+# The widest window either half of the skill will look at.
+MAX_DAYS = 14
+
 TOOLS = {
     "claude-code": {"app_label": "claude-code", "audit": HOME / ".claude/hooks/agent-audit.log"},
     "cursor":      {"app_label": "cursor",      "audit": HOME / ".cursor/hooks/agent-audit.log"},
@@ -270,8 +273,8 @@ def main():
                                   "stdout; the output quotes transcripts verbatim")
     args = ap.parse_args()
 
-    if not 1 <= args.days <= 14:
-        sys.exit("--days must be between 1 and 14")
+    if not 1 <= args.days <= MAX_DAYS:
+        sys.exit("--days must be between 1 and %d" % MAX_DAYS)
     tools = [t.strip() for t in args.tools.split(",") if t.strip()]
     unknown = [t for t in tools if t not in TOOLS]
     if unknown:
