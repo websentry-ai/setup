@@ -957,43 +957,39 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
         with unittest.mock.patch("subprocess.run", return_value=done) as run:
             with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
-                compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1",
-                             {"email": "someone@example.com", "days": 14})
-        argv = run.call_args[0][0]
-        self.assertNotIn("someone@example.com", " ".join(argv))
-        self.assertNotIn("14", " ".join(a for a in argv if a != "-At"))
+                compare.psql("postgres://bob@127.0.0.1/t", "SELECT :'email' AS v",
+                             {"email": "someone@example.com"})
+        self.assertNotIn("someone@example.com", " ".join(run.call_args[0][0]))
 
     def test_the_bind_values_still_arrive(self):
-        """Off the command line is only useful if psql still receives them."""
+        """Off the command line is only useful if the query still carries them."""
         import subprocess
         done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
         with unittest.mock.patch("subprocess.run", return_value=done) as run:
             with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
-                compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1",
+                compare.psql("postgres://bob@127.0.0.1/t", "SELECT :'email' AS v",
                              {"email": "someone@example.com"})
         fed = run.call_args[1]["input"]
-        self.assertIn("\\set email", fed)
+        self.assertIn("someone@example.com", fed)
+        self.assertNotIn(":'email'", fed)
 
-    def test_the_binding_survives_an_awkward_temporary_directory(self):
-        """The path goes into a shell command, and TMPDIR is whatever the operator
-        has set. One apostrophe in it left the value empty instead of failing, which
-        would have the query run on a blank email and report invented losses."""
-        import subprocess, tempfile, os as _os
-        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
-        for awkward in ("we'ird", "sp ace", "dollar$x", "back\\slash"):
-            with self.subTest(tmpdir=awkward):
-                base = _os.path.join(tempfile.mkdtemp(), awkward)
-                _os.makedirs(base)
-                with unittest.mock.patch.dict("os.environ", {"TMPDIR": base}):
-                    with unittest.mock.patch("subprocess.run", return_value=done) as run:
-                        with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
-                            compare.psql("postgres://bob@127.0.0.1/t", "SELECT 1",
-                                         {"email": "someone@example.com"})
-                fed = run.call_args[1]["input"]
-                line = [l for l in fed.splitlines() if l.startswith("\\set email")][0]
-                # the path is one shell word, so cat receives the file and not fragments
-                import shlex
-                self.assertEqual(len(shlex.split(line.split("`")[1])), 2, line)
+    def test_a_value_cannot_end_its_own_quoting(self):
+        """Dollar quoting takes everything between the tags verbatim, and the tag is
+        chosen so the value does not contain it. Carrying values through psql
+        variables meant crossing psql's parser and then a shell, where a backquote or
+        an apostrophe silently produced an empty binding instead of an error."""
+        for value in ("a'; DROP TABLE prompts; --", "back\\slash", "`id`", "$(id)",
+                      "line\nbreak", "'", "$drift$ nested $drift$"):
+            with self.subTest(value=value):
+                literal = compare._sql_literal(value)
+                tag = literal.split("$")[1]
+                self.assertNotIn("$%s$" % tag, value)
+                self.assertTrue(literal.startswith("$%s$" % tag))
+                self.assertTrue(literal.endswith("$%s$" % tag))
+                self.assertEqual(literal[len(tag) + 2:-(len(tag) + 2)], value)
+
+    def test_the_tag_moves_when_the_value_contains_it(self):
+        self.assertTrue(compare._sql_literal("$drift$").startswith("$drift1$"))
 
     def test_the_startup_file_is_disabled(self):
         """A .psqlrc can \\set over the bindings, redirect output with \\o, or run a

@@ -19,12 +19,10 @@ import json
 import os
 import grp
 import pwd
-import shlex
 import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from datetime import datetime
 from urllib.parse import parse_qsl, unquote, urlsplit
 from collections import Counter, defaultdict
@@ -241,44 +239,45 @@ def _psql_binary(explicit=None):
     return real
 
 
+def _sql_literal(value):
+    """A value as a dollar-quoted SQL literal.
+
+    Dollar quoting needs no escaping at all: everything between the tags is taken
+    verbatim, so a quote, a backslash or a newline in the value cannot end it. The
+    only thing it cannot hold is its own tag, and the tag is chosen so the value does
+    not contain it. This replaces carrying values through psql variables, which meant
+    a value or a path crossing psql's parser and then a shell, where a backquote or an
+    apostrophe silently produced an empty binding rather than an error.
+    """
+    text = str(value)
+    tag, index = "drift", 0
+    while "$%s$" % tag in text:
+        index += 1
+        tag = "drift%d" % index
+    return "$%s$%s$%s$" % (tag, text, tag)
+
+
 def psql(dsn, sql, params=None):
     """One query, JSON out. Read-only by construction: the role this connects with
     has no write grant, so a mistake here cannot change anything.
 
-    Values are bound through psql variables and referenced as :'name', which applies
-    literal quoting on psql's side. Nothing the caller supplies is pasted into SQL.
+    Values are substituted as dollar-quoted literals, so nothing the caller supplies
+    is parsed as SQL, and nothing of it reaches this process's arguments, where every
+    local account could read it.
     """
-    # -X: a startup file can \set over these bindings, redirect output with \o, or run
-    # a shell command with \!, none of which the PG* strip covers.
+    for name, value in (params or {}).items():
+        sql = sql.replace(":'%s'" % name, _sql_literal(value))
+    # -X: a startup file can \set over the query, redirect output with \o, or run a
+    # shell command with \!, none of which the PG* strip covers.
     command = [_psql_binary(PSQL), "-At", "-X", "-v", "ON_ERROR_STOP=1"]
-    # Fed on stdin, not through -c: psql only expands :'name' in what it reads as
-    # input, so -c would send the placeholder to the server verbatim.
+    # Fed on stdin, not through -c: an argument is readable by every account on the
+    # machine for as long as the query runs.
     # The alias is deliberately unlikely: json_agg(alias) resolves to a *column* of
     # that name when one exists, which silently returns scalars instead of objects.
     statement = ("SELECT coalesce(json_agg(_drift_row), '[]') FROM (%s) _drift_row;"
                  % sql.rstrip().rstrip(";"))
-    # Bindings reach psql through owner-only files it reads for itself, so no value
-    # appears in this process's arguments where every local account can read them.
-    # \set on stdin cannot carry them: it reads its argument as psql tokens, so a
-    # value holding a quote, a space or a backslash arrives mangled. \getenv would,
-    # but postdates the psql this has to run on.
-    work = tempfile.mkdtemp()
-    try:
-        preamble = ""
-        for name, value in (params or {}).items():
-            path = os.path.join(work, name)
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(str(value))
-            # shlex.quote, not a hand-written pair of quotes: the directory comes
-            # from TMPDIR, and one apostrophe in it would end the quoting and leave
-            # the value empty rather than failing.
-            preamble += "\\set %s `/bin/cat %s`\n" % (name, shlex.quote(path))
-        result = subprocess.run(command, input=preamble + statement,
-                                capture_output=True, text=True,
-                                timeout=180, env=_connection_env(dsn))
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    result = subprocess.run(command, input=statement, capture_output=True, text=True,
+                            timeout=180, env=_connection_env(dsn))
     if result.returncode != 0:
         error = _scrub(result.stderr, dsn).strip()
         if "statement timeout" in error.lower():
