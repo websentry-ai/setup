@@ -18,15 +18,15 @@ This is how queued prompts and unattributed subagent tokens were found.
 Ask all of it before doing any work. Use one AskUserQuestion per item so the answers
 stay separable.
 
-**Environment** — `development`, `staging`, or `production`.
+**Environment.** `development`, `staging`, or `production`.
 
-**Window** — how many days back. **Maximum 14.** Refuse a larger number and ask again;
+**Window.** How many days back. **Maximum 14.** Refuse a larger number and ask again;
 scanning further is slow and the audit log will not reach that far anyway.
 
-**Tools** — any combination of `claude-code`, `cursor`, `copilot`, `codex`, `augment`.
+**Tools.** Any combination of `claude-code`, `cursor`, `copilot`, `codex`, `augment`.
 Offer multi-select.
 
-**Email** — whose activity to check. If `~/.unbound/config.json` holds an `email`,
+**Email.** Whose activity to check. If `~/.unbound/config.json` holds an `email`,
 offer it as the default rather than asking cold.
 
 ---
@@ -54,12 +54,12 @@ itself, so the server is authenticated and not merely encrypted to. Pass
 `?sslrootcert=` alongside it when the certificate needs a specific root. The modes
 that allow a plaintext session are refused outright.
 
-**development** — a local Postgres. Read the database name, user, host and port from
+**development.** A local Postgres. Read the database name, user, host and port from
 `ai-gateway-data/.env` (`DATABASE_NAME`, `DATABASE_USER`, `DATABASE_HOST`,
 `DATABASE_PORT`) and build a passwordless DSN from those. Do not read or copy
 `DATABASE_PASSWORD`. Do not assume names; they differ between machines.
 
-**staging / production** — ask the operator to open their usual read-only tunnel and
+**staging / production.** Ask the operator to open their usual read-only tunnel and
 to say when it is up. The tunnel authenticates them, so its DSN is host, port, user
 and database only. Wait for them; never open a tunnel yourself and never complete an
 MFA prompt on their behalf. If they ask how, point them at the internal
@@ -112,7 +112,58 @@ the database and diffs the three.
 
 ---
 
-## 4. What the comparison means
+## 4. What the two sides are
+
+You do not need to read the scripts to work here. This is everything they know.
+
+**Local.** `scan_local.py` normalises every tool into one record shape: `kind`, `session`,
+`at`, plus `text`, `tool`, `call_id`, or token counts. `kind` is one of `user_prompt`,
+`assistant_message`, `tool_call`, `usage`, `usage_total`, `turn_end`.
+
+The scanner asks every tool for a timestamp and a tool-call id. The last column is
+what a tool does not actually write, measured, not what the reader fails to look for.
+
+| Tool | Transcripts | Recognised by | Does not write |
+|---|---|---|---|
+| claude-code | `~/.claude/projects/*/*.jsonl` | `type` user/assistant; `tool_use` blocks in `message.content`; `message.usage` per message | |
+| cursor | `~/.cursor/projects/*/agent-transcripts/*/*.jsonl` | `role`; blocks typed `tool_use` or `toolUse` | **timestamps, tool ids**, tokens. Records carry `role` and `message` and nothing else, so age comes from the file's mtime and calls can only be counted |
+| copilot | `~/.copilot/session-state/*/events.jsonl` and `~/Library/Application Support/Code/User/workspaceStorage/*/GitHub.copilot-chat/transcripts/*.jsonl` | `type` `user.message`, `assistant.message`, `tool.execution_start`; `data.toolName`, `data.toolCallId` | tokens |
+| codex | `~/.codex/sessions/*/*/*/rollout-*.jsonl` | `payload.type` `message` or `function_call`; session id from a `session_meta` line | per-message tokens, only a running `token_count` |
+| augment | none | keeps no transcript | everything except the audit log |
+
+Every tool writes the same audit log, `~/.<tool>/hooks/agent-audit.log`, keyed on
+`hook_event_name`: `PreToolUse`, `PostToolUse`, `UserPromptSubmit` or
+`beforeSubmitPrompt`, `Stop`. It holds its last hundred entries, which is usually
+under an hour.
+
+**Stored.** Everything hangs off one join. `app_label` is the tool, and it is the join
+key: four tools use their own name, augment is `augment_code`. Get it wrong and every
+query returns nothing.
+
+```
+gateway_users.id  ←  applications.owner_user_id
+applications.id   ←  gateway_metrics.application_id
+gateway_metrics.id ←  prompts.gateway_metrics_id
+                   ←  prompt_analytics.gateway_metrics_id
+```
+
+| Wanted | Where |
+|---|---|
+| the window | `gateway_metrics.request_initialized_at`. There is no `created_at` |
+| tokens | `gateway_metrics.input_token_size`, `output_token_size` |
+| prompts | `prompts.prompt`, a JSON object with `user_prompt` and `assistant_prompt` |
+| tool calls | `prompt_analytics.tool_name`, and `parameters->>'tool_use_id'` where present |
+| sessions | `prompt_analytics.thread_id` |
+| the user | `gateway_users.email`, matched case-insensitively |
+
+**What is compared.** Tokens, user prompts, assistant messages, tool calls, sessions.
+Prompts match on a sha256 of the whitespace-normalised text, computed the same way on
+both sides, so no prompt text crosses the wire. Tool calls match on `tool_use_id` when
+both sides carry one, and by count when they do not.
+
+---
+
+## 5. What the comparison means
 
 The audit log keeps only its last hundred entries, often under an hour. `scan_local.py`
 records the window it still covers, and both audit checks run only inside it: the
@@ -128,21 +179,32 @@ Direction tells you where to look:
 
 | Gap | Meaning |
 |---|---|
-| in transcript, not in audit log | the hook never saw it — a capture bug |
-| in audit log, not in the database | the upload lost it — ingest or network |
+| in transcript, not in audit log | the hook never saw it, a capture bug |
+| in audit log, not in the database | the upload lost it, ingest or network |
 | in the database, not locally | duplicate, or attributed to the wrong user |
+
+Some findings are structural, not faults. Expect them, say so once, and do not
+investigate them:
+
+| Finding | Why it is expected |
+|---|---|
+| cursor: tool calls reconciled by count | its transcripts carry no ids, so identity matching is impossible |
+| codex: token totals not reconciled | it reports a running total per turn, not a delta per message |
+| augment: no transcript to compare | it keeps none, so only the upload direction is checkable |
+| any tool: could not be checked for this window | an aggregate hit the row cap. Re-run over fewer days |
+| any tool: audit log is full | it holds a hundred entries, so absence from it is not evidence |
 
 A token difference under 5% is not reported. Above it, the usual cause is work billed
 to no turn: subagent messages outside the turn window, or turns that never uploaded.
 
 ---
 
-## 5. Report
+## 6. Report
 
 Header first, then the points. Nothing else.
 
 ```
-Identify drift — <environment>
+Identify drift: <environment>
 Window   <n> days (since <date>)
 Tools    <comma separated>
 User     <email>
