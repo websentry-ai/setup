@@ -154,6 +154,28 @@ def _group_members(gid):
     return members
 
 
+def _writable_by_others(path):
+    """Whether anyone but this account and root can write it. Works for a file or a
+    directory: writing either one changes what gets run."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return True
+    if info.st_mode & stat.S_IWOTH:
+        return True
+    if not info.st_mode & stat.S_IWGRP:
+        return False
+    members = _group_members(info.st_gid)
+    # A group this cannot enumerate is not one to vouch for.
+    if members is None:
+        return True
+    try:
+        owner = pwd.getpwuid(info.st_uid).pw_name
+    except KeyError:
+        return True
+    return bool(members - {owner, "root"})
+
+
 def _psql_binary(explicit=None):
     """An absolute psql, resolved once. Whoever can write the directory it sits in can
     replace it, and it is handed the connection and asked for the numbers this reports
@@ -167,18 +189,15 @@ def _psql_binary(explicit=None):
     found = shutil.which("psql")
     if not found or not os.path.isabs(found):
         sys.exit("psql not found on PATH")
-    directory = os.path.dirname(found)
-    info = os.stat(directory)
-    shared = None
-    if info.st_mode & stat.S_IWGRP:
-        members = _group_members(info.st_gid)
-        # Unknown membership counts as shared: a group this cannot enumerate is not one
-        # to vouch for.
-        owner = pwd.getpwuid(info.st_uid).pw_name if info.st_uid else "root"
-        shared = members is None or bool(members - {owner, "root"})
-    if info.st_mode & stat.S_IWOTH or shared:
-        sys.exit("%s is writable by accounts other than yours, so the psql in it could "
-                 "be replaced. Pass --psql with a path you trust." % directory)
+    # Every step that could be swapped: the directory the name resolves in, the real
+    # file behind any symlink, and the directory that one sits in. Checking only the
+    # first catches replacing the binary and misses editing it in place.
+    real = os.path.realpath(found)
+    for path in (os.path.dirname(found), real, os.path.dirname(real)):
+        if _writable_by_others(path):
+            sys.exit("%s is writable by accounts other than yours, so the psql this "
+                     "would run could be changed. Pass --psql with a path you trust."
+                     % path)
     return found
 
 

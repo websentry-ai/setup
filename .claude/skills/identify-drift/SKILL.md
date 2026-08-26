@@ -109,9 +109,15 @@ the database and diffs the three.
 
 ## 4. What the comparison means
 
-The audit log keeps only its last hundred entries. `scan_local.py` records the window
-it still covers, and the transcript-versus-audit check runs only inside it. Outside
-that window a missing audit entry has aged out; it is not evidence.
+The audit log keeps only its last hundred entries, often under an hour. `scan_local.py`
+records the window it still covers, and both audit checks run only inside it: the
+database side is queried for that same interval, so a stored row from days earlier
+cannot stand in for a recently lost one. Outside the window a missing audit entry has
+aged out; it is not evidence.
+
+Tool calls are matched by `tool_use_id` when both sides record one, and counted when
+they do not. Counting cannot tell one call from another of the same name, so a run
+that had to count says so, and a clean result from it is weaker than a clean match.
 
 Direction tells you where to look:
 

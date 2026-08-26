@@ -926,6 +926,42 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
                 compare._psql_binary()
         self.assertIn("writable by accounts other than yours", str(e.exception))
 
+    def _psql_at(self, dir_mode, bin_mode, via_symlink=False):
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        target = _p.Path(directory, "psql-real" if via_symlink else "psql")
+        target.write_text("#!/bin/sh\nexit 0\n")
+        target.chmod(bin_mode)
+        if via_symlink:
+            _p.Path(directory, "psql").symlink_to(target)
+        _os.chmod(directory, dir_mode)
+        return directory
+
+    def _resolve_with(self, directory):
+        import os as _os
+        with unittest.mock.patch.dict("os.environ", {"PATH": directory}):
+            return compare._psql_binary()
+
+    def test_a_writable_binary_in_a_safe_directory_is_refused(self):
+        """Checking the directory catches replacing the file. It does not catch
+        editing the file that is already there."""
+        for bin_mode in (0o777, 0o775):
+            with self.subTest(mode=oct(bin_mode)):
+                with self.assertRaises(SystemExit):
+                    self._resolve_with(self._psql_at(0o755, bin_mode))
+
+    def test_a_symlink_to_a_writable_target_is_refused(self):
+        """The name on PATH is often a link; what runs is what it points at."""
+        with self.assertRaises(SystemExit):
+            self._resolve_with(self._psql_at(0o755, 0o777, via_symlink=True))
+
+    def test_a_symlink_to_a_safe_target_is_accepted(self):
+        directory = self._psql_at(0o755, 0o755, via_symlink=True)
+        self.assertTrue(self._resolve_with(directory))
+
+    def test_a_missing_path_counts_as_unsafe(self):
+        self.assertTrue(compare._writable_by_others("/nonexistent/path/here"))
+
     def test_a_shared_group_directory_is_refused_even_when_we_own_it(self):
         """Owning the directory says nothing about who else is in its group. A prefix
         owned by this user but group-writable by a group with other members can still
@@ -1126,6 +1162,39 @@ class TestTheReportFileIsProtectedLikeTheScan(unittest.TestCase):
         r = self._run(work / "report.json")
         self.assertNotEqual(r.returncode, 0)
         self.assertEqual(victim.read_text(), "do not truncate me")
+
+
+class TestEveryFindingCanBeRendered(unittest.TestCase):
+    """The report format needs a title, a where, an evidence and a why from every
+    finding. A new one missing a field renders as a blank line in front of a human."""
+
+    REQUIRED = ("title", "where", "evidence", "why")
+
+    def _states(self):
+        import itertools
+        for ids, trunc, saturated, present, usage in itertools.product(
+                (True, False), ([], ["prompts"]), (False, True), (True, False),
+                ("usage", "usage_total")):
+            t = [rec("user_prompt", text="a"), rec("assistant_message", text="b"),
+                 rec("tool_call", tool="Bash", call_id="c1"),
+                 rec(usage, input=100, output=50)]
+            a = [rec("user_prompt", text="c"), rec("tool_call", tool="Bash", call_id="c2")]
+            loc = local(t, a, audit_log_present=present,
+                        audit_entries=100 if saturated else 5)
+            yield loc, db(metrics_rows=50, input_tokens=999999, output_tokens=1,
+                          threads=("somewhere-else",), tool_counts={"Write": 3},
+                          call_ids=("zzz",), ids_are_representative=ids,
+                          user_texts=(), assistant_texts=(), truncated=trunc)
+
+    def test_no_finding_is_missing_a_field(self):
+        seen = set()
+        for loc, d in self._states():
+            for finding in compare.compare("claude-code", loc, d, 14, d):
+                seen.add(finding["title"])
+                for field in self.REQUIRED:
+                    self.assertTrue(str(finding.get(field, "")).strip(),
+                                    "%r has no %s" % (finding.get("title"), field))
+        self.assertGreaterEqual(len(seen), 12, "expected the states to exercise more")
 
 
 def _run_compare(local_document):
