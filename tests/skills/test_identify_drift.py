@@ -505,6 +505,65 @@ class TestReconciliationDistinguishesIndividualEvents(unittest.TestCase):
                          compare._digest("hello there"))
 
 
+class TestIdentityNeedsIdsOnBothSides(unittest.TestCase):
+    """Matching on identity skips any record without an id. A source that records
+    none would be compared against nothing and report nothing, which is worse than
+    counting. Cursor transcripts carry no tool-call ids at all."""
+
+    def test_a_source_with_no_ids_is_counted_not_silently_skipped(self):
+        calls = [rec("tool_call", tool="Bash"), rec("tool_call", tool="Write")]
+        t = [rec("user_prompt", text="hello there"),
+             rec("assistant_message", text="hi back"), rec("usage", input=100, output=50)]
+        d = db(tool_counts={"Bash": 1}, call_ids=("c1", "c2"),
+               ids_are_representative=True)
+        got = titles(compare.compare("cursor", local(t + calls), d, 3))
+        self.assertIn("Tool calls made locally are under-recorded (by count)", got)
+        self.assertNotIn("Tool calls made locally are absent from the database", got)
+
+    def test_a_loss_is_still_found_when_the_local_side_has_no_ids(self):
+        """The point of the fallback: the gap must not vanish with the ids."""
+        calls = [rec("tool_call", tool="Write"), rec("tool_call", tool="Write")]
+        t = [rec("user_prompt", text="hello there"),
+             rec("assistant_message", text="hi back"), rec("usage", input=100, output=50)]
+        d = db(tool_counts={"Write": 1}, call_ids=("c1",), ids_are_representative=True)
+        got = compare.compare("cursor", local(t + calls), d, 3)
+        evidence = " ".join(f["evidence"] for f in got)
+        self.assertIn("Write local 2 vs stored 1", evidence)
+
+    def test_a_partial_id_gap_is_declared_rather_than_dropped(self):
+        """Above the coverage bar the run still matches by id, so the handful without
+        one have to be called out or they read as checked."""
+        calls = [rec("tool_call", tool="Bash", call_id="c%d" % i) for i in range(19)]
+        calls.append(rec("tool_call", tool="Bash"))
+        t = [rec("user_prompt", text="hello there"),
+             rec("assistant_message", text="hi back"), rec("usage", input=100, output=50)]
+        d = db(tool_counts={"Bash": 20}, call_ids=tuple("c%d" % i for i in range(19)))
+        got = titles(compare.compare("claude-code", local(t + calls), d, 3))
+        self.assertIn("Some local tool calls carry no id and were not matched", got)
+
+    def test_the_audit_direction_declares_when_it_had_to_count(self):
+        """A tool can stamp ids in its transcript and not in its hook log. Copilot
+        does exactly that, so a clean audit result must not read as strongly as a
+        clean transcript one."""
+        a = [rec("tool_call", tool="Bash"), rec("tool_call", tool="Bash"),
+             rec("tool_call", tool="Bash")]
+        got = titles(compare.compare("copilot", local(MATCHED_TRANSCRIPT, a),
+                                     MATCHED_DB, 3))
+        self.assertIn("The upload direction could only be reconciled by count", got)
+
+    def test_no_such_note_when_both_directions_used_ids(self):
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
+                                     MATCHED_DB, 3))
+        self.assertNotIn("The upload direction could only be reconciled by count", got)
+
+    def test_the_coverage_bar_is_shared_by_both_sides(self):
+        self.assertTrue(compare._ids_are_usable(
+            [{"call_id": "a"}, {"call_id": "b"}, {"call_id": "c"}]))
+        self.assertFalse(compare._ids_are_usable(
+            [{"call_id": "a"}, {}, {}]))
+        self.assertTrue(compare._ids_are_usable([]))
+
+
 class TestRetrievalIsBounded(unittest.TestCase):
     def test_the_cap_is_declared(self):
         self.assertIsInstance(compare.ROW_CAP, int)
@@ -535,6 +594,51 @@ class TestRetrievalIsBounded(unittest.TestCase):
         got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a), d, 3))
         self.assertIn("The hook logged tool calls the database never received "
                       "(by count)", got)
+
+
+class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
+    """The audit log holds its last hundred entries, often under an hour, while the
+    requested window can be fourteen days. Reconciling the first against the second
+    lets an unrelated older stored row cancel a recently lost audited one."""
+
+    def test_an_older_stored_call_cannot_cancel_a_recent_lost_one(self):
+        a = [rec("tool_call", tool="Bash"), rec("tool_call", tool="Bash")]
+        whole_window = db(tool_counts={"Bash": 400}, ids_are_representative=False,
+                          call_ids=())
+        audit_window = db(tool_counts={"Bash": 1}, ids_are_representative=False,
+                          call_ids=())
+        blind = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                       whole_window, 14))
+        seeing = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                        whole_window, 14, audit_window))
+        self.assertNotIn("The hook logged tool calls the database never received "
+                         "(by count)", blind)
+        self.assertIn("The hook logged tool calls the database never received "
+                      "(by count)", seeing)
+
+    def test_an_older_stored_prompt_cannot_cancel_a_recent_lost_one(self):
+        a = [rec("user_prompt", text="the lost one")]
+        whole_window = db(user_texts=("the lost one", "hello there"))
+        audit_window = db(user_texts=("hello there",))
+        blind = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                       whole_window, 14))
+        seeing = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                        whole_window, 14, audit_window))
+        self.assertNotIn("The hook logged prompts the database never received", blind)
+        self.assertIn("The hook logged prompts the database never received", seeing)
+
+    def test_the_transcript_direction_still_uses_the_whole_window(self):
+        """Only the audit direction is bounded; the transcript covers all of it."""
+        t = MATCHED_TRANSCRIPT + [rec("user_prompt", text="never uploaded")]
+        got = titles(compare.compare("claude-code", local(t), MATCHED_DB, 14,
+                                     db(user_texts=())))
+        self.assertIn("User prompts recorded locally are absent from the database", got)
+
+    def test_the_query_accepts_an_explicit_interval(self):
+        import inspect
+        sig = inspect.signature(compare.fetch_db)
+        self.assertIn("since", sig.parameters)
+        self.assertIn("until", sig.parameters)
 
 
 class TestTheServerSideCostIsBoundedToo(unittest.TestCase):
@@ -578,7 +682,7 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
 
     def test_a_remote_host_encrypts_even_when_the_dsn_is_silent(self):
         env = compare._connection_env("postgres://bob@db.example/things")
-        self.assertEqual(env["PGSSLMODE"], "require")
+        self.assertEqual(env["PGSSLMODE"], compare.DEFAULT_SSLMODE)
 
     def test_a_remote_host_cannot_ask_for_plaintext(self):
         for mode in ("disable", "allow", "prefer"):
@@ -624,7 +728,7 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
     def test_an_inherited_sslmode_cannot_survive_a_remote_dsn(self):
         with unittest.mock.patch.dict("os.environ", {"PGSSLMODE": "disable"}):
             env = compare._connection_env("postgres://bob@db.example/things")
-        self.assertEqual(env["PGSSLMODE"], "require")
+        self.assertEqual(env["PGSSLMODE"], compare.DEFAULT_SSLMODE)
 
     def test_the_rest_of_the_environment_is_left_alone(self):
         with unittest.mock.patch.dict("os.environ", {"HOME": "/home/bob"}):
@@ -655,6 +759,44 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         with self.assertRaises(SystemExit) as e:
             compare._connection_env("postgres://bob@db.example/things?madeup=1")
         self.assertIn("madeup", str(e.exception))
+
+    def test_the_startup_file_is_disabled(self):
+        """A .psqlrc can \\set over the bindings, redirect output with \\o, or run a
+        shell command with \\!."""
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1")
+        self.assertIn("-X", run.call_args[0][0])
+
+    def test_psql_own_environment_is_dropped_too(self):
+        """PSQLRC does not start with PG, so the libpq strip does not reach it."""
+        with unittest.mock.patch.dict("os.environ", {"PSQLRC": "/tmp/evil"}):
+            env = compare._connection_env("postgres://bob@127.0.0.1/things")
+        self.assertNotIn("PSQLRC", env)
+
+    def test_a_remote_host_authenticates_the_server_by_default(self):
+        """require encrypts but accepts any certificate, so it stops eavesdropping
+        and not impersonation."""
+        env = compare._connection_env("postgres://bob@db.example/things")
+        self.assertEqual(env["PGSSLMODE"], "verify-full")
+
+    def test_a_weaker_encrypted_mode_is_still_available_by_name(self):
+        env = compare._connection_env("postgres://bob@db.example/t?sslmode=require")
+        self.assertEqual(env["PGSSLMODE"], "require")
+
+    def test_a_psql_in_a_world_writable_directory_is_refused(self):
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        _os.chmod(directory, 0o777)
+        binary = _p.Path(directory, "psql")
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        with unittest.mock.patch.dict("os.environ",
+                                      {"PATH": "%s:%s" % (directory, _os.environ["PATH"])}):
+            with self.assertRaises(SystemExit) as e:
+                compare._psql_binary()
+        self.assertIn("writable by other accounts", str(e.exception))
 
     def test_psql_is_resolved_to_an_absolute_path(self):
         """A writable directory earlier on PATH would otherwise receive every row."""

@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime
@@ -45,10 +46,19 @@ LIBPQ_OPTIONS = {
     "connect_timeout": "PGCONNECT_TIMEOUT", "application_name": "PGAPPNAME",
 }
 
+# psql's own environment, which the PG* strip does not cover.
+PSQL_VARIABLES = {"PSQLRC", "PSQL_HISTORY", "PSQL_PAGER", "PAGER", "PSQL_EDITOR",
+                  "EDITOR", "VISUAL"}
+
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", None, ""}
 
-# The libpq modes that permit a plaintext or unauthenticated session.
+# The libpq modes that permit a plaintext session.
 UNENCRYPTED_SSLMODES = {"disable", "allow", "prefer"}
+
+# require encrypts but accepts any certificate, so it stops eavesdropping and not
+# impersonation. verify-full is the default; the weaker encrypted modes are available
+# to an operator who asks for one by name.
+DEFAULT_SSLMODE = "verify-full"
 
 
 def _connection_env(dsn):
@@ -84,7 +94,8 @@ def _connection_env(dsn):
     # destination and the policy come from different places: a hostless DSN would
     # take PGHOST from the environment and still be judged local, and an inherited
     # PGSSLMODE or PGSERVICE would outlive every check below.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("PG")}
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("PG") and k not in PSQL_VARIABLES}
     # A read-only report is never worth holding a connection open for minutes. This
     # is the server-side bound; the subprocess timeout is only the outer backstop.
     env["PGOPTIONS"] = "-c statement_timeout=%d" % STATEMENT_TIMEOUT_MS
@@ -105,7 +116,7 @@ def _connection_env(dsn):
         # libpq defaults to prefer, which accepts an unverified or plaintext session.
         # A tunnel terminates on the loopback and is exempt; anything else must
         # encrypt, whether by omission or by asking for a weaker mode outright.
-        mode = options.get("sslmode", "require")
+        mode = options.get("sslmode", DEFAULT_SSLMODE)
         if mode in UNENCRYPTED_SSLMODES:
             sys.exit("sslmode=%s would send customer data over an unencrypted or "
                      "unverified connection to %s; use require or stronger"
@@ -129,6 +140,18 @@ def _psql_binary():
     found = shutil.which("psql")
     if not found or not os.path.isabs(found):
         sys.exit("psql not found on PATH")
+    directory = os.path.dirname(found)
+    info = os.stat(directory)
+    # Anyone who can write the directory can replace the binary, and it would be handed
+    # the connection and asked for numbers this reports as fact. World-writable is
+    # always wrong. Group-writable is only wrong when someone else owns the directory:
+    # a package manager prefix owned by this user, or a system path owned by root, is
+    # writable by people who could replace the binary through other means anyway.
+    writable_by_others = info.st_mode & stat.S_IWOTH or (
+        info.st_mode & stat.S_IWGRP and info.st_uid not in (os.getuid(), 0))
+    if writable_by_others:
+        sys.exit("%s is writable by other accounts; refusing to run the psql in it"
+                 % directory)
     return found
 
 
@@ -139,8 +162,14 @@ def psql(dsn, sql, params=None):
     Values are bound through psql variables and referenced as :'name', which applies
     literal quoting on psql's side. Nothing the caller supplies is pasted into SQL.
     """
-    command = [_psql_binary(), "-At", "-v", "ON_ERROR_STOP=1"]
+    # -X: a startup file can \set over these bindings, redirect output with \o, or run
+    # a shell command with \!, none of which the PG* strip covers.
+    command = [_psql_binary(), "-At", "-X", "-v", "ON_ERROR_STOP=1"]
     for name, value in (params or {}).items():
+        # -v, despite putting the value in argv. \set on stdin is not an alternative:
+        # it reads its argument as psql tokens, so a value containing a quote, a space
+        # or a backslash arrives mangled rather than as the literal. \getenv would do
+        # it but postdates the psql this has to run on.
         command += ["-v", "%s=%s" % (name, value)]
     # Fed on stdin, not through -c: psql only expands :'name' in what it reads as
     # input, so -c would send the placeholder to the server verbatim.
@@ -175,7 +204,7 @@ def _capped(rows):
     return rows[:ROW_CAP], len(rows) > ROW_CAP
 
 
-def fetch_db(dsn, email, app_label, days):
+def fetch_db(dsn, email, app_label, days, since=None, until=None):
     """What we hold for this user and tool, aggregated in the database and bounded.
 
     Values are counts, sums, digests and ids. Selecting the rows themselves would pull
@@ -186,16 +215,26 @@ def fetch_db(dsn, email, app_label, days):
     stored once is still visible as a loss. Tool calls come back as ids where the row
     carries one, because equal counts of different calls are not a match.
     """
-    params = {"email": email, "label": app_label, "days": int(days),
-              "cap": ROW_CAP + 1}
+    params = {"email": email, "label": app_label, "days": int(days), "cap": ROW_CAP + 1}
+    # An explicit interval when one is given, so the audit direction can ask about the
+    # hours its log still covers instead of the whole window. Comparing a few audited
+    # hours against fourteen stored days lets an older row cancel a recent loss.
+    if since:
+        params["since"] = since
+        bounds = ["gm.request_initialized_at >= :'since'::timestamptz"]
+    else:
+        bounds = ["gm.request_initialized_at >= now() - (:'days' || ' days')::interval"]
+    if until:
+        params["until"] = until
+        bounds.append("gm.request_initialized_at <= :'until'::timestamptz")
     where = """
         FROM gateway_metrics gm
         JOIN applications app ON app.id = gm.application_id
         JOIN gateway_users u ON u.id = app.owner_user_id
         WHERE lower(u.email) = lower(:'email')
           AND gm.app_label = :'label'
-          AND gm.request_initialized_at >= now() - (:'days' || ' days')::interval
-    """
+          AND %s
+    """ % "\n          AND ".join(bounds)
     # The same trim, collapse and fold _norm applies, then a digest, so the two sides
     # are comparable without carrying the text across. Whole text, no prefix: distinct
     # prompts sharing an opening would otherwise reconcile against each other.
@@ -264,7 +303,7 @@ def fetch_db(dsn, email, app_label, days):
         "call_ids": {r["call_id"] for r in call_ids if r["call_id"]},
         # Whether ids cover enough of the stored rows to reconcile by identity. Below
         # this the rows predate the id being recorded and only counts are available.
-        "ids_are_representative": bool(stored_calls) and with_id >= stored_calls * 0.9,
+        "ids_are_representative": bool(stored_calls) and with_id >= stored_calls * ID_COVERAGE,
         "rows_with_call_id": with_id,
         "user_digests": Counter({r["h"]: int(r["n"]) for r in digests
                                  if r["role"] == "user"}),
@@ -312,7 +351,19 @@ def _norm(text):
     return " ".join((text or "").split()).lower()
 
 
-def compare(tool, local, db, days):
+# Below this share of records carrying an id, matching on identity would skip more
+# than it checked, so counting is the honest method.
+ID_COVERAGE = 0.9
+
+
+def _ids_are_usable(records):
+    """Whether these records carry ids often enough to match on them."""
+    if not records:
+        return True
+    return sum(1 for r in records if r.get("call_id")) >= len(records) * ID_COVERAGE
+
+
+def compare(tool, local, db, days, db_audit=None):
     """Return a list of findings. Each is one problem, with its evidence."""
     findings = []
     transcript = local["transcript"]
@@ -394,12 +445,27 @@ def compare(tool, local, db, days):
 
     # ---- tool calls ----------------------------------------------------
     local_tools = Counter(r.get("tool") for r in by_kind["tool_call"] if r.get("tool"))
-    # Ids are only usable when nearly every stored row has one and the cap returned
-    # them all; a truncated id set would make present calls look absent.
-    by_identity = db["ids_are_representative"] and "tool call ids" not in db["truncated"]
+    # Ids are only usable when both sides carry them: matching on identity skips any
+    # record without one, so a source that records no ids would be compared against
+    # nothing and report nothing. Cursor transcripts carry none at all, which is why
+    # this is a gate rather than an assumption. A truncated id set is unusable too,
+    # because the ids it did not return would make present calls look absent.
+    by_identity = (db["ids_are_representative"]
+                   and _ids_are_usable(by_kind["tool_call"])
+                   and "tool call ids" not in db["truncated"])
     if by_identity:
         # Identity, not arithmetic: five stored calls and five local calls can be ten
         # different calls, which counting alone reports as agreement.
+        unidentified = [r for r in by_kind["tool_call"] if not r.get("call_id")]
+        if unidentified:
+            findings.append({
+                "title": "Some local tool calls carry no id and were not matched",
+                "where": "%s transcripts" % tool,
+                "evidence": "%d of %d local call(s) have no id"
+                            % (len(unidentified), len(by_kind["tool_call"])),
+                "why": "Identity matching skips a record without an id, so these were "
+                       "not compared either way.",
+            })
         absent = [r for r in by_kind["tool_call"]
                   if r.get("call_id") and r["call_id"] not in db["call_ids"]]
         if absent and db["metrics_rows"]:
@@ -438,9 +504,9 @@ def compare(tool, local, db, days):
                 "evidence": "; ".join("%s local %d vs stored %d"
                                       % (n, local_tools[n], db["tool_counts"].get(n, 0))
                                       for n, _ in worst),
-                "why": "Too few stored rows carry a tool_use_id to match calls "
-                       "individually, so this counts them instead: equal counts of "
-                       "different calls would read as agreement.",
+                "why": "Too few records on one side or the other carry a tool_use_id "
+                       "to match calls individually, so this counts them instead: "
+                       "equal counts of different calls would read as agreement.",
             })
 
     # ---- tokens --------------------------------------------------------
@@ -502,10 +568,28 @@ def compare(tool, local, db, days):
         # audit -> database: the hook saw it and the upload lost it. This is the only
         # direction that separates an ingest failure from a capture bug, and for a tool
         # whose audit log is its only local record it is the only check there is.
+        # The database side of this direction covers the audit log's own interval.
+        # Against the whole window an older stored row cancels a recent lost one.
+        dba = db_audit or db
         logged = [r for r in audit_by_kind["tool_call"] if in_window(r)]
-        if by_identity:
+        audit_by_identity = (dba["ids_are_representative"]
+                             and "tool call ids" not in dba["truncated"]
+                             and _ids_are_usable(logged))
+        if not audit_by_identity and logged:
+            # The two directions can use different methods: a tool may stamp ids in its
+            # transcript and not in the hook log. Saying so keeps a clean audit result
+            # from reading as strongly as a clean transcript one.
+            findings.append({
+                "title": "The upload direction could only be reconciled by count",
+                "where": local["audit_log"],
+                "evidence": "%d of %d logged call(s) carry an id"
+                            % (sum(1 for r in logged if r.get("call_id")), len(logged)),
+                "why": "A lost call is invisible here whenever another call of the same "
+                       "name was stored in its place.",
+            })
+        if audit_by_identity:
             dropped = [r for r in logged
-                       if r.get("call_id") and r["call_id"] not in db["call_ids"]]
+                       if r.get("call_id") and r["call_id"] not in dba["call_ids"]]
             if dropped:
                 findings.append({
                     "title": "The hook logged tool calls the database never received",
@@ -521,9 +605,9 @@ def compare(tool, local, db, days):
                 })
         else:
             counts = Counter(r.get("tool") for r in logged if r.get("tool"))
-            dropped = {name: counts[name] - db["tool_counts"].get(name, 0)
+            dropped = {name: counts[name] - dba["tool_counts"].get(name, 0)
                        for name in counts
-                       if counts[name] > db["tool_counts"].get(name, 0)}
+                       if counts[name] > dba["tool_counts"].get(name, 0)}
             if dropped:
                 worst = sorted(dropped.items(), key=lambda kv: -kv[1])[:3]
                 findings.append({
@@ -531,19 +615,20 @@ def compare(tool, local, db, days):
                              "(by count)",
                     "where": "%s -> prompt_analytics.tool_name" % local["audit_log"],
                     "evidence": "; ".join("%s logged %d vs stored %d"
-                                          % (n, counts[n], db["tool_counts"].get(n, 0))
+                                          % (n, counts[n], dba["tool_counts"].get(n, 0))
                                           for n, _ in worst),
-                    "why": "Too few stored rows carry a tool_use_id to match calls "
-                           "individually, so this counts them instead.",
+                    "why": "Too few records on one side or the other carry a "
+                           "tool_use_id to match calls individually, so this counts "
+                           "them instead.",
                 })
 
         logged_prompts = Counter(_digest(r["text"]) for r in audit_by_kind["user_prompt"]
                                  if in_window(r) and r.get("text"))
-        dropped_prompts = logged_prompts - db["user_digests"]
+        dropped_prompts = logged_prompts - dba["user_digests"]
         first = next((r["text"] for r in audit_by_kind["user_prompt"]
                       if in_window(r) and r.get("text")
                       and dropped_prompts.get(_digest(r["text"]))), "(text unavailable)")
-        if dropped_prompts and db["metrics_rows"]:
+        if dropped_prompts and dba["metrics_rows"]:
             findings.append({
                 "title": "The hook logged prompts the database never received",
                 "where": "%s -> prompts.user_prompt" % local["audit_log"],
@@ -606,7 +691,14 @@ def main():
               "days": days, "since": local_all["since"], "tools": {}}
     for tool, local in local_all["tools"].items():
         db = fetch_db(dsn, args.email, APP_LABEL[tool], days)
-        findings = compare(tool, local, db, days)
+        # A second, narrower aggregate covering exactly what the audit log still holds.
+        # The upload direction is reconciled against this, not against the whole window.
+        db_audit = None
+        if local.get("audit_window_start"):
+            db_audit = fetch_db(dsn, args.email, APP_LABEL[tool], days,
+                                since=local["audit_window_start"],
+                                until=local.get("audit_window_end"))
+        findings = compare(tool, local, db, days, db_audit)
         if db["truncated"]:
             # Said out loud rather than left to look like a clean run: past the cap the
             # unreturned rows would each read as a loss that never happened.
@@ -628,8 +720,15 @@ def main():
                 "db_tool_calls": sum(db["tool_counts"].values()),
                 "db_prompts": sum(db["user_digests"].values())
                               + sum(db["assistant_digests"].values()),
-                "tool_calls_matched_by": ("tool_use_id"
-                                          if db["ids_are_representative"] else "count"),
+                # What the run actually did, not what the stored rows alone allow:
+                # identity needs ids on both sides.
+                "tool_calls_matched_by": (
+                    "tool_use_id"
+                    if (db["ids_are_representative"]
+                        and "tool call ids" not in db["truncated"]
+                        and _ids_are_usable([r for r in local["transcript"]
+                                             if r.get("kind") == "tool_call"]))
+                    else "count"),
                 "truncated": db["truncated"],
             },
         }

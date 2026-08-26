@@ -49,8 +49,10 @@ owner-only) or names a file with `?passfile=`, and the DSN stays passwordless.
 The DSN is the only thing that decides where this connects and how. `compare.py`
 starts psql from an environment stripped of every `PG*` variable, so an inherited
 `PGHOST`, `PGSSLMODE` or `PGSERVICE` cannot send it somewhere the DSN did not name.
-Anything but a loopback host must encrypt: pass `?sslmode=verify-full` and
-`?sslrootcert=` in the DSN itself.
+Anything but a loopback host gets `sslmode=verify-full` unless the DSN names a mode
+itself, so the server is authenticated and not merely encrypted to. Pass
+`?sslrootcert=` alongside it when the certificate needs a specific root. The modes
+that allow a plaintext session are refused outright.
 
 **development** — a local Postgres. Read the database name, user, host and port from
 `ai-gateway-data/.env` (`DATABASE_NAME`, `DATABASE_USER`, `DATABASE_HOST`,
