@@ -950,6 +950,30 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
             compare._connection_env("postgres://bob@db.example/things?madeup=1")
         self.assertIn("madeup", str(e.exception))
 
+    def test_no_bind_value_reaches_the_process_arguments(self):
+        """The scanned user's email was on the command line, readable by every local
+        account for the length of the query."""
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1",
+                             {"email": "someone@example.com", "days": 14})
+        argv = run.call_args[0][0]
+        self.assertNotIn("someone@example.com", " ".join(argv))
+        self.assertNotIn("14", " ".join(a for a in argv if a != "-At"))
+
+    def test_the_bind_values_still_arrive(self):
+        """Off the command line is only useful if psql still receives them."""
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1",
+                             {"email": "someone@example.com"})
+        fed = run.call_args[1]["input"]
+        self.assertIn("\\set email", fed)
+
     def test_the_startup_file_is_disabled(self):
         """A .psqlrc can \\set over the bindings, redirect output with \\o, or run a
         shell command with \\!."""
@@ -1035,7 +1059,33 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
 
     def test_a_symlink_to_a_safe_target_is_accepted(self):
         directory = self._psql_at(0o755, 0o755, via_symlink=True)
-        self.assertTrue(self._resolve_with(directory))
+        got = self._resolve_with(directory)
+        self.assertTrue(got)
+
+    def test_the_resolved_target_is_what_runs(self):
+        """Running the name again would re-follow a link that could have been
+        repointed since it was checked."""
+        import os as _os
+        directory = self._psql_at(0o755, 0o755, via_symlink=True)
+        self.assertEqual(self._resolve_with(directory),
+                         _os.path.realpath(_os.path.join(directory, "psql-real")))
+
+    def test_a_link_owned_by_another_account_is_refused(self):
+        """Its owner can delete and recreate it, so a sound target proves nothing."""
+        import os as _os
+        directory = self._psql_at(0o755, 0o755, via_symlink=True)
+        link = _os.path.join(directory, "psql")
+        real_lstat = _os.lstat
+
+        def foreign(path, *a, **k):
+            info = real_lstat(path, *a, **k)
+            if str(path) == link:
+                return _os.stat_result((info.st_mode, 0, 0, 1, 4242, 4242, 0, 0, 0, 0))
+            return info
+
+        with unittest.mock.patch("os.lstat", side_effect=foreign):
+            with self.assertRaises(SystemExit):
+                self._resolve_with(directory)
 
     def test_a_writable_directory_above_the_binary_is_refused(self):
         """Writing the parent lets you swap the whole bin directory, so a sound
@@ -1120,7 +1170,7 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
                                       {"PATH": "%s:%s" % (directory, _os.environ["PATH"])}):
             with unittest.mock.patch.object(compare, "_group_members",
                                             return_value={me, "root"}):
-                self.assertEqual(compare._psql_binary(), str(binary))
+                self.assertEqual(compare._psql_binary(), os.path.realpath(str(binary)))
 
     def test_unknown_group_membership_is_treated_as_shared(self):
         """A group this cannot enumerate is not one to vouch for."""
@@ -1138,7 +1188,7 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
 
     def test_an_explicit_path_must_still_be_absolute_and_executable(self):
         clean = _a_psql()
-        self.assertEqual(compare._psql_binary(clean), clean)
+        self.assertEqual(compare._psql_binary(clean), os.path.realpath(clean))
         for bad in ("relative/psql", "/nonexistent/psql"):
             with self.subTest(path=bad):
                 with self.assertRaises(SystemExit):
@@ -1163,7 +1213,8 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         binary.write_text("#!/bin/sh\nexit 0\n")
         binary.chmod(0o777)
         with unittest.mock.patch.object(compare, "ACCEPT_SHARED_PSQL", True):
-            self.assertEqual(compare._psql_binary(str(binary)), str(binary))
+            self.assertEqual(compare._psql_binary(str(binary)),
+                             os.path.realpath(str(binary)))
 
     def test_psql_is_resolved_to_an_absolute_path(self):
         """A writable directory earlier on PATH would otherwise receive every row.

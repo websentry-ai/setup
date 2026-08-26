@@ -23,6 +23,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from urllib.parse import parse_qsl, unquote, urlsplit
 from collections import Counter, defaultdict
@@ -166,11 +167,13 @@ def _ancestors(path):
         current = parent
 
 
-def _writable_by_others(path):
+def _writable_by_others(path, follow=True):
     """Whether anyone but this account and root can write it. Works for a file or a
-    directory: writing either one changes what gets run."""
+    directory: writing either one changes what gets run. follow=False asks about the
+    link itself, since a link somebody else owns can be repointed after it is checked
+    even when what it currently names is sound."""
     try:
-        info = os.stat(path)
+        info = os.stat(path) if follow else os.lstat(path)
     except OSError:
         return True
     # The owner can rewrite it whatever the mode says, so a 0755 path belonging to
@@ -208,12 +211,15 @@ def _psql_binary(explicit=None):
         found = shutil.which("psql")
         if not found or not os.path.isabs(found):
             sys.exit("psql not found on PATH")
-    # Every step that could be swapped: the real file behind any symlink, and every
-    # directory either name passes through. Checking one level catches replacing the
-    # binary and misses both editing it in place and swapping a directory above it.
+    # Every step that could be swapped: the name itself as a link, the real file behind
+    # it, and every directory either passes through. Checking one level catches
+    # replacing the binary and misses editing it in place, swapping a directory above
+    # it, or repointing a link somebody else owns.
     real = os.path.realpath(found)
-    for path in [real] + _ancestors(found) + _ancestors(real):
-        if not _writable_by_others(path):
+    suspect = [(found, False), (real, True)]
+    suspect += [(d, True) for d in _ancestors(found) + _ancestors(real)]
+    for path, follow in suspect:
+        if not _writable_by_others(path, follow):
             continue
         if ACCEPT_SHARED_PSQL:
             # Named and accepted by a person, which is a different thing from a check
@@ -224,7 +230,9 @@ def _psql_binary(explicit=None):
         sys.exit("%s is writable by accounts other than yours, so the psql this would "
                  "run could be changed. Point --psql at one they cannot, or pass "
                  "--allow-shared-psql as well to accept that risk." % path)
-    return found
+    # The resolved path, not the name it was found under: running the name again would
+    # re-follow a link that could have been repointed since it was checked.
+    return real
 
 
 def psql(dsn, sql, params=None):
@@ -237,20 +245,31 @@ def psql(dsn, sql, params=None):
     # -X: a startup file can \set over these bindings, redirect output with \o, or run
     # a shell command with \!, none of which the PG* strip covers.
     command = [_psql_binary(PSQL), "-At", "-X", "-v", "ON_ERROR_STOP=1"]
-    for name, value in (params or {}).items():
-        # -v, despite putting the value in argv. \set on stdin is not an alternative:
-        # it reads its argument as psql tokens, so a value containing a quote, a space
-        # or a backslash arrives mangled rather than as the literal. \getenv would do
-        # it but postdates the psql this has to run on.
-        command += ["-v", "%s=%s" % (name, value)]
     # Fed on stdin, not through -c: psql only expands :'name' in what it reads as
     # input, so -c would send the placeholder to the server verbatim.
     # The alias is deliberately unlikely: json_agg(alias) resolves to a *column* of
     # that name when one exists, which silently returns scalars instead of objects.
     statement = ("SELECT coalesce(json_agg(_drift_row), '[]') FROM (%s) _drift_row;"
                  % sql.rstrip().rstrip(";"))
-    result = subprocess.run(command, input=statement, capture_output=True, text=True,
-                            timeout=180, env=_connection_env(dsn))
+    # Bindings reach psql through owner-only files it reads for itself, so no value
+    # appears in this process's arguments where every local account can read them.
+    # \set on stdin cannot carry them: it reads its argument as psql tokens, so a
+    # value holding a quote, a space or a backslash arrives mangled. \getenv would,
+    # but postdates the psql this has to run on.
+    work = tempfile.mkdtemp()
+    try:
+        preamble = ""
+        for name, value in (params or {}).items():
+            path = os.path.join(work, name)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(str(value))
+            preamble += "\\set %s `/bin/cat '%s'`\n" % (name, path)
+        result = subprocess.run(command, input=preamble + statement,
+                                capture_output=True, text=True,
+                                timeout=180, env=_connection_env(dsn))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
     if result.returncode != 0:
         error = _scrub(result.stderr, dsn).strip()
         if "statement timeout" in error.lower():
@@ -814,7 +833,8 @@ def main():
     ap.add_argument("--out", help="write the report here, owner-only. A shell "
                                   "redirect would use the umask instead")
     ap.add_argument("--psql", help="an absolute path to a psql to use instead of the "
-                                   "one on PATH, for when its directory is shared")
+                                   "one on PATH. Checked the same way, so it names a "
+                                   "better binary rather than skipping the question")
     ap.add_argument("--allow-shared-psql", action="store_true",
                     help="run a psql that other local accounts can change. They could "
                          "make it report anything")
