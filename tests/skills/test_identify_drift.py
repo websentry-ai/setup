@@ -974,6 +974,27 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         fed = run.call_args[1]["input"]
         self.assertIn("\\set email", fed)
 
+    def test_the_binding_survives_an_awkward_temporary_directory(self):
+        """The path goes into a shell command, and TMPDIR is whatever the operator
+        has set. One apostrophe in it left the value empty instead of failing, which
+        would have the query run on a blank email and report invented losses."""
+        import subprocess, tempfile, os as _os
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        for awkward in ("we'ird", "sp ace", "dollar$x", "back\\slash"):
+            with self.subTest(tmpdir=awkward):
+                base = _os.path.join(tempfile.mkdtemp(), awkward)
+                _os.makedirs(base)
+                with unittest.mock.patch.dict("os.environ", {"TMPDIR": base}):
+                    with unittest.mock.patch("subprocess.run", return_value=done) as run:
+                        with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                            compare.psql("postgres://bob@127.0.0.1/t", "SELECT 1",
+                                         {"email": "someone@example.com"})
+                fed = run.call_args[1]["input"]
+                line = [l for l in fed.splitlines() if l.startswith("\\set email")][0]
+                # the path is one shell word, so cat receives the file and not fragments
+                import shlex
+                self.assertEqual(len(shlex.split(line.split("`")[1])), 2, line)
+
     def test_the_startup_file_is_disabled(self):
         """A .psqlrc can \\set over the bindings, redirect output with \\o, or run a
         shell command with \\!."""
@@ -1069,6 +1090,23 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         directory = self._psql_at(0o755, 0o755, via_symlink=True)
         self.assertEqual(self._resolve_with(directory),
                          _os.path.realpath(_os.path.join(directory, "psql-real")))
+
+    def test_a_symlinks_permission_bits_are_ignored(self):
+        """Linux creates every symlink 0777 and the kernel ignores the bits. Reading
+        them refuses a perfectly sound link on Linux while passing on macOS, which is
+        how this differed between the two."""
+        import os as _os, stat as _stat
+        directory = self._psql_at(0o755, 0o755, via_symlink=True)
+        real_lstat = _os.lstat
+
+        def like_linux(path, *a, **k):
+            info = real_lstat(path, *a, **k)
+            if _stat.S_ISLNK(info.st_mode):
+                return _os.stat_result((_stat.S_IFLNK | 0o777,) + tuple(info)[1:])
+            return info
+
+        with unittest.mock.patch("os.lstat", side_effect=like_linux):
+            self.assertTrue(self._resolve_with(directory))
 
     def test_a_link_owned_by_another_account_is_refused(self):
         """Its owner can delete and recreate it, so a sound target proves nothing."""

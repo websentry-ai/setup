@@ -19,6 +19,7 @@ import json
 import os
 import grp
 import pwd
+import shlex
 import shutil
 import stat
 import subprocess
@@ -180,6 +181,11 @@ def _writable_by_others(path, follow=True):
     # another account is not safe just because the group and world bits are clear.
     if info.st_uid not in (os.getuid(), 0):
         return True
+    if stat.S_ISLNK(info.st_mode):
+        # A symlink's permission bits mean nothing: Linux creates every one of them
+        # 0777 and the kernel ignores them. Who owns it, and the directory holding it,
+        # are what decide whether it can be repointed, and both are checked already.
+        return False
     if stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX:
         # A sticky directory lets anyone create entries but only the owner of an entry
         # may replace or remove it, which is the whole concern here. /tmp is 1777.
@@ -264,7 +270,10 @@ def psql(dsn, sql, params=None):
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(str(value))
-            preamble += "\\set %s `/bin/cat '%s'`\n" % (name, path)
+            # shlex.quote, not a hand-written pair of quotes: the directory comes
+            # from TMPDIR, and one apostrophe in it would end the quoting and leave
+            # the value empty rather than failing.
+            preamble += "\\set %s `/bin/cat %s`\n" % (name, shlex.quote(path))
         result = subprocess.run(command, input=preamble + statement,
                                 capture_output=True, text=True,
                                 timeout=180, env=_connection_env(dsn))
