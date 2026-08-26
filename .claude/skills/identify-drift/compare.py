@@ -19,6 +19,7 @@ import json
 import os
 import grp
 import pwd
+import re
 import shutil
 import stat
 import subprocess
@@ -265,8 +266,16 @@ def psql(dsn, sql, params=None):
     is parsed as SQL, and nothing of it reaches this process's arguments, where every
     local account could read it.
     """
-    for name, value in (params or {}).items():
-        sql = sql.replace(":'%s'" % name, _sql_literal(value))
+    # One left-to-right pass, so a value that happens to contain another marker is
+    # not rewritten by a later substitution. Replacing them one name at a time let an
+    # email holding :'label' be edited inside its own finished literal.
+    def _bind(match):
+        name = match.group(1)
+        if name not in (params or {}):
+            sys.exit("query refers to :'%s', which was never given a value" % name)
+        return _sql_literal((params or {})[name])
+
+    sql = re.sub(r":'([a-z_]+)'", _bind, sql)
     # -X: a startup file can \set over the query, redirect output with \o, or run a
     # shell command with \!, none of which the PG* strip covers.
     command = [_psql_binary(PSQL), "-At", "-X", "-v", "ON_ERROR_STOP=1"]

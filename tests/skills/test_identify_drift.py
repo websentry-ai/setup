@@ -991,6 +991,43 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
     def test_the_tag_moves_when_the_value_contains_it(self):
         self.assertTrue(compare._sql_literal("$drift$").startswith("$drift1$"))
 
+    def test_every_marker_in_a_query_is_substituted(self):
+        """A marker left in place is sent to the server verbatim, which only shows at
+        runtime. fetch_db builds five statements across several parameter sets."""
+        import re, subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.fetch_db("postgres://bob@127.0.0.1/t", "someone@example.com",
+                                 "claude-code", 14, since="2026-08-01T00:00:00+00:00",
+                                 until="2026-08-05T00:00:00+00:00")
+        self.assertGreater(run.call_count, 1)
+        for call in run.call_args_list:
+            statement = call[1]["input"]
+            self.assertEqual(re.findall(r":'[a-z_]+'", statement), [], statement[:200])
+
+    def test_a_value_holding_another_marker_is_not_rewritten(self):
+        """Substituting one name at a time let a later pass edit text inside an
+        already-finished literal, so an email containing :'label' came out changed."""
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        hostile = "victim:'label'@example.com"
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.psql("postgres://bob@127.0.0.1/t",
+                             "SELECT :'email' AS v, :'label' AS w",
+                             {"email": hostile, "label": "claude-code"})
+        fed = run.call_args[1]["input"]
+        self.assertIn("$drift$%s$drift$" % hostile, fed)
+
+    def test_a_marker_with_no_value_is_refused(self):
+        """It would otherwise reach the server verbatim and fail there."""
+        with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+            with self.assertRaises(SystemExit) as e:
+                compare.psql("postgres://bob@127.0.0.1/t", "SELECT :'nope' AS v",
+                             {"email": "x"})
+        self.assertIn("nope", str(e.exception))
+
     def test_the_startup_file_is_disabled(self):
         """A .psqlrc can \\set over the bindings, redirect output with \\o, or run a
         shell command with \\!."""
