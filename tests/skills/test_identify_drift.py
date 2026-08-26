@@ -942,13 +942,28 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         with unittest.mock.patch.dict("os.environ", {"PATH": directory}):
             return compare._psql_binary()
 
-    def test_a_writable_binary_in_a_safe_directory_is_refused(self):
+    def test_a_world_writable_binary_in_a_safe_directory_is_refused(self):
         """Checking the directory catches replacing the file. It does not catch
         editing the file that is already there."""
-        for bin_mode in (0o777, 0o775):
-            with self.subTest(mode=oct(bin_mode)):
-                with self.assertRaises(SystemExit):
-                    self._resolve_with(self._psql_at(0o755, bin_mode))
+        with self.assertRaises(SystemExit):
+            self._resolve_with(self._psql_at(0o755, 0o777))
+
+    def test_a_group_writable_binary_in_a_shared_group_is_refused(self):
+        """Whether a group is shared depends on the machine, so the membership is
+        stated here rather than inherited from whatever group temp files land in."""
+        directory = self._psql_at(0o755, 0o775)
+        with unittest.mock.patch.object(compare, "_group_members",
+                                        return_value={"someone-else"}):
+            with self.assertRaises(SystemExit):
+                self._resolve_with(directory)
+
+    def test_a_group_writable_binary_in_a_private_group_is_accepted(self):
+        import pwd as _pwd
+        directory = self._psql_at(0o755, 0o775)
+        me = _pwd.getpwuid(os.getuid()).pw_name
+        with unittest.mock.patch.object(compare, "_group_members",
+                                        return_value={me, "root"}):
+            self.assertTrue(self._resolve_with(directory))
 
     def test_a_symlink_to_a_writable_target_is_refused(self):
         """The name on PATH is often a link; what runs is what it points at."""
@@ -958,6 +973,43 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
     def test_a_symlink_to_a_safe_target_is_accepted(self):
         directory = self._psql_at(0o755, 0o755, via_symlink=True)
         self.assertTrue(self._resolve_with(directory))
+
+    def test_a_writable_directory_above_the_binary_is_refused(self):
+        """Writing the parent lets you swap the whole bin directory, so a sound
+        directory inside a shared one is not sound."""
+        import os as _os, tempfile, pathlib as _p
+        parent = tempfile.mkdtemp()
+        inner = _p.Path(parent, "bin")
+        inner.mkdir()
+        binary = inner / "psql"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        _os.chmod(inner, 0o755)
+        _os.chmod(parent, 0o777)
+        with self.assertRaises(SystemExit):
+            self._resolve_with(str(inner))
+
+    def test_a_sticky_world_writable_parent_is_not_a_hazard(self):
+        """/tmp is 1777: anyone may create an entry, only its owner may replace it.
+        Treating that as unsafe would refuse every path under it for no gain."""
+        import os as _os, tempfile, pathlib as _p
+        parent = tempfile.mkdtemp()
+        _os.chmod(parent, 0o1777)
+        self.assertFalse(compare._writable_by_others(parent))
+        inner = _p.Path(parent, "bin")
+        inner.mkdir()
+        binary = inner / "psql"
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        _os.chmod(inner, 0o755)
+        self.assertTrue(self._resolve_with(str(inner)))
+
+    def test_a_plain_world_writable_parent_still_is(self):
+        """Without the sticky bit anyone can replace anyone's entry."""
+        import os as _os, tempfile
+        parent = tempfile.mkdtemp()
+        _os.chmod(parent, 0o777)
+        self.assertTrue(compare._writable_by_others(parent))
 
     def test_a_missing_path_counts_as_unsafe(self):
         self.assertTrue(compare._writable_by_others("/nonexistent/path/here"))
@@ -1020,12 +1072,11 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
                     compare._psql_binary(bad)
 
     def test_psql_is_resolved_to_an_absolute_path(self):
-        """A writable directory earlier on PATH would otherwise receive every row."""
-        import pwd as _pwd
-        me = _pwd.getpwuid(os.getuid()).pw_name
-        with unittest.mock.patch.object(compare, "_group_members",
-                                        return_value={me, "root"}):
-            self.assertTrue(os.path.isabs(compare._psql_binary()))
+        """A writable directory earlier on PATH would otherwise receive every row.
+        Uses a controlled tree: how a distribution packages psql is not this test's
+        subject, and Debian resolves it through a wrapper in a different prefix."""
+        directory = self._psql_at(0o755, 0o755)
+        self.assertTrue(os.path.isabs(self._resolve_with(directory)))
 
     def test_psql_missing_from_path_is_an_error_not_a_relative_call(self):
         with unittest.mock.patch("shutil.which", return_value=None):

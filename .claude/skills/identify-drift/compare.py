@@ -154,6 +154,18 @@ def _group_members(gid):
     return members
 
 
+def _ancestors(path):
+    """Every directory a path passes through. Writing any one of them swaps what the
+    step below it resolves to."""
+    out, current = [], os.path.dirname(os.path.abspath(path))
+    while True:
+        out.append(current)
+        parent = os.path.dirname(current)
+        if parent == current:
+            return out
+        current = parent
+
+
 def _writable_by_others(path):
     """Whether anyone but this account and root can write it. Works for a file or a
     directory: writing either one changes what gets run."""
@@ -161,6 +173,10 @@ def _writable_by_others(path):
         info = os.stat(path)
     except OSError:
         return True
+    if stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX:
+        # A sticky directory lets anyone create entries but only the owner of an entry
+        # may replace or remove it, which is the whole concern here. /tmp is 1777.
+        return False
     if info.st_mode & stat.S_IWOTH:
         return True
     if not info.st_mode & stat.S_IWGRP:
@@ -189,11 +205,11 @@ def _psql_binary(explicit=None):
     found = shutil.which("psql")
     if not found or not os.path.isabs(found):
         sys.exit("psql not found on PATH")
-    # Every step that could be swapped: the directory the name resolves in, the real
-    # file behind any symlink, and the directory that one sits in. Checking only the
-    # first catches replacing the binary and misses editing it in place.
+    # Every step that could be swapped: the real file behind any symlink, and every
+    # directory either name passes through. Checking one level catches replacing the
+    # binary and misses both editing it in place and swapping a directory above it.
     real = os.path.realpath(found)
-    for path in (os.path.dirname(found), real, os.path.dirname(real)):
+    for path in [real] + _ancestors(found) + _ancestors(real):
         if _writable_by_others(path):
             sys.exit("%s is writable by accounts other than yours, so the psql this "
                      "would run could be changed. Pass --psql with a path you trust."
