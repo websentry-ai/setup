@@ -785,6 +785,43 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
                                      MATCHED_DB, 14, empty))
         self.assertIn("The hook logged prompts the database never received", got)
 
+    def test_a_capped_full_window_aggregate_does_not_invent_losses_either(self):
+        """The same rule as the audit window: the cap bounds what came back, so what
+        it left out is not evidence of absence."""
+        capped = db(threads=(), tool_counts={}, call_ids=(), user_texts=(),
+                    assistant_texts=(), ids_are_representative=False,
+                    truncated=["sessions", "tool names", "prompts"])
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
+                                     capped, 14))
+        for invented in ("User prompts recorded locally are absent from the database",
+                         "Sessions present locally are absent from the database",
+                         "Tool calls made locally are under-recorded (by count)"):
+            self.assertNotIn(invented, got)
+        for said in ("Sessions could not be checked for this window",
+                     "Prompts could not be checked for this window",
+                     "Tool calls could not be checked for this window"):
+            self.assertIn(said, got)
+
+    def test_the_capped_notice_fires_for_assistant_messages_alone(self):
+        """A window with replies but no prompts must not skip the check in silence."""
+        t = [rec("assistant_message", text="unrecorded answer")]
+        capped = db(user_texts=(), assistant_texts=(), truncated=["prompts"])
+        got = titles(compare.compare("claude-code", local(t), capped, 14))
+        self.assertIn("Prompts could not be checked for this window", got)
+
+    def test_nothing_local_means_nothing_to_say(self):
+        capped = db(user_texts=(), assistant_texts=(), truncated=["prompts"])
+        got = titles(compare.compare("claude-code", local([]), capped, 14))
+        self.assertNotIn("Prompts could not be checked for this window", got)
+
+    def test_an_uncapped_full_window_still_reports_the_real_losses(self):
+        empty = db(threads=("elsewhere",), tool_counts={}, call_ids=(), user_texts=(),
+                   assistant_texts=(), ids_are_representative=False)
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
+                                     empty, 14))
+        self.assertIn("User prompts recorded locally are absent from the database", got)
+        self.assertIn("Tool calls made locally are under-recorded (by count)", got)
+
     def test_the_query_accepts_an_explicit_interval(self):
         import inspect
         sig = inspect.signature(compare.fetch_db)

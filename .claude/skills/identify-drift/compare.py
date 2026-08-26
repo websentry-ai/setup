@@ -447,6 +447,19 @@ def _ids_are_usable(records):
     return sum(1 for r in records if r.get("call_id")) >= len(records) * ID_COVERAGE
 
 
+def _cannot_check(what, where, why):
+    """A capped aggregate is not evidence of absence. Comparing against one turns every
+    row the cap left out into a loss that never happened, so the check says it could
+    not run instead of listing them."""
+    return {
+        "title": "%s could not be checked for this window" % what,
+        "where": where,
+        "evidence": "the stored %s hit the %d row cap" % (why, ROW_CAP),
+        "why": "Comparing against a capped set would report the rows it left out as "
+               "losses. Re-run over fewer days.",
+    }
+
+
 def compare(tool, local, db, days, db_audit=None):
     """Return a list of findings. Each is one problem, with its evidence."""
     findings = []
@@ -491,7 +504,13 @@ def compare(tool, local, db, days, db_audit=None):
 
     # ---- sessions ------------------------------------------------------
     local_sessions = set(local["sessions_transcript"]) | set(local["sessions_audit"])
-    missing_sessions = sorted(s for s in local_sessions if s and s not in db["threads"])
+    if "sessions" in db["truncated"] and local_sessions:
+        findings.append(_cannot_check("Sessions", "%s -> prompt_analytics.thread_id"
+                                      % tool, "sessions"))
+        missing_sessions = []
+    else:
+        missing_sessions = sorted(s for s in local_sessions
+                                  if s and s not in db["threads"])
     if missing_sessions and db["threads"]:
         findings.append({
             "title": "Sessions present locally are absent from the database",
@@ -504,10 +523,16 @@ def compare(tool, local, db, days, db_audit=None):
         })
 
     # ---- prompts -------------------------------------------------------
+    prompts_capped = "prompts" in db["truncated"]
+    if prompts_capped and (by_kind["user_prompt"] or by_kind["assistant_message"]):
+        findings.append(_cannot_check("Prompts", "%s transcripts -> prompts" % tool,
+                                      "prompts"))
     for kind, stored, label, column in (
             ("user_prompt", db["user_digests"], "user prompts", "user_prompt"),
             ("assistant_message", db["assistant_digests"], "assistant messages",
              "assistant_prompt")):
+        if prompts_capped:
+            continue
         # A multiset: the same prompt sent three times and stored once is two losses,
         # which comparing sets would report as none.
         local_counts = Counter(_digest(r["text"]) for r in by_kind[kind] if r.get("text"))
@@ -577,9 +602,16 @@ def compare(tool, local, db, days, db_audit=None):
                        "name was stored in its place. Findings below are counts, and a "
                        "clean result is not proof that every call arrived.",
             })
-        short = {name: local_tools[name] - db["tool_counts"].get(name, 0)
-                 for name in local_tools
-                 if local_tools[name] > db["tool_counts"].get(name, 0)}
+        if "tool names" in db["truncated"]:
+            if local_tools:
+                findings.append(_cannot_check(
+                    "Tool calls", "%s transcripts -> prompt_analytics.tool_name" % tool,
+                    "tool names"))
+            short = {}
+        else:
+            short = {name: local_tools[name] - db["tool_counts"].get(name, 0)
+                     for name in local_tools
+                     if local_tools[name] > db["tool_counts"].get(name, 0)}
         if short and db["metrics_rows"]:
             worst = sorted(short.items(), key=lambda kv: -kv[1])[:3]
             findings.append({
