@@ -87,6 +87,12 @@ python3 .claude/skills/identify-drift/compare.py \
                                                    # would use the umask
 ```
 
+If it refuses the `psql` on `PATH` because other accounts can write its directory,
+that is the check working, not a bug: whoever can write that directory can replace the
+binary this hands the connection to. A package-manager prefix is usually shared this
+way. Tell the operator, and re-run with `--psql` naming a path they trust, rather than
+loosening anything.
+
 `--out` creates both files owner-only, and refuses a symlink at the destination. The
 scan holds every prompt and reply in the window and the report quotes excerpts from
 it, so do not put either in a shared directory and do not keep them after the report

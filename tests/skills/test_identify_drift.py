@@ -311,6 +311,42 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
         finally:
             compare.REDACT = False
 
+    def test_no_finding_quotes_local_data_when_redacting(self):
+        """Redaction has to hold across every finding, not the two that remember to
+        call the helper. Session and call ids name a person's project and turn."""
+        import json as _json
+        secret = "CUSTOMERSECRETPHRASE"
+        t = [rec("user_prompt", text=secret + " one"),
+             rec("assistant_message", text=secret + " two"),
+             rec("tool_call", tool="Bash", call_id=secret + "-call"),
+             rec("usage", input=100, output=50)]
+        a = [rec("user_prompt", text=secret + " three"),
+             rec("tool_call", tool="Bash", call_id=secret + "-audit")]
+        loc = local(t, a, sessions_transcript=[secret + "-session"])
+        empty = db(threads=("somewhere-else",), tool_counts={}, call_ids=(),
+                   user_texts=(), assistant_texts=(), rows_with_call_id=10)
+        try:
+            compare.REDACT = True
+            found = compare.compare("claude-code", loc, empty, 14, empty)
+        finally:
+            compare.REDACT = False
+        self.assertTrue(found, "expected findings to check")
+        self.assertNotIn(secret, _json.dumps(found))
+
+    def test_the_same_run_does_quote_them_off_production(self):
+        """The redaction test would pass trivially if nothing were ever quoted."""
+        import json as _json
+        secret = "CUSTOMERSECRETPHRASE"
+        t = [rec("user_prompt", text=secret + " one"),
+             rec("assistant_message", text=secret + " two"),
+             rec("tool_call", tool="Bash", call_id=secret + "-call"),
+             rec("usage", input=100, output=50)]
+        loc = local(t, sessions_transcript=[secret + "-session"])
+        empty = db(threads=("somewhere-else",), tool_counts={}, call_ids=(),
+                   user_texts=(), assistant_texts=(), rows_with_call_id=10)
+        found = compare.compare("claude-code", loc, empty, 14, empty)
+        self.assertIn(secret, _json.dumps(found))
+
     def test_elsewhere_it_shows_enough_to_find_the_prompt(self):
         self.assertIn("customer", compare._excerpt("something a customer typed"))
 
@@ -365,6 +401,67 @@ class TestTheScannerReadsEveryFormat(unittest.TestCase):
     def test_a_missing_file_is_not_an_error(self):
         from pathlib import Path
         self.assertEqual(list(scan._lines(Path("/nonexistent/x.jsonl"))), [])
+
+
+class TestAnUndatedRecordStillHasAnAge(unittest.TestCase):
+    """A record with no timestamp of its own is never filtered by the window, so a
+    transcript from months ago is compared against a fourteen-day database window and
+    every prompt in it reads as lost. Cursor writes no per-record timestamp at all."""
+
+    def _cursor_transcript(self, age_days, body):
+        import os, tempfile, time
+        from pathlib import Path
+        home = Path(tempfile.mkdtemp())
+        path = home / ".cursor/projects/p/agent-transcripts/s/session.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text(body)
+        old_time = time.time() - age_days * 86400
+        os.utime(path, (old_time, old_time))
+        return home
+
+    def _scan(self, home, days=14):
+        import json as _json, subprocess, sys
+        from tests.conftest import REPO
+        env = dict(os.environ)
+        env["HOME"] = str(home)
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
+             "--tools", "cursor", "--days", str(days)],
+            capture_output=True, text=True, timeout=300, env=env, check=True)
+        return _json.loads(r.stdout)["tools"]["cursor"]["transcript"]
+
+    def test_an_undated_record_in_an_old_file_is_outside_the_window(self):
+        body = _json_line({"role": "user",
+                           "message": {"content": [{"type": "text", "text": "ancient"}]}})
+        got = self._scan(self._cursor_transcript(200, body))
+        self.assertEqual(got, [])
+
+    def test_an_undated_record_in_a_recent_file_is_inside_it(self):
+        body = _json_line({"role": "user",
+                           "message": {"content": [{"type": "text", "text": "recent"}]}})
+        got = self._scan(self._cursor_transcript(1, body))
+        self.assertEqual([r["text"] for r in got], ["recent"])
+
+    def test_the_fallback_gives_the_record_a_usable_time(self):
+        """Without one the localisation check silently compares nothing."""
+        body = _json_line({"role": "user",
+                           "message": {"content": [{"type": "text", "text": "recent"}]}})
+        got = self._scan(self._cursor_transcript(1, body))
+        self.assertTrue(got[0]["at"], "record has no timestamp to place it by")
+
+    def test_a_records_own_timestamp_still_wins(self):
+        """The file time is a fallback, not an override."""
+        from pathlib import Path
+        stamp = "2026-08-20T10:00:00+00:00"
+        body = _json_line({"role": "user", "timestamp": stamp,
+                           "message": {"content": [{"type": "text", "text": "dated"}]}})
+        got = self._scan(self._cursor_transcript(1, body))
+        self.assertEqual(got[0]["at"], stamp)
+
+
+def _json_line(document):
+    import json as _json
+    return _json.dumps(document) + "\n"
 
 
 class TestTheCommandLineActuallyRuns(unittest.TestCase):
@@ -656,8 +753,9 @@ class TestTheServerSideCostIsBoundedToo(unittest.TestCase):
             args=[], returncode=1,
             stdout="", stderr="ERROR:  canceling statement due to statement timeout")
         with unittest.mock.patch("subprocess.run", return_value=done):
-            with self.assertRaises(SystemExit) as e:
-                compare.psql("postgres://bob@db.example/things", "SELECT 1")
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                with self.assertRaises(SystemExit) as e:
+                    compare.psql("postgres://bob@db.example/things", "SELECT 1")
         self.assertIn("fewer days", str(e.exception))
 
     def test_other_errors_are_still_reported_verbatim(self):
@@ -665,8 +763,9 @@ class TestTheServerSideCostIsBoundedToo(unittest.TestCase):
         done = subprocess.CompletedProcess(
             args=[], returncode=1, stdout="", stderr='ERROR:  relation "nope" does not exist')
         with unittest.mock.patch("subprocess.run", return_value=done):
-            with self.assertRaises(SystemExit) as e:
-                compare.psql("postgres://bob@db.example/things", "SELECT 1")
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                with self.assertRaises(SystemExit) as e:
+                    compare.psql("postgres://bob@db.example/things", "SELECT 1")
         self.assertIn("does not exist", str(e.exception))
 
 
@@ -766,7 +865,8 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         import subprocess
         done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
         with unittest.mock.patch("subprocess.run", return_value=done) as run:
-            compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1")
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.psql("postgres://bob@127.0.0.1/things", "SELECT 1")
         self.assertIn("-X", run.call_args[0][0])
 
     def test_psql_own_environment_is_dropped_too(self):
@@ -796,11 +896,72 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
                                       {"PATH": "%s:%s" % (directory, _os.environ["PATH"])}):
             with self.assertRaises(SystemExit) as e:
                 compare._psql_binary()
-        self.assertIn("writable by other accounts", str(e.exception))
+        self.assertIn("writable by accounts other than yours", str(e.exception))
+
+    def test_a_shared_group_directory_is_refused_even_when_we_own_it(self):
+        """Owning the directory says nothing about who else is in its group. A prefix
+        owned by this user but group-writable by a group with other members can still
+        have its psql replaced."""
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        _os.chmod(directory, 0o775)
+        binary = _p.Path(directory, "psql")
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        with unittest.mock.patch.dict("os.environ",
+                                      {"PATH": "%s:%s" % (directory, _os.environ["PATH"])}):
+            with unittest.mock.patch.object(compare, "_group_members",
+                                            return_value={"someone-else"}):
+                with self.assertRaises(SystemExit):
+                    compare._psql_binary()
+
+    def test_a_private_group_directory_is_accepted(self):
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        _os.chmod(directory, 0o775)
+        binary = _p.Path(directory, "psql")
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        import pwd as _pwd
+        me = _pwd.getpwuid(_os.getuid()).pw_name
+        with unittest.mock.patch.dict("os.environ",
+                                      {"PATH": "%s:%s" % (directory, _os.environ["PATH"])}):
+            with unittest.mock.patch.object(compare, "_group_members",
+                                            return_value={me, "root"}):
+                self.assertEqual(compare._psql_binary(), str(binary))
+
+    def test_unknown_group_membership_is_treated_as_shared(self):
+        """A group this cannot enumerate is not one to vouch for."""
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        _os.chmod(directory, 0o775)
+        binary = _p.Path(directory, "psql")
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o755)
+        with unittest.mock.patch.dict("os.environ",
+                                      {"PATH": "%s:%s" % (directory, _os.environ["PATH"])}):
+            with unittest.mock.patch.object(compare, "_group_members", return_value=None):
+                with self.assertRaises(SystemExit):
+                    compare._psql_binary()
+
+    def test_an_explicit_path_is_taken_as_given(self):
+        """The operator naming a binary is an informed choice; it still has to be an
+        absolute path to something executable."""
+        import shutil as _shutil
+        real = _shutil.which("psql") or "/bin/sh"
+        self.assertEqual(compare._psql_binary(real), real)
+        for bad in ("relative/psql", "/nonexistent/psql"):
+            with self.subTest(path=bad):
+                with self.assertRaises(SystemExit):
+                    compare._psql_binary(bad)
 
     def test_psql_is_resolved_to_an_absolute_path(self):
         """A writable directory earlier on PATH would otherwise receive every row."""
-        self.assertTrue(os.path.isabs(compare._psql_binary()))
+        import pwd as _pwd
+        me = _pwd.getpwuid(os.getuid()).pw_name
+        with unittest.mock.patch.object(compare, "_group_members",
+                                        return_value={me, "root"}):
+            self.assertTrue(os.path.isabs(compare._psql_binary()))
 
     def test_psql_missing_from_path_is_an_error_not_a_relative_call(self):
         with unittest.mock.patch("shutil.which", return_value=None):
@@ -953,6 +1114,13 @@ def _run_compare(local_document):
         capture_output=True, text=True, timeout=60,
         env={"PATH": "/usr/bin:/bin", "HOME": str(work),
              "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1:5432/d"})
+
+
+def _a_psql():
+    """A binary the directory check will accept, so a test about something else does
+    not depend on how this machine's PATH happens to be owned."""
+    import shutil as _shutil
+    return _shutil.which("psql") or "/bin/sh"
 
 
 if __name__ == "__main__":

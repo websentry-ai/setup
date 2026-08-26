@@ -17,6 +17,8 @@ import argparse
 import hashlib
 import json
 import os
+import grp
+import pwd
 import shutil
 import stat
 import subprocess
@@ -134,24 +136,43 @@ def _scrub(text, dsn):
     return out
 
 
-def _psql_binary():
-    """An absolute psql, resolved once. A writable directory earlier on PATH would
-    otherwise receive the connection and every row this reads."""
+def _group_members(gid):
+    """Everyone in a group. gr_mem lists only the secondary members, so on a system
+    where a shared group is somebody's primary one it reads as empty."""
+    try:
+        members = set(grp.getgrgid(gid).gr_mem)
+    except KeyError:
+        return None
+    try:
+        members |= {u.pw_name for u in pwd.getpwall() if u.pw_gid == gid}
+    except Exception:
+        return None
+    return members
+
+
+def _psql_binary(explicit=None):
+    """An absolute psql, resolved once. Whoever can write the directory it sits in can
+    replace it, and it is handed the connection and asked for the numbers this reports
+    as fact, so a directory other accounts can write is not a place to take it from."""
+    if explicit:
+        if not os.path.isabs(explicit) or not os.access(explicit, os.X_OK):
+            sys.exit("--psql must be an absolute path to an executable")
+        return explicit
     found = shutil.which("psql")
     if not found or not os.path.isabs(found):
         sys.exit("psql not found on PATH")
     directory = os.path.dirname(found)
     info = os.stat(directory)
-    # Anyone who can write the directory can replace the binary, and it would be handed
-    # the connection and asked for numbers this reports as fact. World-writable is
-    # always wrong. Group-writable is only wrong when someone else owns the directory:
-    # a package manager prefix owned by this user, or a system path owned by root, is
-    # writable by people who could replace the binary through other means anyway.
-    writable_by_others = info.st_mode & stat.S_IWOTH or (
-        info.st_mode & stat.S_IWGRP and info.st_uid not in (os.getuid(), 0))
-    if writable_by_others:
-        sys.exit("%s is writable by other accounts; refusing to run the psql in it"
-                 % directory)
+    shared = None
+    if info.st_mode & stat.S_IWGRP:
+        members = _group_members(info.st_gid)
+        # Unknown membership counts as shared: a group this cannot enumerate is not one
+        # to vouch for.
+        owner = pwd.getpwuid(info.st_uid).pw_name if info.st_uid else "root"
+        shared = members is None or bool(members - {owner, "root"})
+    if info.st_mode & stat.S_IWOTH or shared:
+        sys.exit("%s is writable by accounts other than yours, so the psql in it could "
+                 "be replaced. Pass --psql with a path you trust." % directory)
     return found
 
 
@@ -164,7 +185,7 @@ def psql(dsn, sql, params=None):
     """
     # -X: a startup file can \set over these bindings, redirect output with \o, or run
     # a shell command with \!, none of which the PG* strip covers.
-    command = [_psql_binary(), "-At", "-X", "-v", "ON_ERROR_STOP=1"]
+    command = [_psql_binary(PSQL), "-At", "-X", "-v", "ON_ERROR_STOP=1"]
     for name, value in (params or {}).items():
         # -v, despite putting the value in argv. \set on stdin is not an alternative:
         # it reads its argument as psql tokens, so a value containing a quote, a space
@@ -317,6 +338,7 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
 
 
 REDACT = False
+PSQL = None
 
 
 def _parse(value):
@@ -342,6 +364,16 @@ def _digest(text):
     """The same value the query computes, so the two sides compare without the text
     ever leaving the database."""
     return hashlib.sha256(_norm(text).encode("utf-8")).hexdigest()
+
+
+def _ident(value):
+    """An identifier the operator can search for, or a stable stand-in for it. Session
+    and call ids name a person's project and turn, so production gets the stand-in."""
+    if not value:
+        return "(none)"
+    if REDACT:
+        return "id:%s" % hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return value
 
 
 def _norm(text):
@@ -414,7 +446,7 @@ def compare(tool, local, db, days, db_audit=None):
             "where": "%s -> prompt_analytics.thread_id" % tool,
             "evidence": "%d of %d local sessions have no row. First: %s"
                         % (len(missing_sessions), len(local_sessions),
-                           ", ".join(missing_sessions[:3])),
+                           ", ".join(_ident(s) for s in missing_sessions[:3])),
             "why": "Either the hook never fired for these sessions, or every upload "
                    "for them failed. Check the audit log for one of the ids.",
         })
@@ -476,7 +508,7 @@ def compare(tool, local, db, days, db_audit=None):
                 "evidence": "%d of %d call(s) have no stored row. First: %s (%s)"
                             % (len(absent),
                                len([r for r in by_kind["tool_call"] if r.get("call_id")]),
-                               absent[0]["call_id"], absent[0].get("tool")),
+                               _ident(absent[0]["call_id"]), absent[0].get("tool")),
                 "why": "A PreToolUse that failed to upload, or a tool the hook does not "
                        "handle.",
             })
@@ -560,7 +592,8 @@ def compare(tool, local, db, days, db_audit=None):
                 "where": "%s transcripts -> %s" % (tool, local["audit_log"]),
                 "evidence": "%d call(s) inside the audit window are absent from it. "
                             "First: %s (%s)"
-                            % (len(unseen), unseen[0].get("call_id"), unseen[0].get("tool")),
+                            % (len(unseen), _ident(unseen[0].get("call_id")),
+                               unseen[0].get("tool")),
                 "why": "The loss is upstream of the upload: the hook did not fire, or "
                        "returned before logging. Not a network problem.",
             })
@@ -599,7 +632,8 @@ def compare(tool, local, db, days, db_audit=None):
                                 "%s (%s)"
                                 % (len(dropped),
                                    len([r for r in logged if r.get("call_id")]),
-                                   dropped[0]["call_id"], dropped[0].get("tool")),
+                                   _ident(dropped[0]["call_id"]),
+                                   dropped[0].get("tool")),
                     "why": "The hook saw these and the upload did not land them, so the "
                            "loss is the ingest path or the network, not the capture.",
                 })
@@ -660,6 +694,8 @@ def main():
                     choices=("development", "staging", "production"))
     ap.add_argument("--out", help="write the report here, owner-only. A shell "
                                   "redirect would use the umask instead")
+    ap.add_argument("--psql", help="an absolute path to a psql to use instead of the "
+                                   "one on PATH, for when its directory is shared")
     ap.add_argument("--redact", action="store_true",
                     help="show a digest instead of prompt text; use on production")
     args = ap.parse_args()
@@ -672,7 +708,8 @@ def main():
         sys.exit("set IDENTIFY_DRIFT_DSN or pass --dsn, with no password in either")
     _connection_env(dsn)
 
-    global REDACT
+    global REDACT, PSQL
+    PSQL = args.psql
     # Staging carries customer data too, so development is the only environment that
     # shows prompt text and a mistyped one cannot silently opt out of redaction.
     REDACT = args.redact or args.environment != "development"

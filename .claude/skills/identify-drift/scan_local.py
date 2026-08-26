@@ -102,11 +102,22 @@ def _rec(kind, session, when, **extra):
 
 # ---------------------------------------------------------------- transcripts
 
+def _file_time(path):
+    """When a record carries no time of its own, the file's is the closest thing.
+    Without it an undated record is never filtered, so a transcript from months ago
+    is compared against a fourteen-day window and every prompt in it reads as lost.
+    Cursor writes no per-record timestamp at all."""
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
 def scan_claude_code(since):
     for path in (HOME / ".claude/projects").glob("*/*.jsonl"):
         session = path.stem
         for entry in _lines(path):
-            when = _ts(entry.get("timestamp"))
+            when = _ts(entry.get("timestamp")) or _file_time(path)
             if not when or when < since:
                 continue
             kind = entry.get("type")
@@ -137,7 +148,7 @@ def scan_cursor(since):
     for path in (HOME / ".cursor/projects").glob("*/agent-transcripts/*/*.jsonl"):
         session = path.stem
         for entry in _lines(path):
-            when = _ts(entry.get("timestamp") or entry.get("createdAt"))
+            when = _ts(entry.get("timestamp") or entry.get("createdAt")) or _file_time(path)
             if when and when < since:
                 continue
             role = entry.get("role")
@@ -159,7 +170,7 @@ def scan_cursor(since):
 def _scan_copilot_file(path, session, since):
     for entry in _lines(path):
         data = entry.get("data") or {}
-        when = _ts(entry.get("timestamp") or data.get("timestamp"))
+        when = _ts(entry.get("timestamp") or data.get("timestamp")) or _file_time(path)
         if when and when < since:
             continue
         kind = entry.get("type")
@@ -190,7 +201,7 @@ def scan_codex(since):
         session = None
         for entry in _lines(path):
             payload = entry.get("payload") or {}
-            when = _ts(entry.get("timestamp") or payload.get("started_at"))
+            when = _ts(entry.get("timestamp") or payload.get("started_at")) or _file_time(path)
             if entry.get("type") == "session_meta":
                 session = payload.get("id") or path.stem
             if when and when < since:
