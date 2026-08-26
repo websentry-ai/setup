@@ -87,11 +87,16 @@ python3 .claude/skills/identify-drift/compare.py \
                                                    # would use the umask
 ```
 
-If it refuses the `psql` on `PATH` because other accounts can write its directory,
-that is the check working, not a bug: whoever can write that directory can replace the
-binary this hands the connection to. A package-manager prefix is usually shared this
-way. Tell the operator, and re-run with `--psql` naming a path they trust, rather than
-loosening anything.
+If it refuses the `psql` it found, that is the check working, not a bug. Whoever can
+write the binary, the file a symlink points at, or any directory above either, can
+change what this hands the database connection to. A package-manager prefix is often
+shared this way.
+
+`--psql` names a different one; it is checked the same way, so it is a way to point at
+a better binary and not a way to skip the question. If the operator has no such binary
+and accepts the risk, `--allow-shared-psql` runs the shared one and says on stderr
+which path was accepted. Ask them before using it, and never reach for it to make a
+refusal go away.
 
 `--out` creates both files owner-only, and refuses a symlink at the destination. The
 scan holds every prompt and reply in the window and the report quotes excerpts from

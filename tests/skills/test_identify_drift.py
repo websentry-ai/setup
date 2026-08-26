@@ -759,6 +759,32 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
                                      db(user_texts=())))
         self.assertIn("User prompts recorded locally are absent from the database", got)
 
+    def test_a_capped_audit_aggregate_does_not_invent_upload_losses(self):
+        """The cap bounds what came back. Treating the remainder as absent turns every
+        row it omitted into a loss the upload never had."""
+        a = [rec("user_prompt", text="only in the log"),
+             rec("tool_call", tool="Bash")]
+        capped = db(user_texts=(), tool_counts={}, call_ids=(),
+                    ids_are_representative=False,
+                    truncated=["prompts", "tool names"])
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                     MATCHED_DB, 14, capped))
+        self.assertNotIn("The hook logged prompts the database never received", got)
+        self.assertNotIn("The hook logged tool calls the database never received "
+                         "(by count)", got)
+        self.assertIn("Prompt uploads could not be checked for this window", got)
+        self.assertIn("Upload losses could not be checked for this window", got)
+
+    def test_an_uncapped_audit_aggregate_still_finds_the_loss(self):
+        """The suppression must not swallow real findings."""
+        a = [rec("user_prompt", text="only in the log"),
+             rec("tool_call", tool="Bash")]
+        empty = db(user_texts=(), tool_counts={}, call_ids=(),
+                   ids_are_representative=False)
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                     MATCHED_DB, 14, empty))
+        self.assertIn("The hook logged prompts the database never received", got)
+
     def test_the_query_accepts_an_explicit_interval(self):
         import inspect
         sig = inspect.signature(compare.fetch_db)
@@ -1011,6 +1037,19 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
         _os.chmod(parent, 0o777)
         self.assertTrue(compare._writable_by_others(parent))
 
+    def test_a_path_owned_by_another_account_is_unsafe_whatever_its_mode(self):
+        """Its owner can rewrite it, so clear group and world bits prove nothing."""
+        import os as _os
+        info = _os.stat_result((0o040755, 0, 0, 1, 4242, 4242, 0, 0, 0, 0))
+        with unittest.mock.patch("os.stat", return_value=info):
+            self.assertTrue(compare._writable_by_others("/anywhere"))
+
+    def test_a_path_owned_by_root_is_fine(self):
+        import os as _os
+        info = _os.stat_result((0o040755, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+        with unittest.mock.patch("os.stat", return_value=info):
+            self.assertFalse(compare._writable_by_others("/anywhere"))
+
     def test_a_missing_path_counts_as_unsafe(self):
         self.assertTrue(compare._writable_by_others("/nonexistent/path/here"))
 
@@ -1060,16 +1099,34 @@ class TestTheConnectionCannotBeQuietlyWeakened(unittest.TestCase):
                 with self.assertRaises(SystemExit):
                     compare._psql_binary()
 
-    def test_an_explicit_path_is_taken_as_given(self):
-        """The operator naming a binary is an informed choice; it still has to be an
-        absolute path to something executable."""
-        import shutil as _shutil
-        real = _shutil.which("psql") or "/bin/sh"
-        self.assertEqual(compare._psql_binary(real), real)
+    def test_an_explicit_path_must_still_be_absolute_and_executable(self):
+        clean = _a_psql()
+        self.assertEqual(compare._psql_binary(clean), clean)
         for bad in ("relative/psql", "/nonexistent/psql"):
             with self.subTest(path=bad):
                 with self.assertRaises(SystemExit):
                     compare._psql_binary(bad)
+
+    def test_an_explicit_path_is_checked_like_any_other(self):
+        """Naming a binary must not be a way to skip the checks: the documented
+        workaround would otherwise be the one route with no integrity checking."""
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        binary = _p.Path(directory, "psql")
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o777)
+        with self.assertRaises(SystemExit) as e:
+            compare._psql_binary(str(binary))
+        self.assertIn("--allow-shared-psql", str(e.exception))
+
+    def test_a_shared_psql_runs_only_when_explicitly_accepted(self):
+        import os as _os, tempfile, pathlib as _p
+        directory = tempfile.mkdtemp()
+        binary = _p.Path(directory, "psql")
+        binary.write_text("#!/bin/sh\nexit 0\n")
+        binary.chmod(0o777)
+        with unittest.mock.patch.object(compare, "ACCEPT_SHARED_PSQL", True):
+            self.assertEqual(compare._psql_binary(str(binary)), str(binary))
 
     def test_psql_is_resolved_to_an_absolute_path(self):
         """A writable directory earlier on PATH would otherwise receive every row.
@@ -1265,10 +1322,15 @@ def _run_compare(local_document):
 
 
 def _a_psql():
-    """A binary the directory check will accept, so a test about something else does
-    not depend on how this machine's PATH happens to be owned."""
-    import shutil as _shutil
-    return _shutil.which("psql") or "/bin/sh"
+    """A binary the integrity checks accept, built here rather than borrowed from the
+    machine: how this host's PATH is owned is not the subject of those tests."""
+    import os as _os, tempfile, pathlib as _p
+    directory = tempfile.mkdtemp()
+    _os.chmod(directory, 0o700)
+    binary = _p.Path(directory, "psql")
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o755)
+    return str(binary)
 
 
 if __name__ == "__main__":

@@ -173,6 +173,10 @@ def _writable_by_others(path):
         info = os.stat(path)
     except OSError:
         return True
+    # The owner can rewrite it whatever the mode says, so a 0755 path belonging to
+    # another account is not safe just because the group and world bits are clear.
+    if info.st_uid not in (os.getuid(), 0):
+        return True
     if stat.S_ISDIR(info.st_mode) and info.st_mode & stat.S_ISVTX:
         # A sticky directory lets anyone create entries but only the owner of an entry
         # may replace or remove it, which is the whole concern here. /tmp is 1777.
@@ -197,23 +201,29 @@ def _psql_binary(explicit=None):
     replace it, and it is handed the connection and asked for the numbers this reports
     as fact, so a directory other accounts can write is not a place to take it from."""
     if explicit:
-        # A named path skips the directory check on purpose: the operator picking a
-        # binary is a decision a person made, which is what the check exists to ask for.
         if not os.path.isabs(explicit) or not os.access(explicit, os.X_OK):
             sys.exit("--psql must be an absolute path to an executable")
-        return explicit
-    found = shutil.which("psql")
-    if not found or not os.path.isabs(found):
-        sys.exit("psql not found on PATH")
+        found = explicit
+    else:
+        found = shutil.which("psql")
+        if not found or not os.path.isabs(found):
+            sys.exit("psql not found on PATH")
     # Every step that could be swapped: the real file behind any symlink, and every
     # directory either name passes through. Checking one level catches replacing the
     # binary and misses both editing it in place and swapping a directory above it.
     real = os.path.realpath(found)
     for path in [real] + _ancestors(found) + _ancestors(real):
-        if _writable_by_others(path):
-            sys.exit("%s is writable by accounts other than yours, so the psql this "
-                     "would run could be changed. Pass --psql with a path you trust."
-                     % path)
+        if not _writable_by_others(path):
+            continue
+        if ACCEPT_SHARED_PSQL:
+            # Named and accepted by a person, which is a different thing from a check
+            # that was never run. The path is still reported so it appears in the log.
+            sys.stderr.write("accepting a psql under %s, which other accounts can "
+                             "write\n" % path)
+            break
+        sys.exit("%s is writable by accounts other than yours, so the psql this would "
+                 "run could be changed. Point --psql at one they cannot, or pass "
+                 "--allow-shared-psql as well to accept that risk." % path)
     return found
 
 
@@ -380,6 +390,7 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
 
 REDACT = False
 PSQL = None
+ACCEPT_SHARED_PSQL = False
 
 
 def _parse(value):
@@ -691,6 +702,15 @@ def compare(tool, local, db, days, db_audit=None):
                     "why": "The hook saw these and the upload did not land them, so the "
                            "loss is the ingest path or the network, not the capture.",
                 })
+        elif "tool names" in dba["truncated"]:
+            findings.append({
+                "title": "Upload losses could not be checked for this window",
+                "where": local["audit_log"],
+                "evidence": "the stored tool names for the audit interval hit the "
+                            "%d row cap" % ROW_CAP,
+                "why": "Counting against a capped aggregate would report the rows the "
+                       "cap left out as losses. Re-run over fewer days.",
+            })
         else:
             counts = Counter(r.get("tool") for r in logged if r.get("tool"))
             dropped = {name: counts[name] - dba["tool_counts"].get(name, 0)
@@ -712,7 +732,20 @@ def compare(tool, local, db, days, db_audit=None):
 
         logged_prompts = Counter(_digest(r["text"]) for r in audit_by_kind["user_prompt"]
                                  if in_window(r) and r.get("text"))
-        dropped_prompts = logged_prompts - dba["user_digests"]
+        # A capped digest set is not evidence of absence: the prompts it left out
+        # would each read as one the upload lost.
+        prompts_capped = "prompts" in dba["truncated"]
+        dropped_prompts = Counter() if prompts_capped else (
+            logged_prompts - dba["user_digests"])
+        if prompts_capped and logged_prompts:
+            findings.append({
+                "title": "Prompt uploads could not be checked for this window",
+                "where": local["audit_log"],
+                "evidence": "the stored prompts for the audit interval hit the %d row "
+                            "cap" % ROW_CAP,
+                "why": "Comparing against a capped set would report the prompts it left "
+                       "out as losses. Re-run over fewer days.",
+            })
         first = next((r["text"] for r in audit_by_kind["user_prompt"]
                       if in_window(r) and r.get("text")
                       and dropped_prompts.get(_digest(r["text"]))), "(text unavailable)")
@@ -750,6 +783,9 @@ def main():
                                   "redirect would use the umask instead")
     ap.add_argument("--psql", help="an absolute path to a psql to use instead of the "
                                    "one on PATH, for when its directory is shared")
+    ap.add_argument("--allow-shared-psql", action="store_true",
+                    help="run a psql that other local accounts can change. They could "
+                         "make it report anything")
     ap.add_argument("--redact", action="store_true",
                     help="show a digest instead of prompt text; use on production")
     args = ap.parse_args()
@@ -762,8 +798,9 @@ def main():
         sys.exit("set IDENTIFY_DRIFT_DSN or pass --dsn, with no password in either")
     _connection_env(dsn)
 
-    global REDACT, PSQL
+    global REDACT, PSQL, ACCEPT_SHARED_PSQL
     PSQL = args.psql
+    ACCEPT_SHARED_PSQL = args.allow_shared_psql
     # Staging carries customer data too, so development is the only environment that
     # shows prompt text and a mistyped one cannot silently opt out of redaction.
     REDACT = args.redact or args.environment != "development"
@@ -790,14 +827,16 @@ def main():
                                 since=local["audit_window_start"],
                                 until=local.get("audit_window_end"))
         findings = compare(tool, local, db, days, db_audit)
-        if db["truncated"]:
+        truncated = sorted(set(db["truncated"])
+                           | set(db_audit["truncated"] if db_audit else []))
+        if truncated:
             # Said out loud rather than left to look like a clean run: past the cap the
             # unreturned rows would each read as a loss that never happened.
             findings.insert(0, {
                 "title": "Window too broad to compare exhaustively",
-                "where": "%s -> %s" % (tool, ", ".join(db["truncated"])),
+                "where": "%s -> %s" % (tool, ", ".join(truncated)),
                 "evidence": "more than %d distinct %s in %d days"
-                            % (ROW_CAP, " and ".join(db["truncated"]), days),
+                            % (ROW_CAP, " and ".join(truncated), days),
                 "why": "Findings below cover only what was returned. Re-run over fewer "
                        "days for a complete comparison.",
             })
@@ -820,7 +859,7 @@ def main():
                         and _ids_are_usable([r for r in local["transcript"]
                                              if r.get("kind") == "tool_call"]))
                     else "count"),
-                "truncated": db["truncated"],
+                "truncated": truncated,
             },
         }
     if args.out:
