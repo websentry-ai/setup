@@ -1,4 +1,4 @@
-"""Tests for the capture-audit skill.
+"""Tests for the identify-drift skill.
 
 The skill's job is to say where data was lost, so the tests care about two things:
 that a real gap is reported, and that a gap which is only an artefact of the audit
@@ -12,8 +12,8 @@ from datetime import datetime, timedelta, timezone
 
 from tests.conftest import load_module
 
-scan = load_module(".claude/skills/capture-audit/scan_local.py")
-compare = load_module(".claude/skills/capture-audit/compare.py")
+scan = load_module(".claude/skills/identify-drift/scan_local.py")
+compare = load_module(".claude/skills/identify-drift/compare.py")
 
 WINDOW_START = "2026-08-26T05:00:00+00:00"
 WINDOW_END = "2026-08-26T06:00:00+00:00"
@@ -37,6 +37,7 @@ def local(transcript=None, audit=None, **overrides):
         "transcript": transcript if transcript is not None else [],
         "audit": MATCHING_AUDIT if audit is None else audit,
         "sessions_transcript": ["S1"],
+        "sessions_audit": ["S1"],
         "audit_log": "/tmp/agent-audit.log",
         "audit_log_present": True,
         "audit_window_start": WINDOW_START,
@@ -54,12 +55,22 @@ MATCHED_TRANSCRIPT = [
     rec("tool_call", tool="Bash", call_id="c1"),
     rec("usage", input=100, output=50),
 ]
-MATCHED_DB = {
-    "metrics": [{"input_token_size": 100, "output_token_size": 50}],
-    "prompts": [{"prompt": {"messages": [{"role": "user", "content": "hello there"},
-                                         {"role": "assistant", "content": "hi back"}]}}],
-    "tool_calls": [{"tool_name": "Bash", "thread_id": "S1"}],
-}
+def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
+       tool_counts=None, user_texts=("hello there",), assistant_texts=("hi back",)):
+    """The aggregated shape fetch_db returns. Everything is a count, a sum or a short
+    normalised string, because selecting the rows themselves does not fit in memory."""
+    return {
+        "metrics_rows": metrics_rows,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "threads": set(threads),
+        "tool_counts": dict(tool_counts if tool_counts is not None else {"Bash": 1}),
+        "user_texts": set(user_texts),
+        "assistant_texts": set(assistant_texts),
+    }
+
+
+MATCHED_DB = db()
 
 
 def titles(findings):
@@ -96,9 +107,8 @@ class TestRealGapsAreFound(unittest.TestCase):
 
     def test_a_token_difference_under_five_percent_is_not_reported(self):
         """Rounding and clipping differ between the two sides; only real drift counts."""
-        db = json.loads(json.dumps(MATCHED_DB))
-        db["metrics"] = [{"input_token_size": 98, "output_token_size": 50}]
-        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT), db, 3))
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
+                                     db(input_tokens=98), 3))
         self.assertNotIn("Input tokens do not reconcile", got)
 
     def test_under_recorded_tool_calls(self):
@@ -139,10 +149,73 @@ class TestTheLossIsLocalised(unittest.TestCase):
 
     def test_an_empty_database_is_one_finding_not_one_per_row(self):
         """Nothing stored at all is a setup problem, not thousands of separate gaps."""
-        empty = {"metrics": [], "prompts": [], "tool_calls": []}
+        empty = db(metrics_rows=0, input_tokens=0, output_tokens=0, threads=(),
+                   tool_counts={}, user_texts=(), assistant_texts=())
         got = compare.compare("claude-code", local(MATCHED_TRANSCRIPT), empty, 3)
         self.assertEqual(len(got), 1)
         self.assertIn("almost no record", got[0]["title"])
+
+
+class TestTheUploadDirectionIsActuallyChecked(unittest.TestCase):
+    """The whole point of keeping the audit log separate is telling an ingest failure
+    from a capture bug. Comparing only transcript against database cannot do that, and
+    for a tool whose audit log is its only local record it checks nothing at all."""
+
+    def test_calls_the_hook_logged_but_the_database_never_got(self):
+        got = titles(compare.compare(
+            "claude-code",
+            local(MATCHED_TRANSCRIPT,
+                  [rec("tool_call", tool="Bash", call_id="c1"),
+                   rec("tool_call", tool="Bash", call_id="c2"),
+                   rec("tool_call", tool="Bash", call_id="c3")]),
+            db(tool_counts={"Bash": 1}), 3))
+        self.assertIn("The hook logged tool calls the database never received", got)
+
+    def test_prompts_the_hook_logged_but_the_database_never_got(self):
+        got = titles(compare.compare(
+            "claude-code",
+            local(MATCHED_TRANSCRIPT,
+                  [rec("tool_call", tool="Bash", call_id="c1"),
+                   rec("user_prompt", text="logged but never uploaded")]),
+            MATCHED_DB, 3))
+        self.assertIn("The hook logged prompts the database never received", got)
+
+    def test_a_tool_with_no_transcript_still_gets_checked(self):
+        """Augment ships no rich transcript, so without this direction it would be
+        compared against nothing and always look healthy."""
+        got = titles(compare.compare(
+            "augment",
+            local([],
+                  [rec("tool_call", tool="Bash", call_id="c%d" % i) for i in range(30)]
+                  + [rec("user_prompt", text="turn %d" % i) for i in range(25)],
+                  sessions_transcript=[], sessions_audit=["S1"]),
+            db(metrics_rows=25, tool_counts={"Bash": 2},
+               user_texts={"turn %d" % i for i in range(25)}), 3))
+        self.assertIn("The hook logged tool calls the database never received", got)
+
+    def test_agreement_between_the_two_produces_nothing(self):
+        got = compare.compare(
+            "claude-code",
+            local(MATCHED_TRANSCRIPT, [rec("tool_call", tool="Bash", call_id="c1")]),
+            MATCHED_DB, 3)
+        self.assertEqual(got, [])
+
+
+class TestItReadsTheStoredPromptShape(unittest.TestCase):
+    """The stored column is {user_prompt, system_prompt, assistant_prompt}. An earlier
+    version looked for a messages array, found nothing every run, and reported no
+    stored prompts at all -- which reads identically to total data loss."""
+
+    def test_the_normaliser_matches_what_the_query_returns(self):
+        # SQL does btrim + collapse whitespace + lower + left(200); _norm must agree,
+        # or every prompt looks missing.
+        for raw, expected in [("  Hello   World  ", "hello world"),
+                              ("Line\nBreak", "line break"),
+                              ("TABS\there", "tabs here")]:
+            self.assertEqual(compare._norm(raw), expected)
+
+    def test_it_truncates_at_the_same_length_as_the_query(self):
+        self.assertEqual(len(compare._norm("x" * 500)), 200)
 
 
 class TestNoiseIsSuppressedWithoutHidingRealLoss(unittest.TestCase):
@@ -152,9 +225,9 @@ class TestNoiseIsSuppressedWithoutHidingRealLoss(unittest.TestCase):
 
     def test_a_window_the_database_barely_has_is_one_finding(self):
         transcript = [rec("user_prompt", text="turn %d" % i) for i in range(200)]
-        db = {"metrics": [{"input_token_size": 1, "output_token_size": 1}],
-              "prompts": [], "tool_calls": []}
-        got = compare.compare("claude-code", local(transcript), db, 14)
+        barely = db(metrics_rows=1, threads=(), tool_counts={},
+                    user_texts=(), assistant_texts=())
+        got = compare.compare("claude-code", local(transcript), barely, 14)
         self.assertEqual(len(got), 1)
         self.assertIn("almost no record", got[0]["title"])
 
@@ -163,13 +236,10 @@ class TestNoiseIsSuppressedWithoutHidingRealLoss(unittest.TestCase):
         them. Coverage stays high, so the per-category findings must still fire."""
         transcript = [rec("user_prompt", text="turn %d" % i) for i in range(100)]
         transcript.append(rec("user_prompt", text="the queued one"))
-        db = {
-            "metrics": [{"input_token_size": 1, "output_token_size": 1} for _ in range(100)],
-            "prompts": [{"prompt": {"messages": [
-                {"role": "user", "content": "turn %d" % i}]}} for i in range(100)],
-            "tool_calls": [],
-        }
-        got = titles(compare.compare("claude-code", local(transcript), db, 14))
+        captured = db(metrics_rows=100, threads=("S1",), tool_counts={},
+                      user_texts={"turn %d" % i for i in range(100)},
+                      assistant_texts=())
+        got = titles(compare.compare("claude-code", local(transcript), captured, 14))
         self.assertIn("User prompts recorded locally are absent from the database", got)
         self.assertNotIn("This database holds almost no record of the window", got)
 
@@ -233,7 +303,7 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
         from tests.conftest import REPO
         out = Path(tempfile.mkdtemp()) / "local.json"
         subprocess.run(
-            [sys.executable, str(REPO / ".claude/skills/capture-audit/scan_local.py"),
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
              "--tools", "claude-code", "--days", "1", "--out", str(out)],
             capture_output=True, text=True, timeout=300, check=True)
         mode = os.stat(out).st_mode
@@ -279,12 +349,62 @@ class TestTheScannerReadsEveryFormat(unittest.TestCase):
         self.assertEqual(list(scan._lines(Path("/nonexistent/x.jsonl"))), [])
 
 
+class TestTheCommandLineActuallyRuns(unittest.TestCase):
+    """compare() is unit tested directly, so main() can drift away from the shape
+    fetch_db returns and nothing notices until somebody runs the tool."""
+
+    def test_main_renders_a_report_from_a_stubbed_database(self):
+        import json as _json
+        import subprocess, sys, tempfile
+        from pathlib import Path
+        from tests.conftest import REPO
+
+        work = Path(tempfile.mkdtemp())
+        (work / "local.json").write_text(_json.dumps({
+            "since": "2026-08-01T00:00:00+00:00", "days": 3,
+            "tools": {"claude-code": {
+                "app_label": "claude-code", "audit_log": str(work / "a.log"),
+                "audit_log_present": False, "audit_window_start": None,
+                "audit_window_end": None, "audit_entries": 0, "audit_limit": 100,
+                "transcript": [], "audit": [],
+                "sessions_transcript": [], "sessions_audit": []}}}))
+        # A psql stand-in on PATH: main() must survive the real code path without a
+        # database, which is what makes this a shape check rather than a mock.
+        fake = work / "psql"
+        fake.write_text("#!/bin/sh\necho '[]'\n")
+        fake.chmod(0o755)
+        env = {"PATH": "%s:/usr/bin:/bin" % work, "HOME": str(work),
+               "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1:5432/d"}
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/compare.py"),
+             "--local", str(work / "local.json"),
+             "--email", "a@b.c", "--environment", "development"],
+            capture_output=True, text=True, timeout=120, env=env)
+        self.assertEqual(r.returncode, 0, r.stderr[-400:])
+        report = _json.loads(r.stdout)
+        self.assertEqual(report["email"], "a@b.c")
+        self.assertIn("claude-code", report["tools"])
+        self.assertIn("counts", report["tools"]["claude-code"])
+
+    def test_it_refuses_to_run_with_no_connection_at_all(self):
+        import subprocess, sys, tempfile
+        from pathlib import Path
+        from tests.conftest import REPO
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/compare.py"),
+             "--local", "/dev/null", "--email", "a@b.c", "--environment", "development"],
+            capture_output=True, text=True, timeout=60,
+            env={"PATH": "/usr/bin:/bin", "HOME": tempfile.mkdtemp()})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("IDENTIFY_DRIFT_DSN", r.stderr)
+
+
 class TestTheWindowIsBounded(unittest.TestCase):
     def test_more_than_fourteen_days_is_refused(self):
         import subprocess, sys
         from tests.conftest import REPO
         r = subprocess.run(
-            [sys.executable, str(REPO / ".claude/skills/capture-audit/scan_local.py"),
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
              "--tools", "claude-code", "--days", "15"],
             capture_output=True, text=True, timeout=60)
         self.assertNotEqual(r.returncode, 0)
@@ -294,7 +414,7 @@ class TestTheWindowIsBounded(unittest.TestCase):
         import subprocess, sys
         from tests.conftest import REPO
         r = subprocess.run(
-            [sys.executable, str(REPO / ".claude/skills/capture-audit/scan_local.py"),
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
              "--tools", "not-a-tool", "--days", "3"],
             capture_output=True, text=True, timeout=60)
         self.assertNotEqual(r.returncode, 0)

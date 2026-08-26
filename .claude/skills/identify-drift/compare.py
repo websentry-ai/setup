@@ -77,7 +77,9 @@ def psql(dsn, sql, params=None):
         command += ["-v", "%s=%s" % (name, value)]
     # Fed on stdin, not through -c: psql only expands :'name' in what it reads as
     # input, so -c would send the placeholder to the server verbatim.
-    statement = ("SELECT coalesce(json_agg(t), '[]') FROM (%s) t;"
+    # The alias is deliberately unlikely: json_agg(alias) resolves to a *column* of
+    # that name when one exists, which silently returns scalars instead of objects.
+    statement = ("SELECT coalesce(json_agg(_drift_row), '[]') FROM (%s) _drift_row;"
                  % sql.rstrip().rstrip(";"))
     result = subprocess.run(command, input=statement, capture_output=True, text=True,
                             timeout=180, env=_connection_env(dsn))
@@ -87,14 +89,16 @@ def psql(dsn, sql, params=None):
 
 
 def fetch_db(dsn, email, app_label, days):
-    """Everything this user's tool sent us inside the window.
+    """What we hold for this user and tool, aggregated in the database.
 
-    The join is email -> application -> gateway_metrics; the prompt and tool rows
-    hang off the metrics row by its id.
+    Every value here is a count, a sum, or a short normalised string. Selecting the
+    rows themselves and folding them in Python would pull the whole window across:
+    one ordinary account's stored prompts come to fourteen megabytes, and a single
+    row can be two hundred kilobytes, so a busy fortnight would be far larger than
+    anything worth holding in one JSON value.
     """
-    # No caller value is pasted into the SQL: psql binds and quotes each one.
     params = {"email": email, "label": app_label, "days": int(days)}
-    common = """
+    where = """
         FROM gateway_metrics gm
         JOIN applications app ON app.id = gm.application_id
         JOIN gateway_users u ON u.id = app.owner_user_id
@@ -103,28 +107,57 @@ def fetch_db(dsn, email, app_label, days):
           AND gm.request_initialized_at >= now() - (:'days' || ' days')::interval
     """
 
-    metrics = psql(dsn, """
-        SELECT gm.request_id, gm.input_token_size, gm.output_token_size,
-               gm.cache_read_token_size, gm.status_code, gm.request_initialized_at
+    totals = psql(dsn, """
+        SELECT count(*) AS metrics_rows,
+               coalesce(sum(gm.input_token_size), 0) AS input_tokens,
+               coalesce(sum(gm.output_token_size), 0) AS output_tokens
         %s
-    """ % common, params)
+    """ % where, params)
 
-    prompts = psql(dsn, """
-        SELECT p.request_id, p.prompt, p.created_at
-        FROM prompts p
-        WHERE p.gateway_metrics_id IN (
-            SELECT gm.id %s
-        )
-    """ % common, params)
+    threads = psql(dsn, """
+        SELECT DISTINCT pa.thread_id
+        FROM prompt_analytics pa
+        WHERE pa.thread_id IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+    """ % where, params)
 
     tools = psql(dsn, """
-        SELECT pa.tool_name, pa.thread_id, pa.parameters, pa.created_at
+        SELECT pa.tool_name, count(*) AS n
         FROM prompt_analytics pa
-        WHERE pa.gateway_metrics_id IN (
-            SELECT gm.id %s
-        )
-    """ % common, params)
-    return {"metrics": metrics, "prompts": prompts, "tool_calls": tools}
+        WHERE pa.tool_name IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+        GROUP BY pa.tool_name
+    """ % where, params)
+
+    # Normalised here so the two sides are compared the same way; _norm does the
+    # identical trim, collapse, truncate and fold in Python.
+    texts = psql(dsn, """
+        SELECT DISTINCT role, t FROM (
+          SELECT 'user' AS role,
+                 left(lower(btrim(regexp_replace(p.prompt->>'user_prompt',
+                                                 '\s+', ' ', 'g'))), 200) AS t
+          FROM prompts p
+          WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
+          UNION ALL
+          SELECT 'assistant',
+                 left(lower(btrim(regexp_replace(p.prompt->>'assistant_prompt',
+                                                 '\s+', ' ', 'g'))), 200)
+          FROM prompts p
+          WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
+        ) x WHERE t IS NOT NULL AND t <> ''
+    """ % (where, where), params)
+
+    row = totals[0] if totals else {}
+    return {
+        "metrics_rows": int(row.get("metrics_rows") or 0),
+        "input_tokens": int(row.get("input_tokens") or 0),
+        "output_tokens": int(row.get("output_tokens") or 0),
+        "threads": {r["thread_id"] for r in threads},
+        "tool_counts": {r["tool_name"]: int(r["n"]) for r in tools},
+        "user_texts": {r["t"] for r in texts if r["role"] == "user"},
+        "assistant_texts": {r["t"] for r in texts if r["role"] == "assistant"},
+    }
+
+
+REDACT = False
 
 
 def _parse(value):
@@ -135,9 +168,6 @@ def _parse(value):
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
-
-
-REDACT = False
 
 
 def _excerpt(text):
@@ -154,30 +184,6 @@ def _norm(text):
     return " ".join((text or "").split())[:200].lower()
 
 
-def _db_prompt_texts(prompts):
-    """Pull user and assistant text out of the stored prompt JSON."""
-    users, assistants = set(), set()
-    for row in prompts:
-        payload = row.get("prompt")
-        if isinstance(payload, str):
-            try:
-                payload = json.loads(payload)
-            except ValueError:
-                continue
-        messages = payload.get("messages") if isinstance(payload, dict) else None
-        for message in messages or []:
-            if not isinstance(message, dict):
-                continue
-            content = message.get("content")
-            if isinstance(content, list):
-                content = " ".join(b.get("text", "") for b in content
-                                   if isinstance(b, dict))
-            target = users if message.get("role") == "user" else assistants
-            if content:
-                target.add(_norm(content))
-    return users, assistants
-
-
 def compare(tool, local, db, days):
     """Return a list of findings. Each is one problem, with its evidence."""
     findings = []
@@ -190,20 +196,22 @@ def compare(tool, local, db, days):
     for record in transcript:
         by_kind[record["kind"]].append(record)
 
+    audit_by_kind = defaultdict(list)
+    for record in audit:
+        audit_by_kind[record["kind"]].append(record)
+
     # A database holding essentially nothing for a window the machine was busy in is
     # one fact, not one finding per category. Saying it four times buries whatever
     # else is wrong, and the usual cause is mundane: this machine uploads somewhere
     # else, so the environment picked was the wrong one.
-    turns = len(by_kind["user_prompt"])
-    local_activity = turns + len(by_kind["tool_call"])
-    stored = len(db["metrics"])
+    turns = len(by_kind["user_prompt"]) or len(audit_by_kind["user_prompt"])
+    local_activity = (turns + len(by_kind["tool_call"])
+                      + len(audit_by_kind["tool_call"]))
+    stored = db["metrics_rows"]
     # Judged on coverage, not on strict emptiness: a handful of rows against a thousand
     # turns is the same fact as none. Real partial loss keeps coverage high -- the
     # queued-prompt bug uploaded almost every turn and dropped a prompt inside them --
     # so this only catches the case where the window is simply not there.
-    # A ratio needs enough turns to mean anything: one stored row against one turn is
-    # perfect coverage, not negligible. Below the floor, fall through and let the
-    # per-category checks speak.
     RATIO_FLOOR = 20
     negligible = ((stored == 0 and local_activity > 0)
                   or (turns >= RATIO_FLOOR and stored <= turns * 0.05))
@@ -219,13 +227,12 @@ def compare(tool, local, db, days):
         }]
 
     # ---- sessions ------------------------------------------------------
-    db_threads = {r.get("thread_id") for r in db["tool_calls"] if r.get("thread_id")}
-    local_sessions = set(local["sessions_transcript"])
-    missing_sessions = sorted(s for s in local_sessions if s and s not in db_threads)
-    if missing_sessions and db_threads:
+    local_sessions = set(local["sessions_transcript"]) | set(local["sessions_audit"])
+    missing_sessions = sorted(s for s in local_sessions if s and s not in db["threads"])
+    if missing_sessions and db["threads"]:
         findings.append({
             "title": "Sessions present locally are absent from the database",
-            "where": "%s transcripts -> prompt_analytics.thread_id" % tool,
+            "where": "%s -> prompt_analytics.thread_id" % tool,
             "evidence": "%d of %d local sessions have no row. First: %s"
                         % (len(missing_sessions), len(local_sessions),
                            ", ".join(missing_sessions[:3])),
@@ -234,18 +241,18 @@ def compare(tool, local, db, days):
         })
 
     # ---- prompts -------------------------------------------------------
-    db_users, db_assistants = _db_prompt_texts(db["prompts"])
-    for kind, db_set, label in (("user_prompt", db_users, "user prompts"),
-                                ("assistant_message", db_assistants, "assistant messages")):
+    for kind, stored_texts, label in (
+            ("user_prompt", db["user_texts"], "user prompts"),
+            ("assistant_message", db["assistant_texts"], "assistant messages")):
         local_texts = {_norm(r.get("text")) for r in by_kind[kind] if r.get("text")}
-        missing = sorted(t for t in local_texts if t and t not in db_set)
-        # Report whenever anything at all was stored for this tool. Metrics present but
-        # no prompt rows is the loudest version of this bug, not a reason to say nothing.
-        if missing and db["metrics"]:
+        missing = sorted(t for t in local_texts if t and t not in stored_texts)
+        if missing and db["metrics_rows"]:
             findings.append({
                 "title": "%s recorded locally are absent from the database"
                          % label.capitalize(),
-                "where": "%s transcripts -> prompts.prompt" % tool,
+                "where": "%s transcripts -> prompts.%s"
+                         % (tool, "user_prompt" if kind == "user_prompt"
+                            else "assistant_prompt"),
                 "evidence": "%d of %d missing. First: %s"
                             % (len(missing), len(local_texts), _excerpt(missing[0])),
                 "why": "The hook either did not capture these, or captured them into a "
@@ -254,16 +261,16 @@ def compare(tool, local, db, days):
 
     # ---- tool calls ----------------------------------------------------
     local_tools = Counter(r.get("tool") for r in by_kind["tool_call"] if r.get("tool"))
-    db_tools = Counter(r.get("tool_name") for r in db["tool_calls"] if r.get("tool_name"))
-    short = {name: local_tools[name] - db_tools.get(name, 0)
-             for name in local_tools if local_tools[name] > db_tools.get(name, 0)}
-    if short and db["metrics"]:
+    short = {name: local_tools[name] - db["tool_counts"].get(name, 0)
+             for name in local_tools
+             if local_tools[name] > db["tool_counts"].get(name, 0)}
+    if short and db["metrics_rows"]:
         worst = sorted(short.items(), key=lambda kv: -kv[1])[:3]
         findings.append({
             "title": "Tool calls made locally are under-recorded",
             "where": "%s transcripts -> prompt_analytics.tool_name" % tool,
             "evidence": "; ".join("%s local %d vs stored %d"
-                                  % (n, local_tools[n], db_tools.get(n, 0))
+                                  % (n, local_tools[n], db["tool_counts"].get(n, 0))
                                   for n, _ in worst),
             "why": "A PreToolUse that failed to upload, or a tool the hook does not "
                    "handle. Compare one call_id against the audit log.",
@@ -272,25 +279,22 @@ def compare(tool, local, db, days):
     # ---- tokens --------------------------------------------------------
     local_in = sum(r.get("input", 0) for r in by_kind["usage"])
     local_out = sum(r.get("output", 0) for r in by_kind["usage"])
-    db_in = sum(r.get("input_token_size") or 0 for r in db["metrics"])
-    db_out = sum(r.get("output_token_size") or 0 for r in db["metrics"])
-    if local_in or local_out:
-        for name, local_value, db_value in (("input", local_in, db_in),
-                                            ("output", local_out, db_out)):
-            if db_value and local_value:
-                drift = abs(local_value - db_value) / float(local_value)
-                if drift > 0.05:
-                    findings.append({
-                        "title": "%s tokens do not reconcile" % name.capitalize(),
-                        "where": "%s transcripts -> gateway_metrics.%s_token_size"
-                                 % (tool, name),
-                        "evidence": "local %s vs stored %s (%.0f%% apart)"
-                                    % (f"{local_value:,}", f"{db_value:,}", drift * 100),
-                        "why": "Work billed to no turn: subagent or sidechain messages "
-                               "the turn window excluded, or turns never uploaded.",
-                    })
+    for name, local_value, db_value in (("input", local_in, db["input_tokens"]),
+                                        ("output", local_out, db["output_tokens"])):
+        if db_value and local_value:
+            drift = abs(local_value - db_value) / float(local_value)
+            if drift > 0.05:
+                findings.append({
+                    "title": "%s tokens do not reconcile" % name.capitalize(),
+                    "where": "%s transcripts -> gateway_metrics.%s_token_size"
+                             % (tool, name),
+                    "evidence": "local %s vs stored %s (%.0f%% apart)"
+                                % (f"{local_value:,}", f"{db_value:,}", drift * 100),
+                    "why": "Work billed to no turn: subagent or sidechain messages "
+                           "the turn window excluded, or turns never uploaded.",
+                })
 
-    # ---- localise: transcript vs audit ---------------------------------
+    # ---- localise ------------------------------------------------------
     # Only meaningful while the log has spare room. At its cap it has rotated, so a
     # call missing from it may simply have been trimmed, and every busy session would
     # otherwise report a hook that is working fine as one that is dropping calls.
@@ -312,7 +316,8 @@ def compare(tool, local, db, days):
             when = _parse(record.get("at"))
             return bool(when and start and end and start <= when <= end)
 
-        audit_calls = {r.get("call_id") for r in audit if r["kind"] == "tool_call"}
+        # transcript -> audit: the hook did not see it.
+        audit_calls = {r.get("call_id") for r in audit_by_kind["tool_call"]}
         unseen = [r for r in by_kind["tool_call"]
                   if in_window(r) and r.get("call_id")
                   and r["call_id"] not in audit_calls]
@@ -325,6 +330,41 @@ def compare(tool, local, db, days):
                             % (len(unseen), unseen[0].get("call_id"), unseen[0].get("tool")),
                 "why": "The loss is upstream of the upload: the hook did not fire, or "
                        "returned before logging. Not a network problem.",
+            })
+
+        # audit -> database: the hook saw it and the upload lost it. This is the only
+        # direction that separates an ingest failure from a capture bug, and for a tool
+        # whose audit log is its only local record it is the only check there is.
+        logged = Counter(r.get("tool") for r in audit_by_kind["tool_call"]
+                         if in_window(r) and r.get("tool"))
+        dropped = {name: logged[name] - db["tool_counts"].get(name, 0)
+                   for name in logged
+                   if logged[name] > db["tool_counts"].get(name, 0)}
+        if dropped:
+            worst = sorted(dropped.items(), key=lambda kv: -kv[1])[:3]
+            findings.append({
+                "title": "The hook logged tool calls the database never received",
+                "where": "%s -> prompt_analytics.tool_name" % local["audit_log"],
+                "evidence": "; ".join("%s logged %d vs stored %d"
+                                      % (n, logged[n], db["tool_counts"].get(n, 0))
+                                      for n, _ in worst),
+                "why": "The hook saw these and the upload did not land them, so the loss "
+                       "is the ingest path or the network, not the capture.",
+            })
+
+        logged_prompts = {_norm(r.get("text")) for r in audit_by_kind["user_prompt"]
+                          if in_window(r) and r.get("text")}
+        dropped_prompts = sorted(t for t in logged_prompts
+                                 if t and t not in db["user_texts"])
+        if dropped_prompts and db["metrics_rows"]:
+            findings.append({
+                "title": "The hook logged prompts the database never received",
+                "where": "%s -> prompts.user_prompt" % local["audit_log"],
+                "evidence": "%d of %d missing. First: %s"
+                            % (len(dropped_prompts), len(logged_prompts),
+                               _excerpt(dropped_prompts[0])),
+                "why": "Captured and then lost on the way up, so look at the upload "
+                       "rather than the hook.",
             })
     elif not local["audit_log_present"]:
         findings.append({
@@ -340,12 +380,23 @@ def compare(tool, local, db, days):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", required=True, help="scan_local.py output, or - for stdin")
-    ap.add_argument("--dsn", required=True)
+    ap.add_argument("--dsn", help="prefer IDENTIFY_DRIFT_DSN: an argument is visible "
+                                  "to every account on the machine through ps")
     ap.add_argument("--email", required=True)
     ap.add_argument("--environment", required=True)
     ap.add_argument("--redact", action="store_true",
                     help="show a digest instead of prompt text; use on production")
     args = ap.parse_args()
+
+    # Read from the environment by default. Passing it as an argument puts any
+    # password in this process's own command line, which is exactly the exposure the
+    # libpq handoff below avoids for psql.
+    dsn = os.environ.get("IDENTIFY_DRIFT_DSN") or args.dsn
+    if not dsn:
+        sys.exit("set IDENTIFY_DRIFT_DSN, or pass --dsn if it carries no password")
+    if args.dsn and urlsplit(args.dsn).password:
+        sys.exit("--dsn carries a password and would be visible in ps; "
+                 "put it in IDENTIFY_DRIFT_DSN instead")
 
     global REDACT
     REDACT = args.redact or args.environment.lower() == "production"
@@ -356,14 +407,15 @@ def main():
     report = {"environment": args.environment, "email": args.email,
               "days": days, "since": local_all["since"], "tools": {}}
     for tool, local in local_all["tools"].items():
-        db = fetch_db(args.dsn, args.email, APP_LABEL[tool], days)
+        db = fetch_db(dsn, args.email, APP_LABEL[tool], days)
         report["tools"][tool] = {
             "findings": compare(tool, local, db, days),
             "counts": {
                 "local_sessions": len(local["sessions_transcript"]),
-                "db_metrics_rows": len(db["metrics"]),
-                "db_prompt_rows": len(db["prompts"]),
-                "db_tool_rows": len(db["tool_calls"]),
+                "db_metrics_rows": db["metrics_rows"],
+                "db_threads": len(db["threads"]),
+                "db_tool_kinds": len(db["tool_counts"]),
+                "db_prompt_texts": len(db["user_texts"]) + len(db["assistant_texts"]),
             },
         }
     json.dump(report, sys.stdout, indent=2)

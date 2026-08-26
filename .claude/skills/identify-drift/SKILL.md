@@ -1,9 +1,9 @@
 ---
-name: capture-audit
+name: identify-drift
 description: Find out whether what a coding tool did locally is what we actually recorded. Compares each tool's own transcripts and our hook's audit log against gateway_metrics, prompts and prompt_analytics, and reports where the loss happened. Use when a hook may be dropping prompts, tool calls or tokens, or after changing hook capture logic.
 ---
 
-# Capture audit
+# Identify drift
 
 A tool writes its own transcript. Our hook watches and logs what it sees. The gateway
 stores what we upload. When those three disagree, we are losing data, and the
@@ -44,7 +44,7 @@ normal audited access path.
 between machines.
 
 **staging / production** — ask the operator to open their usual read-only tunnel and
-to paste back the DSN, or to put it in `CAPTURE_AUDIT_DSN`. Wait for them; never open
+to paste back the DSN, or to put it in `IDENTIFY_DRIFT_DSN`. Wait for them; never open
 a tunnel yourself and never complete an MFA prompt on their behalf. If they ask how,
 point them at the internal database-access runbook rather than repeating it here.
 
@@ -58,11 +58,13 @@ few characters a finding needs to be actionable.
 WORK=$(mktemp -d)                       # not /tmp directly: the scan quotes transcripts
 trap 'rm -rf "$WORK"' EXIT              # and there is no reason to leave them behind
 
-python3 .claude/skills/capture-audit/scan_local.py \
+python3 .claude/skills/identify-drift/scan_local.py \
   --tools <tools> --days <n> --out "$WORK/local.json"
 
-python3 .claude/skills/capture-audit/compare.py \
-  --local "$WORK/local.json" --dsn "${CAPTURE_AUDIT_DSN:?set it or pass --dsn}" \
+export IDENTIFY_DRIFT_DSN="<the operator's dsn>"   # never on the command line:
+                                                   # arguments are visible in ps
+python3 .claude/skills/identify-drift/compare.py \
+  --local "$WORK/local.json" \
   --email "<email>" --environment "<env>" \
   > "$WORK/report.json"
 ```
@@ -103,7 +105,7 @@ to no turn: subagent messages outside the turn window, or turns that never uploa
 Header first, then the points. Nothing else.
 
 ```
-Capture audit — <environment>
+Identify drift — <environment>
 Window   <n> days (since <date>)
 Tools    <comma separated>
 User     <email>

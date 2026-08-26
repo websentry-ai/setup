@@ -303,6 +303,9 @@ def main():
         # would create it with the default umask, which on a shared machine is
         # world-readable, so the file is opened with owner-only permissions instead.
         fd = os.open(args.out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # The mode argument only applies when the file is created, so an existing
+        # destination would keep whatever permissions it already had.
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(out, handle, indent=2)
     else:
