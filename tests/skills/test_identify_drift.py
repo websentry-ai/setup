@@ -1422,6 +1422,61 @@ def _redaction_for(environment):
     return environment != "development"
 
 
+class TestTheOutputCannotBeSiphoned(unittest.TestCase):
+    """Owner-only permissions and a symlink check do not stop a pipe. Anything opened
+    for the scan or the report has to be a regular file, checked on the descriptor so
+    nothing can be swapped in after the look."""
+
+    def _fifo(self):
+        import os as _os, tempfile
+        from pathlib import Path
+        path = Path(tempfile.mkdtemp()) / "out.json"
+        _os.mkfifo(path)
+        return path
+
+    def test_the_scan_refuses_a_pipe(self):
+        import subprocess, sys
+        from tests.conftest import REPO
+        target = self._fifo()
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
+             "--tools", "claude-code", "--days", "1", "--out", str(target)],
+            capture_output=True, text=True, timeout=300)
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_the_report_refuses_a_pipe(self):
+        import json as _json, subprocess, sys, tempfile
+        from pathlib import Path
+        from tests.conftest import REPO
+        work = Path(tempfile.mkdtemp())
+        (work / "local.json").write_text(_json.dumps(
+            {"since": "2026-08-01T00:00:00+00:00", "days": 3, "tools": {}}))
+        fake = work / "psql"
+        fake.write_text("#!/bin/sh\necho '[]'\n")
+        fake.chmod(0o755)
+        target = self._fifo()
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/compare.py"),
+             "--local", str(work / "local.json"), "--email", "a@b.c",
+             "--environment", "development", "--out", str(target)],
+            capture_output=True, text=True, timeout=120,
+            env={"PATH": "%s:/usr/bin:/bin" % work, "HOME": str(work),
+                 "IDENTIFY_DRIFT_DSN": "postgres://u@127.0.0.1:5432/d"})
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_a_pipe_with_no_reader_fails_rather_than_waiting(self):
+        """Opening one for writing otherwise blocks until somebody reads, which would
+        hang the run instead of ending it."""
+        import subprocess, sys
+        from tests.conftest import REPO
+        target = self._fifo()
+        r = subprocess.run(
+            [sys.executable, str(REPO / ".claude/skills/identify-drift/scan_local.py"),
+             "--tools", "claude-code", "--days", "1", "--out", str(target)],
+            capture_output=True, text=True, timeout=120)
+        self.assertNotEqual(r.returncode, 0)
+
+
 class TestTheScanFileCannotBeRedirected(unittest.TestCase):
     def test_a_symlink_at_the_destination_is_refused(self):
         """O_TRUNC through a symlink would truncate whatever it points at."""

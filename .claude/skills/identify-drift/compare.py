@@ -1011,9 +1011,16 @@ def main():
         # truncate onto another file.
         try:
             fd = os.open(args.out,
-                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                         os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+                         | os.O_NONBLOCK, 0o600)
         except OSError as error:
             sys.exit("cannot write %s: %s" % (args.out, error.strerror))
+        # On the descriptor, not the path: a pipe planted here would carry the report
+        # to whoever is reading it, and owner-only permissions do not stop that.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            sys.exit("%s is not a regular file; refusing to write the report into it"
+                     % args.out)
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(report, handle, indent=2)

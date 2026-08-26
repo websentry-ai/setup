@@ -17,6 +17,7 @@ Emits one JSON document on stdout; compare.py consumes it.
 import argparse
 import json
 import os
+import stat
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -316,13 +317,22 @@ def main():
         # Every prompt and reply the window covers ends up in here. A shell redirect
         # would create it with the default umask, which on a shared machine is
         # world-readable, so the file is opened with owner-only permissions instead.
-        # O_NOFOLLOW: a symlink planted at this path would otherwise redirect the
-        # truncate onto whatever it points at.
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+        # O_NOFOLLOW: a symlink planted here would redirect the truncate onto whatever
+        # it points at. O_NONBLOCK: opening a pipe for writing otherwise waits for a
+        # reader, so a planted one would hang the scan instead of failing it.
+        flags = (os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW
+                 | os.O_NONBLOCK)
         try:
             fd = os.open(args.out, flags, 0o600)
         except OSError as error:
             sys.exit("cannot write %s: %s" % (args.out, error.strerror))
+        # Checked on the descriptor, not the path, so nothing can be swapped in
+        # between. A pipe left here by another account would carry every prompt in the
+        # window straight to whoever is reading it, and permissions do not stop that.
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            sys.exit("%s is not a regular file; refusing to write the scan into it"
+                     % args.out)
         # The mode argument only applies when the file is created, so an existing
         # destination would keep whatever permissions it already had.
         os.fchmod(fd, 0o600)
