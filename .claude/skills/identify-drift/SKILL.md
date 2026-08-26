@@ -38,15 +38,24 @@ DSN comes from is the operator's business, and for anything other than a local
 development database it should be a read-only role reached through the company's
 normal audited access path.
 
+**Never ask for, type, or echo a password.** This skill runs inside the hooks it is
+checking: what you put in a prompt or a Bash command is captured into the transcripts,
+the audit log and the stored prompt rows that the comparison then reads. A password
+handled here would be sitting in the very data being audited. `compare.py` refuses a
+DSN that carries one, on every route. If a connection needs a password, the operator
+puts it in their libpq password file (`PGPASSFILE`, or `~/.pgpass`, which libpq
+requires be owner-only) and the DSN stays passwordless.
+
 **development** — a local Postgres. Read the database name, user, host and port from
 `ai-gateway-data/.env` (`DATABASE_NAME`, `DATABASE_USER`, `DATABASE_HOST`,
-`DATABASE_PORT`) and build the DSN from those. Do not assume names; they differ
-between machines.
+`DATABASE_PORT`) and build a passwordless DSN from those. Do not read or copy
+`DATABASE_PASSWORD`. Do not assume names; they differ between machines.
 
 **staging / production** — ask the operator to open their usual read-only tunnel and
-to paste back the DSN, or to put it in `IDENTIFY_DRIFT_DSN`. Wait for them; never open
-a tunnel yourself and never complete an MFA prompt on their behalf. If they ask how,
-point them at the internal database-access runbook rather than repeating it here.
+to say when it is up. The tunnel authenticates them, so its DSN is host, port, user
+and database only. Wait for them; never open a tunnel yourself and never complete an
+MFA prompt on their behalf. If they ask how, point them at the internal
+database-access runbook rather than repeating it here.
 
 Production rows are customer data. Keep them in the run: do not write them to disk
 beyond the temporary files this skill uses, and keep the excerpts in the report to the
@@ -61,7 +70,7 @@ trap 'rm -rf "$WORK"' EXIT              # and there is no reason to leave them b
 python3 .claude/skills/identify-drift/scan_local.py \
   --tools <tools> --days <n> --out "$WORK/local.json"
 
-export IDENTIFY_DRIFT_DSN="<the operator's dsn>"   # never on the command line:
+export IDENTIFY_DRIFT_DSN="<passwordless dsn>"      # never on the command line:
                                                    # arguments are visible in ps
 python3 .claude/skills/identify-drift/compare.py \
   --local "$WORK/local.json" \

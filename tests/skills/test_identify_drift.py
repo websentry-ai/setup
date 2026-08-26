@@ -7,6 +7,7 @@ log's hundred-entry cap is not.
 
 import json
 import unittest
+from collections import Counter
 import unittest.mock
 from datetime import datetime, timedelta, timezone
 
@@ -56,17 +57,22 @@ MATCHED_TRANSCRIPT = [
     rec("usage", input=100, output=50),
 ]
 def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
-       tool_counts=None, user_texts=("hello there",), assistant_texts=("hi back",)):
-    """The aggregated shape fetch_db returns. Everything is a count, a sum or a short
-    normalised string, because selecting the rows themselves does not fit in memory."""
+       tool_counts=None, user_texts=("hello there",), assistant_texts=("hi back",),
+       call_ids=("c1",), ids_are_representative=True, truncated=()):
+    """The aggregated shape fetch_db returns. Everything is a count, a sum, a digest or
+    an id, because selecting the rows themselves does not fit in memory. Prompts are a
+    multiset so a repeated prompt stored once still reads as a loss."""
     return {
         "metrics_rows": metrics_rows,
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "threads": set(threads),
         "tool_counts": dict(tool_counts if tool_counts is not None else {"Bash": 1}),
-        "user_texts": set(user_texts),
-        "assistant_texts": set(assistant_texts),
+        "call_ids": set(call_ids),
+        "ids_are_representative": ids_are_representative,
+        "user_digests": Counter(compare._digest(t) for t in user_texts),
+        "assistant_digests": Counter(compare._digest(t) for t in assistant_texts),
+        "truncated": list(truncated),
     }
 
 
@@ -114,7 +120,7 @@ class TestRealGapsAreFound(unittest.TestCase):
     def test_under_recorded_tool_calls(self):
         t = MATCHED_TRANSCRIPT + [rec("tool_call", tool="Write", call_id="c2")]
         got = titles(compare.compare("claude-code", local(t), MATCHED_DB, 3))
-        self.assertIn("Tool calls made locally are under-recorded", got)
+        self.assertIn("Tool calls made locally are absent from the database", got)
 
     def test_a_session_absent_from_the_database(self):
         t = MATCHED_TRANSCRIPT + [rec("tool_call", session="S2", tool="Bash", call_id="c3")]
@@ -262,12 +268,19 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
 
     def test_the_connection_never_reaches_the_process_list(self):
         """A DSN passed as an argument is readable by every account on the machine."""
-        env = compare._connection_env("postgres://bob:hunter2@db.example:6000/things")
-        self.assertEqual(env["PGPASSWORD"], "hunter2")
+        env = compare._connection_env("postgres://bob@db.example:6000/things")
         self.assertEqual(env["PGUSER"], "bob")
         self.assertEqual(env["PGHOST"], "db.example")
         self.assertEqual(env["PGPORT"], "6000")
         self.assertEqual(env["PGDATABASE"], "things")
+
+    def test_a_password_is_refused_rather_than_carried(self):
+        """This runs inside the hooks it audits, so a command carrying a password is
+        captured into the transcripts and prompt rows the comparison then reads."""
+        with self.assertRaises(SystemExit) as e:
+            compare._connection_env("postgres://bob:hunter2@db.example/things")
+        self.assertNotIn("hunter2", str(e.exception))
+        self.assertIn("PGPASSFILE", str(e.exception))
 
     def test_a_stale_password_in_the_environment_is_dropped(self):
         with unittest.mock.patch.dict("os.environ", {"PGPASSWORD": "leftover"}):
@@ -419,6 +432,72 @@ class TestTheWindowIsBounded(unittest.TestCase):
             capture_output=True, text=True, timeout=60)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("unknown tool", r.stderr)
+
+
+class TestReconciliationDistinguishesIndividualEvents(unittest.TestCase):
+    """Equal counts of different events are not a match. Where the stored rows carry a
+    tool_use_id the comparison is by that id, and where they do not the report says the
+    comparison was by count."""
+
+    def test_same_count_of_different_calls_is_still_a_loss(self):
+        t = MATCHED_TRANSCRIPT + [rec("tool_call", tool="Bash", call_id="local-only")]
+        d = db(tool_counts={"Bash": 2}, call_ids=("c1", "stored-only"))
+        got = compare.compare("claude-code", local(t), d, 3)
+        self.assertIn("Tool calls made locally are absent from the database",
+                      titles(got))
+        self.assertIn("local-only", " ".join(f["evidence"] for f in got))
+
+    def test_counting_is_used_when_too_few_rows_carry_an_id(self):
+        t = MATCHED_TRANSCRIPT + [rec("tool_call", tool="Write", call_id="c2")]
+        d = db(ids_are_representative=False, call_ids=())
+        got = titles(compare.compare("claude-code", local(t), d, 3))
+        self.assertIn("Tool calls made locally are under-recorded (by count)", got)
+
+    def test_the_count_fallback_says_it_is_a_count(self):
+        t = MATCHED_TRANSCRIPT + [rec("tool_call", tool="Write", call_id="c2")]
+        d = db(ids_are_representative=False, call_ids=())
+        got = compare.compare("claude-code", local(t), d, 3)
+        why = next(f["why"] for f in got if "by count" in f["title"])
+        self.assertIn("counts them instead", why)
+
+    def test_a_truncated_id_set_falls_back_rather_than_inventing_losses(self):
+        t = MATCHED_TRANSCRIPT + [rec("tool_call", tool="Bash", call_id="c9")]
+        d = db(tool_counts={"Bash": 2}, call_ids=("c1",),
+               truncated=["tool call ids"])
+        got = titles(compare.compare("claude-code", local(t), d, 3))
+        self.assertNotIn("Tool calls made locally are absent from the database", got)
+
+    def test_a_prompt_sent_twice_and_stored_once_is_a_loss(self):
+        t = MATCHED_TRANSCRIPT + [rec("user_prompt", text="hello there")]
+        got = titles(compare.compare("claude-code", local(t), MATCHED_DB, 3))
+        self.assertIn("User prompts recorded locally are absent from the database", got)
+
+    def test_a_prompt_sent_twice_and_stored_twice_is_not_a_loss(self):
+        t = MATCHED_TRANSCRIPT + [rec("user_prompt", text="hello there")]
+        d = db(user_texts=("hello there", "hello there"))
+        got = titles(compare.compare("claude-code", local(t), d, 3))
+        self.assertNotIn("User prompts recorded locally are absent from the database",
+                         got)
+
+    def test_the_digest_matches_what_the_query_computes(self):
+        self.assertEqual(compare._digest("  Hello   THERE  "),
+                         compare._digest("hello there"))
+
+
+class TestRetrievalIsBounded(unittest.TestCase):
+    def test_the_cap_is_declared(self):
+        self.assertIsInstance(compare.ROW_CAP, int)
+        self.assertGreater(compare.ROW_CAP, 0)
+
+    def test_over_the_cap_is_reported_as_truncated(self):
+        rows, capped, _ = compare._capped(list(range(compare.ROW_CAP + 5)), "prompts")
+        self.assertTrue(capped)
+        self.assertEqual(len(rows), compare.ROW_CAP)
+
+    def test_under_the_cap_is_not_reported_as_truncated(self):
+        rows, capped, _ = compare._capped([1, 2, 3], "prompts")
+        self.assertFalse(capped)
+        self.assertEqual(rows, [1, 2, 3])
 
 
 if __name__ == "__main__":

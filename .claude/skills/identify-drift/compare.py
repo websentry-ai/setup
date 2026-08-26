@@ -14,9 +14,8 @@ is not evidence of anything.
 """
 
 import argparse
-import json
-import os
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -40,6 +39,13 @@ def _connection_env(dsn):
     parts = urlsplit(dsn)
     if parts.scheme not in ("postgres", "postgresql"):
         sys.exit("dsn must be a postgres:// or postgresql:// URL")
+    if parts.password:
+        # No route into this tool carries a password, including the environment. The
+        # command that would set one is itself captured by the hooks this compares,
+        # so the secret would land in the transcripts, the audit log and the stored
+        # prompts. libpq reads a password file that stays out of both.
+        sys.exit("the dsn carries a password: remove it and let libpq read one from "
+                 "PGPASSFILE or ~/.pgpass, which this never sees")
     env = dict(os.environ)
     env.pop("PGPASSWORD", None)
     if parts.hostname:
@@ -48,8 +54,6 @@ def _connection_env(dsn):
         env["PGPORT"] = str(parts.port)
     if parts.username:
         env["PGUSER"] = unquote(parts.username)
-    if parts.password:
-        env["PGPASSWORD"] = unquote(parts.password)
     database = parts.path.lstrip("/")
     if database:
         env["PGDATABASE"] = database
@@ -88,16 +92,31 @@ def psql(dsn, sql, params=None):
     return json.loads(result.stdout.strip() or "[]")
 
 
-def fetch_db(dsn, email, app_label, days):
-    """What we hold for this user and tool, aggregated in the database.
+# What one query may return. Past this the window is too broad to compare item by
+# item, and the report says so rather than comparing a truncated set and calling the
+# remainder missing.
+ROW_CAP = 50000
 
-    Every value here is a count, a sum, or a short normalised string. Selecting the
-    rows themselves and folding them in Python would pull the whole window across:
-    one ordinary account's stored prompts come to fourteen megabytes, and a single
-    row can be two hundred kilobytes, so a busy fortnight would be far larger than
-    anything worth holding in one JSON value.
+
+def _capped(rows, what):
+    """Rows plus whether the cap swallowed any. A silent truncation would turn every
+    unreturned row into a false 'absent from the database'."""
+    return rows[:ROW_CAP], len(rows) > ROW_CAP, what
+
+
+def fetch_db(dsn, email, app_label, days):
+    """What we hold for this user and tool, aggregated in the database and bounded.
+
+    Values are counts, sums, digests and ids. Selecting the rows themselves would pull
+    the window across: one ordinary account's stored prompts come to fourteen megabytes
+    and a single row can be two hundred kilobytes.
+
+    Prompts come back as a multiset of digests, not a set, so a prompt sent twice and
+    stored once is still visible as a loss. Tool calls come back as ids where the row
+    carries one, because equal counts of different calls are not a match.
     """
-    params = {"email": email, "label": app_label, "days": int(days)}
+    params = {"email": email, "label": app_label, "days": int(days),
+              "cap": ROW_CAP + 1}
     where = """
         FROM gateway_metrics gm
         JOIN applications app ON app.id = gm.application_id
@@ -106,6 +125,9 @@ def fetch_db(dsn, email, app_label, days):
           AND gm.app_label = :'label'
           AND gm.request_initialized_at >= now() - (:'days' || ' days')::interval
     """
+    # The same trim, collapse, truncate and fold _norm applies, then a digest, so the
+    # two sides are comparable without carrying the text across.
+    norm = ("md5(left(lower(btrim(regexp_replace(%s, '\s+', ' ', 'g'))), 200))")
 
     totals = psql(dsn, """
         SELECT count(*) AS metrics_rows,
@@ -118,42 +140,64 @@ def fetch_db(dsn, email, app_label, days):
         SELECT DISTINCT pa.thread_id
         FROM prompt_analytics pa
         WHERE pa.thread_id IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+        LIMIT :'cap'
     """ % where, params)
 
     tools = psql(dsn, """
-        SELECT pa.tool_name, count(*) AS n
+        SELECT pa.tool_name, count(*) AS n,
+               count(*) FILTER (WHERE pa.parameters ? 'tool_use_id') AS with_id
         FROM prompt_analytics pa
         WHERE pa.tool_name IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)
         GROUP BY pa.tool_name
+        LIMIT :'cap'
     """ % where, params)
 
-    # Normalised here so the two sides are compared the same way; _norm does the
-    # identical trim, collapse, truncate and fold in Python.
-    texts = psql(dsn, """
-        SELECT DISTINCT role, t FROM (
-          SELECT 'user' AS role,
-                 left(lower(btrim(regexp_replace(p.prompt->>'user_prompt',
-                                                 '\s+', ' ', 'g'))), 200) AS t
-          FROM prompts p
-          WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
+    call_ids = psql(dsn, """
+        SELECT DISTINCT pa.parameters->>'tool_use_id' AS call_id
+        FROM prompt_analytics pa
+        WHERE pa.parameters ? 'tool_use_id'
+          AND pa.gateway_metrics_id IN (SELECT gm.id %s)
+        LIMIT :'cap'
+    """ % where, params)
+
+    digests = psql(dsn, """
+        SELECT role, h, count(*) AS n FROM (
+          SELECT 'user' AS role, %s AS h
+          FROM prompts p WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
           UNION ALL
-          SELECT 'assistant',
-                 left(lower(btrim(regexp_replace(p.prompt->>'assistant_prompt',
-                                                 '\s+', ' ', 'g'))), 200)
-          FROM prompts p
-          WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
-        ) x WHERE t IS NOT NULL AND t <> ''
-    """ % (where, where), params)
+          SELECT 'assistant', %s
+          FROM prompts p WHERE p.gateway_metrics_id IN (SELECT gm.id %s)
+        ) x WHERE h IS NOT NULL
+        GROUP BY role, h
+        LIMIT :'cap'
+    """ % (norm % "p.prompt->>'user_prompt'", where,
+           norm % "p.prompt->>'assistant_prompt'", where), params)
+
+    threads, threads_capped, _ = _capped(threads, "sessions")
+    call_ids, ids_capped, _ = _capped(call_ids, "tool call ids")
+    digests, digests_capped, _ = _capped(digests, "prompts")
 
     row = totals[0] if totals else {}
+    tool_counts = {r["tool_name"]: int(r["n"]) for r in tools}
+    with_id = sum(int(r["with_id"]) for r in tools)
+    stored_calls = sum(tool_counts.values())
     return {
         "metrics_rows": int(row.get("metrics_rows") or 0),
         "input_tokens": int(row.get("input_tokens") or 0),
         "output_tokens": int(row.get("output_tokens") or 0),
         "threads": {r["thread_id"] for r in threads},
-        "tool_counts": {r["tool_name"]: int(r["n"]) for r in tools},
-        "user_texts": {r["t"] for r in texts if r["role"] == "user"},
-        "assistant_texts": {r["t"] for r in texts if r["role"] == "assistant"},
+        "tool_counts": tool_counts,
+        "call_ids": {r["call_id"] for r in call_ids if r["call_id"]},
+        # Whether ids cover enough of the stored rows to reconcile by identity. Below
+        # this the rows predate the id being recorded and only counts are available.
+        "ids_are_representative": bool(stored_calls) and with_id >= stored_calls * 0.9,
+        "user_digests": Counter({r["h"]: int(r["n"]) for r in digests
+                                 if r["role"] == "user"}),
+        "assistant_digests": Counter({r["h"]: int(r["n"]) for r in digests
+                                      if r["role"] == "assistant"}),
+        "truncated": [what for flag, what in
+                      ((threads_capped, "sessions"), (ids_capped, "tool call ids"),
+                       (digests_capped, "prompts")) if flag],
     }
 
 
@@ -177,6 +221,12 @@ def _excerpt(text):
         return "sha256:%s (%d chars)" % (
             hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:12], len(text or ""))
     return repr((text or "")[:60])
+
+
+def _digest(text):
+    """The same value the query computes, so the two sides compare without the text
+    ever leaving the database."""
+    return hashlib.md5(_norm(text).encode("utf-8")).hexdigest()
 
 
 def _norm(text):
@@ -241,40 +291,67 @@ def compare(tool, local, db, days):
         })
 
     # ---- prompts -------------------------------------------------------
-    for kind, stored_texts, label in (
-            ("user_prompt", db["user_texts"], "user prompts"),
-            ("assistant_message", db["assistant_texts"], "assistant messages")):
-        local_texts = {_norm(r.get("text")) for r in by_kind[kind] if r.get("text")}
-        missing = sorted(t for t in local_texts if t and t not in stored_texts)
-        if missing and db["metrics_rows"]:
+    for kind, stored, label, column in (
+            ("user_prompt", db["user_digests"], "user prompts", "user_prompt"),
+            ("assistant_message", db["assistant_digests"], "assistant messages",
+             "assistant_prompt")):
+        # A multiset: the same prompt sent three times and stored once is two losses,
+        # which comparing sets would report as none.
+        local_counts = Counter(_digest(r["text"]) for r in by_kind[kind] if r.get("text"))
+        shortfall = local_counts - stored
+        missing_texts = [r["text"] for r in by_kind[kind]
+                         if r.get("text") and shortfall.get(_digest(r["text"]))]
+        if shortfall and db["metrics_rows"]:
+            missing = missing_texts or ["(text unavailable)"]
             findings.append({
                 "title": "%s recorded locally are absent from the database"
                          % label.capitalize(),
-                "where": "%s transcripts -> prompts.%s"
-                         % (tool, "user_prompt" if kind == "user_prompt"
-                            else "assistant_prompt"),
+                "where": "%s transcripts -> prompts.%s" % (tool, column),
                 "evidence": "%d of %d missing. First: %s"
-                            % (len(missing), len(local_texts), _excerpt(missing[0])),
+                            % (sum(shortfall.values()), sum(local_counts.values()),
+                               _excerpt(missing[0])),
                 "why": "The hook either did not capture these, or captured them into a "
                        "turn that was never uploaded.",
             })
 
     # ---- tool calls ----------------------------------------------------
     local_tools = Counter(r.get("tool") for r in by_kind["tool_call"] if r.get("tool"))
-    short = {name: local_tools[name] - db["tool_counts"].get(name, 0)
-             for name in local_tools
-             if local_tools[name] > db["tool_counts"].get(name, 0)}
-    if short and db["metrics_rows"]:
-        worst = sorted(short.items(), key=lambda kv: -kv[1])[:3]
-        findings.append({
-            "title": "Tool calls made locally are under-recorded",
-            "where": "%s transcripts -> prompt_analytics.tool_name" % tool,
-            "evidence": "; ".join("%s local %d vs stored %d"
-                                  % (n, local_tools[n], db["tool_counts"].get(n, 0))
-                                  for n, _ in worst),
-            "why": "A PreToolUse that failed to upload, or a tool the hook does not "
-                   "handle. Compare one call_id against the audit log.",
-        })
+    # Ids are only usable when nearly every stored row has one and the cap returned
+    # them all; a truncated id set would make present calls look absent.
+    by_identity = db["ids_are_representative"] and "tool call ids" not in db["truncated"]
+    if by_identity:
+        # Identity, not arithmetic: five stored calls and five local calls can be ten
+        # different calls, which counting alone reports as agreement.
+        absent = [r for r in by_kind["tool_call"]
+                  if r.get("call_id") and r["call_id"] not in db["call_ids"]]
+        if absent and db["metrics_rows"]:
+            findings.append({
+                "title": "Tool calls made locally are absent from the database",
+                "where": "%s transcripts -> prompt_analytics.parameters->>'tool_use_id'"
+                         % tool,
+                "evidence": "%d of %d call(s) have no stored row. First: %s (%s)"
+                            % (len(absent),
+                               len([r for r in by_kind["tool_call"] if r.get("call_id")]),
+                               absent[0]["call_id"], absent[0].get("tool")),
+                "why": "A PreToolUse that failed to upload, or a tool the hook does not "
+                       "handle.",
+            })
+    else:
+        short = {name: local_tools[name] - db["tool_counts"].get(name, 0)
+                 for name in local_tools
+                 if local_tools[name] > db["tool_counts"].get(name, 0)}
+        if short and db["metrics_rows"]:
+            worst = sorted(short.items(), key=lambda kv: -kv[1])[:3]
+            findings.append({
+                "title": "Tool calls made locally are under-recorded (by count)",
+                "where": "%s transcripts -> prompt_analytics.tool_name" % tool,
+                "evidence": "; ".join("%s local %d vs stored %d"
+                                      % (n, local_tools[n], db["tool_counts"].get(n, 0))
+                                      for n, _ in worst),
+                "why": "Too few stored rows carry a tool_use_id to match calls "
+                       "individually, so this counts them instead: equal counts of "
+                       "different calls would read as agreement.",
+            })
 
     # ---- tokens --------------------------------------------------------
     local_in = sum(r.get("input", 0) for r in by_kind["usage"])
@@ -335,34 +412,54 @@ def compare(tool, local, db, days):
         # audit -> database: the hook saw it and the upload lost it. This is the only
         # direction that separates an ingest failure from a capture bug, and for a tool
         # whose audit log is its only local record it is the only check there is.
-        logged = Counter(r.get("tool") for r in audit_by_kind["tool_call"]
-                         if in_window(r) and r.get("tool"))
-        dropped = {name: logged[name] - db["tool_counts"].get(name, 0)
-                   for name in logged
-                   if logged[name] > db["tool_counts"].get(name, 0)}
-        if dropped:
-            worst = sorted(dropped.items(), key=lambda kv: -kv[1])[:3]
-            findings.append({
-                "title": "The hook logged tool calls the database never received",
-                "where": "%s -> prompt_analytics.tool_name" % local["audit_log"],
-                "evidence": "; ".join("%s logged %d vs stored %d"
-                                      % (n, logged[n], db["tool_counts"].get(n, 0))
-                                      for n, _ in worst),
-                "why": "The hook saw these and the upload did not land them, so the loss "
-                       "is the ingest path or the network, not the capture.",
-            })
+        logged = [r for r in audit_by_kind["tool_call"] if in_window(r)]
+        if by_identity:
+            dropped = [r for r in logged
+                       if r.get("call_id") and r["call_id"] not in db["call_ids"]]
+            if dropped:
+                findings.append({
+                    "title": "The hook logged tool calls the database never received",
+                    "where": "%s -> prompt_analytics.parameters->>'tool_use_id'"
+                             % local["audit_log"],
+                    "evidence": "%d of %d logged call(s) have no stored row. First: "
+                                "%s (%s)"
+                                % (len(dropped),
+                                   len([r for r in logged if r.get("call_id")]),
+                                   dropped[0]["call_id"], dropped[0].get("tool")),
+                    "why": "The hook saw these and the upload did not land them, so the "
+                           "loss is the ingest path or the network, not the capture.",
+                })
+        else:
+            counts = Counter(r.get("tool") for r in logged if r.get("tool"))
+            dropped = {name: counts[name] - db["tool_counts"].get(name, 0)
+                       for name in counts
+                       if counts[name] > db["tool_counts"].get(name, 0)}
+            if dropped:
+                worst = sorted(dropped.items(), key=lambda kv: -kv[1])[:3]
+                findings.append({
+                    "title": "The hook logged tool calls the database never received "
+                             "(by count)",
+                    "where": "%s -> prompt_analytics.tool_name" % local["audit_log"],
+                    "evidence": "; ".join("%s logged %d vs stored %d"
+                                          % (n, counts[n], db["tool_counts"].get(n, 0))
+                                          for n, _ in worst),
+                    "why": "Too few stored rows carry a tool_use_id to match calls "
+                           "individually, so this counts them instead.",
+                })
 
-        logged_prompts = {_norm(r.get("text")) for r in audit_by_kind["user_prompt"]
-                          if in_window(r) and r.get("text")}
-        dropped_prompts = sorted(t for t in logged_prompts
-                                 if t and t not in db["user_texts"])
+        logged_prompts = Counter(_digest(r["text"]) for r in audit_by_kind["user_prompt"]
+                                 if in_window(r) and r.get("text"))
+        dropped_prompts = logged_prompts - db["user_digests"]
+        first = next((r["text"] for r in audit_by_kind["user_prompt"]
+                      if in_window(r) and r.get("text")
+                      and dropped_prompts.get(_digest(r["text"]))), "(text unavailable)")
         if dropped_prompts and db["metrics_rows"]:
             findings.append({
                 "title": "The hook logged prompts the database never received",
                 "where": "%s -> prompts.user_prompt" % local["audit_log"],
                 "evidence": "%d of %d missing. First: %s"
-                            % (len(dropped_prompts), len(logged_prompts),
-                               _excerpt(dropped_prompts[0])),
+                            % (sum(dropped_prompts.values()),
+                               sum(logged_prompts.values()), _excerpt(first)),
                 "why": "Captured and then lost on the way up, so look at the upload "
                        "rather than the hook.",
             })
@@ -381,7 +478,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--local", required=True, help="scan_local.py output, or - for stdin")
     ap.add_argument("--dsn", help="prefer IDENTIFY_DRIFT_DSN: an argument is visible "
-                                  "to every account on the machine through ps")
+                                  "to every account on the machine through ps. No "
+                                  "password in either; libpq reads one from PGPASSFILE")
     ap.add_argument("--email", required=True)
     ap.add_argument("--environment", required=True)
     ap.add_argument("--redact", action="store_true",
@@ -393,10 +491,8 @@ def main():
     # libpq handoff below avoids for psql.
     dsn = os.environ.get("IDENTIFY_DRIFT_DSN") or args.dsn
     if not dsn:
-        sys.exit("set IDENTIFY_DRIFT_DSN, or pass --dsn if it carries no password")
-    if args.dsn and urlsplit(args.dsn).password:
-        sys.exit("--dsn carries a password and would be visible in ps; "
-                 "put it in IDENTIFY_DRIFT_DSN instead")
+        sys.exit("set IDENTIFY_DRIFT_DSN or pass --dsn, with no password in either")
+    _connection_env(dsn)
 
     global REDACT
     REDACT = args.redact or args.environment.lower() == "production"
@@ -408,14 +504,31 @@ def main():
               "days": days, "since": local_all["since"], "tools": {}}
     for tool, local in local_all["tools"].items():
         db = fetch_db(dsn, args.email, APP_LABEL[tool], days)
+        findings = compare(tool, local, db, days)
+        if db["truncated"]:
+            # Said out loud rather than left to look like a clean run: past the cap the
+            # unreturned rows would each read as a loss that never happened.
+            findings.insert(0, {
+                "title": "Window too broad to compare exhaustively",
+                "where": "%s -> %s" % (tool, ", ".join(db["truncated"])),
+                "evidence": "more than %d distinct %s in %d days"
+                            % (ROW_CAP, " and ".join(db["truncated"]), days),
+                "why": "Findings below cover only what was returned. Re-run over fewer "
+                       "days for a complete comparison.",
+            })
         report["tools"][tool] = {
-            "findings": compare(tool, local, db, days),
+            "findings": findings,
             "counts": {
                 "local_sessions": len(local["sessions_transcript"]),
                 "db_metrics_rows": db["metrics_rows"],
                 "db_threads": len(db["threads"]),
                 "db_tool_kinds": len(db["tool_counts"]),
-                "db_prompt_texts": len(db["user_texts"]) + len(db["assistant_texts"]),
+                "db_tool_calls": sum(db["tool_counts"].values()),
+                "db_prompts": sum(db["user_digests"].values())
+                              + sum(db["assistant_digests"].values()),
+                "tool_calls_matched_by": ("tool_use_id"
+                                          if db["ids_are_representative"] else "count"),
+                "truncated": db["truncated"],
             },
         }
     json.dump(report, sys.stdout, indent=2)
