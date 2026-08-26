@@ -89,8 +89,8 @@ def psql(dsn, sql, params=None):
 def fetch_db(dsn, email, app_label, days):
     """Everything this user's tool sent us inside the window.
 
-    The join is email -> application -> gateway_metrics; prompt and prompt_analytics
-    hang off the metrics row by request_id.
+    The join is email -> application -> gateway_metrics; the prompt and tool rows
+    hang off the metrics row by its id.
     """
     # No caller value is pasted into the SQL: psql binds and quotes each one.
     params = {"email": email, "label": app_label, "days": int(days)}
