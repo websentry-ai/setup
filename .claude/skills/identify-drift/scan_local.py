@@ -149,7 +149,7 @@ def scan_cursor(since):
         session = path.stem
         for entry in _lines(path):
             when = _ts(entry.get("timestamp") or entry.get("createdAt")) or _file_time(path)
-            if when and when < since:
+            if not when or when < since:
                 continue
             role = entry.get("role")
             content = (entry.get("message") or {}).get("content")
@@ -171,7 +171,7 @@ def _scan_copilot_file(path, session, since):
     for entry in _lines(path):
         data = entry.get("data") or {}
         when = _ts(entry.get("timestamp") or data.get("timestamp")) or _file_time(path)
-        if when and when < since:
+        if not when or when < since:
             continue
         kind = entry.get("type")
         if kind == "user.message":
@@ -204,7 +204,7 @@ def scan_codex(since):
             when = _ts(entry.get("timestamp") or payload.get("started_at")) or _file_time(path)
             if entry.get("type") == "session_meta":
                 session = payload.get("id") or path.stem
-            if when and when < since:
+            if not when or when < since:
                 continue
             session = session or path.stem
             kind = payload.get("type")

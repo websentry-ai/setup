@@ -298,6 +298,16 @@ class TestItHandlesOtherPeoplesDataCarefully(unittest.TestCase):
         self.assertNotIn("hunter2", scrubbed)
         self.assertNotIn("db.example", scrubbed)
 
+    def test_errors_never_echo_the_infrastructure_either(self):
+        """A password cannot reach the scrubber any more, but the host, user and
+        database still name infrastructure that should not land in a report."""
+        dsn = "postgres://reporting_ro@replica.internal.example:5432/gateway_prod"
+        scrubbed = compare._scrub(
+            'could not connect to server "replica.internal.example" as user '
+            '"reporting_ro" database "gateway_prod"', dsn)
+        for piece in ("replica.internal.example", "reporting_ro", "gateway_prod"):
+            self.assertNotIn(piece, scrubbed)
+
     def test_a_non_postgres_dsn_is_refused(self):
         with self.assertRaises(SystemExit):
             compare._connection_env("file:///etc/passwd")
@@ -691,6 +701,24 @@ class TestRetrievalIsBounded(unittest.TestCase):
         got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a), d, 3))
         self.assertIn("The hook logged tool calls the database never received "
                       "(by count)", got)
+
+
+class TestACheckThatDoesNotRunSaysSo(unittest.TestCase):
+    """Codex reports a cumulative total per turn rather than a delta per message, so
+    the token comparison cannot run for it. Silence would read as a pass."""
+
+    def test_a_running_total_tool_declares_the_gap(self):
+        t = [rec("user_prompt", text="hello there"),
+             rec("assistant_message", text="hi back"),
+             rec("tool_call", tool="Bash", call_id="c1"),
+             rec("usage_total", input=500, output=200)]
+        got = titles(compare.compare("codex", local(t), MATCHED_DB, 3))
+        self.assertIn("Token totals were not reconciled for this tool", got)
+
+    def test_a_per_message_tool_does_not(self):
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
+                                     MATCHED_DB, 3))
+        self.assertNotIn("Token totals were not reconciled for this tool", got)
 
 
 class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):

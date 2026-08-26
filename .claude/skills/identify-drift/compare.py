@@ -128,11 +128,15 @@ def _connection_env(dsn):
 
 
 def _scrub(text, dsn):
-    """Never echo the connection back: psql quotes it in several of its errors."""
+    """Never echo the connection back: psql quotes it in several of its errors. A
+    password cannot reach here any more, but the host, user and database still name
+    infrastructure that does not belong in a report or a terminal someone screenshots."""
     out = (text or "").replace(dsn, "<dsn>")
     parts = urlsplit(dsn)
-    if parts.password:
-        out = out.replace(unquote(parts.password), "<redacted>")
+    for piece in (parts.password and unquote(parts.password), parts.hostname,
+                  parts.username, parts.path.lstrip("/")):
+        if piece and len(piece) > 2:
+            out = out.replace(piece, "<redacted>")
     return out
 
 
@@ -155,6 +159,8 @@ def _psql_binary(explicit=None):
     replace it, and it is handed the connection and asked for the numbers this reports
     as fact, so a directory other accounts can write is not a place to take it from."""
     if explicit:
+        # A named path skips the directory check on purpose: the operator picking a
+        # binary is a decision a person made, which is what the check exists to ask for.
         if not os.path.isabs(explicit) or not os.access(explicit, os.X_OK):
             sys.exit("--psql must be an absolute path to an executable")
         return explicit
@@ -544,6 +550,19 @@ def compare(tool, local, db, days, db_audit=None):
     # ---- tokens --------------------------------------------------------
     local_in = sum(r.get("input", 0) for r in by_kind["usage"])
     local_out = sum(r.get("output", 0) for r in by_kind["usage"])
+    if not by_kind["usage"] and by_kind["usage_total"] and db["metrics_rows"]:
+        # A running per-turn total cannot be added up the way per-message deltas can,
+        # and a session that began before the window carries usage from outside it.
+        # Said out loud, because a check that quietly does not run reads as a pass.
+        findings.append({
+            "title": "Token totals were not reconciled for this tool",
+            "where": "%s transcripts -> gateway_metrics" % tool,
+            "evidence": "%d running-total record(s), no per-message usage"
+                        % len(by_kind["usage_total"]),
+            "why": "This tool reports a cumulative total per turn rather than a delta "
+                   "per message, so the two sides are not comparable here. The prompt "
+                   "and tool-call checks above still apply.",
+        })
     for name, local_value, db_value in (("input", local_in, db["input_tokens"]),
                                         ("output", local_out, db["output_tokens"])):
         if db_value and local_value:
