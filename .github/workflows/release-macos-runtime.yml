@@ -228,6 +228,9 @@ jobs:
           token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
           path: discovery-src
 
+      # Provenance lives with the release, not in the payload: the artifact
+      # carries no commit of its own, so a deployed device is traced by version
+      # through the GitHub Release. Both are immutable, S3 refuses overwrites.
       - name: Record resolved discovery commit
         id: discovery
         if: steps.cfg.outputs.discovery_token == 'true'
