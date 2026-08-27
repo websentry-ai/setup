@@ -77,6 +77,13 @@ class TestComputeMcpCacheKey(unittest.TestCase):
             'url:mcp.slack.com/mcp',
         )
 
+    def test_invalid_port_has_no_fingerprint(self):
+        self.assertIsNone(
+            unbound.compute_mcp_cache_key(
+                'broken', None, 'https://mcp.example.com:99999/mcp', None,
+            )
+        )
+
     def test_git_credentials_are_removed(self):
         self.assertEqual(
             unbound.compute_mcp_cache_key(
