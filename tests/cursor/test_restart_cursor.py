@@ -8,6 +8,7 @@ machine-wide roots: a per-user path there would run a planted binary as SYSTEM.
 
 import importlib.util
 import os
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -85,6 +86,39 @@ class TestElevatedLookupIsMachineWideOnly(unittest.TestCase):
         with patch.dict(os.environ, {"LOCALAPPDATA": r"C:\Users\alice\AppData\Local"}, clear=True), \
              patch.object(Path, "is_file", lambda self: "AppData" in str(self)):
             self.assertIn("AppData", USER.find_cursor_exe())
+
+
+class TestSetupDoesNotDependOnCursorBeingInstalled(unittest.TestCase):
+    """Hooks live in the machine-wide enterprise dir, so they enforce whenever Cursor arrives."""
+
+    def test_hooks_install_with_no_cursor_on_the_machine(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        enterprise = Path(tmp.name) / "ProgramData" / "Cursor"
+
+        def fake_download(url, dest):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_text('{"version":1,"hooks":{"preToolUse":[{"command":"./hooks/unbound.py"}]}}')
+            return True
+
+        with patch.object(MDM, "get_enterprise_hooks_dir", return_value=enterprise), \
+             patch.object(MDM, "download_file", side_effect=fake_download), \
+             patch.object(MDM.platform, "system", return_value="Windows"), \
+             patch.object(MDM, "find_cursor_exe", return_value=None):
+            success, _ = MDM.setup_hooks()
+
+        self.assertTrue(success)
+        self.assertTrue((enterprise / "hooks.json").is_file())
+        self.assertTrue((enterprise / "hooks" / "unbound.py").is_file())
+
+    def test_a_failed_restart_cannot_fail_the_run(self):
+        """Callers invoke restart_cursor() bare. Guard against someone wiring it into a return."""
+        for relpath in ("cursor/setup.py", "cursor/mdm/setup.py"):
+            with self.subTest(path=relpath):
+                for line in (REPO / relpath).read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    if "restart_cursor()" in stripped and not stripped.startswith("def "):
+                        self.assertEqual(stripped, "restart_cursor()")
 
 
 if __name__ == "__main__":
