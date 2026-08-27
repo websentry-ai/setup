@@ -7,7 +7,7 @@
 # unless you replicate those checks.
 #
 # UNBOUND_DISCOVERY_SRC must point to a coding-discovery-tool checkout at the
-# locked SHA. The detection code is bundled as-is — no logic changes here.
+# SOURCE_REF. The detection code is bundled as-is — no logic changes here.
 # Codesigning is intentionally absent (certs pending); PyInstaller applies its
 # default ad-hoc signature on arm64.
 

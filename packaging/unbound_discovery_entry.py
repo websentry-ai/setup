@@ -11,7 +11,7 @@ log one line and exit 0.
 Configuration is considered present when both the API key (--api-key flag or
 the UNBOUND_API_KEY env var, mirroring upstream) and --domain are non-empty.
 
-Subcommand routing mirrors upstream install.sh at the pinned SHA: a leading
+Subcommand routing mirrors upstream install.sh at SOURCE_REF: a leading
 "mcp-scan" runs the on-demand single-server scan (scan_single_mcp_server,
 used by the agent hooks when the gateway reports an unknown MCP server);
 anything else runs the full discovery sweep. Everything else (argument
@@ -31,7 +31,7 @@ import sys
 # TODO(WEB-4802): hook and discovery versions must be bumped in lockstep on
 # every tag until build-time version injection lands (the workflow already
 # notes this). Keep this equal to unbound_hook.__version__ until then.
-__version__ = "0.1.17"
+__version__ = "0.1.18"
 
 
 def _missing_required_config(argv):
