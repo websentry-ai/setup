@@ -1692,6 +1692,132 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
         start_idx = last_fit_end
 
 
+_DESKTOP_SESSION_MAX_BYTES = 512 * 1024
+
+
+def _claude_desktop_support_dirs(home: Path) -> List[Path]:
+    """Claude Desktop app support dir(s) for a home. Team/SSO desktop sessions
+    cache the active account's oauthAccount under local-agent-mode-sessions/ here.
+
+    Taken from unbound.py, keyed off `home` instead of Path.home()/APPDATA: MDM
+    backfill walks every profile, so per-process paths would resolve to the
+    admin's for all of them. On Windows APPDATA is that user's
+    <home>\AppData\Roaming.
+    """
+    system = platform.system().lower()
+    if system == 'darwin':
+        return [home / 'Library' / 'Application Support' / 'Claude']
+    if system == 'windows':
+        # MSIX/Store installs never write %APPDATA%\Claude — Windows redirects it
+        # to a per-package LocalCache. Verified on a Windows Server 2022 box where
+        # only the second path existed. Both are listed; missing ones are skipped.
+        appdata = home / 'AppData'
+        return [
+            appdata / 'Roaming' / 'Claude',
+            appdata / 'Local' / 'Packages' / 'Claude_pzs8sxrjxfjjc' / 'LocalCache' / 'Roaming' / 'Claude',
+        ]
+    return [home / '.config' / 'Claude']
+
+
+def _desktop_session_email(home: Path) -> Optional[str]:
+    """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
+    oauthAccount into ~/.claude.json (anthropics/claude-code#57026) but does write
+    the active account's oauthAccount (with emailAddress) into each per-session
+    sandbox config. These configs are sandbox-writable and thus untrusted, so the
+    email is returned only when every session that carries one agrees on a single
+    address; any disagreement (multiple accounts, or a forged/injected config) or
+    failure yields None, so backfill sends a blank email rather than a wrong one.
+    Best effort — never raises. Copied from unbound.py, keyed off `home`."""
+    timed = []
+    try:
+        bases = _claude_desktop_support_dirs(home)
+    except Exception:
+        return None
+    for base in bases:
+        try:
+            # list() forces the lazy glob traversal to happen inside this guard —
+            # a mid-iteration traversal error (e.g. an unreadable subdir) then only
+            # skips this base instead of aborting the whole scan.
+            candidates = list((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
+        except Exception:
+            continue
+        for path in candidates:
+            # stat per file so one unreadable/vanished entry can't poison the sort.
+            try:
+                timed.append((path.stat().st_mtime, path))
+            except Exception:
+                continue
+    timed.sort(key=lambda t: t[0], reverse=True)
+    found = None
+    found_key = None
+    for _, path in timed:
+        # A session that exists but can't be read (oversized, IO/parse error) is a
+        # blind spot — it could belong to a different account, so we can't verify
+        # agreement. Return blank rather than fall through to a possibly-stale email.
+        # Bound the read itself (read MAX+1 bytes) rather than trusting a separate
+        # stat(): a rewrite-after-stat race can't feed an unbounded file into read.
+        try:
+            with open(path, 'rb') as f:
+                data = f.read(_DESKTOP_SESSION_MAX_BYTES + 1)
+            if len(data) > _DESKTOP_SESSION_MAX_BYTES:
+                return None
+            oauth = json.loads(data.decode('utf-8')).get('oauthAccount')
+        except Exception:
+            return None
+        if not isinstance(oauth, dict):
+            continue
+        raw = oauth.get('emailAddress')
+        email = raw.strip() if isinstance(raw, str) else ''
+        if not email:
+            continue
+        key = email.lower()
+        if found_key is None:
+            found, found_key = email, key
+        elif key != found_key:
+            return None  # accounts disagree — blank over wrong
+    return found
+
+
+def _backfill_account_email(home: Path) -> Optional[str]:
+    """Signed-in email for a home, in the same order read_account_identity uses:
+    oauthAccount in ~/.claude.json first, then the Team/SSO desktop session cache.
+
+    Team/SSO desktop never hydrates oauthAccount, so skipping the fallback would
+    leave exactly those users unattributed — the case this change exists to fix.
+    """
+    email = None
+    try:
+        config = json.loads((home / '.claude.json').read_text(encoding='utf-8'))
+        oauth = config.get('oauthAccount')
+        if isinstance(oauth, dict):
+            raw = oauth.get('emailAddress')
+            if isinstance(raw, str) and raw.strip():
+                email = raw.strip()
+    except Exception:
+        pass
+    if not email:
+        try:
+            email = _desktop_session_email(home)
+        except Exception:
+            email = None
+    return email
+
+
+def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email: Optional[str]) -> None:
+    """Carry the device serial and signed-in email alongside the sessions.
+
+    Without them the server attributes replayed history to whichever application
+    owns the upload key, which under MDM is the admin's rather than the person who
+    actually ran the session. Either field may be absent; the server maps on what
+    it gets.
+    """
+    for session in sessions:
+        if serial:
+            session['device_serial'] = serial
+        if email:
+            session['user_email'] = email
+
+
 def _backfill_collect_sessions(home_dir: Path) -> Tuple[List[Dict], bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
     # Returns (sessions, capped); capped=True means the per-run cap was hit and
@@ -1709,6 +1835,9 @@ def _backfill_collect_sessions(home_dir: Path) -> Tuple[List[Dict], bool]:
         session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
+    # Read here rather than in run_backfill: this runs privilege-dropped as the
+    # owner, so another user's home is never read as root.
+    _backfill_attach_identity(sessions, None, _backfill_account_email(home_dir))
     return sessions, capped
 
 
@@ -1856,9 +1985,10 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
-    MDM /get_application_api_key/ returns one per-device key and attribution is
-    by device, so all profiles' history is seeded under that single key — the
-    same model as install, which configures every user profile."""
+    MDM /get_application_api_key/ returns one per-device key, so the upload is
+    shared. Each session carries its own home's signed-in email plus the machine
+    serial, which is what lets the server attribute a profile's history to the
+    person who ran it rather than to the key's owner."""
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
@@ -1869,6 +1999,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             return
 
         started_at = time.time()
+        device_serial = get_device_identifier()
         sessions = []
         collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
@@ -1880,6 +2011,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             user_sessions, capped = result
             if user_sessions:
                 debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
+                # One serial for the machine; the email was attached per home above.
+                _backfill_attach_identity(user_sessions, device_serial, None)
                 sessions.extend(user_sessions)
             # Capped homes still have unprocessed files — leave their cutoff so the
             # overflow stays eligible on the next run.
