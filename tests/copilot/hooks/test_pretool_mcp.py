@@ -75,6 +75,12 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(srv, "github")
         self.assertEqual(tool, "get_me")
 
+    def test_prefix_matching_is_case_insensitive(self):
+        srv, tool, _cfg = unbound._resolve_vscode_mcp(
+            "MCP_GITHUB_GET_ME", self.servers)
+        self.assertEqual(srv, "github")
+        self.assertEqual(tool, "GET_ME")
+
     def test_claude_double_underscore_form_is_not_handled_here(self):
         # mcp__ is the Claude/CLI form (gateway parses it); resolver ignores it.
         self.assertEqual(

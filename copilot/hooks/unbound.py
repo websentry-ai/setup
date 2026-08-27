@@ -857,7 +857,7 @@ def canonical_tool_name(raw):
         return 'Write'
     if raw in EDIT_TOOLS:
         return 'Edit'
-    if raw.startswith('mcp'):
+    if raw.lower().startswith('mcp'):
         # MCP tools pass through unchanged — the gateway matches on the raw name.
         return raw
     return ''
@@ -1808,7 +1808,7 @@ def detect_mcp_call(raw_tool, mcp_servers):
     if not raw_tool:
         return (None, None, None)
 
-    if raw_tool.startswith('mcp__'):
+    if raw_tool.lower().startswith('mcp__'):
         parts = raw_tool[len('mcp__'):].split('__', 1)
         server = parts[0]
         mcp_tool = parts[1] if len(parts) >= 2 else ''
@@ -1871,7 +1871,8 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
     If a *different* server also matches and can't be proven to be the same server
     (identical fingerprint config), the token is ambiguous -> unresolved (don't
     guess); same-config duplicates (e.g. two keys for one server) still resolve."""
-    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
+    raw_lower = raw_tool.lower()
+    if not raw_lower.startswith('mcp_') or raw_lower.startswith('mcp__'):
         return (None, None, None)
     body = raw_tool[len('mcp_'):]
     body_lower = body.lower()
@@ -2128,16 +2129,15 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
     # Translate the Copilot tool name to the canonical gateway vocabulary.
     canonical = canonical_tool_name(raw_tool)
-    is_mcp = canonical.startswith('mcp')
+    is_mcp = canonical.lower().startswith('mcp')
     mcp_server = mcp_tool = mcp_server_config = None
-
-    if raw_tool in INTERNAL_TOOLS or raw_tool in UNTRACKED_NATIVE_TOOLS:
-        return {}
+    raw_tool_lower = raw_tool.lower()
 
     # VS Code's `mcp_<server>_<tool>` form: canonical_tool_name() leaves the `mcp`
     # prefix as-is so the bare-tool detection below is skipped; resolve the server
     # here and forward its config so the gateway can fingerprint it.
-    if is_mcp and raw_tool.startswith('mcp_') and not raw_tool.startswith('mcp__'):
+    if (is_mcp and raw_tool_lower.startswith('mcp_')
+            and not raw_tool_lower.startswith('mcp__')):
         mcp_servers = read_copilot_mcp_servers(event.get('cwd'))
         mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(raw_tool, mcp_servers)
         if mcp_server is not None:
@@ -2165,7 +2165,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             # potential bypass is observable rather than silent. Skip known-benign
             # native tools so the log isn't noisy.
             if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
-                if not mcp_servers and not raw_tool.startswith('mcp__'):
+                if not mcp_servers and not raw_tool_lower.startswith('mcp__'):
                     log_error(
                         f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
                         'mcp_config',
@@ -2915,7 +2915,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     file path (relative paths joined onto the shell dir), shell entries from
     absolute paths in the command or the tracked shell dir.
     """
-    if not name or name in INTERNAL_TOOLS or name in UNTRACKED_NATIVE_TOOLS:
+    if not name:
         return None
     shell_state = shell_state if shell_state is not None else {}
     root_projects = root_projects if root_projects is not None else {}
@@ -2929,7 +2929,21 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         return os.path.normpath(os.path.join(base, path)) if base else None
 
     project = None
-    if name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
+    native_untracked = name in INTERNAL_TOOLS or name in UNTRACKED_NATIVE_TOOLS
+    if native_untracked:
+        mcp_servers = mcp_servers or {}
+        mcp_server, _mcp_tool, _config = detect_mcp_call(name, mcp_servers)
+        if mcp_server is None:
+            return None
+        entry = {
+            'type': 'afterMCPExecution',
+            'tool_name': name,
+            'tool_input': args,
+            'result_json': result_content or '',
+            'server_name': mcp_server,
+        }
+        project = None
+    elif name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
         if name in SHELL_TOOLS:
             command = args.get('command') or args.get('input') or args.get('text') or ''
         else:
@@ -2972,11 +2986,12 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
         mcp_servers = mcp_servers or {}
-        if name.startswith('mcp_') and not name.startswith('mcp__'):
+        lowered_name = name.lower()
+        if lowered_name.startswith('mcp_') and not lowered_name.startswith('mcp__'):
             mcp_server, _mcp_tool, _config = _resolve_vscode_mcp(name, mcp_servers)
         else:
             mcp_server, _mcp_tool, _config = detect_mcp_call(name, mcp_servers)
-        if mcp_server is None and not name.lower().startswith('mcp_'):
+        if mcp_server is None and not lowered_name.startswith('mcp_'):
             return None
         entry = {
             'type': 'afterMCPExecution',

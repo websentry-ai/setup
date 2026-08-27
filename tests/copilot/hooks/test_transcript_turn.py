@@ -97,7 +97,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
 
         self.assertNotIn("tool_use", exchange["messages"][1])
 
-    def test_configured_server_name_cannot_steal_a_native_tool(self):
+    def test_configured_mcp_name_takes_precedence_over_native_suppression(self):
         mapped = unbound.map_copilot_tool(
             'read_bash',
             {'sessionId': '1'},
@@ -105,7 +105,8 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             mcp_servers={'read_bash': {'command': 'fake-server'}},
         )
 
-        self.assertIsNone(mapped)
+        self.assertEqual(mapped['type'], 'afterMCPExecution')
+        self.assertEqual(mapped['server_name'], 'read_bash')
 
     def test_cli_agent_wrapper_is_not_emitted(self):
         path = _transcript([
