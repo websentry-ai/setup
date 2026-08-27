@@ -175,18 +175,18 @@ jobs:
           # pinned checkout — the placeholder fallback is dry-run only (and
           # the install-test version assert would reject it anyway).
           if [[ "$publish" == "true" && "$HAS_DISCOVERY_TOKEN" != "true" ]]; then
-            echo "::error::tag release requires DISCOVERY_CHECKOUT_TOKEN (pinned coding-discovery-tool checkout). Dry-run via workflow_dispatch instead."
+            echo "::error::tag release requires DISCOVERY_CHECKOUT_TOKEN (coding-discovery-tool checkout). Dry-run via workflow_dispatch instead."
             exit 1
           fi
 
           artifact_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$version"
 
           # discovery.lock is KEY=VALUE (canonical format from WEB-4787).
-          discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
+          discovery_ref="$(awk -F= '$1=="SOURCE_REF"{print $2}' packaging/discovery.lock)"
           lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
           lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
-          if ! [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::SOURCE_SHA in packaging/discovery.lock is not a full 40-char SHA: '$discovery_sha'"
+          if [ -z "$discovery_ref" ]; then
+            echo "::error::SOURCE_REF is not set in packaging/discovery.lock"
             exit 1
           fi
 
@@ -203,28 +203,30 @@ jobs:
             echo "tar_name=unbound-runtime-$version$builder_suffix.tar.gz"
             echo "artifact_name=unbound-runtime-$version$builder_suffix"
             echo "artifact_url=$artifact_base/unbound-runtime-$version$builder_suffix.pkg"
-            echo "discovery_sha=$discovery_sha"
+            echo "discovery_ref=$discovery_ref"
             echo "lock_python=$lock_python"
             echo "lock_pyinstaller=$lock_pyinstaller"
           } >> "$GITHUB_OUTPUT"
           echo "version=$version publish=$publish builder=$builder sign=$sign pkg_sign=$pkg_sign notarize=$notarize s3=$HAS_S3"
 
-      # Pinned-SHA checkout (packaging/discovery.lock) so each release is
-      # reproducible from this repo's history. Gated: the placeholder build
-      # doesn't read the checkout yet; Stream B's spec will, at which point
-      # DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
-      - name: Checkout coding-discovery-tool at pinned SHA
+      # Checkout at SOURCE_REF (packaging/discovery.lock), which tracks the
+      # source repo's main. A release is therefore recorded rather than
+      # reproducible from this repo alone: build-discovery.sh logs the commit it
+      # actually built. Put a SHA in SOURCE_REF to freeze a release. Gated: the
+      # placeholder build doesn't read the checkout yet; Stream B's spec will, at
+      # which point DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
+      - name: Checkout coding-discovery-tool at SOURCE_REF
         if: steps.cfg.outputs.discovery_token == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: websentry-ai/coding-discovery-tool
-          ref: ${{ steps.cfg.outputs.discovery_sha }}
+          ref: ${{ steps.cfg.outputs.discovery_ref }}
           token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
           path: discovery-src
 
       - name: Note skipped discovery checkout
         if: steps.cfg.outputs.discovery_token != 'true'
-        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — skipping pinned discovery checkout (placeholder build only)"
+        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — skipping discovery checkout (placeholder build only)"
 
       # Pinned python.org universal2 CPython — deliberately NOT
       # actions/setup-python (thin, non-relocatable build; cannot produce

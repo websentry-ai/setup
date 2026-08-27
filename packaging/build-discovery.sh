@@ -2,7 +2,7 @@
 # Build the unbound-discovery PyInstaller onedir bundle (macOS universal2).
 #
 # The binary IS the distribution: target machines never git-clone the source
-# or run install.sh. Source is pinned by SHA in discovery.lock.
+# or run install.sh. Source ref comes from discovery.lock.
 #
 # Requirements on the build machine:
 #   - python.org CPython matching PYTHON_VERSION in discovery.lock (universal2
@@ -12,8 +12,8 @@
 #
 # Optional env:
 #   UNBOUND_DISCOVERY_PYTHON  build interpreter (must be universal2 CPython 3.12)
-#   UNBOUND_DISCOVERY_SRC     existing source checkout to build from; its HEAD
-#                             must match SOURCE_SHA from discovery.lock
+#   UNBOUND_DISCOVERY_SRC     existing source checkout to build from; used as-is,
+#                             SOURCE_REF is not consulted
 #
 # Output: packaging/dist/unbound-discovery/  (onedir bundle)
 #         packaging/dist/unbound-discovery-macos-universal2.tar.gz + .sha256
@@ -33,17 +33,17 @@ die() { echo "[build-discovery] ERROR: $*" >&2; exit 1; }
 while IFS='=' read -r key value; do
     case "$key" in
         SOURCE_REPO)         SOURCE_REPO="$value" ;;
-        SOURCE_SHA)          SOURCE_SHA="$value" ;;
+        SOURCE_REF)          SOURCE_REF="$value" ;;
         SOURCE_ENTRYPOINT)   SOURCE_ENTRYPOINT="$value" ;;
         PYTHON_VERSION)      PYTHON_VERSION="$value" ;;
         PYINSTALLER_VERSION) PYINSTALLER_VERSION="$value" ;;
         TARGET_ARCH)         TARGET_ARCH="$value" ;;
     esac
 done < "$LOCK"
-for var in SOURCE_REPO SOURCE_SHA SOURCE_ENTRYPOINT PYTHON_VERSION PYINSTALLER_VERSION TARGET_ARCH; do
+for var in SOURCE_REPO SOURCE_REF SOURCE_ENTRYPOINT PYTHON_VERSION PYINSTALLER_VERSION TARGET_ARCH; do
     [ -n "${!var:-}" ] || die "$var not set in discovery.lock"
 done
-log "source: $SOURCE_REPO @ $SOURCE_SHA"
+log "source: $SOURCE_REPO @ $SOURCE_REF"
 
 # --- 2. Verify the build interpreter is universal2 CPython 3.12 ------------
 PYTHON="${UNBOUND_DISCOVERY_PYTHON:-/Library/Frameworks/Python.framework/Versions/3.12/bin/python3.12}"
@@ -62,22 +62,23 @@ if [[ "$PY_ARCHS" != *x86_64* || "$PY_ARCHS" != *arm64* ]]; then
 fi
 log "build python OK: $PY_REAL ($PY_ARCHS)"
 
-# --- 3. Fetch source at the locked SHA -------------------------------------
+# --- 3. Fetch source at SOURCE_REF -----------------------------------------
+# A moving ref means the build is no longer reproducible from the lock alone, so
+# the resolved commit is logged below and is the only record of what shipped.
 if [ -n "${UNBOUND_DISCOVERY_SRC:-}" ]; then
     SRC="$UNBOUND_DISCOVERY_SRC"
-    HEAD_SHA="$(git -C "$SRC" rev-parse HEAD)"
-    [ "$HEAD_SHA" = "$SOURCE_SHA" ] || \
-        die "UNBOUND_DISCOVERY_SRC HEAD ($HEAD_SHA) != locked SOURCE_SHA ($SOURCE_SHA)"
     log "using existing source checkout: $SRC"
 else
     SRC="$BUILD/src"
     rm -rf "$SRC" && mkdir -p "$SRC"
     git -C "$SRC" init -q
     git -C "$SRC" remote add origin "$SOURCE_REPO"
-    git -C "$SRC" fetch -q --depth 1 origin "$SOURCE_SHA"
+    git -C "$SRC" fetch -q --depth 1 origin "$SOURCE_REF"
     git -C "$SRC" checkout -q FETCH_HEAD
     log "fetched source into $SRC"
 fi
+RESOLVED_SHA="$(git -C "$SRC" rev-parse HEAD 2>/dev/null || echo unknown)"
+log "source commit: $RESOLVED_SHA"
 [ -f "$SRC/$SOURCE_ENTRYPOINT" ] || \
     die "source checkout missing $SOURCE_ENTRYPOINT"
 
