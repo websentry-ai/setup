@@ -48,6 +48,132 @@ def _user_text(exchange):
 
 
 class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
+    def test_powershell_is_not_reported_as_mcp(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="check it"),
+            _entry("tool.execution_start", toolCallId="call-a", toolName="powershell",
+                   arguments={"command": "Get-ChildItem"}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "file.txt"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        tool_use = exchange["messages"][1]["tool_use"]
+        self.assertEqual(tool_use[0]["type"], "afterShellExecution")
+        self.assertEqual(tool_use[0]["command"], "Get-ChildItem")
+
+    def test_write_powershell_is_reported_as_shell_input(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="answer the prompt"),
+            _entry("tool.execution_start", toolCallId="call-a", toolName="write_powershell",
+                   arguments={"input": "yes"}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "continued"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        tool_use = exchange["messages"][1]["tool_use"]
+        self.assertEqual(tool_use[0]["type"], "afterShellExecution")
+        self.assertEqual(tool_use[0]["command"], "yes")
+
+    def test_read_bash_is_not_emitted(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="read output"),
+            _entry("tool.execution_start", toolCallId="call-a", toolName="read_bash",
+                   arguments={"sessionId": "1"}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "done"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        self.assertNotIn("tool_use", exchange["messages"][1])
+
+    def test_configured_server_name_cannot_steal_a_native_tool(self):
+        mapped = unbound.map_copilot_tool(
+            'read_bash',
+            {'sessionId': '1'},
+            'done',
+            mcp_servers={'read_bash': {'command': 'fake-server'}},
+        )
+
+        self.assertIsNone(mapped)
+
+    def test_cli_agent_wrapper_is_not_emitted(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="check agents"),
+            _entry("tool.execution_start", toolCallId="call-a", toolName="list_agents",
+                   arguments={}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "none"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        self.assertNotIn("tool_use", exchange["messages"][1])
+
+    def test_editor_diagnostics_are_not_emitted(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="check errors"),
+            _entry("tool.execution_start", toolCallId="call-a", toolName="get_errors",
+                   arguments={"filePaths": ["app.py"]}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "no errors"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        self.assertNotIn("tool_use", exchange["messages"][1])
+
+    def test_unknown_copilot_tool_is_not_reported_as_mcp(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="use it"),
+            _entry("tool.execution_start", toolCallId="call-a",
+                   toolName="new_copilot_builtin", arguments={"q": 1}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "ok"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        self.assertNotIn("tool_use", exchange["messages"][1])
+
+    def test_configured_bare_mcp_tool_is_reported_with_its_server(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="search github"),
+            _entry("tool.execution_start", toolCallId="call-a",
+                   toolName="github-mcp-server-search_code", arguments={"q": "needle"}),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "ok"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        with unittest.mock.patch.object(
+            unbound,
+            "read_copilot_mcp_servers",
+            return_value={"github-mcp-server": {"command": "github-mcp-server"}},
+        ):
+            exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+                path, SESSION, cwd="/workspace")
+
+        tool_use = exchange["messages"][1]["tool_use"]
+        self.assertEqual(tool_use[0]["type"], "afterMCPExecution")
+        self.assertEqual(tool_use[0]["server_name"], "github-mcp-server")
+
     def test_cli_shape_queued_prompt_inside_the_agent_turn(self):
         path = _transcript([
             _entry("user.message", _id="u1", content="first question"),

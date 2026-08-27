@@ -67,38 +67,41 @@ FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery
 
 # Copilot tool names (VS Code agent mode + CLI) translated to the canonical
 # gateway vocabulary. Covers both surfaces: VS Code's model-facing tool names
-# and the CLI's shell/glob/grep/view/write tools. Anything not listed here and
-# not an MCP tool falls through map_copilot_tool's afterMCPExecution branch and
-# is scored by the action-based rubric (reads/benign stay low).
-SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal', 'send_to_terminal'}
+# and the CLI's shell/glob/grep/view/write tools. Unlisted native tools are not
+# emitted; only a configured MCP match or an explicit mcp_ prefix takes the MCP path.
+SHELL_TOOLS = {
+    'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal',
+    'terminal', 'send_to_terminal', 'write_bash', 'write_powershell',
+}
 READ_TOOLS = {
     'read_file', 'readFile', 'view', 'cat', 'list_dir', 'listDirectory',
     'read_project_structure', 'read_notebook_cell_output',
     'get_notebook_summary', 'copilot_getNotebookSummary', 'view_image',
+    'copilot_readFile', 'copilot_viewImage', 'copilot_listDirectory',
+    'copilot_readProjectStructure', 'copilot_readNotebookCellOutput',
 }
 WRITE_TOOLS = {
     'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file',
     'create_directory',
+    'copilot_createFile', 'copilot_createDirectory',
 }
 EDIT_TOOLS = {
     'str_replace', 'edit', 'edit_file', 'editFile', 'edit_files', 'apply_patch',
     'insert_edit', 'insert_edit_into_file', 'replace_string_in_file',
-    'multi_replace_string_in_file', 'edit_notebook_file',
+    'multi_replace_string_in_file', 'edit_notebook_file', 'vscode_renameSymbol',
+    'copilot_applyPatch', 'copilot_insertEdit', 'copilot_replaceString',
+    'copilot_multiReplaceString', 'copilot_editNotebook', 'copilot_editFiles',
 }
 
-# Copilot terminal/search tools mapped to a synthetic shell command for analytics.
+# Copilot tools whose arguments can be faithfully represented as a shell command.
 # `x or ''` (not `.get(k, '')`) so a present-but-None value coerces to ''.
 TERMINAL_LIKE_TOOLS = {
-    'get_terminal_output':   lambda a: 'true',
-    'kill_terminal':         lambda a: 'true',
-    'terminal_last_command': lambda a: 'true',
-    'terminal_selection':    lambda a: 'true',
-    'get_task_output':       lambda a: 'true',
     'get_changed_files':     lambda a: 'git status',
     'grep_search':           lambda a: f"grep {a.get('query') or ''} {a.get('includePattern') or ''}".strip(),
     'grep':                  lambda a: f"grep {a.get('pattern') or a.get('query') or ''}".strip(),
     'file_search':           lambda a: f"find {a.get('query') or ''}".strip(),
     'glob':                  lambda a: f"find {a.get('pattern') or a.get('query') or ''}".strip(),
+    'rg':                    lambda a: f"grep {a.get('pattern') or a.get('query') or ''}".strip(),
 }
 
 # Copilot orchestration / planning / UI / memory tools — no security-relevant
@@ -108,14 +111,50 @@ TERMINAL_LIKE_TOOLS = {
 INTERNAL_TOOLS = {
     # subagents / agent control
     'execution_subagent', 'explore_subagent', 'search_subagent', 'runSubagent',
-    'run_task', 'switch_agent',
+    'run_task', 'switch_agent', 'list_agents', 'read_agent', 'task', 'write_agent',
     # planning / intent / memory / tool discovery
     'manage_todo_list', 'report_intent', 'memory', 'resolve_memory_file_uri',
-    'tool_search',
+    'tool_search', 'tool_search_tool', 'ask_user', 'skill', 'task_complete',
     # VS Code editor meta / UI confirmations
     'run_vscode_command', 'get_vscode_api', 'get_project_setup_info',
     'vscode_askQuestions', 'vscode_get_confirmation',
     'vscode_get_confirmation_with_options', 'vscode_get_terminal_confirmation',
+    'extensions_reload', 'extensions_manage', 'open_canvas',
+    'list_canvas_capabilities', 'copilot_memory', 'copilot_runVscodeCommand',
+    'copilot_switchAgent', 'copilot_resolveMemoryFileUri',
+}
+
+# Verified Copilot/VS Code host tools whose behavior does not fit the canonical
+# shell/read/write/edit shapes. They are intentionally not emitted. Keeping the
+# names explicit also prevents a same-named MCP config from claiming a host tool.
+UNTRACKED_NATIVE_TOOLS = {
+    'get_errors', 'semantic_search', 'web_fetch', 'web_search', 'fetch_webpage',
+    'search_workspace_symbols', 'test_failure', 'test_search',
+    'get_search_view_results', 'github_repo', 'github_text_search',
+    'vscode_listCodeUsages', 'vscode_searchExtensions_internal',
+    'copilot_searchCodebase', 'copilot_searchWorkspaceSymbols',
+    'copilot_getVSCodeAPI', 'copilot_testFailure', 'copilot_findFiles',
+    'copilot_findTextInFiles', 'copilot_getErrors', 'copilot_getChangedFiles',
+    'copilot_fetchWebPage', 'copilot_findTestFiles',
+    'copilot_getProjectSetupInfo', 'copilot_getSearchResults',
+    'copilot_githubRepo',
+    'get_terminal_output', 'kill_terminal', 'terminal_last_command',
+    'terminal_selection', 'get_task_output', 'read_powershell',
+    'stop_powershell', 'list_powershell', 'read_bash', 'stop_bash',
+    'list_bash', 'await_terminal',
+    'create_new_workspace', 'create_new_jupyter_notebook', 'install_extension',
+    'run_notebook_cell', 'create_and_run_task', 'runTests',
+    'copilot_createNewWorkspace', 'copilot_createNewJupyterNotebook',
+    'copilot_runNotebookCell', 'copilot_installExtension',
+    'copilot_createAndRunTask', 'copilot_runTests1',
+    'configure_notebook', 'configure_notebooks', 'notebook_list_packages',
+    'notebook_install_packages', 'configure_python_notebook',
+    'configure_non_python_notebook', 'restart_notebook_kernel',
+    'configure_python_environment', 'get_python_environment_details',
+    'get_python_executable_details', 'install_python_packages',
+    'open_browser_page', 'list_browser_pages', 'navigate_page', 'read_page',
+    'screenshot_page', 'run_playwright_code', 'click_element', 'hover_element',
+    'type_in_page', 'handle_dialog', 'drag_element',
 }
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
@@ -2092,6 +2131,9 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     is_mcp = canonical.startswith('mcp')
     mcp_server = mcp_tool = mcp_server_config = None
 
+    if raw_tool in INTERNAL_TOOLS or raw_tool in UNTRACKED_NATIVE_TOOLS:
+        return {}
+
     # VS Code's `mcp_<server>_<tool>` form: canonical_tool_name() leaves the `mcp`
     # prefix as-is so the bare-tool detection below is skipped; resolve the server
     # here and forward its config so the gateway can fingerprint it.
@@ -2861,10 +2903,11 @@ def _extract_patch_target_path(args):
     return m.group(1).strip() if m else ''
 
 
-def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None):
+def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
+                     mcp_servers=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
-    Returns None for internal orchestration tools (intentionally not emitted).
+    Returns None for internal and unsupported native tools.
 
     When `shell_state` ({'dir': <path>} tracked across the turn) and
     `root_projects` (per-repo origin cache) are provided, each entry gets a
@@ -2872,7 +2915,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     file path (relative paths joined onto the shell dir), shell entries from
     absolute paths in the command or the tracked shell dir.
     """
-    if name in INTERNAL_TOOLS:
+    if not name or name in INTERNAL_TOOLS or name in UNTRACKED_NATIVE_TOOLS:
         return None
     shell_state = shell_state if shell_state is not None else {}
     root_projects = root_projects if root_projects is not None else {}
@@ -2928,12 +2971,21 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             abs_path = None
         project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
+        mcp_servers = mcp_servers or {}
+        if name.startswith('mcp_') and not name.startswith('mcp__'):
+            mcp_server, _mcp_tool, _config = _resolve_vscode_mcp(name, mcp_servers)
+        else:
+            mcp_server, _mcp_tool, _config = detect_mcp_call(name, mcp_servers)
+        if mcp_server is None and not name.lower().startswith('mcp_'):
+            return None
         entry = {
             'type': 'afterMCPExecution',
             'tool_name': name,
             'tool_input': args,
             'result_json': result_content or '',
         }
+        if mcp_server is not None:
+            entry['server_name'] = mcp_server
         try:
             candidates = [p for p in _ABS_PATH_RE.findall(json.dumps(args)) if not _is_system_checkout_path(p)]
         except Exception:
@@ -3418,6 +3470,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     # cwd; origin lookups are cached once per repo across the turn.
     shell_state = {'dir': cwd}
     root_projects = {}
+    mcp_servers = read_copilot_mcp_servers(cwd)
     forwarded_now = set()
     for call_id in tool_calls:
         call = tool_data[call_id]
@@ -3432,7 +3485,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
             continue
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
-                                  shell_state=shell_state, root_projects=root_projects)
+                                  shell_state=shell_state, root_projects=root_projects,
+                                  mcp_servers=mcp_servers)
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.
