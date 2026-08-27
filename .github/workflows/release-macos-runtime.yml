@@ -175,18 +175,21 @@ jobs:
           # pinned checkout — the placeholder fallback is dry-run only (and
           # the install-test version assert would reject it anyway).
           if [[ "$publish" == "true" && "$HAS_DISCOVERY_TOKEN" != "true" ]]; then
-            echo "::error::tag release requires DISCOVERY_CHECKOUT_TOKEN (pinned coding-discovery-tool checkout). Dry-run via workflow_dispatch instead."
+            echo "::error::tag release requires DISCOVERY_CHECKOUT_TOKEN (coding-discovery-tool checkout). Dry-run via workflow_dispatch instead."
             exit 1
           fi
 
           artifact_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$version"
 
           # discovery.lock is KEY=VALUE (canonical format from WEB-4787).
-          discovery_sha="$(awk -F= '$1=="SOURCE_SHA"{print $2}' packaging/discovery.lock)"
+          discovery_ref="$(awk -F= '$1=="SOURCE_REF"{print $2; exit}' packaging/discovery.lock)"
           lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
           lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
-          if ! [[ "$discovery_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::SOURCE_SHA in packaging/discovery.lock is not a full 40-char SHA: '$discovery_sha'"
+          # Branch/SHA charset only. This value reaches $GITHUB_OUTPUT and a git
+          # ref argument, so a newline would forge a step output and a leading
+          # dash would parse as an option such as --upload-pack.
+          if ! [[ "$discovery_ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+            echo "::error::SOURCE_REF in packaging/discovery.lock is not a valid branch or SHA: '$discovery_ref'"
             exit 1
           fi
 
@@ -203,28 +206,46 @@ jobs:
             echo "tar_name=unbound-runtime-$version$builder_suffix.tar.gz"
             echo "artifact_name=unbound-runtime-$version$builder_suffix"
             echo "artifact_url=$artifact_base/unbound-runtime-$version$builder_suffix.pkg"
-            echo "discovery_sha=$discovery_sha"
+            echo "discovery_ref=$discovery_ref"
             echo "lock_python=$lock_python"
             echo "lock_pyinstaller=$lock_pyinstaller"
           } >> "$GITHUB_OUTPUT"
           echo "version=$version publish=$publish builder=$builder sign=$sign pkg_sign=$pkg_sign notarize=$notarize s3=$HAS_S3"
 
-      # Pinned-SHA checkout (packaging/discovery.lock) so each release is
-      # reproducible from this repo's history. Gated: the placeholder build
-      # doesn't read the checkout yet; Stream B's spec will, at which point
-      # DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
-      - name: Checkout coding-discovery-tool at pinned SHA
+      # Checkout at SOURCE_REF (packaging/discovery.lock), which tracks the
+      # source repo's main. A release is therefore recorded rather than
+      # reproducible from this repo alone, and the next step is what records it:
+      # this workflow drives PyInstaller directly and never runs
+      # build-discovery.sh. Put a SHA in SOURCE_REF to freeze a release. Gated:
+      # the placeholder build doesn't read the checkout yet; Stream B's spec
+      # will, at which point DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
+      - name: Checkout coding-discovery-tool at SOURCE_REF
         if: steps.cfg.outputs.discovery_token == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: websentry-ai/coding-discovery-tool
-          ref: ${{ steps.cfg.outputs.discovery_sha }}
+          ref: ${{ steps.cfg.outputs.discovery_ref }}
           token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
           path: discovery-src
 
+      # Recorded in three places because each answers a different question:
+      # this step for the run, the Release notes for the version, and
+      # dist/unbound-discovery/SOURCE so a deployed device answers offline.
+      - name: Record resolved discovery commit
+        id: discovery
+        if: steps.cfg.outputs.discovery_token == 'true'
+        env:
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C discovery-src rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "discovery source: $DISCOVERY_REF -> $sha"
+          echo "discovery source: \`$DISCOVERY_REF\` @ \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Note skipped discovery checkout
         if: steps.cfg.outputs.discovery_token != 'true'
-        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — skipping pinned discovery checkout (placeholder build only)"
+        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — skipping discovery checkout (placeholder build only)"
 
       # Pinned python.org universal2 CPython — deliberately NOT
       # actions/setup-python (thin, non-relocatable build; cannot produce
@@ -375,6 +396,27 @@ jobs:
       # Builder-agnostic: it validates whatever landed at
       # dist/unbound-hook/unbound-hook, so the Nuitka builder (PR #132)
       # inherits this coverage with no change.
+      # Written into the discovery bundle so the artifact answers for itself:
+      # build-pkg.sh copies this directory into /opt/unbound/<version>/ and the
+      # tarball is packed from it, so one write reaches both. Before signing:
+      # sign-machos.sh signs each Mach-O individually and ignores this file, but
+      # a future bundle-level seal would need it already in place.
+      - name: Record discovery source in the bundle
+        env:
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+          DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          # KEY=VALUE, same shape as packaging/discovery.lock.
+          printf '%s\n' \
+            "SOURCE_REPO=https://github.com/websentry-ai/coding-discovery-tool.git" \
+            "SOURCE_REF=$DISCOVERY_REF" \
+            "SOURCE_COMMIT=${DISCOVERY_SHA:-unknown}" \
+            "RUNTIME_VERSION=$VERSION" \
+            > dist/unbound-discovery/SOURCE
+          cat dist/unbound-discovery/SOURCE
+
       - name: Install pinned pytest (hash-verified) for the parity suite
         run: |
           set -euo pipefail
@@ -521,6 +563,8 @@ jobs:
           ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+          DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
         run: |
           set -euo pipefail
           pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
@@ -534,6 +578,7 @@ jobs:
               -e "s|@PKG_SHA256@|$pkg_sha256|g" \
               -e "s|@ARTIFACT_URL@|$ARTIFACT_URL|g" \
               -e "s|@TEAM_ID@|$team_id|g" \
+              -e "s|@DISCOVERY_SOURCE@|$DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}|g" \
               mdm/onboard.sh.tmpl > out/onboard.sh
           chmod +x out/onboard.sh
           bash -n out/onboard.sh
@@ -668,9 +713,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.cfg.outputs.version }}
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+          DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
         run: |
           set -euo pipefail
           gh release create "runtime-v$VERSION" \
             --title "macOS runtime $VERSION" \
-            --notes "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh." \
+            --notes "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh.
+
+discovery source: $DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}" \
             out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh

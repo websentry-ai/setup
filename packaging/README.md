@@ -11,7 +11,7 @@ template), WEB-4792 (pkg payload).
 |---|---|
 | `versions.env` | Pinned python.org universal2 CPython (URL + sha256), pkg identifier, install prefix, daemon label |
 | `requirements-build.txt` | Hash-pinned PyInstaller toolchain, canonical from WEB-4787 (`pip install --require-hashes --no-deps`) |
-| `discovery.lock` | KEY=VALUE source pin, canonical from WEB-4787 (`SOURCE_SHA` is checked out into `./discovery-src`; `PYTHON_VERSION`/`PYINSTALLER_VERSION` are asserted against the installed toolchain) |
+| `discovery.lock` | KEY=VALUE source config, canonical from WEB-4787 (`SOURCE_REF` is checked out into `./discovery-src`, tracking `main` by default; `PYTHON_VERSION`/`PYINSTALLER_VERSION` are asserted against the installed toolchain) |
 | `unbound-discovery.spec` + `unbound_discovery_entry.py` + `build-discovery.sh` | **Canonical** discovery bundle build (WEB-4787); CI invokes the spec with `UNBOUND_DISCOVERY_SRC=./discovery-src` |
 | `../binary/unbound-hook.spec` | **Canonical** hook bundle build (WEB-4786, Stream A): vendored hook/MDM sources + hidden imports; CI builds this spec directly. Bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
 | `specs/unbound-discovery.spec` + `placeholder/unbound_discovery_main.py` | Dry-run-only discovery fallback for tokenless `workflow_dispatch` runs (the hook side has no placeholder anymore — it always builds from `binary/`) |

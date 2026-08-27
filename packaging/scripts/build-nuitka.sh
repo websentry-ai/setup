@@ -36,7 +36,7 @@
 #   NUITKA_PYTHON          python with the hash-pinned Nuitka toolchain
 #                          (default ./.build-venv-nuitka/bin/python, as
 #                          created by the release workflow)
-#   UNBOUND_DISCOVERY_SRC  coding-discovery-tool checkout at the locked SHA;
+#   UNBOUND_DISCOVERY_SRC  coding-discovery-tool checkout to build from;
 #                          absent -> PLACEHOLDER discovery (dry-run only,
 #                          mirrors the PyInstaller fallback spec)
 #   NUITKA_ARCHS           default "arm64 x86_64" (merged universal2);
