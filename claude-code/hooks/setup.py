@@ -1333,7 +1333,15 @@ def _backfill_account_email(home: Path) -> Optional[str]:
     """
     email = None
     try:
-        config = json.loads((home / '.claude.json').read_text(encoding='utf-8'))
+        account_file = home / '.claude.json'
+        # Same reason the desktop-session scan is guarded: on Windows _run_as_user
+        # cannot fork, so this read happens as SYSTEM across every profile. A link
+        # planted here would otherwise pull another user's address into this
+        # profile's sessions. Containment rather than refusal, so a dotfiles symlink
+        # inside the same home still resolves.
+        if _is_reparse_point(account_file):
+            account_file.resolve(strict=True).relative_to(home.resolve(strict=True))
+        config = json.loads(account_file.read_text(encoding='utf-8'))
         oauth = config.get('oauthAccount')
         if isinstance(oauth, dict):
             raw = oauth.get('emailAddress')

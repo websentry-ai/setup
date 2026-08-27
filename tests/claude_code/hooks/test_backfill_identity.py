@@ -324,3 +324,57 @@ class ReparsePointTestCase(unittest.TestCase):
                 (leaf / '.claude.json').write_text(
                     json.dumps({'oauthAccount': {'emailAddress': 'real@example.com'}}), encoding='utf-8')
                 self.assertEqual(mod._desktop_session_email(home), 'real@example.com')
+
+
+class PrimaryReadContainmentTestCase(unittest.TestCase):
+    """On Windows _run_as_user cannot fork, so this read happens as SYSTEM across
+    every profile. A link planted at .claude.json must not pull another user's
+    address into this profile's sessions."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_link_pointing_outside_the_home_is_refused(self):
+        victim = Path(self.tmp.name) / 'victim'
+        victim.mkdir(parents=True)
+        (victim / '.claude.json').write_text(
+            json.dumps({'oauthAccount': {'emailAddress': 'victim@example.com'}}), encoding='utf-8')
+
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                attacker = Path(self.tmp.name) / f'attacker-{mod.__name__}'
+                attacker.mkdir(parents=True)
+                (attacker / '.claude.json').symlink_to(victim / '.claude.json')
+                # No desktop sessions either, so nothing is resolved at all.
+                self.assertIsNone(mod._backfill_account_email(attacker))
+
+    def test_a_dotfiles_link_inside_the_same_home_still_resolves(self):
+        # Containment rather than blanket refusal: a link into the user's own home
+        # is their own config and must keep working.
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                home = Path(self.tmp.name) / f'dotfiles-{mod.__name__}'
+                (home / 'dotfiles').mkdir(parents=True)
+                real = home / 'dotfiles' / 'claude.json'
+                real.write_text(
+                    json.dumps({'oauthAccount': {'emailAddress': 'owner@example.com'}}), encoding='utf-8')
+                (home / '.claude.json').symlink_to(real)
+                self.assertEqual(mod._backfill_account_email(home), 'owner@example.com')
+
+    def test_a_plain_file_is_unaffected(self):
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                home = Path(self.tmp.name) / f'plain-{mod.__name__}'
+                home.mkdir(parents=True)
+                (home / '.claude.json').write_text(
+                    json.dumps({'oauthAccount': {'emailAddress': 'plain@example.com'}}), encoding='utf-8')
+                self.assertEqual(mod._backfill_account_email(home), 'plain@example.com')
+
+    def test_a_dangling_link_does_not_raise(self):
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                home = Path(self.tmp.name) / f'dangling-{mod.__name__}'
+                home.mkdir(parents=True)
+                (home / '.claude.json').symlink_to(home / 'nope.json')
+                self.assertIsNone(mod._backfill_account_email(home))
