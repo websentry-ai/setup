@@ -1,11 +1,15 @@
 """On Windows, restart_cursor must never make the shell resolve a bare name.
 
-`start cursor` from an elevated or SYSTEM shell cannot find Cursor's per-user
-launcher, so ShellExecute raises a "Windows cannot find 'cursor'" dialog.
+`start cursor` from an elevated or SYSTEM shell cannot find Cursor's per-user launcher,
+so ShellExecute raises a "Windows cannot find 'cursor'" dialog. Resolving the path
+ourselves fixes that, but the MDM script runs elevated, so it must resolve only to
+machine-wide roots: a per-user path there would run a planted binary as SYSTEM.
 """
 
 import importlib.util
+import os
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tests.conftest import REPO
@@ -18,13 +22,14 @@ def _load(name, relative):
     return module
 
 
-BOTH = [_load("cursor_mdm_setup", "cursor/mdm/setup.py"),
-        _load("cursor_user_setup", "cursor/setup.py")]
+MDM = _load("cursor_mdm_setup", "cursor/mdm/setup.py")
+USER = _load("cursor_user_setup", "cursor/setup.py")
+BOTH = [MDM, USER]
 
 
 class TestWindowsRestart(unittest.TestCase):
     def test_launches_the_resolved_exe_never_a_bare_name(self):
-        exe = r"C:\Users\alice\AppData\Local\Programs\cursor\Cursor.exe"
+        exe = r"C:\Program Files\cursor\Cursor.exe"
         for mod in BOTH:
             with self.subTest(module=mod.__name__):
                 with patch.object(mod.platform, "system", return_value="Windows"), \
@@ -50,13 +55,36 @@ class TestWindowsRestart(unittest.TestCase):
                 popen.assert_not_called()
                 self.assertIn("Restart Cursor", [c[0][0] for c in printed.call_args_list if c[0]])
 
-    def test_find_cursor_exe_ignores_the_cmd_shim_on_path(self):
-        """`cursor` on PATH is a .cmd, which CreateProcess cannot run without a shell."""
-        for mod in BOTH:
-            with self.subTest(module=mod.__name__):
-                with patch.object(mod.shutil, "which", return_value=None), \
-                     patch.object(mod.Path, "is_file", return_value=False):
-                    self.assertIsNone(mod.find_cursor_exe())
+
+class TestElevatedLookupIsMachineWideOnly(unittest.TestCase):
+    """A user-writable path launched by the elevated MDM script is a privilege escalation."""
+
+    def test_mdm_never_probes_a_per_user_path(self):
+        probed = []
+
+        def record(self):
+            probed.append(str(self))
+            return False
+
+        with patch.object(Path, "is_file", record), \
+             patch.dict(os.environ, {"SystemDrive": "C:"}, clear=True):
+            self.assertIsNone(MDM.find_cursor_exe())
+
+        self.assertTrue(probed, "expected at least one candidate")
+        for candidate in probed:
+            self.assertNotIn("AppData", candidate)
+            self.assertNotIn("Users", candidate)
+
+    def test_mdm_accepts_a_machine_wide_install(self):
+        with patch.dict(os.environ, {"SystemDrive": "C:"}, clear=True), \
+             patch.object(Path, "is_file", lambda self: "Program Files" in str(self)):
+            self.assertIn("Program Files", MDM.find_cursor_exe())
+
+    def test_user_level_may_use_localappdata(self):
+        """No privilege boundary is crossed when the script runs as the user who owns that path."""
+        with patch.dict(os.environ, {"LOCALAPPDATA": r"C:\Users\alice\AppData\Local"}, clear=True), \
+             patch.object(Path, "is_file", lambda self: "AppData" in str(self)):
+            self.assertIn("AppData", USER.find_cursor_exe())
 
 
 if __name__ == "__main__":

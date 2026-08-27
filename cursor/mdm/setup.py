@@ -806,16 +806,14 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> Tuple[bool, bool]:
 
 
 def find_cursor_exe() -> Optional[str]:
-    """Path to Cursor.exe, or None. Passing a bare name to the shell pops an error dialog."""
-    found = shutil.which("Cursor.exe")
-    if found:
-        return found
-    candidates = [home / "AppData" / "Local" / "Programs" / "cursor" / "Cursor.exe"
-                  for _, home in get_all_user_homes()]
-    program_files = os.environ.get("ProgramFiles")
-    if program_files:
-        candidates.append(Path(program_files) / "cursor" / "Cursor.exe")
-    for candidate in candidates:
+    """Machine-wide Cursor.exe, or None. A bare name would make the shell pop an error dialog."""
+    # Machine-wide only: this script runs elevated, and a per-user AppData path, a PATH
+    # lookup or shutil.which (which prepends the CWD on Windows) would let any local user
+    # plant a binary we then launch as SYSTEM. Cursor installed per-user is simply not
+    # restarted here; the caller prints the manual line instead.
+    system_drive = os.environ.get("SystemDrive", "C:")
+    for base in ("Program Files", "Program Files (x86)"):
+        candidate = Path(system_drive + "\\" + base) / "cursor" / "Cursor.exe"
         if candidate.is_file():
             return str(candidate)
     return None

@@ -3,7 +3,6 @@
 import os
 import sys
 import platform
-import shutil
 import subprocess
 import urllib.parse
 import time
@@ -373,14 +372,15 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
 
 
 def find_cursor_exe() -> Optional[str]:
-    """Path to Cursor.exe, or None. Passing a bare name to the shell pops an error dialog."""
-    found = shutil.which("Cursor.exe")
-    if found:
-        return found
-    candidates = [Path.home() / "AppData" / "Local" / "Programs" / "cursor" / "Cursor.exe"]
-    program_files = os.environ.get("ProgramFiles")
-    if program_files:
-        candidates.append(Path(program_files) / "cursor" / "Cursor.exe")
+    """Path to Cursor.exe, or None. A bare name would make the shell pop an error dialog."""
+    # Fixed install roots only. shutil.which prepends the CWD on Windows, so a Cursor.exe
+    # dropped in the working directory would win the lookup.
+    local_appdata = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    system_drive = os.environ.get("SystemDrive", "C:")
+    candidates = [
+        Path(local_appdata) / "Programs" / "cursor" / "Cursor.exe",
+        Path(system_drive + "\\Program Files") / "cursor" / "Cursor.exe",
+    ]
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
