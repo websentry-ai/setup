@@ -233,3 +233,94 @@ class NeverFailsTestCase(unittest.TestCase):
                 sessions = [{'session_id': 'a'}]
                 mod._backfill_attach_identity(sessions, None, None)
                 self.assertEqual(sessions[0], {'session_id': 'a'})
+
+
+class SliceKeepsIdentityTestCase(unittest.TestCase):
+    """An oversized session is re-emitted as fresh dicts. Identity has to survive
+    that or long MDM sessions stay attributed to the upload key's owner."""
+
+    def _big_session(self):
+        # Two exchanges, each big enough that the pair cannot fit in one chunk.
+        entries = []
+        for i in range(2):
+            entries.append({'type': 'user', 'message': {'role': 'user', 'content': 'x' * 4000}})
+            entries.append({'type': 'assistant', 'message': {'role': 'assistant', 'content': 'y' * 4000}})
+        return {
+            'session_id': 'SESS-BIG',
+            'entries': entries,
+            'device_serial': 'FCQFM54',
+            'user_email': 'alice@example.com',
+        }
+
+    def test_every_slice_of_an_oversized_session_keeps_the_identity(self):
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                session = self._big_session()
+                slices = list(mod._backfill_slice_session(session, 9000))
+                self.assertGreater(len(slices), 1, "expected the session to be split")
+                for s in slices:
+                    self.assertEqual(s['device_serial'], 'FCQFM54')
+                    self.assertEqual(s['user_email'], 'alice@example.com')
+
+    def test_a_session_that_fits_is_passed_through_untouched(self):
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                session = {'session_id': 'S', 'entries': [{'a': 1}],
+                           'device_serial': 'FCQFM54', 'user_email': 'alice@example.com'}
+                slices = list(mod._backfill_slice_session(session, 10 * 1024 * 1024))
+                self.assertEqual(slices, [session])
+
+    def test_a_session_without_identity_gains_no_empty_keys(self):
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                session = {'session_id': 'S', 'entries': [{'a': 1}]}
+                for s in mod._backfill_slice_session(session, 10 * 1024 * 1024):
+                    self.assertNotIn('device_serial', s)
+                    self.assertNotIn('user_email', s)
+
+
+class ReparsePointTestCase(unittest.TestCase):
+    """On Windows _run_as_user cannot fork, so the MDM script globs every profile's
+    user-writable AppData while still elevated. A planted junction must not walk it
+    out of the profile."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_a_symlinked_support_dir_is_skipped(self):
+        outside = Path(self.tmp.name) / 'outside'
+        (outside / 'local-agent-mode-sessions' / 'a' / 'b' / 'local_1' / '.claude').mkdir(parents=True)
+        (outside / 'local-agent-mode-sessions' / 'a' / 'b' / 'local_1' / '.claude' / '.claude.json').write_text(
+            json.dumps({'oauthAccount': {'emailAddress': 'planted@evil.com'}}), encoding='utf-8')
+
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                home = Path(self.tmp.name) / f'home-{mod.__name__}'
+                base = mod._claude_desktop_support_dirs(home)[0]
+                base.parent.mkdir(parents=True, exist_ok=True)
+                base.symlink_to(outside, target_is_directory=True)
+                self.assertIsNone(mod._desktop_session_email(home))
+
+    def test_a_symlinked_session_file_is_skipped(self):
+        planted = Path(self.tmp.name) / 'planted.json'
+        planted.write_text(json.dumps({'oauthAccount': {'emailAddress': 'planted@evil.com'}}), encoding='utf-8')
+
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                home = Path(self.tmp.name) / f'h2-{mod.__name__}'
+                leaf = mod._claude_desktop_support_dirs(home)[0] / 'local-agent-mode-sessions' / 'a' / 'b' / 'local_1' / '.claude'
+                leaf.mkdir(parents=True)
+                (leaf / '.claude.json').symlink_to(planted)
+                self.assertIsNone(mod._desktop_session_email(home))
+
+    def test_a_real_file_inside_the_base_is_still_read(self):
+        # The guard must not break the normal case.
+        for mod in (setup, mdm):
+            with self.subTest(module=mod.__name__):
+                home = Path(self.tmp.name) / f'h3-{mod.__name__}'
+                leaf = mod._claude_desktop_support_dirs(home)[0] / 'local-agent-mode-sessions' / 'a' / 'b' / 'local_1' / '.claude'
+                leaf.mkdir(parents=True)
+                (leaf / '.claude.json').write_text(
+                    json.dumps({'oauthAccount': {'emailAddress': 'real@example.com'}}), encoding='utf-8')
+                self.assertEqual(mod._desktop_session_email(home), 'real@example.com')

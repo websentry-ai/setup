@@ -1153,6 +1153,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     globally stable per (org, tool, session, record_index)."""
     session_id = session.get('session_id')
     entries = session.get('entries') or []
+    # A slice is a fresh dict, so the identity has to be carried over explicitly or
+    # an oversized session silently loses the attribution the whole change is for.
+    identity = {k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1176,6 +1179,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': [],
+            **identity,
         }).encode('utf-8'))
         cum = wrap
         cursor = start_idx
@@ -1194,16 +1198,31 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        yield {
+        slice_payload = {
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': entries[start_idx:last_fit_end],
         }
+        slice_payload.update(identity)
+        yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
 
 
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
+_IS_JUNCTION = getattr(os.path, 'isjunction', None)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Symlink, or a Windows directory junction. os.path.islink reports False for
+    junctions and os.path.isjunction only exists on 3.12+, so both are checked and
+    an unreadable path is treated as suspect."""
+    try:
+        if path.is_symlink():
+            return True
+        return bool(_IS_JUNCTION and _IS_JUNCTION(path))
+    except OSError:
+        return True
 
 
 def _claude_desktop_support_dirs(home: Path) -> List[Path]:
@@ -1245,6 +1264,17 @@ def _desktop_session_email(home: Path) -> Optional[str]:
     except Exception:
         return None
     for base in bases:
+        # These live under a user-writable AppData. On Windows _run_as_user cannot
+        # fork, so the MDM script globs every profile while still elevated; a planted
+        # junction would otherwise walk SYSTEM out of the profile. Transcript
+        # collection already skips symlinks, this mirrors that.
+        if _is_reparse_point(base):
+            debug_print("skipping reparse-point desktop support dir")
+            continue
+        try:
+            base_real = base.resolve(strict=True)
+        except OSError:
+            continue
         try:
             # list() forces the lazy glob traversal to happen inside this guard —
             # a mid-iteration traversal error (e.g. an unreadable subdir) then only
@@ -1255,8 +1285,13 @@ def _desktop_session_email(home: Path) -> Optional[str]:
         for path in candidates:
             # stat per file so one unreadable/vanished entry can't poison the sort.
             try:
+                if not path.is_file() or _is_reparse_point(path):
+                    continue
+                # Resolving and re-containing catches a junction at any level of the
+                # globbed path, not just the leaf.
+                path.resolve(strict=True).relative_to(base_real)
                 timed.append((path.stat().st_mtime, path))
-            except Exception:
+            except (OSError, ValueError):
                 continue
     timed.sort(key=lambda t: t[0], reverse=True)
     found = None
@@ -1304,13 +1339,18 @@ def _backfill_account_email(home: Path) -> Optional[str]:
             raw = oauth.get('emailAddress')
             if isinstance(raw, str) and raw.strip():
                 email = raw.strip()
-    except Exception:
-        pass
+    except FileNotFoundError:
+        debug_print("no .claude.json for this home")
+    except Exception as e:
+        debug_print(f"could not read oauthAccount: {e!r}")
     if not email:
         try:
             email = _desktop_session_email(home)
-        except Exception:
+        except Exception as e:
+            debug_print(f"desktop session email lookup failed: {e!r}")
             email = None
+    if not email:
+        debug_print("no signed-in email resolved; backfill will send none")
     return email
 
 
