@@ -43,6 +43,11 @@ done < "$LOCK"
 for var in SOURCE_REPO SOURCE_REF SOURCE_ENTRYPOINT PYTHON_VERSION PYINSTALLER_VERSION TARGET_ARCH; do
     [ -n "${!var:-}" ] || die "$var not set in discovery.lock"
 done
+# Branch/SHA charset only: SOURCE_REF becomes a git ref argument, and a leading
+# dash would parse as an option such as --upload-pack.
+case "$SOURCE_REF" in
+    -*|*[!A-Za-z0-9._/-]*) die "SOURCE_REF is not a valid branch or SHA: '$SOURCE_REF'" ;;
+esac
 log "source: $SOURCE_REPO @ $SOURCE_REF"
 
 # --- 2. Verify the build interpreter is universal2 CPython 3.12 ------------
@@ -73,7 +78,7 @@ else
     rm -rf "$SRC" && mkdir -p "$SRC"
     git -C "$SRC" init -q
     git -C "$SRC" remote add origin "$SOURCE_REPO"
-    git -C "$SRC" fetch -q --depth 1 origin "$SOURCE_REF"
+    git -C "$SRC" fetch -q --depth 1 origin -- "$SOURCE_REF"
     git -C "$SRC" checkout -q FETCH_HEAD
     log "fetched source into $SRC"
 fi

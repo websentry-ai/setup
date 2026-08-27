@@ -182,11 +182,14 @@ jobs:
           artifact_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$version"
 
           # discovery.lock is KEY=VALUE (canonical format from WEB-4787).
-          discovery_ref="$(awk -F= '$1=="SOURCE_REF"{print $2}' packaging/discovery.lock)"
+          discovery_ref="$(awk -F= '$1=="SOURCE_REF"{print $2; exit}' packaging/discovery.lock)"
           lock_python="$(awk -F= '$1=="PYTHON_VERSION"{print $2}' packaging/discovery.lock)"
           lock_pyinstaller="$(awk -F= '$1=="PYINSTALLER_VERSION"{print $2}' packaging/discovery.lock)"
-          if [ -z "$discovery_ref" ]; then
-            echo "::error::SOURCE_REF is not set in packaging/discovery.lock"
+          # Branch/SHA charset only. This value reaches $GITHUB_OUTPUT and a git
+          # ref argument, so a newline would forge a step output and a leading
+          # dash would parse as an option such as --upload-pack.
+          if ! [[ "$discovery_ref" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
+            echo "::error::SOURCE_REF in packaging/discovery.lock is not a valid branch or SHA: '$discovery_ref'"
             exit 1
           fi
 
@@ -211,10 +214,11 @@ jobs:
 
       # Checkout at SOURCE_REF (packaging/discovery.lock), which tracks the
       # source repo's main. A release is therefore recorded rather than
-      # reproducible from this repo alone: build-discovery.sh logs the commit it
-      # actually built. Put a SHA in SOURCE_REF to freeze a release. Gated: the
-      # placeholder build doesn't read the checkout yet; Stream B's spec will, at
-      # which point DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
+      # reproducible from this repo alone, and the next step is what records it:
+      # this workflow drives PyInstaller directly and never runs
+      # build-discovery.sh. Put a SHA in SOURCE_REF to freeze a release. Gated:
+      # the placeholder build doesn't read the checkout yet; Stream B's spec
+      # will, at which point DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
       - name: Checkout coding-discovery-tool at SOURCE_REF
         if: steps.cfg.outputs.discovery_token == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -223,6 +227,18 @@ jobs:
           ref: ${{ steps.cfg.outputs.discovery_ref }}
           token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
           path: discovery-src
+
+      - name: Record resolved discovery commit
+        id: discovery
+        if: steps.cfg.outputs.discovery_token == 'true'
+        env:
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+        run: |
+          set -euo pipefail
+          sha="$(git -C discovery-src rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "discovery source: $DISCOVERY_REF -> $sha"
+          echo "discovery source: \`$DISCOVERY_REF\` @ \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Note skipped discovery checkout
         if: steps.cfg.outputs.discovery_token != 'true'
@@ -670,9 +686,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.cfg.outputs.version }}
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+          DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
         run: |
           set -euo pipefail
           gh release create "runtime-v$VERSION" \
             --title "macOS runtime $VERSION" \
-            --notes "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh." \
+            --notes "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh.
+
+discovery source: $DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}" \
             out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh
