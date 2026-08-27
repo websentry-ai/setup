@@ -228,9 +228,9 @@ jobs:
           token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
           path: discovery-src
 
-      # Provenance lives with the release, not in the payload: the artifact
-      # carries no commit of its own, so a deployed device is traced by version
-      # through the GitHub Release. Both are immutable, S3 refuses overwrites.
+      # Recorded in three places because each answers a different question:
+      # this step for the run, the Release notes for the version, and
+      # dist/unbound-discovery/SOURCE so a deployed device answers offline.
       - name: Record resolved discovery commit
         id: discovery
         if: steps.cfg.outputs.discovery_token == 'true'
@@ -396,6 +396,27 @@ jobs:
       # Builder-agnostic: it validates whatever landed at
       # dist/unbound-hook/unbound-hook, so the Nuitka builder (PR #132)
       # inherits this coverage with no change.
+      # Written into the discovery bundle so the artifact answers for itself:
+      # build-pkg.sh copies this directory into /opt/unbound/<version>/ and the
+      # tarball is packed from it, so one write reaches both. Before signing:
+      # sign-machos.sh signs each Mach-O individually and ignores this file, but
+      # a future bundle-level seal would need it already in place.
+      - name: Record discovery source in the bundle
+        env:
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+          DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
+          VERSION: ${{ steps.cfg.outputs.version }}
+        run: |
+          set -euo pipefail
+          # KEY=VALUE, same shape as packaging/discovery.lock.
+          printf '%s\n' \
+            "SOURCE_REPO=https://github.com/websentry-ai/coding-discovery-tool.git" \
+            "SOURCE_REF=$DISCOVERY_REF" \
+            "SOURCE_COMMIT=${DISCOVERY_SHA:-unknown}" \
+            "RUNTIME_VERSION=$VERSION" \
+            > dist/unbound-discovery/SOURCE
+          cat dist/unbound-discovery/SOURCE
+
       - name: Install pinned pytest (hash-verified) for the parity suite
         run: |
           set -euo pipefail
@@ -542,6 +563,8 @@ jobs:
           ARTIFACT_URL: ${{ steps.cfg.outputs.artifact_url }}
           TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           PKG_SIGN: ${{ steps.cfg.outputs.pkg_sign }}
+          DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
+          DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
         run: |
           set -euo pipefail
           pkg_sha256="$(shasum -a 256 "out/$PKG_NAME" | awk '{print $1}')"
@@ -555,6 +578,7 @@ jobs:
               -e "s|@PKG_SHA256@|$pkg_sha256|g" \
               -e "s|@ARTIFACT_URL@|$ARTIFACT_URL|g" \
               -e "s|@TEAM_ID@|$team_id|g" \
+              -e "s|@DISCOVERY_SOURCE@|$DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}|g" \
               mdm/onboard.sh.tmpl > out/onboard.sh
           chmod +x out/onboard.sh
           bash -n out/onboard.sh
