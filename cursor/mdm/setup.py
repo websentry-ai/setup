@@ -805,6 +805,22 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> Tuple[bool, bool]:
     return True, hooks_changed
 
 
+def find_cursor_exe() -> Optional[str]:
+    """Path to Cursor.exe, or None. Passing a bare name to the shell pops an error dialog."""
+    found = shutil.which("Cursor.exe")
+    if found:
+        return found
+    candidates = [home / "AppData" / "Local" / "Programs" / "cursor" / "Cursor.exe"
+                  for _, home in get_all_user_homes()]
+    program_files = os.environ.get("ProgramFiles")
+    if program_files:
+        candidates.append(Path(program_files) / "cursor" / "Cursor.exe")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def restart_cursor() -> bool:
     """Attempt to restart Cursor IDE."""
     system = platform.system().lower()
@@ -842,16 +858,19 @@ def restart_cursor() -> bool:
                 return False
 
         elif system == "windows":
+            exe = find_cursor_exe()
+            if exe is None:
+                print("Restart Cursor")
+                return False
             print("\n🔄 Restarting Cursor IDE...")
             subprocess.run(["taskkill", "/F", "/IM", "Cursor.exe"],
                            capture_output=True, timeout=5)
             time.sleep(1)
-            proc = subprocess.Popen(["start", "cursor"],
-                                    shell=True,
+            proc = subprocess.Popen([exe],
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
             time.sleep(0.5)
-            if proc.poll() is None or proc.returncode == 0:
+            if proc.poll() is None:
                 print("✅ Cursor restarted")
                 return True
             else:
