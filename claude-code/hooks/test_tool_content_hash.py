@@ -77,6 +77,15 @@ class TestComputeMcpCacheKey(unittest.TestCase):
             'url:mcp.slack.com/mcp',
         )
 
+    def test_git_credentials_are_removed(self):
+        self.assertEqual(
+            unbound.compute_mcp_cache_key(
+                'server', 'npx', None,
+                ['git+https://user:secret@github.com/owner/repo.git'],
+            ),
+            'git:github.com/owner/repo',
+        )
+
     def test_bare_npm_package(self):
         self.assertEqual(
             unbound.compute_mcp_cache_key('one', 'npx', None, ['-y', 'mcp-server']),
