@@ -321,6 +321,32 @@ class TestDispatchPassesCodingTool(unittest.TestCase):
         self.assertEqual(unbound._UNBOUND_CODING_TOOL, 'Claude Code')
 
 
+class TestClaudeBuiltinFingerprint(unittest.TestCase):
+    def test_each_builtin_server_has_a_distinct_fingerprint(self):
+        expected = {
+            'computer-use': 'claude-builtin:computer-use',
+            'claude_in_chrome': 'claude-builtin:claude-in-chrome',
+            'claude_browser': 'claude-builtin:claude-browser',
+            'claude_preview': 'claude-builtin:claude-preview',
+            'claude_design': 'claude-builtin:claude-design',
+            'ccd_session': 'claude-builtin:ccd-session',
+            'ccd_session_mgmt': 'claude-builtin:ccd-session-mgmt',
+            'ide': 'claude-builtin:ide',
+        }
+        for name, fingerprint in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(
+                    unbound.compute_fingerprint(
+                        name=name,
+                        command=None,
+                        url=None,
+                        args=[],
+                        additional_data=None,
+                    ),
+                    fingerprint,
+                )
+
+
 class TestCrossHookSectionConsistency(unittest.TestCase):
     """The risk-scoring section is embedded per hook (single-file self-update
     constraint). It must stay byte-identical across variants, modulo the three
