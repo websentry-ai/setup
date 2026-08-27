@@ -364,6 +364,24 @@ class TestExtractCommand(unittest.TestCase):
         self.assertIsInstance(out, str)
 
 
+class TestMcpFingerprinting(unittest.TestCase):
+    def test_bare_package_fingerprint_is_computed_before_redaction(self):
+        cfg = unbound._normalize_mcp_entry(
+            {"command": "npx", "args": ["-y", "pg-mcp"]},
+            name="postgres",
+        )
+        self.assertEqual(cfg["args"], [])
+        self.assertEqual(cfg["_unbound_fingerprint"], "npm:pg-mcp")
+
+    def test_command_string_uses_unredacted_package_for_fingerprint(self):
+        cfg = unbound._normalize_mcp_entry(
+            {"command": "uvx markitdown-mcp@latest"},
+            name="markitdown",
+        )
+        self.assertEqual(cfg["args"], [])
+        self.assertEqual(cfg["_unbound_fingerprint"], "pypi:markitdown-mcp")
+
+
 # --------------------------------------------------------------------------- #
 # Stop audit exchange                                                         #
 # --------------------------------------------------------------------------- #

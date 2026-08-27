@@ -1,15 +1,5 @@
-"""
-Tests for the MCP tool risk-scoring section in claude-code/hooks/unbound.py:
-the local mcp-tools-cache.json lookup that attaches `tool_content_hash` to the
-outgoing mcp_server_config on MCP PreToolUse, and the single name-inclusive
-config-hash cache keying shared with the discovery tool.
-
-The section is embedded identically in every hook variant; a drift-guard test
-below asserts the copies stay byte-identical modulo the per-hook constants.
-"""
-
-import hashlib
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -19,17 +9,12 @@ from unittest.mock import patch
 import unbound
 
 HASH_A = 'a' * 64
+HASH_B = 'b' * 64
 SLACK_CFG = {'url': 'https://mcp.slack.com/mcp', 'type': 'http'}
 SLACK_KEY = unbound.compute_mcp_cache_key(
     name='slack', command=None, url='https://mcp.slack.com/mcp', args=None,
 )
 USER = Path.home().name  # home_user convention: home-directory basename
-
-
-def _config_hash(subset):
-    return hashlib.sha256(
-        json.dumps(subset, sort_keys=True, separators=(',', ':')).encode('utf-8')
-    ).hexdigest()
 
 
 def _cache_payload(coding_tool='Claude Code', user=USER, cache_key=SLACK_KEY,
@@ -47,8 +32,6 @@ def _metadata(server='slack', tool='post_message', cfg=None):
 
 
 class _CacheDirMixin(unittest.TestCase):
-    """Points the state-dir resolution at a temp dir the test controls."""
-
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.state_dir = Path(self._tmp.name)
@@ -67,49 +50,52 @@ class _CacheDirMixin(unittest.TestCase):
 
 
 class TestComputeMcpCacheKey(unittest.TestCase):
-    """The single name-inclusive config-hash contract (SPEC §6 v3), shared
-    byte-identically with coding-discovery-tool's mcp_tools_cache module."""
-
-    def test_name_only_server(self):
-        # Empty-config servers (connectors, claude.ai integrations, IDE
-        # builtins) key on their name alone — no pattern identities.
-        self.assertEqual(
-            unbound.compute_mcp_cache_key('claude.ai Atlassian', None, None, None),
-            _config_hash({'name': 'claude.ai Atlassian'}),
+    def test_unknown_name_only_server_has_no_fingerprint(self):
+        self.assertIsNone(
+            unbound.compute_mcp_cache_key('unknown server', None, None, None)
         )
 
-    def test_name_and_command(self):
+    def test_intellij_builtin(self):
         self.assertEqual(
             unbound.compute_mcp_cache_key('srv', 'builtin', None, None),
-            _config_hash({'name': 'srv', 'command': 'builtin'}),
+            'intellij:srv',
         )
 
-    def test_full_config(self):
+    def test_url_has_priority_over_command(self):
         self.assertEqual(
             unbound.compute_mcp_cache_key(
                 'slack', 'npx', 'https://mcp.slack.com/mcp', ['-y', '@slack/mcp']),
-            _config_hash({'name': 'slack', 'url': 'https://mcp.slack.com/mcp',
-                          'command': 'npx', 'args': ['-y', '@slack/mcp']}),
+            'url:mcp.slack.com/mcp',
         )
 
-    def test_strings_stripped_and_empty_dropped(self):
+    def test_url_credentials_query_and_fragment_are_removed(self):
         self.assertEqual(
-            unbound.compute_mcp_cache_key(' slack ', '   ', ' https://a.example/m ', None),
-            _config_hash({'name': 'slack', 'url': 'https://a.example/m'}),
+            unbound.compute_mcp_cache_key(
+                'slack', None,
+                'https://user:secret@mcp.slack.com/mcp?token=x#fragment', None,
+            ),
+            'url:mcp.slack.com/mcp',
         )
 
-    def test_canonical_json_form_pinned(self):
-        # sort_keys + compact separators over the non-empty subset.
-        key = unbound.compute_mcp_cache_key('s', 'node', 'https://a.example', ['x'])
-        expected = hashlib.sha256(
-            '{"args":["x"],"command":"node","name":"s","url":"https://a.example"}'.encode('utf-8')
-        ).hexdigest()
-        self.assertEqual(key, expected)
+    def test_bare_npm_package(self):
+        self.assertEqual(
+            unbound.compute_mcp_cache_key('one', 'npx', None, ['-y', 'mcp-server']),
+            'npm:mcp-server',
+        )
 
-    def test_name_changes_the_key(self):
+    def test_name_does_not_change_package_identity(self):
         a = unbound.compute_mcp_cache_key('name-one', None, 'https://a.example', None)
         b = unbound.compute_mcp_cache_key('name-two', None, 'https://a.example', None)
-        self.assertNotEqual(a, b)
+        self.assertEqual(a, b)
+
+    def test_connector_scope_uses_name(self):
+        self.assertEqual(
+            unbound.compute_mcp_cache_key(
+                'Gmail', None, 'https://registration.example/id', None,
+                additional_data={'scope': 'claude-connector'},
+            ),
+            'claude-connector:gmail',
+        )
 
     def test_all_empty_returns_none(self):
         self.assertIsNone(unbound.compute_mcp_cache_key(None, None, None, None))
@@ -137,11 +123,22 @@ class TestAttachToolContentHash(_CacheDirMixin):
         self.assertEqual(md['mcp_server_config']['tool_content_hash'], HASH_A)
 
     def test_name_only_server_hit(self):
-        # Empty-config server (e.g. a connector): keyed on name alone.
-        self.write_cache(_cache_payload(cache_key=_config_hash({'name': 'Gmail'})))
+        self.write_cache(_cache_payload(cache_key='claude-connector:gmail'))
         md = _metadata(server='Gmail', cfg={'additional_data': {'scope': 'claude-connector'}})
         unbound._attach_tool_content_hash(md)
         self.assertEqual(md['mcp_server_config']['tool_content_hash'], HASH_A)
+
+    def test_precomputed_fingerprint_survives_argument_redaction(self):
+        self.write_cache(_cache_payload(cache_key='npm:mcp-server'))
+        md = _metadata(cfg={
+            'command': 'npx',
+            'args': [],
+            '_unbound_fingerprint': 'npm:mcp-server',
+        })
+        unbound._attach_tool_content_hash(md)
+        cfg = md['mcp_server_config']
+        self.assertEqual(cfg['tool_content_hash'], HASH_A)
+        self.assertNotIn('_unbound_fingerprint', cfg)
 
     def test_empty_server_name_attaches_nothing(self):
         # No name and an empty config -> no cache key -> no field.
@@ -157,7 +154,13 @@ class TestAttachToolContentHash(_CacheDirMixin):
         self.assertNotIn('tool_content_hash', md['mcp_server_config'])
 
     def test_miss_unknown_cache_key_omits_field(self):
-        self.write_cache(_cache_payload(cache_key=_config_hash({'url': 'https://other.example'})))
+        self.write_cache(_cache_payload(cache_key='url:other.example'))
+        md = _metadata()
+        unbound._attach_tool_content_hash(md)
+        self.assertNotIn('tool_content_hash', md['mcp_server_config'])
+
+    def test_ambiguous_cached_hashes_are_ignored(self):
+        self.write_cache(_cache_payload(content_hash=[HASH_A, 'b' * 64]))
         md = _metadata()
         unbound._attach_tool_content_hash(md)
         self.assertNotIn('tool_content_hash', md['mcp_server_config'])
@@ -217,10 +220,59 @@ class TestAttachToolContentHash(_CacheDirMixin):
             unbound._attach_tool_content_hash(md)
             self.assertNotIn('tool_content_hash', md['mcp_server_config'])
 
-    def test_no_config_is_a_noop(self):
-        md = {'mcp_server': 'slack', 'mcp_tool': 'post_message'}
-        unbound._attach_tool_content_hash(md)  # must not raise
+    def test_unknown_server_without_config_is_a_noop(self):
+        md = {'mcp_server': 'unknown server', 'mcp_tool': 'post_message'}
+        unbound._attach_tool_content_hash(md)
         self.assertNotIn('mcp_server_config', md)
+
+    def test_builtin_without_config_attaches_hash(self):
+        self.write_cache(_cache_payload(cache_key='claude-builtin:computer-use'))
+        md = {'mcp_server': 'computer-use', 'mcp_tool': 'post_message'}
+        unbound._attach_tool_content_hash(md)
+        self.assertEqual(md['mcp_server_config']['tool_content_hash'], HASH_A)
+
+    def test_bad_home_cache_does_not_shadow_valid_fallback(self):
+        home_state_dir = self.state_dir / '.unbound'
+        fallback_state_dir = self.state_dir / 'fallback'
+        home_state_dir.mkdir(mode=0o700)
+        fallback_state_dir.mkdir(mode=0o700)
+        (home_state_dir / 'mcp-tools-cache.json').write_text('{not json')
+        (fallback_state_dir / 'mcp-tools-cache.json').write_text(
+            json.dumps(_cache_payload(user=self.state_dir.name))
+        )
+
+        with patch.object(Path, 'home', return_value=home_state_dir.parent), patch.object(
+            unbound,
+            '_unbound_state_dir_candidates',
+            return_value=[home_state_dir, fallback_state_dir],
+        ):
+            md = _metadata()
+            unbound._attach_tool_content_hash(md)
+
+        self.assertEqual(md['mcp_server_config']['tool_content_hash'], HASH_A)
+
+    def test_newer_fallback_cache_wins_over_valid_stale_home_cache(self):
+        home_state_dir = self.state_dir / '.unbound'
+        fallback_state_dir = self.state_dir / 'fallback'
+        home_state_dir.mkdir(mode=0o700)
+        fallback_state_dir.mkdir(mode=0o700)
+        home_cache = home_state_dir / 'mcp-tools-cache.json'
+        fallback_cache = fallback_state_dir / 'mcp-tools-cache.json'
+        user = self.state_dir.name
+        home_cache.write_text(json.dumps(_cache_payload(user=user)))
+        fallback_cache.write_text(json.dumps(_cache_payload(user=user, content_hash=HASH_B)))
+        os.utime(home_cache, (1, 1))
+        os.utime(fallback_cache, (2, 2))
+
+        with patch.object(Path, 'home', return_value=self.state_dir), patch.object(
+            unbound,
+            '_unbound_state_dir_candidates',
+            return_value=[home_state_dir, fallback_state_dir],
+        ):
+            md = _metadata()
+            unbound._attach_tool_content_hash(md)
+
+        self.assertEqual(md['mcp_server_config']['tool_content_hash'], HASH_B)
 
     def test_internal_error_never_escapes(self):
         self.write_cache(_cache_payload())

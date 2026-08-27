@@ -369,6 +369,21 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
             unbound._vscode_user_dirs()[0].mkdir(parents=True, exist_ok=True)
             self.assertEqual(unbound.read_copilot_mcp_servers(None), {})
 
+    def test_bare_package_fingerprint_is_computed_before_redaction(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+            user_dir = unbound._vscode_user_dirs()[0]
+            user_dir.mkdir(parents=True, exist_ok=True)
+            (user_dir / "mcp.json").write_text(json.dumps({"servers": {
+                "postgres": {"command": "npx", "args": ["-y", "pg-mcp"]},
+            }}))
+            servers = unbound.read_copilot_mcp_servers(None)
+        self.assertEqual(servers["postgres"]["args"], [])
+        self.assertEqual(
+            servers["postgres"]["_unbound_fingerprint"], "npm:pg-mcp"
+        )
+
     def test_plugin_relative_command_hashes_against_bundle(self):
         # A plugin's relative script is fingerprinted against its own bundle dir,
         # not the workspace cwd (else null/wrong fingerprint -> sanction bypass).
