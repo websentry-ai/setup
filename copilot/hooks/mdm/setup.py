@@ -8,6 +8,7 @@ import time
 import platform
 import subprocess
 import json
+import sqlite3
 import tempfile
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -820,7 +821,188 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 
     if not session_id or not entries:
         return None
-    return {'session_id': session_id, 'entries': entries}
+    session = {'session_id': session_id, 'entries': entries}
+    usage = _backfill_session_usage(transcript_path, session_id)
+    if usage:
+        session['usage'] = usage
+    return session
+
+
+# KEEP IN SYNC: copilot/hooks/unbound.py's usage readers. Same stores, same cache and
+# finality rules; historical sessions are already final so there is no waiting here.
+_BACKFILL_USAGE_FIELDS = ('input_tokens', 'output_tokens',
+                          'cache_read_input_tokens', 'cache_creation_input_tokens')
+# No separator, drive letter or dot-only name can appear, so an id can only ever name a
+# file directly inside chatSessions/ and cannot escape it by construction.
+_BACKFILL_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
+                                    'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+# On Windows these resolve to devices wherever they appear, so opening one would attach to
+# the device and hang the run rather than miss a file.
+_BACKFILL_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
+                                            + ['com%d' % n for n in range(1, 10)]
+                                            + ['lpt%d' % n for n in range(1, 10)])
+_BACKFILL_MAX_LINE_CHARS = 1 << 20
+
+
+def _backfill_is_regular_file(path: Path) -> bool:
+    """A FIFO or device node here would block the run, so opening is gated on a real file
+    rather than on mere existence. Symlinks are followed: anything able to plant one inside
+    the user's own home could edit this script instead."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _backfill_safe_path_component(value) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= 128
+            and not set(value) - _BACKFILL_SAFE_ID_CHARS and value not in ('.', '..')
+            and value.split('.')[0].lower() not in _BACKFILL_RESERVED_DEVICE_NAMES)
+
+
+def _backfill_capped_lines(handle, max_lines, max_chars):
+    """Lines from an untrusted journal, bounded in count and in length. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen.
+    In text mode the readline hint counts characters, so utf-8 bounds the bytes at 4x that.
+    Draining an oversize line is charged against the same budget, so the whole read costs at
+    most max_lines readline calls however the file is shaped."""
+    count = 0
+    while count < max_lines:
+        line = handle.readline(max_chars)
+        if not line:
+            return
+        count += 1
+        if len(line) >= max_chars and not line.endswith('\n'):
+            while count < max_lines:  # drop the rest of an oversize line rather than buffer it
+                rest = handle.readline(max_chars)
+                count += 1
+                if not rest or rest.endswith('\n'):
+                    break
+            continue
+        yield line
+
+
+def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
+    """Per-turn usage from the CLI's own store, ordered by turn. Its input_tokens counts
+    both cache tiers, so they come back out to leave the fresh input the gateway prices."""
+    # <copilot home>/session-state/<id>/events.jsonl: the store sits beside session-state,
+    # so a relocated COPILOT_HOME and MDM's per-user homes both resolve from the path.
+    parents = transcript_path.parents
+    if len(parents) < 3:
+        return []
+    store = parents[2] / 'session-store.db'
+    if not _backfill_is_regular_file(store):
+        return []
+    conn = None
+    try:
+        conn = sqlite3.connect(str(store), timeout=1.0)
+        conn.execute('PRAGMA query_only = 1')
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                            " AND name = 'assistant_usage_events'").fetchone():
+            return []
+        rows = conn.execute(
+            'SELECT turn_index, input_tokens, output_tokens, cache_read_tokens,'
+            ' cache_write_tokens FROM assistant_usage_events WHERE session_id = ?'
+            ' ORDER BY turn_index, id', (session_id,)).fetchall()
+        # Totals stay inside the guard: a non-numeric column would otherwise raise out of
+        # the collector and abort the whole backfill run.
+        by_turn: Dict = {}
+        for turn, row_input, row_output, cache_read, cache_write in rows:
+            totals = by_turn.setdefault(turn if isinstance(turn, int) else 0,
+                                        dict((f, 0) for f in _BACKFILL_USAGE_FIELDS))
+            cache_read = max(int(cache_read or 0), 0)
+            cache_write = max(int(cache_write or 0), 0)
+            totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
+            totals['output_tokens'] += max(int(row_output or 0), 0)
+            totals['cache_read_input_tokens'] += cache_read
+            totals['cache_creation_input_tokens'] += cache_write
+    except Exception as e:
+        debug_print(f"backfill cli usage read failed: {e}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+    return [by_turn[t] for t in sorted(by_turn)]
+
+
+def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]:
+    """Per-request usage from VS Code's own chat store, a sibling of the copilot-chat
+    transcript directory. elapsedMs is written after the final counts, so it is what marks
+    a request finished; the counts alone appear mid-stream and climb. No cache split."""
+    if transcript_path.parent.name != 'transcripts':
+        return []
+    if not _backfill_safe_path_component(session_id):
+        return []
+    store = transcript_path.parent.parent.parent / 'chatSessions' / (session_id + '.jsonl')
+    if not _backfill_is_regular_file(store):
+        return []
+    requests: Dict = {}
+    next_index = 0
+
+    def _merge(index, obj):
+        if not isinstance(obj, dict):
+            return
+        entry = requests.setdefault(index, {})
+        for field in ('promptTokens', 'completionTokens', 'elapsedMs'):
+            if obj.get(field) is not None:
+                entry[field] = obj[field]
+
+    try:
+        with open(store, 'r', encoding='utf-8') as handle:
+            for line in _backfill_capped_lines(handle, BACKFILL_MAX_LINES_PER_FILE,
+                                               _BACKFILL_MAX_LINE_CHARS):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key, value = record.get('k'), record.get('v')
+                if key is None:
+                    for obj in (value or {}).get('requests') or []:
+                        _merge(next_index, obj)
+                        next_index += 1
+                    continue
+                keypath = [str(part) for part in key] if isinstance(key, list) else [str(key)]
+                if keypath == ['requests'] and isinstance(value, list):
+                    for obj in value:
+                        _merge(next_index, obj)
+                        next_index += 1
+                elif len(keypath) == 3 and keypath[0] == 'requests':
+                    try:
+                        _merge(int(keypath[1]), {keypath[2]: value})
+                    except ValueError:
+                        continue
+    except Exception as e:
+        debug_print(f"backfill vscode usage read failed: {e}")
+        return []
+    usage = []
+    # Guarded: a non-numeric count in the journal would otherwise raise out of the collector
+    # and abort the whole backfill run.
+    try:
+        for index in sorted(requests):
+            entry = requests[index]
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                break
+            totals = dict((f, 0) for f in _BACKFILL_USAGE_FIELDS)
+            totals['input_tokens'] = max(int(prompt), 0)
+            totals['output_tokens'] = max(int(completion), 0)
+            usage.append(totals)
+    except (TypeError, ValueError) as e:
+        debug_print(f"backfill vscode usage totals failed: {e}")
+        return []
+    return usage
+
+
+def _backfill_session_usage(transcript_path: Path, session_id: str) -> List[Dict]:
+    """One usage dict per exchange, in transcript order. Copilot forwards no usage, so
+    without this the backend tiktoken-estimates from visible text and misses cache reads,
+    tool definitions and system instructions."""
+    if transcript_path.stem == 'events':
+        return _backfill_cli_usage(transcript_path, session_id)
+    return _backfill_vscode_usage(transcript_path, session_id)
 
 
 def _backfill_vscode_workspace_roots(home_dir: Path) -> List[Path]:
@@ -1044,6 +1226,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     globally stable per (org, tool, session, record_index)."""
     session_id = session.get('session_id')
     entries = session.get('entries') or []
+    session_usage = session.get('usage') or []
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1085,11 +1268,16 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        yield {
+        slice_payload = {
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': entries[start_idx:last_fit_end],
         }
+        # Usage is one dict per exchange, so it cuts on the same boundaries the entries do.
+        usage_slice = session_usage[record_index_base:record_index_base + last_fit_base_count]
+        if usage_slice:
+            slice_payload['usage'] = usage_slice
+        yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
 
