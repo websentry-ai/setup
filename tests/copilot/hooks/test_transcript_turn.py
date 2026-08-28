@@ -146,7 +146,7 @@ class TestReportedPromptWatermark(unittest.TestCase):
                            "forwarded_prompt_ids": ["u1"],
                            "text_sig": "sig"}}]
         with unittest.mock.patch.object(unbound, "load_existing_logs", lambda: logs):
-            tools, sig, prompts = unbound.get_forwarded_state(SESSION)
+            tools, sig, prompts, _index = unbound.get_forwarded_state(SESSION)
         self.assertEqual(tools, {"call-a"})
         self.assertEqual(sig, "sig")
         self.assertEqual(prompts, {"u1"})
@@ -157,7 +157,7 @@ class TestReportedPromptWatermark(unittest.TestCase):
                            "session_id": SESSION,
                            "forwarded_tool_ids": ["call-a"]}}]
         with unittest.mock.patch.object(unbound, "load_existing_logs", lambda: logs):
-            tools, _sig, prompts = unbound.get_forwarded_state(SESSION)
+            tools, _sig, prompts, _index = unbound.get_forwarded_state(SESSION)
         self.assertEqual(tools, {"call-a"})
         self.assertEqual(prompts, set())
 
@@ -170,7 +170,7 @@ class TestReportedPromptWatermark(unittest.TestCase):
                                         lambda x: (logs.clear(), logs.extend(x))):
             unbound.record_forwarded_tool_ids(SESSION, {"call-a"}, "sig1", {"u1"})
             unbound.record_forwarded_tool_ids(SESSION, {"call-b"}, "sig2", {"u2"})
-            tools, _sig, prompts = unbound.get_forwarded_state(SESSION)
+            tools, _sig, prompts, _index = unbound.get_forwarded_state(SESSION)
         self.assertEqual(tools, {"call-a", "call-b"})
         self.assertEqual(prompts, {"u1", "u2"})
 
@@ -191,7 +191,7 @@ class TestReportedPromptWatermark(unittest.TestCase):
         self.assertEqual(_user_text(exchange), ["second question"])
 
     def test_no_session_id_is_empty_state(self):
-        self.assertEqual(unbound.get_forwarded_state(None), (set(), None, set()))
+        self.assertEqual(unbound.get_forwarded_state(None), (set(), None, set(), 0))
 
 
 if __name__ == "__main__":
