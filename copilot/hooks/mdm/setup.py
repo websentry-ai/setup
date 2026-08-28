@@ -841,7 +841,7 @@ _BACKFILL_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
 _BACKFILL_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
                                             + ['com%d' % n for n in range(1, 10)]
                                             + ['lpt%d' % n for n in range(1, 10)])
-_BACKFILL_MAX_LINE_BYTES = 1 << 20
+_BACKFILL_MAX_LINE_CHARS = 1 << 20
 
 
 def _backfill_safe_path_component(value) -> bool:
@@ -850,18 +850,22 @@ def _backfill_safe_path_component(value) -> bool:
             and value.split('.')[0].lower() not in _BACKFILL_RESERVED_DEVICE_NAMES)
 
 
-def _backfill_capped_lines(handle, max_lines, max_bytes):
-    """Lines from an untrusted journal, bounded in count and in size. A count cap alone
-    does not bound memory: one oversized line is still read whole before the count is seen."""
+def _backfill_capped_lines(handle, max_lines, max_chars):
+    """Lines from an untrusted journal, bounded in count and in length. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen.
+    In text mode the readline hint counts characters, so utf-8 bounds the bytes at 4x that.
+    Draining an oversize line is charged against the same budget, so the whole read costs at
+    most max_lines readline calls however the file is shaped."""
     count = 0
     while count < max_lines:
-        line = handle.readline(max_bytes)
+        line = handle.readline(max_chars)
         if not line:
             return
         count += 1
-        if len(line) >= max_bytes and not line.endswith('\n'):
-            while True:  # drop the remainder of an oversize line rather than buffer it
-                rest = handle.readline(max_bytes)
+        if len(line) >= max_chars and not line.endswith('\n'):
+            while count < max_lines:  # drop the rest of an oversize line rather than buffer it
+                rest = handle.readline(max_chars)
+                count += 1
                 if not rest or rest.endswith('\n'):
                     break
             continue
@@ -936,7 +940,7 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
     try:
         with open(store, 'r', encoding='utf-8') as handle:
             for line in _backfill_capped_lines(handle, BACKFILL_MAX_LINES_PER_FILE,
-                                               _BACKFILL_MAX_LINE_BYTES):
+                                               _BACKFILL_MAX_LINE_CHARS):
                 line = line.strip()
                 if not line:
                     continue

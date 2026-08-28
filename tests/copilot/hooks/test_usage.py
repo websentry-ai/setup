@@ -550,3 +550,67 @@ class TestCappedLines(unittest.TestCase):
 
     def test_an_empty_file_yields_nothing(self):
         self.assertEqual(self._lines(""), [])
+
+    def test_draining_an_oversize_line_cannot_outrun_the_budget(self):
+        # a file of nothing but oversize lines must still cost at most max_lines reads
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "j.jsonl"
+            path.write_text(("X" * 5000 + "\n") * 20, encoding="utf-8")
+            reads = []
+            with open(path, encoding="utf-8") as handle:
+                original = handle.readline
+
+                def counting(*args):
+                    reads.append(1)
+                    return original(*args)
+
+                handle.readline = counting
+                consumed = list(unbound._capped_lines(handle, 5, 1024))
+        self.assertEqual(consumed, [])
+        self.assertLessEqual(len(reads), 5)
+
+
+class TestCleanupKeepsTheUsageFloor(unittest.TestCase):
+    """Cleanup and the usage-window floor must agree on what a session is. Grouping on the
+    payload session_id drops a Stop that omits it, and the next window then loses its lower
+    bound and recounts the session from the start."""
+
+    CLI = "/h/.copilot/session-state/" + SESSION + "/events.jsonl"
+    OTHER = "/h/.copilot/session-state/other-session/events.jsonl"
+
+    def _run_cleanup(self, logs):
+        saved = {}
+        with patch.object(unbound, "load_existing_logs", lambda: logs), \
+             patch.object(unbound, "save_logs", lambda new: saved.setdefault("logs", new)), \
+             patch.object(unbound, "AUDIT_LOG_TOTAL_LIMIT", 3):
+            unbound.cleanup_old_logs()
+        return saved.get("logs", logs)
+
+    def _stop(self, ts, sess, path):
+        event = {"hook_event_name": "Stop"}
+        if sess:
+            event["session_id"] = sess
+        if path:
+            event["transcript_path"] = path
+        return {"timestamp": ts, "event": event}
+
+    def test_a_stop_without_session_id_survives_cleanup(self):
+        logs = [self._stop("t0", "other-session", self.OTHER),
+                self._stop("t1", SESSION, self.CLI),
+                self._stop("t2", None, self.CLI),
+                self._stop("t3", SESSION, self.CLI)]
+        kept = self._run_cleanup(logs)
+        stamps = [log["timestamp"] for log in kept]
+        self.assertIn("t2", stamps)
+        self.assertNotIn("t0", stamps)
+
+    def test_the_floor_still_resolves_after_cleanup(self):
+        logs = [self._stop("t0", "other-session", self.OTHER),
+                self._stop("t1", SESSION, self.CLI),
+                self._stop("t2", None, self.CLI),
+                self._stop("t3", None, self.CLI)]
+        kept = self._run_cleanup(logs)
+        with patch.object(unbound, "load_existing_logs", lambda: kept):
+            floor = unbound.get_previous_stop_timestamp_for_session(
+                {"transcript_path": self.CLI})
+        self.assertEqual(floor, "t2")

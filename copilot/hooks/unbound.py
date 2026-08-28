@@ -555,6 +555,21 @@ def append_to_audit_log(event_data):
         pass
 
 
+def stop_session_key(event):
+    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
+    path FIRST -- it is constant for a session and present on every Stop that builds an
+    exchange -- so the key never flips between Stops that do and don't carry session_id
+    (which would split the watermark and resend the whole history). Falls back to
+    session_id only when there is no transcript path."""
+    # Type-checked because the floor lookup runs this over historical audit-log rows, and
+    # a non-string path there would raise out of the Stop handler and drop the exchange.
+    tp = event.get('transcript_path')
+    if isinstance(tp, str) and tp:
+        p = Path(tp)
+        return p.parent.name if p.stem == 'events' else p.stem
+    return event.get('session_id') or event.get('sessionId')
+
+
 def cleanup_old_logs():
     """Manage log file size by keeping only the most recent session's entries once the
     audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
@@ -573,10 +588,15 @@ def cleanup_old_logs():
     markers = [log for log in logs if _is_marker(log)]
     entries = [log for log in logs if not _is_marker(log)]
 
+    # Grouped by stop_session_key, the same identity the usage-window floor looks Stops up
+    # by. Grouping on the payload session_id instead would drop a Stop that omits it, and
+    # the next window would lose its lower bound and recount the session from the start.
+    # The two agree whenever session_id is present: for both surfaces the transcript path
+    # ends in the session id.
     session_order = []
     seen_sessions = set()
     for log in entries:
-        session_id = log.get('event', {}).get('session_id')
+        session_id = stop_session_key(log.get('event', {}))
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
@@ -584,7 +604,7 @@ def cleanup_old_logs():
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
         kept = [log for log in entries
-                if log.get('event', {}).get('session_id') == most_recent_session]
+                if stop_session_key(log.get('event', {})) == most_recent_session]
     elif len(entries) > AUDIT_LOG_TOTAL_LIMIT:
         kept = entries[-AUDIT_LOG_TOTAL_LIMIT:]
     else:
@@ -592,21 +612,6 @@ def cleanup_old_logs():
     # Always keep the watermark markers (one small consolidated row per session; the
     # active session's is always the newest), bounded to the most recent sessions.
     save_logs(kept + markers[-20:])
-
-
-def stop_session_key(event):
-    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
-    path FIRST -- it is constant for a session and present on every Stop that builds an
-    exchange -- so the key never flips between Stops that do and don't carry session_id
-    (which would split the watermark and resend the whole history). Falls back to
-    session_id only when there is no transcript path."""
-    # Type-checked because the floor lookup runs this over historical audit-log rows, and
-    # a non-string path there would raise out of the Stop handler and drop the exchange.
-    tp = event.get('transcript_path')
-    if isinstance(tp, str) and tp:
-        p = Path(tp)
-        return p.parent.name if p.stem == 'events' else p.stem
-    return event.get('session_id') or event.get('sessionId')
 
 
 def get_forwarded_state(session_id):
@@ -2930,7 +2935,7 @@ _COPILOT_STORE = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot'
 _VSCODE_SETTLE_SECONDS = 10.0
 _VSCODE_POLL_SECONDS = 0.25
 _VSCODE_MAX_LINES = 50000
-_VSCODE_MAX_LINE_BYTES = 1 << 20
+_VSCODE_MAX_LINE_CHARS = 1 << 20
 # No separator, drive letter or dot-only name can appear, so an id can only ever name a
 # file directly inside chatSessions/ and cannot escape it by construction.
 _SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
@@ -2948,18 +2953,22 @@ def _safe_path_component(value):
             and value.split('.')[0].lower() not in _RESERVED_DEVICE_NAMES)
 
 
-def _capped_lines(handle, max_lines, max_bytes):
-    """Lines from an untrusted journal, bounded in count and in size. A count cap alone
-    does not bound memory: one oversized line is still read whole before the count is seen."""
+def _capped_lines(handle, max_lines, max_chars):
+    """Lines from an untrusted journal, bounded in count and in length. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen.
+    In text mode the readline hint counts characters, so utf-8 bounds the bytes at 4x that.
+    Draining an oversize line is charged against the same budget, so the whole read costs at
+    most max_lines readline calls however the file is shaped."""
     count = 0
     while count < max_lines:
-        line = handle.readline(max_bytes)
+        line = handle.readline(max_chars)
         if not line:
             return
         count += 1
-        if len(line) >= max_bytes and not line.endswith('\n'):
-            while True:  # drop the remainder of an oversize line rather than buffer it
-                rest = handle.readline(max_bytes)
+        if len(line) >= max_chars and not line.endswith('\n'):
+            while count < max_lines:  # drop the rest of an oversize line rather than buffer it
+                rest = handle.readline(max_chars)
+                count += 1
                 if not rest or rest.endswith('\n'):
                     break
             continue
@@ -3050,7 +3059,7 @@ def _vscode_requests(path):
     next_index = 0
     try:
         with open(path, 'r', encoding='utf-8') as handle:
-            for line in _capped_lines(handle, _VSCODE_MAX_LINES, _VSCODE_MAX_LINE_BYTES):
+            for line in _capped_lines(handle, _VSCODE_MAX_LINES, _VSCODE_MAX_LINE_CHARS):
                 line = line.strip()
                 if not line:
                     continue
