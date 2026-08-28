@@ -137,6 +137,16 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
 
         self.assertNotIn("tool_use", exchange["messages"][1])
 
+    def test_search_tool_is_not_emitted(self):
+        mapped = unbound.map_copilot_tool(
+            'grep_search',
+            {'query': 'needle', 'includePattern': '**/*.py'},
+            'match.py:1',
+            mcp_servers={},
+        )
+
+        self.assertIsNone(mapped)
+
     def test_unmapped_native_tool_is_not_emitted(self):
         mapped = unbound.map_copilot_tool(
             'install_python_packages',

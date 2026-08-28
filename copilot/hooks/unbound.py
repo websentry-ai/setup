@@ -89,15 +89,6 @@ EDIT_TOOLS = {
     'copilot_multiReplaceString', 'copilot_editNotebook', 'copilot_editFiles',
 }
 
-TERMINAL_LIKE_TOOLS = {
-    'get_changed_files':     lambda a: 'git status',
-    'grep_search':           lambda a: f"grep {a.get('query') or ''} {a.get('includePattern') or ''}".strip(),
-    'grep':                  lambda a: f"grep {a.get('pattern') or a.get('query') or ''}".strip(),
-    'file_search':           lambda a: f"find {a.get('query') or ''}".strip(),
-    'glob':                  lambda a: f"find {a.get('pattern') or a.get('query') or ''}".strip(),
-    'rg':                    lambda a: f"grep {a.get('pattern') or a.get('query') or ''}".strip(),
-}
-
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
@@ -2091,8 +2082,6 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             # the allow-list isn't evaluated without a resolved server (fail-open).
             log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
 
-    if raw_tool in TERMINAL_LIKE_TOOLS:
-        return {}
     if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         cwd = event.get('cwd')
         mcp_servers = read_copilot_mcp_servers(cwd)
@@ -2854,11 +2843,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         return os.path.normpath(os.path.join(base, path)) if base else None
 
     project = None
-    if name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
-        if name in SHELL_TOOLS:
-            command = args.get('command') or args.get('input') or args.get('text') or ''
-        else:
-            command = TERMINAL_LIKE_TOOLS[name](args)
+    if name in SHELL_TOOLS:
+        command = args.get('command') or args.get('input') or args.get('text') or ''
         entry = {
             'type': 'afterShellExecution',
             'command': command,
