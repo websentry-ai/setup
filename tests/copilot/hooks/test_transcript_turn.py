@@ -65,7 +65,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(tool_use[0]["type"], "afterShellExecution")
         self.assertEqual(tool_use[0]["command"], "Get-ChildItem")
 
-    def test_write_powershell_is_reported_as_shell_input(self):
+    def test_write_powershell_is_not_emitted(self):
         path = _transcript([
             _entry("user.message", _id="u1", content="answer the prompt"),
             _entry("tool.execution_start", toolCallId="call-a", toolName="write_powershell",
@@ -78,9 +78,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
             path, SESSION)
 
-        tool_use = exchange["messages"][1]["tool_use"]
-        self.assertEqual(tool_use[0]["type"], "afterShellExecution")
-        self.assertEqual(tool_use[0]["command"], "yes")
+        self.assertNotIn("tool_use", exchange["messages"][1])
 
     def test_read_bash_is_not_emitted(self):
         path = _transcript([

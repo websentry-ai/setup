@@ -65,29 +65,10 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-SHELL_TOOLS = {
-    'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal',
-    'terminal', 'send_to_terminal', 'write_bash', 'write_powershell',
-}
-READ_TOOLS = {
-    'read_file', 'readFile', 'view', 'cat', 'list_dir', 'listDirectory',
-    'read_project_structure', 'read_notebook_cell_output',
-    'get_notebook_summary', 'copilot_getNotebookSummary', 'view_image',
-    'copilot_readFile', 'copilot_viewImage', 'copilot_listDirectory',
-    'copilot_readProjectStructure', 'copilot_readNotebookCellOutput',
-}
-WRITE_TOOLS = {
-    'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file',
-    'create_directory',
-    'copilot_createFile', 'copilot_createDirectory',
-}
-EDIT_TOOLS = {
-    'str_replace', 'edit', 'edit_file', 'editFile', 'edit_files', 'apply_patch',
-    'insert_edit', 'insert_edit_into_file', 'replace_string_in_file',
-    'multi_replace_string_in_file', 'edit_notebook_file', 'vscode_renameSymbol',
-    'copilot_applyPatch', 'copilot_insertEdit', 'copilot_replaceString',
-    'copilot_multiReplaceString', 'copilot_editNotebook', 'copilot_editFiles',
-}
+SHELL_TOOLS = {'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+READ_TOOLS = {'read_file', 'readFile', 'view', 'list_dir', 'listDirectory', 'cat'}
+WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
+EDIT_TOOLS = {'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit', 'replace_string_in_file'}
 
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
@@ -1835,8 +1816,7 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
-        # Shell tools key the payload differently: run_in_terminal/bash use
-        # `command`; send_to_terminal and some variants use `input`/`text`.
+        # Shell tools can use `command`, `input`, or `text`.
         # `value` holds an unparseable raw payload preserved by _normalize_arguments.
         # Try all so the policy check never sees an empty command for a real
         # shell execution.
@@ -2808,7 +2788,7 @@ def _normalize_arguments(arguments):
 def _extract_patch_target_path(args):
     """`apply_patch` carries the target file inside its patch `input` text rather
     than a filePath/path arg. Pull the first `*** {Add|Update|Delete} File: <path>`
-    so the edit is scored like insert_edit_into_file / create_file instead of being
+    so the edit is scored like other file edits instead of being
     dropped for want of a path. Returns '' when no path line is present."""
     text = args.get('input') or args.get('patch') or args.get('diff') or ''
     if not isinstance(text, str):
