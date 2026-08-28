@@ -692,6 +692,9 @@ def _copilot_hooks_config(script_path: Path) -> Dict:
         "PreToolUse": 600,
         "PostToolUse": 30,
         "Stop": 60,
+        # Copilot aliases this to its internal sessionEnd. It closes the gap where a
+        # session ends before a final Stop fires, leaving the last turn unreported.
+        "SessionEnd": 60,
     }
 
     hooks = {}
