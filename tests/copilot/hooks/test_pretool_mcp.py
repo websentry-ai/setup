@@ -257,6 +257,57 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertNotIn("mcp_server", captured.get("md", {}))
         self.assertFalse(self.is_block(ret))
 
+    def test_effectful_native_tool_reaches_command_policy_gateway(self):
+        captured = {}
+
+        def blocking_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "deny", "reason": "blocked by policy"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "install_python_packages",
+            "tool_input": {"packageNames": ["requests"]},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        with patch.object(unbound, "send_to_hook_api", blocking_gw):
+            ret = unbound.process_pre_tool_use(event, "K")
+
+        policy_data = captured["body"]["pre_tool_use_data"]
+        self.assertEqual(policy_data["tool_name"], "Bash")
+        self.assertIn("install_python_packages", policy_data["command"])
+        self.assertIn("requests", policy_data["command"])
+        self.assertTrue(self.is_block(ret))
+
+    def test_every_policy_effectful_tool_is_untracked_but_policy_checked(self):
+        self.assertLessEqual(
+            unbound.POLICY_EFFECTFUL_NATIVE_TOOLS,
+            unbound.UNTRACKED_NATIVE_TOOLS,
+        )
+
+        for raw_tool in sorted(unbound.POLICY_EFFECTFUL_NATIVE_TOOLS):
+            with self.subTest(raw_tool=raw_tool):
+                captured = {}
+
+                def capturing_gw(request_body, api_key):
+                    captured["body"] = request_body
+                    return {"decision": "allow"}
+
+                event = {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": raw_tool,
+                    "tool_input": {},
+                    "cwd": self.cwd,
+                    "session_id": "s",
+                }
+                with patch.object(unbound, "send_to_hook_api", capturing_gw):
+                    unbound.process_pre_tool_use(event, "K")
+
+                policy_data = captured["body"]["pre_tool_use_data"]
+                self.assertEqual(policy_data["tool_name"], "Bash")
+                self.assertIn(raw_tool, policy_data["command"])
+
 
 class TestStringToolArgs(ProcessPreToolUseBase):
     """VS Code sends toolArgs as a JSON string. The command must still reach the policy

@@ -156,6 +156,33 @@ UNTRACKED_NATIVE_TOOLS = {
     'screenshot_page', 'run_playwright_code', 'click_element', 'hover_element',
     'type_in_page', 'handle_dialog', 'drag_element',
 }
+
+# These tools stay out of Stop transcript analytics, but their PreToolUse calls
+# can change local state, execute code, or contact external systems. Represent
+# the invocation as a command only at the policy boundary so existing terminal
+# deny/approval policies can evaluate it without creating a new analytics type.
+POLICY_EFFECTFUL_NATIVE_TOOLS = frozenset({
+    # network access
+    'web_fetch', 'web_search', 'fetch_webpage', 'github_repo',
+    'github_text_search', 'vscode_searchExtensions_internal',
+    'copilot_fetchWebPage', 'copilot_githubRepo',
+    # process control
+    'kill_terminal', 'stop_powershell', 'stop_bash',
+    # workspace, extension, task, and notebook changes/execution
+    'create_new_workspace', 'create_new_jupyter_notebook', 'install_extension',
+    'run_notebook_cell', 'create_and_run_task', 'runTests',
+    'copilot_createNewWorkspace', 'copilot_createNewJupyterNotebook',
+    'copilot_runNotebookCell', 'copilot_installExtension',
+    'copilot_createAndRunTask', 'copilot_runTests1',
+    'configure_notebook', 'configure_notebooks', 'notebook_install_packages',
+    'configure_python_notebook', 'configure_non_python_notebook',
+    'restart_notebook_kernel', 'configure_python_environment',
+    'install_python_packages',
+    # browser actions; reads can still contact an external origin
+    'open_browser_page', 'navigate_page', 'read_page', 'screenshot_page',
+    'run_playwright_code', 'click_element', 'hover_element', 'type_in_page',
+    'handle_dialog', 'drag_element',
+})
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
@@ -1921,6 +1948,12 @@ def extract_command_for_pretool(canonical, tool_input):
     return ''
 
 
+def _effectful_native_policy_command(raw_tool, tool_input):
+    """Serialize a native host action for the existing command-policy boundary."""
+    payload = json.dumps(tool_input, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+    return f'{raw_tool} {payload}'
+
+
 def send_to_hook_api(request_body, api_key):
     """Send request to /v1/hooks/pretool endpoint."""
     if not api_key:
@@ -2159,29 +2192,33 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         mcp_servers = read_copilot_mcp_servers(cwd)
         mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
         if mcp_server is None:
-            # A bare (non-mcp__) tool can only be resolved against the MCP config.
-            # If no config was readable, a genuine MCP call can't be identified
-            # and would slip the allow-list — surface that distinctly so the
-            # potential bypass is observable rather than silent. Skip known-benign
-            # native tools so the log isn't noisy.
-            if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
-                if not mcp_servers and not raw_tool_lower.startswith('mcp__'):
-                    log_error(
-                        f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
-                        'mcp_config',
-                    )
-                else:
-                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
-            return {}
-        is_mcp = True
-        canonical = f"mcp__{mcp_server}__{mcp_tool}"
-        # Names only — never args/config (those can carry secrets).
-        log_error(
-            f"copilot mcp detected session={session_id} tool={raw_tool} "
-            f"server={mcp_server} mcp_tool={mcp_tool} "
-            f"config={'yes' if mcp_server_config else 'no'}",
-            'mcp_match',
-        )
+            if raw_tool in POLICY_EFFECTFUL_NATIVE_TOOLS:
+                canonical = 'Bash'
+            else:
+                # A bare (non-mcp__) tool can only be resolved against the MCP config.
+                # If no config was readable, a genuine MCP call can't be identified
+                # and would slip the allow-list — surface that distinctly so the
+                # potential bypass is observable rather than silent. Skip known-benign
+                # native tools so the log isn't noisy.
+                if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
+                    if not mcp_servers and not raw_tool_lower.startswith('mcp__'):
+                        log_error(
+                            f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
+                            'mcp_config',
+                        )
+                    else:
+                        log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+                return {}
+        else:
+            is_mcp = True
+            canonical = f"mcp__{mcp_server}__{mcp_tool}"
+            # Names only — never args/config (those can carry secrets).
+            log_error(
+                f"copilot mcp detected session={session_id} tool={raw_tool} "
+                f"server={mcp_server} mcp_tool={mcp_tool} "
+                f"config={'yes' if mcp_server_config else 'no'}",
+                'mcp_match',
+            )
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -2195,7 +2232,10 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         return {}
 
     model = get_session_start_model(session_id) or 'auto'
-    command = extract_command_for_pretool(canonical, tool_input)
+    if raw_tool in POLICY_EFFECTFUL_NATIVE_TOOLS and not is_mcp:
+        command = _effectful_native_policy_command(raw_tool, tool_input)
+    else:
+        command = extract_command_for_pretool(canonical, tool_input)
 
     recent_user_prompts = get_recent_user_prompts_for_session(
         session_id, PRETOOL_USER_MESSAGES_LIMIT

@@ -138,6 +138,16 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
 
         self.assertNotIn("tool_use", exchange["messages"][1])
 
+    def test_effectful_native_tool_is_policy_only_not_analytics(self):
+        mapped = unbound.map_copilot_tool(
+            'install_python_packages',
+            {'packageNames': ['requests']},
+            'installed',
+            mcp_servers={},
+        )
+
+        self.assertIsNone(mapped)
+
     def test_unknown_copilot_tool_is_not_reported_as_mcp(self):
         path = _transcript([
             _entry("user.message", _id="u1", content="use it"),
