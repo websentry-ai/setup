@@ -755,6 +755,24 @@ def get_turn_start_timestamp_for_session(session_id):
     return turn_start or completed_start
 
 
+def _transcript_path_for_session(event):
+    """SessionEnd carries sessionId, timestamp, cwd and reason but no transcript path, so
+    recover it from the newest event of this session that had one. Matched by
+    stop_session_key, the identity the window floor and log cleanup also use, so a row that
+    omits session_id is not passed over."""
+    key = stop_session_key(event)
+    if not key:
+        return None
+    for log in reversed(load_existing_logs()):
+        logged = log.get('event', {})
+        if stop_session_key(logged) != key:
+            continue
+        path = logged.get('transcript_path')
+        if isinstance(path, str) and path:
+            return path
+    return None
+
+
 def get_previous_stop_timestamp_for_session(event):
     """Close of the previous turn, which is the floor of this turn's usage window. The Stop
     being handled is already logged, so the one before it is that floor. Keyed by
@@ -767,7 +785,11 @@ def get_previous_stop_timestamp_for_session(event):
     stops = [log.get('timestamp') for log in load_existing_logs()
              if log.get('event', {}).get('hook_event_name') == 'Stop'
              and stop_session_key(log.get('event', {})) == key]
-    return stops[-2] if len(stops) > 1 else None
+    # A Stop is already logged by the time it is handled, so its own row is the last one.
+    # SessionEnd is a different event, so every Stop in the log precedes it.
+    if event.get('hook_event_name') == 'Stop':
+        return stops[-2] if len(stops) > 1 else None
+    return stops[-1] if stops else None
 
 
 def _build_user_prompt_payload(recent_user_prompts):
@@ -3783,8 +3805,16 @@ def main():
         }
         append_to_audit_log(log_entry)
 
-        if event_name == 'Stop':
-            session_id = event.get('session_id')
+        if event_name in ('Stop', 'SessionEnd'):
+            # Copilot sends the conversation id under either spelling and SessionEnd uses
+            # the camelCase one. The turn-start and session-model lookups key on it, so
+            # reading only the snake_case name would cost the exchange its start time and
+            # its model attribution.
+            session_id = event.get('session_id') or event.get('sessionId')
+            if event_name == 'SessionEnd' and not event.get('transcript_path'):
+                recovered = _transcript_path_for_session(event)
+                if recovered:
+                    event = dict(event, transcript_path=recovered)
             # Watermark key mirrors the exchange's session fallback, so get/record stay
             # consistent even when the Stop payload omits session_id.
             wm_key = stop_session_key(event)
@@ -3808,6 +3838,10 @@ def main():
             # Send only when there is something new -- new tool calls, new assistant text,
             # or usage carried over from an earlier turn -- so a pure replay Stop is a
             # no-op, but a Stop that appended new text (even with no new tools) is sent.
+            # The same gate makes SessionEnd a no-op unless the session ended with a turn
+            # that no Stop ever reported; a turn already sent is left alone, because usage
+            # is part of the backend's request id and re-sending would add a row, not
+            # complete the existing one.
             if exchange and (forwarded_now or text_sig != last_text_sig or usage):
                 # Turn boundaries from event-fire times
                 request_initialized = get_turn_start_timestamp_for_session(session_id)

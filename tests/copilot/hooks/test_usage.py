@@ -129,7 +129,9 @@ class TestPreviousStop(unittest.TestCase):
             out.append({"timestamp": ts, "event": event})
         return out
 
-    def _previous(self, logs, event):
+    def _previous(self, logs, event, name="Stop"):
+        # the handler's own event is already logged, so a Stop skips its own row
+        event = dict(event, hook_event_name=name) if name else event
         with patch.object(unbound, "load_existing_logs", lambda: logs):
             return unbound.get_previous_stop_timestamp_for_session(event)
 
@@ -157,6 +159,18 @@ class TestPreviousStop(unittest.TestCase):
 
     def test_no_identity_at_all_has_no_floor(self):
         self.assertIsNone(self._previous(self._logs(("Stop", "t1", None, None)), {}))
+
+    def test_session_end_floors_on_the_last_stop_not_the_one_before(self):
+        # SessionEnd is a different event, so every Stop in the log precedes it
+        logs = self._logs(("Stop", "t1", SESSION, self.CLI), ("Stop", "t2", SESSION, self.CLI))
+        self.assertEqual(self._previous(logs, {"session_id": SESSION}, name="SessionEnd"), "t2")
+
+    def test_session_end_with_a_single_stop_still_has_a_floor(self):
+        logs = self._logs(("Stop", "t1", SESSION, self.CLI))
+        self.assertEqual(self._previous(logs, {"session_id": SESSION}, name="SessionEnd"), "t1")
+
+    def test_session_end_with_no_stops_has_no_floor(self):
+        self.assertIsNone(self._previous([], {"session_id": SESSION}, name="SessionEnd"))
 
     def test_a_corrupt_log_row_does_not_break_the_lookup(self):
         # the audit log is user-writable; a non-string path here would otherwise raise
@@ -612,7 +626,7 @@ class TestCleanupKeepsTheUsageFloor(unittest.TestCase):
         kept = self._run_cleanup(logs)
         with patch.object(unbound, "load_existing_logs", lambda: kept):
             floor = unbound.get_previous_stop_timestamp_for_session(
-                {"transcript_path": self.CLI})
+                {"transcript_path": self.CLI, "hook_event_name": "Stop"})
         self.assertEqual(floor, "t2")
 
 
