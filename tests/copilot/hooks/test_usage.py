@@ -454,3 +454,99 @@ class TestForwardedStateWatermark(unittest.TestCase):
         with patch.object(unbound, "load_existing_logs", lambda: []):
             _, _, _, index = unbound.get_forwarded_state(SESSION)
         self.assertEqual(index, 0)
+
+
+class TestReplayStopHasNothingToAttachUsageTo(unittest.TestCase):
+    """Usage is resolved before the send gate, so it is worth pinning why that cannot
+    produce a duplicate row: a Stop with nothing new builds no exchange at all."""
+
+    def _transcript(self, tmpdir):
+        session_dir = Path(tmpdir) / SESSION
+        session_dir.mkdir(parents=True)
+        path = session_dir / "events.jsonl"
+        path.write_text("\n".join(json.dumps(e) for e in [
+            {"type": "session.start", "data": {"sessionId": SESSION},
+             "timestamp": "2026-08-28T05:00:00Z"},
+            {"id": "u1", "type": "user.message", "data": {"content": "hello"},
+             "timestamp": "2026-08-28T05:00:01Z"},
+            {"id": "a1", "type": "assistant.message",
+             "data": {"content": "hi", "turnId": "0"},
+             "timestamp": "2026-08-28T05:00:02Z"},
+        ]), encoding="utf-8")
+        return str(path)
+
+    def test_a_replayed_stop_builds_no_exchange(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = self._transcript(tmpdir)
+            first, tools, sig, prompts = unbound.build_exchange_from_transcript(
+                transcript, SESSION, cwd=tmpdir)
+            self.assertIsNotNone(first)
+            replay, new_tools, _sig, _prompts = unbound.build_exchange_from_transcript(
+                transcript, SESSION, cwd=tmpdir,
+                already_forwarded=tools, already_prompted=prompts)
+        # nothing new means nothing to send, so deferred usage cannot fabricate a row
+        self.assertIsNone(replay)
+        self.assertEqual(len(new_tools), 0)
+
+
+class TestSafePathComponent(unittest.TestCase):
+    """Session ids are joined into a path, so they are constrained to a shape that cannot
+    name anything outside chatSessions/. The charset admits no separator, drive letter or
+    dot-only name, which is why no resolve() check follows the join."""
+
+    def test_real_session_id_shapes_are_accepted(self):
+        for real in ("a805e63b-1737-4b9f-8c22-fdc17a9dbe0e",
+                     "cfa94ccc-2d93-4bfc-b1ac-724dac0c30de",
+                     "request_a8bb9a76-bb6f-487b-8e66-695863861d96",
+                     "abc123", "a" * 128):
+            self.assertTrue(unbound._safe_path_component(real), real)
+
+    def test_traversal_and_absolute_shapes_are_rejected(self):
+        for probe in ("../../../etc/passwd", "/etc/passwd", "..", ".", "",
+                      "x/../../y", "C:\\Windows\\win.ini", "a" * 129,
+                      "has space", "semi;colon", None, 12345, True, b"bytes"):
+            self.assertFalse(unbound._safe_path_component(probe), repr(probe))
+
+    def test_windows_reserved_device_names_are_rejected(self):
+        # these resolve to devices on Windows wherever they appear, so opening one would
+        # attach to the device and hang rather than miss a file
+        for probe in ("CON", "con", "NUL", "PRN", "AUX", "COM1", "com9", "LPT1", "lpt9",
+                      "CON.jsonl", "nul.txt"):
+            self.assertFalse(unbound._safe_path_component(probe), probe)
+
+    def test_names_that_merely_look_reserved_are_kept(self):
+        for probe in ("console", "con1", "com", "com10", "nullable", "lpt", "aux2"):
+            self.assertTrue(unbound._safe_path_component(probe), probe)
+
+    def test_a_rejected_id_yields_no_store_path(self):
+        self.assertIsNone(unbound._vscode_store_path(
+            "/ws/hash/GitHub.copilot-chat/transcripts/x.jsonl", "../../../etc/passwd"))
+
+
+class TestCappedLines(unittest.TestCase):
+    """A line-count cap alone does not bound memory: one oversized line is still read whole
+    before the count is checked, so the reader caps bytes per line too."""
+
+    def _lines(self, blob, max_lines=50000, max_bytes=1024):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "j.jsonl"
+            path.write_text(blob, encoding="utf-8")
+            with open(path, encoding="utf-8") as handle:
+                return [line.strip() for line in
+                        unbound._capped_lines(handle, max_lines, max_bytes)]
+
+    def test_an_oversized_line_is_dropped_and_the_rest_survive(self):
+        blob = "a\n" + ("X" * 5000) + "\n" + "b\n" + "c\n"
+        self.assertEqual(self._lines(blob), ["a", "b", "c"])
+
+    def test_the_line_count_cap_still_applies(self):
+        self.assertEqual(self._lines("a\nb\nc\nd\n", max_lines=2), ["a", "b"])
+
+    def test_a_trailing_line_without_a_newline_is_kept(self):
+        self.assertEqual(self._lines("a\nb"), ["a", "b"])
+
+    def test_an_oversized_final_line_without_a_newline_is_dropped(self):
+        self.assertEqual(self._lines("a\n" + "X" * 5000), ["a"])
+
+    def test_an_empty_file_yields_nothing(self):
+        self.assertEqual(self._lines(""), [])

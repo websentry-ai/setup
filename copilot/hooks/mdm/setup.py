@@ -836,11 +836,36 @@ _BACKFILL_USAGE_FIELDS = ('input_tokens', 'output_tokens',
 # file directly inside chatSessions/ and cannot escape it by construction.
 _BACKFILL_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
                                     'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+# On Windows these resolve to devices wherever they appear, so opening one would attach to
+# the device and hang the run rather than miss a file.
+_BACKFILL_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
+                                            + ['com%d' % n for n in range(1, 10)]
+                                            + ['lpt%d' % n for n in range(1, 10)])
+_BACKFILL_MAX_LINE_BYTES = 1 << 20
 
 
 def _backfill_safe_path_component(value) -> bool:
     return (isinstance(value, str) and 1 <= len(value) <= 128
-            and not set(value) - _BACKFILL_SAFE_ID_CHARS and value not in ('.', '..'))
+            and not set(value) - _BACKFILL_SAFE_ID_CHARS and value not in ('.', '..')
+            and value.split('.')[0].lower() not in _BACKFILL_RESERVED_DEVICE_NAMES)
+
+
+def _backfill_capped_lines(handle, max_lines, max_bytes):
+    """Lines from an untrusted journal, bounded in count and in size. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen."""
+    count = 0
+    while count < max_lines:
+        line = handle.readline(max_bytes)
+        if not line:
+            return
+        count += 1
+        if len(line) >= max_bytes and not line.endswith('\n'):
+            while True:  # drop the remainder of an oversize line rather than buffer it
+                rest = handle.readline(max_bytes)
+                if not rest or rest.endswith('\n'):
+                    break
+            continue
+        yield line
 
 
 def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
@@ -910,9 +935,8 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
 
     try:
         with open(store, 'r', encoding='utf-8') as handle:
-            for lineno, line in enumerate(handle):
-                if lineno >= BACKFILL_MAX_LINES_PER_FILE:
-                    break
+            for line in _backfill_capped_lines(handle, BACKFILL_MAX_LINES_PER_FILE,
+                                               _BACKFILL_MAX_LINE_BYTES):
                 line = line.strip()
                 if not line:
                     continue

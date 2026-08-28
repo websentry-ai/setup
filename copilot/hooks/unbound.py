@@ -2930,15 +2930,40 @@ _COPILOT_STORE = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot'
 _VSCODE_SETTLE_SECONDS = 10.0
 _VSCODE_POLL_SECONDS = 0.25
 _VSCODE_MAX_LINES = 50000
+_VSCODE_MAX_LINE_BYTES = 1 << 20
 # No separator, drive letter or dot-only name can appear, so an id can only ever name a
 # file directly inside chatSessions/ and cannot escape it by construction.
 _SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
                            'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+# On Windows these resolve to devices wherever they appear, so opening one would attach to
+# the device and hang the hook rather than miss a file.
+_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
+                                   + ['com%d' % n for n in range(1, 10)]
+                                   + ['lpt%d' % n for n in range(1, 10)])
 
 
 def _safe_path_component(value):
     return (isinstance(value, str) and 1 <= len(value) <= 128
-            and not set(value) - _SAFE_ID_CHARS and value not in ('.', '..'))
+            and not set(value) - _SAFE_ID_CHARS and value not in ('.', '..')
+            and value.split('.')[0].lower() not in _RESERVED_DEVICE_NAMES)
+
+
+def _capped_lines(handle, max_lines, max_bytes):
+    """Lines from an untrusted journal, bounded in count and in size. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen."""
+    count = 0
+    while count < max_lines:
+        line = handle.readline(max_bytes)
+        if not line:
+            return
+        count += 1
+        if len(line) >= max_bytes and not line.endswith('\n'):
+            while True:  # drop the remainder of an oversize line rather than buffer it
+                rest = handle.readline(max_bytes)
+                if not rest or rest.endswith('\n'):
+                    break
+            continue
+        yield line
 
 
 def _epoch(value):
@@ -3025,9 +3050,7 @@ def _vscode_requests(path):
     next_index = 0
     try:
         with open(path, 'r', encoding='utf-8') as handle:
-            for lineno, line in enumerate(handle):
-                if lineno >= _VSCODE_MAX_LINES:
-                    break
+            for line in _capped_lines(handle, _VSCODE_MAX_LINES, _VSCODE_MAX_LINE_BYTES):
                 line = line.strip()
                 if not line:
                     continue
@@ -3754,9 +3777,10 @@ def main():
                 already_forwarded=already_forwarded,
                 already_prompted=already_prompted,
             )
-            # Resolved before the send gate because usage is a reason to send in its own
-            # right: a turn whose tokens landed too late for its own Stop is reported here,
-            # and gating it behind new text or tools would strand it on a quiet Stop.
+            # Resolved before the send gate so a turn whose tokens landed too late for its
+            # own Stop can ride this one. A Stop with nothing new builds no exchange at all,
+            # so there is never anything to attach deferred usage to on a pure replay: it
+            # waits for the next real turn, and a session that ends first loses it.
             usage = None
             if exchange:
                 usage, usage_index = get_turn_usage(
