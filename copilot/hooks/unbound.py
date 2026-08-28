@@ -3806,7 +3806,11 @@ def main():
         append_to_audit_log(log_entry)
 
         if event_name in ('Stop', 'SessionEnd'):
-            session_id = event.get('session_id')
+            # Copilot sends the conversation id under either spelling and SessionEnd uses
+            # the camelCase one. The turn-start and session-model lookups key on it, so
+            # reading only the snake_case name would cost the exchange its start time and
+            # its model attribution.
+            session_id = event.get('session_id') or event.get('sessionId')
             if event_name == 'SessionEnd' and not event.get('transcript_path'):
                 recovered = _transcript_path_for_session(event)
                 if recovered:

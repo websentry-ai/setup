@@ -98,3 +98,33 @@ class TestTranscriptPathRecovery(unittest.TestCase):
         logs = [self._log("Stop", SESSION, CLI)]
         with patch.object(unbound, "load_existing_logs", lambda: logs):
             self.assertIsNone(unbound._transcript_path_for_session({}))
+
+
+class TestBothSessionIdSpellings(unittest.TestCase):
+    """Copilot sends the conversation id under either spelling and sessionEnd uses the
+    camelCase one. The turn-start and session-model lookups key on it, so reading only the
+    snake_case name would cost the exchange its start time and its model attribution."""
+
+    SNAKE = {"hook_event_name": "SessionEnd", "session_id": SESSION}
+    CAMEL = {"hook_event_name": "SessionEnd", "sessionId": SESSION}
+
+    def test_the_watermark_key_is_the_same_either_way(self):
+        self.assertEqual(unbound.stop_session_key(self.SNAKE),
+                         unbound.stop_session_key(self.CAMEL))
+        self.assertEqual(unbound.stop_session_key(self.CAMEL), SESSION)
+
+    def test_transcript_recovery_works_from_the_camel_case_payload(self):
+        logs = [{"timestamp": "t", "event": {"hook_event_name": "Stop",
+                                             "session_id": SESSION,
+                                             "transcript_path": CLI}}]
+        with patch.object(unbound, "load_existing_logs", lambda: logs):
+            self.assertEqual(unbound._transcript_path_for_session(self.CAMEL), CLI)
+            self.assertEqual(unbound._transcript_path_for_session(self.SNAKE), CLI)
+
+    def test_the_turn_start_lookup_resolves_for_the_normalized_id(self):
+        logs = [{"timestamp": "t1", "event": {"hook_event_name": "UserPromptSubmit",
+                                              "session_id": SESSION}}]
+        with patch.object(unbound, "load_existing_logs", lambda: logs):
+            resolved = self.CAMEL.get("session_id") or self.CAMEL.get("sessionId")
+            self.assertEqual(unbound.get_turn_start_timestamp_for_session(resolved), "t1")
+            self.assertIsNone(unbound.get_turn_start_timestamp_for_session(None))
