@@ -1,0 +1,670 @@
+"""
+Tests for local token-usage capture in copilot/hooks/unbound.py.
+
+Copilot forwards no usage, so the hook reads it from the store behind each surface.
+Covers:
+  - _cli_turn_usage (CLI sqlite store, cache-inclusive input)
+  - _vscode_turn_usage (VS Code append-only chat journal)
+  - get_previous_stop_timestamp_for_session / get_turn_usage (windowing, guards)
+"""
+
+import importlib.util
+import json
+import os
+import sqlite3
+import tempfile
+import unittest
+from pathlib import Path, PureWindowsPath
+from unittest.mock import patch
+
+from tests.conftest import tool_module
+
+unbound = tool_module("copilot/hooks")
+
+SESSION = "sess-usage"
+FLOOR = "2026-08-28T10:37:00.000+05:30"   # 05:07:00Z, as the audit log writes it
+CEILING = "2026-08-28T10:40:00.000+05:30"
+BEFORE = "2026-08-28T05:06:00.000Z"
+INSIDE = "2026-08-28T05:08:00.000Z"
+AFTER = "2026-08-28T05:20:00.000Z"
+
+SCHEMA = """CREATE TABLE assistant_usage_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, turn_index INTEGER, model TEXT,
+    input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER, reasoning_tokens INTEGER, created_at TEXT)"""
+
+
+def _store(rows, tmpdir):
+    path = Path(tmpdir) / "session-store.db"
+    conn = sqlite3.connect(str(path))
+    conn.execute(SCHEMA)
+    conn.executemany(
+        "INSERT INTO assistant_usage_events (session_id, input_tokens, output_tokens,"
+        " cache_read_tokens, cache_write_tokens, created_at) VALUES (?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _cli_usage(rows, since=None, until=None, session=SESSION):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with patch.object(unbound, "_COPILOT_STORE", _store(rows, tmpdir)):
+            return unbound._cli_turn_usage(session, since, until or float("inf"))
+
+
+def _journal(tmpdir, session, lines):
+    root = Path(tmpdir) / "ws" / "hash"
+    (root / "chatSessions").mkdir(parents=True)
+    (root / "GitHub.copilot-chat" / "transcripts").mkdir(parents=True)
+    (root / "chatSessions" / (session + ".jsonl")).write_text(
+        "\n".join(json.dumps(line) for line in lines), encoding="utf-8")
+    transcript = root / "GitHub.copilot-chat" / "transcripts" / (session + ".jsonl")
+    transcript.write_text("", encoding="utf-8")
+    return str(transcript)
+
+
+def _request(ts_ms, prompt=None, completion=None):
+    obj = {"timestamp": ts_ms}
+    if prompt is not None:
+        obj["promptTokens"] = prompt
+    if completion is not None:
+        obj["completionTokens"] = completion
+    return obj
+
+
+class TestCliUsage(unittest.TestCase):
+    def test_cache_tiers_come_out_of_input(self):
+        # 26941 = 10 fresh + 0 read + 26931 write, the shape Copilot actually records
+        usage = _cli_usage([(SESSION, 26941, 274, 0, 26931, INSIDE)])
+        self.assertEqual(usage, {"input_tokens": 10, "output_tokens": 274,
+                                 "cache_read_input_tokens": 0,
+                                 "cache_creation_input_tokens": 26931})
+
+    def test_window_excludes_the_floor_and_includes_the_ceiling(self):
+        rows = [(SESSION, 1000, 10, 0, 0, BEFORE), (SESSION, 2000, 20, 0, 0, INSIDE),
+                (SESSION, 4000, 40, 0, 0, AFTER)]
+        usage = _cli_usage(rows, unbound._epoch(FLOOR), unbound._epoch(CEILING))
+        self.assertEqual(usage["input_tokens"], 2000)
+        self.assertEqual(usage["output_tokens"], 20)
+
+    def test_no_floor_takes_everything_up_to_the_ceiling(self):
+        rows = [(SESSION, 1000, 10, 0, 0, BEFORE), (SESSION, 2000, 20, 0, 0, INSIDE)]
+        self.assertEqual(_cli_usage(rows, None, unbound._epoch(CEILING))["input_tokens"], 3000)
+
+    def test_other_sessions_are_not_counted(self):
+        rows = [("other", 5000, 50, 0, 0, INSIDE), (SESSION, 7, 1, 0, 0, INSIDE)]
+        self.assertEqual(_cli_usage(rows)["input_tokens"], 7)
+
+    def test_input_never_goes_negative(self):
+        self.assertEqual(_cli_usage([(SESSION, 100, 5, 900, 900, INSIDE)])["input_tokens"], 0)
+
+    def test_missing_store_returns_none(self):
+        with patch.object(unbound, "_COPILOT_STORE", Path("/nonexistent/session-store.db")):
+            self.assertIsNone(unbound._cli_turn_usage(SESSION, None, float("inf")))
+
+    def test_store_without_the_table_returns_none(self):
+        # older Copilot builds predate assistant_usage_events
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "session-store.db"
+            sqlite3.connect(str(path)).close()
+            with patch.object(unbound, "_COPILOT_STORE", path):
+                self.assertIsNone(unbound._cli_turn_usage(SESSION, None, float("inf")))
+
+
+class TestPreviousStop(unittest.TestCase):
+    """The floor is keyed by transcript path, so a Stop that omits session_id still
+    matches its own earlier Stops instead of losing the floor and recounting."""
+
+    CLI = "/h/.copilot/session-state/" + SESSION + "/events.jsonl"
+
+    @staticmethod
+    def _logs(*events):
+        out = []
+        for name, ts, sess, path in events:
+            event = {"hook_event_name": name}
+            if sess:
+                event["session_id"] = sess
+            if path:
+                event["transcript_path"] = path
+            out.append({"timestamp": ts, "event": event})
+        return out
+
+    def _previous(self, logs, event, name="Stop"):
+        # the handler's own event is already logged, so a Stop skips its own row
+        event = dict(event, hook_event_name=name) if name else event
+        with patch.object(unbound, "load_existing_logs", lambda: logs):
+            return unbound.get_previous_stop_timestamp_for_session(event)
+
+    def test_the_stop_before_the_one_being_handled(self):
+        logs = self._logs(("Stop", "t1", SESSION, None), ("Stop", "t2", SESSION, None))
+        self.assertEqual(self._previous(logs, {"session_id": SESSION}), "t1")
+
+    def test_first_stop_of_a_session_has_no_floor(self):
+        logs = self._logs(("Stop", "t1", SESSION, None))
+        self.assertIsNone(self._previous(logs, {"session_id": SESSION}))
+
+    def test_other_sessions_are_ignored(self):
+        logs = self._logs(("Stop", "t1", "other", None), ("Stop", "t2", SESSION, None))
+        self.assertIsNone(self._previous(logs, {"session_id": SESSION}))
+
+    def test_a_stop_without_session_id_still_finds_its_floor(self):
+        # the recount bug: keyed on session_id this matched nothing and dropped the floor
+        logs = self._logs(("Stop", "t1", SESSION, self.CLI), ("Stop", "t2", None, self.CLI))
+        self.assertEqual(self._previous(logs, {"transcript_path": self.CLI}), "t1")
+
+    def test_transcript_path_matches_across_stops_that_disagree_on_session_id(self):
+        logs = self._logs(("Stop", "t1", None, self.CLI), ("Stop", "t2", SESSION, self.CLI))
+        self.assertEqual(self._previous(logs, {"transcript_path": self.CLI,
+                                               "session_id": SESSION}), "t1")
+
+    def test_no_identity_at_all_has_no_floor(self):
+        self.assertIsNone(self._previous(self._logs(("Stop", "t1", None, None)), {}))
+
+    def test_session_end_floors_on_the_last_stop_not_the_one_before(self):
+        # SessionEnd is a different event, so every Stop in the log precedes it
+        logs = self._logs(("Stop", "t1", SESSION, self.CLI), ("Stop", "t2", SESSION, self.CLI))
+        self.assertEqual(self._previous(logs, {"session_id": SESSION}, name="SessionEnd"), "t2")
+
+    def test_session_end_with_a_single_stop_still_has_a_floor(self):
+        logs = self._logs(("Stop", "t1", SESSION, self.CLI))
+        self.assertEqual(self._previous(logs, {"session_id": SESSION}, name="SessionEnd"), "t1")
+
+    def test_session_end_with_no_stops_has_no_floor(self):
+        self.assertIsNone(self._previous([], {"session_id": SESSION}, name="SessionEnd"))
+
+    def test_a_corrupt_log_row_does_not_break_the_lookup(self):
+        # the audit log is user-writable; a non-string path here would otherwise raise
+        # out of the Stop handler and drop the whole exchange, not just its usage
+        logs = (self._logs(("Stop", "t1", None, self.CLI))
+                + [{"timestamp": "t2", "event": {"hook_event_name": "Stop",
+                                                 "transcript_path": {"corrupt": 1}}},
+                   {"timestamp": "t3", "event": {"hook_event_name": "Stop",
+                                                 "transcript_path": 12345}}]
+                + self._logs(("Stop", "t4", None, self.CLI)))
+        self.assertEqual(self._previous(logs, {"transcript_path": self.CLI}), "t1")
+
+    def test_stop_session_key_is_total_for_any_payload(self):
+        for payload in ({"transcript_path": {"corrupt": 1}}, {"transcript_path": 12345},
+                        {"transcript_path": None}, {}):
+            self.assertIsNone(unbound.stop_session_key(payload))
+
+
+class TestEpoch(unittest.TestCase):
+    def test_local_offset_and_zulu_compare_equal(self):
+        self.assertEqual(unbound._epoch("2026-08-28T10:37:00.000+05:30"),
+                         unbound._epoch("2026-08-28T05:07:00.000Z"))
+
+    def test_epoch_millis_are_accepted(self):
+        self.assertEqual(unbound._epoch(1787893680000), 1787893680.0)
+
+    def test_garbage_is_none(self):
+        for value in (None, "", "not-a-date", True):
+            self.assertIsNone(unbound._epoch(value))
+
+
+class TestWindows(unittest.TestCase):
+    """The store paths must resolve on Windows too. `Path` is `WindowsPath` there, so it
+    accepts both separators; hook payloads use '/' even on Windows."""
+
+    WS = "C:/Users/dev/AppData/Roaming/Code/User/workspaceStorage/abc123"
+
+    def _derive(self, transcript):
+        # mirrors _vscode_store_path's relative walk, under Windows path semantics
+        parent = PureWindowsPath(transcript).parent
+        if parent.name != "transcripts":
+            return None
+        return parent.parent.parent / "chatSessions" / (SESSION + ".jsonl")
+
+    def test_forward_slash_payload_resolves_the_sibling_store(self):
+        got = self._derive(self.WS + "/GitHub.copilot-chat/transcripts/" + SESSION + ".jsonl")
+        self.assertEqual(got, PureWindowsPath(self.WS) / "chatSessions" / (SESSION + ".jsonl"))
+
+    def test_backslash_payload_resolves_the_same_store(self):
+        transcript = (self.WS + "/GitHub.copilot-chat/transcripts/" + SESSION + ".jsonl").replace("/", "\\")
+        got = self._derive(transcript)
+        self.assertEqual(got, PureWindowsPath(self.WS) / "chatSessions" / (SESSION + ".jsonl"))
+
+    def test_cli_transcript_is_recognised_by_stem(self):
+        self.assertEqual(PureWindowsPath("C:/Users/dev/.copilot/session-state/s/events.jsonl").stem,
+                         "events")
+
+
+class TestCopilotHome(unittest.TestCase):
+    @staticmethod
+    def _store_path(env):
+        with patch.dict(os.environ, env, clear=False):
+            spec = importlib.util.spec_from_file_location(
+                "unb_home_probe", Path(unbound.__file__))
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module._COPILOT_STORE
+
+    def test_copilot_home_relocates_the_store(self):
+        # COPILOT_HOME replaces the whole ~/.copilot path
+        self.assertEqual(self._store_path({"COPILOT_HOME": "/tmp/custom-copilot"}),
+                         Path("/tmp/custom-copilot/session-store.db"))
+
+    def test_default_is_the_home_dotfile_dir(self):
+        env = {k: v for k, v in os.environ.items() if k != "COPILOT_HOME"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(self._store_path({}), Path.home() / ".copilot" / "session-store.db")
+
+
+def _request(ts_ms=1787893680000, prompt=None, completion=None, elapsed=1234):
+    """A finished request. VS Code writes elapsedMs last, after the final counts."""
+    obj = {"timestamp": ts_ms}
+    if prompt is not None:
+        obj["promptTokens"] = prompt
+    if completion is not None:
+        obj["completionTokens"] = completion
+    if elapsed is not None:
+        obj["elapsedMs"] = elapsed
+    return obj
+
+
+class TestVscodeUsage(unittest.TestCase):
+    """Index-driven: report contiguous finished requests, leave the rest for a later Stop."""
+
+    def _usage(self, lines, start_index=0):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, lines)
+            usage, nxt, _pending = unbound._vscode_turn_usage(transcript, SESSION, start_index)
+            return usage, nxt
+
+    def _usage_pending(self, lines, start_index=0):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, lines)
+            return unbound._vscode_turn_usage(transcript, SESSION, start_index)[2]
+
+    def test_appends_then_patches_resolve_to_the_last_write(self):
+        usage, nxt = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request()]},
+            {"kind": 2, "k": ["requests", "0", "promptTokens"], "v": 40355},
+            {"kind": 2, "k": ["requests", "0", "promptTokens"], "v": 40669},
+            {"kind": 2, "k": ["requests", "0", "completionTokens"], "v": 248},
+        ])
+        self.assertEqual(usage["input_tokens"], 40669)
+        self.assertEqual(nxt, 1)
+
+    def test_unfinished_request_is_left_for_a_later_stop(self):
+        # idx1 has no tokens yet: report idx0 only, and do not advance past idx1
+        usage, nxt = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5), _request()]},
+        ])
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(nxt, 1)
+
+    def test_half_written_request_is_not_reported(self):
+        # prompt present but completion still pending
+        usage, nxt = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, elapsed=None)]},
+        ])
+        self.assertEqual(usage["input_tokens"], 0)
+        self.assertEqual(nxt, 0)
+
+    def test_streaming_counts_are_not_trusted_until_elapsed_is_written(self):
+        # counts appear mid-stream and climb; without elapsedMs they must not be reported
+        usage, nxt = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(prompt=40369, completion=178, elapsed=None)]},
+        ])
+        self.assertEqual((usage["input_tokens"], nxt), (0, 0))
+
+    def test_final_counts_are_reported_once_elapsed_lands(self):
+        usage, nxt = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(prompt=40369, completion=178, elapsed=None)]},
+            {"kind": 2, "k": ["requests", "0", "completionTokens"], "v": 591},
+            {"kind": 2, "k": ["requests", "0", "promptTokens"], "v": 44090},
+            {"kind": 2, "k": ["requests", "0", "elapsedMs"], "v": 10980},
+        ])
+        self.assertEqual((usage["input_tokens"], usage["output_tokens"], nxt), (44090, 591, 1))
+
+    def test_start_index_skips_what_was_already_reported(self):
+        lines = [{"kind": 1, "v": {"requests": []}},
+                 {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5),
+                                                      _request(prompt=200, completion=7)]}]
+        usage, nxt = self._usage(lines, start_index=1)
+        self.assertEqual(usage["input_tokens"], 200)
+        self.assertEqual(nxt, 2)
+
+    def test_late_request_is_picked_up_on_the_next_read(self):
+        first = [{"kind": 1, "v": {"requests": []}},
+                 {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5), _request()]}]
+        usage, nxt = self._usage(first)
+        self.assertEqual(nxt, 1)
+        later = first + [{"kind": 2, "k": ["requests", "1", "promptTokens"], "v": 900},
+                         {"kind": 2, "k": ["requests", "1", "completionTokens"], "v": 9}]
+        usage2, nxt2 = self._usage(later, start_index=nxt)
+        self.assertEqual(usage2["input_tokens"], 900)
+        self.assertEqual(nxt2, 2)
+
+    def test_pending_is_true_only_while_a_request_is_mid_write(self):
+        half = [{"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5),
+                                                     _request(elapsed=None)]}]
+        self.assertTrue(self._usage_pending(half))
+        done = [{"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5)]}]
+        self.assertFalse(self._usage_pending(done))
+
+    def test_store_path_requires_a_transcripts_parent(self):
+        self.assertIsNone(unbound._vscode_store_path("/tmp/elsewhere/x.jsonl", SESSION))
+
+    def test_unparseable_lines_are_skipped(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, [
+                {"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [_request(prompt=7, completion=1)]}])
+            with open(unbound._vscode_store_path(transcript, SESSION), "a", encoding="utf-8") as handle:
+                handle.write("\nnot json\n")
+            usage, _nxt, _pending = unbound._vscode_turn_usage(transcript, SESSION, 0)
+        self.assertEqual(usage["input_tokens"], 7)
+
+
+class TestVscodeSettle(unittest.TestCase):
+    """VS Code writes counts while the response streams, then rewrites them when done."""
+
+    def _settle(self, reads, start=0, cap=0.3):
+        # reads are (usage, next_index, pending) triples, newest last
+        with patch.object(unbound, "_VSCODE_POLL_SECONDS", 0), \
+             patch.object(unbound, "_VSCODE_SETTLE_SECONDS", cap), \
+             patch.object(unbound, "_vscode_store_path", lambda *a: None), \
+             patch.object(unbound, "_vscode_turn_usage", side_effect=reads):
+            return unbound._vscode_settled_usage("/ws/transcripts/x.jsonl", SESSION, start)
+
+    def test_returns_at_once_when_the_turn_is_already_final(self):
+        usage, nxt = self._settle([({"input_tokens": 500}, 1, False)])
+        self.assertEqual((usage["input_tokens"], nxt), (500, 1))
+
+    def test_waits_for_a_late_turn_to_be_finalised(self):
+        usage, nxt = self._settle([({"input_tokens": 0}, 0, True), ({"input_tokens": 0}, 0, True),
+                                   ({"input_tokens": 44090}, 1, False)])
+        self.assertEqual((usage["input_tokens"], nxt), (44090, 1))
+
+    def test_never_settles_leaves_the_watermark_alone(self):
+        with patch.object(unbound, "_VSCODE_POLL_SECONDS", 0), \
+             patch.object(unbound, "_VSCODE_SETTLE_SECONDS", 0.05), \
+             patch.object(unbound, "_vscode_store_path", lambda *a: None), \
+             patch.object(unbound, "_vscode_turn_usage",
+                          side_effect=lambda *a: ({"input_tokens": 0}, 0, True)):
+            usage, nxt = unbound._vscode_settled_usage("/ws/transcripts/x.jsonl", SESSION, 0)
+        self.assertEqual(nxt, 0)
+
+    def test_no_store_returns_immediately(self):
+        with patch.object(unbound, "_vscode_turn_usage", side_effect=[(None, 3, False)]) as reader:
+            usage, nxt = unbound._vscode_settled_usage("/nope.jsonl", SESSION, 3)
+        self.assertEqual((usage, nxt, reader.call_count), (None, 3, 1))
+
+    def test_nothing_pending_does_not_wait(self):
+        # a quiet Stop must not block for the whole window when nothing is mid-write
+        with patch.object(unbound, "_vscode_turn_usage",
+                          side_effect=[({"input_tokens": 0}, 0, False)]) as reader:
+            usage, nxt = unbound._vscode_settled_usage("/ws/transcripts/x.jsonl", SESSION, 0)
+        self.assertEqual((nxt, reader.call_count), (0, 1))
+
+
+class TestGetTurnUsage(unittest.TestCase):
+    def test_cli_needs_a_window_ceiling(self):
+        usage, nxt = unbound.get_turn_usage("/x/events.jsonl", SESSION, FLOOR, None)
+        self.assertIsNone(usage)
+
+    def test_cli_transcript_selects_the_cli_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _store([(SESSION, 26941, 274, 0, 26931, INSIDE)], tmpdir)
+            with patch.object(unbound, "_COPILOT_STORE", store):
+                usage, nxt = unbound.get_turn_usage(
+                    os.path.join(tmpdir, SESSION, "events.jsonl"), SESSION, FLOOR, CEILING)
+        self.assertEqual(usage["input_tokens"], 10)
+        self.assertEqual(usage["total_tokens"], 10 + 274 + 26931)
+
+    def test_cli_watermark_passes_through_untouched(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _store([(SESSION, 0, 0, 0, 0, INSIDE)], tmpdir)
+            with patch.object(unbound, "_COPILOT_STORE", store):
+                usage, nxt = unbound.get_turn_usage(
+                    os.path.join(tmpdir, SESSION, "events.jsonl"), SESSION, FLOOR, CEILING, 7)
+        self.assertEqual((usage, nxt), (None, 7))
+
+    def test_consecutive_cli_stops_partition_the_session(self):
+        rows = [(SESSION, 100, 1, 0, 0, "2026-08-28T05:06:00.000Z"),
+                (SESSION, 200, 2, 0, 0, "2026-08-28T05:08:00.000Z"),
+                (SESSION, 400, 4, 0, 0, "2026-08-28T05:12:00.000Z")]
+        stops = [None, "2026-08-28T10:37:00.000+05:30", "2026-08-28T10:39:00.000+05:30",
+                 "2026-08-28T10:45:00.000+05:30"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = _store(rows, tmpdir)
+            transcript = os.path.join(tmpdir, SESSION, "events.jsonl")
+            total = 0
+            with patch.object(unbound, "_COPILOT_STORE", store):
+                for floor, ceiling in zip(stops, stops[1:]):
+                    usage, _ = unbound.get_turn_usage(transcript, SESSION, floor, ceiling)
+                    total += usage["input_tokens"] if usage else 0
+        self.assertEqual(total, 700)
+
+
+class TestForwardedStateWatermark(unittest.TestCase):
+    def test_watermark_round_trips_through_the_marker(self):
+        logs = []
+        with patch.object(unbound, "load_existing_logs", lambda: list(logs)), \
+             patch.object(unbound, "save_logs", lambda new: logs.__setitem__(slice(None), new)):
+            unbound.record_forwarded_tool_ids(SESSION, ["t1"], "sig", ["p1"], 4)
+            _, _, _, index = unbound.get_forwarded_state(SESSION)
+        self.assertEqual(index, 4)
+
+    def test_watermark_is_carried_forward_when_not_supplied(self):
+        logs = []
+        with patch.object(unbound, "load_existing_logs", lambda: list(logs)), \
+             patch.object(unbound, "save_logs", lambda new: logs.__setitem__(slice(None), new)):
+            unbound.record_forwarded_tool_ids(SESSION, ["t1"], "sig", ["p1"], 4)
+            unbound.record_forwarded_tool_ids(SESSION, ["t2"], "sig2", ["p2"], None)
+            _, _, _, index = unbound.get_forwarded_state(SESSION)
+        self.assertEqual(index, 4)
+
+    def test_unknown_session_starts_at_zero(self):
+        with patch.object(unbound, "load_existing_logs", lambda: []):
+            _, _, _, index = unbound.get_forwarded_state(SESSION)
+        self.assertEqual(index, 0)
+
+
+class TestReplayStopHasNothingToAttachUsageTo(unittest.TestCase):
+    """Usage is resolved before the send gate, so it is worth pinning why that cannot
+    produce a duplicate row: a Stop with nothing new builds no exchange at all."""
+
+    def _transcript(self, tmpdir):
+        session_dir = Path(tmpdir) / SESSION
+        session_dir.mkdir(parents=True)
+        path = session_dir / "events.jsonl"
+        path.write_text("\n".join(json.dumps(e) for e in [
+            {"type": "session.start", "data": {"sessionId": SESSION},
+             "timestamp": "2026-08-28T05:00:00Z"},
+            {"id": "u1", "type": "user.message", "data": {"content": "hello"},
+             "timestamp": "2026-08-28T05:00:01Z"},
+            {"id": "a1", "type": "assistant.message",
+             "data": {"content": "hi", "turnId": "0"},
+             "timestamp": "2026-08-28T05:00:02Z"},
+        ]), encoding="utf-8")
+        return str(path)
+
+    def test_a_replayed_stop_builds_no_exchange(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = self._transcript(tmpdir)
+            first, tools, sig, prompts = unbound.build_exchange_from_transcript(
+                transcript, SESSION, cwd=tmpdir)
+            self.assertIsNotNone(first)
+            replay, new_tools, _sig, _prompts = unbound.build_exchange_from_transcript(
+                transcript, SESSION, cwd=tmpdir,
+                already_forwarded=tools, already_prompted=prompts)
+        # nothing new means nothing to send, so deferred usage cannot fabricate a row
+        self.assertIsNone(replay)
+        self.assertEqual(len(new_tools), 0)
+
+
+class TestSafePathComponent(unittest.TestCase):
+    """Session ids are joined into a path, so they are constrained to a shape that cannot
+    name anything outside chatSessions/. The charset admits no separator, drive letter or
+    dot-only name, which is why no resolve() check follows the join."""
+
+    def test_real_session_id_shapes_are_accepted(self):
+        for real in ("a805e63b-1737-4b9f-8c22-fdc17a9dbe0e",
+                     "cfa94ccc-2d93-4bfc-b1ac-724dac0c30de",
+                     "request_a8bb9a76-bb6f-487b-8e66-695863861d96",
+                     "abc123", "a" * 128):
+            self.assertTrue(unbound._safe_path_component(real), real)
+
+    def test_traversal_and_absolute_shapes_are_rejected(self):
+        for probe in ("../../../etc/passwd", "/etc/passwd", "..", ".", "",
+                      "x/../../y", "C:\\Windows\\win.ini", "a" * 129,
+                      "has space", "semi;colon", None, 12345, True, b"bytes"):
+            self.assertFalse(unbound._safe_path_component(probe), repr(probe))
+
+    def test_windows_reserved_device_names_are_rejected(self):
+        # these resolve to devices on Windows wherever they appear, so opening one would
+        # attach to the device and hang rather than miss a file
+        for probe in ("CON", "con", "NUL", "PRN", "AUX", "COM1", "com9", "LPT1", "lpt9",
+                      "CON.jsonl", "nul.txt"):
+            self.assertFalse(unbound._safe_path_component(probe), probe)
+
+    def test_names_that_merely_look_reserved_are_kept(self):
+        for probe in ("console", "con1", "com", "com10", "nullable", "lpt", "aux2"):
+            self.assertTrue(unbound._safe_path_component(probe), probe)
+
+    def test_a_rejected_id_yields_no_store_path(self):
+        self.assertIsNone(unbound._vscode_store_path(
+            "/ws/hash/GitHub.copilot-chat/transcripts/x.jsonl", "../../../etc/passwd"))
+
+
+class TestCappedLines(unittest.TestCase):
+    """A line-count cap alone does not bound memory: one oversized line is still read whole
+    before the count is checked, so the reader caps bytes per line too."""
+
+    def _lines(self, blob, max_lines=50000, max_bytes=1024):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "j.jsonl"
+            path.write_text(blob, encoding="utf-8")
+            with open(path, encoding="utf-8") as handle:
+                return [line.strip() for line in
+                        unbound._capped_lines(handle, max_lines, max_bytes)]
+
+    def test_an_oversized_line_is_dropped_and_the_rest_survive(self):
+        blob = "a\n" + ("X" * 5000) + "\n" + "b\n" + "c\n"
+        self.assertEqual(self._lines(blob), ["a", "b", "c"])
+
+    def test_the_line_count_cap_still_applies(self):
+        self.assertEqual(self._lines("a\nb\nc\nd\n", max_lines=2), ["a", "b"])
+
+    def test_a_trailing_line_without_a_newline_is_kept(self):
+        self.assertEqual(self._lines("a\nb"), ["a", "b"])
+
+    def test_an_oversized_final_line_without_a_newline_is_dropped(self):
+        self.assertEqual(self._lines("a\n" + "X" * 5000), ["a"])
+
+    def test_an_empty_file_yields_nothing(self):
+        self.assertEqual(self._lines(""), [])
+
+    def test_draining_an_oversize_line_cannot_outrun_the_budget(self):
+        # a file of nothing but oversize lines must still cost at most max_lines reads
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "j.jsonl"
+            path.write_text(("X" * 5000 + "\n") * 20, encoding="utf-8")
+            reads = []
+            with open(path, encoding="utf-8") as handle:
+                original = handle.readline
+
+                def counting(*args):
+                    reads.append(1)
+                    return original(*args)
+
+                handle.readline = counting
+                consumed = list(unbound._capped_lines(handle, 5, 1024))
+        self.assertEqual(consumed, [])
+        self.assertLessEqual(len(reads), 5)
+
+
+class TestCleanupKeepsTheUsageFloor(unittest.TestCase):
+    """Cleanup and the usage-window floor must agree on what a session is. Grouping on the
+    payload session_id drops a Stop that omits it, and the next window then loses its lower
+    bound and recounts the session from the start."""
+
+    CLI = "/h/.copilot/session-state/" + SESSION + "/events.jsonl"
+    OTHER = "/h/.copilot/session-state/other-session/events.jsonl"
+
+    def _run_cleanup(self, logs):
+        saved = {}
+        with patch.object(unbound, "load_existing_logs", lambda: logs), \
+             patch.object(unbound, "save_logs", lambda new: saved.setdefault("logs", new)), \
+             patch.object(unbound, "AUDIT_LOG_TOTAL_LIMIT", 3):
+            unbound.cleanup_old_logs()
+        return saved.get("logs", logs)
+
+    def _stop(self, ts, sess, path):
+        event = {"hook_event_name": "Stop"}
+        if sess:
+            event["session_id"] = sess
+        if path:
+            event["transcript_path"] = path
+        return {"timestamp": ts, "event": event}
+
+    def test_a_stop_without_session_id_survives_cleanup(self):
+        logs = [self._stop("t0", "other-session", self.OTHER),
+                self._stop("t1", SESSION, self.CLI),
+                self._stop("t2", None, self.CLI),
+                self._stop("t3", SESSION, self.CLI)]
+        kept = self._run_cleanup(logs)
+        stamps = [log["timestamp"] for log in kept]
+        self.assertIn("t2", stamps)
+        self.assertNotIn("t0", stamps)
+
+    def test_the_floor_still_resolves_after_cleanup(self):
+        logs = [self._stop("t0", "other-session", self.OTHER),
+                self._stop("t1", SESSION, self.CLI),
+                self._stop("t2", None, self.CLI),
+                self._stop("t3", None, self.CLI)]
+        kept = self._run_cleanup(logs)
+        with patch.object(unbound, "load_existing_logs", lambda: kept):
+            floor = unbound.get_previous_stop_timestamp_for_session(
+                {"transcript_path": self.CLI, "hook_event_name": "Stop"})
+        self.assertEqual(floor, "t2")
+
+
+class TestStorePathsMustBeRegularFiles(unittest.TestCase):
+    """A FIFO or device node in place of a store would block the hook for its whole budget,
+    so opening is gated on a real file rather than on mere existence."""
+
+    def test_a_fifo_is_not_accepted_as_a_vscode_store(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ws" / "hash"
+            (root / "chatSessions").mkdir(parents=True)
+            (root / "GitHub.copilot-chat" / "transcripts").mkdir(parents=True)
+            os.mkfifo(str(root / "chatSessions" / (SESSION + ".jsonl")))
+            transcript = root / "GitHub.copilot-chat" / "transcripts" / (SESSION + ".jsonl")
+            transcript.write_text("", encoding="utf-8")
+            self.assertIsNone(unbound._vscode_store_path(str(transcript), SESSION))
+
+    def test_a_directory_is_not_accepted_as_a_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ws" / "hash"
+            (root / "chatSessions" / (SESSION + ".jsonl")).mkdir(parents=True)
+            (root / "GitHub.copilot-chat" / "transcripts").mkdir(parents=True)
+            transcript = root / "GitHub.copilot-chat" / "transcripts" / (SESSION + ".jsonl")
+            transcript.write_text("", encoding="utf-8")
+            self.assertIsNone(unbound._vscode_store_path(str(transcript), SESSION))
+
+    def test_a_real_file_is_still_accepted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, [{"kind": 1, "v": {"requests": []}}])
+            self.assertIsNotNone(unbound._vscode_store_path(transcript, SESSION))
+
+    def test_a_fifo_is_not_accepted_as_the_cli_store(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Path(tmpdir) / "session-store.db"
+            os.mkfifo(str(store))
+            with patch.object(unbound, "_COPILOT_STORE", store):
+                self.assertIsNone(unbound._cli_turn_usage(SESSION, None, float("inf")))
