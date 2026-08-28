@@ -112,26 +112,51 @@ class TestCliUsage(unittest.TestCase):
 
 
 class TestPreviousStop(unittest.TestCase):
+    """The floor is keyed by transcript path, so a Stop that omits session_id still
+    matches its own earlier Stops instead of losing the floor and recounting."""
+
+    CLI = "/h/.copilot/session-state/" + SESSION + "/events.jsonl"
+
     @staticmethod
     def _logs(*events):
-        return [{"timestamp": ts,
-                 "event": {"hook_event_name": name, "session_id": sess}}
-                for name, ts, sess in events]
+        out = []
+        for name, ts, sess, path in events:
+            event = {"hook_event_name": name}
+            if sess:
+                event["session_id"] = sess
+            if path:
+                event["transcript_path"] = path
+            out.append({"timestamp": ts, "event": event})
+        return out
 
-    def _previous(self, logs):
+    def _previous(self, logs, event):
         with patch.object(unbound, "load_existing_logs", lambda: logs):
-            return unbound.get_previous_stop_timestamp_for_session(SESSION)
+            return unbound.get_previous_stop_timestamp_for_session(event)
 
     def test_the_stop_before_the_one_being_handled(self):
-        logs = self._logs(("Stop", "t1", SESSION), ("Stop", "t2", SESSION))
-        self.assertEqual(self._previous(logs), "t1")
+        logs = self._logs(("Stop", "t1", SESSION, None), ("Stop", "t2", SESSION, None))
+        self.assertEqual(self._previous(logs, {"session_id": SESSION}), "t1")
 
     def test_first_stop_of_a_session_has_no_floor(self):
-        self.assertIsNone(self._previous(self._logs(("Stop", "t1", SESSION))))
+        logs = self._logs(("Stop", "t1", SESSION, None))
+        self.assertIsNone(self._previous(logs, {"session_id": SESSION}))
 
     def test_other_sessions_are_ignored(self):
-        logs = self._logs(("Stop", "t1", "other"), ("Stop", "t2", SESSION))
-        self.assertIsNone(self._previous(logs))
+        logs = self._logs(("Stop", "t1", "other", None), ("Stop", "t2", SESSION, None))
+        self.assertIsNone(self._previous(logs, {"session_id": SESSION}))
+
+    def test_a_stop_without_session_id_still_finds_its_floor(self):
+        # the recount bug: keyed on session_id this matched nothing and dropped the floor
+        logs = self._logs(("Stop", "t1", SESSION, self.CLI), ("Stop", "t2", None, self.CLI))
+        self.assertEqual(self._previous(logs, {"transcript_path": self.CLI}), "t1")
+
+    def test_transcript_path_matches_across_stops_that_disagree_on_session_id(self):
+        logs = self._logs(("Stop", "t1", None, self.CLI), ("Stop", "t2", SESSION, self.CLI))
+        self.assertEqual(self._previous(logs, {"transcript_path": self.CLI,
+                                               "session_id": SESSION}), "t1")
+
+    def test_no_identity_at_all_has_no_floor(self):
+        self.assertIsNone(self._previous(self._logs(("Stop", "t1", None, None)), {}))
 
 
 class TestEpoch(unittest.TestCase):

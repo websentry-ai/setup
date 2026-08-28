@@ -748,14 +748,18 @@ def get_turn_start_timestamp_for_session(session_id):
     return turn_start or completed_start
 
 
-def get_previous_stop_timestamp_for_session(session_id):
-    """Close of the previous turn. The Stop being handled is already logged, so the one
-    before it is the floor for this turn's usage."""
-    if not session_id:
+def get_previous_stop_timestamp_for_session(event):
+    """Close of the previous turn, which is the floor of this turn's usage window. The Stop
+    being handled is already logged, so the one before it is that floor. Keyed by
+    stop_session_key rather than the payload's session_id: a Stop that omits session_id
+    would match no earlier Stop, lose its floor, and recount every earlier request in the
+    session."""
+    key = stop_session_key(event)
+    if not key:
         return None
     stops = [log.get('timestamp') for log in load_existing_logs()
-             if log.get('event', {}).get('session_id') == session_id
-             and log.get('event', {}).get('hook_event_name') == 'Stop']
+             if log.get('event', {}).get('hook_event_name') == 'Stop'
+             and stop_session_key(log.get('event', {})) == key]
     return stops[-2] if len(stops) > 1 else None
 
 
@@ -3072,6 +3076,9 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index):
     usage, next_index = _vscode_turn_usage(transcript_path, conversation_id, start_index)
     if usage is None or next_index > start_index:
         return usage, next_index
+    # Timing out defers, it does not drop: the watermark is only persisted after a send, so
+    # an unreported turn rides the next exchange this session sends, one row later than it
+    # happened. Only a session whose last turn finalises after its final Stop loses it.
     deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
     while time.monotonic() < deadline:
         time.sleep(_VSCODE_POLL_SECONDS)
@@ -3715,7 +3722,7 @@ def main():
                 exchange['requestCompleted'] = timestamp
                 usage, usage_index = get_turn_usage(
                     event.get('transcript_path'), exchange.get('conversation_id'),
-                    get_previous_stop_timestamp_for_session(session_id), timestamp, usage_index)
+                    get_previous_stop_timestamp_for_session(event), timestamp, usage_index)
                 if usage:
                     exchange['usage'] = usage
                 # Record only after the send succeeds, so a failed send retries next Stop
