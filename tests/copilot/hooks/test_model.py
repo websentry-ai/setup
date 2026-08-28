@@ -29,8 +29,8 @@ def _journal(tmpdir, lines, session=SESSION):
     return str(transcript)
 
 
-def _request(selected=None, served=None):
-    obj = {"timestamp": 1787893680000}
+def _request(selected=None, served=None, ts=1787893680000):
+    obj = {"timestamp": ts}
     if selected is not None:
         obj["modelId"] = selected
     if served is not None:
@@ -39,12 +39,12 @@ def _request(selected=None, served=None):
 
 
 class TestTurnModel(unittest.TestCase):
-    def _model(self, requests, session=SESSION):
+    def _model(self, requests, session=SESSION, turn_end=None):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _journal(tmpdir, [{"kind": 1, "v": {"requests": []}},
                                            {"kind": 2, "k": ["requests"], "v": requests}],
                                   session=session)
-            return unbound._vscode_turn_model(transcript, session)
+            return unbound._vscode_turn_model(transcript, session, turn_end)
 
     def test_the_serving_model_wins_over_the_selection(self):
         # this is what makes an 'auto' pick report the model that actually ran
@@ -98,6 +98,29 @@ class TestTurnModel(unittest.TestCase):
             self._model([{"timestamp": 1, "modelId": "copilot/claude-haiku-4.5",
                           "result": {"metadata": {"toolCallRounds": [{"modelId": 12345}]}}}]),
             "claude-haiku-4.5")
+
+    def test_a_queued_next_turn_does_not_steal_this_row(self):
+        # a prompt queued while this turn runs already exists in the journal; taking the
+        # newest outright would report the next turn's model on this row
+        stop_at = "2026-08-28T12:00:10.000Z"
+        got = self._model(
+            [_request(selected="copilot/claude-haiku-4.5", served="claude-haiku-4.5",
+                      ts=1787918400000),                      # 12:00:00, this turn
+             _request(selected="copilot/claude-sonnet-5", ts=1787918420000)],  # 12:00:20, queued
+            turn_end=stop_at)
+        self.assertEqual(got, "claude-haiku-4.5")
+
+    def test_without_a_bound_the_newest_is_used(self):
+        got = self._model(
+            [_request(selected="copilot/claude-haiku-4.5", ts=1787918400000),
+             _request(selected="copilot/claude-sonnet-5", ts=1787918420000)])
+        self.assertEqual(got, "claude-sonnet-5")
+
+    def test_a_bound_before_every_request_falls_back_to_newest(self):
+        # clock skew must not blank the model entirely
+        got = self._model([_request(selected="copilot/claude-haiku-4.5", ts=1787918400000)],
+                          turn_end="2026-08-28T00:00:00.000Z")
+        self.assertEqual(got, "claude-haiku-4.5")
 
     def test_a_cli_transcript_has_no_vscode_store(self):
         self.assertIsNone(unbound._vscode_turn_model(

@@ -3130,21 +3130,30 @@ def _vscode_requests(path):
     return requests
 
 
-def _vscode_turn_model(transcript_path, conversation_id):
+def _vscode_turn_model(transcript_path, conversation_id, turn_end=None):
     """Model for the turn this Stop is reporting. VS Code records it per request, so a
     mid-session switch is picked up; the transcript the exchange is built from carries no
     model at all, which is why every row otherwise reads 'auto'.
 
-    The newest request is this turn's. Prefer the model that served it, which names the
-    real model behind an 'auto' pick but only lands once the response completes. The
-    selection is there from the moment the prompt is sent, so an explicitly chosen model is
-    always reported even when the served name has not arrived."""
+    The turn is the newest request created no later than this Stop. Bounding it matters
+    when a prompt is queued while the turn runs: that request already exists in the journal
+    and taking the newest outright would report the next turn's model on this row.
+
+    Prefer the model that served the request, which names the real model behind an 'auto'
+    pick but only lands once the response completes. The selection is there from the moment
+    the prompt is sent, so an explicitly chosen model is reported even without it."""
     path = _vscode_store_path(transcript_path, conversation_id)
     if not path:
         return None
     requests = _vscode_requests(path)
     if not requests:
         return None
+    until = _epoch(turn_end)
+    if until is not None:
+        started = [i for i in requests
+                   if (_epoch(requests[i].get('timestamp')) or 0) <= until]
+        if started:
+            requests = {i: requests[i] for i in started}
     entry = requests[max(requests)]
     served = entry.get('servedBy')
     if isinstance(served, str) and served:
@@ -3865,7 +3874,7 @@ def main():
             # waits for the next real turn, and a session that ends first loses it.
             if exchange:
                 turn_model = _vscode_turn_model(event.get('transcript_path'),
-                                                exchange.get('conversation_id'))
+                                                exchange.get('conversation_id'), timestamp)
                 if turn_model:
                     exchange['model'] = turn_model
             usage = None
