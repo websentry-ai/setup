@@ -39,12 +39,16 @@ def _request(selected=None, served=None, ts=1787893680000):
 
 
 class TestTurnModel(unittest.TestCase):
-    def _model(self, requests, session=SESSION, turn_end=None):
+    # requests default to 12:00:00; the window runs from previous_stop to turn_end
+    STOP = "2026-08-28T12:00:30.000Z"
+
+    def _model(self, requests, session=SESSION, previous_stop=None, turn_end=None):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _journal(tmpdir, [{"kind": 1, "v": {"requests": []}},
                                            {"kind": 2, "k": ["requests"], "v": requests}],
                                   session=session)
-            return unbound._vscode_turn_model(transcript, session, turn_end)
+            return unbound._vscode_turn_model(transcript, session, previous_stop,
+                                              turn_end or self.STOP)
 
     def test_the_serving_model_wins_over_the_selection(self):
         # this is what makes an 'auto' pick report the model that actually ran
@@ -100,35 +104,43 @@ class TestTurnModel(unittest.TestCase):
             "claude-haiku-4.5")
 
     def test_a_queued_next_turn_does_not_steal_this_row(self):
-        # a prompt queued while this turn runs already exists in the journal; taking the
-        # newest outright would report the next turn's model on this row
-        stop_at = "2026-08-28T12:00:10.000Z"
+        # a prompt queued while this turn runs already exists in the journal
         got = self._model(
             [_request(selected="copilot/claude-haiku-4.5", served="claude-haiku-4.5",
-                      ts=1787918400000),                      # 12:00:00, this turn
-             _request(selected="copilot/claude-sonnet-5", ts=1787918420000)],  # 12:00:20, queued
-            turn_end=stop_at)
+                      ts=1787918400000),                                     # 12:00:00, this turn
+             _request(selected="copilot/claude-sonnet-5", ts=1787918460000)],  # 12:01:00, queued
+            turn_end="2026-08-28T12:00:30.000Z")
         self.assertEqual(got, "claude-haiku-4.5")
 
-    def test_without_a_bound_the_newest_is_used(self):
+    def test_the_previous_turn_is_never_reported_as_this_one(self):
+        # the journal is written lazily, so this turn's request may not be there yet.
+        # Reporting the previous turn's model would be a confidently wrong answer.
         got = self._model(
-            [_request(selected="copilot/claude-haiku-4.5", ts=1787918400000),
-             _request(selected="copilot/claude-sonnet-5", ts=1787918420000)])
-        self.assertEqual(got, "claude-sonnet-5")
+            [_request(selected="copilot/gpt-5.6-terra", served="gpt-5.6-terra",
+                      ts=1787918400000)],                    # 12:00:00, the PREVIOUS turn
+            previous_stop="2026-08-28T12:00:10.000Z",        # it ended before this turn began
+            turn_end="2026-08-28T12:00:30.000Z")
+        self.assertIsNone(got)
 
-    def test_a_bound_before_every_request_falls_back_to_newest(self):
-        # clock skew must not blank the model entirely
+    def test_the_first_turn_has_no_lower_bound(self):
+        got = self._model([_request(selected="copilot/claude-haiku-4.5", ts=1787918400000)],
+                          previous_stop=None)
+        self.assertEqual(got, "claude-haiku-4.5")
+
+    def test_an_empty_window_reports_nothing(self):
         got = self._model([_request(selected="copilot/claude-haiku-4.5", ts=1787918400000)],
                           turn_end="2026-08-28T00:00:00.000Z")
-        self.assertEqual(got, "claude-haiku-4.5")
+        self.assertIsNone(got)
 
     def test_a_cli_transcript_has_no_vscode_store(self):
         self.assertIsNone(unbound._vscode_turn_model(
-            "/h/.copilot/session-state/" + SESSION + "/events.jsonl", SESSION))
+            "/h/.copilot/session-state/" + SESSION + "/events.jsonl", SESSION,
+            None, self.STOP))
 
     def test_a_rejected_session_id_reports_nothing(self):
         # the id is joined into a path, so it goes through the same validation
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _journal(tmpdir, [{"kind": 1, "v": {"requests": []}}])
-            self.assertIsNone(unbound._vscode_turn_model(transcript, "../../../etc/passwd"))
-            self.assertIsNone(unbound._vscode_turn_model(transcript, "CON"))
+            self.assertIsNone(unbound._vscode_turn_model(
+                transcript, "../../../etc/passwd", None, self.STOP))
+            self.assertIsNone(unbound._vscode_turn_model(transcript, "CON", None, self.STOP))
