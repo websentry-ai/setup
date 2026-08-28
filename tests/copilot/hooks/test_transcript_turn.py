@@ -137,7 +137,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
 
         self.assertNotIn("tool_use", exchange["messages"][1])
 
-    def test_effectful_native_tool_is_policy_only_not_analytics(self):
+    def test_unmapped_native_tool_is_not_emitted(self):
         mapped = unbound.map_copilot_tool(
             'install_python_packages',
             {'packageNames': ['requests']},

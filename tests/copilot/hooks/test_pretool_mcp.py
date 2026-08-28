@@ -133,6 +133,11 @@ class TestResolveVscodeMcp(unittest.TestCase):
             unbound._resolve_vscode_mcp("mcp_unknownserver_do_thing", self.servers),
             (None, None, None))
 
+    def test_configured_server_name_without_a_tool_is_not_an_mcp_call(self):
+        self.assertEqual(
+            unbound.detect_mcp_call("github", self.servers),
+            (None, None, None))
+
 
 def _gateway(sanctioned_groups):
     """Mirror preToolUseHandler: read mcp_server/mcp_tool, fingerprint the forwarded
@@ -257,13 +262,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertNotIn("mcp_server", captured.get("md", {}))
         self.assertFalse(self.is_block(ret))
 
-    def test_effectful_native_tool_reaches_command_policy_gateway(self):
-        captured = {}
-
-        def blocking_gw(request_body, api_key):
-            captured["body"] = request_body
-            return {"decision": "deny", "reason": "blocked by policy"}
-
+    def test_unmapped_native_tool_is_ignored(self):
         event = {
             "hook_event_name": "PreToolUse",
             "tool_name": "install_python_packages",
@@ -271,22 +270,14 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
             "cwd": self.cwd,
             "session_id": "s",
         }
-        with patch.object(unbound, "send_to_hook_api", blocking_gw):
+        gateway = unittest.mock.Mock(return_value={"decision": "deny"})
+        with patch.object(unbound, "send_to_hook_api", gateway):
             ret = unbound.process_pre_tool_use(event, "K")
 
-        policy_data = captured["body"]["pre_tool_use_data"]
-        self.assertEqual(policy_data["tool_name"], "Bash")
-        self.assertIn("install_python_packages", policy_data["command"])
-        self.assertIn("requests", policy_data["command"])
-        self.assertTrue(self.is_block(ret))
+        self.assertEqual(ret, {})
+        gateway.assert_not_called()
 
-    def test_workspace_mcp_config_cannot_shadow_effectful_native_tool(self):
-        captured = {}
-
-        def blocking_gw(request_body, api_key):
-            captured["body"] = request_body
-            return {"decision": "deny", "reason": "blocked by policy"}
-
+    def test_server_name_without_tool_does_not_claim_native_tool(self):
         event = {
             "hook_event_name": "PreToolUse",
             "tool_name": "install_python_packages",
@@ -297,15 +288,14 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         colliding_config = {
             "install_python_packages": {"command": "untrusted-workspace-server"},
         }
+        gateway = unittest.mock.Mock(return_value={"decision": "deny"})
         with patch.object(
             unbound, "read_copilot_mcp_servers", return_value=colliding_config
-        ), patch.object(unbound, "send_to_hook_api", blocking_gw):
+        ), patch.object(unbound, "send_to_hook_api", gateway):
             ret = unbound.process_pre_tool_use(event, "K")
 
-        policy_data = captured["body"]["pre_tool_use_data"]
-        self.assertEqual(policy_data["tool_name"], "Bash")
-        self.assertNotIn("mcp_server", policy_data["metadata"])
-        self.assertTrue(self.is_block(ret))
+        self.assertEqual(ret, {})
+        gateway.assert_not_called()
 
     def test_workspace_mcp_config_cannot_relabel_terminal_like_native_tool(self):
         gateway = unittest.mock.Mock(return_value={"decision": "allow"})
@@ -326,35 +316,6 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
 
         self.assertEqual(ret, {})
         gateway.assert_not_called()
-
-    def test_every_policy_effectful_tool_is_untracked_but_policy_checked(self):
-        self.assertLessEqual(
-            unbound.POLICY_EFFECTFUL_NATIVE_TOOLS,
-            unbound.UNTRACKED_NATIVE_TOOLS,
-        )
-
-        for raw_tool in sorted(unbound.POLICY_EFFECTFUL_NATIVE_TOOLS):
-            with self.subTest(raw_tool=raw_tool):
-                captured = {}
-
-                def capturing_gw(request_body, api_key):
-                    captured["body"] = request_body
-                    return {"decision": "allow"}
-
-                event = {
-                    "hook_event_name": "PreToolUse",
-                    "tool_name": raw_tool,
-                    "tool_input": {},
-                    "cwd": self.cwd,
-                    "session_id": "s",
-                }
-                with patch.object(unbound, "send_to_hook_api", capturing_gw):
-                    unbound.process_pre_tool_use(event, "K")
-
-                policy_data = captured["body"]["pre_tool_use_data"]
-                self.assertEqual(policy_data["tool_name"], "Bash")
-                self.assertIn(raw_tool, policy_data["command"])
-
 
 class TestStringToolArgs(ProcessPreToolUseBase):
     """VS Code sends toolArgs as a JSON string. The command must still reach the policy

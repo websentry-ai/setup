@@ -793,11 +793,87 @@ def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
     return name or None
 
 
+_BACKFILL_HOOK_MODULE = None
+
+
+def _backfill_load_hook_module():
+    global _BACKFILL_HOOK_MODULE
+    if _BACKFILL_HOOK_MODULE is not None:
+        return _BACKFILL_HOOK_MODULE
+    hook_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
+    if not hook_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("unbound_copilot_backfill_hook", hook_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _BACKFILL_HOOK_MODULE = module
+        return module
+    except Exception as exc:
+        debug_print(f"could not load installed hook for MCP resolution: {exc}")
+        return None
+
+
+def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, str]]:
+    hook = _backfill_load_hook_module()
+    if hook is None:
+        return {}
+    try:
+        cwd = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            candidate = entry.get("cwd") or data.get("cwd")
+            if isinstance(candidate, str) and candidate:
+                cwd = candidate
+                break
+        mcp_servers = hook.read_copilot_mcp_servers(cwd)
+        provenance = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            requests = data.get("toolRequests") if entry.get("type") == "assistant.message" else None
+            if entry.get("type") == "tool.execution_start":
+                requests = [{
+                    "toolCallId": data.get("toolCallId"),
+                    "name": data.get("toolName"),
+                    "arguments": data.get("arguments"),
+                }]
+            for request in requests or []:
+                if not isinstance(request, dict):
+                    continue
+                call_id = request.get("toolCallId")
+                tool_name = request.get("name")
+                if not isinstance(call_id, str) or not isinstance(tool_name, str):
+                    continue
+                arguments = request.get("arguments")
+                normalizer = getattr(hook, "_normalize_arguments", None)
+                if callable(normalizer):
+                    arguments = normalizer(arguments)
+                elif not isinstance(arguments, dict):
+                    arguments = {}
+                mapped = hook.map_copilot_tool(
+                    tool_name, arguments, "", mcp_servers=mcp_servers
+                )
+                if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
+                    continue
+                server_name = mapped.get("server_name")
+                if isinstance(server_name, str) and server_name:
+                    provenance[call_id] = {
+                        "tool_name": tool_name,
+                        "server_name": server_name,
+                    }
+        return provenance
+    except Exception as exc:
+        debug_print(f"could not resolve backfill MCP calls: {exc}")
+        return {}
+
+
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
-    """Read a transcript and return {session_id, entries} for server-side parsing.
-    The client only JSON-decodes lines and resolves a session id (preferring the
-    session.start payload, falling back to the path). All semantic parsing
-    happens server-side in webapp.services.coding_tools_backfill_service."""
     entries = []
     session_id = None
     try:

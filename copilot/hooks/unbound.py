@@ -65,10 +65,6 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-# Copilot tool names (VS Code agent mode + CLI) translated to the canonical
-# gateway vocabulary. Covers both surfaces: VS Code's model-facing tool names
-# and the CLI's shell/glob/grep/view/write tools. Unlisted native tools are not
-# emitted; only a configured MCP match or an explicit mcp_ prefix takes the MCP path.
 SHELL_TOOLS = {
     'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal',
     'terminal', 'send_to_terminal', 'write_bash', 'write_powershell',
@@ -93,8 +89,6 @@ EDIT_TOOLS = {
     'copilot_multiReplaceString', 'copilot_editNotebook', 'copilot_editFiles',
 }
 
-# Copilot tools whose arguments can be faithfully represented as a shell command.
-# `x or ''` (not `.get(k, '')`) so a present-but-None value coerces to ''.
 TERMINAL_LIKE_TOOLS = {
     'get_changed_files':     lambda a: 'git status',
     'grep_search':           lambda a: f"grep {a.get('query') or ''} {a.get('includePattern') or ''}".strip(),
@@ -104,85 +98,6 @@ TERMINAL_LIKE_TOOLS = {
     'rg':                    lambda a: f"grep {a.get('pattern') or a.get('query') or ''}".strip(),
 }
 
-# Copilot orchestration / planning / UI / memory tools — no security-relevant
-# action of their own; dropped (not emitted as analytics), the same way Claude
-# Code's Task/Agent tools are not scored. A subagent's real actions are reported
-# and scored as their own tool calls, so scoring the wrapper double-counts.
-INTERNAL_TOOLS = {
-    # subagents / agent control
-    'execution_subagent', 'explore_subagent', 'search_subagent', 'runSubagent',
-    'run_task', 'switch_agent', 'list_agents', 'read_agent', 'task', 'write_agent',
-    # planning / intent / memory / tool discovery
-    'manage_todo_list', 'report_intent', 'memory', 'resolve_memory_file_uri',
-    'tool_search', 'tool_search_tool', 'ask_user', 'skill', 'task_complete',
-    # VS Code editor meta / UI confirmations
-    'run_vscode_command', 'get_vscode_api', 'get_project_setup_info',
-    'vscode_askQuestions', 'vscode_get_confirmation',
-    'vscode_get_confirmation_with_options', 'vscode_get_terminal_confirmation',
-    'extensions_reload', 'extensions_manage', 'open_canvas',
-    'list_canvas_capabilities', 'copilot_memory', 'copilot_runVscodeCommand',
-    'copilot_switchAgent', 'copilot_resolveMemoryFileUri',
-}
-
-# Verified Copilot/VS Code host tools whose behavior does not fit the canonical
-# shell/read/write/edit shapes. They are intentionally not emitted. Keeping the
-# names explicit also prevents a same-named MCP config from claiming a host tool.
-UNTRACKED_NATIVE_TOOLS = {
-    'get_errors', 'semantic_search', 'web_fetch', 'web_search', 'fetch_webpage',
-    'search_workspace_symbols', 'test_failure', 'test_search',
-    'get_search_view_results', 'github_repo', 'github_text_search',
-    'vscode_listCodeUsages', 'vscode_searchExtensions_internal',
-    'copilot_searchCodebase', 'copilot_searchWorkspaceSymbols',
-    'copilot_getVSCodeAPI', 'copilot_testFailure', 'copilot_findFiles',
-    'copilot_findTextInFiles', 'copilot_getErrors', 'copilot_getChangedFiles',
-    'copilot_fetchWebPage', 'copilot_findTestFiles',
-    'copilot_getProjectSetupInfo', 'copilot_getSearchResults',
-    'copilot_githubRepo',
-    'get_terminal_output', 'kill_terminal', 'terminal_last_command',
-    'terminal_selection', 'get_task_output', 'read_powershell',
-    'stop_powershell', 'list_powershell', 'read_bash', 'stop_bash',
-    'list_bash', 'await_terminal',
-    'create_new_workspace', 'create_new_jupyter_notebook', 'install_extension',
-    'run_notebook_cell', 'create_and_run_task', 'runTests',
-    'copilot_createNewWorkspace', 'copilot_createNewJupyterNotebook',
-    'copilot_runNotebookCell', 'copilot_installExtension',
-    'copilot_createAndRunTask', 'copilot_runTests1',
-    'configure_notebook', 'configure_notebooks', 'notebook_list_packages',
-    'notebook_install_packages', 'configure_python_notebook',
-    'configure_non_python_notebook', 'restart_notebook_kernel',
-    'configure_python_environment', 'get_python_environment_details',
-    'get_python_executable_details', 'install_python_packages',
-    'open_browser_page', 'list_browser_pages', 'navigate_page', 'read_page',
-    'screenshot_page', 'run_playwright_code', 'click_element', 'hover_element',
-    'type_in_page', 'handle_dialog', 'drag_element',
-}
-
-# These tools stay out of Stop transcript analytics, but their PreToolUse calls
-# can change local state, execute code, or contact external systems. Represent
-# the invocation as a command only at the policy boundary so existing terminal
-# deny/approval policies can evaluate it without creating a new analytics type.
-POLICY_EFFECTFUL_NATIVE_TOOLS = frozenset({
-    # network access
-    'web_fetch', 'web_search', 'fetch_webpage', 'github_repo',
-    'github_text_search', 'vscode_searchExtensions_internal',
-    'copilot_fetchWebPage', 'copilot_githubRepo',
-    # process control
-    'kill_terminal', 'stop_powershell', 'stop_bash',
-    # workspace, extension, task, and notebook changes/execution
-    'create_new_workspace', 'create_new_jupyter_notebook', 'install_extension',
-    'run_notebook_cell', 'create_and_run_task', 'runTests',
-    'copilot_createNewWorkspace', 'copilot_createNewJupyterNotebook',
-    'copilot_runNotebookCell', 'copilot_installExtension',
-    'copilot_createAndRunTask', 'copilot_runTests1',
-    'configure_notebook', 'configure_notebooks', 'notebook_install_packages',
-    'configure_python_notebook', 'configure_non_python_notebook',
-    'restart_notebook_kernel', 'configure_python_environment',
-    'install_python_packages',
-    # browser actions; reads can still contact an external origin
-    'open_browser_page', 'navigate_page', 'read_page', 'screenshot_page',
-    'run_playwright_code', 'click_element', 'hover_element', 'type_in_page',
-    'handle_dialog', 'drag_element',
-})
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
@@ -1827,10 +1742,6 @@ _MCP_NAME_SEPARATORS = ('__', '-')
 _MIN_MCP_SERVER_NAME = 2
 
 
-# Resolve (server, tool, config) from a Copilot tool name. The mcp__ form is
-# self-delimiting; the bare form is matched against configured server names.
-# Matching is case-insensitive (Copilot lowercases nothing, configs vary case)
-# and the longest server match wins; ties resolve to config/iteration order.
 def detect_mcp_call(raw_tool, mcp_servers):
     if not raw_tool:
         return (None, None, None)
@@ -1848,15 +1759,14 @@ def detect_mcp_call(raw_tool, mcp_servers):
             if len(candidate) < _MIN_MCP_SERVER_NAME:
                 continue
             cand_lower = candidate.lower()
-            if raw_lower == cand_lower:
-                mcp_tool = ''
-            elif raw_lower.startswith(cand_lower):
-                remainder = raw_tool[len(candidate):]
-                sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
-                if sep is None:
-                    continue
-                mcp_tool = remainder[len(sep):]
-            else:
+            if not raw_lower.startswith(cand_lower):
+                continue
+            remainder = raw_tool[len(candidate):]
+            sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
+            if sep is None:
+                continue
+            mcp_tool = remainder[len(sep):]
+            if not mcp_tool:
                 continue
             if best is None or len(candidate) > best[0]:
                 best = (len(candidate), server_name, mcp_tool)
@@ -1946,12 +1856,6 @@ def extract_command_for_pretool(canonical, tool_input):
     if canonical.startswith('mcp'):
         return json.dumps(tool_input)
     return ''
-
-
-def _effectful_native_policy_command(raw_tool, tool_input):
-    """Serialize a native host action for the existing command-policy boundary."""
-    payload = json.dumps(tool_input, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
-    return f'{raw_tool} {payload}'
 
 
 def send_to_hook_api(request_body, api_key):
@@ -2187,44 +2091,22 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             # the allow-list isn't evaluated without a resolved server (fail-open).
             log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
 
-    native_without_policy = (
-        raw_tool in INTERNAL_TOOLS
-        or raw_tool in UNTRACKED_NATIVE_TOOLS
-        or raw_tool in TERMINAL_LIKE_TOOLS
-    )
-    if raw_tool in POLICY_EFFECTFUL_NATIVE_TOOLS:
-        canonical = 'Bash'
-    elif native_without_policy:
+    if raw_tool in TERMINAL_LIKE_TOOLS:
         return {}
-    elif not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
+    if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         cwd = event.get('cwd')
         mcp_servers = read_copilot_mcp_servers(cwd)
         mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
         if mcp_server is None:
-            # A bare (non-mcp__) tool can only be resolved against the MCP config.
-            # If no config was readable, a genuine MCP call can't be identified
-            # and would slip the allow-list — surface that distinctly so the
-            # potential bypass is observable rather than silent. Skip known-benign
-            # native tools so the log isn't noisy.
-            if raw_tool and raw_tool not in TERMINAL_LIKE_TOOLS:
-                if not mcp_servers and not raw_tool_lower.startswith('mcp__'):
-                    log_error(
-                        f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
-                        'mcp_config',
-                    )
-                else:
-                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
             return {}
-        else:
-            is_mcp = True
-            canonical = f"mcp__{mcp_server}__{mcp_tool}"
-            # Names only — never args/config (those can carry secrets).
-            log_error(
-                f"copilot mcp detected session={session_id} tool={raw_tool} "
-                f"server={mcp_server} mcp_tool={mcp_tool} "
-                f"config={'yes' if mcp_server_config else 'no'}",
-                'mcp_match',
-            )
+        is_mcp = True
+        canonical = f"mcp__{mcp_server}__{mcp_tool}"
+        log_error(
+            f"copilot mcp detected session={session_id} tool={raw_tool} "
+            f"server={mcp_server} mcp_tool={mcp_tool} "
+            f"config={'yes' if mcp_server_config else 'no'}",
+            'mcp_match',
+        )
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -2238,10 +2120,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         return {}
 
     model = get_session_start_model(session_id) or 'auto'
-    if raw_tool in POLICY_EFFECTFUL_NATIVE_TOOLS and not is_mcp:
-        command = _effectful_native_policy_command(raw_tool, tool_input)
-    else:
-        command = extract_command_for_pretool(canonical, tool_input)
+    command = extract_command_for_pretool(canonical, tool_input)
 
     recent_user_prompts = get_recent_user_prompts_for_session(
         session_id, PRETOOL_USER_MESSAGES_LIMIT
@@ -2975,10 +2854,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         return os.path.normpath(os.path.join(base, path)) if base else None
 
     project = None
-    native_untracked = name in INTERNAL_TOOLS or name in UNTRACKED_NATIVE_TOOLS
-    if native_untracked:
-        return None
-    elif name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
+    if name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
         if name in SHELL_TOOLS:
             command = args.get('command') or args.get('input') or args.get('text') or ''
         else:
