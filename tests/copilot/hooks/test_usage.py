@@ -158,6 +158,22 @@ class TestPreviousStop(unittest.TestCase):
     def test_no_identity_at_all_has_no_floor(self):
         self.assertIsNone(self._previous(self._logs(("Stop", "t1", None, None)), {}))
 
+    def test_a_corrupt_log_row_does_not_break_the_lookup(self):
+        # the audit log is user-writable; a non-string path here would otherwise raise
+        # out of the Stop handler and drop the whole exchange, not just its usage
+        logs = (self._logs(("Stop", "t1", None, self.CLI))
+                + [{"timestamp": "t2", "event": {"hook_event_name": "Stop",
+                                                 "transcript_path": {"corrupt": 1}}},
+                   {"timestamp": "t3", "event": {"hook_event_name": "Stop",
+                                                 "transcript_path": 12345}}]
+                + self._logs(("Stop", "t4", None, self.CLI)))
+        self.assertEqual(self._previous(logs, {"transcript_path": self.CLI}), "t1")
+
+    def test_stop_session_key_is_total_for_any_payload(self):
+        for payload in ({"transcript_path": {"corrupt": 1}}, {"transcript_path": 12345},
+                        {"transcript_path": None}, {}):
+            self.assertIsNone(unbound.stop_session_key(payload))
+
 
 class TestEpoch(unittest.TestCase):
     def test_local_offset_and_zulu_compare_equal(self):
@@ -238,7 +254,13 @@ class TestVscodeUsage(unittest.TestCase):
     def _usage(self, lines, start_index=0):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _journal(tmpdir, SESSION, lines)
-            return unbound._vscode_turn_usage(transcript, SESSION, start_index)
+            usage, nxt, _pending = unbound._vscode_turn_usage(transcript, SESSION, start_index)
+            return usage, nxt
+
+    def _usage_pending(self, lines, start_index=0):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, lines)
+            return unbound._vscode_turn_usage(transcript, SESSION, start_index)[2]
 
     def test_appends_then_patches_resolve_to_the_last_write(self):
         usage, nxt = self._usage([
@@ -306,6 +328,15 @@ class TestVscodeUsage(unittest.TestCase):
         self.assertEqual(usage2["input_tokens"], 900)
         self.assertEqual(nxt2, 2)
 
+    def test_pending_is_true_only_while_a_request_is_mid_write(self):
+        half = [{"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5),
+                                                     _request(elapsed=None)]}]
+        self.assertTrue(self._usage_pending(half))
+        done = [{"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [_request(prompt=100, completion=5)]}]
+        self.assertFalse(self._usage_pending(done))
+
     def test_store_path_requires_a_transcripts_parent(self):
         self.assertIsNone(unbound._vscode_store_path("/tmp/elsewhere/x.jsonl", SESSION))
 
@@ -316,7 +347,7 @@ class TestVscodeUsage(unittest.TestCase):
                 {"kind": 2, "k": ["requests"], "v": [_request(prompt=7, completion=1)]}])
             with open(unbound._vscode_store_path(transcript, SESSION), "a", encoding="utf-8") as handle:
                 handle.write("\nnot json\n")
-            usage, _ = unbound._vscode_turn_usage(transcript, SESSION, 0)
+            usage, _nxt, _pending = unbound._vscode_turn_usage(transcript, SESSION, 0)
         self.assertEqual(usage["input_tokens"], 7)
 
 
@@ -324,32 +355,42 @@ class TestVscodeSettle(unittest.TestCase):
     """VS Code writes counts while the response streams, then rewrites them when done."""
 
     def _settle(self, reads, start=0, cap=0.3):
+        # reads are (usage, next_index, pending) triples, newest last
         with patch.object(unbound, "_VSCODE_POLL_SECONDS", 0), \
              patch.object(unbound, "_VSCODE_SETTLE_SECONDS", cap), \
+             patch.object(unbound, "_vscode_store_path", lambda *a: None), \
              patch.object(unbound, "_vscode_turn_usage", side_effect=reads):
             return unbound._vscode_settled_usage("/ws/transcripts/x.jsonl", SESSION, start)
 
     def test_returns_at_once_when_the_turn_is_already_final(self):
-        usage, nxt = self._settle([({"input_tokens": 500}, 1)])
+        usage, nxt = self._settle([({"input_tokens": 500}, 1, False)])
         self.assertEqual((usage["input_tokens"], nxt), (500, 1))
 
     def test_waits_for_a_late_turn_to_be_finalised(self):
-        usage, nxt = self._settle([({"input_tokens": 0}, 0), ({"input_tokens": 0}, 0),
-                                   ({"input_tokens": 44090}, 1)])
+        usage, nxt = self._settle([({"input_tokens": 0}, 0, True), ({"input_tokens": 0}, 0, True),
+                                   ({"input_tokens": 44090}, 1, False)])
         self.assertEqual((usage["input_tokens"], nxt), (44090, 1))
 
     def test_never_settles_leaves_the_watermark_alone(self):
         with patch.object(unbound, "_VSCODE_POLL_SECONDS", 0), \
              patch.object(unbound, "_VSCODE_SETTLE_SECONDS", 0.05), \
+             patch.object(unbound, "_vscode_store_path", lambda *a: None), \
              patch.object(unbound, "_vscode_turn_usage",
-                          side_effect=lambda *a: ({"input_tokens": 0}, 0)):
+                          side_effect=lambda *a: ({"input_tokens": 0}, 0, True)):
             usage, nxt = unbound._vscode_settled_usage("/ws/transcripts/x.jsonl", SESSION, 0)
         self.assertEqual(nxt, 0)
 
     def test_no_store_returns_immediately(self):
-        with patch.object(unbound, "_vscode_turn_usage", side_effect=[(None, 3)]) as reader:
+        with patch.object(unbound, "_vscode_turn_usage", side_effect=[(None, 3, False)]) as reader:
             usage, nxt = unbound._vscode_settled_usage("/nope.jsonl", SESSION, 3)
         self.assertEqual((usage, nxt, reader.call_count), (None, 3, 1))
+
+    def test_nothing_pending_does_not_wait(self):
+        # a quiet Stop must not block for the whole window when nothing is mid-write
+        with patch.object(unbound, "_vscode_turn_usage",
+                          side_effect=[({"input_tokens": 0}, 0, False)]) as reader:
+            usage, nxt = unbound._vscode_settled_usage("/ws/transcripts/x.jsonl", SESSION, 0)
+        self.assertEqual((nxt, reader.call_count), (0, 1))
 
 
 class TestGetTurnUsage(unittest.TestCase):

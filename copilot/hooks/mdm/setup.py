@@ -832,6 +832,15 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 # finality rules; historical sessions are already final so there is no waiting here.
 _BACKFILL_USAGE_FIELDS = ('input_tokens', 'output_tokens',
                           'cache_read_input_tokens', 'cache_creation_input_tokens')
+# No separator, drive letter or dot-only name can appear, so an id can only ever name a
+# file directly inside chatSessions/ and cannot escape it by construction.
+_BACKFILL_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
+                                    'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+
+
+def _backfill_safe_path_component(value) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= 128
+            and not set(value) - _BACKFILL_SAFE_ID_CHARS and value not in ('.', '..'))
 
 
 def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
@@ -856,22 +865,24 @@ def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
             'SELECT turn_index, input_tokens, output_tokens, cache_read_tokens,'
             ' cache_write_tokens FROM assistant_usage_events WHERE session_id = ?'
             ' ORDER BY turn_index, id', (session_id,)).fetchall()
+        # Totals stay inside the guard: a non-numeric column would otherwise raise out of
+        # the collector and abort the whole backfill run.
+        by_turn: Dict = {}
+        for turn, row_input, row_output, cache_read, cache_write in rows:
+            totals = by_turn.setdefault(turn if isinstance(turn, int) else 0,
+                                        dict((f, 0) for f in _BACKFILL_USAGE_FIELDS))
+            cache_read = max(int(cache_read or 0), 0)
+            cache_write = max(int(cache_write or 0), 0)
+            totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
+            totals['output_tokens'] += max(int(row_output or 0), 0)
+            totals['cache_read_input_tokens'] += cache_read
+            totals['cache_creation_input_tokens'] += cache_write
     except Exception as e:
         debug_print(f"backfill cli usage read failed: {e}")
         return []
     finally:
         if conn is not None:
             conn.close()
-    by_turn: Dict = {}
-    for turn, row_input, row_output, cache_read, cache_write in rows:
-        totals = by_turn.setdefault(turn if isinstance(turn, int) else 0,
-                                    dict((f, 0) for f in _BACKFILL_USAGE_FIELDS))
-        cache_read = max(int(cache_read or 0), 0)
-        cache_write = max(int(cache_write or 0), 0)
-        totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
-        totals['output_tokens'] += max(int(row_output or 0), 0)
-        totals['cache_read_input_tokens'] += cache_read
-        totals['cache_creation_input_tokens'] += cache_write
     return [by_turn[t] for t in sorted(by_turn)]
 
 
@@ -880,6 +891,8 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
     transcript directory. elapsedMs is written after the final counts, so it is what marks
     a request finished; the counts alone appear mid-stream and climb. No cache split."""
     if transcript_path.parent.name != 'transcripts':
+        return []
+    if not _backfill_safe_path_component(session_id):
         return []
     store = transcript_path.parent.parent.parent / 'chatSessions' / (session_id + '.jsonl')
     if not store.exists():
@@ -927,15 +940,21 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
         debug_print(f"backfill vscode usage read failed: {e}")
         return []
     usage = []
-    for index in sorted(requests):
-        entry = requests[index]
-        prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
-        if prompt is None or completion is None or entry.get('elapsedMs') is None:
-            break
-        totals = dict((f, 0) for f in _BACKFILL_USAGE_FIELDS)
-        totals['input_tokens'] = max(int(prompt), 0)
-        totals['output_tokens'] = max(int(completion), 0)
-        usage.append(totals)
+    # Guarded: a non-numeric count in the journal would otherwise raise out of the collector
+    # and abort the whole backfill run.
+    try:
+        for index in sorted(requests):
+            entry = requests[index]
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                break
+            totals = dict((f, 0) for f in _BACKFILL_USAGE_FIELDS)
+            totals['input_tokens'] = max(int(prompt), 0)
+            totals['output_tokens'] = max(int(completion), 0)
+            usage.append(totals)
+    except (TypeError, ValueError) as e:
+        debug_print(f"backfill vscode usage totals failed: {e}")
+        return []
     return usage
 
 

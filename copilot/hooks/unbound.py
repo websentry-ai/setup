@@ -600,8 +600,10 @@ def stop_session_key(event):
     exchange -- so the key never flips between Stops that do and don't carry session_id
     (which would split the watermark and resend the whole history). Falls back to
     session_id only when there is no transcript path."""
+    # Type-checked because the floor lookup runs this over historical audit-log rows, and
+    # a non-string path there would raise out of the Stop handler and drop the exchange.
     tp = event.get('transcript_path')
-    if tp:
+    if isinstance(tp, str) and tp:
         p = Path(tp)
         return p.parent.name if p.stem == 'events' else p.stem
     return event.get('session_id') or event.get('sessionId')
@@ -2927,6 +2929,16 @@ _COPILOT_STORE = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot'
 # later Stop reports the turn. The Stop hook's budget is 60s.
 _VSCODE_SETTLE_SECONDS = 10.0
 _VSCODE_POLL_SECONDS = 0.25
+_VSCODE_MAX_LINES = 50000
+# No separator, drive letter or dot-only name can appear, so an id can only ever name a
+# file directly inside chatSessions/ and cannot escape it by construction.
+_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
+                           'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+
+
+def _safe_path_component(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 128
+            and not set(value) - _SAFE_ID_CHARS and value not in ('.', '..'))
 
 
 def _epoch(value):
@@ -2963,30 +2975,32 @@ def _cli_turn_usage(conversation_id, since, until):
         rows = conn.execute(
             'SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at'
             ' FROM assistant_usage_events WHERE session_id = ?', (conversation_id,)).fetchall()
+        # Totals stay inside the guard: a non-numeric column would otherwise raise past the
+        # Stop handler and drop the whole exchange, not just its usage.
+        totals = dict((field, 0) for field in _USAGE_FIELDS)
+        for row_input, row_output, cache_read, cache_write, created_at in rows:
+            created = _epoch(created_at)
+            if not _in_window(created, since, until):
+                continue
+            cache_read = max(int(cache_read or 0), 0)
+            cache_write = max(int(cache_write or 0), 0)
+            totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
+            totals['output_tokens'] += max(int(row_output or 0), 0)
+            totals['cache_read_input_tokens'] += cache_read
+            totals['cache_creation_input_tokens'] += cache_write
     except Exception as e:
         log_error('cli usage read failed: %s' % e, 'usage')
         return None
     finally:
         if conn is not None:
             conn.close()
-    totals = dict((field, 0) for field in _USAGE_FIELDS)
-    for row_input, row_output, cache_read, cache_write, created_at in rows:
-        created = _epoch(created_at)
-        if not _in_window(created, since, until):
-            continue
-        cache_read = max(int(cache_read or 0), 0)
-        cache_write = max(int(cache_write or 0), 0)
-        totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
-        totals['output_tokens'] += max(int(row_output or 0), 0)
-        totals['cache_read_input_tokens'] += cache_read
-        totals['cache_creation_input_tokens'] += cache_write
     return totals
 
 
 def _vscode_store_path(transcript_path, conversation_id):
     """VS Code keeps per-request tokens in its own chat store, beside the copilot-chat
     transcript directory the hook reads. The transcripts themselves carry no tokens."""
-    if not transcript_path or not conversation_id:
+    if not transcript_path or not _safe_path_component(conversation_id):
         return None
     parent = Path(transcript_path).parent
     if parent.name != 'transcripts':
@@ -3011,7 +3025,9 @@ def _vscode_requests(path):
     next_index = 0
     try:
         with open(path, 'r', encoding='utf-8') as handle:
-            for line in handle:
+            for lineno, line in enumerate(handle):
+                if lineno >= _VSCODE_MAX_LINES:
+                    break
                 line = line.strip()
                 if not line:
                     continue
@@ -3047,42 +3063,69 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
     """Usage for requests from start_index on, stopping at the first whose tokens are not
     written yet. VS Code fills them in after Stop fires, and the lead grows with turn
     length, so an unfinished request is left for a later Stop rather than skipped. Returns
-    (usage, next index to report). No cache split is reported."""
+    (usage, next index to report, whether a request is still being written at that index).
+    No cache split is reported."""
     path = _vscode_store_path(transcript_path, conversation_id)
     if not path:
-        return None, start_index
+        return None, start_index, False
     requests = _vscode_requests(path)
     if requests is None:
-        return None, start_index
+        return None, start_index, False
     totals = dict((field, 0) for field in _USAGE_FIELDS)
     index = max(int(start_index or 0), 0)
-    while index in requests:
-        entry = requests[index]
-        prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
-        # elapsedMs is written after the final counts, so it is the only reliable signal
-        # that they have stopped climbing; the counts themselves appear mid-stream.
-        if prompt is None or completion is None or entry.get('elapsedMs') is None:
-            break
-        totals['input_tokens'] += max(int(prompt), 0)
-        totals['output_tokens'] += max(int(completion), 0)
-        index += 1
-    return totals, index
+    # Guarded: a non-numeric count in the journal would otherwise raise past the Stop
+    # handler and drop the whole exchange, not just its usage.
+    try:
+        while index in requests:
+            entry = requests[index]
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            # elapsedMs is written after the final counts, so it is the only reliable signal
+            # that they have stopped climbing; the counts themselves appear mid-stream.
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                break
+            totals['input_tokens'] += max(int(prompt), 0)
+            totals['output_tokens'] += max(int(completion), 0)
+            index += 1
+    except (TypeError, ValueError) as e:
+        log_error('vscode usage totals failed: %s' % e, 'usage')
+        return None, start_index, False
+    return totals, index, index in requests
+
+
+def _vscode_store_stamp(path):
+    """(mtime, size) of the chat journal, or None when it cannot be stat'd."""
+    if not path:
+        return None
+    try:
+        st = path.stat()
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return None
 
 
 def _vscode_settled_usage(transcript_path, conversation_id, start_index):
     """Wait for this turn to finish being written. Stop fires before the response ends, so
     a first read usually has nothing to report. Giving up is safe: the watermark does not
     advance, so a later Stop reports the turn instead."""
-    usage, next_index = _vscode_turn_usage(transcript_path, conversation_id, start_index)
-    if usage is None or next_index > start_index:
+    usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
+                                                    start_index)
+    # Wait only while a request is mid-write. With nothing pending there is nothing to wait
+    # for, and blocking every quiet Stop for the full window would be pure cost.
+    if usage is None or next_index > start_index or not pending:
         return usage, next_index
-    # Timing out defers, it does not drop: the watermark is only persisted after a send, so
-    # an unreported turn rides the next exchange this session sends, one row later than it
-    # happened. Only a session whose last turn finalises after its final Stop loses it.
+    path = _vscode_store_path(transcript_path, conversation_id)
+    stamp = _vscode_store_stamp(path)
     deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
     while time.monotonic() < deadline:
         time.sleep(_VSCODE_POLL_SECONDS)
-        usage, next_index = _vscode_turn_usage(transcript_path, conversation_id, start_index)
+        # Re-parse only when the journal actually grew; polling alone would otherwise
+        # re-read the whole file once per interval for the length of the wait.
+        current = _vscode_store_stamp(path)
+        if current is not None and current == stamp:
+            continue
+        stamp = current
+        usage, next_index, _pending = _vscode_turn_usage(transcript_path, conversation_id,
+                                                         start_index)
         if usage is None or next_index > start_index:
             break
     return usage, next_index
@@ -3711,18 +3754,23 @@ def main():
                 already_forwarded=already_forwarded,
                 already_prompted=already_prompted,
             )
-            # Send only when there is something new -- new tool calls OR new assistant
-            # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
-            # (even with no new tools) is still sent and logged.
-            if exchange and (forwarded_now or text_sig != last_text_sig):
+            # Resolved before the send gate because usage is a reason to send in its own
+            # right: a turn whose tokens landed too late for its own Stop is reported here,
+            # and gating it behind new text or tools would strand it on a quiet Stop.
+            usage = None
+            if exchange:
+                usage, usage_index = get_turn_usage(
+                    event.get('transcript_path'), exchange.get('conversation_id'),
+                    get_previous_stop_timestamp_for_session(event), timestamp, usage_index)
+            # Send only when there is something new -- new tool calls, new assistant text,
+            # or usage carried over from an earlier turn -- so a pure replay Stop is a
+            # no-op, but a Stop that appended new text (even with no new tools) is sent.
+            if exchange and (forwarded_now or text_sig != last_text_sig or usage):
                 # Turn boundaries from event-fire times
                 request_initialized = get_turn_start_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
-                usage, usage_index = get_turn_usage(
-                    event.get('transcript_path'), exchange.get('conversation_id'),
-                    get_previous_stop_timestamp_for_session(event), timestamp, usage_index)
                 if usage:
                     exchange['usage'] = usage
                 # Record only after the send succeeds, so a failed send retries next Stop
