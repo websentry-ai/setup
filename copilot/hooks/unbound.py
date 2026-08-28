@@ -755,16 +755,19 @@ def get_turn_start_timestamp_for_session(session_id):
     return turn_start or completed_start
 
 
-def _transcript_path_for_session(session_id):
+def _transcript_path_for_session(event):
     """SessionEnd carries sessionId, timestamp, cwd and reason but no transcript path, so
-    recover it from the newest event of this session that had one."""
-    if not session_id:
+    recover it from the newest event of this session that had one. Matched by
+    stop_session_key, the identity the window floor and log cleanup also use, so a row that
+    omits session_id is not passed over."""
+    key = stop_session_key(event)
+    if not key:
         return None
     for log in reversed(load_existing_logs()):
-        event = log.get('event', {})
-        if event.get('session_id') != session_id:
+        logged = log.get('event', {})
+        if stop_session_key(logged) != key:
             continue
-        path = event.get('transcript_path')
+        path = logged.get('transcript_path')
         if isinstance(path, str) and path:
             return path
     return None
@@ -3805,7 +3808,7 @@ def main():
         if event_name in ('Stop', 'SessionEnd'):
             session_id = event.get('session_id')
             if event_name == 'SessionEnd' and not event.get('transcript_path'):
-                recovered = _transcript_path_for_session(session_id)
+                recovered = _transcript_path_for_session(event)
                 if recovered:
                     event = dict(event, transcript_path=recovered)
             # Watermark key mirrors the exchange's session fallback, so get/record stay
