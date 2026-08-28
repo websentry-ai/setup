@@ -1,5 +1,6 @@
-# Release pipeline for the macOS runtime (WEB-4789): tag runtime-v* in,
-# stapled pkg + tar.gz on S3 + GitHub Release out, zero manual steps.
+# Release pipeline for the macOS runtime: dispatched by hand,
+# stapled pkg + tar.gz on S3 + GitHub Release out. Manual dispatch only --
+# no tag or branch push starts a release.
 #
 # Signing / notarization / S3 are each independently GATED on their secrets
 # and vars being configured, so the pipeline runs end-to-end UNSIGNED today
@@ -33,8 +34,6 @@
 name: release-macos-runtime
 
 on:
-  push:
-    tags: ["runtime-v*"]
   workflow_dispatch:
     inputs:
       version:
@@ -42,14 +41,14 @@ on:
         required: true
         default: "0.0.0-dev"
       builder:
-        description: "Bundle builder (WEB-4804 EDR bake-off; tag releases always use pyinstaller)"
+        description: "Bundle builder (WEB-4804 EDR bake-off)"
         type: choice
         options:
           - pyinstaller
           - nuitka
         default: pyinstaller
       publish:
-        description: "Publish to S3 + latest/onboard.sh + GitHub Release. Required to ship a Nuitka build (tag pushes always publish)."
+        description: "Publish to S3 + latest/onboard.sh + GitHub Release. Required to ship a Nuitka build."
         type: boolean
         default: false
 
@@ -717,9 +716,13 @@ jobs:
           DISCOVERY_SHA: ${{ steps.discovery.outputs.sha }}
         run: |
           set -euo pipefail
+          # Built here rather than inline: a bare newline inside the --notes string ends
+          # the YAML block scalar, and indenting the second line to stay inside it would
+          # put four leading spaces in the notes, which renders as a code block.
+          notes="$(printf '%s\n\n%s\n' \
+            "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh." \
+            "discovery source: $DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}")"
           gh release create "runtime-v$VERSION" \
             --title "macOS runtime $VERSION" \
-            --notes "Universal2 macOS runtime (unbound-hook + unbound-discovery). Deploy via Jamf with the attached onboard.sh.
-
-discovery source: $DISCOVERY_REF @ ${DISCOVERY_SHA:-unknown}" \
+            --notes "$notes" \
             out/*.pkg out/*.tar.gz out/*.sha256 out/onboard.sh
