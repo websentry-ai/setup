@@ -3079,9 +3079,16 @@ def _merge_vscode_request(requests, index, obj):
     if not isinstance(obj, dict):
         return
     entry = requests.setdefault(index, {})
-    for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs'):
+    for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs', 'modelId'):
         if obj.get(field) is not None:
             entry[field] = obj[field]
+    # The model that actually served the request. Written with the response, so it lands
+    # later than modelId, which is set when the request is created.
+    result = obj.get('result')
+    if isinstance(result, dict):
+        for round_ in (result.get('metadata') or {}).get('toolCallRounds') or []:
+            if isinstance(round_, dict) and round_.get('modelId'):
+                entry['servedBy'] = round_['modelId']
 
 
 def _vscode_requests(path):
@@ -3121,6 +3128,44 @@ def _vscode_requests(path):
         log_error('vscode usage read failed: %s' % e, 'usage')
         return None
     return requests
+
+
+def _vscode_turn_model(transcript_path, conversation_id, previous_stop, turn_end):
+    """Model for the turn this Stop is reporting. VS Code records it per request, so a
+    mid-session switch is picked up; the transcript the exchange is built from carries no
+    model at all, which is why every row otherwise reads 'auto'.
+
+    Windowed to this turn, the same way usage is: from the previous Stop to this one. The
+    journal is written lazily, so at this Stop the turn's own request may not be there yet.
+    Without the lower bound the newest request would then be the PREVIOUS turn's, and its
+    model would be reported here as though it were this one's -- a confidently wrong answer
+    where saying nothing is correct. Reporting nothing leaves the row at 'auto'.
+
+    Prefer the model that served the request, which names the real model behind an 'auto'
+    pick but only lands once the response completes. The selection is there from the moment
+    the prompt is sent, so an explicitly chosen model is reported even without it."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None
+    requests = _vscode_requests(path)
+    if not requests:
+        return None
+    since, until = _epoch(previous_stop), _epoch(turn_end)
+    if until is None:
+        return None
+    windowed = [i for i in requests
+                if _in_window(_epoch(requests[i].get('timestamp')), since, until)]
+    if not windowed:
+        return None
+    entry = requests[max(windowed)]
+    served = entry.get('servedBy')
+    if isinstance(served, str) and served:
+        return served
+    selected = entry.get('modelId')
+    if isinstance(selected, str) and selected:
+        # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
+        return selected.split('/', 1)[-1] or None
+    return None
 
 
 def _vscode_turn_usage(transcript_path, conversation_id, start_index):
@@ -3832,9 +3877,17 @@ def main():
             # waits for the next real turn, and a session that ends first loses it.
             usage = None
             if exchange:
+                previous_stop = get_previous_stop_timestamp_for_session(event)
                 usage, usage_index = get_turn_usage(
                     event.get('transcript_path'), exchange.get('conversation_id'),
-                    get_previous_stop_timestamp_for_session(event), timestamp, usage_index)
+                    previous_stop, timestamp, usage_index)
+                # After the usage settle, not before: that wait is for this same journal
+                # being written, so resolving the model here sees anything it waited for.
+                turn_model = _vscode_turn_model(event.get('transcript_path'),
+                                                exchange.get('conversation_id'),
+                                                previous_stop, timestamp)
+                if turn_model:
+                    exchange['model'] = turn_model
             # Send only when there is something new -- new tool calls, new assistant text,
             # or usage carried over from an earlier turn -- so a pure replay Stop is a
             # no-op, but a Stop that appended new text (even with no new tools) is sent.
