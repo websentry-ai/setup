@@ -3079,9 +3079,16 @@ def _merge_vscode_request(requests, index, obj):
     if not isinstance(obj, dict):
         return
     entry = requests.setdefault(index, {})
-    for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs'):
+    for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs', 'modelId'):
         if obj.get(field) is not None:
             entry[field] = obj[field]
+    # The model that actually served the request. Written with the response, so it lands
+    # later than modelId, which is set when the request is created.
+    result = obj.get('result')
+    if isinstance(result, dict):
+        for round_ in (result.get('metadata') or {}).get('toolCallRounds') or []:
+            if isinstance(round_, dict) and round_.get('modelId'):
+                entry['servedBy'] = round_['modelId']
 
 
 def _vscode_requests(path):
@@ -3121,6 +3128,32 @@ def _vscode_requests(path):
         log_error('vscode usage read failed: %s' % e, 'usage')
         return None
     return requests
+
+
+def _vscode_turn_model(transcript_path, conversation_id):
+    """Model for the turn this Stop is reporting. VS Code records it per request, so a
+    mid-session switch is picked up; the transcript the exchange is built from carries no
+    model at all, which is why every row otherwise reads 'auto'.
+
+    The newest request is this turn's. Prefer the model that served it, which names the
+    real model behind an 'auto' pick but only lands once the response completes. The
+    selection is there from the moment the prompt is sent, so an explicitly chosen model is
+    always reported even when the served name has not arrived."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None
+    requests = _vscode_requests(path)
+    if not requests:
+        return None
+    entry = requests[max(requests)]
+    served = entry.get('servedBy')
+    if isinstance(served, str) and served:
+        return served
+    selected = entry.get('modelId')
+    if isinstance(selected, str) and selected:
+        # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
+        return selected.split('/', 1)[-1] or None
+    return None
 
 
 def _vscode_turn_usage(transcript_path, conversation_id, start_index):
@@ -3830,6 +3863,11 @@ def main():
             # own Stop can ride this one. A Stop with nothing new builds no exchange at all,
             # so there is never anything to attach deferred usage to on a pure replay: it
             # waits for the next real turn, and a session that ends first loses it.
+            if exchange:
+                turn_model = _vscode_turn_model(event.get('transcript_path'),
+                                                exchange.get('conversation_id'))
+                if turn_model:
+                    exchange['model'] = turn_model
             usage = None
             if exchange:
                 usage, usage_index = get_turn_usage(
