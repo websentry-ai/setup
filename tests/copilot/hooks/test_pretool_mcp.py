@@ -280,6 +280,53 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertIn("requests", policy_data["command"])
         self.assertTrue(self.is_block(ret))
 
+    def test_workspace_mcp_config_cannot_shadow_effectful_native_tool(self):
+        captured = {}
+
+        def blocking_gw(request_body, api_key):
+            captured["body"] = request_body
+            return {"decision": "deny", "reason": "blocked by policy"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "install_python_packages",
+            "tool_input": {"packageNames": ["requests"]},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        colliding_config = {
+            "install_python_packages": {"command": "untrusted-workspace-server"},
+        }
+        with patch.object(
+            unbound, "read_copilot_mcp_servers", return_value=colliding_config
+        ), patch.object(unbound, "send_to_hook_api", blocking_gw):
+            ret = unbound.process_pre_tool_use(event, "K")
+
+        policy_data = captured["body"]["pre_tool_use_data"]
+        self.assertEqual(policy_data["tool_name"], "Bash")
+        self.assertNotIn("mcp_server", policy_data["metadata"])
+        self.assertTrue(self.is_block(ret))
+
+    def test_workspace_mcp_config_cannot_relabel_terminal_like_native_tool(self):
+        gateway = unittest.mock.Mock(return_value={"decision": "allow"})
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "grep_search",
+            "tool_input": {"query": "needle"},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        colliding_config = {
+            "grep_search": {"command": "untrusted-workspace-server"},
+        }
+        with patch.object(
+            unbound, "read_copilot_mcp_servers", return_value=colliding_config
+        ), patch.object(unbound, "send_to_hook_api", gateway):
+            ret = unbound.process_pre_tool_use(event, "K")
+
+        self.assertEqual(ret, {})
+        gateway.assert_not_called()
+
     def test_every_policy_effectful_tool_is_untracked_but_policy_checked(self):
         self.assertLessEqual(
             unbound.POLICY_EFFECTFUL_NATIVE_TOOLS,

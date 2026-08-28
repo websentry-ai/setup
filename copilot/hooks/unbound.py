@@ -2187,28 +2187,34 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             # the allow-list isn't evaluated without a resolved server (fail-open).
             log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
 
-    if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
+    native_without_policy = (
+        raw_tool in INTERNAL_TOOLS
+        or raw_tool in UNTRACKED_NATIVE_TOOLS
+        or raw_tool in TERMINAL_LIKE_TOOLS
+    )
+    if raw_tool in POLICY_EFFECTFUL_NATIVE_TOOLS:
+        canonical = 'Bash'
+    elif native_without_policy:
+        return {}
+    elif not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         cwd = event.get('cwd')
         mcp_servers = read_copilot_mcp_servers(cwd)
         mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
         if mcp_server is None:
-            if raw_tool in POLICY_EFFECTFUL_NATIVE_TOOLS:
-                canonical = 'Bash'
-            else:
-                # A bare (non-mcp__) tool can only be resolved against the MCP config.
-                # If no config was readable, a genuine MCP call can't be identified
-                # and would slip the allow-list — surface that distinctly so the
-                # potential bypass is observable rather than silent. Skip known-benign
-                # native tools so the log isn't noisy.
-                if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
-                    if not mcp_servers and not raw_tool_lower.startswith('mcp__'):
-                        log_error(
-                            f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
-                            'mcp_config',
-                        )
-                    else:
-                        log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
-                return {}
+            # A bare (non-mcp__) tool can only be resolved against the MCP config.
+            # If no config was readable, a genuine MCP call can't be identified
+            # and would slip the allow-list — surface that distinctly so the
+            # potential bypass is observable rather than silent. Skip known-benign
+            # native tools so the log isn't noisy.
+            if raw_tool and raw_tool not in TERMINAL_LIKE_TOOLS:
+                if not mcp_servers and not raw_tool_lower.startswith('mcp__'):
+                    log_error(
+                        f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
+                        'mcp_config',
+                    )
+                else:
+                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
+            return {}
         else:
             is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
@@ -2971,18 +2977,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     project = None
     native_untracked = name in INTERNAL_TOOLS or name in UNTRACKED_NATIVE_TOOLS
     if native_untracked:
-        mcp_servers = mcp_servers or {}
-        mcp_server, _mcp_tool, _config = detect_mcp_call(name, mcp_servers)
-        if mcp_server is None:
-            return None
-        entry = {
-            'type': 'afterMCPExecution',
-            'tool_name': name,
-            'tool_input': args,
-            'result_json': result_content or '',
-            'server_name': mcp_server,
-        }
-        project = None
+        return None
     elif name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
         if name in SHELL_TOOLS:
             command = args.get('command') or args.get('input') or args.get('text') or ''
