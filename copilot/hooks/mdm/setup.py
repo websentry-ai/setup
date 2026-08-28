@@ -844,6 +844,16 @@ _BACKFILL_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
 _BACKFILL_MAX_LINE_CHARS = 1 << 20
 
 
+def _backfill_is_regular_file(path: Path) -> bool:
+    """A FIFO or device node here would block the run, so opening is gated on a real file
+    rather than on mere existence. Symlinks are followed: anything able to plant one inside
+    the user's own home could edit this script instead."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def _backfill_safe_path_component(value) -> bool:
     return (isinstance(value, str) and 1 <= len(value) <= 128
             and not set(value) - _BACKFILL_SAFE_ID_CHARS and value not in ('.', '..')
@@ -881,7 +891,7 @@ def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
     if len(parents) < 3:
         return []
     store = parents[2] / 'session-store.db'
-    if not store.exists():
+    if not _backfill_is_regular_file(store):
         return []
     conn = None
     try:
@@ -924,7 +934,7 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
     if not _backfill_safe_path_component(session_id):
         return []
     store = transcript_path.parent.parent.parent / 'chatSessions' / (session_id + '.jsonl')
-    if not store.exists():
+    if not _backfill_is_regular_file(store):
         return []
     requests: Dict = {}
     next_index = 0

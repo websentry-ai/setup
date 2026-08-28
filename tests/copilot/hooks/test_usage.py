@@ -614,3 +614,43 @@ class TestCleanupKeepsTheUsageFloor(unittest.TestCase):
             floor = unbound.get_previous_stop_timestamp_for_session(
                 {"transcript_path": self.CLI})
         self.assertEqual(floor, "t2")
+
+
+class TestStorePathsMustBeRegularFiles(unittest.TestCase):
+    """A FIFO or device node in place of a store would block the hook for its whole budget,
+    so opening is gated on a real file rather than on mere existence."""
+
+    def test_a_fifo_is_not_accepted_as_a_vscode_store(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ws" / "hash"
+            (root / "chatSessions").mkdir(parents=True)
+            (root / "GitHub.copilot-chat" / "transcripts").mkdir(parents=True)
+            os.mkfifo(str(root / "chatSessions" / (SESSION + ".jsonl")))
+            transcript = root / "GitHub.copilot-chat" / "transcripts" / (SESSION + ".jsonl")
+            transcript.write_text("", encoding="utf-8")
+            self.assertIsNone(unbound._vscode_store_path(str(transcript), SESSION))
+
+    def test_a_directory_is_not_accepted_as_a_store(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "ws" / "hash"
+            (root / "chatSessions" / (SESSION + ".jsonl")).mkdir(parents=True)
+            (root / "GitHub.copilot-chat" / "transcripts").mkdir(parents=True)
+            transcript = root / "GitHub.copilot-chat" / "transcripts" / (SESSION + ".jsonl")
+            transcript.write_text("", encoding="utf-8")
+            self.assertIsNone(unbound._vscode_store_path(str(transcript), SESSION))
+
+    def test_a_real_file_is_still_accepted(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, [{"kind": 1, "v": {"requests": []}}])
+            self.assertIsNotNone(unbound._vscode_store_path(transcript, SESSION))
+
+    def test_a_fifo_is_not_accepted_as_the_cli_store(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no mkfifo on this platform")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = Path(tmpdir) / "session-store.db"
+            os.mkfifo(str(store))
+            with patch.object(unbound, "_COPILOT_STORE", store):
+                self.assertIsNone(unbound._cli_turn_usage(SESSION, None, float("inf")))

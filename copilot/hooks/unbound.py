@@ -2947,6 +2947,16 @@ _RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
                                    + ['lpt%d' % n for n in range(1, 10)])
 
 
+def _is_regular_file(path):
+    """A FIFO or device node here would block the hook for its whole budget, so opening is
+    gated on a real file rather than on mere existence. Symlinks are followed: anything able
+    to plant one inside the user's own home could edit this script instead."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
 def _safe_path_component(value):
     return (isinstance(value, str) and 1 <= len(value) <= 128
             and not set(value) - _SAFE_ID_CHARS and value not in ('.', '..')
@@ -2996,7 +3006,7 @@ def _in_window(created, since, until):
 def _cli_turn_usage(conversation_id, since, until):
     """Per-request tokens the CLI writes to its own store within seconds of each call.
     Its input_tokens counts both cache tiers, so they come back out to leave fresh input."""
-    if not conversation_id or not _COPILOT_STORE.exists():
+    if not conversation_id or not _is_regular_file(_COPILOT_STORE):
         return None
     conn = None
     try:
@@ -3040,7 +3050,7 @@ def _vscode_store_path(transcript_path, conversation_id):
     if parent.name != 'transcripts':
         return None
     path = parent.parent.parent / 'chatSessions' / (conversation_id + '.jsonl')
-    return path if path.exists() else None
+    return path if _is_regular_file(path) else None
 
 
 def _merge_vscode_request(requests, index, obj):
