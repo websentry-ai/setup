@@ -10,7 +10,7 @@ import json
 
 import pytest
 
-from conftest import run_binary, run_cli_dev, run_python_path
+from conftest import run_binary, run_cli_dev, run_go_binary, run_python_path
 
 S = {"session_id": "test-session", "transcript_path": "/nonexistent/transcript.jsonl"}
 
@@ -102,6 +102,15 @@ def test_frozen_binary_matches_python_path(tool, event, sandbox_home):
     payload = json.dumps(EVENT_PAYLOADS[tool][event])
     ref = run_python_path(tool, payload, sandbox_home)
     got = run_binary(["hook", tool, event], payload, sandbox_home)
+    assert got.stdout == ref.stdout
+    assert got.returncode == ref.returncode
+
+
+@pytest.mark.parametrize("tool,event", CASES)
+def test_go_binary_matches_python_path(tool, event, sandbox_home):
+    payload = json.dumps(EVENT_PAYLOADS[tool][event])
+    ref = run_python_path(tool, payload, sandbox_home)
+    got = run_go_binary(["hook", tool, event], payload, sandbox_home)
     assert got.stdout == ref.stdout
     assert got.returncode == ref.returncode
 
