@@ -145,6 +145,18 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
 
         self.assertIsNone(mapped)
 
+    def test_existing_native_aliases_keep_their_analytics_types(self):
+        cases = (
+            ('send_to_terminal', {'command': 'pwd'}, 'afterShellExecution'),
+            ('read_project_structure', {'path': '/repo'}, 'beforeReadFile'),
+            ('create_directory', {'path': '/repo/new'}, 'afterFileEdit'),
+            ('insert_edit_into_file', {'path': '/repo/a.py'}, 'afterFileEdit'),
+        )
+        for name, arguments, expected_type in cases:
+            with self.subTest(name=name):
+                mapped = unbound.map_copilot_tool(name, arguments, 'ok')
+                self.assertEqual(mapped['type'], expected_type)
+
     def test_unmapped_native_tool_is_not_emitted(self):
         mapped = unbound.map_copilot_tool(
             'install_python_packages',
@@ -195,6 +207,19 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(
             tool_use[0]["mcp_server_config"], {"command": "github-mcp-server"}
         )
+
+    def test_builtin_github_is_reported_without_local_config(self):
+        mapped = unbound.map_copilot_tool(
+            "github-mcp-server-search_code",
+            {"query": "mcp"},
+            "ok",
+            mcp_servers={},
+        )
+
+        self.assertEqual(mapped["type"], "afterMCPExecution")
+        self.assertEqual(mapped["server_name"], "github-mcp-server")
+        self.assertEqual(mapped["mcp_tool_name"], "search_code")
+        self.assertNotIn("mcp_server_config", mapped)
 
     def test_transcript_mcp_fields_are_used_without_parsing_tool_name(self):
         path = _transcript([

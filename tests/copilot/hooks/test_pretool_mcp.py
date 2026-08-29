@@ -132,6 +132,7 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(
             unbound._resolve_vscode_mcp("mcp_unknownserver_do_thing", self.servers),
             (None, None, None))
+        self.assertEqual(unbound.canonical_tool_name("mcpWithoutSeparator"), "")
 
     def test_configured_server_name_without_a_tool_is_not_an_mcp_call(self):
         self.assertEqual(
@@ -150,6 +151,14 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(server, "azure_devops")
         self.assertEqual(tool, "wit_work_item_link_write")
         self.assertEqual(config, servers["azure_devops"])
+
+    def test_builtin_github_resolves_without_local_config(self):
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-search_code", {}
+            ),
+            ("github-mcp-server", "search_code", None),
+        )
 
 
 def _gateway(sanctioned_groups):
@@ -257,6 +266,30 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(captured["md"].get("mcp_server"), "microsoft/markitdown")
         self.assertEqual(captured["md"].get("mcp_tool"), "convert_to_markdown")
         self.assertIn("mcp_server_config", captured["md"])
+
+    def test_builtin_github_forwards_identity_without_local_config(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["request"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "github-mcp-server-search_code",
+            "tool_input": {"query": "mcp"},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        with patch.object(unbound, "read_copilot_mcp_servers", return_value={}), \
+             patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+
+        pretool = captured["request"]["pre_tool_use_data"]
+        self.assertEqual(pretool["tool_name"], "mcp__github-mcp-server__search_code")
+        self.assertEqual(pretool["metadata"]["mcp_server"], "github-mcp-server")
+        self.assertEqual(pretool["metadata"]["mcp_tool"], "search_code")
+        self.assertNotIn("mcp_server_config", pretool["metadata"])
 
     def test_unknown_fingerprint_dispatches_targeted_scan(self):
         event = {

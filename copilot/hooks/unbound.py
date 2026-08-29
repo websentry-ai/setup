@@ -66,12 +66,27 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-SHELL_TOOLS = {'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal', 'terminal'}
-READ_TOOLS = {'read_file', 'readFile', 'view', 'list_dir', 'listDirectory', 'cat'}
-WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
-EDIT_TOOLS = {'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit', 'replace_string_in_file'}
+# Only aliases mapped to existing analytics types. Other native tools are skipped.
+SHELL_TOOLS = {
+    'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal',
+    'terminal', 'send_to_terminal',
+}
+READ_TOOLS = {
+    'read_file', 'readFile', 'view', 'cat', 'list_dir', 'listDirectory',
+    'read_project_structure', 'read_notebook_cell_output',
+    'get_notebook_summary', 'copilot_getNotebookSummary', 'view_image',
+}
+WRITE_TOOLS = {
+    'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file',
+    'create_directory',
+}
+EDIT_TOOLS = {
+    'str_replace', 'edit', 'edit_file', 'editFile', 'edit_files', 'apply_patch',
+    'insert_edit', 'insert_edit_into_file', 'replace_string_in_file',
+    'multi_replace_string_in_file', 'edit_notebook_file',
+}
 
-ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
+ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
 # when the tool reports it, otherwise a deterministic synthetic one. The backend
@@ -757,6 +772,8 @@ def _build_user_prompt_payload(recent_user_prompts):
 def canonical_tool_name(raw):
     """Translate a Copilot tool name to the canonical gateway vocabulary.
     Returns '' when the tool is not security-relevant."""
+    if not isinstance(raw, str):
+        return ''
     # The Copilot CLI emits Claude-style canonical names directly (Read / Write
     # / Edit / Bash); only the VS Code agent uses the lowercase vocabulary in
     # the sets below. Pass canonical names through, otherwise every CLI
@@ -772,7 +789,7 @@ def canonical_tool_name(raw):
         return 'Write'
     if raw in EDIT_TOOLS:
         return 'Edit'
-    if raw.lower().startswith('mcp'):
+    if raw.lower().startswith('mcp_'):
         # MCP tools pass through unchanged — the gateway matches on the raw name.
         return raw
     return ''
@@ -1052,7 +1069,7 @@ def _hook_candidate_script(command, args):
 _HOOK_MAX_SCRIPT_BYTES = 256 * 1024
 
 
-def _read_script_body_b64(command, args, cwd):
+def _read_local_script(command, args, cwd):
     try:
         candidate = _hook_candidate_script(command, args)
         if not candidate:
@@ -1065,10 +1082,14 @@ def _read_script_body_b64(command, args, cwd):
         if not os.path.isfile(path):
             return None
         with open(path, 'rb') as f:
-            data = f.read(_HOOK_MAX_SCRIPT_BYTES)
-        return base64.b64encode(data).decode('ascii')
+            return f.read(_HOOK_MAX_SCRIPT_BYTES)
     except Exception:
         return None
+
+
+def _read_script_body_b64(command, args, cwd):
+    data = _read_local_script(command, args, cwd)
+    return base64.b64encode(data).decode('ascii') if data is not None else None
 
 
 def _compute_script_hash(command, args, cwd):
@@ -1076,29 +1097,8 @@ def _compute_script_hash(command, args, cwd):
     local script. Matches what the backend recomputes from the uploaded body, so
     the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
     Capped so all clients agree on the hash for large scripts."""
-    try:
-        cand = _hook_candidate_script(command, args)
-        if not cand:
-            return None
-        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
-        if '${' in path:  # an env var we couldn't expand -> can't resolve
-            return None
-        if not os.path.isabs(path) and cwd:
-            path = os.path.join(cwd, path)
-        if not os.path.isfile(path):
-            return None
-        h = hashlib.sha256()
-        remaining = _HOOK_MAX_SCRIPT_BYTES
-        with open(path, 'rb') as f:
-            while remaining > 0:
-                chunk = f.read(min(65536, remaining))
-                if not chunk:
-                    break
-                h.update(chunk)
-                remaining -= len(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
+    data = _read_local_script(command, args, cwd)
+    return hashlib.sha256(data).hexdigest() if data is not None else None
 
 
 def _augment_script_hash(result, cwd):
@@ -1806,6 +1806,7 @@ def _sanitize_copilot_server_name(name):
 # and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
 # false-positive relabels of unrelated tools sharing a server's prefix.
 _MCP_NAME_SEPARATORS = ('__', '-')
+_GITHUB_BUILTIN_MCP_PREFIX = 'github-mcp-server-'
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
@@ -1909,6 +1910,21 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
         if best_key is None or other_key is None or other_key != best_key:
             return (None, None, None)
     return (best[2], best[3], mcp_servers.get(best[2]))
+
+
+def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None):
+    if (isinstance(server_name, str) and server_name
+            and isinstance(tool_name, str) and tool_name):
+        return (server_name, tool_name, mcp_servers.get(server_name))
+    lowered = (raw_tool or '').lower()
+    if lowered.startswith(_GITHUB_BUILTIN_MCP_PREFIX):
+        tool = raw_tool[len(_GITHUB_BUILTIN_MCP_PREFIX):]
+        if tool:
+            server = _GITHUB_BUILTIN_MCP_PREFIX[:-1]
+            return (server, tool, mcp_servers.get(server))
+    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
+        return _resolve_vscode_mcp(raw_tool, mcp_servers)
+    return detect_mcp_call(raw_tool, mcp_servers)
 
 
 def extract_command_for_pretool(canonical, tool_input):
@@ -2126,53 +2142,39 @@ def process_pre_tool_use(event, api_key):
 def _evaluate_pre_tool_use_policies(event, api_key):
     """Run the gateway policy check for a PreToolUse event."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
+    if not isinstance(raw_tool, str):
+        return {}
     # VS Code can hand toolArgs over as a JSON string. Every reader below calls
     # tool_input.get(), so normalize once here — a raw str raised out of the hook, and a
     # hook that raises fails open, so the tool ran with no policy check at all.
     tool_input = _normalize_arguments(event.get('tool_input') or event.get('toolArgs') or {})
     session_id = event.get('session_id') or event.get('sessionId')
 
-    # Translate the Copilot tool name to the canonical gateway vocabulary.
     canonical = canonical_tool_name(raw_tool)
-    is_mcp = canonical.lower().startswith('mcp')
+    is_mcp = canonical.lower().startswith('mcp_')
     mcp_server = mcp_tool = mcp_server_config = None
-    raw_tool_lower = raw_tool.lower()
 
-    # VS Code's `mcp_<server>_<tool>` form: canonical_tool_name() leaves the `mcp`
-    # prefix as-is so the bare-tool detection below is skipped; resolve the server
-    # here and forward its config so the gateway can fingerprint it.
-    if (is_mcp and raw_tool_lower.startswith('mcp_')
-            and not raw_tool_lower.startswith('mcp__')):
+    if is_mcp or canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         mcp_servers = read_copilot_mcp_servers(event.get('cwd'))
-        mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(raw_tool, mcp_servers)
-        if mcp_server is not None:
+        mcp_server, mcp_tool, mcp_server_config = resolve_copilot_mcp(
+            raw_tool,
+            mcp_servers,
+            event.get('mcp_server_name') or event.get('mcpServerName'),
+            event.get('mcp_tool_name') or event.get('mcpToolName'),
+        )
+        if mcp_server is None:
+            if not is_mcp:
+                return {}
+            log_error(f"copilot mcp unresolved session={session_id} tool={raw_tool}", 'mcp_match')
+        else:
+            is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
             log_error(
-                f"copilot vscode mcp detected session={session_id} tool={raw_tool} "
+                f"copilot mcp detected session={session_id} tool={raw_tool} "
                 f"server={mcp_server} mcp_tool={mcp_tool} "
                 f"config={'yes' if mcp_server_config else 'no'}",
                 'mcp_match',
             )
-        else:
-            # Unmappable server: fall through to the gateway with mcp_server unset
-            # (not a short-circuit) so its other policies/logging/metering still run;
-            # the allow-list isn't evaluated without a resolved server (fail-open).
-            log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
-
-    if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
-        cwd = event.get('cwd')
-        mcp_servers = read_copilot_mcp_servers(cwd)
-        mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
-        if mcp_server is None:
-            return {}
-        is_mcp = True
-        canonical = f"mcp__{mcp_server}__{mcp_tool}"
-        log_error(
-            f"copilot mcp detected session={session_id} tool={raw_tool} "
-            f"server={mcp_server} mcp_tool={mcp_tool} "
-            f"config={'yes' if mcp_server_config else 'no'}",
-            'mcp_match',
-        )
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -2910,7 +2912,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     file path (relative paths joined onto the shell dir), shell entries from
     absolute paths in the command or the tracked shell dir.
     """
-    if not name:
+    if not isinstance(name, str) or not name:
         return None
     shell_state = shell_state if shell_state is not None else {}
     root_projects = root_projects if root_projects is not None else {}
@@ -2965,19 +2967,9 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     else:
         mcp_servers = mcp_servers or {}
         lowered_name = name.lower()
-        if (
-            isinstance(mcp_server_name, str)
-            and isinstance(mcp_tool_name, str)
-            and mcp_server_name
-            and mcp_tool_name
-        ):
-            mcp_server = mcp_server_name
-            mcp_tool = mcp_tool_name
-            mcp_server_config = mcp_servers.get(mcp_server_name)
-        elif lowered_name.startswith('mcp_') and not lowered_name.startswith('mcp__'):
-            mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(name, mcp_servers)
-        else:
-            mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(name, mcp_servers)
+        mcp_server, mcp_tool, mcp_server_config = resolve_copilot_mcp(
+            name, mcp_servers, mcp_server_name, mcp_tool_name
+        )
         if mcp_server is None and not lowered_name.startswith('mcp_'):
             return None
         entry = {

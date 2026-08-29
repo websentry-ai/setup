@@ -44,6 +44,30 @@ class TestRunAsUserIpc(unittest.TestCase):
     def test_parent_rejects_pickle_from_the_unprivileged_child(self):
         self.assertIsNone(self._decode(pickle.dumps({"unsafe": True})))
 
+    def test_child_retries_partial_pipe_writes(self):
+        info = SimpleNamespace(pw_uid=501, pw_gid=20, pw_dir="/tmp/user")
+        writes = []
+
+        def partial_write(_fd, payload):
+            writes.append(payload)
+            return 2 if len(writes) == 1 else len(payload)
+
+        with patch.object(mdm.platform, "system", return_value="linux"), \
+                patch.object(mdm.pwd, "getpwnam", return_value=info), \
+                patch.object(mdm.os, "pipe", return_value=(10, 11)), \
+                patch.object(mdm.os, "fork", return_value=0), \
+                patch.object(mdm.os, "close"), \
+                patch.object(mdm.os, "setgroups"), \
+                patch.object(mdm.os, "setgid"), \
+                patch.object(mdm.os, "setuid"), \
+                patch.object(mdm.os, "write", side_effect=partial_write), \
+                patch.object(mdm.os, "_exit", side_effect=SystemExit), \
+                patch.dict(mdm.os.environ, {}, clear=False):
+            with self.assertRaises(SystemExit):
+                mdm._run_as_user("user", lambda: {"ok": True})
+
+        self.assertEqual(writes[1], writes[0][2:])
+
 
 def _cli_tree(tmpdir, rows, session=SESSION):
     copilot = Path(tmpdir) / ".copilot"

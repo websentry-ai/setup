@@ -87,7 +87,12 @@ def _run_as_user(username, fn, *args, **kwargs):
             # a future slip and keeps the env consistent with the dropped uid.
             os.environ['HOME'] = info.pw_dir
             result = fn(*args, **kwargs)
-            os.write(w_fd, json.dumps(result).encode('utf-8'))
+            payload = json.dumps(result).encode('utf-8')
+            while payload:
+                written = os.write(w_fd, payload)
+                if written <= 0:
+                    raise OSError('could not write child result')
+                payload = payload[written:]
             os.close(w_fd)
             os._exit(0)
         except Exception:
