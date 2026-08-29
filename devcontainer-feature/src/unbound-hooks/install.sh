@@ -7,17 +7,30 @@
 # it into this feature dir before publish — see .github/workflows/publish-feature.yml), so
 # there is no vendored/drifting duplicate.
 #
-# python3 (the hook's only dependency) is installed automatically via the dependsOn the
-# official python feature. The hook reads credentials directly: UNBOUND_CLAUDE_API_KEY in
+# python3 (the hook's only dependency) is installed best-effort across common package
+# managers (apt/apk/dnf/microdnf/yum) so the Feature stays OS-agnostic — no external
+# feature dependency. The hook reads credentials directly: UNBOUND_CLAUDE_API_KEY in
 # the env, or a mounted ~/.unbound/config.json. No shell env-export bridge is installed —
 # the hook resolves config.json itself.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
-# Safety net: dependsOn should have provided python3 already.
+# The hook requires python3. Install it best-effort across common package managers, the
+# same way curl is handled below. Guarded with `|| true` so a failed install never aborts
+# the build under `set -e` — the safety-net warning below fires only if it truly failed.
 if ! command -v python3 >/dev/null 2>&1; then
-  echo "unbound-hooks: WARNING — python3 not found on PATH despite the python dependency;" >&2
+  if   command -v apt-get  >/dev/null 2>&1; then apt-get update 2>&1 && apt-get install -y --no-install-recommends python3 2>&1 || true
+  elif command -v apk      >/dev/null 2>&1; then apk add --no-cache python3 2>&1 || true
+  elif command -v dnf      >/dev/null 2>&1; then dnf install -y python3 2>&1 || true
+  elif command -v microdnf >/dev/null 2>&1; then microdnf install -y python3 2>&1 || true
+  elif command -v yum      >/dev/null 2>&1; then yum install -y python3 2>&1 || true
+  fi
+fi
+
+# Safety net: warn (don't fail) if python3 still isn't available after the best-effort install.
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "unbound-hooks: WARNING — python3 not found on PATH and could not be installed;" >&2
   echo "unbound-hooks: hooks will fail open (no enforcement) until python3 is available." >&2
 fi
 
