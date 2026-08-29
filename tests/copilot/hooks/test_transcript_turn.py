@@ -191,6 +191,85 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         tool_use = exchange["messages"][1]["tool_use"]
         self.assertEqual(tool_use[0]["type"], "afterMCPExecution")
         self.assertEqual(tool_use[0]["server_name"], "github-mcp-server")
+        self.assertEqual(tool_use[0]["mcp_tool_name"], "search_code")
+        self.assertEqual(
+            tool_use[0]["mcp_server_config"], {"command": "github-mcp-server"}
+        )
+
+    def test_transcript_mcp_fields_are_used_without_parsing_tool_name(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="search docs"),
+            _entry(
+                "tool.execution_start",
+                toolCallId="call-a",
+                toolName="opaque-tool-name",
+                mcpServerName="docs_alias",
+                mcpToolName="search_docs",
+                arguments={"query": "hooks"},
+            ),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "ok"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        config = {"type": "http", "url": "https://docs.example/mcp"}
+        with unittest.mock.patch.object(
+            unbound,
+            "read_copilot_mcp_servers",
+            return_value={"docs_alias": config},
+        ):
+            exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+                path, SESSION, cwd="/workspace")
+
+        tool_use = exchange["messages"][1]["tool_use"]
+        self.assertEqual(tool_use[0]["server_name"], "docs_alias")
+        self.assertEqual(tool_use[0]["mcp_tool_name"], "search_docs")
+        self.assertEqual(tool_use[0]["mcp_server_config"], config)
+
+    def test_tool_request_mcp_fields_work_without_execution_start(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="search code"),
+            _entry("assistant.message", content="", toolRequests=[{
+                "toolCallId": "call-a",
+                "name": "github-mcp-server-search_code",
+                "arguments": {"query": "mcp"},
+                "mcpServerName": "github-mcp-server",
+                "mcpToolName": "search_code",
+            }]),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "ok"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION)
+
+        tool_use = exchange["messages"][1]["tool_use"]
+        self.assertEqual(tool_use[0]["server_name"], "github-mcp-server")
+        self.assertEqual(tool_use[0]["mcp_tool_name"], "search_code")
+        self.assertNotIn("mcp_server_config", tool_use[0])
+
+    def test_invalid_explicit_mcp_fields_fall_back_without_breaking_stop(self):
+        path = _transcript([
+            _entry("user.message", _id="u1", content="use it"),
+            _entry(
+                "tool.execution_start",
+                toolCallId="call-a",
+                toolName="new_copilot_builtin",
+                mcpServerName={"unexpected": "object"},
+                mcpToolName="search_code",
+                arguments={},
+            ),
+            _entry("tool.execution_complete", toolCallId="call-a", success=True,
+                   result={"content": "ok"}),
+            _entry("assistant.message", content="done"),
+        ])
+
+        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            path, SESSION
+        )
+
+        self.assertNotIn("tool_use", exchange["messages"][1])
 
     def test_cli_shape_queued_prompt_inside_the_agent_turn(self):
         path = _transcript([

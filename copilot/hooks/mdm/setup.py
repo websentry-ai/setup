@@ -12,7 +12,7 @@ import json
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict
+from typing import Any, Tuple, List, Optional, Dict
 try:
     import pwd
 except ImportError:
@@ -814,7 +814,7 @@ def _backfill_load_hook_module():
         return None
 
 
-def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, str]]:
+def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, Any]]:
     hook = _backfill_load_hook_module()
     if hook is None:
         return {}
@@ -840,6 +840,8 @@ def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, st
                     "toolCallId": data.get("toolCallId"),
                     "name": data.get("toolName"),
                     "arguments": data.get("arguments"),
+                    "mcpServerName": data.get("mcpServerName"),
+                    "mcpToolName": data.get("mcpToolName"),
                 }]
             for request in requests or []:
                 if not isinstance(request, dict):
@@ -854,17 +856,32 @@ def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, st
                     arguments = normalizer(arguments)
                 elif not isinstance(arguments, dict):
                     arguments = {}
-                mapped = hook.map_copilot_tool(
-                    tool_name, arguments, "", mcp_servers=mcp_servers
-                )
+                explicit_server = request.get("mcpServerName")
+                explicit_tool = request.get("mcpToolName")
+                if isinstance(explicit_server, str) and isinstance(explicit_tool, str):
+                    mapped = hook.map_copilot_tool(
+                        tool_name, arguments, "", mcp_servers=mcp_servers,
+                        mcp_server_name=explicit_server, mcp_tool_name=explicit_tool,
+                    )
+                else:
+                    mapped = hook.map_copilot_tool(
+                        tool_name, arguments, "", mcp_servers=mcp_servers
+                    )
                 if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
                     continue
                 server_name = mapped.get("server_name")
                 if isinstance(server_name, str) and server_name:
-                    provenance[call_id] = {
+                    item = {
                         "tool_name": tool_name,
                         "server_name": server_name,
                     }
+                    mcp_tool_name = mapped.get("mcp_tool_name")
+                    if isinstance(mcp_tool_name, str) and mcp_tool_name:
+                        item["mcp_tool_name"] = mcp_tool_name
+                    mcp_server_config = mapped.get("mcp_server_config")
+                    if isinstance(mcp_server_config, dict) and mcp_server_config:
+                        item["mcp_server_config"] = mcp_server_config
+                    provenance[call_id] = item
         return provenance
     except Exception as exc:
         debug_print(f"could not resolve backfill MCP calls: {exc}")

@@ -5,6 +5,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 """
 
 import sys
+import base64
 import json
 import os
 import platform
@@ -796,6 +797,13 @@ def _vscode_user_dirs():
 
 # Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
 # into mcp.json, so scan them. Not capped — a dropped config would fail open.
+def _copilot_home(home=None):
+    configured = os.environ.get("COPILOT_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    return (home or Path.home()) / ".copilot"
+
+
 def _plugin_mcp_config_paths(home):
     paths = []
     for user_dir in _vscode_user_dirs():
@@ -804,39 +812,61 @@ def _plugin_mcp_config_paths(home):
         except OSError:
             pass
     try:
-        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
+        paths.extend(sorted((_copilot_home(home) / "installed-plugins").glob("*/.mcp.json")))
     except OSError:
         pass
     return paths
 
 
-# All Copilot MCP config locations, ordered for the last-wins merge in
-# read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
+def _workspace_mcp_config_paths(cwd):
+    if not cwd:
+        return []
+    try:
+        current = Path(cwd).resolve()
+    except OSError:
+        current = Path(cwd)
+    directories = []
+    found_git_root = False
+    while True:
+        directories.append(current)
+        try:
+            if (current / ".git").exists():
+                found_git_root = True
+                break
+        except OSError:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+    if not found_git_root:
+        directories = directories[:1]
+    paths = [directories[0] / ".vscode" / "mcp.json"]
+    for directory in reversed(directories):
+        paths.append(directory / ".github" / "mcp.json")
+        paths.append(directory / ".mcp.json")
+    return paths
+
+
+# Last config wins. Copilot's priority is user < workspace < plugin.
 def _copilot_mcp_config_paths(cwd=None, plugins=None):
     home = Path.home()
-
-    workspace = []
-    if cwd:
-        workspace.append(Path(cwd) / ".vscode" / "mcp.json")
-        workspace.append(Path(cwd) / ".mcp.json")
-
-    trusted = []
+    user = []
     for user_dir in _vscode_user_dirs():
-        trusted.append(user_dir / "mcp.json")
-        trusted.append(user_dir / "settings.json")
+        user.append(user_dir / "mcp.json")
+        user.append(user_dir / "settings.json")
         profiles = user_dir / "profiles"
         try:
             if profiles.is_dir():
                 for profile in sorted(profiles.iterdir()):
-                    trusted.append(profile / "mcp.json")
+                    user.append(profile / "mcp.json")
         except OSError:
             pass
-    trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
-    trusted.append(home / ".copilot" / "mcp-config.json")
+    user.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
+    user.append(_copilot_home(home) / "mcp-config.json")
 
     if plugins is None:
         plugins = _plugin_mcp_config_paths(home)
-    return workspace + plugins + trusted
+    return user + _workspace_mcp_config_paths(cwd) + plugins
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -882,6 +912,17 @@ _TOKEN_RE = re.compile(
     r'|AIza[0-9A-Za-z_\-]{20,}'
 )
 _REDACTED = '***'
+_SENSITIVE_ARG_FLAG_RE = re.compile(
+    r'^--?(?:api[-_]?key|access[-_]?key|secret[-_]?key|client[-_]?secret|'
+    r'auth[-_]?token|access[-_]?token|token|secret|password|passwd|pwd|auth|'
+    r'bearer|credentials?|key)$',
+    re.IGNORECASE,
+)
+_SENSITIVE_ARG_ASSIGNMENT_RE = re.compile(
+    r'^([\w-]*(?:key|token|secret|password|passwd|pwd|auth|bearer|credential)[\w-]*)=.*',
+    re.IGNORECASE,
+)
+_SENSITIVE_ARG_VALUE_FLAGS = {'--header', '--headers', '-H', '--env', '-e'}
 
 
 # Reduce any url to scheme://host[:port]/path — the only part the gateway
@@ -901,20 +942,35 @@ def _redact_url(url):
     return urlunsplit((parts.scheme, netloc, _TOKEN_RE.sub(_REDACTED, parts.path), '', ''))
 
 
-# Allowlist: forward only fingerprint-relevant args (urls, @npm packages); drop
-# everything else so no secret can ride along. Urls are credential-stripped.
 def _redact_args(args):
     if not isinstance(args, list):
         return args
-    kept = []
+    redacted = []
+    redact_next = False
     for arg in args:
         if not isinstance(arg, str):
             continue
+        if redact_next:
+            redacted.append(_REDACTED)
+            redact_next = False
+            continue
+        if _SENSITIVE_ARG_FLAG_RE.match(arg) or arg in _SENSITIVE_ARG_VALUE_FLAGS:
+            redacted.append(arg)
+            redact_next = True
+            continue
+        inline_flag, separator, _value = arg.partition('=')
+        if separator and inline_flag in _SENSITIVE_ARG_VALUE_FLAGS:
+            redacted.append(f'{inline_flag}={_REDACTED}')
+            continue
+        assignment = _SENSITIVE_ARG_ASSIGNMENT_RE.match(arg)
+        if assignment:
+            redacted.append(f'{assignment.group(1)}={_REDACTED}')
+            continue
         if '://' in arg:
-            kept.append(_redact_url(arg))
-        elif arg.startswith('@'):
-            kept.append(arg)
-    return kept
+            redacted.append(_redact_url(arg))
+        else:
+            redacted.append(_TOKEN_RE.sub(_REDACTED, arg))
+    return redacted
 
 
 def _sanitize_mcp_server_fields(server, cwd=None, name=None):
@@ -994,6 +1050,25 @@ def _hook_candidate_script(command, args):
 
 
 _HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _read_script_body_b64(command, args, cwd):
+    try:
+        candidate = _hook_candidate_script(command, args)
+        if not candidate:
+            return None
+        path = os.path.expanduser(os.path.expandvars(candidate.strip().strip('"\'')))
+        if '${' in path:
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        with open(path, 'rb') as f:
+            data = f.read(_HOOK_MAX_SCRIPT_BYTES)
+        return base64.b64encode(data).decode('ascii')
+    except Exception:
+        return None
 
 
 def _compute_script_hash(command, args, cwd):
@@ -1654,6 +1729,30 @@ def _attach_tool_content_hash(metadata):
 # ───────────────────────── end MCP tool risk-scoring section ─────────────────
 
 
+def _mcp_servers_from_config(config, allow_bare=False):
+    raw = config.get('servers')
+    if not isinstance(raw, dict):
+        raw = config.get('mcpServers')
+    if not isinstance(raw, dict):
+        nested = config.get('mcp')
+        raw = nested.get('servers') if isinstance(nested, dict) else None
+    if not isinstance(raw, dict) and allow_bare:
+        raw = {
+            name: value for name, value in config.items()
+            if isinstance(value, dict)
+            and any(key in value for key in ('command', 'url', 'type', 'args'))
+        }
+    return raw if isinstance(raw, dict) else None
+
+
+def _mcp_config_base(config_path):
+    if config_path.name == 'mcp.json' and config_path.parent.name in {
+        '.github', '.vscode'
+    }:
+        return config_path.parent.parent
+    return config_path.parent
+
+
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
     plugin_names = set()
@@ -1670,18 +1769,16 @@ def read_copilot_mcp_servers(cwd=None):
                 config = _parse_jsonc(f.read())
             if not isinstance(config, dict):
                 continue
-            raw = config.get('servers')
-            if not isinstance(raw, dict):
-                raw = config.get('mcpServers')
-            if not isinstance(raw, dict):
-                nested = config.get('mcp')
-                raw = nested.get('servers') if isinstance(nested, dict) else None
+            allow_bare = config_path.name == '.mcp.json' or (
+                config_path.name == 'mcp.json' and config_path.parent.name == '.github'
+            )
+            raw = _mcp_servers_from_config(config, allow_bare=allow_bare)
             if not isinstance(raw, dict):
                 continue
             is_plugin = config_path in plugin_paths
             # Hash a plugin's relative script against its own bundle, not cwd,
             # so the fingerprint is correct and not workspace-spoofable.
-            base = config_path.parent if is_plugin else cwd
+            base = _mcp_config_base(config_path)
             for name, server in raw.items():
                 fields = _sanitize_mcp_server_fields(server, base, name=name) or {}
                 # Surface only genuine plugin-vs-plugin name clashes (name only).
@@ -1762,11 +1859,10 @@ def _vscode_server_aliases(server_name):
 
 
 def _vscode_fingerprint_key(config):
-    """Coarse identity used to decide if two configured servers are really the same
-    one (mirrors the gateway's url-first / command+args fingerprint priority).
-    Returns None when identity can't be established."""
     if not config:
         return None
+    if config.get('_unbound_fingerprint'):
+        return ('fingerprint', config['_unbound_fingerprint'])
     if config.get('url'):
         return ('url', config['url'])
     if config.get('command'):
@@ -1790,7 +1886,9 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
     for server_name in mcp_servers:
         for alias in _vscode_server_aliases(server_name):
             if body_lower.startswith(alias + '_'):
-                cand = (len(alias), 1, server_name, body[len(alias) + 1:])
+                remainder = body[len(alias):]
+                separator_length = 2 if remainder.startswith('__') else 1
+                cand = (len(alias), 1, server_name, remainder[separator_length:])
             else:
                 cand = None
                 for k in range(len(segments) - 1, 0, -1):
@@ -1816,7 +1914,6 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
-        # Shell tools can use `command`, `input`, or `text`.
         # `value` holds an unparseable raw payload preserved by _normalize_arguments.
         # Try all so the policy check never sees an empty command for a real
         # shell execution.
@@ -2190,6 +2287,10 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                 'do not modify them in any way. Retry exactly once — the second attempt will wait for the approval.'
             ),
         })
+
+    scan_config = metadata.get('mcp_server_config')
+    if is_mcp and api_response.get('unknown_mcp_server') and scan_config:
+        _dispatch_mcp_server_scan(mcp_server, scan_config, event.get('cwd'))
 
     return transform_response_for_copilot(api_response)
 
@@ -2798,7 +2899,7 @@ def _extract_patch_target_path(args):
 
 
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
-                     mcp_servers=None):
+                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal and unsupported native tools.
@@ -2864,10 +2965,19 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     else:
         mcp_servers = mcp_servers or {}
         lowered_name = name.lower()
-        if lowered_name.startswith('mcp_') and not lowered_name.startswith('mcp__'):
-            mcp_server, _mcp_tool, _config = _resolve_vscode_mcp(name, mcp_servers)
+        if (
+            isinstance(mcp_server_name, str)
+            and isinstance(mcp_tool_name, str)
+            and mcp_server_name
+            and mcp_tool_name
+        ):
+            mcp_server = mcp_server_name
+            mcp_tool = mcp_tool_name
+            mcp_server_config = mcp_servers.get(mcp_server_name)
+        elif lowered_name.startswith('mcp_') and not lowered_name.startswith('mcp__'):
+            mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(name, mcp_servers)
         else:
-            mcp_server, _mcp_tool, _config = detect_mcp_call(name, mcp_servers)
+            mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(name, mcp_servers)
         if mcp_server is None and not lowered_name.startswith('mcp_'):
             return None
         entry = {
@@ -2878,6 +2988,15 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         }
         if mcp_server is not None:
             entry['server_name'] = mcp_server
+            entry['mcp_tool_name'] = mcp_tool
+            metadata = {
+                'mcp_server': mcp_server,
+                'mcp_tool': mcp_tool,
+                'mcp_server_config': mcp_server_config,
+            }
+            _attach_tool_content_hash(metadata)
+            if metadata.get('mcp_server_config'):
+                entry['mcp_server_config'] = metadata['mcp_server_config']
         try:
             candidates = [p for p in _ABS_PATH_RE.findall(json.dumps(args)) if not _is_system_checkout_path(p)]
         except Exception:
@@ -3310,7 +3429,14 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     def _register(call_id):
         if call_id not in tool_data:
-            tool_data[call_id] = {'name': '', 'arguments': {}, 'result': None, 'success': None}
+            tool_data[call_id] = {
+                'name': '',
+                'arguments': {},
+                'result': None,
+                'success': None,
+                'mcp_server_name': None,
+                'mcp_tool_name': None,
+            }
             tool_calls.append(call_id)
         return tool_data[call_id]
 
@@ -3332,6 +3458,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     continue
                 call = _register(call_id)
                 call['name'] = req.get('name') or call['name']
+                if req.get('mcpServerName'):
+                    call['mcp_server_name'] = req['mcpServerName']
+                if req.get('mcpToolName'):
+                    call['mcp_tool_name'] = req['mcpToolName']
                 call['arguments'] = _normalize_arguments(req.get('arguments'))
 
         elif entry_type == 'skill.invoked':
@@ -3344,6 +3474,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             call = _register(call_id)
             if data.get('toolName'):
                 call['name'] = data['toolName']
+            if data.get('mcpServerName'):
+                call['mcp_server_name'] = data['mcpServerName']
+            if data.get('mcpToolName'):
+                call['mcp_tool_name'] = data['mcpToolName']
             if data.get('arguments') is not None:
                 call['arguments'] = _normalize_arguments(data.get('arguments'))
 
@@ -3378,7 +3512,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             continue
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
                                   shell_state=shell_state, root_projects=root_projects,
-                                  mcp_servers=mcp_servers)
+                                  mcp_servers=mcp_servers,
+                                  mcp_server_name=call['mcp_server_name'],
+                                  mcp_tool_name=call['mcp_tool_name'])
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.
@@ -3627,6 +3763,26 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
+def _ensure_discovery_installer():
+    if DISCOVERY_INSTALL_SH.exists():
+        return True
+    DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        log_error(
+            "discovery install.sh download failed: "
+            + result.stderr.decode(errors='replace')[:200],
+            'discovery_gate',
+        )
+        return False
+    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+    return True
+
+
 def _dispatch_discovery() -> None:
     try:
         cache = {}
@@ -3701,16 +3857,8 @@ def _dispatch_discovery() -> None:
                     return
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
-                DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if not DISCOVERY_INSTALL_SH.exists():
-                    r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
-                        capture_output=True, timeout=30,
-                    )
-                    if r.returncode != 0:
-                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                        return
-                    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
+                if not _ensure_discovery_installer():
+                    return
                 discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
@@ -3742,6 +3890,59 @@ def _dispatch_discovery() -> None:
                 pass
     except Exception as e:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
+
+
+def _dispatch_mcp_server_scan(server_name, server_config, cwd=None):
+    if not server_name or not isinstance(server_config, dict):
+        return
+    try:
+        if server_config.get('command') and not server_config.get('script_content'):
+            script_body = _read_script_body_b64(
+                server_config.get('command'), server_config.get('args'), cwd
+            )
+            if script_body:
+                server_config = {**server_config, 'script_content': script_body}
+        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+            unbound_config = json.load(f)
+        api_key = unbound_config.get("api_key")
+        backend_url = unbound_config.get("base_url")
+        if not api_key or not backend_url:
+            return
+
+        if RUNNING_FROZEN:
+            if not os.path.isfile(FROZEN_DISCOVERY_BIN):
+                return
+            scan_cmd = [FROZEN_DISCOVERY_BIN, "mcp-scan", "--name", server_name,
+                        "--domain", backend_url]
+        else:
+            if not _ensure_discovery_installer():
+                return
+            scan_cmd = [
+                "bash", str(DISCOVERY_INSTALL_SH), "mcp-scan", "--name", server_name,
+                "--domain", backend_url,
+            ]
+
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+            "env": {
+                **os.environ,
+                "UNBOUND_API_KEY": api_key,
+                "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
+                "UNBOUND_CODING_TOOL": _UNBOUND_CODING_TOOL,
+            },
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(scan_cmd, **popen_kwargs)
+    except Exception as exc:
+        log_error(f"mcp scan dispatch failed for {server_name}: {exc}", 'mcp_server')
 
 
 def main():
