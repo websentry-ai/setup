@@ -889,7 +889,12 @@ def complete_pending_turn(event, wm_key, api_key, final=False):
     }
     if usage:
         exchange['usage'] = usage
-    return bool(send_to_api(exchange, api_key))
+    if not send_to_api(exchange, api_key):
+        return False
+    # Settled means the tokens are in, not merely that something was sent. A model-only
+    # send is progress, so the slot stays and any later event for this session can still
+    # attach them; re-sending fills the same row and changes nothing.
+    return bool(usage)
 
 
 def rebuild_turn_content(transcript_path, conversation_id, prompt_id):

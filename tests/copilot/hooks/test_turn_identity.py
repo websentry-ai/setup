@@ -152,12 +152,18 @@ class TestCompletePendingTurn(unittest.TestCase):
         self.assertFalse(settled)
         self.assertEqual(sent, [])
 
-    def test_session_end_sends_the_model_even_without_tokens(self):
-        # Last chance this session gets, so take what is there.
+    def test_session_end_sends_the_model_but_keeps_the_slot(self):
+        # Last chance this session gets, so take what is there. Settled still means the
+        # tokens are in, so the slot survives for anything that runs after.
         settled, sent = self._run(self._pending(), None, "claude-haiku-4.5", final=True)
-        self.assertTrue(settled)
+        self.assertFalse(settled)
         self.assertEqual(sent[0]["model"], "claude-haiku-4.5")
         self.assertNotIn("usage", sent[0])
+
+    def test_a_send_carrying_tokens_is_what_settles_the_turn(self):
+        settled, sent = self._run(self._pending(), {"input_tokens": 5}, None)
+        self.assertTrue(settled)
+        self.assertEqual(sent[0]["usage"], {"input_tokens": 5})
 
     def test_tokens_arriving_after_a_model_still_complete_the_turn(self):
         # The slot survived the model-only round, so the later tokens land on the row.
