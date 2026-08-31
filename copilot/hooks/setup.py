@@ -645,6 +645,9 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     usage = _backfill_session_usage(transcript_path, session_id)
     if usage:
         session['usage'] = usage
+    models = _backfill_session_models(transcript_path, session_id)
+    if any(models):
+        session['models'] = models
     return session
 
 
@@ -745,17 +748,20 @@ def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
     return [by_turn[t] for t in sorted(by_turn)]
 
 
-def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]:
-    """Per-request usage from VS Code's own chat store, a sibling of the copilot-chat
-    transcript directory. elapsedMs is written after the final counts, so it is what marks
-    a request finished; the counts alone appear mid-stream and climb. No cache split."""
+def _backfill_vscode_store(transcript_path: Path, session_id: str) -> Optional[Path]:
+    """VS Code's chat journal for a session, a sibling of the copilot-chat transcript
+    directory, or None when the path is not a VS Code transcript."""
     if transcript_path.parent.name != 'transcripts':
-        return []
+        return None
     if not _backfill_safe_path_component(session_id):
-        return []
+        return None
     store = transcript_path.parent.parent.parent / 'chatSessions' / (session_id + '.jsonl')
-    if not _backfill_is_regular_file(store):
-        return []
+    return store if _backfill_is_regular_file(store) else None
+
+
+def _backfill_vscode_requests(store: Path) -> Dict:
+    """Requests by ordinal, replayed from the append-only journal: a base snapshot
+    followed by path-keyed patches, last write wins."""
     requests: Dict = {}
     next_index = 0
 
@@ -763,7 +769,7 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
         if not isinstance(obj, dict):
             return
         entry = requests.setdefault(index, {})
-        for field in ('promptTokens', 'completionTokens', 'elapsedMs'):
+        for field in ('promptTokens', 'completionTokens', 'elapsedMs', 'servedBy', 'modelId'):
             if obj.get(field) is not None:
                 entry[field] = obj[field]
 
@@ -795,8 +801,19 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
                     except ValueError:
                         continue
     except Exception as e:
-        debug_print(f"backfill vscode usage read failed: {e}")
+        debug_print(f"backfill vscode journal read failed: {e}")
+        return {}
+    return requests
+
+
+def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]:
+    """Per-request usage from VS Code's own chat store. elapsedMs is written after the
+    final counts, so it is what marks a request finished; the counts alone appear
+    mid-stream and climb. No cache split."""
+    store = _backfill_vscode_store(transcript_path, session_id)
+    if store is None:
         return []
+    requests = _backfill_vscode_requests(store)
     usage = []
     # Guarded: a non-numeric count in the journal would otherwise raise out of the collector
     # and abort the whole backfill run.
@@ -816,6 +833,31 @@ def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]
     return usage
 
 
+def _backfill_vscode_models(transcript_path: Path, session_id: str) -> List[str]:
+    """Model per request, in journal order. The transcript carries none at all, which is
+    why these rows otherwise read 'auto'. Prefer the model that served the request, which
+    names the real one behind an 'auto' pick; the selection is there either way. Gaps stay
+    as '' so positions still line up with the transcript's exchanges."""
+    store = _backfill_vscode_store(transcript_path, session_id)
+    if store is None:
+        return []
+    requests = _backfill_vscode_requests(store)
+    models = []
+    for index in sorted(requests):
+        entry = requests[index]
+        served = entry.get('servedBy')
+        if isinstance(served, str) and served:
+            models.append(served)
+            continue
+        selected = entry.get('modelId')
+        if isinstance(selected, str) and selected:
+            # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
+            models.append(selected.split('/', 1)[-1])
+        else:
+            models.append('')
+    return models
+
+
 def _backfill_session_usage(transcript_path: Path, session_id: str) -> List[Dict]:
     """One usage dict per exchange, in transcript order. Copilot forwards no usage, so
     without this the backend tiktoken-estimates from visible text and misses cache reads,
@@ -823,6 +865,14 @@ def _backfill_session_usage(transcript_path: Path, session_id: str) -> List[Dict
     if transcript_path.stem == 'events':
         return _backfill_cli_usage(transcript_path, session_id)
     return _backfill_vscode_usage(transcript_path, session_id)
+
+
+def _backfill_session_models(transcript_path: Path, session_id: str) -> List[str]:
+    """One model name per exchange, in transcript order. Only VS Code needs this: the CLI
+    transcript records model_change and per-message models, which the server already reads."""
+    if transcript_path.stem == 'events':
+        return []
+    return _backfill_vscode_models(transcript_path, session_id)
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -873,8 +923,37 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     return code, out[:sep]
 
 
-def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
-    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
+def _backfill_force_epoch(api_key: str, backend_url: str) -> Optional[float]:
+    """When the organization last asked every device to re-walk its full history, or None.
+    A device honours it only if its own last backfill predates it, so the request expires
+    by itself once each device has acted on it -- nobody has to switch it back off."""
+    try:
+        code, body = _backfill_http_request(
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/config/",
+            method='GET',
+            headers=_backfill_edr_headers({'Authorization': f'Bearer {api_key}'}),
+            timeout=15,
+        )
+        if code < 200 or code >= 300:
+            debug_print(f"backfill config request failed: HTTP {code}")
+            return None
+        requested = json.loads(body.decode('utf-8')).get('force_backfill_requested_epoch')
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            return None
+        return float(requested)
+    except Exception as e:
+        debug_print(f"backfill config read failed: {e}")
+        return None
+
+
+def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
+                           force: bool = False) -> bool:
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if force:
+        # Marks this upload as the org's requested re-walk. The server still checks the
+        # request itself, so this only narrows what force applies to; it cannot grant it.
+        payload['force'] = True
+    payload_bytes = json.dumps(payload).encode('utf-8')
 
     auth_headers = _backfill_edr_headers({
         'Authorization': f'Bearer {api_key}',
@@ -1036,6 +1115,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     session_id = session.get('session_id')
     entries = session.get('entries') or []
     session_usage = session.get('usage') or []
+    session_models = session.get('models') or []
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1086,6 +1166,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
         usage_slice = session_usage[record_index_base:record_index_base + last_fit_base_count]
         if usage_slice:
             slice_payload['usage'] = usage_slice
+        models_slice = session_models[record_index_base:record_index_base + last_fit_base_count]
+        if any(models_slice):
+            slice_payload['models'] = models_slice
         yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
@@ -1101,6 +1184,11 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         home = Path.home()
         started_at = time.time()
         cutoff_mtime = _backfill_read_cutoff(home)
+        force_epoch = _backfill_force_epoch(api_key, backend_url)
+        forced = force_epoch is not None and force_epoch > cutoff_mtime
+        if forced:
+            cutoff_mtime = started_at - (BACKFILL_MAX_AGE_DAYS * 86400)
+            print("[backfill] Re-reading full history at your organization's request.")
         sessions: List[Dict] = []
         capped = False
         for transcript_path in sorted(_backfill_iter_transcripts(cutoff_mtime)):
@@ -1131,7 +1219,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
             if not current_chunk:
                 return
             chunks_total += 1
-            if _backfill_upload_chunk(api_key, backend_url, current_chunk):
+            if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
                 chunks_sent += 1
                 for s in current_chunk:
                     sessions_sent_ids.add(s.get('session_id'))
