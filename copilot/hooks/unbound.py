@@ -859,8 +859,20 @@ def complete_pending_turns(event, wm_key, api_key, final=False):
     A list rather than one slot: a turn whose tokens have not landed by the next Stop
     would otherwise be displaced by that Stop's own pending turn, and its tokens lost."""
     pending_turns = get_session_marker(wm_key).get('pending_turns') or []
-    return [p for p in pending_turns
-            if not complete_pending_turn(event, p, api_key, final)]
+    remaining = []
+    # The journal is read from an index with no upper bound, so two turns starting from
+    # the same one would each claim every request that has settled since. Threading the
+    # index through them in order partitions the requests exactly as consecutive Stops
+    # would have, which is what these deferred turns are.
+    index = None
+    for pending in pending_turns:
+        if index is None:
+            index = pending.get('usage_index') or 0
+        settled, index = complete_pending_turn(
+            event, dict(pending, usage_index=index), api_key, final)
+        if not settled:
+            remaining.append(dict(pending, usage_index=index))
+    return remaining
 
 
 def complete_pending_turn(event, pending, api_key, final=False):
@@ -868,18 +880,20 @@ def complete_pending_turn(event, pending, api_key, final=False):
 
     Copilot writes both after the turn has already been reported, so its own Stop had
     nothing to send. The re-send carries the id the turn was sent with, so the control
-    plane fills that row rather than adding a second one. Returns True when the turn is
-    settled and can be dropped."""
+    plane fills that row rather than adding a second one. Returns (settled, next index),
+    where the index is what the following pending turn must read from so the two do not
+    both claim the same requests."""
+    start_index = (pending or {}).get('usage_index') or 0
     if not isinstance(pending, dict) or not pending.get('turn_request_id'):
-        return True
+        return True, start_index
 
     transcript_path = event.get('transcript_path')
     conversation_id = pending.get('conversation_id')
     # At session end this is the turn's last chance, so an unwritten journal is worth
     # waiting on. Mid-session a later Stop would pick it up, and waiting would be cost.
-    usage, _ = get_turn_usage(transcript_path, conversation_id,
-                              pending.get('since'), pending.get('until'),
-                              pending.get('usage_index') or 0, wait_when_idle=final)
+    usage, next_index = get_turn_usage(transcript_path, conversation_id,
+                                       pending.get('since'), pending.get('until'),
+                                       start_index, wait_when_idle=final)
     model = _vscode_turn_model(transcript_path, conversation_id,
                                pending.get('since'), pending.get('until'))
     # Tokens are the point, and VS Code can expose a model before it has finished
@@ -887,12 +901,12 @@ def complete_pending_turn(event, pending, api_key, final=False):
     # tokens permanently, so a model-only result waits -- except at SessionEnd, which is
     # the last chance this session gets.
     if not usage and not (final and model):
-        return False
+        return False, next_index
 
     content = rebuild_turn_content(transcript_path, conversation_id, pending.get('prompt_id'))
     if content is None:
         # The turn is no longer in the transcript, so nothing can be rebuilt for it.
-        return True
+        return True, next_index
     user_prompt, assistant_prompt = content
 
     exchange = {
@@ -907,11 +921,12 @@ def complete_pending_turn(event, pending, api_key, final=False):
     if usage:
         exchange['usage'] = usage
     if not send_to_api(exchange, api_key):
-        return False
+        # Nothing consumed, so the next turn must still start where this one did.
+        return False, start_index
     # Settled means the tokens are in, not merely that something was sent. A model-only
     # send is progress, so the slot stays and any later event for this session can still
     # attach them; re-sending fills the same row and changes nothing.
-    return bool(usage)
+    return bool(usage), next_index
 
 
 def rebuild_turn_content(transcript_path, conversation_id, prompt_id):

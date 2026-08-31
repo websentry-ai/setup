@@ -121,6 +121,7 @@ class TestCompletePendingTurn(unittest.TestCase):
                 capture.update(k)
             return (usage, 0)
 
+
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _transcript(tmpdir, entries)
             event = {"transcript_path": str(path)}
@@ -128,7 +129,8 @@ class TestCompletePendingTurn(unittest.TestCase):
                     patch.object(unbound, "_vscode_turn_model", lambda *a, **k: model), \
                     patch.object(unbound, "send_to_api",
                                  lambda ex, key: sent.append(ex) or True):
-                settled = unbound.complete_pending_turn(event, pending, "key", final=final)
+                settled, _ = unbound.complete_pending_turn(event, pending, "key",
+                                                           final=final)
         return settled, sent
 
     def _pending(self):
@@ -216,7 +218,7 @@ class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
         with patch.object(unbound, "get_session_marker",
                           lambda k: {"pending_turns": pending_turns}), \
                 patch.object(unbound, "complete_pending_turn",
-                             lambda ev, p, key, final=False: settle(p)):
+                             lambda ev, p, key, final=False: (settle(p), 0)):
             return unbound.complete_pending_turns({}, "wm", "key")
 
     def test_an_unsettled_turn_stays_while_a_later_one_settles(self):
@@ -238,3 +240,49 @@ class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
         # every one of them pending until SessionEnd. A bound below that would drop the
         # tokens of exactly the sessions this exists to rescue.
         self.assertGreater(unbound.MAX_PENDING_TURNS, 301)
+
+
+class TestPendingTurnsPartitionTheJournal(unittest.TestCase):
+    """Two pending turns starting from the same journal index would each claim every
+    request that settled since, counting the same tokens twice on two different rows."""
+
+    def _pending(self, n, index):
+        return {"turn_request_id": "tid-%d" % n, "conversation_id": SESSION,
+                "prompt_id": "p%d" % n, "since": None, "until": "2026-08-31T00:00:00Z",
+                "usage_index": index}
+
+    def _run(self, turns, reads):
+        """reads: start index -> (usage, next index) the journal would return."""
+        seen = []
+
+        def _usage(path, conv, since, until, index=0, wait_when_idle=False):
+            seen.append(index)
+            return reads.get(index, (None, index))
+
+        with patch.object(unbound, "get_session_marker",
+                          lambda k: {"pending_turns": turns}), \
+                patch.object(unbound, "get_turn_usage", _usage), \
+                patch.object(unbound, "_vscode_turn_model", lambda *a, **k: None), \
+                patch.object(unbound, "rebuild_turn_content",
+                             lambda *a, **k: ("q", "a")), \
+                patch.object(unbound, "send_to_api", lambda ex, key: True):
+            remaining = unbound.complete_pending_turns({}, "wm", "key")
+        return seen, remaining
+
+    def test_the_second_turn_reads_on_from_where_the_first_stopped(self):
+        turns = [self._pending(1, 0), self._pending(2, 0)]
+        seen, remaining = self._run(turns, {0: ({"input_tokens": 5}, 1),
+                                            1: ({"input_tokens": 7}, 2)})
+        self.assertEqual(seen, [0, 1], "the second turn must not re-read the first's requests")
+        self.assertEqual(remaining, [])
+
+    def test_a_turn_that_reads_nothing_leaves_the_index_where_it_was(self):
+        turns = [self._pending(1, 0), self._pending(2, 0)]
+        seen, remaining = self._run(turns, {})
+        self.assertEqual(seen, [0, 0], "nothing was consumed, so the next turn starts there")
+        self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1", "tid-2"])
+
+    def test_an_unsettled_turn_keeps_the_index_it_should_resume_from(self):
+        turns = [self._pending(1, 0)]
+        _, remaining = self._run(turns, {})
+        self.assertEqual(remaining[0]["usage_index"], 0)
