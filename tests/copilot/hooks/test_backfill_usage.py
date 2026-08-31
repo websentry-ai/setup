@@ -70,6 +70,16 @@ def _request(prompt=None, completion=None, elapsed=1234):
 
 
 class TestBackfillCliUsage(unittest.TestCase):
+    def test_copilot_home_contains_cli_transcripts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            copilot_home = Path(tmpdir) / "custom-copilot"
+            transcript = copilot_home / "session-state" / SESSION / "events.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"COPILOT_HOME": str(copilot_home)}):
+                found = list(setup._backfill_iter_transcripts(0))
+        self.assertEqual(found, [transcript])
+
     def test_one_entry_per_turn_in_order(self):
         usage = _cli_usage([(SESSION, 0, 100, 5, 0, 0), (SESSION, 1, 200, 7, 0, 0)])
         self.assertEqual([u["input_tokens"] for u in usage], [100, 200])
@@ -155,6 +165,162 @@ class TestBackfillVscodeUsage(unittest.TestCase):
 
 
 class TestBackfillPayload(unittest.TestCase):
+    def tearDown(self):
+        setup._BACKFILL_HOOK_MODULE = None
+        setup._BACKFILL_HOOK_PATH = None
+
+    def test_installed_hook_resolves_a_configured_bare_mcp_call_end_to_end(self):
+        entries = [
+            {"type": "user.message", "data": {"content": "show issue"}},
+            {"type": "assistant.message", "data": {"toolRequests": [{
+                "toolCallId": "call-1",
+                "name": "github-get_issue",
+                "arguments": {"id": 1},
+            }]}},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            hook_dir = home / ".copilot" / "hooks"
+            hook_dir.mkdir(parents=True)
+            source_hook = Path(__file__).resolve().parents[3] / "copilot" / "hooks" / "unbound.py"
+            (hook_dir / "unbound.py").write_text(
+                source_hook.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            (home / ".copilot" / "mcp-config.json").write_text(json.dumps({
+                "mcpServers": {
+                    "github": {"command": "npx", "args": ["github-mcp-server"]},
+                },
+            }), encoding="utf-8")
+            transcript = home / ".copilot" / "session-state" / SESSION / "events.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                "\n".join(json.dumps(entry) for entry in entries), encoding="utf-8"
+            )
+            with patch.object(setup.Path, "home", return_value=home):
+                session = setup._backfill_collect_session(transcript)
+
+        self.assertEqual(session["mcp_tool_provenance"], {
+            "call-1": {
+                "tool_name": "github-get_issue",
+                "server_name": "github",
+                "mcp_tool_name": "get_issue",
+                "mcp_server_config": {
+                    "command": "npx",
+                    "args": ["github-mcp-server"],
+                },
+            },
+        })
+
+    def test_installed_hook_uses_explicit_mcp_fields_without_local_config(self):
+        entries = [
+            {"type": "user.message", "data": {"content": "search code"}},
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "call-1",
+                "toolName": "github-mcp-server-search_code",
+                "arguments": {"query": "mcp"},
+                "mcpServerName": "github-mcp-server",
+                "mcpToolName": "search_code",
+            }},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            hook_dir = home / ".copilot" / "hooks"
+            hook_dir.mkdir(parents=True)
+            source_hook = Path(__file__).resolve().parents[3] / "copilot" / "hooks" / "unbound.py"
+            (hook_dir / "unbound.py").write_text(
+                source_hook.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+            transcript = home / ".copilot" / "session-state" / SESSION / "events.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(
+                "\n".join(json.dumps(entry) for entry in entries), encoding="utf-8"
+            )
+            with patch.object(setup.Path, "home", return_value=home):
+                session = setup._backfill_collect_session(transcript)
+
+        self.assertEqual(session["mcp_tool_provenance"], {
+            "call-1": {
+                "tool_name": "github-mcp-server-search_code",
+                "server_name": "github-mcp-server",
+                "mcp_tool_name": "search_code",
+            },
+        })
+
+    def test_collected_session_carries_positive_mcp_provenance(self):
+        class HookModule:
+            @staticmethod
+            def read_copilot_mcp_servers(cwd):
+                return {"github": {"command": "github-mcp-server"}}
+
+            @staticmethod
+            def map_copilot_tool(name, args, result, **_kwargs):
+                if name == "github-get_issue":
+                    return {
+                        "type": "afterMCPExecution",
+                        "tool_name": name,
+                        "server_name": "github",
+                        "mcp_tool_name": "get_issue",
+                        "mcp_server_config": {"command": "github-mcp-server"},
+                    }
+                return None
+
+        entries = [
+            {"type": "user.message", "data": {"content": "show issue"}},
+            {"type": "assistant.message", "data": {"toolRequests": [{
+                "toolCallId": "call-1",
+                "name": "github-get_issue",
+                "arguments": {"id": 1},
+            }]}},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "events.jsonl"
+            transcript.write_text(
+                "\n".join(json.dumps(entry) for entry in entries), encoding="utf-8"
+            )
+            with patch.object(setup, "_backfill_session_usage", lambda *a: []), patch.object(
+                setup, "_backfill_load_hook_module", return_value=HookModule
+            ):
+                session = setup._backfill_collect_session(transcript)
+
+        self.assertEqual(session["mcp_tool_provenance"], {
+            "call-1": {
+                "tool_name": "github-get_issue",
+                "server_name": "github",
+                "mcp_tool_name": "get_issue",
+                "mcp_server_config": {"command": "github-mcp-server"},
+            },
+        })
+
+    def test_collected_session_does_not_label_an_unresolved_tool_as_mcp(self):
+        class HookModule:
+            @staticmethod
+            def read_copilot_mcp_servers(cwd):
+                return {}
+
+            @staticmethod
+            def map_copilot_tool(name, args, result, **_kwargs):
+                return None
+
+        entries = [
+            {"type": "user.message", "data": {"content": "use it"}},
+            {"type": "assistant.message", "data": {"toolRequests": [{
+                "toolCallId": "call-1",
+                "name": "future_native_tool",
+                "arguments": {},
+            }]}},
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = Path(tmpdir) / "events.jsonl"
+            transcript.write_text(
+                "\n".join(json.dumps(entry) for entry in entries), encoding="utf-8"
+            )
+            with patch.object(setup, "_backfill_session_usage", lambda *a: []), patch.object(
+                setup, "_backfill_load_hook_module", return_value=HookModule
+            ):
+                session = setup._backfill_collect_session(transcript)
+
+        self.assertNotIn("mcp_tool_provenance", session)
+
     def test_usage_is_omitted_when_there_is_none(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = Path(tmpdir) / "events.jsonl"
@@ -187,3 +353,44 @@ class TestBackfillPayload(unittest.TestCase):
         slices = list(setup._backfill_slice_session(session, 1_000_000))
         self.assertEqual(len(slices), 1)
         self.assertEqual(slices[0]["usage"], session["usage"])
+
+    def test_slices_only_carry_provenance_for_calls_in_that_slice(self):
+        entries = []
+        provenance = {}
+        for turn in range(3):
+            call_id = "call-%d" % turn
+            tool_name = "server-tool-%d" % turn
+            entries.extend([
+                {"type": "user.message", "data": {"content": "prompt %d" % turn}},
+                {"type": "assistant.message", "data": {
+                    "content": "x" * 400,
+                    "toolRequests": [{"toolCallId": call_id, "name": tool_name}],
+                }},
+            ])
+            provenance[call_id] = {
+                "tool_name": tool_name,
+                "server_name": "server",
+                "mcp_tool_name": "tool-%d" % turn,
+                "mcp_server_config": {"command": "npx", "args": ["server-mcp"]},
+            }
+        session = {
+            "session_id": SESSION,
+            "entries": entries,
+            "mcp_tool_provenance": provenance,
+        }
+
+        slices = list(setup._backfill_slice_session(session, 1100))
+
+        self.assertGreater(len(slices), 1)
+        rebuilt = {}
+        for chunk in slices:
+            chunk_call_ids = {
+                request["toolCallId"]
+                for entry in chunk["entries"]
+                for request in (entry.get("data") or {}).get("toolRequests") or []
+            }
+            self.assertEqual(
+                set((chunk.get("mcp_tool_provenance") or {}).keys()), chunk_call_ids
+            )
+            rebuilt.update(chunk.get("mcp_tool_provenance") or {})
+        self.assertEqual(rebuilt, provenance)

@@ -27,7 +27,12 @@ import sys
 from pathlib import Path
 
 from ._loader import load_mdm_setup_module
-from ._resources import DISCOVERY_BINARY, HOOK_BINARY, hook_command_for_event
+from ._resources import (
+    DISCOVERY_BINARY,
+    HOOK_BINARY,
+    hook_command_for_event,
+    hook_source_path,
+)
 from . import migration
 
 # Mirrors mdm/onboard.py's discovery timeout contract.
@@ -804,7 +809,8 @@ def _setup_copilot(opts):
     m.notify_setup_complete(api_key, "copilot", backend_url=base,
                             install_state=state, serial_number=device_id)
     if opts["backfill"]:
-        m.run_backfill(api_key, base, user_homes)
+        hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
+        m.run_backfill(api_key, base, user_homes, hook_source)
     return ("configured", None)
 
 

@@ -5,6 +5,7 @@ server keys mirror a real VS Code mcp.json.
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,7 +34,7 @@ def _read_fixture_servers():
     # Build the same shape read_copilot_mcp_servers() returns, from CONFIG.
     out = {}
     for name, srv in CONFIG["servers"].items():
-        out[name] = unbound._sanitize_mcp_server_fields(srv) or {}
+        out[name] = unbound._extract_mcp_server_fields(srv) or {}
     return out
 
 
@@ -75,6 +76,12 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(srv, "github")
         self.assertEqual(tool, "get_me")
 
+    def test_prefix_matching_is_case_insensitive(self):
+        srv, tool, _cfg = unbound._resolve_vscode_mcp(
+            "MCP_GITHUB_GET_ME", self.servers)
+        self.assertEqual(srv, "github")
+        self.assertEqual(tool, "GET_ME")
+
     def test_claude_double_underscore_form_is_not_handled_here(self):
         # mcp__ is the Claude/CLI form (gateway parses it); resolver ignores it.
         self.assertEqual(
@@ -90,6 +97,15 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(
             unbound._resolve_vscode_mcp("mcp_sup_run", servers),
             (None, None, None))
+
+    def test_short_prefix_cannot_borrow_a_configured_server(self):
+        self.assertEqual(
+            unbound._resolve_vscode_mcp(
+                "mcp_git_read_issue",
+                {"github": {"url": "https://github.example/mcp"}},
+            ),
+            (None, None, None),
+        )
 
     def test_full_name_disambiguates_overlapping_servers(self):
         # When the token carries the full server name, the overlap is resolved.
@@ -126,6 +142,72 @@ class TestResolveVscodeMcp(unittest.TestCase):
         self.assertEqual(
             unbound._resolve_vscode_mcp("mcp_unknownserver_do_thing", self.servers),
             (None, None, None))
+        self.assertEqual(unbound.canonical_tool_name("mcpWithoutSeparator"), "")
+
+    def test_configured_server_name_without_a_tool_is_not_an_mcp_call(self):
+        self.assertEqual(
+            unbound.detect_mcp_call("github", self.servers),
+            (None, None, None))
+
+    def test_double_separator_does_not_become_part_of_tool_name(self):
+        servers = {
+            "azure_devops": {"command": "npx", "args": ["azure-devops-mcp"]},
+        }
+
+        server, tool, config = unbound._resolve_vscode_mcp(
+            "mcp_azure_devops__wit_work_item_link_write", servers
+        )
+
+        self.assertEqual(server, "azure_devops")
+        self.assertEqual(tool, "wit_work_item_link_write")
+        self.assertEqual(config, servers["azure_devops"])
+
+    def test_builtin_github_resolves_without_local_config(self):
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-search_code", {}
+            ),
+            ("github-mcp-server", "search_code", None),
+        )
+
+    def test_configured_github_wins_over_builtin_shortcut(self):
+        servers = {
+            "github-mcp-server": {"url": "https://company.example/mcp"},
+        }
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-search_code", servers
+            ),
+            (
+                "github-mcp-server",
+                "search_code",
+                {"url": "https://company.example/mcp"},
+            ),
+        )
+
+    def test_short_configured_prefix_does_not_steal_builtin_github(self):
+        servers = {"github": {"url": "https://company.example/mcp"}}
+        for explicit in (
+            {},
+            {"server_name": "github", "tool_name": "mcp-server-search_code"},
+        ):
+            with self.subTest(explicit=explicit):
+                self.assertEqual(
+                    unbound.resolve_copilot_mcp(
+                        "github-mcp-server-search_code", servers, **explicit
+                    ),
+                    ("github-mcp-server", "search_code", None),
+                )
+
+    def test_longer_configured_server_wins_over_builtin_prefix(self):
+        config = {"command": "evil-mcp"}
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-evil-steal",
+                {"github-mcp-server-evil": config},
+            ),
+            ("github-mcp-server-evil", "steal", config),
+        )
 
 
 def _gateway(sanctioned_groups):
@@ -232,7 +314,161 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
             unbound.process_pre_tool_use(event, "K")
         self.assertEqual(captured["md"].get("mcp_server"), "microsoft/markitdown")
         self.assertEqual(captured["md"].get("mcp_tool"), "convert_to_markdown")
-        self.assertIn("mcp_server_config", captured["md"])
+        self.assertEqual(captured["md"]["mcp_server_config"], {
+            "command": "uvx",
+            "args": ["markitdown-mcp@0.0.1a4"],
+        })
+
+    def test_explicit_mcp_identity_cannot_relabel_a_native_tool_name(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["pretool"] = request_body["pre_tool_use_data"]
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "read_file",
+            "tool_input": {"path": "document"},
+            "mcpServerName": "documents",
+            "mcpToolName": "read_file",
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        with patch.object(
+            unbound,
+            "read_copilot_mcp_servers",
+            return_value={"documents": {"command": "documents-mcp"}},
+        ), patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+
+        self.assertEqual(captured["pretool"]["tool_name"], "Read")
+        self.assertNotIn("mcp_server", captured["pretool"]["metadata"])
+
+    def test_builtin_github_forwards_identity_without_local_config(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["request"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "github-mcp-server-search_code",
+            "tool_input": {"query": "mcp"},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        with patch.object(unbound, "read_copilot_mcp_servers", return_value={}), \
+             patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+
+        pretool = captured["request"]["pre_tool_use_data"]
+        self.assertEqual(pretool["tool_name"], "mcp__github-mcp-server__search_code")
+        self.assertEqual(pretool["metadata"]["mcp_server"], "github-mcp-server")
+        self.assertEqual(pretool["metadata"]["mcp_tool"], "search_code")
+        self.assertNotIn("mcp_server_config", pretool["metadata"])
+
+    def test_unknown_server_dispatches_targeted_scan(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_markitdown_convert_to_markdown",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "s",
+        }
+        gateway = unittest.mock.Mock(return_value={
+            "decision": "allow",
+            "unknown_mcp_server": True,
+        })
+        with patch.object(unbound, "send_to_hook_api", gateway), patch.object(
+            unbound, "_dispatch_mcp_server_scan"
+        ) as dispatch:
+            unbound.process_pre_tool_use(event, "K")
+
+        dispatch.assert_called_once()
+        self.assertEqual(dispatch.call_args.args[0], "microsoft/markitdown")
+        self.assertEqual(dispatch.call_args.args[1]["command"], "uvx")
+
+    def test_denied_unknown_server_does_not_dispatch_targeted_scan(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_markitdown_convert_to_markdown",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "s",
+        }
+        gateway = unittest.mock.Mock(return_value={
+            "decision": "deny",
+            "unknown_mcp_server": True,
+        })
+        with patch.object(unbound, "send_to_hook_api", gateway), patch.object(
+            unbound, "_dispatch_mcp_server_scan"
+        ) as dispatch:
+            unbound.process_pre_tool_use(event, "K")
+
+        dispatch.assert_not_called()
+
+    def test_targeted_scan_uses_resolved_config(self):
+        config_path = Path(self._tmp.name) / "unbound.json"
+        config_path.write_text(json.dumps({
+            "api_key": "secret-api-key",
+            "base_url": "https://backend.example.com",
+        }))
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
+            unbound, "RUNNING_FROZEN", True
+        ), patch.object(unbound.os.path, "isfile", return_value=True), patch.object(
+            unbound.subprocess, "Popen"
+        ) as popen:
+            unbound._dispatch_mcp_server_scan(
+                "microsoft/markitdown", {"command": "uvx", "args": ["markitdown-mcp"]}
+            )
+
+        command = popen.call_args.args[0]
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual(command[:2], [unbound.FROZEN_DISCOVERY_BIN, "mcp-scan"])
+        self.assertNotIn("secret-api-key", command)
+        self.assertEqual(environment["UNBOUND_API_KEY"], "secret-api-key")
+        self.assertEqual(json.loads(environment["UNBOUND_MCP_SERVER_JSON"]), {
+            "command": "uvx",
+            "args": ["markitdown-mcp"],
+        })
+
+    def test_non_frozen_targeted_scan_uses_direct_command(self):
+        config_path = Path(self._tmp.name) / "unbound.json"
+        install_path = Path(self._tmp.name) / "install.sh"
+        config_path.write_text(json.dumps({
+            "api_key": "secret-api-key",
+            "base_url": "https://backend.example.com",
+        }))
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
+            unbound, "DISCOVERY_INSTALL_SH", install_path
+        ), patch.object(unbound, "RUNNING_FROZEN", False), patch.object(
+            unbound, "_ensure_discovery_installer", return_value=True
+        ), patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_mcp_server_scan(
+                "microsoft/markitdown", {"command": "uvx", "args": ["markitdown-mcp"]}
+            )
+
+        self.assertEqual(popen.call_args.args[0], [
+            "bash", str(install_path), "mcp-scan", "--name", "microsoft/markitdown",
+            "--domain", "https://backend.example.com",
+        ])
+        self.assertNotIn("-c", popen.call_args.args[0])
+
+    def test_discovery_installer_is_published_after_download(self):
+        install_dir = Path(self._tmp.name) / "discovery"
+        install_path = install_dir / "install.sh"
+
+        def download(command, **_kwargs):
+            destination = Path(command[command.index("-o") + 1])
+            self.assertNotEqual(destination, install_path)
+            destination.write_text("installer", encoding="utf-8")
+            return unittest.mock.Mock(returncode=0, stderr=b"")
+
+        with patch.object(unbound, "DISCOVERY_INSTALL_DIR", install_dir), patch.object(
+            unbound, "DISCOVERY_INSTALL_SH", install_path
+        ), patch.object(unbound.subprocess, "run", side_effect=download):
+            self.assertTrue(unbound._ensure_discovery_installer())
+
+        self.assertEqual(install_path.read_text(encoding="utf-8"), "installer")
+        self.assertEqual(list(install_dir.glob("*.tmp")), [])
 
     def test_non_mcp_tool_not_treated_as_mcp(self):
         captured = {}
@@ -251,6 +487,60 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertNotIn("mcp_server", captured.get("md", {}))
         self.assertFalse(self.is_block(ret))
 
+    def test_unmapped_native_tool_is_ignored(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "install_python_packages",
+            "tool_input": {"packageNames": ["requests"]},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        gateway = unittest.mock.Mock(return_value={"decision": "deny"})
+        with patch.object(unbound, "send_to_hook_api", gateway):
+            ret = unbound.process_pre_tool_use(event, "K")
+
+        self.assertEqual(ret, {})
+        gateway.assert_not_called()
+
+    def test_server_name_without_tool_does_not_claim_native_tool(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "install_python_packages",
+            "tool_input": {"packageNames": ["requests"]},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        colliding_config = {
+            "install_python_packages": {"command": "untrusted-workspace-server"},
+        }
+        gateway = unittest.mock.Mock(return_value={"decision": "deny"})
+        with patch.object(
+            unbound, "read_copilot_mcp_servers", return_value=colliding_config
+        ), patch.object(unbound, "send_to_hook_api", gateway):
+            ret = unbound.process_pre_tool_use(event, "K")
+
+        self.assertEqual(ret, {})
+        gateway.assert_not_called()
+
+    def test_workspace_mcp_config_cannot_relabel_terminal_like_native_tool(self):
+        gateway = unittest.mock.Mock(return_value={"decision": "allow"})
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "grep_search",
+            "tool_input": {"query": "needle"},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        colliding_config = {
+            "grep_search": {"command": "untrusted-workspace-server"},
+        }
+        with patch.object(
+            unbound, "read_copilot_mcp_servers", return_value=colliding_config
+        ), patch.object(unbound, "send_to_hook_api", gateway):
+            ret = unbound.process_pre_tool_use(event, "K")
+
+        self.assertEqual(ret, {})
+        gateway.assert_not_called()
 
 class TestStringToolArgs(ProcessPreToolUseBase):
     """VS Code sends toolArgs as a JSON string. The command must still reach the policy
@@ -315,7 +605,6 @@ class TestUnresolvedForwarding(ProcessPreToolUseBase):
         self.assertFalse(self.is_block(ret))
 
 
-# Query string is stripped by the hook + gateway, so the fingerprint is host+path.
 _PLUGIN_TOOLCHAIN_URL = (
     "https://mcp.example.com/mcp/v1/rpc?tool_filter=gdrive*,gdocs*"
 )
@@ -352,15 +641,11 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
         )
         self.assertEqual(server, "gdrive")
         self.assertEqual(tool, "gdrive-search")
-        self.assertEqual(
-            cfg.get("url"), "https://mcp.example.com/mcp/v1/rpc"
-        )
+        self.assertEqual(cfg["url"], _PLUGIN_TOOLCHAIN_URL)
 
-    def test_user_mcp_json_wins_over_plugin(self):
-        # A plugin must not override the user's own same-named server.
+    def test_plugin_and_user_name_collision_is_ambiguous(self):
         servers = self._run(write_user_gdrive="/usr/local/bin/my-real-gdrive")
-        self.assertEqual(servers["gdrive"].get("command"), "/usr/local/bin/my-real-gdrive")
-        self.assertNotIn("url", servers["gdrive"])
+        self.assertIsNone(servers["gdrive"])
 
     def test_no_plugins_is_noop(self):
         tmp = tempfile.TemporaryDirectory()
@@ -369,7 +654,7 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
             unbound._vscode_user_dirs()[0].mkdir(parents=True, exist_ok=True)
             self.assertEqual(unbound.read_copilot_mcp_servers(None), {})
 
-    def test_bare_package_fingerprint_is_computed_before_redaction(self):
+    def test_bare_package_config_reaches_the_gateway(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
@@ -379,14 +664,58 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
                 "postgres": {"command": "npx", "args": ["-y", "pg-mcp"]},
             }}))
             servers = unbound.read_copilot_mcp_servers(None)
-        self.assertEqual(servers["postgres"]["args"], [])
-        self.assertEqual(
-            servers["postgres"]["_unbound_fingerprint"], "npm:pg-mcp"
-        )
+        self.assertEqual(servers["postgres"], {
+            "command": "npx",
+            "args": ["-y", "pg-mcp"],
+        })
 
-    def test_plugin_relative_command_hashes_against_bundle(self):
-        # A plugin's relative script is fingerprinted against its own bundle dir,
-        # not the workspace cwd (else null/wrong fingerprint -> sanction bypass).
+    def test_config_is_forwarded_unchanged(self):
+        config = unbound._extract_mcp_server_fields({
+            "command": "npx",
+            "args": ["-y", "pg-mcp", "--token", "ghp_abcdefghijklmnopqrst", "API_KEY=secret"],
+        })
+
+        metadata = {
+            "mcp_server": "postgres",
+            "mcp_tool": "query",
+            "mcp_server_config": config,
+        }
+        unbound._attach_tool_content_hash(metadata)
+        self.assertEqual(metadata["mcp_server_config"], config)
+
+    def test_bespoke_command_config_is_forwarded(self):
+        config = unbound._extract_mcp_server_fields({
+            "command": "server",
+            "args": [
+                "--header", "Authorization: Bearer opaque-value",
+                "--env", "SESSION=opaque-value",
+                "--header=X-Key: opaque-value",
+            ],
+        })
+
+        self.assertEqual(config["command"], "server")
+        self.assertEqual(len(config["args"]), 5)
+
+    def test_config_survives_tool_hash_lookup_failure(self):
+        metadata = {
+            "mcp_server": "private",
+            "mcp_tool": "read",
+            "mcp_server_config": {
+                "command": "private-mcp",
+                "args": ["--token", "secret"],
+            },
+        }
+        with patch.object(
+            unbound, "_lookup_tool_content_hash", side_effect=RuntimeError("failed")
+        ):
+            unbound._attach_tool_content_hash(metadata)
+
+        self.assertEqual(metadata["mcp_server_config"], {
+            "command": "private-mcp",
+            "args": ["--token", "secret"],
+        })
+
+    def test_plugin_relative_command_is_forwarded_without_hook_fingerprint(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
@@ -403,8 +732,148 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
             # cwd points at a dir that does NOT contain the script.
             servers = unbound.read_copilot_mcp_servers(str(user_dir.parent))
         self.assertIn("local", servers)
-        self.assertIsNotNone(servers["local"].get("scriptHash"))
+        self.assertEqual(servers["local"], {"command": "./server.py"})
 
+
+class TestCopilotProjectConfigPaths(unittest.TestCase):
+    def test_copilot_home_contains_cli_config_and_plugins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            custom_home = Path(tmpdir) / "copilot-home"
+            plugin = custom_home / "installed-plugins" / "docs"
+            plugin.mkdir(parents=True)
+            custom_home.mkdir(exist_ok=True)
+            (custom_home / "mcp-config.json").write_text(json.dumps({
+                "mcpServers": {"linear": {"url": "https://mcp.linear.app/mcp"}},
+            }))
+            (plugin / ".mcp.json").write_text(json.dumps({
+                "mcpServers": {"docs": {"command": "docs-mcp"}},
+            }))
+
+            with patch.dict(os.environ, {"COPILOT_HOME": str(custom_home)}):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertEqual(servers["linear"]["url"], "https://mcp.linear.app/mcp")
+        self.assertEqual(servers["docs"]["command"], "docs-mcp")
+
+    def test_cli_github_config_is_read_from_git_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            nested = repo / "packages" / "app"
+            (repo / ".git").mkdir(parents=True)
+            (repo / ".github").mkdir()
+            nested.mkdir(parents=True)
+            (repo / ".github" / "mcp.json").write_text(json.dumps({
+                "mcpServers": {
+                    "github": {"command": "npx", "args": ["github-mcp-server"]},
+                },
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home):
+                servers = unbound.read_copilot_mcp_servers(str(nested))
+
+        self.assertEqual(servers["github"], {
+            "command": "npx",
+            "args": ["github-mcp-server"],
+        })
+
+    def test_bare_project_config_is_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            (repo / ".mcp.json").write_text(json.dumps({
+                "linear": {"type": "http", "url": "https://mcp.linear.app/mcp"},
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home):
+                servers = unbound.read_copilot_mcp_servers(str(repo))
+
+        self.assertEqual(servers["linear"]["url"], "https://mcp.linear.app/mcp")
+
+    def test_nearest_portable_config_wins(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            nested = repo / "packages" / "app"
+            (repo / ".git").mkdir(parents=True)
+            (repo / ".github").mkdir()
+            nested.mkdir(parents=True)
+            (repo / ".github" / "mcp.json").write_text(json.dumps({
+                "mcpServers": {"github": {"command": "root-server"}},
+            }))
+            (nested / ".mcp.json").write_text(json.dumps({
+                "mcpServers": {"github": {"command": "nested-server"}},
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home):
+                servers = unbound.read_copilot_mcp_servers(str(nested))
+
+        self.assertEqual(servers["github"]["command"], "nested-server")
+
+    def test_dot_mcp_overrides_only_conflicting_github_servers(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            (repo / ".github").mkdir()
+            (repo / ".github" / "mcp.json").write_text(json.dumps({
+                "mcpServers": {
+                    "shared": {"command": "github-value"},
+                    "github-only": {"command": "loaded"},
+                },
+            }))
+            (repo / ".mcp.json").write_text(json.dumps({
+                "mcpServers": {
+                    "shared": {"command": "portable-value"},
+                    "portable": {"command": "loaded"},
+                },
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home):
+                servers = unbound.read_copilot_mcp_servers(str(repo))
+
+        self.assertEqual(servers["portable"]["command"], "loaded")
+        self.assertEqual(servers["github-only"]["command"], "loaded")
+        self.assertEqual(servers["shared"]["command"], "portable-value")
+
+    def test_vscode_workspace_config_is_read(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            (repo / ".git").mkdir(parents=True)
+            (repo / ".vscode").mkdir()
+            (repo / ".vscode" / "mcp.json").write_text(json.dumps({
+                "servers": {"context7": {"command": "npx", "args": ["context7-mcp"]}},
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home):
+                servers = unbound.read_copilot_mcp_servers(str(repo))
+
+        self.assertEqual(servers["context7"]["args"], ["context7-mcp"])
+
+    def test_conflicting_user_and_workspace_configs_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            user_dir = home / "Library" / "Application Support" / "Code" / "User"
+            user_dir.mkdir(parents=True)
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (repo / ".mcp.json").write_text(json.dumps({
+                "shared": {"command": "workspace-server"},
+            }))
+            (user_dir / "mcp.json").write_text(json.dumps({
+                "servers": {"shared": {"command": "user-server"}},
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home), patch.object(
+                unbound.platform, "system", return_value="Darwin"
+            ):
+                servers = unbound.read_copilot_mcp_servers(str(repo))
+
+        self.assertIn("shared", servers)
+        self.assertIsNone(servers["shared"])
 
 if __name__ == "__main__":
     unittest.main()
