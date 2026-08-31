@@ -9,10 +9,11 @@ import time
 import platform
 import subprocess
 import json
+import types
 import sqlite3
 import tempfile
 from pathlib import Path
-from typing import Tuple, List, Optional, Dict
+from typing import Any, Tuple, List, Optional, Dict
 try:
     import pwd
 except ImportError:
@@ -793,11 +794,104 @@ def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
     return name or None
 
 
-def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
-    """Read a transcript and return {session_id, entries} for server-side parsing.
-    The client only JSON-decodes lines and resolves a session id (preferring the
-    session.start payload, falling back to the path). All semantic parsing
-    happens server-side in webapp.services.coding_tools_backfill_service."""
+_BACKFILL_HOOK_MODULE = None
+_BACKFILL_HOOK_SOURCE = None
+
+
+def _backfill_load_hook_module():
+    global _BACKFILL_HOOK_MODULE
+    if _BACKFILL_HOOK_MODULE is not None:
+        return _BACKFILL_HOOK_MODULE
+    if not isinstance(_BACKFILL_HOOK_SOURCE, str) or not _BACKFILL_HOOK_SOURCE:
+        return None
+    try:
+        module = types.ModuleType("unbound_copilot_backfill_hook")
+        exec(compile(_BACKFILL_HOOK_SOURCE, "unbound.py", "exec"), module.__dict__)
+        _BACKFILL_HOOK_MODULE = module
+        return module
+    except Exception as exc:
+        debug_print(f"could not load installed hook for MCP resolution: {exc}")
+        return None
+
+
+def _backfill_mcp_tool_provenance(
+    entries: List[Dict], home_dir: Optional[Path] = None
+) -> Dict[str, Dict[str, Any]]:
+    hook = _backfill_load_hook_module()
+    if hook is None:
+        return {}
+    try:
+        cwd = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            candidate = entry.get("cwd") or data.get("cwd")
+            if isinstance(candidate, str) and candidate:
+                cwd = candidate
+                break
+        if cwd and home_dir is not None and platform.system().lower() == 'windows':
+            try:
+                Path(cwd).resolve().relative_to(home_dir.resolve())
+            except (OSError, RuntimeError, ValueError):
+                cwd = None
+        mcp_servers = hook.read_copilot_mcp_servers(cwd)
+        provenance = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            requests = data.get("toolRequests") if entry.get("type") == "assistant.message" else None
+            if entry.get("type") == "tool.execution_start":
+                requests = [{
+                    "toolCallId": data.get("toolCallId"),
+                    "name": data.get("toolName"),
+                    "arguments": data.get("arguments"),
+                    "mcpServerName": data.get("mcpServerName"),
+                    "mcpToolName": data.get("mcpToolName"),
+                }]
+            for request in requests or []:
+                if not isinstance(request, dict):
+                    continue
+                call_id = request.get("toolCallId")
+                tool_name = request.get("name")
+                if not isinstance(call_id, str) or not isinstance(tool_name, str):
+                    continue
+                arguments = request.get("arguments")
+                normalizer = getattr(hook, "_normalize_arguments", None)
+                if callable(normalizer):
+                    arguments = normalizer(arguments)
+                elif not isinstance(arguments, dict):
+                    arguments = {}
+                mapped = hook.map_copilot_tool(
+                    tool_name, arguments, "", mcp_servers=mcp_servers,
+                    mcp_server_name=request.get("mcpServerName"),
+                    mcp_tool_name=request.get("mcpToolName"),
+                )
+                if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
+                    continue
+                server_name = mapped.get("server_name")
+                if isinstance(server_name, str) and server_name:
+                    item = {
+                        "tool_name": tool_name,
+                        "server_name": server_name,
+                    }
+                    mcp_tool_name = mapped.get("mcp_tool_name")
+                    if isinstance(mcp_tool_name, str) and mcp_tool_name:
+                        item["mcp_tool_name"] = mcp_tool_name
+                    mcp_server_config = mapped.get("mcp_server_config")
+                    if isinstance(mcp_server_config, dict) and mcp_server_config:
+                        item["mcp_server_config"] = mcp_server_config
+                    provenance[call_id] = item
+        return provenance
+    except Exception as exc:
+        debug_print(f"could not resolve backfill MCP calls: {exc}")
+        return {}
+
+
+def _backfill_collect_session(
+    transcript_path: Path, home_dir: Optional[Path] = None
+) -> Optional[Dict]:
     entries = []
     session_id = None
     try:
@@ -828,6 +922,9 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     if not session_id or not entries:
         return None
     session = {'session_id': session_id, 'entries': entries}
+    mcp_tool_provenance = _backfill_mcp_tool_provenance(entries, home_dir)
+    if mcp_tool_provenance:
+        session['mcp_tool_provenance'] = mcp_tool_provenance
     usage = _backfill_session_usage(transcript_path, session_id)
     if usage:
         session['usage'] = usage
@@ -1142,25 +1239,37 @@ def _backfill_iter_transcripts(home_dir: Path, cutoff_mtime: float):
 
 
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None) -> Tuple[List[Dict], bool, bool]:
-    # Must run inside _run_as_user (reads transcripts as the target user).
-    # Returns (sessions, capped); capped=True means the per-run cap was hit and
-    # older files remain unprocessed, so this home's cutoff must not advance.
-    cutoff_mtime = _backfill_read_cutoff(home_dir)
-    # Compared per home: one device can hold profiles that last backfilled at different
-    # times, and only those behind the request re-walk.
-    forced = force_epoch is not None and force_epoch > cutoff_mtime
-    if forced:
-        cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
-    sessions = []
-    capped = False
-    for transcript_path in sorted(_backfill_iter_transcripts(home_dir, cutoff_mtime)):
-        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
-            capped = True
-            break
-        session = _backfill_collect_session(transcript_path)
-        if session:
-            sessions.append(session)
-    return sessions, capped, forced
+    previous_env = {}
+    if platform.system().lower() == 'windows':
+        values = {
+            'HOME': str(home_dir),
+            'USERPROFILE': str(home_dir),
+            'APPDATA': str(home_dir / 'AppData' / 'Roaming'),
+        }
+        for name, value in values.items():
+            previous_env[name] = os.environ.get(name)
+            os.environ[name] = value
+    try:
+        cutoff_mtime = _backfill_read_cutoff(home_dir)
+        forced = force_epoch is not None and force_epoch > cutoff_mtime
+        if forced:
+            cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+        sessions = []
+        capped = False
+        for transcript_path in sorted(_backfill_iter_transcripts(home_dir, cutoff_mtime)):
+            if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                capped = True
+                break
+            session = _backfill_collect_session(transcript_path, home_dir)
+            if session:
+                sessions.append(session)
+        return sessions, capped, forced
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1310,6 +1419,22 @@ def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
     return [i for i, entry in enumerate(entries) if _backfill_is_user_message(entry)]
 
 
+def _backfill_tool_call_ids(entries: List[Dict]):
+    call_ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        data = entry.get('data') or {}
+        if entry.get('type') == 'assistant.message':
+            for request in data.get('toolRequests') or []:
+                if isinstance(request, dict) and isinstance(request.get('toolCallId'), str):
+                    call_ids.add(request['toolCallId'])
+        elif entry.get('type') in ('tool.execution_start', 'tool.execution_complete'):
+            if isinstance(data.get('toolCallId'), str):
+                call_ids.add(data['toolCallId'])
+    return call_ids
+
+
 def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
     yielded as-is. Oversized sessions are split at server-side exchange
@@ -1320,6 +1445,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     entries = session.get('entries') or []
     session_usage = session.get('usage') or []
     session_models = session.get('models') or []
+    session_provenance = session.get('mcp_tool_provenance') or {}
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1361,18 +1487,45 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        slice_payload = {
-            'session_id': session_id,
-            'record_index_base': record_index_base,
-            'entries': entries[start_idx:last_fit_end],
-        }
-        # Usage is one dict per exchange, so it cuts on the same boundaries the entries do.
-        usage_slice = session_usage[record_index_base:record_index_base + last_fit_base_count]
-        if usage_slice:
-            slice_payload['usage'] = usage_slice
-        models_slice = session_models[record_index_base:record_index_base + last_fit_base_count]
-        if any(models_slice):
-            slice_payload['models'] = models_slice
+        fit_ends = [end_idx for end_idx in ends if end_idx <= last_fit_end]
+        slice_payload = None
+        while fit_ends:
+            candidate_end = fit_ends.pop()
+            candidate_count = sum(
+                1 for boundary in boundaries if start_idx <= boundary < candidate_end
+            )
+            candidate_entries = entries[start_idx:candidate_end]
+            candidate = {
+                'session_id': session_id,
+                'record_index_base': record_index_base,
+                'entries': candidate_entries,
+            }
+            usage_slice = session_usage[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if usage_slice:
+                candidate['usage'] = usage_slice
+            models_slice = session_models[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if any(models_slice):
+                candidate['models'] = models_slice
+            call_ids = _backfill_tool_call_ids(candidate_entries)
+            provenance_slice = {
+                call_id: session_provenance[call_id]
+                for call_id in call_ids
+                if call_id in session_provenance
+            }
+            if provenance_slice:
+                candidate['mcp_tool_provenance'] = provenance_slice
+            if len(json.dumps(candidate).encode('utf-8')) <= max_chunk_bytes:
+                slice_payload = candidate
+                last_fit_end = candidate_end
+                last_fit_base_count = candidate_count
+                break
+        if slice_payload is None:
+            debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            return
         yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
@@ -1417,7 +1570,8 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
 
 
-def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
+def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]],
+                 hook_source: Optional[str] = None) -> None:
     """Walk every user's Copilot CLI + VS Code transcripts and seed historical sessions.
 
     MDM /get_application_api_key/ returns one per-device key and attribution is
@@ -1427,6 +1581,10 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
 
+    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_SOURCE
+    if hook_source is not None:
+        _BACKFILL_HOOK_MODULE = None
+        _BACKFILL_HOOK_SOURCE = hook_source
     try:
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
@@ -1719,7 +1877,7 @@ def main():
         notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if success and backfill_mode:
-        run_backfill(api_key, base_url, user_homes)
+        run_backfill(api_key, base_url, user_homes, script_text)
 
     return success
 
