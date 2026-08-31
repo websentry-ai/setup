@@ -859,20 +859,13 @@ def complete_pending_turns(event, wm_key, api_key, final=False):
     A list rather than one slot: a turn whose tokens have not landed by the next Stop
     would otherwise be displaced by that Stop's own pending turn, and its tokens lost."""
     pending_turns = get_session_marker(wm_key).get('pending_turns') or []
-    remaining = []
-    # The journal is read from an index with no upper bound, so two turns starting from
-    # the same one would each claim every request that has settled since. Threading the
-    # index through them in order partitions the requests exactly as consecutive Stops
-    # would have, which is what these deferred turns are.
-    index = None
-    for pending in pending_turns:
-        if index is None:
-            index = pending.get('usage_index') or 0
-        settled, index = complete_pending_turn(
-            event, dict(pending, usage_index=index), api_key, final)
-        if not settled:
-            remaining.append(dict(pending, usage_index=index))
-    return remaining
+    if pending_turns and final:
+        # Once for the list, not once per turn: they all read the same journal, and at
+        # session end it may not have been written yet.
+        _await_vscode_journal(event.get('transcript_path'),
+                              pending_turns[0].get('conversation_id'))
+    return [p for p in pending_turns
+            if not complete_pending_turn(event, p, api_key, final)]
 
 
 def complete_pending_turn(event, pending, api_key, final=False):
@@ -880,20 +873,17 @@ def complete_pending_turn(event, pending, api_key, final=False):
 
     Copilot writes both after the turn has already been reported, so its own Stop had
     nothing to send. The re-send carries the id the turn was sent with, so the control
-    plane fills that row rather than adding a second one. Returns (settled, next index),
-    where the index is what the following pending turn must read from so the two do not
-    both claim the same requests."""
-    start_index = (pending or {}).get('usage_index') or 0
+    plane fills that row rather than adding a second one. Returns True when the turn is
+    settled and can be dropped."""
     if not isinstance(pending, dict) or not pending.get('turn_request_id'):
-        return True, start_index
+        return True
 
     transcript_path = event.get('transcript_path')
     conversation_id = pending.get('conversation_id')
-    # At session end this is the turn's last chance, so an unwritten journal is worth
-    # waiting on. Mid-session a later Stop would pick it up, and waiting would be cost.
-    usage, next_index = get_turn_usage(transcript_path, conversation_id,
-                                       pending.get('since'), pending.get('until'),
-                                       start_index, wait_when_idle=final)
+    # By the turn's own window, never by the live path's watermark: every turn after this
+    # one has settled by now, and a watermark read would hand this turn all of them.
+    usage = pending_turn_usage(transcript_path, conversation_id,
+                               pending.get('since'), pending.get('until'))
     model = _vscode_turn_model(transcript_path, conversation_id,
                                pending.get('since'), pending.get('until'))
     # Tokens are the point, and VS Code can expose a model before it has finished
@@ -901,12 +891,12 @@ def complete_pending_turn(event, pending, api_key, final=False):
     # tokens permanently, so a model-only result waits -- except at SessionEnd, which is
     # the last chance this session gets.
     if not usage and not (final and model):
-        return False, next_index
+        return False
 
     content = rebuild_turn_content(transcript_path, conversation_id, pending.get('prompt_id'))
     if content is None:
         # The turn is no longer in the transcript, so nothing can be rebuilt for it.
-        return True, next_index
+        return True
     user_prompt, assistant_prompt = content
 
     exchange = {
@@ -921,12 +911,11 @@ def complete_pending_turn(event, pending, api_key, final=False):
     if usage:
         exchange['usage'] = usage
     if not send_to_api(exchange, api_key):
-        # Nothing consumed, so the next turn must still start where this one did.
-        return False, start_index
+        return False
     # Settled means the tokens are in, not merely that something was sent. A model-only
     # send is progress, so the slot stays and any later event for this session can still
     # attach them; re-sending fills the same row and changes nothing.
-    return bool(usage), next_index
+    return bool(usage)
 
 
 def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
@@ -3402,6 +3391,82 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
     return totals, index, index in requests
 
 
+def _await_vscode_journal(transcript_path, conversation_id):
+    """Wait out the settle window for a journal that has not finished being written.
+
+    Only worth doing at session end. Mid-session an unwritten journal means a later Stop
+    reports the turn, but at session end there is no later Stop, and VS Code sometimes
+    writes the whole journal only as the session closes."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return
+    stamp = _vscode_store_stamp(path)
+    deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(_VSCODE_POLL_SECONDS)
+        current = _vscode_store_stamp(path)
+        if current is not None and current != stamp:
+            # It grew, so give the write a moment to finish rather than reading a
+            # half-written turn.
+            stamp = current
+            continue
+        return
+
+
+def _vscode_windowed_usage(transcript_path, conversation_id, since, until):
+    """Usage for the requests belonging to one past turn, chosen by the window it ran in.
+
+    A deferred turn cannot use the index the live path uses. That reader takes every
+    settled request from a point onward, which is right for a Stop reporting the turn that
+    just ended and wrong for a turn completed later, when the requests of every turn after
+    it have settled too and the first read would swallow them all."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None
+    requests = _vscode_requests(path)
+    if not requests:
+        return None
+    lo, hi = _epoch(since), _epoch(until)
+    if hi is None:
+        return None
+    totals = dict((field, 0) for field in _USAGE_FIELDS)
+    found = False
+    # Guarded for the same reason the index reader is: a non-numeric count in the journal
+    # must not raise past the hook.
+    try:
+        for index in sorted(requests):
+            entry = requests[index]
+            if not _in_window(_epoch(entry.get('timestamp')), lo, hi):
+                continue
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            # elapsedMs is written after the final counts, so a request without it is
+            # still climbing and is left out rather than counted low.
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                continue
+            totals['input_tokens'] += max(int(prompt), 0)
+            totals['output_tokens'] += max(int(completion), 0)
+            found = True
+    except (TypeError, ValueError) as e:
+        log_error('vscode windowed usage failed: %s' % e, 'usage')
+        return None
+    if not found:
+        return None
+    totals['total_tokens'] = sum(totals[field] for field in _USAGE_FIELDS)
+    return totals
+
+
+def pending_turn_usage(transcript_path, conversation_id, since, until):
+    """Usage for one turn being completed after the fact, by its own window on either
+    surface. Both stores stamp every request, so neither needs the live path's watermark."""
+    if transcript_path and Path(transcript_path).stem == 'events':
+        usage = _cli_turn_usage(conversation_id, _epoch(since), _epoch(until))
+        if usage and any(usage.values()):
+            usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
+            return usage
+        return None
+    return _vscode_windowed_usage(transcript_path, conversation_id, since, until)
+
+
 def _vscode_store_stamp(path):
     """(mtime, size) of the chat journal, or None when it cannot be stat'd."""
     if not path:
@@ -3413,20 +3478,18 @@ def _vscode_store_stamp(path):
         return None
 
 
-def _vscode_settled_usage(transcript_path, conversation_id, start_index,
-                          wait_when_idle=False):
+def _vscode_settled_usage(transcript_path, conversation_id, start_index):
     """Wait for this turn to finish being written. Stop fires before the response ends, so
     a first read usually has nothing to report. Giving up is safe: the watermark does not
     advance, so a later Stop reports the turn instead.
 
-    `wait_when_idle` is for the session's last chance, where that safety net does not
-    exist. VS Code writes the journal lazily and sometimes only as the session closes, so
-    an empty read there is worth waiting on rather than the give-up it means mid-session."""
+    A turn being completed after the fact does not come through here at all; it reads by
+    its own window, because by then every later turn has settled too."""
     usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
                                                     start_index)
     # Wait only while a request is mid-write. With nothing pending there is nothing to wait
     # for, and blocking every quiet Stop for the full window would be pure cost.
-    if next_index > start_index or (not wait_when_idle and (usage is None or not pending)):
+    if usage is None or next_index > start_index or not pending:
         return usage, next_index
     path = _vscode_store_path(transcript_path, conversation_id)
     stamp = _vscode_store_stamp(path)
@@ -3441,13 +3504,12 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index,
         stamp = current
         usage, next_index, _pending = _vscode_turn_usage(transcript_path, conversation_id,
                                                          start_index)
-        if next_index > start_index or (usage is None and not wait_when_idle):
+        if usage is None or next_index > start_index:
             break
     return usage, next_index
 
 
-def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, usage_index=0,
-                   wait_when_idle=False):
+def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, usage_index=0):
     """Exact usage for the turn, read from the local store behind whichever surface wrote
     the transcript -- Copilot forwards none, so without this the backend estimates from
     visible text and misses cache reads, tool definitions and system instructions.
@@ -3461,7 +3523,7 @@ def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, us
         next_index = usage_index
     else:
         usage, next_index = _vscode_settled_usage(transcript_path, conversation_id,
-                                                  usage_index, wait_when_idle)
+                                                  usage_index)
     if not usage or not any(usage.values()):
         return None, next_index
     usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
@@ -4148,7 +4210,6 @@ def main():
                             'prompt_id': anchor,
                             'since': previous_stop,
                             'until': timestamp,
-                            'usage_index': usage_index,
                         })
                     record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now,
                                               usage_index, digests + [digest],

@@ -116,21 +116,20 @@ class TestCompletePendingTurn(unittest.TestCase):
         sent = []
         entries = entries or [_user("q", "p1"), _assistant("a")]
 
-        def _usage(*a, **k):
+        def _usage(path, conv, since, until):
             if capture is not None:
-                capture.update(k)
-            return (usage, 0)
+                capture.update({"since": since, "until": until})
+            return usage
 
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _transcript(tmpdir, entries)
             event = {"transcript_path": str(path)}
-            with patch.object(unbound, "get_turn_usage", _usage), \
+            with patch.object(unbound, "pending_turn_usage", _usage), \
                     patch.object(unbound, "_vscode_turn_model", lambda *a, **k: model), \
                     patch.object(unbound, "send_to_api",
                                  lambda ex, key: sent.append(ex) or True):
-                settled, _ = unbound.complete_pending_turn(event, pending, "key",
-                                                           final=final)
+                settled = unbound.complete_pending_turn(event, pending, "key", final=final)
         return settled, sent
 
     def _pending(self):
@@ -193,18 +192,12 @@ class TestCompletePendingTurn(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 
-    def test_session_end_waits_for_a_journal_that_has_not_been_written(self):
-        # VS Code writes the journal lazily, sometimes only as the session closes. Mid
-        # session an empty read means "a later Stop will get it"; at SessionEnd there is
-        # no later Stop, so the read has to wait instead of giving up.
+    def test_the_read_is_bounded_by_the_turns_own_window(self):
+        # Not the live path's watermark: by the time a turn is completed, every later
+        # turn has settled too, and a watermark read would hand this turn all of them.
         capture = {}
-        self._run(self._pending(), {"input_tokens": 5}, None, final=True, capture=capture)
-        self.assertTrue(capture.get("wait_when_idle"))
-
-    def test_mid_session_does_not_pay_for_the_wait(self):
-        capture = {}
-        self._run(self._pending(), {"input_tokens": 5}, None, final=False, capture=capture)
-        self.assertFalse(capture.get("wait_when_idle"))
+        self._run(self._pending(), {"input_tokens": 5}, None, capture=capture)
+        self.assertEqual(capture.get("until"), "2026-08-31T00:00:00Z")
 
 
 class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
@@ -218,7 +211,7 @@ class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
         with patch.object(unbound, "get_session_marker",
                           lambda k: {"pending_turns": pending_turns}), \
                 patch.object(unbound, "complete_pending_turn",
-                             lambda ev, p, key, final=False: (settle(p), 0)):
+                             lambda ev, p, key, final=False: settle(p)):
             return unbound.complete_pending_turns({}, "wm", "key")
 
     def test_an_unsettled_turn_stays_while_a_later_one_settles(self):
@@ -242,47 +235,30 @@ class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
         self.assertGreater(unbound.MAX_PENDING_TURNS, 301)
 
 
-class TestPendingTurnsPartitionTheJournal(unittest.TestCase):
-    """Two pending turns starting from the same journal index would each claim every
-    request that settled since, counting the same tokens twice on two different rows."""
+class TestPendingTurnsReadTheirOwnWindows(unittest.TestCase):
+    """Every pending turn used to read from one shared index, so the first took every
+    settled request and the rest got nothing."""
 
-    def _pending(self, n, index):
+    def _pending(self, n, since, until):
         return {"turn_request_id": "tid-%d" % n, "conversation_id": SESSION,
-                "prompt_id": "p%d" % n, "since": None, "until": "2026-08-31T00:00:00Z",
-                "usage_index": index}
+                "prompt_id": "p%d" % n, "since": since, "until": until}
 
-    def _run(self, turns, reads):
-        """reads: start index -> (usage, next index) the journal would return."""
-        seen = []
+    def test_each_turn_is_read_with_its_own_boundaries(self):
+        windows = []
 
-        def _usage(path, conv, since, until, index=0, wait_when_idle=False):
-            seen.append(index)
-            return reads.get(index, (None, index))
+        def _usage(path, conv, since, until):
+            windows.append((since, until))
+            return {"input_tokens": 1}
 
+        turns = [self._pending(1, None, "t1"), self._pending(2, "t1", "t2")]
         with patch.object(unbound, "get_session_marker",
                           lambda k: {"pending_turns": turns}), \
-                patch.object(unbound, "get_turn_usage", _usage), \
+                patch.object(unbound, "pending_turn_usage", _usage), \
                 patch.object(unbound, "_vscode_turn_model", lambda *a, **k: None), \
-                patch.object(unbound, "rebuild_turn_content",
-                             lambda *a, **k: ("q", "a")), \
+                patch.object(unbound, "rebuild_turn_content", lambda *a, **k: ("q", "a")), \
                 patch.object(unbound, "send_to_api", lambda ex, key: True):
             remaining = unbound.complete_pending_turns({}, "wm", "key")
-        return seen, remaining
 
-    def test_the_second_turn_reads_on_from_where_the_first_stopped(self):
-        turns = [self._pending(1, 0), self._pending(2, 0)]
-        seen, remaining = self._run(turns, {0: ({"input_tokens": 5}, 1),
-                                            1: ({"input_tokens": 7}, 2)})
-        self.assertEqual(seen, [0, 1], "the second turn must not re-read the first's requests")
+        self.assertEqual(windows, [(None, "t1"), ("t1", "t2")],
+                         "the second turn must not be read with the first's window")
         self.assertEqual(remaining, [])
-
-    def test_a_turn_that_reads_nothing_leaves_the_index_where_it_was(self):
-        turns = [self._pending(1, 0), self._pending(2, 0)]
-        seen, remaining = self._run(turns, {})
-        self.assertEqual(seen, [0, 0], "nothing was consumed, so the next turn starts there")
-        self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1", "tid-2"])
-
-    def test_an_unsettled_turn_keeps_the_index_it_should_resume_from(self):
-        turns = [self._pending(1, 0)]
-        _, remaining = self._run(turns, {})
-        self.assertEqual(remaining[0]["usage_index"], 0)
