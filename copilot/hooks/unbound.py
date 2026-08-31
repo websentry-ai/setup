@@ -3402,15 +3402,21 @@ def _await_vscode_journal(transcript_path, conversation_id):
         return
     stamp = _vscode_store_stamp(path)
     deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
+    written = False
     while time.monotonic() < deadline:
         time.sleep(_VSCODE_POLL_SECONDS)
         current = _vscode_store_stamp(path)
         if current is not None and current != stamp:
-            # It grew, so give the write a moment to finish rather than reading a
+            # Still being written. Keep waiting for it to go quiet rather than reading a
             # half-written turn.
             stamp = current
+            written = True
             continue
-        return
+        if written:
+            return  # it grew and has now settled
+        # Unchanged so far means the write has not started, which is the case worth
+        # waiting out here: returning now would give up on a journal VS Code writes a
+        # few seconds into the close.
 
 
 def _vscode_windowed_usage(transcript_path, conversation_id, since, until):

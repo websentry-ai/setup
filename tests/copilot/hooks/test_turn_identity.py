@@ -262,3 +262,52 @@ class TestPendingTurnsReadTheirOwnWindows(unittest.TestCase):
         self.assertEqual(windows, [(None, "t1"), ("t1", "t2")],
                          "the second turn must not be read with the first's window")
         self.assertEqual(remaining, [])
+
+
+class TestAwaitVscodeJournal(unittest.TestCase):
+    """Session end is the last chance to catch a journal VS Code writes lazily, so an
+    unchanged first poll means the write has not started, not that it never will."""
+
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.slept = 0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            self.slept += 1
+
+    def _await(self, stamps):
+        """stamps: what each _vscode_store_stamp call returns, in order."""
+        clock = self._Clock()
+        seq = iter(stamps)
+        last = [stamps[-1]]
+
+        def _stamp(_path):
+            try:
+                last[0] = next(seq)
+            except StopIteration:
+                pass
+            return last[0]
+
+        with patch.object(unbound, "time", clock), \
+                patch.object(unbound, "_vscode_store_path", lambda *a: Path("/tmp/j.jsonl")), \
+                patch.object(unbound, "_vscode_store_stamp", _stamp):
+            unbound._await_vscode_journal("/tmp/t.jsonl", SESSION)
+        return clock
+
+    def test_it_waits_the_whole_window_when_nothing_is_written(self):
+        clock = self._await([(1, 1)] * 200)
+        expected = unbound._VSCODE_SETTLE_SECONDS / unbound._VSCODE_POLL_SECONDS
+        self.assertGreaterEqual(clock.slept, expected - 1,
+                                "gave up before the window instead of waiting for the write")
+
+    def test_it_returns_once_a_write_lands_and_goes_quiet(self):
+        # grows twice, then settles
+        clock = self._await([(1, 1), (2, 2), (3, 3), (3, 3), (3, 3)])
+        self.assertLess(clock.now, unbound._VSCODE_SETTLE_SECONDS,
+                        "should stop as soon as the journal settles")
+        self.assertGreaterEqual(clock.slept, 3)
