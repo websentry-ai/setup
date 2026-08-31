@@ -5,7 +5,6 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 """
 
 import sys
-import base64
 import json
 import os
 import platform
@@ -985,11 +984,6 @@ def _read_local_script(command, args, cwd):
             return f.read(_HOOK_MAX_SCRIPT_BYTES)
     except Exception:
         return None
-
-
-def _read_script_body_b64(command, args, cwd):
-    data = _read_local_script(command, args, cwd)
-    return base64.b64encode(data).decode('ascii') if data is not None else None
 
 
 def _compute_script_hash(command, args, cwd):
@@ -2218,7 +2212,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         and api_response.get('unknown_mcp_server')
         and scan_config
     ):
-        _dispatch_mcp_server_scan(mcp_server, scan_config, event.get('cwd'))
+        _dispatch_mcp_server_scan(mcp_server, scan_config)
 
     return transform_response_for_copilot(api_response)
 
@@ -3819,16 +3813,10 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
-def _dispatch_mcp_server_scan(server_name, server_config, cwd=None):
+def _dispatch_mcp_server_scan(server_name, server_config):
     if not server_name or not isinstance(server_config, dict):
         return
     try:
-        if server_config.get('command') and not server_config.get('script_content'):
-            script_body = _read_script_body_b64(
-                server_config.get('command'), server_config.get('args'), cwd
-            )
-            if script_body:
-                server_config = {**server_config, 'script_content': script_body}
         with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
             unbound_config = json.load(f)
         api_key = unbound_config.get("api_key")
