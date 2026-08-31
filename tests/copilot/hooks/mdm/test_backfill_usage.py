@@ -101,6 +101,7 @@ class TestMdmBackfillUsage(unittest.TestCase):
                 transcript.parent.mkdir(parents=True)
                 transcript.write_text(json.dumps({
                     "type": "assistant.message",
+                    "cwd": str(home),
                     "data": {"toolRequests": [{
                         "toolCallId": server,
                         "name": f"{server}-get_issue",
@@ -127,6 +128,30 @@ class TestMdmBackfillUsage(unittest.TestCase):
                 }},
             ],
         )
+
+    def test_windows_collection_ignores_workspace_outside_user_home(self):
+        source_hook = Path(__file__).resolve().parents[4] / "copilot" / "hooks" / "unbound.py"
+        mdm._BACKFILL_HOOK_SOURCE = source_hook.read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as user_root, tempfile.TemporaryDirectory() as other:
+            home = Path(user_root)
+            (Path(other) / ".mcp.json").write_text(json.dumps({
+                "outside": {"command": "outside-mcp"},
+            }), encoding="utf-8")
+            transcript = home / ".copilot" / "session-state" / "outside" / "events.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(json.dumps({
+                "type": "assistant.message",
+                "cwd": other,
+                "data": {"toolRequests": [{
+                    "toolCallId": "outside",
+                    "name": "outside-read",
+                    "arguments": {},
+                }]},
+            }) + "\n", encoding="utf-8")
+            with patch.object(mdm.platform, "system", return_value="Windows"):
+                sessions = mdm._backfill_collect_sessions(home)[0]
+
+        self.assertNotIn("mcp_tool_provenance", sessions[0])
 
 
 class TestReaderBlockStaysInSync(unittest.TestCase):

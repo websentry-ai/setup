@@ -814,7 +814,9 @@ def _backfill_load_hook_module():
         return None
 
 
-def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, Any]]:
+def _backfill_mcp_tool_provenance(
+    entries: List[Dict], home_dir: Optional[Path] = None
+) -> Dict[str, Dict[str, Any]]:
     hook = _backfill_load_hook_module()
     if hook is None:
         return {}
@@ -828,6 +830,11 @@ def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, An
             if isinstance(candidate, str) and candidate:
                 cwd = candidate
                 break
+        if cwd and home_dir is not None and platform.system().lower() == 'windows':
+            try:
+                Path(cwd).resolve().relative_to(home_dir.resolve())
+            except (OSError, RuntimeError, ValueError):
+                cwd = None
         mcp_servers = hook.read_copilot_mcp_servers(cwd)
         provenance = {}
         for entry in entries:
@@ -882,7 +889,9 @@ def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, An
         return {}
 
 
-def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
+def _backfill_collect_session(
+    transcript_path: Path, home_dir: Optional[Path] = None
+) -> Optional[Dict]:
     entries = []
     session_id = None
     try:
@@ -913,7 +922,7 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     if not session_id or not entries:
         return None
     session = {'session_id': session_id, 'entries': entries}
-    mcp_tool_provenance = _backfill_mcp_tool_provenance(entries)
+    mcp_tool_provenance = _backfill_mcp_tool_provenance(entries, home_dir)
     if mcp_tool_provenance:
         session['mcp_tool_provenance'] = mcp_tool_provenance
     usage = _backfill_session_usage(transcript_path, session_id)
@@ -1251,7 +1260,7 @@ def _backfill_collect_sessions(home_dir: Path, force_epoch=None) -> Tuple[List[D
             if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
                 capped = True
                 break
-            session = _backfill_collect_session(transcript_path)
+            session = _backfill_collect_session(transcript_path, home_dir)
             if session:
                 sessions.append(session)
         return sessions, capped, forced

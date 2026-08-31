@@ -1751,22 +1751,30 @@ def _explicit_mcp_identity_matches(raw_tool, server_name, tool_name):
 
 
 def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None):
-    if _explicit_mcp_identity_matches(raw_tool, server_name, tool_name):
-        return (server_name, tool_name, mcp_servers.get(server_name))
     lowered = (raw_tool or '').lower()
-    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
-        configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
-    else:
-        configured = detect_mcp_call(raw_tool, mcp_servers)
-    if configured[0] is not None:
-        return configured
+    builtin = (None, None, None)
     for server in _BUILTIN_MCP_SERVERS:
         prefix = server + '-'
         if lowered.startswith(prefix):
             tool = raw_tool[len(prefix):]
             if tool:
-                return (server, tool, mcp_servers.get(server))
-    return (None, None, None)
+                builtin = (server, tool, mcp_servers.get(server))
+                break
+    if _explicit_mcp_identity_matches(raw_tool, server_name, tool_name) and (
+        builtin[0] is None
+        or len(_sanitize_copilot_server_name(server_name)) >= len(builtin[0])
+    ):
+        return (server_name, tool_name, mcp_servers.get(server_name))
+    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
+        configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
+    else:
+        configured = detect_mcp_call(raw_tool, mcp_servers)
+    if builtin[0] is not None and (
+        configured[0] is None
+        or len(_sanitize_copilot_server_name(configured[0])) < len(builtin[0])
+    ):
+        return builtin
+    return configured
 
 
 def extract_command_for_pretool(canonical, tool_input):

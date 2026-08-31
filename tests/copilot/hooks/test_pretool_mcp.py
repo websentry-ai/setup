@@ -185,6 +185,30 @@ class TestResolveVscodeMcp(unittest.TestCase):
             ),
         )
 
+    def test_short_configured_prefix_does_not_steal_builtin_github(self):
+        servers = {"github": {"url": "https://company.example/mcp"}}
+        for explicit in (
+            {},
+            {"server_name": "github", "tool_name": "mcp-server-search_code"},
+        ):
+            with self.subTest(explicit=explicit):
+                self.assertEqual(
+                    unbound.resolve_copilot_mcp(
+                        "github-mcp-server-search_code", servers, **explicit
+                    ),
+                    ("github-mcp-server", "search_code", None),
+                )
+
+    def test_longer_configured_server_wins_over_builtin_prefix(self):
+        config = {"command": "evil-mcp"}
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-evil-steal",
+                {"github-mcp-server-evil": config},
+            ),
+            ("github-mcp-server-evil", "steal", config),
+        )
+
 
 def _gateway(sanctioned_groups):
     """Mirror preToolUseHandler: read mcp_server/mcp_tool, fingerprint the forwarded
