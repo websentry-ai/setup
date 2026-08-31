@@ -858,9 +858,11 @@ def complete_pending_turn(event, wm_key, api_key, final=False):
 
     transcript_path = event.get('transcript_path')
     conversation_id = pending.get('conversation_id')
+    # At session end this is the turn's last chance, so an unwritten journal is worth
+    # waiting on. Mid-session a later Stop would pick it up, and waiting would be cost.
     usage, _ = get_turn_usage(transcript_path, conversation_id,
                               pending.get('since'), pending.get('until'),
-                              pending.get('usage_index') or 0)
+                              pending.get('usage_index') or 0, wait_when_idle=final)
     model = _vscode_turn_model(transcript_path, conversation_id,
                                pending.get('since'), pending.get('until'))
     # Tokens are the point, and VS Code can expose a model before it has finished
@@ -3374,15 +3376,20 @@ def _vscode_store_stamp(path):
         return None
 
 
-def _vscode_settled_usage(transcript_path, conversation_id, start_index):
+def _vscode_settled_usage(transcript_path, conversation_id, start_index,
+                          wait_when_idle=False):
     """Wait for this turn to finish being written. Stop fires before the response ends, so
     a first read usually has nothing to report. Giving up is safe: the watermark does not
-    advance, so a later Stop reports the turn instead."""
+    advance, so a later Stop reports the turn instead.
+
+    `wait_when_idle` is for the session's last chance, where that safety net does not
+    exist. VS Code writes the journal lazily and sometimes only as the session closes, so
+    an empty read there is worth waiting on rather than the give-up it means mid-session."""
     usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
                                                     start_index)
     # Wait only while a request is mid-write. With nothing pending there is nothing to wait
     # for, and blocking every quiet Stop for the full window would be pure cost.
-    if usage is None or next_index > start_index or not pending:
+    if next_index > start_index or (not wait_when_idle and (usage is None or not pending)):
         return usage, next_index
     path = _vscode_store_path(transcript_path, conversation_id)
     stamp = _vscode_store_stamp(path)
@@ -3397,12 +3404,13 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index):
         stamp = current
         usage, next_index, _pending = _vscode_turn_usage(transcript_path, conversation_id,
                                                          start_index)
-        if usage is None or next_index > start_index:
+        if next_index > start_index or (usage is None and not wait_when_idle):
             break
     return usage, next_index
 
 
-def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, usage_index=0):
+def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, usage_index=0,
+                   wait_when_idle=False):
     """Exact usage for the turn, read from the local store behind whichever surface wrote
     the transcript -- Copilot forwards none, so without this the backend estimates from
     visible text and misses cache reads, tool definitions and system instructions.
@@ -3415,7 +3423,8 @@ def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, us
         usage = None if until is None else _cli_turn_usage(conversation_id, since, until)
         next_index = usage_index
     else:
-        usage, next_index = _vscode_settled_usage(transcript_path, conversation_id, usage_index)
+        usage, next_index = _vscode_settled_usage(transcript_path, conversation_id,
+                                                  usage_index, wait_when_idle)
     if not usage or not any(usage.values()):
         return None, next_index
     usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)

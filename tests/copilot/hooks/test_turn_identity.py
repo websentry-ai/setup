@@ -112,15 +112,21 @@ class TestRebuildTurnContent(unittest.TestCase):
 
 
 class TestCompletePendingTurn(unittest.TestCase):
-    def _run(self, pending, usage, model, entries=None, final=False):
+    def _run(self, pending, usage, model, entries=None, final=False, capture=None):
         sent = []
         entries = entries or [_user("q", "p1"), _assistant("a")]
+
+        def _usage(*a, **k):
+            if capture is not None:
+                capture.update(k)
+            return (usage, 0)
+
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _transcript(tmpdir, entries)
             event = {"transcript_path": str(path)}
             with patch.object(unbound, "get_session_marker",
                               lambda k: {"pending_turn": pending}), \
-                    patch.object(unbound, "get_turn_usage", lambda *a, **k: (usage, 0)), \
+                    patch.object(unbound, "get_turn_usage", _usage), \
                     patch.object(unbound, "_vscode_turn_model", lambda *a, **k: model), \
                     patch.object(unbound, "send_to_api",
                                  lambda ex, key: sent.append(ex) or True):
@@ -180,3 +186,16 @@ class TestCompletePendingTurn(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_session_end_waits_for_a_journal_that_has_not_been_written(self):
+        # VS Code writes the journal lazily, sometimes only as the session closes. Mid
+        # session an empty read means "a later Stop will get it"; at SessionEnd there is
+        # no later Stop, so the read has to wait instead of giving up.
+        capture = {}
+        self._run(self._pending(), {"input_tokens": 5}, None, final=True, capture=capture)
+        self.assertTrue(capture.get("wait_when_idle"))
+
+    def test_mid_session_does_not_pay_for_the_wait(self):
+        capture = {}
+        self._run(self._pending(), {"input_tokens": 5}, None, final=False, capture=capture)
+        self.assertFalse(capture.get("wait_when_idle"))
