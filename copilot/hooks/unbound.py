@@ -844,7 +844,7 @@ def turn_prompt_id(entry, conversation_id, index, content):
         .encode('utf-8', 'replace')).hexdigest()[:24]
 
 
-def complete_pending_turn(event, wm_key, api_key):
+def complete_pending_turn(event, wm_key, api_key, final=False):
     """Re-send an earlier turn once its tokens or model have landed.
 
     Copilot writes both after the turn has already been reported, so its own Stop had
@@ -863,7 +863,11 @@ def complete_pending_turn(event, wm_key, api_key):
                               pending.get('usage_index') or 0)
     model = _vscode_turn_model(transcript_path, conversation_id,
                                pending.get('since'), pending.get('until'))
-    if not usage and not model:
+    # Tokens are the point, and VS Code can expose a model before it has finished
+    # accounting. Sending on the model alone and clearing the slot would lose those
+    # tokens permanently, so a model-only result waits -- except at SessionEnd, which is
+    # the last chance this session gets.
+    if not usage and not (final and model):
         return False
 
     content = rebuild_turn_content(transcript_path, conversation_id, pending.get('prompt_id'))
@@ -4053,7 +4057,8 @@ def main():
             # complete the existing one.
             # An earlier turn whose numbers arrived after its own Stop is completed here,
             # before this turn is handled, so each turn carries its own tokens.
-            pending_settled = complete_pending_turn(event, wm_key, api_key)
+            pending_settled = complete_pending_turn(
+                event, wm_key, api_key, final=(event_name == 'SessionEnd'))
 
             if exchange and (forwarded_now or text_sig != last_text_sig or usage):
                 # Turn boundaries from event-fire times

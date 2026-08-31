@@ -112,7 +112,7 @@ class TestRebuildTurnContent(unittest.TestCase):
 
 
 class TestCompletePendingTurn(unittest.TestCase):
-    def _run(self, pending, usage, model, entries=None):
+    def _run(self, pending, usage, model, entries=None, final=False):
         sent = []
         entries = entries or [_user("q", "p1"), _assistant("a")]
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -124,7 +124,7 @@ class TestCompletePendingTurn(unittest.TestCase):
                     patch.object(unbound, "_vscode_turn_model", lambda *a, **k: model), \
                     patch.object(unbound, "send_to_api",
                                  lambda ex, key: sent.append(ex) or True):
-                settled = unbound.complete_pending_turn(event, "wm", "key")
+                settled = unbound.complete_pending_turn(event, "wm", "key", final=final)
         return settled, sent
 
     def _pending(self):
@@ -139,9 +139,25 @@ class TestCompletePendingTurn(unittest.TestCase):
         self.assertEqual(sent[0]["usage"], {"input_tokens": 5})
         self.assertEqual(sent[0]["messages"][0]["content"], "q")
 
-    def test_a_model_that_lands_later_is_sent_too(self):
+    def test_a_model_alone_keeps_waiting_for_the_tokens(self):
+        # VS Code can name the model before it has finished counting. Sending on the model
+        # alone and clearing the slot would lose those tokens permanently.
         settled, sent = self._run(self._pending(), None, "claude-haiku-4.5")
+        self.assertFalse(settled)
+        self.assertEqual(sent, [])
+
+    def test_session_end_sends_the_model_even_without_tokens(self):
+        # Last chance this session gets, so take what is there.
+        settled, sent = self._run(self._pending(), None, "claude-haiku-4.5", final=True)
         self.assertTrue(settled)
+        self.assertEqual(sent[0]["model"], "claude-haiku-4.5")
+        self.assertNotIn("usage", sent[0])
+
+    def test_tokens_arriving_after_a_model_still_complete_the_turn(self):
+        # The slot survived the model-only round, so the later tokens land on the row.
+        settled, sent = self._run(self._pending(), {"input_tokens": 5}, "claude-haiku-4.5")
+        self.assertTrue(settled)
+        self.assertEqual(sent[0]["usage"], {"input_tokens": 5})
         self.assertEqual(sent[0]["model"], "claude-haiku-4.5")
 
     def test_nothing_landed_means_nothing_sent(self):
