@@ -143,6 +143,9 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
 # Distinguishes 'carry the old value forward' from 'clear it'.
 _UNSET = object()
+# Turns still waiting on their numbers. A session that never settles one would grow
+# this without a bound, and the oldest are the least likely to ever arrive.
+MAX_PENDING_TURNS = 20
 
 # Ensure log directory exists
 try:
@@ -657,7 +660,7 @@ def get_forwarded_state(session_id):
 
 
 def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None,
-                             turn_digests=None, pending_turn=_UNSET):
+                             turn_digests=None, pending_turns=_UNSET):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -685,8 +688,8 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
                 usage_index = ev.get('usage_request_index')
             if turn_digests is None:
                 turn_digests = ev.get('turn_digests')
-            if pending_turn is _UNSET:
-                pending_turn = ev.get('pending_turn')
+            if pending_turns is _UNSET:
+                pending_turns = ev.get('pending_turns')
             continue  # drop the old marker; a fresh consolidated one is appended below
         kept.append(log)
     kept.append({
@@ -701,9 +704,9 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
             # Digests of turns already sent, so a repeated prompt-and-reply gets its own
             # occurrence rather than colliding with the earlier one.
             'turn_digests': turn_digests if isinstance(turn_digests, list) else [],
-            # The last turn sent whose tokens or model had not landed yet. Holds an id and
-            # a time window, never prompt text: the turn is rebuilt from the transcript.
-            'pending_turn': pending_turn if pending_turn is not _UNSET else None,
+            # Turns sent whose tokens or model had not landed yet. Each holds an id and
+            # a window, never prompt text: the turn is rebuilt from the transcript.
+            'pending_turns': (pending_turns if pending_turns is not _UNSET else []) or [],
         },
     })
     save_logs(kept)
@@ -844,17 +847,25 @@ def turn_prompt_id(entry, conversation_id, index, content):
         .encode('utf-8', 'replace')).hexdigest()[:24]
 
 
-def complete_pending_turn(event, wm_key, api_key, final=False):
+def complete_pending_turns(event, wm_key, api_key, final=False):
+    """Complete every turn still waiting on its numbers; return those still waiting.
+
+    A list rather than one slot: a turn whose tokens have not landed by the next Stop
+    would otherwise be displaced by that Stop's own pending turn, and its tokens lost."""
+    pending_turns = get_session_marker(wm_key).get('pending_turns') or []
+    return [p for p in pending_turns
+            if not complete_pending_turn(event, p, api_key, final)]
+
+
+def complete_pending_turn(event, pending, api_key, final=False):
     """Re-send an earlier turn once its tokens or model have landed.
 
     Copilot writes both after the turn has already been reported, so its own Stop had
     nothing to send. The re-send carries the id the turn was sent with, so the control
-    plane fills that row rather than adding a second one. Returns True when the pending
-    turn is settled and should be cleared."""
-    marker = get_session_marker(wm_key)
-    pending = marker.get('pending_turn')
+    plane fills that row rather than adding a second one. Returns True when the turn is
+    settled and can be dropped."""
     if not isinstance(pending, dict) or not pending.get('turn_request_id'):
-        return False
+        return True
 
     transcript_path = event.get('transcript_path')
     conversation_id = pending.get('conversation_id')
@@ -4069,9 +4080,10 @@ def main():
             # that no Stop ever reported; a turn already sent is left alone, because usage
             # is part of the backend's request id and re-sending would add a row, not
             # complete the existing one.
-            # An earlier turn whose numbers arrived after its own Stop is completed here,
+            # Earlier turns whose numbers arrived after their own Stop are completed here,
             # before this turn is handled, so each turn carries its own tokens.
-            pending_settled = complete_pending_turn(
+            was_pending = get_session_marker(wm_key).get('pending_turns') or []
+            still_pending = complete_pending_turns(
                 event, wm_key, api_key, final=(event_name == 'SessionEnd'))
 
             if exchange and (forwarded_now or text_sig != last_text_sig or usage):
@@ -4107,22 +4119,23 @@ def main():
                     # 'auto' is the unresolved model, not a missing one: a CLI turn takes
                     # its model from the transcript and is already settled.
                     incomplete = not usage or exchange.get('model') in (None, '', 'auto')
-                    pending = None
+                    pending_turns = list(still_pending)
                     if incomplete and anchor:
-                        pending = {
+                        pending_turns.append({
                             'turn_request_id': turn_request_id,
                             'conversation_id': exchange.get('conversation_id'),
                             'prompt_id': anchor,
                             'since': previous_stop,
                             'until': timestamp,
                             'usage_index': usage_index,
-                        }
+                        })
                     record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now,
-                                              usage_index, digests + [digest], pending)
-            elif pending_settled:
-                # Nothing new this Stop, but the pending turn is done with; clear the slot
-                # so a later Stop does not re-send it.
-                record_forwarded_tool_ids(wm_key, set(), None, None, None, None, None)
+                                              usage_index, digests + [digest],
+                                              pending_turns[-MAX_PENDING_TURNS:])
+            elif still_pending != was_pending:
+                # Nothing new this Stop, but some turns settled; drop just those.
+                record_forwarded_tool_ids(wm_key, set(), None, None, None, None,
+                                          still_pending)
             cleanup_old_logs()
 
         # Output required by Copilot hooks

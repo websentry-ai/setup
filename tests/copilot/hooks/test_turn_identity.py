@@ -124,13 +124,11 @@ class TestCompletePendingTurn(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = _transcript(tmpdir, entries)
             event = {"transcript_path": str(path)}
-            with patch.object(unbound, "get_session_marker",
-                              lambda k: {"pending_turn": pending}), \
-                    patch.object(unbound, "get_turn_usage", _usage), \
+            with patch.object(unbound, "get_turn_usage", _usage), \
                     patch.object(unbound, "_vscode_turn_model", lambda *a, **k: model), \
                     patch.object(unbound, "send_to_api",
                                  lambda ex, key: sent.append(ex) or True):
-                settled = unbound.complete_pending_turn(event, "wm", "key", final=final)
+                settled = unbound.complete_pending_turn(event, pending, "key", final=final)
         return settled, sent
 
     def _pending(self):
@@ -177,9 +175,9 @@ class TestCompletePendingTurn(unittest.TestCase):
         self.assertFalse(settled)
         self.assertEqual(sent, [])
 
-    def test_no_pending_turn_is_a_no_op(self):
-        self.assertEqual(self._run(None, {"input_tokens": 5}, None), (False, []))
-        self.assertEqual(self._run({}, {"input_tokens": 5}, None), (False, []))
+    def test_a_junk_entry_is_dropped_rather_than_retried(self):
+        self.assertEqual(self._run(None, {"input_tokens": 5}, None), (True, []))
+        self.assertEqual(self._run({}, {"input_tokens": 5}, None), (True, []))
 
     def test_a_turn_gone_from_the_transcript_is_cleared_not_resent(self):
         # Otherwise the slot would hold a turn that can never be rebuilt and every later
@@ -205,3 +203,36 @@ if __name__ == "__main__":
         capture = {}
         self._run(self._pending(), {"input_tokens": 5}, None, final=False, capture=capture)
         self.assertFalse(capture.get("wait_when_idle"))
+
+
+class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
+    """One slot lost a turn: the next Stop wrote its own pending over the earlier one."""
+
+    def _pending(self, n):
+        return {"turn_request_id": "tid-%d" % n, "conversation_id": SESSION,
+                "prompt_id": "p%d" % n, "since": None, "until": "2026-08-31T00:00:00Z"}
+
+    def _remaining(self, pending_turns, settle):
+        with patch.object(unbound, "get_session_marker",
+                          lambda k: {"pending_turns": pending_turns}), \
+                patch.object(unbound, "complete_pending_turn",
+                             lambda ev, p, key, final=False: settle(p)):
+            return unbound.complete_pending_turns({}, "wm", "key")
+
+    def test_an_unsettled_turn_stays_while_a_later_one_settles(self):
+        turns = [self._pending(1), self._pending(2)]
+        remaining = self._remaining(turns, lambda p: p["turn_request_id"] == "tid-2")
+        self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1"])
+
+    def test_everything_settled_leaves_nothing(self):
+        turns = [self._pending(1), self._pending(2)]
+        self.assertEqual(self._remaining(turns, lambda p: True), [])
+
+    def test_nothing_settled_keeps_them_all_in_order(self):
+        turns = [self._pending(1), self._pending(2)]
+        remaining = self._remaining(turns, lambda p: False)
+        self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1", "tid-2"])
+
+    def test_the_list_is_bounded(self):
+        # A session that never settles a turn must not grow this without limit.
+        self.assertEqual(unbound.MAX_PENDING_TURNS, 20)
