@@ -143,9 +143,15 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
 # Distinguishes 'carry the old value forward' from 'clear it'.
 _UNSET = object()
-# Turns still waiting on their numbers. A session that never settles one would grow
-# this without a bound, and the oldest are the least likely to ever arrive.
-MAX_PENDING_TURNS = 20
+# Safety net, not the working bound. Entries drop themselves as soon as their tokens
+# land or their turn leaves the transcript, so the list tracks a session's unsettled
+# turns and can never exceed its length. This only exists so a pathological session
+# cannot grow the marker without limit. Sized against real sessions rather than a guess:
+# 57 turns at p95 and 301 at the observed maximum, and VS Code sometimes writes the whole
+# journal only as the session closes, which leaves every turn of a long session pending
+# until SessionEnd. Each entry is a handful of short strings, so 500 is well under a
+# hundred kilobytes.
+MAX_PENDING_TURNS = 500
 
 # Ensure log directory exists
 try:

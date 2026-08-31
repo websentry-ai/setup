@@ -233,6 +233,8 @@ class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
         remaining = self._remaining(turns, lambda p: False)
         self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1", "tid-2"])
 
-    def test_the_list_is_bounded(self):
-        # A session that never settles a turn must not grow this without limit.
-        self.assertEqual(unbound.MAX_PENDING_TURNS, 20)
+    def test_the_bound_clears_real_session_lengths(self):
+        # The longest session observed in production ran 301 turns, and VS Code can leave
+        # every one of them pending until SessionEnd. A bound below that would drop the
+        # tokens of exactly the sessions this exists to rescue.
+        self.assertGreater(unbound.MAX_PENDING_TURNS, 301)
