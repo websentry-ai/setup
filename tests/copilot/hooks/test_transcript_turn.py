@@ -48,7 +48,7 @@ def _user_text(exchange):
 
 
 class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
-    def test_powershell_is_not_emitted(self):
+    def test_powershell_is_emitted_as_shell(self):
         path = _transcript([
             _entry("user.message", _id="u1", content="check it"),
             _entry("tool.execution_start", toolCallId="call-a", toolName="powershell",
@@ -61,7 +61,11 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
             path, SESSION)
 
-        self.assertNotIn("tool_use", exchange["messages"][1])
+        tool_use = exchange["messages"][1]["tool_use"]
+        self.assertEqual(len(tool_use), 1)
+        self.assertEqual(tool_use[0]["type"], "afterShellExecution")
+        self.assertEqual(tool_use[0]["command"], "Get-ChildItem")
+        self.assertEqual(tool_use[0]["output"], "file.txt")
 
     def test_write_powershell_is_not_emitted(self):
         path = _transcript([
