@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import random
 import stat
 import shutil
 import sys
@@ -8,6 +9,7 @@ import platform
 import subprocess
 import json
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Tuple, List, Optional, Dict
@@ -19,6 +21,7 @@ except ImportError:
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/augment/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not re-synchronise
 
 
 # --- Augment settings blocks (mirrors augment/hooks/setup.py) ----------------
@@ -538,14 +541,15 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
     debug_print(f"Fetching API key from: {url}")
 
     try:
+        time.sleep(random.uniform(0, MDM_RETRY_JITTER_SECONDS))
         # The privileged admin key goes off-argv via a 0600 temp header file.
         result = curl_with_auth(
             [f"Authorization: Bearer {auth_api_key}"],
             ["-fsSL", "-w", "\n%{http_code}",
-             "--max-time", "30", "--retry", "3", "--retry-delay", "2", "--retry-connrefused",
+             "--max-time", "30", "--retry", "7", "--retry-max-time", "180", "--retry-connrefused",
              url],
             text=True,
-            timeout=140,
+            timeout=300,
         )
         if result is None:
             print("Failed to fetch API key")
