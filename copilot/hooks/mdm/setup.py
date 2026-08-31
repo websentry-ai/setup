@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import random
 import stat
 import shutil
 import sys
@@ -20,6 +21,7 @@ except ImportError:
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not re-synchronise
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
 BACKFILL_TOOL_TYPE = "copilot"
@@ -423,13 +425,14 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, devi
     debug_print(f"Fetching API key from: {url}")
 
     try:
+        time.sleep(random.uniform(0, MDM_RETRY_JITTER_SECONDS))
         result = subprocess.run(
             ["curl", "-fsSL", "-w", "\n%{http_code}",
-             "--max-time", "30", "--retry", "3", "--retry-delay", "2", "--retry-connrefused",
+             "--max-time", "30", "--retry", "7", "--retry-max-time", "180", "--retry-connrefused",
              "-H", f"Authorization: Bearer {auth_api_key}", url],
             capture_output=True,
             text=True,
-            timeout=140
+            timeout=300
         )
 
         output_lines = result.stdout.strip().split('\n')

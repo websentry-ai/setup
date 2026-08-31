@@ -82,7 +82,7 @@ SUBPROCESS_TIMEOUT_SECONDS = 600
 # itself instead of being force-killed with a stale lock left behind. The parent
 # waits a short grace beyond the discovery deadline before its own backstop kill,
 # so the child's graceful self-timeout always fires first.
-DISCOVERY_TIMEOUT_SECONDS = 9000   # 150 min; kept in sync with the discovery --timeout
+DISCOVERY_TIMEOUT_SECONDS = 12000   # 200 min; kept in sync with the discovery --timeout
 DISCOVERY_KILL_GRACE_SECONDS = 120
 
 # (display_name, url, supports_backfill, supports_skip_managed_settings). Only
