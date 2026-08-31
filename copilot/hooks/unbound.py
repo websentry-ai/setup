@@ -36,10 +36,16 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
+DISCOVERY_WINDOWS_STATE_DIR = Path(tempfile.gettempdir()) / "unbound"
+DISCOVERY_WINDOWS_CACHE_PATH = DISCOVERY_WINDOWS_STATE_DIR / "discovery-cache.json"
+DISCOVERY_WINDOWS_LOCK_PATH = DISCOVERY_WINDOWS_STATE_DIR / "discovery.lock"
+DISCOVERY_WINDOWS_DISPATCH_PATH = DISCOVERY_WINDOWS_STATE_DIR / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 APPROVAL_POLL_PHASES = (
@@ -3891,28 +3897,87 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _discovery_state_paths():
+    """Match discovery's %TEMP% fallback when MDM owns ~/.unbound on Windows."""
+    home_paths = (
+        DISCOVERY_CACHE_PATH,
+        DISCOVERY_LOCK_PATH,
+        DISCOVERY_DISPATCH_PATH,
+    )
+    if not _is_windows():
+        return home_paths
+
+    windows_paths = (
+        DISCOVERY_WINDOWS_CACHE_PATH,
+        DISCOVERY_WINDOWS_LOCK_PATH,
+        DISCOVERY_WINDOWS_DISPATCH_PATH,
+    )
+    last_error = None
+    for paths in (home_paths, windows_paths):
+        state_dir = paths[0].parent
+        probe_path = None
+        try:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            fd, probe_path = tempfile.mkstemp(
+                dir=str(state_dir), prefix=".discovery-state.", suffix=".tmp"
+            )
+            os.close(fd)
+            return paths
+        except OSError as exc:
+            last_error = exc
+        finally:
+            if probe_path is not None:
+                try:
+                    os.unlink(probe_path)
+                except OSError:
+                    pass
+
+    raise OSError("no writable discovery state directory") from last_error
+
+
+def _discovery_installer():
+    if _is_windows():
+        return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
+    return DISCOVERY_INSTALL_SH, DISCOVERY_INSTALL_URL
+
+
+def _discovery_command(installer_path: Path, backend_url: str):
+    if _is_windows():
+        return [
+            "powershell", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+        ]
+    return ["bash", str(installer_path), "--domain", backend_url]
+
+
 def _ensure_discovery_installer():
-    if DISCOVERY_INSTALL_SH.exists():
-        return True
+    installer_path, installer_url = _discovery_installer()
+    if installer_path.exists():
+        return installer_path
     DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(dir=str(DISCOVERY_INSTALL_DIR), suffix='.tmp')
     os.close(fd)
     try:
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", temporary_path, DISCOVERY_INSTALL_URL],
+            ["curl", "-fsSL", "-o", temporary_path, installer_url],
             capture_output=True,
             timeout=30,
         )
         if result.returncode != 0:
             log_error(
-                "discovery install.sh download failed: "
+                f"discovery {installer_path.name} download failed: "
                 + result.stderr.decode(errors='replace')[:200],
                 'discovery_gate',
             )
-            return False
-        os.chmod(temporary_path, 0o755)
-        os.replace(temporary_path, DISCOVERY_INSTALL_SH)
-        return True
+            return None
+        if not _is_windows():
+            os.chmod(temporary_path, 0o755)
+        os.replace(temporary_path, installer_path)
+        return installer_path
     finally:
         try:
             os.unlink(temporary_path)
@@ -3922,10 +3987,11 @@ def _ensure_discovery_installer():
 
 def _dispatch_discovery() -> None:
     try:
+        cache_path, lock_path, dispatch_path = _discovery_state_paths()
         cache = {}
-        if DISCOVERY_CACHE_PATH.exists():
+        if cache_path.exists():
             try:
-                with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
+                with cache_path.open("r", encoding="utf-8") as f:
                     cache = json.load(f) or {}
             except (OSError, json.JSONDecodeError):
                 cache = {}
@@ -3941,9 +4007,9 @@ def _dispatch_discovery() -> None:
             except ValueError:
                 pass
 
-        if DISCOVERY_LOCK_PATH.exists():
+        if lock_path.exists():
             try:
-                age = time.time() - DISCOVERY_LOCK_PATH.stat().st_mtime
+                age = time.time() - lock_path.stat().st_mtime
             except OSError:
                 age = DISCOVERY_STALE_LOCK_SECONDS + 1
             if age < DISCOVERY_STALE_LOCK_SECONDS:
@@ -3952,19 +4018,19 @@ def _dispatch_discovery() -> None:
         # Atomic dispatch claim — first hook to create the marker wins;
         # concurrent peers bail to avoid duplicate fork-detached Popens.
         try:
-            _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+            _dispatch_fd = os.open(str(dispatch_path),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
         except FileExistsError:
             try:
-                age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
+                age = time.time() - dispatch_path.stat().st_mtime
             except OSError:
                 age = DISCOVERY_DISPATCH_TTL_SECONDS + 1
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                DISCOVERY_DISPATCH_PATH.unlink()
-                _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                dispatch_path.unlink()
+                _dispatch_fd = os.open(str(dispatch_path),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
             except (FileExistsError, OSError):
@@ -3994,14 +4060,16 @@ def _dispatch_discovery() -> None:
                     return
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
-                if not _ensure_discovery_installer():
+                installer_path = _ensure_discovery_installer()
+                if installer_path is None:
                     return
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                discovery_cmd = _discovery_command(installer_path, backend_url)
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DOMAIN": backend_url}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:
@@ -4015,14 +4083,14 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            os.replace(tmp, cache_path)
         finally:
             try:
-                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
+                dispatch_path.unlink(missing_ok=True)
             except OSError:
                 pass
     except Exception as e:
