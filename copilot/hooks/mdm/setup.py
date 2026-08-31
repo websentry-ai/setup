@@ -1430,7 +1430,10 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         started_at = time.time()
         # Fetched once, before privileges are dropped: one call per device, not per profile.
         force_epoch = _backfill_force_epoch(api_key, backend_url)
-        any_forced = False
+        # Kept apart by whether the profile they came from is actually behind the org's
+        # request. Merging them would assert force over a profile that never asked for
+        # it, letting its settled sessions be reopened.
+        forced_sessions = []
         sessions = []
         collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
@@ -1440,27 +1443,30 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
                 # cutoff, or we'd permanently skip its history on the next run.
                 continue
             user_sessions, capped, home_forced = result
-            # One upload covers every profile, so force is asserted for all of them once
-            # any profile is behind. It only widens what the server re-examines: filling a
-            # row still requires that row to carry the server-written backfill marker, so a
-            # profile that was not behind can only no-op.
-            any_forced = any_forced or home_forced
             if user_sessions:
                 debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
-                sessions.extend(user_sessions)
+                (forced_sessions if home_forced else sessions).extend(user_sessions)
             # Capped homes still have unprocessed files — leave their cutoff so the
             # overflow stays eligible on the next run.
             if not capped:
                 collected_homes.append((username, home_dir))
 
-        if not sessions:
+        total = len(forced_sessions) + len(sessions)
+        if not total:
             for username, home_dir in collected_homes:
                 _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
             print("[backfill] No past sessions found.")
             return
 
-        print(f"[backfill] Found {len(sessions)} past sessions. Uploading (this may take a few minutes)...")
-        sessions_sent, _, chunks_failed = _backfill_send_sessions(api_key, backend_url, sessions, any_forced)
+        print(f"[backfill] Found {total} past sessions. Uploading (this may take a few minutes)...")
+        sessions_sent = 0
+        chunks_failed = 0
+        for batch, forced in ((forced_sessions, True), (sessions, False)):
+            if not batch:
+                continue
+            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            sessions_sent += sent
+            chunks_failed += failed
 
         if sessions_sent == 0:
             print(f"[backfill] No sessions queued (all {chunks_failed} uploads failed).")
