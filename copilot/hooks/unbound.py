@@ -16,6 +16,7 @@ import time
 import hashlib
 import re
 import sqlite3
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
@@ -140,6 +141,8 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 # event: every existing reader filters by its own event name and skips it, and
 # cleanup_old_logs prunes it per-session like any other row (no new file, no new state).
 FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
+# Distinguishes 'carry the old value forward' from 'clear it'.
+_UNSET = object()
 
 # Ensure log directory exists
 try:
@@ -653,7 +656,8 @@ def get_forwarded_state(session_id):
     return sent, last_sig, prompted, usage_index
 
 
-def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None):
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None,
+                             turn_digests=None, pending_turn=_UNSET):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -679,6 +683,10 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
                 text_sig = ev.get('text_sig')  # carry forward the last known text sig
             if usage_index is None:
                 usage_index = ev.get('usage_request_index')
+            if turn_digests is None:
+                turn_digests = ev.get('turn_digests')
+            if pending_turn is _UNSET:
+                pending_turn = ev.get('pending_turn')
             continue  # drop the old marker; a fresh consolidated one is appended below
         kept.append(log)
     kept.append({
@@ -690,6 +698,12 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
             'forwarded_prompt_ids': sorted(merged_prompts),
             'text_sig': text_sig,
             'usage_request_index': usage_index if isinstance(usage_index, int) else 0,
+            # Digests of turns already sent, so a repeated prompt-and-reply gets its own
+            # occurrence rather than colliding with the earlier one.
+            'turn_digests': turn_digests if isinstance(turn_digests, list) else [],
+            # The last turn sent whose tokens or model had not landed yet. Holds an id and
+            # a time window, never prompt text: the turn is rebuilt from the transcript.
+            'pending_turn': pending_turn if pending_turn is not _UNSET else None,
         },
     })
     save_logs(kept)
@@ -771,6 +785,150 @@ def _transcript_path_for_session(event):
         if isinstance(path, str) and path:
             return path
     return None
+
+
+def turn_content_digest(user_prompt, assistant_prompt):
+    """Digest of what both this hook and the server-side transcript parser can see of one
+    turn. NUL-joined so a prompt ending where the reply begins cannot forge another
+    turn's digest. KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service."""
+    return hashlib.sha256(
+        (user_prompt or '').encode('utf-8') + b'\x00' + (assistant_prompt or '').encode('utf-8')
+    ).hexdigest()
+
+
+def build_turn_request_id(session_id, digest, occurrence):
+    """Stable id for one turn, keyed on content rather than position.
+
+    Position is not usable: a turn that never reached the gateway is in the transcript
+    and not in our history, so counting turns would map one turn's tokens onto its
+    neighbour. Content is the same on both sides by construction. `occurrence` separates
+    turns whose prompt AND reply are byte-identical inside one session."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_OID,
+        'turn:copilot:%s:%s:%d' % (session_id, digest, occurrence),
+    ))
+
+
+def exchange_turn_content(exchange):
+    """(user prompt, assistant text) of an exchange, in the shape the digest is taken over."""
+    user_prompt = ''
+    assistant_prompt = ''
+    for message in (exchange or {}).get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') == 'user':
+            user_prompt = message.get('content') or ''
+        elif message.get('role') == 'assistant':
+            assistant_prompt = message.get('content') or ''
+    return user_prompt, assistant_prompt
+
+
+def get_session_marker(session_key):
+    """The consolidated per-session marker, or an empty dict."""
+    if not session_key:
+        return {}
+    for log in reversed(load_existing_logs()):
+        event = log.get('event', {})
+        if (event.get('hook_event_name') == FORWARDED_TOOLS_EVENT
+                and event.get('session_id') == session_key):
+            return event
+    return {}
+
+
+def turn_prompt_id(entry, conversation_id, index, content):
+    """Stable id for a user prompt entry. An entry without an envelope id still has to be
+    watermarked, or every later Stop re-selects it and re-uploads its text with the
+    current turn."""
+    return entry.get('id') or 'unb-' + hashlib.sha256(
+        ('%s\x1f%d\x1f%s' % (conversation_id or '', index, content or ''))
+        .encode('utf-8', 'replace')).hexdigest()[:24]
+
+
+def complete_pending_turn(event, wm_key, api_key):
+    """Re-send an earlier turn once its tokens or model have landed.
+
+    Copilot writes both after the turn has already been reported, so its own Stop had
+    nothing to send. The re-send carries the id the turn was sent with, so the control
+    plane fills that row rather than adding a second one. Returns True when the pending
+    turn is settled and should be cleared."""
+    marker = get_session_marker(wm_key)
+    pending = marker.get('pending_turn')
+    if not isinstance(pending, dict) or not pending.get('turn_request_id'):
+        return False
+
+    transcript_path = event.get('transcript_path')
+    conversation_id = pending.get('conversation_id')
+    usage, _ = get_turn_usage(transcript_path, conversation_id,
+                              pending.get('since'), pending.get('until'),
+                              pending.get('usage_index') or 0)
+    model = _vscode_turn_model(transcript_path, conversation_id,
+                               pending.get('since'), pending.get('until'))
+    if not usage and not model:
+        return False
+
+    content = rebuild_turn_content(transcript_path, conversation_id, pending.get('prompt_id'))
+    if content is None:
+        # The turn is no longer in the transcript, so nothing can be rebuilt for it.
+        return True
+    user_prompt, assistant_prompt = content
+
+    exchange = {
+        'conversation_id': conversation_id,
+        'model': model or 'auto',
+        'messages': [{'role': 'user', 'content': user_prompt},
+                     {'role': 'assistant', 'content': assistant_prompt}],
+        'turn_request_id': pending['turn_request_id'],
+        'requestInitialized': pending.get('since') or pending.get('until'),
+        'requestCompleted': pending.get('until'),
+    }
+    if usage:
+        exchange['usage'] = usage
+    return bool(send_to_api(exchange, api_key))
+
+
+def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
+    """(user prompt, assistant text) for one earlier turn, or None.
+
+    Anchored on the turn's own prompt entry rather than a time window: transcript entries
+    carry no timestamp, and the turn ends where the next user prompt begins. Reads the
+    transcript again rather than keeping the text on disk, so no prompt text is persisted."""
+    if not transcript_path or not prompt_id:
+        return None
+    try:
+        entries = []
+        with open(transcript_path, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        log_error('turn rebuild read failed: %s' % e, 'usage')
+        return None
+
+    user_prompt = None
+    assistant_parts = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        entry_type = entry.get('type')
+        data = entry.get('data') or {}
+        if entry_type == 'user.message':
+            if user_prompt is not None:
+                break  # the next prompt closes the turn
+            content = data.get('content')
+            if turn_prompt_id(entry, conversation_id, index, content) == prompt_id:
+                user_prompt = content or ''
+        elif entry_type == 'assistant.message' and user_prompt is not None:
+            content = data.get('content')
+            if isinstance(content, str) and content:
+                assistant_parts.append(content)
+    if user_prompt is None:
+        return None
+    return user_prompt, '\n\n'.join(assistant_parts)
 
 
 def get_previous_stop_timestamp_for_session(event):
@@ -3329,9 +3487,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             # An entry without an envelope id still has to be watermarked, or every later
             # Stop re-selects it and re-uploads its text with the current turn. Keyed the
             # same way turn_id is when its id is missing.
-            message_id = entry.get('id') or 'unb-' + hashlib.sha256(
-                ('%s\x1f%d\x1f%s' % (conversation_id or '', i, content or ''))
-                .encode('utf-8', 'replace')).hexdigest()[:24]
+            message_id = turn_prompt_id(entry, conversation_id, i, content)
             if message_id in already_prompted:
                 continue
             if turn_start_index < 0:
@@ -3895,6 +4051,10 @@ def main():
             # that no Stop ever reported; a turn already sent is left alone, because usage
             # is part of the backend's request id and re-sending would add a row, not
             # complete the existing one.
+            # An earlier turn whose numbers arrived after its own Stop is completed here,
+            # before this turn is handled, so each turn carries its own tokens.
+            pending_settled = complete_pending_turn(event, wm_key, api_key)
+
             if exchange and (forwarded_now or text_sig != last_text_sig or usage):
                 # Turn boundaries from event-fire times
                 request_initialized = get_turn_start_timestamp_for_session(session_id)
@@ -3903,11 +4063,47 @@ def main():
                 exchange['requestCompleted'] = timestamp
                 if usage:
                     exchange['usage'] = usage
+
+                # Content, not position: the id has to survive being sent again once the
+                # tokens land, and a turn that never reached the gateway would shift every
+                # position after it.
+                marker = get_session_marker(wm_key)
+                digests = marker.get('turn_digests') or []
+                user_prompt, assistant_prompt = exchange_turn_content(exchange)
+                digest = turn_content_digest(user_prompt, assistant_prompt)
+                turn_request_id = build_turn_request_id(session_id, digest, digests.count(digest))
+                exchange['turn_request_id'] = turn_request_id
+
                 # Record only after the send succeeds, so a failed send retries next Stop
                 # (the backend dedups). Updates the text signature too, even with no new
                 # tools, so an unchanged later Stop becomes a no-op.
                 if send_to_api(exchange, api_key):
-                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now, usage_index)
+                    # One slot, holding an id and a window, never prompt text. Kept only
+                    # while something is still missing, so a complete turn leaves nothing
+                    # behind for the next Stop to re-send.
+                    # Only one prompt can anchor a rebuild: the rebuild reads from that
+                    # prompt to the next one, so a turn opened by several prompts would be
+                    # cut short. Those turns simply go uncompleted.
+                    anchor = next(iter(prompts_now)) if len(prompts_now) == 1 else None
+                    # 'auto' is the unresolved model, not a missing one: a CLI turn takes
+                    # its model from the transcript and is already settled.
+                    incomplete = not usage or exchange.get('model') in (None, '', 'auto')
+                    pending = None
+                    if incomplete and anchor:
+                        pending = {
+                            'turn_request_id': turn_request_id,
+                            'conversation_id': exchange.get('conversation_id'),
+                            'prompt_id': anchor,
+                            'since': previous_stop,
+                            'until': timestamp,
+                            'usage_index': usage_index,
+                        }
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now,
+                                              usage_index, digests + [digest], pending)
+            elif pending_settled:
+                # Nothing new this Stop, but the pending turn is done with; clear the slot
+                # so a later Stop does not re-send it.
+                record_forwarded_tool_ids(wm_key, set(), None, None, None, None, None)
             cleanup_old_logs()
 
         # Output required by Copilot hooks
