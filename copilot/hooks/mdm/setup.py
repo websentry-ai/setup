@@ -9,7 +9,7 @@ import time
 import platform
 import subprocess
 import json
-import importlib.util
+import types
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -49,7 +49,6 @@ def debug_print(message: str) -> None:
 
 def _run_as_user(username, fn, *args, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
-    Returns whatever fn returns on success, or None on failure.
 
     Security-critical primitive: any MDM op that writes inside a user's
     home dir must go through this. Running file ops as root against
@@ -88,9 +87,8 @@ def _run_as_user(username, fn, *args, **kwargs):
             # a future slip and keeps the env consistent with the dropped uid.
             os.environ['HOME'] = info.pw_dir
             result = fn(*args, **kwargs)
-            import pickle
-            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
-            os.close(w_fd)
+            with os.fdopen(w_fd, 'wb') as pipe:
+                pipe.write(json.dumps(result).encode('utf-8'))
             os._exit(0)
         except Exception:
             try:
@@ -117,8 +115,7 @@ def _run_as_user(username, fn, *args, **kwargs):
         if os.WEXITSTATUS(status) != 0:
             return None
         try:
-            import pickle
-            return pickle.loads(data) if data else None
+            return json.loads(data.decode('utf-8')) if data else None
         except Exception:
             return None
 
@@ -379,7 +376,7 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
     if result is None:
         debug_print(f"Could not set env var for {username}")
         return False, False
-    return result
+    return bool(result[0]), bool(result[1])
 
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
@@ -795,24 +792,19 @@ def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
 
 
 _BACKFILL_HOOK_MODULE = None
-_BACKFILL_HOOK_PATH = None
+_BACKFILL_HOOK_SOURCE = None
 
 
 def _backfill_load_hook_module():
-    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_PATH
-    hook_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
-    if _BACKFILL_HOOK_MODULE is not None and _BACKFILL_HOOK_PATH == hook_path:
+    global _BACKFILL_HOOK_MODULE
+    if _BACKFILL_HOOK_MODULE is not None:
         return _BACKFILL_HOOK_MODULE
-    if not hook_path.is_file():
+    if not isinstance(_BACKFILL_HOOK_SOURCE, str) or not _BACKFILL_HOOK_SOURCE:
         return None
     try:
-        spec = importlib.util.spec_from_file_location("unbound_copilot_backfill_hook", hook_path)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = types.ModuleType("unbound_copilot_backfill_hook")
+        exec(compile(_BACKFILL_HOOK_SOURCE, "unbound.py", "exec"), module.__dict__)
         _BACKFILL_HOOK_MODULE = module
-        _BACKFILL_HOOK_PATH = hook_path
         return module
     except Exception as exc:
         debug_print(f"could not load installed hook for MCP resolution: {exc}")
@@ -1566,7 +1558,8 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
 
 
-def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
+def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]],
+                 hook_source: Optional[str] = None) -> None:
     """Walk every user's Copilot CLI + VS Code transcripts and seed historical sessions.
 
     MDM /get_application_api_key/ returns one per-device key and attribution is
@@ -1576,6 +1569,10 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return
 
+    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_SOURCE
+    if hook_source is not None:
+        _BACKFILL_HOOK_MODULE = None
+        _BACKFILL_HOOK_SOURCE = hook_source
     try:
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
@@ -1868,7 +1865,7 @@ def main():
         notify_setup_complete(api_key, "copilot", backend_url=base_url, install_state=state, serial_number=device_id)
 
     if success and backfill_mode:
-        run_backfill(api_key, base_url, user_homes)
+        run_backfill(api_key, base_url, user_homes, script_text)
 
     return success
 

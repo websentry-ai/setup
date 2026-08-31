@@ -7,10 +7,12 @@ with the user-level installer and must not drift.
 """
 
 import json
+import pickle
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from tests.conftest import tool_module
@@ -22,6 +24,25 @@ SCHEMA = """CREATE TABLE assistant_usage_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, turn_index INTEGER, model TEXT,
     input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
     cache_write_tokens INTEGER, reasoning_tokens INTEGER, created_at TEXT)"""
+
+
+class TestRunAsUserIpc(unittest.TestCase):
+    def _decode(self, payload):
+        info = SimpleNamespace(pw_uid=501, pw_gid=20, pw_dir="/tmp/user")
+        with patch.object(mdm.platform, "system", return_value="linux"), \
+                patch.object(mdm.pwd, "getpwnam", return_value=info), \
+                patch.object(mdm.os, "pipe", return_value=(10, 11)), \
+                patch.object(mdm.os, "fork", return_value=123), \
+                patch.object(mdm.os, "close"), \
+                patch.object(mdm.os, "read", side_effect=[payload, b""]), \
+                patch.object(mdm.os, "waitpid", return_value=(123, 0)):
+            return mdm._run_as_user("user", lambda: None)
+
+    def test_parent_accepts_json_from_the_unprivileged_child(self):
+        self.assertEqual(self._decode(b'{"safe": true}'), {"safe": True})
+
+    def test_parent_rejects_pickle_from_the_unprivileged_child(self):
+        self.assertIsNone(self._decode(pickle.dumps({"unsafe": True})))
 
 
 def _cli_tree(tmpdir, rows, session=SESSION):
@@ -42,7 +63,7 @@ def _cli_tree(tmpdir, rows, session=SESSION):
 class TestMdmBackfillUsage(unittest.TestCase):
     def tearDown(self):
         mdm._BACKFILL_HOOK_MODULE = None
-        mdm._BACKFILL_HOOK_PATH = None
+        mdm._BACKFILL_HOOK_SOURCE = None
 
     def test_cache_tiers_come_out_of_input(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -86,6 +107,7 @@ class TestMdmBackfillUsage(unittest.TestCase):
 
     def test_windows_collection_uses_each_users_copilot_config(self):
         source_hook = Path(__file__).resolve().parents[4] / "copilot" / "hooks" / "unbound.py"
+        mdm._BACKFILL_HOOK_SOURCE = source_hook.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
             sessions = []
             for root, server in ((first, "alpha"), (second, "beta")):

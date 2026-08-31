@@ -98,6 +98,15 @@ class TestResolveVscodeMcp(unittest.TestCase):
             unbound._resolve_vscode_mcp("mcp_sup_run", servers),
             (None, None, None))
 
+    def test_short_prefix_cannot_borrow_a_configured_server(self):
+        self.assertEqual(
+            unbound._resolve_vscode_mcp(
+                "mcp_git_read_issue",
+                {"github": {"url": "https://github.example/mcp"}},
+            ),
+            (None, None, None),
+        )
+
     def test_full_name_disambiguates_overlapping_servers(self):
         # When the token carries the full server name, the overlap is resolved.
         servers = {"supabase": {"url": "https://safe/mcp"},
@@ -159,6 +168,21 @@ class TestResolveVscodeMcp(unittest.TestCase):
                 "github-mcp-server-search_code", {}
             ),
             ("github-mcp-server", "search_code", None),
+        )
+
+    def test_configured_github_wins_over_builtin_shortcut(self):
+        servers = {
+            "github-mcp-server": {"url": "https://company.example/mcp"},
+        }
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-search_code", servers
+            ),
+            (
+                "github-mcp-server",
+                "search_code",
+                {"url": "https://company.example/mcp"},
+            ),
         )
 
 
@@ -340,7 +364,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(dispatch.call_args.args[0], "microsoft/markitdown")
         self.assertEqual(dispatch.call_args.args[1]["command"], "uvx")
 
-    def test_denied_unknown_server_dispatches_targeted_scan(self):
+    def test_denied_unknown_server_does_not_dispatch_targeted_scan(self):
         event = {
             "hook_event_name": "PreToolUse",
             "tool_name": "mcp_markitdown_convert_to_markdown",
@@ -355,7 +379,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         ) as dispatch:
             unbound.process_pre_tool_use(event, "K")
 
-        dispatch.assert_called_once()
+        dispatch.assert_not_called()
 
     def test_targeted_scan_uses_resolved_config(self):
         config_path = Path(self._tmp.name) / "unbound.json"
@@ -595,9 +619,9 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
         self.assertEqual(tool, "gdrive-search")
         self.assertEqual(cfg["url"], _PLUGIN_TOOLCHAIN_URL)
 
-    def test_plugin_mcp_json_wins_over_user_config(self):
+    def test_plugin_and_user_name_collision_is_ambiguous(self):
         servers = self._run(write_user_gdrive="/usr/local/bin/my-real-gdrive")
-        self.assertEqual(servers["gdrive"]["url"], _PLUGIN_TOOLCHAIN_URL)
+        self.assertIsNone(servers["gdrive"])
 
     def test_no_plugins_is_noop(self):
         tmp = tempfile.TemporaryDirectory()
@@ -667,9 +691,7 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
             "args": ["--token", "secret"],
         })
 
-    def test_plugin_relative_command_hashes_against_bundle(self):
-        # A plugin's relative script is fingerprinted against its own bundle dir,
-        # not the workspace cwd (else null/wrong fingerprint -> sanction bypass).
+    def test_plugin_relative_command_is_forwarded_without_hook_fingerprint(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
@@ -686,7 +708,7 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
             # cwd points at a dir that does NOT contain the script.
             servers = unbound.read_copilot_mcp_servers(str(user_dir.parent))
         self.assertIn("local", servers)
-        self.assertRegex(servers["local"]["scriptHash"], r"^[a-f0-9]{64}$")
+        self.assertEqual(servers["local"], {"command": "./server.py"})
 
 
 class TestCopilotProjectConfigPaths(unittest.TestCase):
@@ -805,6 +827,29 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
                 servers = unbound.read_copilot_mcp_servers(str(repo))
 
         self.assertEqual(servers["context7"]["args"], ["context7-mcp"])
+
+    def test_conflicting_user_and_workspace_configs_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir) / "home"
+            repo = Path(tmpdir) / "repo"
+            user_dir = home / "Library" / "Application Support" / "Code" / "User"
+            user_dir.mkdir(parents=True)
+            repo.mkdir()
+            (repo / ".git").mkdir()
+            (repo / ".mcp.json").write_text(json.dumps({
+                "shared": {"command": "workspace-server"},
+            }))
+            (user_dir / "mcp.json").write_text(json.dumps({
+                "servers": {"shared": {"command": "user-server"}},
+            }))
+
+            with patch.object(unbound.Path, "home", return_value=home), patch.object(
+                unbound.platform, "system", return_value="Darwin"
+            ):
+                servers = unbound.read_copilot_mcp_servers(str(repo))
+
+        self.assertIn("shared", servers)
+        self.assertIsNone(servers["shared"])
 
 if __name__ == "__main__":
     unittest.main()

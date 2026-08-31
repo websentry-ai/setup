@@ -850,7 +850,6 @@ def _workspace_mcp_config_paths(cwd):
     return paths
 
 
-# Last config wins. Copilot's priority is user < workspace < plugin.
 def _copilot_mcp_config_paths(cwd=None, plugins=None):
     home = Path.home()
     user = []
@@ -906,7 +905,7 @@ def _parse_jsonc(text):
         return None
 
 
-def _extract_mcp_server_fields(server, cwd=None):
+def _extract_mcp_server_fields(server):
     if not isinstance(server, dict):
         return None
     result = {
@@ -914,92 +913,10 @@ def _extract_mcp_server_fields(server, cwd=None):
         for key in ('url', 'command', 'args', 'type')
         if server.get(key)
     }
-    script_hash = _compute_script_hash(server.get('command'), server.get('args'), cwd)
-    if script_hash:
-        result['scriptHash'] = script_hash
     return result or None
 
 
 _MCP_CONFIG_MAX_BYTES = 1_000_000
-
-
-_HOOK_SCRIPT_RUNTIMES = {
-    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
-    'ruby', 'dart', 'php', 'perl', 'rscript',
-}
-_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
-_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
-
-
-def _hook_command_basename(command):
-    base = re.split(r'[\\/]', (command or '').strip())[-1]
-    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
-
-
-def _hook_looks_like_path(value):
-    v = (value or '').strip().strip('"\'')
-    if v.startswith(('http://', 'https://', '@', 'git+')):
-        return False
-    # Only treat an arg as a local script if it has a recognised script
-    # extension. Previously any '/'-containing arg matched, which let a crafted
-    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
-    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
-
-
-def _hook_candidate_script(command, args):
-    """The local script this config runs: the file arg under a runtime, or the
-    command itself when it's a script file. None for packages/urls/binaries."""
-    base = _hook_command_basename(command or '')
-    if base in _HOOK_SCRIPT_RUNTIMES:
-        for a in (args or []):
-            if not isinstance(a, str) or a.startswith('-'):
-                continue
-            t = a.strip().strip('"\'')
-            if t in _HOOK_RUNNER_SUBTOKENS:
-                continue
-            if _hook_looks_like_path(t):
-                return t
-        return None
-    if command and _HOOK_SCRIPT_EXT_RE.search(base):
-        return command
-    return None
-
-
-_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
-
-
-def _read_local_script(command, args, cwd):
-    try:
-        candidate = _hook_candidate_script(command, args)
-        if not candidate:
-            return None
-        path = os.path.expanduser(os.path.expandvars(candidate.strip().strip('"\'')))
-        if '${' in path:
-            return None
-        if not os.path.isabs(path) and cwd:
-            path = os.path.join(cwd, path)
-        if not os.path.isfile(path):
-            return None
-        with open(path, 'rb') as f:
-            return f.read(_HOOK_MAX_SCRIPT_BYTES)
-    except Exception:
-        return None
-
-
-def _compute_script_hash(command, args, cwd):
-    data = _read_local_script(command, args, cwd)
-    return hashlib.sha256(data).hexdigest() if data is not None else None
-
-
-def _augment_script_hash(result, cwd):
-    """Add scriptHash to an MCP server config when it runs a local script, so the
-    gateway can fingerprint it as `script:<hash>`."""
-    if result and result.get('command'):
-        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
-        if script_hash:
-            result['scriptHash'] = script_hash
-    return result
-
 
 # KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
 # Fingerprints key the local tool-hash cache; Redis tool scores are separately
@@ -1632,20 +1549,15 @@ def _mcp_servers_from_config(config, allow_bare=False):
     return raw if isinstance(raw, dict) else None
 
 
-def _mcp_config_base(config_path):
-    if config_path.name == 'mcp.json' and config_path.parent.name in {
-        '.github', '.vscode'
-    }:
-        return config_path.parent.parent
-    return config_path.parent
-
-
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
+    server_sources = {}
+    ambiguous_names = set()
     plugin_names = set()
     # Match plugin bundles by exact path (a substring check could misclassify).
     plugin_list = _plugin_mcp_config_paths()
     plugin_paths = set(plugin_list)
+    workspace_paths = set(_workspace_mcp_config_paths(cwd))
     for config_path in _copilot_mcp_config_paths(cwd, plugin_list):
         try:
             if not config_path.exists():
@@ -1663,11 +1575,11 @@ def read_copilot_mcp_servers(cwd=None):
             if not isinstance(raw, dict):
                 continue
             is_plugin = config_path in plugin_paths
-            # Hash a plugin's relative script against its own bundle, not cwd,
-            # so the fingerprint is correct and not workspace-spoofable.
-            base = _mcp_config_base(config_path)
+            source = 'plugin' if is_plugin else (
+                'workspace' if config_path in workspace_paths else 'user'
+            )
             for name, server in raw.items():
-                fields = _extract_mcp_server_fields(server, base) or {}
+                fields = _extract_mcp_server_fields(server) or {}
                 # Surface only genuine plugin-vs-plugin name clashes (name only).
                 if is_plugin:
                     if name in plugin_names and servers.get(name) != fields:
@@ -1675,7 +1587,19 @@ def read_copilot_mcp_servers(cwd=None):
                             f"copilot mcp plugin name collision: {name}", 'mcp_plugin'
                         )
                     plugin_names.add(name)
-                servers[name] = fields
+                previous_source = server_sources.get(name)
+                if name in ambiguous_names:
+                    continue
+                if (
+                    previous_source is not None
+                    and previous_source != source
+                    and servers.get(name) != fields
+                ):
+                    servers[name] = None
+                    ambiguous_names.add(name)
+                elif previous_source is None or previous_source == source:
+                    servers[name] = fields
+                server_sources[name] = source
         except Exception as e:
             # Missing files are skipped above without raising; this only fires on
             # a genuine read failure, so it's worth surfacing for diagnosis.
@@ -1697,6 +1621,7 @@ _BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright', 'fetch', 'time')
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
+_VSCODE_TRUNCATED_SERVER_LENGTH = 13
 
 
 def detect_mcp_call(raw_tool, mcp_servers):
@@ -1757,7 +1682,6 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
         return (None, None, None)
     body = raw_tool[len('mcp_'):]
     body_lower = body.lower()
-    segments = body.split('_')
     candidates = []  # (server_portion_len, exact_flag, server_name, tool)
     for server_name in mcp_servers:
         for alias in _vscode_server_aliases(server_name):
@@ -1767,11 +1691,15 @@ def _resolve_vscode_mcp(raw_tool, mcp_servers):
                 cand = (len(alias), 1, server_name, remainder[separator_length:])
             else:
                 cand = None
-                for k in range(len(segments) - 1, 0, -1):
-                    left = '_'.join(segments[:k])
-                    if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
-                        cand = (len(left), 0, server_name, '_'.join(segments[k:]))
-                        break
+                truncated = alias[:_VSCODE_TRUNCATED_SERVER_LENGTH]
+                if (
+                    len(alias) > _VSCODE_TRUNCATED_SERVER_LENGTH
+                    and body_lower.startswith(truncated + '_')
+                ):
+                    cand = (
+                        len(truncated), 0, server_name,
+                        body[len(truncated) + 1:],
+                    )
             if cand is not None and cand[3]:
                 candidates.append(cand)
     if not candidates:
@@ -1810,8 +1738,14 @@ def _explicit_mcp_identity_matches(raw_tool, server_name, tool_name):
         server_token = body[:-len(suffix)]
         if len(server_token) < _MIN_MCP_SERVER_NAME:
             continue
-        if any(alias == server_token or alias.startswith(server_token)
-               for alias in _vscode_server_aliases(server_name)):
+        if any(
+            alias == server_token
+            or (
+                len(alias) > _VSCODE_TRUNCATED_SERVER_LENGTH
+                and server_token == alias[:_VSCODE_TRUNCATED_SERVER_LENGTH]
+            )
+            for alias in _vscode_server_aliases(server_name)
+        ):
             return True
     return False
 
@@ -1820,15 +1754,19 @@ def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None)
     if _explicit_mcp_identity_matches(raw_tool, server_name, tool_name):
         return (server_name, tool_name, mcp_servers.get(server_name))
     lowered = (raw_tool or '').lower()
+    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
+        configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
+    else:
+        configured = detect_mcp_call(raw_tool, mcp_servers)
+    if configured[0] is not None:
+        return configured
     for server in _BUILTIN_MCP_SERVERS:
         prefix = server + '-'
         if lowered.startswith(prefix):
             tool = raw_tool[len(prefix):]
             if tool:
                 return (server, tool, mcp_servers.get(server))
-    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
-        return _resolve_vscode_mcp(raw_tool, mcp_servers)
-    return detect_mcp_call(raw_tool, mcp_servers)
+    return (None, None, None)
 
 
 def extract_command_for_pretool(canonical, tool_input):
@@ -2209,6 +2147,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
     if (
         is_mcp
+        and api_response.get('decision') != 'deny'
         and api_response.get('unknown_mcp_server')
         and scan_config
     ):
