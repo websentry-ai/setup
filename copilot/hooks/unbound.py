@@ -71,7 +71,7 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+SHELL_TOOLS = {'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal', 'terminal'}
 READ_TOOLS = {'read_file', 'readFile', 'view', 'cat'}
 WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
 EDIT_TOOLS = {
