@@ -311,3 +311,34 @@ class TestAwaitVscodeJournal(unittest.TestCase):
         self.assertLess(clock.now, unbound._VSCODE_SETTLE_SECONDS,
                         "should stop as soon as the journal settles")
         self.assertGreaterEqual(clock.slept, 3)
+
+
+class TestSessionEndWaitsBeforeReading(unittest.TestCase):
+    """main() is not driven by these tests, so this guards the one thing about it that
+    cannot be recovered if it regresses: at session end the journal wait has to happen
+    before anything reads usage, because the turn ending the session has no later event
+    to be completed by. Asserted on the source, the way the reader block already is."""
+
+    def _main_body(self):
+        path = Path(__file__).resolve().parents[3] / "copilot/hooks/unbound.py"
+        text = path.read_text(encoding="utf-8")
+        return text[text.index("def main():"):]
+
+    def test_the_wait_precedes_the_usage_read(self):
+        body = self._main_body()
+        wait = body.index("_await_vscode_journal(")
+        read = body.index("usage, usage_index = get_turn_usage(")
+        self.assertLess(wait, read,
+                        "session end must settle the journal before reading the last turn")
+
+    def test_the_wait_precedes_completing_earlier_turns(self):
+        body = self._main_body()
+        wait = body.index("_await_vscode_journal(")
+        complete = body.index("complete_pending_turns(")
+        self.assertLess(wait, complete)
+
+    def test_the_wait_is_only_for_session_end(self):
+        body = self._main_body()
+        wait = body.index("_await_vscode_journal(")
+        guard = body.rindex("if event_name == 'SessionEnd':", 0, wait)
+        self.assertLess(wait - guard, 400, "the wait must stay under the SessionEnd guard")

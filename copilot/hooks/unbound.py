@@ -859,11 +859,6 @@ def complete_pending_turns(event, wm_key, api_key, final=False):
     A list rather than one slot: a turn whose tokens have not landed by the next Stop
     would otherwise be displaced by that Stop's own pending turn, and its tokens lost."""
     pending_turns = get_session_marker(wm_key).get('pending_turns') or []
-    if pending_turns and final:
-        # Once for the list, not once per turn: they all read the same journal, and at
-        # session end it may not have been written yet.
-        _await_vscode_journal(event.get('transcript_path'),
-                              pending_turns[0].get('conversation_id'))
     return [p for p in pending_turns
             if not complete_pending_turn(event, p, api_key, final)]
 
@@ -4149,6 +4144,13 @@ def main():
             # own Stop can ride this one. A Stop with nothing new builds no exchange at all,
             # so there is never anything to attach deferred usage to on a pure replay: it
             # waits for the next real turn, and a session that ends first loses it.
+            if event_name == 'SessionEnd':
+                # Before anything reads, because this is the last chance for every turn in
+                # the session including the one ending it. Waiting after the read would
+                # leave that turn a pending entry no later event will ever process.
+                _await_vscode_journal(event.get('transcript_path'),
+                                      (exchange or {}).get('conversation_id') or session_id)
+
             usage = None
             if exchange:
                 previous_stop = get_previous_stop_timestamp_for_session(event)
