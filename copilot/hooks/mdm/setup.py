@@ -9,6 +9,7 @@ import time
 import platform
 import subprocess
 import json
+import importlib.util
 import sqlite3
 import tempfile
 from pathlib import Path
@@ -794,13 +795,14 @@ def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
 
 
 _BACKFILL_HOOK_MODULE = None
+_BACKFILL_HOOK_PATH = None
 
 
 def _backfill_load_hook_module():
-    global _BACKFILL_HOOK_MODULE
-    if _BACKFILL_HOOK_MODULE is not None:
-        return _BACKFILL_HOOK_MODULE
+    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_PATH
     hook_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
+    if _BACKFILL_HOOK_MODULE is not None and _BACKFILL_HOOK_PATH == hook_path:
+        return _BACKFILL_HOOK_MODULE
     if not hook_path.is_file():
         return None
     try:
@@ -810,6 +812,7 @@ def _backfill_load_hook_module():
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         _BACKFILL_HOOK_MODULE = module
+        _BACKFILL_HOOK_PATH = hook_path
         return module
     except Exception as exc:
         debug_print(f"could not load installed hook for MCP resolution: {exc}")
@@ -921,6 +924,9 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     if not session_id or not entries:
         return None
     session = {'session_id': session_id, 'entries': entries}
+    mcp_tool_provenance = _backfill_mcp_tool_provenance(entries)
+    if mcp_tool_provenance:
+        session['mcp_tool_provenance'] = mcp_tool_provenance
     usage = _backfill_session_usage(transcript_path, session_id)
     if usage:
         session['usage'] = usage
@@ -1235,25 +1241,37 @@ def _backfill_iter_transcripts(home_dir: Path, cutoff_mtime: float):
 
 
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None) -> Tuple[List[Dict], bool, bool]:
-    # Must run inside _run_as_user (reads transcripts as the target user).
-    # Returns (sessions, capped); capped=True means the per-run cap was hit and
-    # older files remain unprocessed, so this home's cutoff must not advance.
-    cutoff_mtime = _backfill_read_cutoff(home_dir)
-    # Compared per home: one device can hold profiles that last backfilled at different
-    # times, and only those behind the request re-walk.
-    forced = force_epoch is not None and force_epoch > cutoff_mtime
-    if forced:
-        cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
-    sessions = []
-    capped = False
-    for transcript_path in sorted(_backfill_iter_transcripts(home_dir, cutoff_mtime)):
-        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
-            capped = True
-            break
-        session = _backfill_collect_session(transcript_path)
-        if session:
-            sessions.append(session)
-    return sessions, capped, forced
+    previous_env = {}
+    if platform.system().lower() == 'windows':
+        values = {
+            'HOME': str(home_dir),
+            'USERPROFILE': str(home_dir),
+            'APPDATA': str(home_dir / 'AppData' / 'Roaming'),
+        }
+        for name, value in values.items():
+            previous_env[name] = os.environ.get(name)
+            os.environ[name] = value
+    try:
+        cutoff_mtime = _backfill_read_cutoff(home_dir)
+        forced = force_epoch is not None and force_epoch > cutoff_mtime
+        if forced:
+            cutoff_mtime = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+        sessions = []
+        capped = False
+        for transcript_path in sorted(_backfill_iter_transcripts(home_dir, cutoff_mtime)):
+            if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+                capped = True
+                break
+            session = _backfill_collect_session(transcript_path)
+            if session:
+                sessions.append(session)
+        return sessions, capped, forced
+    finally:
+        for name, value in previous_env.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -1403,6 +1421,22 @@ def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
     return [i for i, entry in enumerate(entries) if _backfill_is_user_message(entry)]
 
 
+def _backfill_tool_call_ids(entries: List[Dict]):
+    call_ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        data = entry.get('data') or {}
+        if entry.get('type') == 'assistant.message':
+            for request in data.get('toolRequests') or []:
+                if isinstance(request, dict) and isinstance(request.get('toolCallId'), str):
+                    call_ids.add(request['toolCallId'])
+        elif entry.get('type') in ('tool.execution_start', 'tool.execution_complete'):
+            if isinstance(data.get('toolCallId'), str):
+                call_ids.add(data['toolCallId'])
+    return call_ids
+
+
 def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
     yielded as-is. Oversized sessions are split at server-side exchange
@@ -1413,6 +1447,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     entries = session.get('entries') or []
     session_usage = session.get('usage') or []
     session_models = session.get('models') or []
+    session_provenance = session.get('mcp_tool_provenance') or {}
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1454,18 +1489,45 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        slice_payload = {
-            'session_id': session_id,
-            'record_index_base': record_index_base,
-            'entries': entries[start_idx:last_fit_end],
-        }
-        # Usage is one dict per exchange, so it cuts on the same boundaries the entries do.
-        usage_slice = session_usage[record_index_base:record_index_base + last_fit_base_count]
-        if usage_slice:
-            slice_payload['usage'] = usage_slice
-        models_slice = session_models[record_index_base:record_index_base + last_fit_base_count]
-        if any(models_slice):
-            slice_payload['models'] = models_slice
+        fit_ends = [end_idx for end_idx in ends if end_idx <= last_fit_end]
+        slice_payload = None
+        while fit_ends:
+            candidate_end = fit_ends.pop()
+            candidate_count = sum(
+                1 for boundary in boundaries if start_idx <= boundary < candidate_end
+            )
+            candidate_entries = entries[start_idx:candidate_end]
+            candidate = {
+                'session_id': session_id,
+                'record_index_base': record_index_base,
+                'entries': candidate_entries,
+            }
+            usage_slice = session_usage[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if usage_slice:
+                candidate['usage'] = usage_slice
+            models_slice = session_models[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if any(models_slice):
+                candidate['models'] = models_slice
+            call_ids = _backfill_tool_call_ids(candidate_entries)
+            provenance_slice = {
+                call_id: session_provenance[call_id]
+                for call_id in call_ids
+                if call_id in session_provenance
+            }
+            if provenance_slice:
+                candidate['mcp_tool_provenance'] = provenance_slice
+            if len(json.dumps(candidate).encode('utf-8')) <= max_chunk_bytes:
+                slice_payload = candidate
+                last_fit_end = candidate_end
+                last_fit_base_count = candidate_count
+                break
+        if slice_payload is None:
+            debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            return
         yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end

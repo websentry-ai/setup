@@ -190,10 +190,11 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
+        config = {"command": "github-mcp-server"}
         with unittest.mock.patch.object(
             unbound,
             "read_copilot_mcp_servers",
-            return_value={"github-mcp-server": {"command": "github-mcp-server"}},
+            return_value={"github-mcp-server": config},
         ):
             exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
                 path, SESSION, cwd="/workspace")
@@ -202,9 +203,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(tool_use[0]["type"], "afterMCPExecution")
         self.assertEqual(tool_use[0]["server_name"], "github-mcp-server")
         self.assertEqual(tool_use[0]["mcp_tool_name"], "search_code")
-        self.assertEqual(
-            tool_use[0]["mcp_server_config"], {"command": "github-mcp-server"}
-        )
+        self.assertEqual(tool_use[0]["mcp_server_config"], config)
 
     def test_builtin_github_is_reported_without_local_config(self):
         mapped = unbound.map_copilot_tool(
@@ -219,13 +218,26 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(mapped["mcp_tool_name"], "search_code")
         self.assertNotIn("mcp_server_config", mapped)
 
+    def test_other_builtin_mcp_is_reported_without_local_config(self):
+        mapped = unbound.map_copilot_tool(
+            "playwright-browser_navigate",
+            {"url": "https://example.com"},
+            "ok",
+            mcp_servers={},
+        )
+
+        self.assertEqual(mapped["type"], "afterMCPExecution")
+        self.assertEqual(mapped["server_name"], "playwright")
+        self.assertEqual(mapped["mcp_tool_name"], "browser_navigate")
+        self.assertNotIn("mcp_server_config", mapped)
+
     def test_transcript_mcp_fields_are_used_without_parsing_tool_name(self):
         path = _transcript([
             _entry("user.message", _id="u1", content="search docs"),
             _entry(
                 "tool.execution_start",
                 toolCallId="call-a",
-                toolName="opaque-tool-name",
+                toolName="docs_alias-search_docs",
                 mcpServerName="docs_alias",
                 mcpToolName="search_docs",
                 arguments={"query": "hooks"},
@@ -248,6 +260,18 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(tool_use[0]["server_name"], "docs_alias")
         self.assertEqual(tool_use[0]["mcp_tool_name"], "search_docs")
         self.assertEqual(tool_use[0]["mcp_server_config"], config)
+
+    def test_explicit_mcp_fields_cannot_relabel_a_native_tool_name(self):
+        mapped = unbound.map_copilot_tool(
+            "read_file",
+            {"path": "document"},
+            "ok",
+            mcp_servers={"documents": {"command": "documents-mcp"}},
+            mcp_server_name="documents",
+            mcp_tool_name="read_file",
+        )
+
+        self.assertEqual(mapped["type"], "beforeReadFile")
 
     def test_tool_request_mcp_fields_work_without_execution_start(self):
         path = _transcript([

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Tuple, Optional, Dict, List
 import threading
 import http.server
+import importlib.util
 import socketserver
 import socket
 import json
@@ -29,6 +30,10 @@ BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 DEBUG = False
+
+
+def _copilot_home() -> Path:
+    return Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
 
 
 def debug_print(message: str) -> None:
@@ -337,7 +342,7 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
 
 
 def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
-    hooks_dir = Path.home() / ".copilot" / "hooks"
+    hooks_dir = _copilot_home() / "hooks"
     script_path = hooks_dir / "unbound.py"
 
     print("\n📥 Downloading unbound.py script...")
@@ -398,8 +403,8 @@ def _copilot_hooks_config(script_path: Path) -> dict:
 def configure_copilot_hooks() -> bool:
     """Write ~/.copilot/hooks/unbound.json. Unbound owns this file and overwrites
     it wholesale; other *.json files in the directory are left untouched."""
-    hooks_path = Path.home() / ".copilot" / "hooks" / "unbound.json"
-    script_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
+    hooks_path = _copilot_home() / "hooks" / "unbound.json"
+    script_path = _copilot_home() / "hooks" / "unbound.py"
 
     try:
         hooks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -442,12 +447,12 @@ def clear_setup() -> bool:
         print("Failed to clear API_KEY")
         any_failed = True
 
-    _r = _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.py", "Copilot unbound.py hook")
+    _r = _clear_path(_copilot_home() / "hooks" / "unbound.py", "Copilot unbound.py hook")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
         any_failed = True
-    _r = _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.json", "Copilot unbound.json hooks config")
+    _r = _clear_path(_copilot_home() / "hooks" / "unbound.json", "Copilot unbound.json hooks config")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
@@ -570,7 +575,7 @@ def detect_install_state() -> str:
     Unbound setup already exists on this device, else 'fresh'. User-level setups
     are never tamper-eligible, so 'tampered' is never reported."""
     try:
-        return "persisted" if (Path.home() / ".copilot" / "hooks" / "unbound.py").exists() else "fresh"
+        return "persisted" if (_copilot_home() / "hooks" / "unbound.py").exists() else "fresh"
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return "fresh"
@@ -608,13 +613,14 @@ def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
 
 
 _BACKFILL_HOOK_MODULE = None
+_BACKFILL_HOOK_PATH = None
 
 
 def _backfill_load_hook_module():
-    global _BACKFILL_HOOK_MODULE
-    if _BACKFILL_HOOK_MODULE is not None:
+    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_PATH
+    hook_path = _copilot_home() / "hooks" / "unbound.py"
+    if _BACKFILL_HOOK_MODULE is not None and _BACKFILL_HOOK_PATH == hook_path:
         return _BACKFILL_HOOK_MODULE
-    hook_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
     if not hook_path.is_file():
         return None
     try:
@@ -624,6 +630,7 @@ def _backfill_load_hook_module():
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         _BACKFILL_HOOK_MODULE = module
+        _BACKFILL_HOOK_PATH = hook_path
         return module
     except Exception as exc:
         debug_print(f"could not load installed hook for MCP resolution: {exc}")
@@ -735,6 +742,9 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
     if not session_id or not entries:
         return None
     session = {'session_id': session_id, 'entries': entries}
+    mcp_tool_provenance = _backfill_mcp_tool_provenance(entries)
+    if mcp_tool_provenance:
+        session['mcp_tool_provenance'] = mcp_tool_provenance
     usage = _backfill_session_usage(transcript_path, session_id)
     if usage:
         session['usage'] = usage
@@ -1126,8 +1136,8 @@ def _backfill_vscode_workspace_roots() -> List[Path]:
     return bases
 
 
-def _backfill_state_path(home: Path) -> Path:
-    return home / '.copilot' / 'hooks' / BACKFILL_STATE_FILE
+def _backfill_state_path(copilot_home: Path) -> Path:
+    return copilot_home / 'hooks' / BACKFILL_STATE_FILE
 
 
 def _backfill_read_cutoff(home: Path) -> float:
@@ -1175,7 +1185,7 @@ def _backfill_should_include(p: Path, cutoff_mtime: float) -> bool:
 
 
 def _backfill_iter_transcripts(cutoff_mtime: float):
-    cli_root = Path.home() / '.copilot' / 'session-state'
+    cli_root = _copilot_home() / 'session-state'
     if cli_root.exists():
         for p in cli_root.glob('*/events.jsonl'):
             if _backfill_should_include(p, cutoff_mtime):
@@ -1201,6 +1211,22 @@ def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
     return [i for i, entry in enumerate(entries) if _backfill_is_user_message(entry)]
 
 
+def _backfill_tool_call_ids(entries: List[Dict]):
+    call_ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        data = entry.get('data') or {}
+        if entry.get('type') == 'assistant.message':
+            for request in data.get('toolRequests') or []:
+                if isinstance(request, dict) and isinstance(request.get('toolCallId'), str):
+                    call_ids.add(request['toolCallId'])
+        elif entry.get('type') in ('tool.execution_start', 'tool.execution_complete'):
+            if isinstance(data.get('toolCallId'), str):
+                call_ids.add(data['toolCallId'])
+    return call_ids
+
+
 def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
     yielded as-is. Oversized sessions are split at server-side exchange
@@ -1211,6 +1237,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     entries = session.get('entries') or []
     session_usage = session.get('usage') or []
     session_models = session.get('models') or []
+    session_provenance = session.get('mcp_tool_provenance') or {}
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1252,18 +1279,45 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        slice_payload = {
-            'session_id': session_id,
-            'record_index_base': record_index_base,
-            'entries': entries[start_idx:last_fit_end],
-        }
-        # Usage is one dict per exchange, so it cuts on the same boundaries the entries do.
-        usage_slice = session_usage[record_index_base:record_index_base + last_fit_base_count]
-        if usage_slice:
-            slice_payload['usage'] = usage_slice
-        models_slice = session_models[record_index_base:record_index_base + last_fit_base_count]
-        if any(models_slice):
-            slice_payload['models'] = models_slice
+        fit_ends = [end_idx for end_idx in ends if end_idx <= last_fit_end]
+        slice_payload = None
+        while fit_ends:
+            candidate_end = fit_ends.pop()
+            candidate_count = sum(
+                1 for boundary in boundaries if start_idx <= boundary < candidate_end
+            )
+            candidate_entries = entries[start_idx:candidate_end]
+            candidate = {
+                'session_id': session_id,
+                'record_index_base': record_index_base,
+                'entries': candidate_entries,
+            }
+            usage_slice = session_usage[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if usage_slice:
+                candidate['usage'] = usage_slice
+            models_slice = session_models[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if any(models_slice):
+                candidate['models'] = models_slice
+            call_ids = _backfill_tool_call_ids(candidate_entries)
+            provenance_slice = {
+                call_id: session_provenance[call_id]
+                for call_id in call_ids
+                if call_id in session_provenance
+            }
+            if provenance_slice:
+                candidate['mcp_tool_provenance'] = provenance_slice
+            if len(json.dumps(candidate).encode('utf-8')) <= max_chunk_bytes:
+                slice_payload = candidate
+                last_fit_end = candidate_end
+                last_fit_base_count = candidate_count
+                break
+        if slice_payload is None:
+            debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            return
         yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
@@ -1276,7 +1330,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         return
 
     try:
-        home = Path.home()
+        home = _copilot_home()
         started_at = time.time()
         cutoff_mtime = _backfill_read_cutoff(home)
         force_epoch = _backfill_force_epoch(api_key, backend_url)

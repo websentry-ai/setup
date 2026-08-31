@@ -70,6 +70,16 @@ def _request(prompt=None, completion=None, elapsed=1234):
 
 
 class TestBackfillCliUsage(unittest.TestCase):
+    def test_copilot_home_contains_cli_transcripts(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            copilot_home = Path(tmpdir) / "custom-copilot"
+            transcript = copilot_home / "session-state" / SESSION / "events.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text("{}\n", encoding="utf-8")
+            with patch.dict(os.environ, {"COPILOT_HOME": str(copilot_home)}):
+                found = list(setup._backfill_iter_transcripts(0))
+        self.assertEqual(found, [transcript])
+
     def test_one_entry_per_turn_in_order(self):
         usage = _cli_usage([(SESSION, 0, 100, 5, 0, 0), (SESSION, 1, 200, 7, 0, 0)])
         self.assertEqual([u["input_tokens"] for u in usage], [100, 200])
@@ -157,6 +167,7 @@ class TestBackfillVscodeUsage(unittest.TestCase):
 class TestBackfillPayload(unittest.TestCase):
     def tearDown(self):
         setup._BACKFILL_HOOK_MODULE = None
+        setup._BACKFILL_HOOK_PATH = None
 
     def test_installed_hook_resolves_a_configured_bare_mcp_call_end_to_end(self):
         entries = [

@@ -11,6 +11,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.conftest import tool_module
 
@@ -39,6 +40,10 @@ def _cli_tree(tmpdir, rows, session=SESSION):
 
 
 class TestMdmBackfillUsage(unittest.TestCase):
+    def tearDown(self):
+        mdm._BACKFILL_HOOK_MODULE = None
+        mdm._BACKFILL_HOOK_PATH = None
+
     def test_cache_tiers_come_out_of_input(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _cli_tree(tmpdir, [(SESSION, 0, 26941, 274, 0, 26931)])
@@ -78,6 +83,49 @@ class TestMdmBackfillUsage(unittest.TestCase):
                 {"type": "user.message", "data": {"content": "hi"}}) + "\n", encoding="utf-8")
             session = mdm._backfill_collect_session(transcript)
         self.assertEqual(session["usage"][0]["input_tokens"], 100)
+
+    def test_windows_collection_uses_each_users_copilot_config(self):
+        source_hook = Path(__file__).resolve().parents[4] / "copilot" / "hooks" / "unbound.py"
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            sessions = []
+            for root, server in ((first, "alpha"), (second, "beta")):
+                home = Path(root)
+                hook_dir = home / ".copilot" / "hooks"
+                hook_dir.mkdir(parents=True)
+                (hook_dir / "unbound.py").write_text(source_hook.read_text(encoding="utf-8"), encoding="utf-8")
+                (home / ".copilot" / "mcp-config.json").write_text(json.dumps({
+                    "mcpServers": {server: {"command": "npx", "args": [server]}},
+                }), encoding="utf-8")
+                transcript = home / ".copilot" / "session-state" / server / "events.jsonl"
+                transcript.parent.mkdir(parents=True)
+                transcript.write_text(json.dumps({
+                    "type": "assistant.message",
+                    "data": {"toolRequests": [{
+                        "toolCallId": server,
+                        "name": f"{server}-get_issue",
+                        "arguments": {},
+                    }]},
+                }) + "\n", encoding="utf-8")
+                with patch.object(mdm.platform, "system", return_value="Windows"):
+                    sessions.extend(mdm._backfill_collect_sessions(home)[0])
+
+        self.assertEqual(
+            [session["mcp_tool_provenance"] for session in sessions],
+            [
+                {"alpha": {
+                    "tool_name": "alpha-get_issue",
+                    "server_name": "alpha",
+                    "mcp_tool_name": "get_issue",
+                    "mcp_server_config": {"command": "npx", "args": ["alpha"]},
+                }},
+                {"beta": {
+                    "tool_name": "beta-get_issue",
+                    "server_name": "beta",
+                    "mcp_tool_name": "get_issue",
+                    "mcp_server_config": {"command": "npx", "args": ["beta"]},
+                }},
+            ],
+        )
 
 
 class TestReaderBlockStaysInSync(unittest.TestCase):
