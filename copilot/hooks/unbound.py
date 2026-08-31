@@ -16,6 +16,7 @@ import time
 import hashlib
 import re
 import sqlite3
+import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlsplit, urlunsplit
 
@@ -140,6 +141,17 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 # event: every existing reader filters by its own event name and skips it, and
 # cleanup_old_logs prunes it per-session like any other row (no new file, no new state).
 FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
+# Distinguishes 'carry the old value forward' from 'clear it'.
+_UNSET = object()
+# Safety net, not the working bound. Entries drop themselves as soon as their tokens
+# land or their turn leaves the transcript, so the list tracks a session's unsettled
+# turns and can never exceed its length. This only exists so a pathological session
+# cannot grow the marker without limit. Sized against real sessions rather than a guess:
+# 57 turns at p95 and 301 at the observed maximum, and VS Code sometimes writes the whole
+# journal only as the session closes, which leaves every turn of a long session pending
+# until SessionEnd. Each entry is a handful of short strings, so 500 is well under a
+# hundred kilobytes.
+MAX_PENDING_TURNS = 500
 
 # Ensure log directory exists
 try:
@@ -653,7 +665,8 @@ def get_forwarded_state(session_id):
     return sent, last_sig, prompted, usage_index
 
 
-def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None):
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None,
+                             turn_digests=None, pending_turns=_UNSET):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -679,6 +692,10 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
                 text_sig = ev.get('text_sig')  # carry forward the last known text sig
             if usage_index is None:
                 usage_index = ev.get('usage_request_index')
+            if turn_digests is None:
+                turn_digests = ev.get('turn_digests')
+            if pending_turns is _UNSET:
+                pending_turns = ev.get('pending_turns')
             continue  # drop the old marker; a fresh consolidated one is appended below
         kept.append(log)
     kept.append({
@@ -690,6 +707,12 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
             'forwarded_prompt_ids': sorted(merged_prompts),
             'text_sig': text_sig,
             'usage_request_index': usage_index if isinstance(usage_index, int) else 0,
+            # Digests of turns already sent, so a repeated prompt-and-reply gets its own
+            # occurrence rather than colliding with the earlier one.
+            'turn_digests': turn_digests if isinstance(turn_digests, list) else [],
+            # Turns sent whose tokens or model had not landed yet. Each holds an id and
+            # a window, never prompt text: the turn is rebuilt from the transcript.
+            'pending_turns': (pending_turns if pending_turns is not _UNSET else []) or [],
         },
     })
     save_logs(kept)
@@ -771,6 +794,168 @@ def _transcript_path_for_session(event):
         if isinstance(path, str) and path:
             return path
     return None
+
+
+def turn_content_digest(user_prompt, assistant_prompt):
+    """Digest of what both this hook and the server-side transcript parser can see of one
+    turn. NUL-joined so a prompt ending where the reply begins cannot forge another
+    turn's digest. KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service."""
+    return hashlib.sha256(
+        (user_prompt or '').encode('utf-8') + b'\x00' + (assistant_prompt or '').encode('utf-8')
+    ).hexdigest()
+
+
+def build_turn_request_id(session_id, digest, occurrence):
+    """Stable id for one turn, keyed on content rather than position.
+
+    Position is not usable: a turn that never reached the gateway is in the transcript
+    and not in our history, so counting turns would map one turn's tokens onto its
+    neighbour. Content is the same on both sides by construction. `occurrence` separates
+    turns whose prompt AND reply are byte-identical inside one session."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_OID,
+        'turn:copilot:%s:%s:%d' % (session_id, digest, occurrence),
+    ))
+
+
+def exchange_turn_content(exchange):
+    """(user prompt, assistant text) of an exchange, in the shape the digest is taken over."""
+    user_prompt = ''
+    assistant_prompt = ''
+    for message in (exchange or {}).get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') == 'user':
+            user_prompt = message.get('content') or ''
+        elif message.get('role') == 'assistant':
+            assistant_prompt = message.get('content') or ''
+    return user_prompt, assistant_prompt
+
+
+def get_session_marker(session_key):
+    """The consolidated per-session marker, or an empty dict."""
+    if not session_key:
+        return {}
+    for log in reversed(load_existing_logs()):
+        event = log.get('event', {})
+        if (event.get('hook_event_name') == FORWARDED_TOOLS_EVENT
+                and event.get('session_id') == session_key):
+            return event
+    return {}
+
+
+def turn_prompt_id(entry, conversation_id, index, content):
+    """Stable id for a user prompt entry. An entry without an envelope id still has to be
+    watermarked, or every later Stop re-selects it and re-uploads its text with the
+    current turn."""
+    return entry.get('id') or 'unb-' + hashlib.sha256(
+        ('%s\x1f%d\x1f%s' % (conversation_id or '', index, content or ''))
+        .encode('utf-8', 'replace')).hexdigest()[:24]
+
+
+def complete_pending_turns(event, wm_key, api_key, final=False):
+    """Complete every turn still waiting on its numbers; return those still waiting.
+
+    A list rather than one slot: a turn whose tokens have not landed by the next Stop
+    would otherwise be displaced by that Stop's own pending turn, and its tokens lost."""
+    pending_turns = get_session_marker(wm_key).get('pending_turns') or []
+    return [p for p in pending_turns
+            if not complete_pending_turn(event, p, api_key, final)]
+
+
+def complete_pending_turn(event, pending, api_key, final=False):
+    """Re-send an earlier turn once its tokens or model have landed.
+
+    Copilot writes both after the turn has already been reported, so its own Stop had
+    nothing to send. The re-send carries the id the turn was sent with, so the control
+    plane fills that row rather than adding a second one. Returns True when the turn is
+    settled and can be dropped."""
+    if not isinstance(pending, dict) or not pending.get('turn_request_id'):
+        return True
+
+    transcript_path = event.get('transcript_path')
+    conversation_id = pending.get('conversation_id')
+    # By the turn's own window, never by the live path's watermark: every turn after this
+    # one has settled by now, and a watermark read would hand this turn all of them.
+    usage = pending_turn_usage(transcript_path, conversation_id,
+                               pending.get('since'), pending.get('until'))
+    model = _vscode_turn_model(transcript_path, conversation_id,
+                               pending.get('since'), pending.get('until'))
+    # Tokens are the point, and VS Code can expose a model before it has finished
+    # accounting. Sending on the model alone and clearing the slot would lose those
+    # tokens permanently, so a model-only result waits -- except at SessionEnd, which is
+    # the last chance this session gets.
+    if not usage and not (final and model):
+        return False
+
+    content = rebuild_turn_content(transcript_path, conversation_id, pending.get('prompt_id'))
+    if content is None:
+        # The turn is no longer in the transcript, so nothing can be rebuilt for it.
+        return True
+    user_prompt, assistant_prompt = content
+
+    exchange = {
+        'conversation_id': conversation_id,
+        'model': model or 'auto',
+        'messages': [{'role': 'user', 'content': user_prompt},
+                     {'role': 'assistant', 'content': assistant_prompt}],
+        'turn_request_id': pending['turn_request_id'],
+        'requestInitialized': pending.get('since') or pending.get('until'),
+        'requestCompleted': pending.get('until'),
+    }
+    if usage:
+        exchange['usage'] = usage
+    if not send_to_api(exchange, api_key):
+        return False
+    # Settled means the tokens are in, not merely that something was sent. A model-only
+    # send is progress, so the slot stays and any later event for this session can still
+    # attach them; re-sending fills the same row and changes nothing.
+    return bool(usage)
+
+
+def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
+    """(user prompt, assistant text) for one earlier turn, or None.
+
+    Anchored on the turn's own prompt entry rather than a time window: transcript entries
+    carry no timestamp, and the turn ends where the next user prompt begins. Reads the
+    transcript again rather than keeping the text on disk, so no prompt text is persisted."""
+    if not transcript_path or not prompt_id:
+        return None
+    try:
+        entries = []
+        with open(transcript_path, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        log_error('turn rebuild read failed: %s' % e, 'usage')
+        return None
+
+    user_prompt = None
+    assistant_parts = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        entry_type = entry.get('type')
+        data = entry.get('data') or {}
+        if entry_type == 'user.message':
+            if user_prompt is not None:
+                break  # the next prompt closes the turn
+            content = data.get('content')
+            if turn_prompt_id(entry, conversation_id, index, content) == prompt_id:
+                user_prompt = content or ''
+        elif entry_type == 'assistant.message' and user_prompt is not None:
+            content = data.get('content')
+            if isinstance(content, str) and content:
+                assistant_parts.append(content)
+    if user_prompt is None:
+        return None
+    return user_prompt, '\n\n'.join(assistant_parts)
 
 
 def get_previous_stop_timestamp_for_session(event):
@@ -3201,6 +3386,88 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
     return totals, index, index in requests
 
 
+def _await_vscode_journal(transcript_path, conversation_id):
+    """Wait out the settle window for a journal that has not finished being written.
+
+    Only worth doing at session end. Mid-session an unwritten journal means a later Stop
+    reports the turn, but at session end there is no later Stop, and VS Code sometimes
+    writes the whole journal only as the session closes."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return
+    stamp = _vscode_store_stamp(path)
+    deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
+    written = False
+    while time.monotonic() < deadline:
+        time.sleep(_VSCODE_POLL_SECONDS)
+        current = _vscode_store_stamp(path)
+        if current is not None and current != stamp:
+            # Still being written. Keep waiting for it to go quiet rather than reading a
+            # half-written turn.
+            stamp = current
+            written = True
+            continue
+        if written:
+            return  # it grew and has now settled
+        # Unchanged so far means the write has not started, which is the case worth
+        # waiting out here: returning now would give up on a journal VS Code writes a
+        # few seconds into the close.
+
+
+def _vscode_windowed_usage(transcript_path, conversation_id, since, until):
+    """Usage for the requests belonging to one past turn, chosen by the window it ran in.
+
+    A deferred turn cannot use the index the live path uses. That reader takes every
+    settled request from a point onward, which is right for a Stop reporting the turn that
+    just ended and wrong for a turn completed later, when the requests of every turn after
+    it have settled too and the first read would swallow them all."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None
+    requests = _vscode_requests(path)
+    if not requests:
+        return None
+    lo, hi = _epoch(since), _epoch(until)
+    if hi is None:
+        return None
+    totals = dict((field, 0) for field in _USAGE_FIELDS)
+    found = False
+    # Guarded for the same reason the index reader is: a non-numeric count in the journal
+    # must not raise past the hook.
+    try:
+        for index in sorted(requests):
+            entry = requests[index]
+            if not _in_window(_epoch(entry.get('timestamp')), lo, hi):
+                continue
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            # elapsedMs is written after the final counts, so a request without it is
+            # still climbing and is left out rather than counted low.
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                continue
+            totals['input_tokens'] += max(int(prompt), 0)
+            totals['output_tokens'] += max(int(completion), 0)
+            found = True
+    except (TypeError, ValueError) as e:
+        log_error('vscode windowed usage failed: %s' % e, 'usage')
+        return None
+    if not found:
+        return None
+    totals['total_tokens'] = sum(totals[field] for field in _USAGE_FIELDS)
+    return totals
+
+
+def pending_turn_usage(transcript_path, conversation_id, since, until):
+    """Usage for one turn being completed after the fact, by its own window on either
+    surface. Both stores stamp every request, so neither needs the live path's watermark."""
+    if transcript_path and Path(transcript_path).stem == 'events':
+        usage = _cli_turn_usage(conversation_id, _epoch(since), _epoch(until))
+        if usage and any(usage.values()):
+            usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
+            return usage
+        return None
+    return _vscode_windowed_usage(transcript_path, conversation_id, since, until)
+
+
 def _vscode_store_stamp(path):
     """(mtime, size) of the chat journal, or None when it cannot be stat'd."""
     if not path:
@@ -3215,7 +3482,10 @@ def _vscode_store_stamp(path):
 def _vscode_settled_usage(transcript_path, conversation_id, start_index):
     """Wait for this turn to finish being written. Stop fires before the response ends, so
     a first read usually has nothing to report. Giving up is safe: the watermark does not
-    advance, so a later Stop reports the turn instead."""
+    advance, so a later Stop reports the turn instead.
+
+    A turn being completed after the fact does not come through here at all; it reads by
+    its own window, because by then every later turn has settled too."""
     usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
                                                     start_index)
     # Wait only while a request is mid-write. With nothing pending there is nothing to wait
@@ -3253,7 +3523,8 @@ def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, us
         usage = None if until is None else _cli_turn_usage(conversation_id, since, until)
         next_index = usage_index
     else:
-        usage, next_index = _vscode_settled_usage(transcript_path, conversation_id, usage_index)
+        usage, next_index = _vscode_settled_usage(transcript_path, conversation_id,
+                                                  usage_index)
     if not usage or not any(usage.values()):
         return None, next_index
     usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
@@ -3329,9 +3600,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             # An entry without an envelope id still has to be watermarked, or every later
             # Stop re-selects it and re-uploads its text with the current turn. Keyed the
             # same way turn_id is when its id is missing.
-            message_id = entry.get('id') or 'unb-' + hashlib.sha256(
-                ('%s\x1f%d\x1f%s' % (conversation_id or '', i, content or ''))
-                .encode('utf-8', 'replace')).hexdigest()[:24]
+            message_id = turn_prompt_id(entry, conversation_id, i, content)
             if message_id in already_prompted:
                 continue
             if turn_start_index < 0:
@@ -3875,6 +4144,13 @@ def main():
             # own Stop can ride this one. A Stop with nothing new builds no exchange at all,
             # so there is never anything to attach deferred usage to on a pure replay: it
             # waits for the next real turn, and a session that ends first loses it.
+            if event_name == 'SessionEnd':
+                # Before anything reads, because this is the last chance for every turn in
+                # the session including the one ending it. Waiting after the read would
+                # leave that turn a pending entry no later event will ever process.
+                _await_vscode_journal(event.get('transcript_path'),
+                                      (exchange or {}).get('conversation_id') or session_id)
+
             usage = None
             if exchange:
                 previous_stop = get_previous_stop_timestamp_for_session(event)
@@ -3895,6 +4171,12 @@ def main():
             # that no Stop ever reported; a turn already sent is left alone, because usage
             # is part of the backend's request id and re-sending would add a row, not
             # complete the existing one.
+            # Earlier turns whose numbers arrived after their own Stop are completed here,
+            # before this turn is handled, so each turn carries its own tokens.
+            was_pending = get_session_marker(wm_key).get('pending_turns') or []
+            still_pending = complete_pending_turns(
+                event, wm_key, api_key, final=(event_name == 'SessionEnd'))
+
             if exchange and (forwarded_now or text_sig != last_text_sig or usage):
                 # Turn boundaries from event-fire times
                 request_initialized = get_turn_start_timestamp_for_session(session_id)
@@ -3903,11 +4185,47 @@ def main():
                 exchange['requestCompleted'] = timestamp
                 if usage:
                     exchange['usage'] = usage
+
+                # Content, not position: the id has to survive being sent again once the
+                # tokens land, and a turn that never reached the gateway would shift every
+                # position after it.
+                marker = get_session_marker(wm_key)
+                digests = marker.get('turn_digests') or []
+                user_prompt, assistant_prompt = exchange_turn_content(exchange)
+                digest = turn_content_digest(user_prompt, assistant_prompt)
+                turn_request_id = build_turn_request_id(session_id, digest, digests.count(digest))
+                exchange['turn_request_id'] = turn_request_id
+
                 # Record only after the send succeeds, so a failed send retries next Stop
                 # (the backend dedups). Updates the text signature too, even with no new
                 # tools, so an unchanged later Stop becomes a no-op.
                 if send_to_api(exchange, api_key):
-                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now, usage_index)
+                    # One slot, holding an id and a window, never prompt text. Kept only
+                    # while something is still missing, so a complete turn leaves nothing
+                    # behind for the next Stop to re-send.
+                    # Only one prompt can anchor a rebuild: the rebuild reads from that
+                    # prompt to the next one, so a turn opened by several prompts would be
+                    # cut short. Those turns simply go uncompleted.
+                    anchor = next(iter(prompts_now)) if len(prompts_now) == 1 else None
+                    # 'auto' is the unresolved model, not a missing one: a CLI turn takes
+                    # its model from the transcript and is already settled.
+                    incomplete = not usage or exchange.get('model') in (None, '', 'auto')
+                    pending_turns = list(still_pending)
+                    if incomplete and anchor:
+                        pending_turns.append({
+                            'turn_request_id': turn_request_id,
+                            'conversation_id': exchange.get('conversation_id'),
+                            'prompt_id': anchor,
+                            'since': previous_stop,
+                            'until': timestamp,
+                        })
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now,
+                                              usage_index, digests + [digest],
+                                              pending_turns[-MAX_PENDING_TURNS:])
+            elif still_pending != was_pending:
+                # Nothing new this Stop, but some turns settled; drop just those.
+                record_forwarded_tool_ids(wm_key, set(), None, None, None, None,
+                                          still_pending)
             cleanup_old_logs()
 
         # Output required by Copilot hooks

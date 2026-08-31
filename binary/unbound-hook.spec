@@ -38,7 +38,7 @@ VENDORED = [
 HIDDEN = [
     "base64", "collections", "ctypes", "datetime", "hashlib", "json",
     "pathlib", "pickle", "platform", "pwd", "re", "shutil", "socket",
-    "sqlite3", "stat", "subprocess", "tempfile", "time", "tomllib", "typing",
+    "sqlite3", "stat", "subprocess", "tempfile", "time", "tomllib", "typing", "uuid",
     "urllib", "urllib.request", "urllib.error", "importlib.util",
 ]
 
