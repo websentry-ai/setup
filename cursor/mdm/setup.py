@@ -32,7 +32,7 @@ if platform.system().lower() == "windows":
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
-MDM_RETRY_JITTER_SECONDS = 10  # spreads a fleet-wide MDM push so retries do not re-synchronise
+MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not re-synchronise
 
 
 def normalize_url(value: str) -> str:

@@ -21,7 +21,7 @@ except ImportError:
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/augment/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
-MDM_RETRY_JITTER_SECONDS = 10  # spreads a fleet-wide MDM push so retries do not re-synchronise
+MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not re-synchronise
 
 
 # --- Augment settings blocks (mirrors augment/hooks/setup.py) ----------------

@@ -20,7 +20,7 @@ except ImportError:
 DEBUG = False
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
-MDM_RETRY_JITTER_SECONDS = 10  # spreads a fleet-wide MDM push so retries do not re-synchronise
+MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not re-synchronise
 
 BACKFILL_CHUNK_BYTES = 14 * 1024 * 1024
 BACKFILL_TOOL_TYPE = "claude-code"
