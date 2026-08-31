@@ -1440,6 +1440,10 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
                 # cutoff, or we'd permanently skip its history on the next run.
                 continue
             user_sessions, capped, home_forced = result
+            # One upload covers every profile, so force is asserted for all of them once
+            # any profile is behind. It only widens what the server re-examines: filling a
+            # row still requires that row to carry the server-written backfill marker, so a
+            # profile that was not behind can only no-op.
             any_forced = any_forced or home_forced
             if user_sessions:
                 debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
