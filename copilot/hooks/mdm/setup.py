@@ -1214,7 +1214,9 @@ def _backfill_force_epoch(api_key: str, backend_url: str) -> Optional[float]:
     by itself once each device has acted on it -- nobody has to switch it back off."""
     try:
         code, body = _backfill_http_request(
-            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/config/",
+            # tool_type is a metrics label only; the request itself is org-wide.
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/config/"
+            f"?tool_type={BACKFILL_TOOL_TYPE}",
             method='GET',
             headers=_backfill_edr_headers({'Authorization': f'Bearer {api_key}'}),
             timeout=15,
