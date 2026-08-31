@@ -321,7 +321,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(pretool["metadata"]["mcp_tool"], "search_code")
         self.assertNotIn("mcp_server_config", pretool["metadata"])
 
-    def test_unknown_fingerprint_dispatches_targeted_scan(self):
+    def test_unknown_server_dispatches_targeted_scan(self):
         event = {
             "hook_event_name": "PreToolUse",
             "tool_name": "mcp_markitdown_convert_to_markdown",
@@ -340,7 +340,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(dispatch.call_args.args[0], "microsoft/markitdown")
         self.assertEqual(dispatch.call_args.args[1]["command"], "uvx")
 
-    def test_denied_unknown_fingerprint_dispatches_targeted_scan(self):
+    def test_denied_unknown_server_dispatches_targeted_scan(self):
         event = {
             "hook_event_name": "PreToolUse",
             "tool_name": "mcp_markitdown_convert_to_markdown",

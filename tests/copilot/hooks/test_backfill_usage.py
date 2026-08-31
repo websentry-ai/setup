@@ -253,7 +253,7 @@ class TestBackfillPayload(unittest.TestCase):
                 return {"github": {"command": "github-mcp-server"}}
 
             @staticmethod
-            def map_copilot_tool(name, args, result, mcp_servers=None):
+            def map_copilot_tool(name, args, result, **_kwargs):
                 if name == "github-get_issue":
                     return {
                         "type": "afterMCPExecution",
@@ -298,7 +298,7 @@ class TestBackfillPayload(unittest.TestCase):
                 return {}
 
             @staticmethod
-            def map_copilot_tool(name, args, result, mcp_servers=None):
+            def map_copilot_tool(name, args, result, **_kwargs):
                 return None
 
         entries = [

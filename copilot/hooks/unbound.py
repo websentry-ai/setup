@@ -1755,9 +1755,9 @@ def _vscode_server_aliases(server_name):
 def _resolve_vscode_mcp(raw_tool, mcp_servers):
     """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
     tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
-    If a *different* server also matches and can't be proven to be the same server
-    (identical fingerprint config), the token is ambiguous -> unresolved (don't
-    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
+    If a different server also matches and has a different resolved config, the
+    token is ambiguous and remains unresolved. Duplicate keys with the same config
+    still resolve."""
     raw_lower = raw_tool.lower()
     if not raw_lower.startswith('mcp_') or raw_lower.startswith('mcp__'):
         return (None, None, None)

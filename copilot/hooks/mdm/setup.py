@@ -861,17 +861,11 @@ def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, An
                     arguments = normalizer(arguments)
                 elif not isinstance(arguments, dict):
                     arguments = {}
-                explicit_server = request.get("mcpServerName")
-                explicit_tool = request.get("mcpToolName")
-                if isinstance(explicit_server, str) and isinstance(explicit_tool, str):
-                    mapped = hook.map_copilot_tool(
-                        tool_name, arguments, "", mcp_servers=mcp_servers,
-                        mcp_server_name=explicit_server, mcp_tool_name=explicit_tool,
-                    )
-                else:
-                    mapped = hook.map_copilot_tool(
-                        tool_name, arguments, "", mcp_servers=mcp_servers
-                    )
+                mapped = hook.map_copilot_tool(
+                    tool_name, arguments, "", mcp_servers=mcp_servers,
+                    mcp_server_name=request.get("mcpServerName"),
+                    mcp_tool_name=request.get("mcpToolName"),
+                )
                 if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
                     continue
                 server_name = mapped.get("server_name")
