@@ -622,9 +622,7 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
                 },
             }))
 
-            with patch.object(unbound.Path, "home", return_value=home), patch.dict(
-                unbound.os.environ, {"COPILOT_HOME": str(home / ".copilot")}
-            ):
+            with patch.object(unbound.Path, "home", return_value=home):
                 servers = unbound.read_copilot_mcp_servers(str(nested))
 
         self.assertEqual(servers["github"]["command"], "npx")
@@ -639,9 +637,7 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
                 "linear": {"type": "http", "url": "https://mcp.linear.app/mcp"},
             }))
 
-            with patch.object(unbound.Path, "home", return_value=home), patch.dict(
-                unbound.os.environ, {"COPILOT_HOME": str(home / ".copilot")}
-            ):
+            with patch.object(unbound.Path, "home", return_value=home):
                 servers = unbound.read_copilot_mcp_servers(str(repo))
 
         self.assertEqual(servers["linear"]["url"], "https://mcp.linear.app/mcp")
@@ -661,9 +657,7 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
                 "mcpServers": {"github": {"command": "nested-server"}},
             }))
 
-            with patch.object(unbound.Path, "home", return_value=home), patch.dict(
-                unbound.os.environ, {"COPILOT_HOME": str(home / ".copilot")}
-            ):
+            with patch.object(unbound.Path, "home", return_value=home):
                 servers = unbound.read_copilot_mcp_servers(str(nested))
 
         self.assertEqual(servers["github"]["command"], "nested-server")
@@ -687,9 +681,7 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
                 },
             }))
 
-            with patch.object(unbound.Path, "home", return_value=home), patch.dict(
-                unbound.os.environ, {"COPILOT_HOME": str(home / ".copilot")}
-            ):
+            with patch.object(unbound.Path, "home", return_value=home):
                 servers = unbound.read_copilot_mcp_servers(str(repo))
 
         self.assertEqual(servers["portable"]["command"], "loaded")
@@ -706,29 +698,10 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
                 "servers": {"context7": {"command": "npx", "args": ["context7-mcp"]}},
             }))
 
-            with patch.object(unbound.Path, "home", return_value=home), patch.dict(
-                unbound.os.environ, {"COPILOT_HOME": str(home / ".copilot")}
-            ):
+            with patch.object(unbound.Path, "home", return_value=home):
                 servers = unbound.read_copilot_mcp_servers(str(repo))
 
         self.assertEqual(servers["context7"]["args"], ["context7-mcp"])
-
-    def test_copilot_home_config_is_read(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            home = Path(tmpdir) / "home"
-            copilot_home = Path(tmpdir) / "isolated-copilot"
-            copilot_home.mkdir()
-            (copilot_home / "mcp-config.json").write_text(json.dumps({
-                "mcpServers": {"github": {"command": "copilot-home-server"}},
-            }))
-
-            with patch.object(unbound.Path, "home", return_value=home), patch.dict(
-                unbound.os.environ, {"COPILOT_HOME": str(copilot_home)}
-            ):
-                servers = unbound.read_copilot_mcp_servers(None)
-
-        self.assertEqual(servers["github"]["command"], "copilot-home-server")
-
 
 if __name__ == "__main__":
     unittest.main()

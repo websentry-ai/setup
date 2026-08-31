@@ -66,24 +66,12 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-# Only aliases mapped to existing analytics types. Other native tools are skipped.
-SHELL_TOOLS = {
-    'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal',
-    'terminal', 'send_to_terminal',
-}
-READ_TOOLS = {
-    'read_file', 'readFile', 'view', 'cat', 'list_dir', 'listDirectory',
-    'read_project_structure', 'read_notebook_cell_output',
-    'get_notebook_summary', 'copilot_getNotebookSummary', 'view_image',
-}
-WRITE_TOOLS = {
-    'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file',
-    'create_directory',
-}
+SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+READ_TOOLS = {'read_file', 'readFile', 'view', 'cat'}
+WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
 EDIT_TOOLS = {
-    'str_replace', 'edit', 'edit_file', 'editFile', 'edit_files', 'apply_patch',
-    'insert_edit', 'insert_edit_into_file', 'replace_string_in_file',
-    'multi_replace_string_in_file', 'edit_notebook_file',
+    'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit',
+    'replace_string_in_file',
 }
 
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
@@ -814,13 +802,6 @@ def _vscode_user_dirs():
 
 # Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
 # into mcp.json, so scan them. Not capped — a dropped config would fail open.
-def _copilot_home(home=None):
-    configured = os.environ.get("COPILOT_HOME")
-    if configured:
-        return Path(configured).expanduser()
-    return (home or Path.home()) / ".copilot"
-
-
 def _plugin_mcp_config_paths(home):
     paths = []
     for user_dir in _vscode_user_dirs():
@@ -829,7 +810,7 @@ def _plugin_mcp_config_paths(home):
         except OSError:
             pass
     try:
-        paths.extend(sorted((_copilot_home(home) / "installed-plugins").glob("*/.mcp.json")))
+        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
     except OSError:
         pass
     return paths
@@ -879,7 +860,7 @@ def _copilot_mcp_config_paths(cwd=None, plugins=None):
         except OSError:
             pass
     user.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
-    user.append(_copilot_home(home) / "mcp-config.json")
+    user.append(home / ".copilot" / "mcp-config.json")
 
     if plugins is None:
         plugins = _plugin_mcp_config_paths(home)

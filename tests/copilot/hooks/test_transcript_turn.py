@@ -48,7 +48,7 @@ def _user_text(exchange):
 
 
 class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
-    def test_powershell_is_not_reported_as_mcp(self):
+    def test_powershell_is_not_emitted(self):
         path = _transcript([
             _entry("user.message", _id="u1", content="check it"),
             _entry("tool.execution_start", toolCallId="call-a", toolName="powershell",
@@ -61,9 +61,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
             path, SESSION)
 
-        tool_use = exchange["messages"][1]["tool_use"]
-        self.assertEqual(tool_use[0]["type"], "afterShellExecution")
-        self.assertEqual(tool_use[0]["command"], "Get-ChildItem")
+        self.assertNotIn("tool_use", exchange["messages"][1])
 
     def test_write_powershell_is_not_emitted(self):
         path = _transcript([
@@ -145,17 +143,17 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
 
         self.assertIsNone(mapped)
 
-    def test_existing_native_aliases_keep_their_analytics_types(self):
+    def test_unsupported_native_aliases_are_not_emitted(self):
         cases = (
-            ('send_to_terminal', {'command': 'pwd'}, 'afterShellExecution'),
-            ('read_project_structure', {'path': '/repo'}, 'beforeReadFile'),
-            ('create_directory', {'path': '/repo/new'}, 'afterFileEdit'),
-            ('insert_edit_into_file', {'path': '/repo/a.py'}, 'afterFileEdit'),
+            ('send_to_terminal', {'command': 'pwd'}),
+            ('read_project_structure', {'path': '/repo'}),
+            ('list_dir', {'path': '/repo'}),
+            ('create_directory', {'path': '/repo/new'}),
+            ('insert_edit_into_file', {'path': '/repo/a.py'}),
         )
-        for name, arguments, expected_type in cases:
+        for name, arguments in cases:
             with self.subTest(name=name):
-                mapped = unbound.map_copilot_tool(name, arguments, 'ok')
-                self.assertEqual(mapped['type'], expected_type)
+                self.assertIsNone(unbound.map_copilot_tool(name, arguments, 'ok'))
 
     def test_unmapped_native_tool_is_not_emitted(self):
         mapped = unbound.map_copilot_tool(

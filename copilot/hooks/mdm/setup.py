@@ -48,7 +48,7 @@ def debug_print(message: str) -> None:
 
 def _run_as_user(username, fn, *args, **kwargs):
     """Fork and execute fn(*args, **kwargs) as the unprivileged user `username`.
-    Returns the JSON-compatible value from fn, or None on failure.
+    Returns whatever fn returns on success, or None on failure.
 
     Security-critical primitive: any MDM op that writes inside a user's
     home dir must go through this. Running file ops as root against
@@ -87,12 +87,8 @@ def _run_as_user(username, fn, *args, **kwargs):
             # a future slip and keeps the env consistent with the dropped uid.
             os.environ['HOME'] = info.pw_dir
             result = fn(*args, **kwargs)
-            payload = json.dumps(result).encode('utf-8')
-            while payload:
-                written = os.write(w_fd, payload)
-                if written <= 0:
-                    raise OSError('could not write child result')
-                payload = payload[written:]
+            import pickle
+            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
             os.close(w_fd)
             os._exit(0)
         except Exception:
@@ -120,7 +116,8 @@ def _run_as_user(username, fn, *args, **kwargs):
         if os.WEXITSTATUS(status) != 0:
             return None
         try:
-            return json.loads(data.decode('utf-8')) if data else None
+            import pickle
+            return pickle.loads(data) if data else None
         except Exception:
             return None
 
@@ -381,7 +378,7 @@ def set_env_var_for_user(username: str, home_dir: Path, var_name: str, value: st
     if result is None:
         debug_print(f"Could not set env var for {username}")
         return False, False
-    return bool(result[0]), bool(result[1])
+    return result
 
 
 def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:

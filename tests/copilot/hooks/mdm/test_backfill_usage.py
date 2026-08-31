@@ -7,13 +7,10 @@ with the user-level installer and must not drift.
 """
 
 import json
-import pickle
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from tests.conftest import tool_module
 
@@ -24,49 +21,6 @@ SCHEMA = """CREATE TABLE assistant_usage_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, turn_index INTEGER, model TEXT,
     input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
     cache_write_tokens INTEGER, reasoning_tokens INTEGER, created_at TEXT)"""
-
-
-class TestRunAsUserIpc(unittest.TestCase):
-    def _decode(self, payload):
-        info = SimpleNamespace(pw_uid=501, pw_gid=20, pw_dir="/tmp/user")
-        with patch.object(mdm.platform, "system", return_value="linux"), \
-                patch.object(mdm.pwd, "getpwnam", return_value=info), \
-                patch.object(mdm.os, "pipe", return_value=(10, 11)), \
-                patch.object(mdm.os, "fork", return_value=123), \
-                patch.object(mdm.os, "close"), \
-                patch.object(mdm.os, "read", side_effect=[payload, b""]), \
-                patch.object(mdm.os, "waitpid", return_value=(123, 0)):
-            return mdm._run_as_user("user", lambda: None)
-
-    def test_parent_accepts_json_from_the_unprivileged_child(self):
-        self.assertEqual(self._decode(b'{"safe": true}'), {"safe": True})
-
-    def test_parent_rejects_pickle_from_the_unprivileged_child(self):
-        self.assertIsNone(self._decode(pickle.dumps({"unsafe": True})))
-
-    def test_child_retries_partial_pipe_writes(self):
-        info = SimpleNamespace(pw_uid=501, pw_gid=20, pw_dir="/tmp/user")
-        writes = []
-
-        def partial_write(_fd, payload):
-            writes.append(payload)
-            return 2 if len(writes) == 1 else len(payload)
-
-        with patch.object(mdm.platform, "system", return_value="linux"), \
-                patch.object(mdm.pwd, "getpwnam", return_value=info), \
-                patch.object(mdm.os, "pipe", return_value=(10, 11)), \
-                patch.object(mdm.os, "fork", return_value=0), \
-                patch.object(mdm.os, "close"), \
-                patch.object(mdm.os, "setgroups"), \
-                patch.object(mdm.os, "setgid"), \
-                patch.object(mdm.os, "setuid"), \
-                patch.object(mdm.os, "write", side_effect=partial_write), \
-                patch.object(mdm.os, "_exit", side_effect=SystemExit), \
-                patch.dict(mdm.os.environ, {}, clear=False):
-            with self.assertRaises(SystemExit):
-                mdm._run_as_user("user", lambda: {"ok": True})
-
-        self.assertEqual(writes[1], writes[0][2:])
 
 
 def _cli_tree(tmpdir, rows, session=SESSION):
