@@ -30,7 +30,7 @@ class TestForceStaysScopedToTheProfilesBehind(unittest.TestCase):
             return len(sessions), 1, 0
 
         with patch.object(mdm, "_run_as_user", _fake_run_as_user), \
-                patch.object(mdm, "_backfill_force_epoch", lambda *a: 1000.0), \
+                patch.object(mdm, "_backfill_force_config", lambda *a: (1000.0, None)), \
                 patch.object(mdm, "_backfill_send_sessions", _fake_send):
             mdm.run_backfill("key", "https://backend", homes)
         return uploads
@@ -87,3 +87,48 @@ class TestForceStaysScopedToTheProfilesBehind(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForceWindow(unittest.TestCase):
+    """How far back a forced re-walk reaches. Without the org's window the walk cannot
+    pass 30 days, so history an earlier backfill had already reached is never revisited."""
+
+    def _forced_cutoff(self, force_days):
+        """The mtime floor a forced collection actually walks from."""
+        seen = {}
+
+        def _capture(home_dir, cutoff_mtime):
+            seen['cutoff'] = cutoff_mtime
+            return iter(())
+
+        with patch.object(mdm, "_backfill_read_cutoff", lambda home: 0.0), \
+                patch.object(mdm, "_backfill_iter_transcripts", _capture):
+            mdm._backfill_collect_sessions(Path("/home/alice"), 1e12, force_days)
+        return seen['cutoff']
+
+    def test_the_window_widens_the_walk(self):
+        import time
+        reach = time.time() - self._forced_cutoff(45)
+        self.assertAlmostEqual(reach / 86400, 45, delta=1)
+
+    def test_no_window_keeps_the_installer_default(self):
+        import time
+        reach = time.time() - self._forced_cutoff(None)
+        self.assertAlmostEqual(reach / 86400, mdm.BACKFILL_MAX_AGE_DAYS, delta=1)
+
+    def test_the_window_reaches_the_profile_collector(self):
+        # It travels through _run_as_user positionally, so a dropped argument is silent.
+        seen = {}
+
+        def _fake_run_as_user(username, fn, *args, **kwargs):
+            # run_backfill also drops privileges to write each profile's cutoff, so the
+            # collector's call is the one to look at, not the last one.
+            if fn is mdm._backfill_collect_sessions:
+                seen['args'] = args
+            return ([], False, False)
+
+        with patch.object(mdm, "_run_as_user", _fake_run_as_user), \
+                patch.object(mdm, "_backfill_force_config", lambda *a: (1000.0, 45)), \
+                patch.object(mdm, "_backfill_send_sessions", lambda *a, **k: (0, 0, 0)):
+            mdm.run_backfill("key", "https://backend", [("alice", Path("/home/alice"))])
+        self.assertEqual(seen['args'][-1], 45, "the window must reach the collector")
