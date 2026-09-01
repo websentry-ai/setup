@@ -7,12 +7,13 @@ exchange. Covers:
   - _backfill_vscode_models   (servedBy over modelId, namespacing, gaps)
   - _backfill_session_models  (VS Code only; the CLI transcript already names its model)
   - _backfill_collect_session / _backfill_slice_session (payload + boundary-aligned slicing)
-  - _backfill_force_epoch     (org-wide re-walk request)
+  - _backfill_force_config    (org-wide re-walk request + its window)
 """
 
 import json
 from datetime import datetime, timezone
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -190,11 +191,14 @@ class TestBackfillModelsPayload(unittest.TestCase):
                              ["m0", "m1", "m2"][base:base + len(part.get("models", []))])
 
 
-class TestBackfillForceEpoch(unittest.TestCase):
-    def _epoch(self, code, payload):
+class TestBackfillForceConfig(unittest.TestCase):
+    def _config(self, code, payload):
         body = json.dumps(payload).encode("utf-8") if payload is not None else b"not json"
         with patch.object(setup, "_backfill_http_request", lambda *a, **k: (code, body)):
-            return setup._backfill_force_epoch("key", "https://backend")
+            return setup._backfill_force_config("key", "https://backend")
+
+    def _epoch(self, code, payload):
+        return self._config(code, payload)[0]
 
     def test_a_requested_time_is_returned(self):
         self.assertEqual(self._epoch(200, {"force_backfill_requested_epoch": 1787893680.5}),
@@ -214,6 +218,69 @@ class TestBackfillForceEpoch(unittest.TestCase):
         self.assertIsNone(self._epoch(0, {"force_backfill_requested_epoch": 1787893680}))
         self.assertIsNone(self._epoch(200, None))
 
+    def test_a_window_rides_with_the_request(self):
+        self.assertEqual(
+            self._config(200, {"force_backfill_requested_epoch": 1787893680,
+                               "force_backfill_days": 45}),
+            (1787893680.0, 45))
+
+    def test_no_window_leaves_the_installer_default(self):
+        # None, not 30: the caller owns the default, so an old backend behaves as before.
+        for payload in ({"force_backfill_requested_epoch": 1787893680},
+                        {"force_backfill_requested_epoch": 1787893680,
+                         "force_backfill_days": None}):
+            self.assertIsNone(self._config(200, payload)[1], payload)
+
+    def test_an_unusable_window_is_ignored(self):
+        # bool is an int subclass; 0 and negatives would reach back to the epoch.
+        for bad in (True, False, 0, -5, "45", 45.5, [45], {"days": 45}):
+            self.assertIsNone(
+                self._config(200, {"force_backfill_requested_epoch": 1787893680,
+                                   "force_backfill_days": bad})[1], bad)
+
+    def test_a_window_without_a_request_is_never_returned(self):
+        self.assertEqual(self._config(200, {"force_backfill_days": 45}), (None, None))
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForceWindow(unittest.TestCase):
+    """How far back a forced re-walk reaches on a user-scope install. Without the org's
+    window it cannot pass 30 days, so history an earlier backfill already reached is
+    dropped and never revisited."""
+
+    def _forced_cutoff(self, force_days, persisted=None):
+        """The mtime floor a forced run actually walks from."""
+        # A device that backfilled yesterday, which is what the window widens.
+        persisted = time.time() - 86400 if persisted is None else persisted
+        seen = {}
+
+        def _capture(cutoff_mtime):
+            seen["cutoff"] = cutoff_mtime
+            return iter(())
+
+        with patch.object(setup, "_copilot_home", lambda: Path("/tmp/nope")), \
+                patch.object(setup, "_backfill_read_cutoff", lambda home: persisted), \
+                patch.object(setup, "_backfill_force_config",
+                             lambda *a: (1e12, force_days)), \
+                patch.object(setup, "_backfill_iter_transcripts", _capture), \
+                patch.object(setup, "_backfill_write_cutoff", lambda *a: None):
+            setup.run_backfill("key", "https://backend")
+        return seen["cutoff"]
+
+    def test_the_window_widens_the_walk(self):
+        reach = time.time() - self._forced_cutoff(45)
+        self.assertAlmostEqual(reach / 86400, 45, delta=1)
+
+    def test_no_window_keeps_the_installer_default(self):
+        reach = time.time() - self._forced_cutoff(None)
+        self.assertAlmostEqual(reach / 86400, setup.BACKFILL_MAX_AGE_DAYS, delta=1)
+
+    def test_a_narrow_window_never_gives_up_ground_already_reached(self):
+        # The run advances the cutoff on success, so anything a narrow window skips is
+        # never visited again. Force may widen the walk; it may not shrink it.
+        sixty_days_ago = time.time() - 60 * 86400
+        cutoff = self._forced_cutoff(10, persisted=sixty_days_ago)
+        self.assertAlmostEqual(cutoff, sixty_days_ago, delta=2)

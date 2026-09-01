@@ -111,3 +111,107 @@ def test_no_installer_hardcodes_a_developer_home(relpath):
             if needle in line and not line.lstrip().startswith("#"):
                 assert '"' not in line.split(needle)[0][-2:], \
                     "%s hardcodes a home: %s" % (relpath, line.strip()[:80])
+
+
+# Installers that walk history. The force request is org-wide on the backend, with no
+# tool in it, so every one of these must ask for it or an admin's request is silently
+# honoured by some tools and ignored by others.
+BACKFILLERS = [s for s in SETUPS if _has(s, "run_backfill")]
+
+
+def test_the_backfiller_inventory_is_not_empty():
+    """Derived by reading source, so a rename would quietly empty this and pass."""
+    assert len(BACKFILLERS) >= 6, BACKFILLERS
+
+
+@pytest.mark.parametrize("relpath", BACKFILLERS)
+def test_every_backfiller_asks_for_the_force_request(relpath):
+    """The backend stores one timestamp for the organization and does not scope it to a
+    tool, so a backfiller that never asks makes the request a lie for that tool."""
+    assert _has(relpath, "_backfill_force_config"), (
+        "%s walks history but never asks whether the org requested a re-walk" % relpath)
+
+
+def test_every_installer_reads_the_force_request_the_same_way():
+    """Six copies of one function. Byte-identical or a fix lands in one tool only."""
+    import ast
+
+    bodies = {}
+    for relpath in BACKFILLERS:
+        tree = ast.parse((REPO / relpath).read_text())
+        fn = next((n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "_backfill_force_config"), None)
+        assert fn is not None, relpath
+        bodies.setdefault(ast.dump(fn), []).append(relpath)
+    assert len(bodies) == 1, "copies have drifted: %s" % list(bodies.values())
+
+
+@pytest.mark.parametrize("relpath", BACKFILLERS)
+class TestEveryForceRequestReader:
+    """Each installer carries its own copy, so a bad copy has to fail on its own."""
+
+    @staticmethod
+    def _read(module, payload, code=200):
+        from unittest.mock import patch
+        body = json.dumps(payload).encode("utf-8")
+        with patch.object(module, "_backfill_http_request", lambda *a, **k: (code, body)):
+            return module._backfill_force_config("key", "https://backend")
+
+    def test_it_reads_a_request_and_its_window(self, relpath):
+        module = load_module(relpath)
+        assert self._read(module, {"force_backfill_requested_epoch": 1787893680,
+                                   "force_backfill_days": 45}) == (1787893680.0, 45)
+
+    def test_no_request_means_no_window(self, relpath):
+        module = load_module(relpath)
+        assert self._read(module, {}) == (None, None)
+        assert self._read(module, {"force_backfill_days": 45}) == (None, None)
+
+    def test_an_unusable_window_falls_back_to_the_installer_default(self, relpath):
+        # None, not 30: the caller owns the default. bool is an int subclass, and 0 or a
+        # negative would reach back to the epoch.
+        module = load_module(relpath)
+        for bad in (True, False, 0, -5, "45", 45.5, [45], {"d": 45}):
+            assert self._read(module, {"force_backfill_requested_epoch": 1787893680,
+                                       "force_backfill_days": bad})[1] is None, bad
+
+    def test_a_failed_call_never_forces(self, relpath):
+        module = load_module(relpath)
+        assert self._read(module, {"force_backfill_requested_epoch": 1787893680},
+                          code=500) == (None, None)
+
+
+MDM_BACKFILLERS = [s for s in BACKFILLERS if "/mdm/" in s]
+
+
+class TestCollectorShapeMatchesEveryUnpacker:
+    """The managed collector is unpacked by the installer AND by the packaged
+    `unbound-hook backfill --dry-run`. Both must agree on how many values it
+    returns, or the odd one out raises ValueError at runtime."""
+
+    @staticmethod
+    def _return_arities(path, fn_name):
+        import ast
+        tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        return {len(n.value.elts) if isinstance(n.value, ast.Tuple) else 1
+                for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None}
+
+    @pytest.mark.parametrize("relpath", MDM_BACKFILLERS)
+    def test_every_exit_returns_the_same_number_of_values(self, relpath):
+        # An early return that is one value short is invisible until a device hits
+        # exactly that path, and its ValueError aborts the whole run.
+        arities = self._return_arities(relpath, "_backfill_collect_sessions")
+        assert arities == {3}, f"{relpath}: mixed arities {sorted(arities)}"
+
+    def test_the_packaged_dry_run_unpacks_what_the_collectors_return(self):
+        import ast
+        path = "binary/src/unbound_hook/backfill_cmd.py"
+        src = (REPO / path).read_text(encoding="utf-8")
+        targets = [n.targets[0] for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
+                   and isinstance(n.value, ast.Name) and n.value.id == "result"]
+        assert targets, f"{path}: no `<tuple> = result` unpack found — did it get renamed?"
+        for t in targets:
+            assert len(t.elts) == 3, f"{path}: unpacks {len(t.elts)}, collectors return 3"
