@@ -7,6 +7,7 @@ a profile that is not behind must never ride an upload asserting force, or that
 profile's settled sessions get reopened.
 """
 
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -93,26 +94,26 @@ class TestForceWindow(unittest.TestCase):
     """How far back a forced re-walk reaches. Without the org's window the walk cannot
     pass 30 days, so history an earlier backfill had already reached is never revisited."""
 
-    def _forced_cutoff(self, force_days):
+    def _forced_cutoff(self, force_days, persisted=None):
         """The mtime floor a forced collection actually walks from."""
+        # A device that backfilled yesterday, which is what the window widens.
+        persisted = time.time() - 86400 if persisted is None else persisted
         seen = {}
 
         def _capture(home_dir, cutoff_mtime):
             seen['cutoff'] = cutoff_mtime
             return iter(())
 
-        with patch.object(mdm, "_backfill_read_cutoff", lambda home: 0.0), \
+        with patch.object(mdm, "_backfill_read_cutoff", lambda home: persisted), \
                 patch.object(mdm, "_backfill_iter_transcripts", _capture):
             mdm._backfill_collect_sessions(Path("/home/alice"), 1e12, force_days)
         return seen['cutoff']
 
     def test_the_window_widens_the_walk(self):
-        import time
         reach = time.time() - self._forced_cutoff(45)
         self.assertAlmostEqual(reach / 86400, 45, delta=1)
 
     def test_no_window_keeps_the_installer_default(self):
-        import time
         reach = time.time() - self._forced_cutoff(None)
         self.assertAlmostEqual(reach / 86400, mdm.BACKFILL_MAX_AGE_DAYS, delta=1)
 
@@ -132,3 +133,11 @@ class TestForceWindow(unittest.TestCase):
                 patch.object(mdm, "_backfill_send_sessions", lambda *a, **k: (0, 0, 0)):
             mdm.run_backfill("key", "https://backend", [("alice", Path("/home/alice"))])
         self.assertEqual(seen['args'][-1], 45, "the window must reach the collector")
+
+
+    def test_a_narrow_window_never_gives_up_ground_already_reached(self):
+        # The run advances the cutoff on success, so anything a narrow window skips is
+        # never visited again. Force may widen the walk; it may not shrink it.
+        sixty_days_ago = time.time() - 60 * 86400
+        cutoff = self._forced_cutoff(10, persisted=sixty_days_ago)
+        self.assertAlmostEqual(cutoff, sixty_days_ago, delta=2)

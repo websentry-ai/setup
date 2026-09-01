@@ -251,8 +251,10 @@ class TestForceWindow(unittest.TestCase):
     window it cannot pass 30 days, so history an earlier backfill already reached is
     dropped and never revisited."""
 
-    def _forced_cutoff(self, force_days):
+    def _forced_cutoff(self, force_days, persisted=None):
         """The mtime floor a forced run actually walks from."""
+        # A device that backfilled yesterday, which is what the window widens.
+        persisted = time.time() - 86400 if persisted is None else persisted
         seen = {}
 
         def _capture(cutoff_mtime):
@@ -260,7 +262,7 @@ class TestForceWindow(unittest.TestCase):
             return iter(())
 
         with patch.object(setup, "_copilot_home", lambda: Path("/tmp/nope")), \
-                patch.object(setup, "_backfill_read_cutoff", lambda home: 0.0), \
+                patch.object(setup, "_backfill_read_cutoff", lambda home: persisted), \
                 patch.object(setup, "_backfill_force_config",
                              lambda *a: (1e12, force_days)), \
                 patch.object(setup, "_backfill_iter_transcripts", _capture), \
@@ -275,3 +277,10 @@ class TestForceWindow(unittest.TestCase):
     def test_no_window_keeps_the_installer_default(self):
         reach = time.time() - self._forced_cutoff(None)
         self.assertAlmostEqual(reach / 86400, setup.BACKFILL_MAX_AGE_DAYS, delta=1)
+
+    def test_a_narrow_window_never_gives_up_ground_already_reached(self):
+        # The run advances the cutoff on success, so anything a narrow window skips is
+        # never visited again. Force may widen the walk; it may not shrink it.
+        sixty_days_ago = time.time() - 60 * 86400
+        cutoff = self._forced_cutoff(10, persisted=sixty_days_ago)
+        self.assertAlmostEqual(cutoff, sixty_days_ago, delta=2)

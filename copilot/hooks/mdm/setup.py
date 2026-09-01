@@ -1336,9 +1336,11 @@ def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
         forced = force_epoch is not None and force_epoch > cutoff_mtime
         if forced:
             # The organization's window when it set one, otherwise this installer's own
-            # default. Without this a re-walk could not reach past 30 days, so history an
-            # earlier backfill had already reached would be dropped and never revisited.
-            cutoff_mtime = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            # default. Widen only: a window narrower than what this device had already
+            # reached would skip the band in between, and the successful run then advances
+            # the cutoff past it, so that history is never visited again.
+            window = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            cutoff_mtime = min(cutoff_mtime, window)
         sessions = []
         capped = False
         for transcript_path in sorted(_backfill_iter_transcripts(home_dir, cutoff_mtime)):

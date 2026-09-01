@@ -1430,9 +1430,11 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         forced = force_epoch is not None and force_epoch > cutoff_mtime
         if forced:
             # The organization's window when it set one, otherwise this installer's own
-            # default. Without this a re-walk could not reach past 30 days, so history an
-            # earlier backfill had already reached would be dropped and never revisited.
-            cutoff_mtime = started_at - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            # default. Widen only: a window narrower than what this device had already
+            # reached would skip the band in between, and the successful run then advances
+            # the cutoff past it, so that history is never visited again.
+            window = started_at - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            cutoff_mtime = min(cutoff_mtime, window)
             print("[backfill] Re-reading full history at your organization's request.")
         sessions: List[Dict] = []
         capped = False
