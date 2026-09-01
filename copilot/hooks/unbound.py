@@ -9,7 +9,7 @@ import json
 import os
 import platform
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
 import tempfile
 import time
@@ -39,7 +39,9 @@ DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 APPROVAL_POLL_PHASES = (
@@ -71,7 +73,7 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+SHELL_TOOLS = {'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal', 'terminal'}
 READ_TOOLS = {'read_file', 'readFile', 'view', 'cat'}
 WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
 EDIT_TOOLS = {
@@ -3275,12 +3277,16 @@ def _vscode_turn_model(transcript_path, conversation_id, previous_stop, turn_end
     return None
 
 
-def _vscode_turn_usage(transcript_path, conversation_id, start_index):
+def _vscode_turn_usage(transcript_path, conversation_id, start_index, since=None, until=None):
     """Usage for requests from start_index on, stopping at the first whose tokens are not
     written yet. VS Code fills them in after Stop fires, and the lead grows with turn
     length, so an unfinished request is left for a later Stop rather than skipped. Returns
     (usage, next index to report, whether a request is still being written at that index).
-    No cache split is reported."""
+    No cache split is reported.
+
+    Position alone does not say which turn a request belongs to: one that settles after its
+    own turn's Stop is still unread at the next one, so `since`/`until` decide what this
+    turn may count."""
     path = _vscode_store_path(transcript_path, conversation_id)
     if not path:
         return None, start_index, False
@@ -3289,6 +3295,7 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
         return None, start_index, False
     totals = dict((field, 0) for field in _USAGE_FIELDS)
     index = max(int(start_index or 0), 0)
+    lo, hi = _epoch(since), _epoch(until)
     # Guarded: a non-numeric count in the journal would otherwise raise past the Stop
     # handler and drop the whole exchange, not just its usage.
     try:
@@ -3299,8 +3306,17 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
             # that they have stopped climbing; the counts themselves appear mid-stream.
             if prompt is None or completion is None or entry.get('elapsedMs') is None:
                 break
-            totals['input_tokens'] += max(int(prompt), 0)
-            totals['output_tokens'] += max(int(completion), 0)
+            created = _epoch(entry.get('timestamp'))
+            # Past this turn's close the requests belong to turns not yet reported, so the
+            # watermark stops here. Nothing is pending: what remains is a later turn's work,
+            # not this one's, and waiting on it would stall the hook for the settle window.
+            if hi is not None and created is not None and created > hi:
+                return totals, index, False
+            # An earlier turn's late request is read here but not counted here; it is left
+            # to that turn's own windowed completion. The index still advances past it.
+            if hi is None or _in_window(created, lo, hi):
+                totals['input_tokens'] += max(int(prompt), 0)
+                totals['output_tokens'] += max(int(completion), 0)
             index += 1
     except (TypeError, ValueError) as e:
         log_error('vscode usage totals failed: %s' % e, 'usage')
@@ -3401,7 +3417,7 @@ def _vscode_store_stamp(path):
         return None
 
 
-def _vscode_settled_usage(transcript_path, conversation_id, start_index):
+def _vscode_settled_usage(transcript_path, conversation_id, start_index, since=None, until=None):
     """Wait for this turn to finish being written. Stop fires before the response ends, so
     a first read usually has nothing to report. Giving up is safe: the watermark does not
     advance, so a later Stop reports the turn instead.
@@ -3409,7 +3425,7 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index):
     A turn being completed after the fact does not come through here at all; it reads by
     its own window, because by then every later turn has settled too."""
     usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
-                                                    start_index)
+                                                    start_index, since, until)
     # Wait only while a request is mid-write. With nothing pending there is nothing to wait
     # for, and blocking every quiet Stop for the full window would be pure cost.
     if usage is None or next_index > start_index or not pending:
@@ -3426,7 +3442,7 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index):
             continue
         stamp = current
         usage, next_index, _pending = _vscode_turn_usage(transcript_path, conversation_id,
-                                                         start_index)
+                                                         start_index, since, until)
         if usage is None or next_index > start_index:
             break
     return usage, next_index
@@ -3446,7 +3462,7 @@ def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, us
         next_index = usage_index
     else:
         usage, next_index = _vscode_settled_usage(transcript_path, conversation_id,
-                                                  usage_index)
+                                                  usage_index, previous_stop, turn_end)
     if not usage or not any(usage.values()):
         return None, next_index
     usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
@@ -3891,27 +3907,64 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _ensure_discovery_installer():
-    if DISCOVERY_INSTALL_SH.exists():
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _discovery_installer():
+    if _is_windows():
+        return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
+    return DISCOVERY_INSTALL_SH, DISCOVERY_INSTALL_URL
+
+
+def _windows_system32_path(*parts: str) -> str:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise OSError("SystemRoot is not set")
+    root = PureWindowsPath(system_root)
+    if not root.is_absolute():
+        raise OSError("SystemRoot is not absolute")
+    return str(root.joinpath("System32", *parts))
+
+
+def _discovery_command(installer_path: Path, backend_url: str):
+    if _is_windows():
+        return [
+            _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+            "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+        ]
+    return ["bash", str(installer_path), "--domain", backend_url]
+
+
+def _ensure_discovery_installer(
+    installer_path=None,
+    installer_url=None,
+):
+    installer_path = installer_path or DISCOVERY_INSTALL_SH
+    installer_url = installer_url or DISCOVERY_INSTALL_URL
+    if installer_path.exists():
         return True
     DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
     fd, temporary_path = tempfile.mkstemp(dir=str(DISCOVERY_INSTALL_DIR), suffix='.tmp')
     os.close(fd)
     try:
+        curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
         result = subprocess.run(
-            ["curl", "-fsSL", "-o", temporary_path, DISCOVERY_INSTALL_URL],
+            [curl, "-fsSL", "-o", temporary_path, installer_url],
             capture_output=True,
             timeout=30,
         )
         if result.returncode != 0:
             log_error(
-                "discovery install.sh download failed: "
+                f"discovery {installer_path.name} download failed: "
                 + result.stderr.decode(errors='replace')[:200],
                 'discovery_gate',
             )
             return False
-        os.chmod(temporary_path, 0o755)
-        os.replace(temporary_path, DISCOVERY_INSTALL_SH)
+        if installer_path == DISCOVERY_INSTALL_SH:
+            os.chmod(temporary_path, 0o755)
+        os.replace(temporary_path, installer_path)
         return True
     finally:
         try:
@@ -3994,14 +4047,16 @@ def _dispatch_discovery() -> None:
                     return
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
-                if not _ensure_discovery_installer():
+                installer_path, installer_url = _discovery_installer()
+                if not _ensure_discovery_installer(installer_path, installer_url):
                     return
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                discovery_cmd = _discovery_command(installer_path, backend_url)
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DOMAIN": backend_url}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:

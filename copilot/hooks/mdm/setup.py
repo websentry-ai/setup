@@ -11,6 +11,7 @@ import subprocess
 import json
 import types
 import sqlite3
+from datetime import datetime
 import tempfile
 from pathlib import Path
 from typing import Any, Tuple, List, Optional, Dict
@@ -908,7 +909,7 @@ def _backfill_collect_session(
                 entries.append(entry)
                 if not session_id and isinstance(entry, dict):
                     if entry.get('type') == 'session.start':
-                        sid = (entry.get('data') or {}).get('sessionId')
+                        sid = _backfill_entry_data(entry).get('sessionId')
                         if sid:
                             session_id = sid
     except (OSError, UnicodeDecodeError):
@@ -925,10 +926,12 @@ def _backfill_collect_session(
     mcp_tool_provenance = _backfill_mcp_tool_provenance(entries, home_dir)
     if mcp_tool_provenance:
         session['mcp_tool_provenance'] = mcp_tool_provenance
-    usage = _backfill_session_usage(transcript_path, session_id)
-    if usage:
+    usage = _backfill_session_usage(transcript_path, session_id, entries)
+    # any(), not truthiness: every turn now gets a slot, and a list of empty ones says
+    # nothing the backend cannot work out itself.
+    if any(usage):
         session['usage'] = usage
-    models = _backfill_session_models(transcript_path, session_id)
+    models = _backfill_session_models(transcript_path, session_id, entries)
     if any(models):
         session['models'] = models
     return session
@@ -1052,7 +1055,8 @@ def _backfill_vscode_requests(store: Path) -> Dict:
         if not isinstance(obj, dict):
             return
         entry = requests.setdefault(index, {})
-        for field in ('promptTokens', 'completionTokens', 'elapsedMs', 'servedBy', 'modelId'):
+        for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs',
+                      'servedBy', 'modelId'):
             if obj.get(field) is not None:
                 entry[field] = obj[field]
 
@@ -1089,34 +1093,99 @@ def _backfill_vscode_requests(store: Path) -> Dict:
     return requests
 
 
-def _backfill_vscode_usage(transcript_path: Path, session_id: str) -> List[Dict]:
-    """Per-request usage from VS Code's own chat store. elapsedMs is written after the
-    final counts, so it is what marks a request finished; the counts alone appear
-    mid-stream and climb. No cache split."""
+def _backfill_epoch(value):
+    """Journal stamps are epoch millis, transcript stamps are ISO with a Z or an offset."""
+    if value is None or value == '' or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > 10_000_000_000 else float(value)
+    try:
+        # A stamp without an offset takes the platform path, which raises OSError on
+        # Windows for pre-epoch dates; naming it keeps an odd transcript from aborting a run.
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _backfill_turn_ceilings(entries: List[Dict]) -> List[float]:
+    """Close of each turn, counted the way the backend counts them: one per user.message it
+    accepts. Turns are divided at their close, not their start, because VS Code stamps a
+    request when it is created, fractionally BEFORE the prompt reaches the transcript.
+    Dividing on prompts would hand every request to the turn before it."""
+    starts = [index for index, entry in enumerate(entries)
+              if _backfill_is_user_message(entry)]
+    ceilings: List[float] = []
+    previous = float('-inf')
+    for position, start in enumerate(starts):
+        if position + 1 >= len(starts):
+            ceilings.append(float('inf'))
+            continue
+        latest = None
+        for entry in entries[start:starts[position + 1]]:
+            stamp = _backfill_epoch(entry.get('timestamp')) if isinstance(entry, dict) else None
+            if stamp is not None and (latest is None or stamp > latest):
+                latest = stamp
+        # An undated turn closes where the last one did, so it claims nothing rather than
+        # swallowing its neighbours. Never earlier than the turn before it: the scan below
+        # takes the first ceiling a request fits under, which needs them non-decreasing.
+        latest = previous if latest is None else max(latest, previous)
+        ceilings.append(latest)
+        previous = latest
+    return ceilings
+
+
+def _backfill_requests_by_turn(requests: Dict, ceilings: List[float]) -> Dict:
+    """Journal requests grouped by the turn whose window they ran in. An undated request
+    belongs to no turn: better an estimate than someone else's tokens."""
+    by_turn: Dict = {}
+    for index in sorted(requests):
+        entry = requests[index]
+        stamp = _backfill_epoch(entry.get('timestamp'))
+        if stamp is None:
+            continue
+        for turn, ceiling in enumerate(ceilings):
+            if stamp <= ceiling:
+                by_turn.setdefault(turn, []).append(entry)
+                break
+    return by_turn
+
+
+def _backfill_vscode_usage(transcript_path: Path, session_id: str,
+                           entries: List[Dict]) -> List[Dict]:
+    """Per-turn usage from VS Code's own chat store, one entry per turn the backend counts.
+    elapsedMs is written after the final counts, so it is what marks a request finished; the
+    counts alone appear mid-stream and climb. A turn with nothing finished reports {} and is
+    estimated. No cache split."""
     store = _backfill_vscode_store(transcript_path, session_id)
     if store is None:
         return []
-    requests = _backfill_vscode_requests(store)
-    usage = []
-    # Guarded: a non-numeric count in the journal would otherwise raise out of the collector
-    # and abort the whole backfill run.
+    usage: List[Dict] = []
+    # Guarded: a non-numeric count or an unreadable stamp in the journal would otherwise
+    # raise out of the collector and abort the whole backfill run, not just this session.
     try:
-        for index in sorted(requests):
-            entry = requests[index]
-            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
-            if prompt is None or completion is None or entry.get('elapsedMs') is None:
-                break
+        ceilings = _backfill_turn_ceilings(entries)
+        if not ceilings:
+            return []
+        by_turn = _backfill_requests_by_turn(_backfill_vscode_requests(store), ceilings)
+        for turn in range(len(ceilings)):
             totals = dict((f, 0) for f in _BACKFILL_USAGE_FIELDS)
-            totals['input_tokens'] = max(int(prompt), 0)
-            totals['output_tokens'] = max(int(completion), 0)
-            usage.append(totals)
-    except (TypeError, ValueError) as e:
+            counted = False
+            for entry in by_turn.get(turn, []):
+                prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+                if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                    continue
+                totals['input_tokens'] += max(int(prompt), 0)
+                totals['output_tokens'] += max(int(completion), 0)
+                counted = True
+            usage.append(totals if counted else {})
+    except (TypeError, ValueError, OSError, OverflowError) as e:
         debug_print(f"backfill vscode usage totals failed: {e}")
         return []
     return usage
 
 
-def _backfill_vscode_models(transcript_path: Path, session_id: str) -> List[str]:
+def _backfill_vscode_models(transcript_path: Path, session_id: str,
+                            entries: List[Dict]) -> List[str]:
     """Model per request, in journal order. The transcript carries none at all, which is
     why these rows otherwise read 'auto'. Prefer the model that served the request, which
     names the real one behind an 'auto' pick; the selection is there either way. Gaps stay
@@ -1124,38 +1193,50 @@ def _backfill_vscode_models(transcript_path: Path, session_id: str) -> List[str]
     store = _backfill_vscode_store(transcript_path, session_id)
     if store is None:
         return []
-    requests = _backfill_vscode_requests(store)
     models = []
-    for index in sorted(requests):
-        entry = requests[index]
-        served = entry.get('servedBy')
-        if isinstance(served, str) and served:
-            models.append(served)
-            continue
-        selected = entry.get('modelId')
-        if isinstance(selected, str) and selected:
-            # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
-            models.append(selected.split('/', 1)[-1])
-        else:
-            models.append('')
+    # Same guard as the usage collector: a model name is never worth aborting a run for.
+    try:
+        ceilings = _backfill_turn_ceilings(entries)
+        if not ceilings:
+            return []
+        by_turn = _backfill_requests_by_turn(_backfill_vscode_requests(store), ceilings)
+        for turn in range(len(ceilings)):
+            name = ''
+            # The turn's last request, matching the live collector, so a mid-turn model
+            # switch is costed the same whether the row came from a hook or a re-walk.
+            for entry in by_turn.get(turn, [])[-1:]:
+                served = entry.get('servedBy')
+                if isinstance(served, str) and served:
+                    name = served
+                    break
+                selected = entry.get('modelId')
+                if isinstance(selected, str) and selected:
+                    # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
+                    name = selected.split('/', 1)[-1]
+            models.append(name)
+    except (TypeError, ValueError, OSError, OverflowError) as e:
+        debug_print(f"backfill vscode models failed: {e}")
+        return []
     return models
 
 
-def _backfill_session_usage(transcript_path: Path, session_id: str) -> List[Dict]:
+def _backfill_session_usage(transcript_path: Path, session_id: str,
+                            entries: List[Dict]) -> List[Dict]:
     """One usage dict per exchange, in transcript order. Copilot forwards no usage, so
     without this the backend tiktoken-estimates from visible text and misses cache reads,
     tool definitions and system instructions."""
     if transcript_path.stem == 'events':
         return _backfill_cli_usage(transcript_path, session_id)
-    return _backfill_vscode_usage(transcript_path, session_id)
+    return _backfill_vscode_usage(transcript_path, session_id, entries)
 
 
-def _backfill_session_models(transcript_path: Path, session_id: str) -> List[str]:
+def _backfill_session_models(transcript_path: Path, session_id: str,
+                             entries: List[Dict]) -> List[str]:
     """One model name per exchange, in transcript order. Only VS Code needs this: the CLI
     transcript records model_change and per-message models, which the server already reads."""
     if transcript_path.stem == 'events':
         return []
-    return _backfill_vscode_models(transcript_path, session_id)
+    return _backfill_vscode_models(transcript_path, session_id, entries)
 
 
 def _backfill_vscode_workspace_roots(home_dir: Path) -> List[Path]:
@@ -1406,13 +1487,22 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     return True
 
 
+def _backfill_entry_data(entry) -> Dict:
+    """A transcript entry's data object. It is whatever the JSONL held, so a truthy
+    non-dict must never reach .get(): that raises past the collectors and stops every
+    remaining session from being backfilled."""
+    data = entry.get('data') if isinstance(entry, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
 def _backfill_is_user_message(entry) -> bool:
-    # Mirror server-side parse_copilot_session: a new exchange starts on a
-    # user.message with non-empty data.content.
+    # Mirror server-side parse_copilot_session: a new exchange starts on a user.message
+    # whose data.content is a non-blank string. Non-string content starts no exchange
+    # there, so counting one here would shift every later record_index.
     if not isinstance(entry, dict) or entry.get('type') != 'user.message':
         return False
-    content = (entry.get('data') or {}).get('content')
-    return bool(content and str(content).strip())
+    content = _backfill_entry_data(entry).get('content')
+    return isinstance(content, str) and bool(content.strip())
 
 
 def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
@@ -1424,7 +1514,7 @@ def _backfill_tool_call_ids(entries: List[Dict]):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        data = entry.get('data') or {}
+        data = _backfill_entry_data(entry)
         if entry.get('type') == 'assistant.message':
             for request in data.get('toolRequests') or []:
                 if isinstance(request, dict) and isinstance(request.get('toolCallId'), str):
