@@ -362,7 +362,7 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
 
 
 def _copilot_hooks_config(script_path: Path) -> dict:
-    """Build the ~/.copilot/hooks/unbound.json config for the 5 Copilot events.
+    """Build the ~/.copilot/hooks/unbound.json config for Copilot events.
     Copilot delivers hook_event_name in the payload, so no per-event env is needed."""
     # Copilot reads `bash` on Unix, `powershell` on Windows. The Unix script is
     # chmod +x with a python3 shebang, so bash executes it directly. On Windows
@@ -376,6 +376,7 @@ def _copilot_hooks_config(script_path: Path) -> dict:
     event_timeouts = {
         "SessionStart": 30,
         "UserPromptSubmit": 60,
+        "userPromptTransformed": 60,
         "PreToolUse": 600,
         "PostToolUse": 30,
         "Stop": 60,

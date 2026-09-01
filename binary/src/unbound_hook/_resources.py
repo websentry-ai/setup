@@ -42,7 +42,7 @@ TOOL_EVENTS = {
                     "SessionStart", "SessionEnd"),
     "codex": ("PreToolUse", "PostToolUse", "UserPromptSubmit", "Stop",
               "SessionStart"),
-    "copilot": ("SessionStart", "UserPromptSubmit", "PreToolUse",
+    "copilot": ("SessionStart", "UserPromptSubmit", "userPromptTransformed", "PreToolUse",
                 "PostToolUse", "Stop"),
     "augment": ("PreToolUse", "PostToolUse", "Stop", "SessionStart",
                 "SessionEnd"),

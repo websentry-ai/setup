@@ -136,6 +136,7 @@ def test_setup_full_run_configures_everything(env):
     copilot = json.loads((env["home"] / ".copilot" / "hooks" / "unbound.json").read_text())
     assert copilot["version"] == 1
     expected_timeouts = {"SessionStart": 30, "UserPromptSubmit": 60,
+                         "userPromptTransformed": 60,
                          "PreToolUse": 600, "PostToolUse": 30, "Stop": 60}
     assert set(copilot["hooks"]) == set(expected_timeouts)
     for ev, t in expected_timeouts.items():

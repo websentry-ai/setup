@@ -684,7 +684,7 @@ def _write_file(path: Path, data: str, mode: int) -> None:
 
 
 def _copilot_hooks_config(script_path: Path) -> Dict:
-    """Build the ~/.copilot/hooks/unbound.json config for the 5 Copilot events.
+    """Build the ~/.copilot/hooks/unbound.json config for Copilot events.
     Copilot delivers hook_event_name in the payload, so no per-event env is needed."""
     bash_cmd = f'"{script_path}"'
     launcher = "py -3" if shutil.which("py") else "python"
@@ -693,6 +693,7 @@ def _copilot_hooks_config(script_path: Path) -> Dict:
     event_timeouts = {
         "SessionStart": 30,
         "UserPromptSubmit": 60,
+        "userPromptTransformed": 60,
         "PreToolUse": 600,
         "PostToolUse": 30,
         "Stop": 60,

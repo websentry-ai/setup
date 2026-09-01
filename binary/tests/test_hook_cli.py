@@ -33,6 +33,13 @@ EVENT_PAYLOADS = {
                         "tool_input": {"command": "git status"},
                         "tool_response": {"output": "clean"}},
         "UserPromptSubmit": {**S, "hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+        "userPromptTransformed": {
+            **S,
+            "hook_event_name": "userPromptTransformed",
+            "sessionId": "test-session",
+            "prompt": "hello",
+            "transformedPrompt": "hello",
+        },
         "Stop": {**S, "hook_event_name": "Stop"},
         "SessionStart": {**S, "hook_event_name": "SessionStart"},
         "SessionEnd": {**S, "hook_event_name": "SessionEnd"},
