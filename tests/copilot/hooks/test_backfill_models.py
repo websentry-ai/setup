@@ -130,6 +130,18 @@ class TestBackfillVscodeModels(unittest.TestCase):
         ], turns=2)
         self.assertEqual(models, ["", "gpt-5-mini"])
 
+    def test_a_mid_turn_switch_reports_the_turns_last_model(self):
+        # The live collector reads the turn's last request; the re-walk must agree or the
+        # same turn is costed under two different models.
+        models = self._models([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [
+                _request(served="claude-haiku-4.5", turn=0),
+                dict(_request(served="gpt-5-mini", turn=0),
+                     **{"timestamp": BASE_MS - 400 + 100})]},
+        ], turns=1)
+        self.assertEqual(models, ["gpt-5-mini"])
+
     def test_non_transcript_path_is_empty(self):
         self.assertEqual(
             setup._backfill_vscode_models(Path("/tmp/x/y.jsonl"), SESSION, _turn_entries(1)), [])

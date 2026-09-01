@@ -235,6 +235,21 @@ class TestBackfillVscodeUsage(unittest.TestCase):
         self.assertEqual(usage, [])
         self.assertEqual(models, [])
 
+    def test_a_non_object_message_body_never_aborts_the_run(self):
+        # A transcript entry whose `data` is a truthy non-dict must not take every
+        # remaining session down with it.
+        for bad in ("a string", ["a", "list"], 42, True):
+            entries = [
+                {"type": "user.message", "timestamp": _iso(BASE_MS), "data": bad},
+                {"type": "assistant.message", "timestamp": _iso(BASE_MS + CLOSE_MS),
+                 "data": {"content": "r"}},
+                {"type": "user.message", "timestamp": _iso(BASE_MS + TURN_MS),
+                 "data": {"content": "real prompt"}},
+            ]
+            ceilings = setup._backfill_turn_ceilings(entries)
+            # only the well-formed prompt counts as a turn
+            self.assertEqual(len(ceilings), 1, bad)
+
     def test_turn_ceilings_never_decrease(self):
         # The scan takes the first ceiling a request fits under, so out-of-order transcript
         # stamps must not produce a window that reaches backwards.

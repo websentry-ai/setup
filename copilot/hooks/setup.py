@@ -930,7 +930,10 @@ def _backfill_turn_ceilings(entries: List[Dict]) -> List[float]:
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict) or entry.get('type') != 'user.message':
             continue
-        content = (entry.get('data') or {}).get('content')
+        # data is whatever the JSONL held: a truthy non-dict would raise on .get() and
+        # take every remaining session down with it.
+        data = entry.get('data')
+        content = data.get('content') if isinstance(data, dict) else None
         if isinstance(content, str) and content.strip():
             starts.append(index)
     ceilings: List[float] = []
@@ -1021,13 +1024,15 @@ def _backfill_vscode_models(transcript_path: Path, session_id: str,
         by_turn = _backfill_requests_by_turn(_backfill_vscode_requests(store), ceilings)
         for turn in range(len(ceilings)):
             name = ''
-            for entry in by_turn.get(turn, []):
+            # The turn's last request, matching the live collector, so a mid-turn model
+            # switch is costed the same whether the row came from a hook or a re-walk.
+            for entry in by_turn.get(turn, [])[-1:]:
                 served = entry.get('servedBy')
                 if isinstance(served, str) and served:
                     name = served
                     break
                 selected = entry.get('modelId')
-                if isinstance(selected, str) and selected and not name:
+                if isinstance(selected, str) and selected:
                     # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
                     name = selected.split('/', 1)[-1]
             models.append(name)
