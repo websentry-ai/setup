@@ -771,10 +771,13 @@ def _skill_policy_loaded_facts(event):
                 continue
             if not isinstance(entry, dict) or entry.get('type') != 'skill.invoked':
                 continue
-            data = entry.get('data') or {}
+            data = entry.get('data')
+            if not isinstance(data, dict):
+                continue
             name = next((data.get(key) for key in ('name', 'skillName', 'skill_name', 'skill')
                          if isinstance(data.get(key), str) and data.get(key)), '')
-            if name.startswith(UNBOUND_SKILL_PREFIX):
+            slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else ''
+            if _skill_policy_valid_slug(slug):
                 names.add(name)
     except OSError:
         pass

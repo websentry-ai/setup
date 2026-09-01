@@ -297,6 +297,21 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
 
         self.assertEqual(facts["loaded"], {"secure-sql"})
 
+    def test_copilot_ignores_malformed_skill_invocation_events(self):
+        copilot = CLIENTS["copilot"]
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "events.jsonl"
+            transcript.write_text("\n".join(json.dumps(entry) for entry in (
+                {"type": "skill.invoked", "data": "unbound-secure-sql"},
+                {"type": "skill.invoked", "data": {"name": "unbound-invalid/slug"}},
+            )) + "\n")
+            event = {"session_id": "s1", "transcript_path": str(transcript)}
+            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = copilot._skill_policy_loaded_facts(event)
+
+        self.assertEqual(facts["loaded"], set())
+        self.assertEqual(facts["session_count"], 0)
+
     def test_cursor_loaded_state_survives_audit_log_eviction(self):
         cursor = CLIENTS["cursor"]
         event = {"conversation_id": "c1"}
