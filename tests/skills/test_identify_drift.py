@@ -60,7 +60,7 @@ MATCHED_TRANSCRIPT = [
 def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
        tool_counts=None, user_texts=("hello there",), assistant_texts=("hi back",),
        call_ids=("c1",), ids_are_representative=True, truncated=(),
-       rows_with_call_id=None, threads_are_representative=True,
+       rows_with_call_id=None,
        first_stored_at=None):
     """The aggregated shape fetch_db returns. Everything is a count, a sum, a digest or
     an id, because selecting the rows themselves does not fit in memory. Prompts are a
@@ -75,7 +75,6 @@ def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
         "ids_are_representative": ids_are_representative,
         "rows_with_call_id": (len(call_ids) if rows_with_call_id is None
                               else rows_with_call_id),
-        "threads_are_representative": threads_are_representative,
         "first_stored_at": first_stored_at,
         "user_digests": Counter(compare._digest(t) for t in user_texts),
         "assistant_digests": Counter(compare._digest(t) for t in assistant_texts),
@@ -129,56 +128,58 @@ class TestRealGapsAreFound(unittest.TestCase):
         got = titles(compare.compare("claude-code", local(t), MATCHED_DB, 3))
         self.assertIn("Tool calls made locally are absent from the database", got)
 
-    def test_a_session_the_hook_logged_but_nothing_reached(self):
-        """A session the hook saw and the database has no row for lost every one of
-        its turns, which is worse than losing some of them."""
+    def test_a_session_the_database_never_got_is_not_reported_at_all(self):
+        """Even when the hook logged it. Configuration moves between environments, so
+        a session with no stored row says nothing about drift; only a session the
+        database does hold, missing pieces of itself, is worth reporting."""
         t = MATCHED_TRANSCRIPT + [rec("tool_call", session="S2", tool="Bash", call_id="c3")]
         a = MATCHING_AUDIT + [rec("tool_call", session="S2", tool="Bash", call_id="c3")]
-        got = titles(compare.compare("claude-code",
-                                     local(t, a, sessions_transcript=["S1", "S2"],
-                                           sessions_audit=["S1", "S2"]),
-                                     MATCHED_DB, 3))
-        self.assertIn("The hook logged sessions the database has no record of", got)
+        got = compare.compare("claude-code",
+                              local(t, a, sessions_transcript=["S1", "S2"],
+                                    sessions_audit=["S1", "S2"]),
+                              MATCHED_DB, 3)
+        self.assertEqual(got, [])
 
-    def test_activity_predating_the_first_upload_is_not_a_loss(self):
-        """Most stored rows carry no thread_id for some tools, so scoping by session
-        is unavailable there. The first stored row is the floor instead: nothing older
-        than it was ever uploaded, so it cannot have been lost."""
-        old = [rec("user_prompt", at="2026-01-01T00:00:00+00:00", text="p%d" % i)
-               for i in range(50)]
-        d = db(metrics_rows=500, threads_are_representative=False, threads=(),
-               user_texts=(), first_stored_at="2026-08-01 00:00:00+00")
-        got = titles(compare.compare("claude-code", local(old), d, 14))
-        self.assertIn("Local activity predates anything this tool ever uploaded", got)
+    def test_activity_predating_the_install_is_not_a_loss(self):
+        """It sits in sessions that ran before the hook existed, which the database
+        therefore has no row for, so the session scope excludes it without needing to
+        reason about when the first upload happened."""
+        old = [rec("user_prompt", session="S0", at="2026-01-01T00:00:00+00:00",
+                   text="p%d" % i) for i in range(50)]
+        d = db(metrics_rows=500, threads=("S1",), user_texts=(),
+               first_stored_at="2026-08-01 00:00:00+00")
+        got = titles(compare.compare("claude-code",
+                                     local(old, [], sessions_transcript=["S0"],
+                                           sessions_audit=[]), d, 14))
         self.assertNotIn("User prompts recorded locally are absent from the database",
                          got)
 
-    def test_activity_after_the_first_upload_still_counts(self):
+    def test_a_prompt_missing_from_a_session_the_database_has_still_counts(self):
+        """The scope narrows to the stored sessions; it does not go quiet inside one."""
         recent = [rec("user_prompt", text="never sent")]
-        d = db(metrics_rows=500, threads_are_representative=False, threads=(),
-               user_texts=(), first_stored_at="2026-08-01 00:00:00+00")
+        d = db(metrics_rows=500, threads=("S1",), user_texts=(),
+               first_stored_at="2026-08-01 00:00:00+00")
         got = titles(compare.compare("claude-code", local(recent), d, 14))
         self.assertIn("User prompts recorded locally are absent from the database", got)
 
-    def test_no_scoping_finding_when_scoping_is_unavailable(self):
-        """An empty scope must not make every session look unknown."""
-        got = titles(compare.compare("claude-code",
-                                     local(MATCHED_TRANSCRIPT, MATCHING_AUDIT),
-                                     db(threads_are_representative=False, threads=()),
-                                     3))
-        self.assertNotIn("The hook logged sessions the database has no record of", got)
-        self.assertNotIn("Some local sessions were never instrumented", got)
+    def test_an_empty_scope_says_so_once_instead_of_per_session(self):
+        """Stored rows that name no session leave nothing to place local activity
+        against. That is nothing to compare, not everything lost."""
+        got = compare.compare("claude-code",
+                              local(MATCHED_TRANSCRIPT, MATCHING_AUDIT),
+                              db(threads=(), metrics_rows=500), 3)
+        self.assertEqual(titles(got),
+                         ["None of this window's sessions are in the database"])
 
     def test_a_session_nobody_instrumented_is_not_a_loss(self):
         """A tool runs whether or not the integration was installed, so a machine can
-        hold months of transcripts the gateway was never told about."""
+        hold months of transcripts the gateway was never told about. A session the
+        database has no row for is out of scope, and out of scope is not a finding."""
         t = MATCHED_TRANSCRIPT + [rec("user_prompt", session="S2", text="never sent")]
-        got = titles(compare.compare("claude-code",
-                                     local(t, sessions_transcript=["S1", "S2"]),
-                                     MATCHED_DB, 3))
-        self.assertIn("Some local sessions were never instrumented", got)
-        self.assertNotIn("User prompts recorded locally are absent from the database",
-                         got)
+        got = compare.compare("claude-code",
+                              local(t, sessions_transcript=["S1", "S2"]),
+                              MATCHED_DB, 3)
+        self.assertEqual(got, [])
 
 
 class TestTheLossIsLocalised(unittest.TestCase):
@@ -274,6 +275,129 @@ class TestItReadsTheStoredPromptShape(unittest.TestCase):
     def test_it_does_not_truncate_the_way_the_query_no_longer_does(self):
         """A prefix digest made two prompts sharing an opening interchangeable."""
         self.assertEqual(len(compare._norm("x" * 500)), 500)
+
+
+def stored_turn(*messages):
+    """A turn as the hook writes it: the replies, or the prompts queued during it,
+    joined with a blank line, then split back the way the query splits them."""
+    return Counter(compare._digest(seg)
+                   for seg in compare._segments("\n\n".join(messages)))
+
+
+class TestAStoredRowHoldsAWholeTurnNotAMessage(unittest.TestCase):
+    """The hook joins a turn's replies, and any prompts queued during it, with a blank
+    line before storing them. Digesting that joined text matched nothing a transcript
+    holds, so every message in the window read as lost -- 596 of 596 on the run that
+    found this, while the same run's tool calls and tokens reconciled."""
+
+    def _db(self, **over):
+        base = dict(user_texts=(), assistant_texts=(), tool_counts={}, call_ids=())
+        base.update(over)
+        return db(**base)
+
+    def test_replies_joined_into_one_turn_are_not_a_loss(self):
+        transcript = [rec("assistant_message", text="first reply"),
+                      rec("assistant_message", text="second reply")]
+        stored = self._db()
+        stored["assistant_digests"] = stored_turn("first reply", "second reply")
+        got = titles(compare.compare("claude-code", local(transcript, []), stored, 3))
+        self.assertNotIn(
+            "Assistant messages recorded locally are absent from the database", got)
+
+    def test_a_reply_the_turn_arrived_without_is_still_a_loss(self):
+        transcript = [rec("assistant_message", text="first reply"),
+                      rec("assistant_message", text="second reply")]
+        stored = self._db()
+        stored["assistant_digests"] = stored_turn("first reply")
+        found = compare.compare("claude-code", local(transcript, []), stored, 3)
+        gap = [f for f in found if f["title"].startswith("Assistant messages")]
+        self.assertEqual(len(gap), 1)
+        self.assertIn("1 of 2 missing", gap[0]["evidence"])
+
+    def test_prompts_queued_into_one_row_are_not_a_loss(self):
+        transcript = [rec("user_prompt", text="do the thing"),
+                      rec("user_prompt", text="and this too")]
+        stored = self._db()
+        stored["user_digests"] = stored_turn("do the thing", "and this too")
+        got = titles(compare.compare("claude-code", local(transcript, []), stored, 3))
+        self.assertNotIn(
+            "User prompts recorded locally are absent from the database", got)
+
+    def test_a_message_of_several_paragraphs_matches_its_own(self):
+        """Both sides split on any run of newlines, so a reply written as paragraphs
+        reconciles against the same paragraphs inside the turn that carried it."""
+        reply = "the first paragraph\n\nthe second paragraph"
+        stored = self._db()
+        stored["assistant_digests"] = stored_turn(reply, "a later reply")
+        got = titles(compare.compare(
+            "claude-code", local([rec("assistant_message", text=reply)], []), stored, 3))
+        self.assertNotIn(
+            "Assistant messages recorded locally are absent from the database", got)
+
+    def test_a_repeat_stored_once_is_still_one_loss(self):
+        """Segments are consumed as they match, so the multiset property the whole-text
+        comparison had survives the split."""
+        transcript = [rec("assistant_message", text="same answer"),
+                      rec("assistant_message", text="same answer")]
+        stored = self._db()
+        stored["assistant_digests"] = stored_turn("same answer")
+        found = compare.compare("claude-code", local(transcript, []), stored, 3)
+        gap = [f for f in found if f["title"].startswith("Assistant messages")]
+        self.assertEqual(len(gap), 1)
+        self.assertIn("1 of 2 missing", gap[0]["evidence"])
+
+
+class TestBothSourcesOfACallIdAreRead(unittest.TestCase):
+    """prompt_analytics holds a row per pre-tool call; the stop hook's payload holds the
+    turn's whole list, and it is the larger of the two -- every pre-tool id measured was
+    also in a payload, and 11 of 12 calls in one session were in the payload alone.
+    Reading only the first reported calls the database had received."""
+
+    def _statements(self, **kwargs):
+        import subprocess
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="[]", stderr="")
+        with unittest.mock.patch("subprocess.run", return_value=done) as run:
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                compare.fetch_db("postgres://bob@127.0.0.1/t", "a@b.c", "claude-code",
+                                 14, **kwargs)
+        return [c[1]["input"] for c in run.call_args_list]
+
+    def test_the_id_query_reads_the_payload_as_well_as_the_rows(self):
+        ids = [q for q in self._statements() if "tool_use_id" in q]
+        self.assertTrue(ids, "expected a call id query")
+        union = [q for q in ids if "jsonb_array_elements" in q]
+        self.assertTrue(union, "the payload's own list is never read")
+        self.assertIn("prompt_analytics", union[0])
+
+    def test_the_assistant_text_is_taken_out_of_the_object(self):
+        """content is a field of the stored object, not the object itself."""
+        digests = [q for q in self._statements() if "regexp_split_to_table" in q]
+        self.assertTrue(digests, "expected the segment digests query")
+        self.assertIn("'content'", digests[0])
+
+    def test_coverage_is_judged_on_every_id_either_source_knows(self):
+        """Judging it on the pre-tool rows alone falls back to counting on a window the
+        payload could have reconciled by identity."""
+        import subprocess
+
+        def reply(*_a, **kw):
+            sql = kw["input"]
+            if "tool_use_id" in sql and "jsonb_array_elements" in sql:
+                out = json.dumps([{"call_id": "c%d" % i} for i in range(10)])
+            elif "tool_name" in sql:
+                out = json.dumps([{"tool_name": "Bash", "n": 10,
+                                   "with_thread": 10, "with_id": 0}])
+            else:
+                out = "[]"
+            return subprocess.CompletedProcess(args=[], returncode=0, stdout=out,
+                                               stderr="")
+
+        with unittest.mock.patch("subprocess.run", side_effect=reply):
+            with unittest.mock.patch.object(compare, "PSQL", _a_psql()):
+                got = compare.fetch_db("postgres://bob@127.0.0.1/t", "a@b.c",
+                                       "claude-code", 14)
+        self.assertEqual(len(got["call_ids"]), 10)
+        self.assertTrue(got["ids_are_representative"])
 
 
 class TestNoiseIsSuppressedWithoutHidingRealLoss(unittest.TestCase):
@@ -439,6 +563,50 @@ class TestTheScannerReadsEveryFormat(unittest.TestCase):
             scan._text_of([{"type": "input_text", "text": "typed this"}]), "typed this")
         self.assertEqual(scan._text_of("plain string"), "plain string")
         self.assertEqual(scan._text_of([{"type": "thinking", "text": "hidden"}]), "")
+
+    def _claude_home(self, *entries):
+        """A transcript on disk, scanned the way a run scans it."""
+        import tempfile, json as _json
+        from pathlib import Path
+        home = Path(tempfile.mkdtemp())
+        session = home / ".claude/projects/p"
+        session.mkdir(parents=True)
+        (session / "S1.jsonl").write_text(
+            "".join(_json.dumps(e) + "\n" for e in entries))
+        with unittest.mock.patch.object(scan, "HOME", home):
+            since = datetime(2026, 8, 1, tzinfo=timezone.utc)
+            return [r for r in scan.scan_claude_code(since)
+                    if r["kind"] == "user_prompt"]
+
+    def _user(self, text, **fields):
+        entry = {"type": "user", "timestamp": INSIDE,
+                 "message": {"role": "user", "content": text}}
+        entry.update(fields)
+        return entry
+
+    def test_only_what_the_person_actually_sent_is_a_prompt(self):
+        """Everything else under the user role -- injected reminders, slash-command
+        expansions, command output, task notifications -- was never submitted, so the
+        hook never saw it. Counting it invented 44 losses in one day's window."""
+        got = self._claude_home(
+            self._user("do the thing", promptSource="typed"),
+            self._user("x", promptSource="queued"),
+            self._user("<task-notification>done</task-notification>",
+                       promptSource="system"),
+            self._user("<command-name>/cd</command-name>"),
+            self._user("Base directory for this skill: /x", isMeta=True))
+        self.assertEqual([r["text"] for r in got], ["do the thing", "x"])
+
+    def test_a_transcript_that_marks_nothing_keeps_all_its_prompts(self):
+        """Older transcripts carry no promptSource. Filtering on a field a file never
+        writes would drop every prompt in it and report a silent, total loss."""
+        got = self._claude_home(self._user("older format"),
+                                self._user("second one"))
+        self.assertEqual([r["text"] for r in got], ["older format", "second one"])
+
+    def test_a_meta_record_is_never_a_prompt_in_either_format(self):
+        got = self._claude_home(self._user("injected", isMeta=True))
+        self.assertEqual(got, [])
 
     def test_timestamps_in_every_spelling_the_files_use(self):
         for value in ("2026-08-26T05:00:00Z", "2026-08-26T05:00:00+00:00",
@@ -835,7 +1003,7 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
     def test_a_capped_full_window_aggregate_does_not_invent_losses_either(self):
         """The same rule as the audit window: the cap bounds what came back, so what
         it left out is not evidence of absence."""
-        capped = db(threads=(), tool_counts={}, call_ids=(), user_texts=(),
+        capped = db(threads=("S1",), tool_counts={}, call_ids=(), user_texts=(),
                     assistant_texts=(), ids_are_representative=False,
                     truncated=["sessions", "tool names", "prompts"])
         got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
