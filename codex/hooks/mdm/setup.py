@@ -1775,11 +1775,13 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
                                force_days=None) -> Tuple[List[Dict], bool, bool]:
-    # Returns (sessions, capped); capped=True means the per-run cap was hit and
+    # Returns (sessions, capped, forced); capped=True means the per-run cap was hit and
     # older files remain unprocessed, so this home's cutoff must not advance.
     sessions_root = home_dir / '.codex' / 'sessions'
     if not sessions_root.exists():
-        return [], False
+        # Three values like every other exit: the caller unpacks one shape, and a
+        # profile with no history here was not behind the request either.
+        return [], False, False
     cutoff_mtime = _backfill_read_cutoff(home_dir)
     forced = force_epoch is not None and force_epoch > cutoff_mtime
     if forced:

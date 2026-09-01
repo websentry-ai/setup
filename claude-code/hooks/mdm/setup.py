@@ -1872,11 +1872,13 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
                                force_days=None) -> Tuple[List[Dict], bool, bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
-    # Returns (sessions, capped); capped=True means the per-run cap was hit and
+    # Returns (sessions, capped, forced); capped=True means the per-run cap was hit and
     # older files remain unprocessed, so this home's cutoff must not advance.
     projects_root = home_dir / '.claude' / 'projects'
     if not projects_root.exists():
-        return [], False
+        # Three values like every other exit: the caller unpacks one shape, and a
+        # profile with no history here was not behind the request either.
+        return [], False, False
     cutoff_mtime = _backfill_read_cutoff(home_dir)
     forced = force_epoch is not None and force_epoch > cutoff_mtime
     if forced:

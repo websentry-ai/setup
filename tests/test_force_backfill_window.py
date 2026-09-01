@@ -137,3 +137,51 @@ class TestForceStaysScopedToTheProfilesBehind:
         })
         forced = [ids for ids, is_forced in uploads if is_forced]
         assert forced == [["A1"]], "only the profile behind may be forced: %s" % uploads
+
+
+@pytest.mark.parametrize("relpath", MDM)
+class TestOneProfileCannotSinkTheDevice:
+    """One MDM run walks every profile on the machine under a single device key. A
+    profile with nothing to contribute must cost that profile nothing, not the run."""
+
+    def test_a_profile_with_no_history_returns_the_shape_the_caller_unpacks(self, relpath, tmp_path):
+        # run_backfill unpacks three. Returning two raises ValueError out of the
+        # collector, and the run's own except swallows it as "skipped due to error",
+        # taking every remaining profile with it.
+        module = load_module(relpath)
+        result = module._backfill_collect_sessions(tmp_path / "no-such-home", 1e12, 45)
+        assert len(result) == 3, result
+        sessions, capped, forced = result
+        assert sessions == [] and capped is False
+
+    def test_an_empty_profile_does_not_stop_the_others(self, relpath, tmp_path):
+        module = load_module(relpath)
+        uploaded = []
+
+        def _fake_run_as_user(username, fn, *args, **kwargs):
+            if fn is not module._backfill_collect_sessions:
+                return None
+            if username == "empty":
+                # The real collector's answer for a home with no transcript directory.
+                return module._backfill_collect_sessions(tmp_path / "no-such-home", *args[1:])
+            return ([{"session_id": "S1", "entries": [{}]}], False, False)
+
+        stack = [
+            patch.object(module, "_run_as_user", _fake_run_as_user),
+            patch.object(module, "_backfill_force_config", lambda *a: (1000.0, None)),
+            patch.object(module, "_backfill_send_sessions",
+                         lambda *a, **k: (uploaded.extend(a[2]), (len(a[2]), 1, 0))[1]),
+        ]
+        if hasattr(module, "get_device_identifier"):
+            stack.append(patch.object(module, "get_device_identifier", lambda: "serial"))
+        for ctx in stack:
+            ctx.start()
+        try:
+            module.run_backfill("key", "https://backend",
+                                [("empty", tmp_path / "empty"), ("busy", tmp_path / "busy")])
+        finally:
+            for ctx in reversed(stack):
+                ctx.stop()
+
+        assert [s["session_id"] for s in uploaded] == ["S1"], (
+            "the profile with history must still upload")
