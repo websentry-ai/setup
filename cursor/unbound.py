@@ -115,6 +115,9 @@ _reporting_error = False
 
 
 # BEGIN GENERATED SKILL POLICY CORE
+import urllib.request
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -125,7 +128,8 @@ def _managed_skill_dirs():
             (
                 entry for entry in MANAGED_SKILLS_ROOT.iterdir()
                 if entry.is_dir() and not entry.is_symlink()
-                and (entry / UNBOUND_SKILL_MARKER).exists()
+                and (entry / UNBOUND_SKILL_MARKER).is_file()
+                and not (entry / UNBOUND_SKILL_MARKER).is_symlink()
             ),
             key=lambda entry: entry.name,
         )
@@ -159,7 +163,12 @@ def _managed_skill_state(slug):
     try:
         state['exists'] = directory.is_dir()
         if state['exists']:
-            state['managed'] = not directory.is_symlink() and (directory / UNBOUND_SKILL_MARKER).exists()
+            marker = directory / UNBOUND_SKILL_MARKER
+            state['managed'] = (
+                not directory.is_symlink()
+                and marker.is_file()
+                and not marker.is_symlink()
+            )
             state['sha256'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
     except Exception:
         pass
@@ -251,15 +260,20 @@ def install_injected_skills(inject_skills):
 
                 created = not state['exists']
                 directory.mkdir(parents=True, exist_ok=True)
-                try:
-                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
-                except OSError:
-                    if created:
+                if created:
+                    try:
+                        marker_fd = os.open(
+                            str(directory / UNBOUND_SKILL_MARKER),
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o600,
+                        )
+                        os.close(marker_fd)
+                    except OSError:
                         try:
                             directory.rmdir()
                         except OSError:
                             pass
-                    raise
+                        raise
 
                 fd, temp_path = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
                 try:
@@ -292,7 +306,8 @@ def prune_injected_skills(remove_skills):
                 directory = MANAGED_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
                 if not directory.is_dir():
                     continue
-                if directory.is_symlink() or not (directory / UNBOUND_SKILL_MARKER).exists():
+                marker = directory / UNBOUND_SKILL_MARKER
+                if directory.is_symlink() or not marker.is_file() or marker.is_symlink():
                     log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
                     continue
                 shutil.rmtree(directory)
@@ -336,22 +351,45 @@ def _skills_lock_release(lock_fd):
         pass
 
 
+class _SkillSyncNoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def _request_skill_sync(api_key, payload):
+    request = urllib.request.Request(
+        f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync',
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    opener = urllib.request.build_opener(_SkillSyncNoRedirects())
+    try:
+        with opener.open(request, timeout=SKILLS_SYNC_TIMEOUT_SECONDS) as response:
+            body = response.read(4 * 1024 * 1024 + 1)
+    except Exception as exc:
+        log_error(f'skills sync request failed: {type(exc).__name__}', 'skill_injection')
+        return None
+    if not body or len(body) > 4 * 1024 * 1024:
+        return None
+    try:
+        plan = json.loads(body.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return plan if isinstance(plan, dict) else None
+
+
 def _sync_skills_once(api_key):
     lock_fd = _skills_lock_acquire()
     if lock_fd is None:
         return
     try:
-        payload = json.dumps({'installed': installed_skill_report()})
-        result = subprocess.run(
-            ['curl', '-fsSL', '-X', 'POST',
-             '-H', f'Authorization: Bearer {api_key}',
-             '-H', 'Content-Type: application/json',
-             '--data-binary', '@-', f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync'],
-            input=payload.encode(), capture_output=True, timeout=SKILLS_SYNC_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0 or not result.stdout or len(result.stdout) > 4 * 1024 * 1024:
+        plan = _request_skill_sync(api_key, {'installed': installed_skill_report()})
+        if plan is None:
             return
-        plan = json.loads(result.stdout.decode('utf-8'))
         if not _valid_skill_plan(plan):
             log_error('skills sync rejected invalid plan', 'skill_injection')
             return
@@ -359,7 +397,7 @@ def _sync_skills_once(api_key):
             return
         prune_injected_skills(plan.get('remove', []))
     except Exception as exc:
-        log_error(f"skills sync failed: {exc}", 'skill_injection')
+        log_error(f'skills sync failed: {type(exc).__name__}', 'skill_injection')
     finally:
         _skills_lock_release(lock_fd)
 
@@ -546,7 +584,10 @@ def _stage_skill_injection_delivery(event, api_response):
         pass
 
 
-def _ack_skill_injection_delivery(event):
+def _ack_skill_injection_delivery(event, hook_output):
+    output_delivered = globals().get('_skill_policy_output_delivered')
+    if not callable(output_delivered) or not output_delivered(hook_output):
+        return
     turn_key = globals().get('_skill_policy_turn_key')
     if not callable(turn_key):
         return
@@ -583,6 +624,14 @@ def _skill_policy_turn_key(event):
     conversation = event.get('conversation_id')
     generation = event.get('generation_id')
     return f'{conversation}:{generation}' if conversation and generation else ''
+
+
+def _skill_policy_output_delivered(output):
+    if not isinstance(output, dict) or output.get('permission') != 'deny':
+        return False
+    message = output.get('agent_message')
+    token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}'
+    return isinstance(message, str) and token in message
 
 
 def _skill_policy_loaded_facts(event):
@@ -2279,6 +2328,13 @@ def process_user_prompt_submit(event, api_key):
     cache = load_policy_cache()
     need_pull_policies = cache is None or is_cache_stale(cache)
 
+    metadata = {}
+    cwd = event.get('cwd')
+    if not isinstance(cwd, str) or not cwd:
+        roots = event.get('workspace_roots')
+        cwd = roots[0] if isinstance(roots, list) and roots and isinstance(roots[0], str) else None
+    if cwd:
+        metadata['cwd'] = cwd
     request_body = {
         'conversation_id': conversation_id,
         'unbound_app_label': 'cursor',
@@ -2286,7 +2342,7 @@ def process_user_prompt_submit(event, api_key):
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(event),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
-        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': {}},
+        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': metadata},
     }
     _attach_installed_skill_facts(request_body['pre_tool_use_data']['metadata'], event)
     if need_pull_policies:
@@ -3822,7 +3878,7 @@ def main():
         if hook_event_name == 'preToolUse':
             response = _with_deferred_skill_context(event, process_pre_tool_use(event, api_key))
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event)
+            _ack_skill_injection_delivery(event, response)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -3833,7 +3889,7 @@ def main():
                 event, process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             )
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event)
+            _ack_skill_injection_delivery(event, response)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -3847,7 +3903,7 @@ def main():
                 mcp_server=mcp_server, mcp_tool=mcp_tool_name
             ))
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event)
+            _ack_skill_injection_delivery(event, response)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return

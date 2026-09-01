@@ -2,7 +2,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = Path(__file__).with_name("core.py")
+SOURCE = Path(__file__).with_name("core.py.tmpl")
 TARGETS = (
     ROOT / "copilot" / "hooks" / "unbound.py",
     ROOT / "cursor" / "unbound.py",

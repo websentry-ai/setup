@@ -143,6 +143,9 @@ _reporting_error = False
 
 
 # BEGIN GENERATED SKILL POLICY CORE
+import urllib.request
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -153,7 +156,8 @@ def _managed_skill_dirs():
             (
                 entry for entry in MANAGED_SKILLS_ROOT.iterdir()
                 if entry.is_dir() and not entry.is_symlink()
-                and (entry / UNBOUND_SKILL_MARKER).exists()
+                and (entry / UNBOUND_SKILL_MARKER).is_file()
+                and not (entry / UNBOUND_SKILL_MARKER).is_symlink()
             ),
             key=lambda entry: entry.name,
         )
@@ -187,7 +191,12 @@ def _managed_skill_state(slug):
     try:
         state['exists'] = directory.is_dir()
         if state['exists']:
-            state['managed'] = not directory.is_symlink() and (directory / UNBOUND_SKILL_MARKER).exists()
+            marker = directory / UNBOUND_SKILL_MARKER
+            state['managed'] = (
+                not directory.is_symlink()
+                and marker.is_file()
+                and not marker.is_symlink()
+            )
             state['sha256'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
     except Exception:
         pass
@@ -279,15 +288,20 @@ def install_injected_skills(inject_skills):
 
                 created = not state['exists']
                 directory.mkdir(parents=True, exist_ok=True)
-                try:
-                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
-                except OSError:
-                    if created:
+                if created:
+                    try:
+                        marker_fd = os.open(
+                            str(directory / UNBOUND_SKILL_MARKER),
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o600,
+                        )
+                        os.close(marker_fd)
+                    except OSError:
                         try:
                             directory.rmdir()
                         except OSError:
                             pass
-                    raise
+                        raise
 
                 fd, temp_path = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
                 try:
@@ -320,7 +334,8 @@ def prune_injected_skills(remove_skills):
                 directory = MANAGED_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
                 if not directory.is_dir():
                     continue
-                if directory.is_symlink() or not (directory / UNBOUND_SKILL_MARKER).exists():
+                marker = directory / UNBOUND_SKILL_MARKER
+                if directory.is_symlink() or not marker.is_file() or marker.is_symlink():
                     log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
                     continue
                 shutil.rmtree(directory)
@@ -364,22 +379,45 @@ def _skills_lock_release(lock_fd):
         pass
 
 
+class _SkillSyncNoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def _request_skill_sync(api_key, payload):
+    request = urllib.request.Request(
+        f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync',
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    opener = urllib.request.build_opener(_SkillSyncNoRedirects())
+    try:
+        with opener.open(request, timeout=SKILLS_SYNC_TIMEOUT_SECONDS) as response:
+            body = response.read(4 * 1024 * 1024 + 1)
+    except Exception as exc:
+        log_error(f'skills sync request failed: {type(exc).__name__}', 'skill_injection')
+        return None
+    if not body or len(body) > 4 * 1024 * 1024:
+        return None
+    try:
+        plan = json.loads(body.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return plan if isinstance(plan, dict) else None
+
+
 def _sync_skills_once(api_key):
     lock_fd = _skills_lock_acquire()
     if lock_fd is None:
         return
     try:
-        payload = json.dumps({'installed': installed_skill_report()})
-        result = subprocess.run(
-            ['curl', '-fsSL', '-X', 'POST',
-             '-H', f'Authorization: Bearer {api_key}',
-             '-H', 'Content-Type: application/json',
-             '--data-binary', '@-', f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync'],
-            input=payload.encode(), capture_output=True, timeout=SKILLS_SYNC_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0 or not result.stdout or len(result.stdout) > 4 * 1024 * 1024:
+        plan = _request_skill_sync(api_key, {'installed': installed_skill_report()})
+        if plan is None:
             return
-        plan = json.loads(result.stdout.decode('utf-8'))
         if not _valid_skill_plan(plan):
             log_error('skills sync rejected invalid plan', 'skill_injection')
             return
@@ -387,7 +425,7 @@ def _sync_skills_once(api_key):
             return
         prune_injected_skills(plan.get('remove', []))
     except Exception as exc:
-        log_error(f"skills sync failed: {exc}", 'skill_injection')
+        log_error(f'skills sync failed: {type(exc).__name__}', 'skill_injection')
     finally:
         _skills_lock_release(lock_fd)
 
@@ -574,7 +612,10 @@ def _stage_skill_injection_delivery(event, api_response):
         pass
 
 
-def _ack_skill_injection_delivery(event):
+def _ack_skill_injection_delivery(event, hook_output):
+    output_delivered = globals().get('_skill_policy_output_delivered')
+    if not callable(output_delivered) or not output_delivered(hook_output):
+        return
     turn_key = globals().get('_skill_policy_turn_key')
     if not callable(turn_key):
         return
@@ -617,6 +658,21 @@ def _skill_policy_turn_key(event):
         return ''
     anchor = get_turn_start_timestamp_for_session(session_id) or event.get('promptId') or event.get('prompt_id')
     return f'{session_id}:{anchor}' if anchor else ''
+
+
+def _skill_policy_output_delivered(output):
+    if not isinstance(output, dict):
+        return False
+    token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}'
+    transformed = output.get('modifiedTransformedPrompt')
+    if isinstance(transformed, str) and token in transformed:
+        return True
+    reason = output.get('permissionDecisionReason')
+    return (
+        output.get('permissionDecision') in ('deny', 'ask')
+        and isinstance(reason, str)
+        and token in reason
+    )
 
 
 def _copilot_inventory_path(session_id):
@@ -669,9 +725,28 @@ def _skill_policy_visible_inventory(event, physical):
         return []
 
 
+def _copilot_transcript_path(event):
+    candidates = (
+        event.get('transcript_path'),
+        event.get('transcriptPath'),
+        _transcript_path_for_session(event),
+    )
+    for path in candidates:
+        if isinstance(path, str) and path and os.path.isfile(path):
+            return path
+    session_id = _skill_policy_session_id(event)
+    if not session_id or not _safe_skill_segment(session_id):
+        return None
+    try:
+        candidate = _copilot_home() / 'session-state' / session_id / 'events.jsonl'
+        return str(candidate) if candidate.is_file() else None
+    except OSError:
+        return None
+
+
 def _skill_policy_loaded_facts(event):
     session_id = _skill_policy_session_id(event)
-    transcript = event.get('transcript_path') or event.get('transcriptPath')
+    transcript = _copilot_transcript_path(event)
     if not isinstance(transcript, str) or not transcript:
         return _remember_loaded_skill_facts(session_id, set())
     names = set()
@@ -2736,7 +2811,6 @@ def transform_response_for_copilot_prompt(api_response):
 
 
 def transform_response_for_copilot_transformed_prompt(event, api_response):
-    """Use Copilot's model-visible transformed-prompt command hook."""
     transformed = event.get('transformedPrompt') or event.get('prompt') or ''
     if not isinstance(api_response, dict) or api_response.get('decision') == 'deny':
         return {}
@@ -2943,13 +3017,17 @@ def _evaluate_user_prompt_policy(event, api_key):
     cache = load_policy_cache()
     need_pull_policies = cache is None or is_cache_stale(cache)
 
+    metadata = {}
+    cwd = event.get('cwd')
+    if isinstance(cwd, str) and cwd:
+        metadata['cwd'] = cwd
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'user_prompt',
         'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
-        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': {}},
+        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': metadata},
     }
     _attach_installed_skill_facts(request_body['pre_tool_use_data']['metadata'], event)
     if need_pull_policies:
@@ -3026,7 +3104,6 @@ def _take_copilot_prompt_plan(event):
 
 
 def process_user_prompt_submit(event, api_key):
-    """Check once, then hand the raw plan to userPromptTransformed across processes."""
     api_response = _evaluate_user_prompt_policy(event, api_key)
     _store_copilot_prompt_plan(event, api_response)
     return transform_response_for_copilot_prompt(api_response)
@@ -4790,14 +4867,15 @@ def main():
             if not found_plan:
                 gateway_response = _evaluate_user_prompt_policy(event, api_key)
             _stage_skill_injection_delivery(event, gateway_response)
-            print(json.dumps(transform_response_for_copilot_transformed_prompt(event, gateway_response)), flush=True)
-            _ack_skill_injection_delivery(event)
+            response = transform_response_for_copilot_transformed_prompt(event, gateway_response)
+            print(json.dumps(response), flush=True)
+            _ack_skill_injection_delivery(event, response)
             return
 
         if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event)
+            _ack_skill_injection_delivery(event, response)
             return
 
         if event_name == 'UserPromptSubmit':

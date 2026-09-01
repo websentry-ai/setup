@@ -44,6 +44,8 @@ SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'codex'
 SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CODEX_API_KEY'
 SKILL_POLICY_INVOKE_PREFIX = '$'
+CODEX_SELECTED_SKILL_KIND = 'skills.selected_skill_instructions'
+CODEX_SELECTED_SKILL_NAME_RE = re.compile(r'<name>\s*([^<\s][^<]*?)\s*</name>')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
@@ -99,6 +101,9 @@ _reporting_error = False
 
 
 # BEGIN GENERATED SKILL POLICY CORE
+import urllib.request
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -109,7 +114,8 @@ def _managed_skill_dirs():
             (
                 entry for entry in MANAGED_SKILLS_ROOT.iterdir()
                 if entry.is_dir() and not entry.is_symlink()
-                and (entry / UNBOUND_SKILL_MARKER).exists()
+                and (entry / UNBOUND_SKILL_MARKER).is_file()
+                and not (entry / UNBOUND_SKILL_MARKER).is_symlink()
             ),
             key=lambda entry: entry.name,
         )
@@ -143,7 +149,12 @@ def _managed_skill_state(slug):
     try:
         state['exists'] = directory.is_dir()
         if state['exists']:
-            state['managed'] = not directory.is_symlink() and (directory / UNBOUND_SKILL_MARKER).exists()
+            marker = directory / UNBOUND_SKILL_MARKER
+            state['managed'] = (
+                not directory.is_symlink()
+                and marker.is_file()
+                and not marker.is_symlink()
+            )
             state['sha256'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
     except Exception:
         pass
@@ -235,15 +246,20 @@ def install_injected_skills(inject_skills):
 
                 created = not state['exists']
                 directory.mkdir(parents=True, exist_ok=True)
-                try:
-                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
-                except OSError:
-                    if created:
+                if created:
+                    try:
+                        marker_fd = os.open(
+                            str(directory / UNBOUND_SKILL_MARKER),
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o600,
+                        )
+                        os.close(marker_fd)
+                    except OSError:
                         try:
                             directory.rmdir()
                         except OSError:
                             pass
-                    raise
+                        raise
 
                 fd, temp_path = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
                 try:
@@ -276,7 +292,8 @@ def prune_injected_skills(remove_skills):
                 directory = MANAGED_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
                 if not directory.is_dir():
                     continue
-                if directory.is_symlink() or not (directory / UNBOUND_SKILL_MARKER).exists():
+                marker = directory / UNBOUND_SKILL_MARKER
+                if directory.is_symlink() or not marker.is_file() or marker.is_symlink():
                     log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
                     continue
                 shutil.rmtree(directory)
@@ -320,22 +337,45 @@ def _skills_lock_release(lock_fd):
         pass
 
 
+class _SkillSyncNoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def _request_skill_sync(api_key, payload):
+    request = urllib.request.Request(
+        f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync',
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    opener = urllib.request.build_opener(_SkillSyncNoRedirects())
+    try:
+        with opener.open(request, timeout=SKILLS_SYNC_TIMEOUT_SECONDS) as response:
+            body = response.read(4 * 1024 * 1024 + 1)
+    except Exception as exc:
+        log_error(f'skills sync request failed: {type(exc).__name__}', 'skill_injection')
+        return None
+    if not body or len(body) > 4 * 1024 * 1024:
+        return None
+    try:
+        plan = json.loads(body.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return plan if isinstance(plan, dict) else None
+
+
 def _sync_skills_once(api_key):
     lock_fd = _skills_lock_acquire()
     if lock_fd is None:
         return
     try:
-        payload = json.dumps({'installed': installed_skill_report()})
-        result = subprocess.run(
-            ['curl', '-fsSL', '-X', 'POST',
-             '-H', f'Authorization: Bearer {api_key}',
-             '-H', 'Content-Type: application/json',
-             '--data-binary', '@-', f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync'],
-            input=payload.encode(), capture_output=True, timeout=SKILLS_SYNC_TIMEOUT_SECONDS,
-        )
-        if result.returncode != 0 or not result.stdout or len(result.stdout) > 4 * 1024 * 1024:
+        plan = _request_skill_sync(api_key, {'installed': installed_skill_report()})
+        if plan is None:
             return
-        plan = json.loads(result.stdout.decode('utf-8'))
         if not _valid_skill_plan(plan):
             log_error('skills sync rejected invalid plan', 'skill_injection')
             return
@@ -343,7 +383,7 @@ def _sync_skills_once(api_key):
             return
         prune_injected_skills(plan.get('remove', []))
     except Exception as exc:
-        log_error(f"skills sync failed: {exc}", 'skill_injection')
+        log_error(f'skills sync failed: {type(exc).__name__}', 'skill_injection')
     finally:
         _skills_lock_release(lock_fd)
 
@@ -530,7 +570,10 @@ def _stage_skill_injection_delivery(event, api_response):
         pass
 
 
-def _ack_skill_injection_delivery(event):
+def _ack_skill_injection_delivery(event, hook_output):
+    output_delivered = globals().get('_skill_policy_output_delivered')
+    if not callable(output_delivered) or not output_delivered(hook_output):
+        return
     turn_key = globals().get('_skill_policy_turn_key')
     if not callable(turn_key):
         return
@@ -567,6 +610,66 @@ def _skill_policy_turn_key(event):
     session = event.get('session_id')
     turn = event.get('turn_id') or event.get('prompt_id')
     return f'{session}:{turn}' if session and turn else ''
+
+
+def _skill_policy_output_delivered(output):
+    if not isinstance(output, dict):
+        return False
+    specific = output.get('hookSpecificOutput')
+    context = specific.get('additionalContext') if isinstance(specific, dict) else None
+    token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}'
+    return isinstance(context, str) and token in context
+
+
+def _codex_selected_skill_slugs(payload):
+    metadata = payload.get('internal_chat_message_metadata_passthrough')
+    kinds = metadata.get('content_item_kinds') if isinstance(metadata, dict) else None
+    if not isinstance(kinds, list) or CODEX_SELECTED_SKILL_KIND not in kinds:
+        return set()
+    names = []
+    for part in payload.get('content') or []:
+        text = part.get('text') if isinstance(part, dict) else None
+        if isinstance(text, str):
+            names.extend(CODEX_SELECTED_SKILL_NAME_RE.findall(text))
+    return {
+        name[len(UNBOUND_SKILL_PREFIX):]
+        for name in names
+        if name.startswith(UNBOUND_SKILL_PREFIX)
+        and _skill_policy_valid_slug(name[len(UNBOUND_SKILL_PREFIX):])
+    }
+
+
+def _skill_policy_loaded_facts(event):
+    session_id = event.get('session_id')
+    transcript = event.get('transcript_path')
+    if not isinstance(transcript, str) or not transcript or transcript == 'undefined':
+        return _remember_loaded_skill_facts(session_id, set())
+    observed = set()
+    try:
+        with open(transcript, 'rb') as transcript_file:
+            transcript_file.seek(0, os.SEEK_END)
+            size = transcript_file.tell()
+            transcript_file.seek(max(0, size - 1024 * 1024))
+            if size > 1024 * 1024:
+                transcript_file.readline()
+            lines = transcript_file.readlines()
+        for raw in lines:
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict) or entry.get('type') != 'response_item':
+                continue
+            payload = entry.get('payload')
+            if (
+                isinstance(payload, dict)
+                and payload.get('type') == 'message'
+                and payload.get('role') == 'user'
+            ):
+                observed.update(_codex_selected_skill_slugs(payload))
+    except OSError:
+        pass
+    return _remember_loaded_skill_facts(session_id, observed)
 
 
 def _should_report():
@@ -2195,6 +2298,10 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     cache = load_policy_cache()
     need_pull_policies = cache is None or is_cache_stale(cache)
 
+    metadata = {}
+    cwd = event.get('cwd')
+    if isinstance(cwd, str) and cwd:
+        metadata['cwd'] = cwd
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'codex',
@@ -2202,7 +2309,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
-        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': {}},
+        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': metadata},
     }
     _attach_installed_skill_facts(request_body['pre_tool_use_data']['metadata'], event)
     if need_pull_policies:
@@ -3787,7 +3894,7 @@ def main():
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event)
+            _ack_skill_injection_delivery(event, response)
             return
 
         # Handle UserPromptSubmit - check policy before processing
@@ -3803,7 +3910,7 @@ def main():
                     'event': event
                 })
                 print(json.dumps(response), flush=True)
-                _ack_skill_injection_delivery(event)
+                _ack_skill_injection_delivery(event, response)
                 return
 
             # Allowed but with hook output to emit (e.g. the spend-limit
@@ -3816,7 +3923,7 @@ def main():
                     'event': event
                 })
                 print(json.dumps(response), flush=True)
-                _ack_skill_injection_delivery(event)
+                _ack_skill_injection_delivery(event, response)
                 return
 
             # If allowed, continue to log the event (output printed at end)

@@ -73,6 +73,32 @@ class Gateway(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
 
+class RedirectGateway(BaseHTTPRequestHandler):
+    requests = []
+
+    def log_message(self, *_args):
+        return
+
+    def do_POST(self):
+        self.__class__.requests.append(self.path)
+        if self.path != "/v1/hooks/skills/sync":
+            self.send_response(204)
+            self.end_headers()
+            return
+        self.send_response(302)
+        self.send_header("location", "/redirect-target")
+        self.end_headers()
+
+    def do_GET(self):
+        self.__class__.requests.append(self.path)
+        encoded = json.dumps({"install": [SKILL], "remove": []}).encode()
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
 @pytest.fixture
 def gateway():
     Gateway.requests = []
@@ -187,8 +213,6 @@ def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, g
     }, home, gateway)
     assert json.loads(unavailable.stdout) == {}
 
-    # s1's active inventory was snapped before the detached install. A new
-    # session snapshots the now-discoverable skill before evaluating prompts.
     second = _run("copilot", {"hook_event_name": "SessionStart", "session_id": "s2"}, home, gateway)
     assert second.returncode == 0, second.stderr
     submitted = _run("copilot", {
@@ -207,3 +231,34 @@ def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, g
     output = json.loads(transformed.stdout)
     assert "/unbound-secure-sql" in output["modifiedTransformedPrompt"]
     assert output["modifiedTransformedPrompt"].endswith("Write a database query.")
+
+
+def test_skill_sync_does_not_follow_authenticated_redirects(tmp_path):
+    RedirectGateway.requests = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), RedirectGateway)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        home = tmp_path / "codex"
+        home.mkdir()
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "UNBOUND_GATEWAY_URL": f"http://127.0.0.1:{server.server_port}",
+            "UNBOUND_CODEX_API_KEY": "test-key",
+        }
+        result = subprocess.run(
+            [sys.executable, str(SCRIPTS["codex"]), "--sync-skills"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=env,
+        )
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+
+    assert result.returncode == 0, result.stderr
+    assert RedirectGateway.requests[0] == "/v1/hooks/skills/sync"
+    assert "/redirect-target" not in RedirectGateway.requests
+    assert not (home / ".agents/skills/unbound-secure-sql").exists()

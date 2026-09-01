@@ -4,7 +4,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from tests.conftest import tool_module
 
@@ -72,6 +72,24 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 self.assertFalse((directory / module.UNBOUND_SKILL_MARKER).exists())
             self._reset_root()
 
+    def test_never_trusts_a_symlinked_managed_marker(self):
+        for name, module in CLIENTS.items():
+            with self.subTest(client=name), patch.object(module, "MANAGED_SKILLS_ROOT", self.root):
+                directory = self.root / "unbound-secure-sql"
+                directory.mkdir(parents=True)
+                original = "developer-owned\n"
+                (directory / "SKILL.md").write_text(original)
+                target = self.root / "marker-target"
+                target.write_text("keep me\n")
+                (directory / module.UNBOUND_SKILL_MARKER).symlink_to(target)
+
+                self.assertFalse(module.install_injected_skills([_entry()]))
+                module.prune_injected_skills(["secure-sql"])
+
+                self.assertEqual(target.read_text(), "keep me\n")
+                self.assertEqual((directory / "SKILL.md").read_text(), original)
+            self._reset_root()
+
     def test_sync_sends_hash_inventory_then_applies_plan(self):
         for name, module in CLIENTS.items():
             with self.subTest(client=name), \
@@ -79,14 +97,12 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                     patch.object(module, "SKILLS_SYNC_LOCK_PATH", self.root.parent / f"{name}.lock"):
                 module.install_injected_skills([_entry("old")])
                 incoming = _entry("secure-sql")
-                completed = MagicMock(
-                    returncode=0,
-                    stdout=json.dumps({"install": [incoming], "remove": ["old"]}).encode(),
-                )
-                with patch.object(module.subprocess, "run", return_value=completed) as run:
+                plan = {"install": [incoming], "remove": ["old"]}
+                with patch.object(module, "_request_skill_sync", return_value=plan) as request:
                     module._sync_skills_once("secret")
 
-                payload = json.loads(run.call_args.kwargs["input"])
+                api_key, payload = request.call_args.args
+                self.assertEqual(api_key, "secret")
                 self.assertEqual(payload["installed"][0]["slug"], "old")
                 self.assertTrue((self.root / "unbound-secure-sql" / "SKILL.md").exists())
                 self.assertFalse((self.root / "unbound-old").exists())
@@ -101,11 +117,8 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 module.install_injected_skills([old])
                 incoming = _entry("secure-sql")
                 incoming["sha256"] = "0" * 64
-                completed = MagicMock(
-                    returncode=0,
-                    stdout=json.dumps({"install": [incoming], "remove": ["old"]}).encode(),
-                )
-                with patch.object(module.subprocess, "run", return_value=completed):
+                plan = {"install": [incoming], "remove": ["old"]}
+                with patch.object(module, "_request_skill_sync", return_value=plan):
                     module._sync_skills_once("secret")
 
                 self.assertEqual(
@@ -114,6 +127,21 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 )
                 self.assertFalse((self.root / "unbound-secure-sql").exists())
             self._reset_root()
+
+    def test_sync_failure_logs_never_include_the_api_key(self):
+        for name, module in CLIENTS.items():
+            with self.subTest(client=name), \
+                    patch.object(module, "SKILLS_SYNC_LOCK_PATH", self.root.parent / f"{name}.lock"), \
+                    patch.object(
+                        module,
+                        "_request_skill_sync",
+                        side_effect=TimeoutError("Authorization: Bearer secret"),
+                    ), \
+                    patch.object(module, "log_error") as log_error:
+                module._sync_skills_once("secret")
+
+                logged = " ".join(str(part) for call in log_error.call_args_list for part in call.args)
+                self.assertNotIn("secret", logged)
 
     def test_install_rejects_hash_mismatch_without_writing(self):
         for name, module in CLIENTS.items():
@@ -126,6 +154,21 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
 
     def test_turn_claim_is_written_only_after_output_ack(self):
         event = {"session_id": "s1", "turn_id": "t1"}
+        delivered_outputs = {
+            "copilot": {
+                "permissionDecision": "deny",
+                "permissionDecisionReason": "Invoke /unbound-secure-sql before continuing.",
+            },
+            "cursor": {
+                "permission": "deny",
+                "agent_message": "Invoke /unbound-secure-sql before continuing.",
+            },
+            "codex": {
+                "hookSpecificOutput": {
+                    "additionalContext": "Invoke $unbound-secure-sql before continuing.",
+                },
+            },
+        }
         for name, module in CLIENTS.items():
             with self.subTest(client=name), tempfile.TemporaryDirectory() as tmp:
                 client_event = dict(event)
@@ -136,13 +179,17 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                         with patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
                             module._apply_skill_lifecycle_actions({"inject_skills": [_entry()]}, "key", client_event)
                             self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                            module._ack_skill_injection_delivery(client_event)
+                            module._ack_skill_injection_delivery(client_event, {})
+                            self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
+                            module._ack_skill_injection_delivery(client_event, delivered_outputs[name])
                             self.assertTrue(module._skill_turn_claim_path("s1:t1").exists())
                     continue
                 with patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
                     module._apply_skill_lifecycle_actions({"inject_skills": [_entry()]}, "key", client_event)
                     self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                    module._ack_skill_injection_delivery(client_event)
+                    module._ack_skill_injection_delivery(client_event, {})
+                    self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
+                    module._ack_skill_injection_delivery(client_event, delivered_outputs[name])
                     self.assertTrue(module._skill_turn_claim_path("s1:t1").exists())
 
 
@@ -205,6 +252,23 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertEqual(first["loaded"], {"secure-sql"})
         self.assertEqual(after_eviction, first)
 
+    def test_copilot_finds_the_normal_cli_transcript_without_an_event_path(self):
+        copilot = CLIENTS["copilot"]
+        event = {"session_id": "s1"}
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / ".copilot"
+            transcript = home / "session-state" / "s1" / "events.jsonl"
+            transcript.parent.mkdir(parents=True)
+            transcript.write_text(json.dumps({
+                "type": "skill.invoked",
+                "data": {"name": "unbound-secure-sql"},
+            }) + "\n")
+            with patch.object(copilot, "_copilot_home", return_value=home), \
+                    patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = copilot._skill_policy_loaded_facts(event)
+
+        self.assertEqual(facts["loaded"], {"secure-sql"})
+
     def test_cursor_loaded_state_survives_audit_log_eviction(self):
         cursor = CLIENTS["cursor"]
         event = {"conversation_id": "c1"}
@@ -236,6 +300,31 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                 self.assertIn("/unbound-secure-sql", response["agent_message"])
                 self.assertEqual(cursor._consume_deferred_skill_context(event), "")
 
+    def test_cursor_keeps_deferred_context_when_another_policy_denies_the_tool(self):
+        cursor = CLIENTS["cursor"]
+        event = {"conversation_id": "c1", "generation_id": "g1"}
+        denied = {"permission": "deny", "user_message": "Blocked by another policy."}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+            cursor._PENDING_SKILL_DELIVERY_KEYS.clear()
+            cursor._defer_prompt_skill_context(
+                event, "Invoke /unbound-secure-sql before continuing."
+            )
+            cursor._apply_skill_lifecycle_actions(
+                {"inject_skills": [_entry("another-skill")]}, "key", event
+            )
+
+            response = cursor._with_deferred_skill_context(event, denied)
+            cursor._ack_skill_injection_delivery(event, response)
+
+            self.assertEqual(response, denied)
+            self.assertFalse(cursor._skill_turn_claim_path("c1:g1").exists())
+            delivered = cursor._with_deferred_skill_context(event, {})
+            self.assertIn("/unbound-secure-sql", delivered["agent_message"])
+            cursor._ack_skill_injection_delivery(event, delivered)
+            self.assertTrue(cursor._skill_turn_claim_path("c1:g1").exists())
+            cursor._PENDING_SKILL_DELIVERY_KEYS.clear()
+
     def test_codex_does_not_conflate_skill_delivery_with_confirmed_load(self):
         codex = CLIENTS["codex"]
         with tempfile.TemporaryDirectory() as tmp:
@@ -254,7 +343,94 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                     metadata, {"transcript_path": str(transcript)}
                 )
         self.assertNotIn("loaded_skills", metadata)
-        self.assertNotIn("skills_loaded_this_session", metadata)
+        self.assertEqual(metadata["skills_loaded_this_session"], 0)
+
+    def test_codex_reports_a_host_selected_managed_skill_as_loaded(self):
+        codex = CLIENTS["codex"]
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "rollout.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": (
+                            "<skill>\n<name>unbound-secure-sql</name>\n"
+                            "<path>/tmp/unbound-secure-sql/SKILL.md</path>\n"
+                        ),
+                    }],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["skills.selected_skill_instructions"],
+                    },
+                },
+            }) + "\n")
+            event = {"session_id": "s1", "transcript_path": str(transcript)}
+            with patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = codex._skill_policy_loaded_facts(event)
+
+        self.assertEqual(facts["loaded"], {"secure-sql"})
+        self.assertEqual(facts["session_count"], 1)
+
+    def test_codex_does_not_trust_a_model_tool_call_as_load_evidence(self):
+        codex = CLIENTS["codex"]
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "rollout.jsonl"
+            transcript.write_text(json.dumps({
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "status": "completed",
+                    "name": "exec",
+                    "input": "echo /tmp/unbound-secure-sql/SKILL.md",
+                },
+            }) + "\n")
+            event = {"session_id": "s1", "transcript_path": str(transcript)}
+            with patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = codex._skill_policy_loaded_facts(event)
+
+        self.assertEqual(facts["loaded"], set())
+        self.assertEqual(facts["session_count"], 0)
+
+    def test_user_prompt_skill_facts_include_the_project_directory(self):
+        cases = (
+            (
+                "copilot",
+                CLIENTS["copilot"]._evaluate_user_prompt_policy,
+                {"session_id": "s1", "prompt": "query", "cwd": "/work/copilot"},
+                "/work/copilot",
+            ),
+            (
+                "cursor",
+                CLIENTS["cursor"].process_user_prompt_submit,
+                {
+                    "conversation_id": "s1",
+                    "generation_id": "g1",
+                    "prompt": "query",
+                    "workspace_roots": ["/work/cursor"],
+                },
+                "/work/cursor",
+            ),
+            (
+                "codex",
+                CLIENTS["codex"].process_user_prompt_submit,
+                {"session_id": "s1", "prompt": "query", "cwd": "/work/codex"},
+                "/work/codex",
+            ),
+        )
+        for name, processor, event, expected in cases:
+            module = CLIENTS[name]
+            with self.subTest(client=name), \
+                    patch.object(module, "load_policy_cache", return_value={}), \
+                    patch.object(module, "is_cache_stale", return_value=False), \
+                    patch.object(module, "installed_skill_report", return_value=[]), \
+                    patch.object(module, "send_to_hook_api", return_value={"decision": "allow"}) as send:
+                processor(event, "key")
+
+            request = send.call_args.args[0]
+            metadata = request["pre_tool_use_data"]["metadata"]
+            self.assertEqual(metadata["cwd"], expected)
 
     def test_copilot_keeps_plan_for_the_matching_batched_message(self):
         copilot = CLIENTS["copilot"]
