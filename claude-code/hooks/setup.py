@@ -1006,8 +1006,48 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     return code, out[:sep]
 
 
-def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
-    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
+def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[float], Optional[int]]:
+    """When the organization last asked every device to re-walk its full history, and how
+    far back that walk should reach. Either may be None.
+
+    A device honours the request only if its own last backfill predates it, so the request
+    expires by itself once each device has acted on it -- nobody has to switch it back off.
+    The window is optional: without one the walk uses this installer's own default, which
+    is what every device did before the organization could set it."""
+    try:
+        code, body = _backfill_http_request(
+            # tool_type is a metrics label only; the request itself is org-wide.
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/config/"
+            f"?tool_type={BACKFILL_TOOL_TYPE}",
+            method='GET',
+            headers=_backfill_edr_headers({'Authorization': f'Bearer {api_key}'}),
+            timeout=15,
+        )
+        if code < 200 or code >= 300:
+            debug_print(f"backfill config request failed: HTTP {code}")
+            return None, None
+        config = json.loads(body.decode('utf-8'))
+        requested = config.get('force_backfill_requested_epoch')
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            return None, None
+        days = config.get('force_backfill_days')
+        # bool is an int subclass, so True would otherwise read as a one-day window.
+        if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+            days = None
+        return float(requested), days
+    except Exception as e:
+        debug_print(f"backfill config read failed: {e}")
+        return None, None
+
+
+def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
+                           force: bool = False) -> bool:
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if force:
+        # Marks this upload as the org's requested re-walk. The server still checks the
+        # request itself, so this only narrows what force applies to; it cannot grant it.
+        payload['force'] = True
+    payload_bytes = json.dumps(payload).encode('utf-8')
 
     auth_headers = _backfill_edr_headers({
         'Authorization': f'Bearer {api_key}',
@@ -1387,6 +1427,16 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         home = Path.home()
         started_at = time.time()
         cutoff_mtime = _backfill_read_cutoff(home)
+        force_epoch, force_days = _backfill_force_config(api_key, backend_url)
+        forced = force_epoch is not None and force_epoch > cutoff_mtime
+        if forced:
+            # The organization's window when it set one, otherwise this installer's own
+            # default. Widen only: a window narrower than what this device had already
+            # reached would skip the band in between, and the successful run then advances
+            # the cutoff past it, so that history is never visited again.
+            window = started_at - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            cutoff_mtime = min(cutoff_mtime, window)
+            print("[backfill] Re-reading full history at your organization's request.")
         projects_root = home / '.claude' / 'projects'
         sessions: List[Dict] = []
         capped = False
@@ -1420,7 +1470,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
             if not current_chunk:
                 return
             chunks_total += 1
-            if _backfill_upload_chunk(api_key, backend_url, current_chunk):
+            if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
                 chunks_sent += 1
                 for s in current_chunk:
                     sessions_sent_ids.add(s.get('session_id'))
