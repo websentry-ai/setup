@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 import shutil
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import time
@@ -74,7 +74,9 @@ DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 
 DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
@@ -3531,9 +3533,39 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _install_sh_is_stale() -> bool:
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _discovery_installer():
+    if _is_windows():
+        return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
+    return DISCOVERY_INSTALL_SH, DISCOVERY_INSTALL_URL
+
+
+def _windows_system32_path(*parts: str) -> str:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise OSError("SystemRoot is not set")
+    root = PureWindowsPath(system_root)
+    if not root.is_absolute():
+        raise OSError("SystemRoot is not absolute")
+    return str(root.joinpath("System32", *parts))
+
+
+def _discovery_command(installer_path: Path, backend_url: str):
+    if _is_windows():
+        return [
+            _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+            "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+        ]
+    return ["bash", str(installer_path), "--domain", backend_url]
+
+
+def _discovery_installer_is_stale(installer_path: Path) -> bool:
     try:
-        return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
+        return (time.time() - installer_path.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
     except OSError:
         return True
 
@@ -3673,30 +3705,34 @@ def _dispatch_discovery() -> None:
                     return
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
+                installer_path, installer_url = _discovery_installer()
                 DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if _install_sh_is_stale():
+                if _discovery_installer_is_stale(installer_path):
                     fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
                     os.close(fd)
                     tmp = Path(_tmp)
+                    curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
+                        [curl, "-fsSL", "-o", str(tmp), installer_url],
                         capture_output=True, timeout=30,
                     )
                     if r.returncode == 0:
-                        os.chmod(tmp, 0o755)
-                        os.replace(tmp, DISCOVERY_INSTALL_SH)
+                        if not _is_windows():
+                            os.chmod(tmp, 0o755)
+                        os.replace(tmp, installer_path)
                     else:
                         tmp.unlink(missing_ok=True)
-                        if not DISCOVERY_INSTALL_SH.exists():
-                            log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                        if not installer_path.exists():
+                            log_error(f"discovery {installer_path.name} download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                             return
-                        log_error(f"discovery install.sh refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                        log_error(f"discovery {installer_path.name} refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                discovery_cmd = _discovery_command(installer_path, backend_url)
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DOMAIN": backend_url}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:
