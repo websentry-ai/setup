@@ -33,8 +33,11 @@ def installed_skill_report():
         slug = _managed_skill_slug(directory)
         if not slug:
             continue
+        skill_file = directory / 'SKILL.md'
+        if skill_file.is_symlink():
+            continue
         try:
-            digest = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+            digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
         except OSError:
             continue
         report.append({'slug': slug, 'sha256': digest})
@@ -48,12 +51,15 @@ def _managed_skill_state(slug):
         state['exists'] = directory.is_dir()
         if state['exists']:
             marker = directory / UNBOUND_SKILL_MARKER
+            skill_file = directory / 'SKILL.md'
             state['managed'] = (
                 not directory.is_symlink()
                 and marker.is_file()
                 and not marker.is_symlink()
+                and not skill_file.is_symlink()
             )
-            state['sha256'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+            if state['managed']:
+                state['sha256'] = hashlib.sha256(skill_file.read_bytes()).hexdigest()
     except Exception:
         pass
     return state

@@ -91,6 +91,24 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 self.assertEqual((directory / "SKILL.md").read_text(), original)
             self._reset_root()
 
+    def test_never_reads_or_overwrites_a_symlinked_skill_body(self):
+        for name, module in CLIENTS.items():
+            with self.subTest(client=name), patch.object(module, "MANAGED_SKILLS_ROOT", self.root):
+                directory = self.root / "unbound-secure-sql"
+                directory.mkdir(parents=True)
+                (directory / module.UNBOUND_SKILL_MARKER).touch()
+                target = self.root / "body-target"
+                target.write_text("keep me\n")
+                (directory / "SKILL.md").symlink_to(target)
+
+                self.assertEqual(module.installed_skill_report(), [])
+                self.assertFalse(module.install_injected_skills([_entry()]))
+                module.prune_injected_skills(["secure-sql"])
+
+                self.assertEqual(target.read_text(), "keep me\n")
+                self.assertFalse(directory.exists())
+            self._reset_root()
+
     def test_sync_sends_hash_inventory_then_applies_plan(self):
         for name, module in CLIENTS.items():
             with self.subTest(client=name), \
@@ -215,12 +233,14 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertIn("/unbound-secure-sql", response["modifiedTransformedPrompt"])
         self.assertIn("Write the query.", response["modifiedTransformedPrompt"])
 
-    def test_copilot_transformed_prompt_preserves_deny(self):
-        response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
-            {"transformedPrompt": "Drop the table."},
-            {"decision": "deny", "reason": "Blocked by policy."},
-        )
-        self.assertEqual(response, {"decision": "block", "reason": "Blocked by policy."})
+    def test_copilot_transformed_prompt_preserves_blocking_decisions(self):
+        for decision in ("deny", "block"):
+            with self.subTest(decision=decision):
+                response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
+                    {"transformedPrompt": "Drop the table."},
+                    {"decision": decision, "reason": "Blocked by policy."},
+                )
+                self.assertEqual(response, {"decision": "block", "reason": "Blocked by policy."})
 
     def test_tool_injection_uses_each_clients_native_syntax(self):
         plan = {

@@ -149,8 +149,11 @@ def installed_skill_report():
         slug = _managed_skill_slug(directory)
         if not slug:
             continue
+        skill_file = directory / 'SKILL.md'
+        if skill_file.is_symlink():
+            continue
         try:
-            digest = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+            digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
         except OSError:
             continue
         report.append({'slug': slug, 'sha256': digest})
@@ -164,12 +167,15 @@ def _managed_skill_state(slug):
         state['exists'] = directory.is_dir()
         if state['exists']:
             marker = directory / UNBOUND_SKILL_MARKER
+            skill_file = directory / 'SKILL.md'
             state['managed'] = (
                 not directory.is_symlink()
                 and marker.is_file()
                 and not marker.is_symlink()
+                and not skill_file.is_symlink()
             )
-            state['sha256'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+            if state['managed']:
+                state['sha256'] = hashlib.sha256(skill_file.read_bytes()).hexdigest()
     except Exception:
         pass
     return state
@@ -2351,7 +2357,7 @@ def process_user_prompt_submit(event, api_key):
     api_response = send_to_hook_api(request_body, api_key)
     _cache_policies_from_response(api_response)
     _apply_skill_lifecycle_actions(api_response, api_key, event)
-    if isinstance(api_response, dict) and api_response.get('decision') != 'deny':
+    if isinstance(api_response, dict) and api_response.get('decision') not in ('deny', 'block'):
         context = _skill_policy_native_context(api_response)
         if api_response.get('inject_skills') and isinstance(context, str) and context.strip():
             _defer_prompt_skill_context(event, context)
@@ -3914,7 +3920,7 @@ def main():
             response = process_user_prompt_submit(event, api_key)
 
             # If denied, log the event, transform response for Cursor format and exit
-            if response.get('decision') == 'deny':
+            if response.get('decision') in ('deny', 'block'):
                 append_to_audit_log({
                     'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
                     'event': event

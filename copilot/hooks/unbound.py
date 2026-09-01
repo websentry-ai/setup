@@ -177,8 +177,11 @@ def installed_skill_report():
         slug = _managed_skill_slug(directory)
         if not slug:
             continue
+        skill_file = directory / 'SKILL.md'
+        if skill_file.is_symlink():
+            continue
         try:
-            digest = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+            digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
         except OSError:
             continue
         report.append({'slug': slug, 'sha256': digest})
@@ -192,12 +195,15 @@ def _managed_skill_state(slug):
         state['exists'] = directory.is_dir()
         if state['exists']:
             marker = directory / UNBOUND_SKILL_MARKER
+            skill_file = directory / 'SKILL.md'
             state['managed'] = (
                 not directory.is_symlink()
                 and marker.is_file()
                 and not marker.is_symlink()
+                and not skill_file.is_symlink()
             )
-            state['sha256'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+            if state['managed']:
+                state['sha256'] = hashlib.sha256(skill_file.read_bytes()).hexdigest()
     except Exception:
         pass
     return state
@@ -2800,8 +2806,8 @@ def transform_response_for_copilot_prompt(api_response):
     decision = api_response.get('decision', 'allow')
     reason = api_response.get('reason', '')
 
-    # For UserPromptSubmit, 'deny' maps to 'block'
-    if decision == 'deny':
+    # UserPromptSubmit represents blocked prompts with the 'block' decision.
+    if decision in ('deny', 'block'):
         return {
             'decision': 'block',
             'reason': reason
@@ -2814,7 +2820,7 @@ def transform_response_for_copilot_transformed_prompt(event, api_response):
     transformed = event.get('transformedPrompt') or event.get('prompt') or ''
     if not isinstance(api_response, dict):
         return {}
-    if api_response.get('decision') == 'deny':
+    if api_response.get('decision') in ('deny', 'block'):
         return transform_response_for_copilot_prompt(api_response)
     context = _skill_policy_native_context(api_response)
     if not context:
