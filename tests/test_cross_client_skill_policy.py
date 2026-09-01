@@ -1,4 +1,5 @@
 import hashlib
+import io
 import json
 import shutil
 import tempfile
@@ -213,6 +214,13 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         )
         self.assertIn("/unbound-secure-sql", response["modifiedTransformedPrompt"])
         self.assertIn("Write the query.", response["modifiedTransformedPrompt"])
+
+    def test_copilot_transformed_prompt_preserves_deny(self):
+        response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
+            {"transformedPrompt": "Drop the table."},
+            {"decision": "deny", "reason": "Blocked by policy."},
+        )
+        self.assertEqual(response, {"decision": "block", "reason": "Blocked by policy."})
 
     def test_tool_injection_uses_each_clients_native_syntax(self):
         plan = {
@@ -493,6 +501,32 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                 found, plan = copilot._take_copilot_prompt_plan(current)
         self.assertTrue(found)
         self.assertEqual(plan["inject_skills"][0]["slug"], "secure-sql")
+
+    def test_copilot_transformed_prompt_blocks_stored_and_fallback_denies(self):
+        copilot = CLIENTS["copilot"]
+        event = {
+            "hook_event_name": "userPromptTransformed",
+            "sessionId": "s1",
+            "prompt": "Drop the table.",
+            "transformedPrompt": "Drop the table.",
+        }
+        deny = {"decision": "deny", "reason": "Blocked by policy."}
+        for source in ("stored", "fallback"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
+                    patch.object(copilot, "get_api_key", return_value="key"), \
+                    patch.object(copilot, "_stage_skill_injection_delivery"), \
+                    patch.object(copilot, "_ack_skill_injection_delivery"), \
+                    patch.object(copilot, "_evaluate_user_prompt_policy", return_value=deny) as evaluate, \
+                    patch.object(copilot.sys, "stdin", io.StringIO(json.dumps(event))), \
+                    patch.object(copilot.sys, "stdout", io.StringIO()) as stdout:
+                if source == "stored":
+                    copilot._store_copilot_prompt_plan(event, deny)
+                copilot.main()
+                output = json.loads(stdout.getvalue())
+
+            self.assertEqual(output, {"decision": "block", "reason": "Blocked by policy."})
+            self.assertEqual(evaluate.call_count, 0 if source == "stored" else 1)
 
 
 class GeneratedCoreTests(unittest.TestCase):

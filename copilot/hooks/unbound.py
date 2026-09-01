@@ -2812,8 +2812,10 @@ def transform_response_for_copilot_prompt(api_response):
 
 def transform_response_for_copilot_transformed_prompt(event, api_response):
     transformed = event.get('transformedPrompt') or event.get('prompt') or ''
-    if not isinstance(api_response, dict) or api_response.get('decision') == 'deny':
+    if not isinstance(api_response, dict):
         return {}
+    if api_response.get('decision') == 'deny':
+        return transform_response_for_copilot_prompt(api_response)
     context = _skill_policy_native_context(api_response)
     if not context:
         return {}
