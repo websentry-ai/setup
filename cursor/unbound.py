@@ -8,6 +8,7 @@ import sys
 import json
 import os
 import subprocess
+import shutil
 from pathlib import Path
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -76,6 +77,26 @@ EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exch
 # are byte-identical, so nothing can tell a replay from a genuine repeat.
 SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
                      ('.claude', 'skills'), ('.codex', 'skills'))
+
+# ── skill-injection policy (org-managed skills) ───────────────────────────────
+# Cursor reads personal skills from ~/.cursor/skills. Its own managed store is a
+# separate root, ~/.cursor/skills-cursor, which we never touch.
+CURSOR_SKILLS_ROOT = Path.home() / '.cursor' / 'skills'
+UNBOUND_SKILL_PREFIX = 'unbound-'
+UNBOUND_SKILL_MARKER = '.unbound-managed'
+# Suffixed per tool: the lock guards ONE skills root, and Cursor's is not Claude
+# Code's. A shared lock would make either tool's reconcile a silent no-op while
+# the other held it.
+SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync-cursor.lock'
+INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn-cursor'
+SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
+SKILLS_SYNC_TIMEOUT_SECONDS = 20
+SKILL_LOADED_WINDOW = 10
+# Cursor's own wording, written by Cursor into the prompt it sends the model.
+ATTACHED_SKILLS_MARKER = '<manually_attached_skills>'
+ATTACHED_SKILL_NAME_RE = re.compile(r'^Skill Name:[ \t]*(\S+)', re.MULTILINE)
+SKILL_READ_TOOLS = {'Read', 'ReadFile'}
+_SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
@@ -482,6 +503,444 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
     return 'timeout'
 
 
+def _safe_skill_segment(value):
+    """A path segment safe to join: no traversal, no separators, no glob
+    metacharacters, and nothing Windows reads as a drive or UNC root."""
+    return bool(value) and '/' not in value and '\\' not in value \
+        and '..' not in value and ':' not in value \
+        and not any(ch in value for ch in '*?[')
+
+
+def _attached_skill_names(text):
+    """Skills Cursor inlined into the prompt under <manually_attached_skills>.
+    Cursor writes that block itself, and it tells the model the body is already
+    inlined — so an attached skill loads with no file read for us to see."""
+    names = []
+    if not isinstance(text, str) or ATTACHED_SKILLS_MARKER not in text:
+        return names
+    for chunk in text.split(ATTACHED_SKILLS_MARKER)[1:]:
+        names += ATTACHED_SKILL_NAME_RE.findall(chunk)
+    return names
+
+
+def _loaded_slug_from_read(path):
+    """The slug when `path` is the SKILL.md of a skill we installed, else None.
+    Anchored at our own root: a read anywhere else is the agent browsing files,
+    which is most of what SKILL.md reads actually are."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        parts = Path(path).parts
+    except (TypeError, ValueError):
+        return None
+    if len(parts) < 3 or parts[-1] != 'SKILL.md':
+        return None
+    if Path(*parts[:-2]) != CURSOR_SKILLS_ROOT:
+        return None
+    directory = parts[-2]
+    if not directory.startswith(UNBOUND_SKILL_PREFIX):
+        return None
+    slug = directory[len(UNBOUND_SKILL_PREFIX):]
+    return slug if _SLUG_RE.match(slug) else None
+
+
+def read_skill_facts(event):
+    """`loaded` is what was loaded inside the last SKILL_LOADED_WINDOW prompts;
+    `session_count` ignores the window because the file is append-only and the
+    tokens were spent either way.
+
+    Cursor loads a skill two ways and both are harness-written, never model text:
+    it inlines an attached skill into the prompt, or the agent reads the SKILL.md.
+    Cursor emits no compaction marker, so the window is prompts alone."""
+    facts = {'loaded': set(), 'session_count': 0}
+    path = event.get('transcript_path')
+    if not isinstance(path, str) or not path:
+        return facts
+    try:
+        with open(path, 'rb') as f:
+            lines = f.read().split(b'\n')
+    except OSError:
+        return facts
+
+    session_names = set()
+    turns = 0
+    in_window = True
+    for raw in reversed(lines):
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        role = entry.get('role')
+        content = (entry.get('message') or {}).get('content')
+        if not isinstance(content, list):
+            continue
+        if role == 'user':
+            # Each user record is one prompt, so it is the turn boundary. Counted
+            # before its own attachments so the newest prompt stays in window.
+            turns += 1
+            if turns > SKILL_LOADED_WINDOW:
+                in_window = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                for name in _attached_skill_names(part.get('text')):
+                    if not name.startswith(UNBOUND_SKILL_PREFIX):
+                        continue
+                    session_names.add(name)
+                    if in_window:
+                        facts['loaded'].add(name[len(UNBOUND_SKILL_PREFIX):])
+            continue
+        if role != 'assistant':
+            continue
+        for part in content:
+            if not isinstance(part, dict) or part.get('type') != 'tool_use':
+                continue
+            if part.get('name') not in SKILL_READ_TOOLS:
+                continue
+            slug = _loaded_slug_from_read((part.get('input') or {}).get('path'))
+            if not slug:
+                continue
+            session_names.add(UNBOUND_SKILL_PREFIX + slug)
+            if in_window:
+                facts['loaded'].add(slug)
+
+    facts['session_count'] = len(session_names)
+    return facts
+
+
+def _managed_skill_dirs():
+    # Marker, not prefix, so the prefix can change without orphaning older installs.
+    try:
+        found = []
+        for entry in CURSOR_SKILLS_ROOT.iterdir():
+            try:
+                if entry.is_dir() and (entry / UNBOUND_SKILL_MARKER).exists():
+                    found.append(entry)
+            except OSError:
+                continue
+        return sorted(found, key=lambda p: p.name)
+    except Exception:
+        return []
+
+
+def _slug_of(directory):
+    name = directory.name
+    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    return slug if _SLUG_RE.match(slug) else None
+
+
+def _turn_guard_path(session_id):
+    safe = re.sub(r'[^A-Za-z0-9._-]', '', str(session_id or ''))[:64]
+    return INJECTION_TURN_GUARD_DIR / (safe or 'default')
+
+
+def _turn_guard_read(session_id):
+    try:
+        return _turn_guard_path(session_id).read_text(encoding='utf-8').strip()
+    except OSError:
+        return ''
+
+
+def _turn_guard_write(session_id, turn_id):
+    try:
+        INJECTION_TURN_GUARD_DIR.mkdir(parents=True, exist_ok=True)
+        _turn_guard_path(session_id).write_text(str(turn_id), encoding='utf-8')
+        cutoff = time.time() - 7 * 24 * 3600
+        for stale in INJECTION_TURN_GUARD_DIR.iterdir():
+            if stale.is_file() and stale.stat().st_mtime < cutoff:
+                stale.unlink()
+    except OSError:
+        pass
+
+
+def _injection_turn_id(event):
+    """Turn identity for the injection guard. `generation_id` is one submit-to-stop
+    cycle, so it names the turn exactly. A turn without one gets no guard rather
+    than a shared id, which would suppress injection across every unnamed turn."""
+    return str(event.get('generation_id') or '')
+
+
+def _inject_skill_slugs(inject_skills):
+    if not isinstance(inject_skills, list):
+        return []
+    return [
+        entry['slug'] for entry in inject_skills
+        if isinstance(entry, dict) and isinstance(entry.get('slug'), str) and entry['slug']
+    ]
+
+
+def installed_skill_report():
+    report = []
+    for directory in _managed_skill_dirs():
+        slug = _slug_of(directory)
+        if not slug:
+            continue
+        try:
+            digest = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+        except OSError:
+            continue
+        report.append({'slug': slug, 'sha256': digest})
+    return report
+
+
+def _attach_skill_facts(metadata, event):
+    """`installed_skills` is what the device will DELETE, so it is marker-managed
+    only. `loaded_skills` also counts a developer's own unbound-<slug>: excluding
+    it would re-inject on every turn for a slug we may never overwrite."""
+    installed_skills = installed_skill_report()
+    if not installed_skills:
+        # Nothing installed means nothing to suppress or count, so skip the read.
+        return
+    metadata['installed_skills'] = installed_skills
+    facts = read_skill_facts(event)
+    if facts['loaded']:
+        metadata['loaded_skills'] = sorted(facts['loaded'])
+    metadata['skills_loaded_this_session'] = facts['session_count']
+
+
+def _skill_dir_state(slug):
+    directory = CURSOR_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+    state = {'path': directory, 'exists': False, 'managed': False, 'content_hash': None}
+    try:
+        state['exists'] = directory.is_dir()
+        if state['exists']:
+            state['managed'] = (directory / UNBOUND_SKILL_MARKER).exists()
+            state['content_hash'] = hashlib.sha256((directory / 'SKILL.md').read_bytes()).hexdigest()
+    except Exception:
+        pass
+    return state
+
+
+def install_injected_skills(inject_skills):
+    try:
+        for entry in inject_skills or []:
+            slug = entry.get('slug') if isinstance(entry, dict) else None
+            try:
+                if not isinstance(entry, dict):
+                    log_error(f"skill injection entry is not an object: {type(entry).__name__}", 'skill_injection')
+                    continue
+                content = entry.get('content')
+                if not isinstance(slug, str) or not _safe_skill_segment(slug) or not _SLUG_RE.match(slug):
+                    log_error(f"skill injection rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                if not isinstance(content, str) or not content:
+                    log_error(f"skill injection rejected empty content for slug: {slug}", 'skill_injection')
+                    continue
+
+                data = content.encode('utf-8')
+                # Hash what gets written: a wrong wire hash would pin stale content.
+                expected = hashlib.sha256(data).hexdigest()
+                wire_hash = entry.get('sha256')
+                if isinstance(wire_hash, str) and wire_hash and wire_hash.lower() != expected:
+                    log_error(
+                        f"skill injection hash mismatch for {slug}: wire={wire_hash} computed={expected}",
+                        'skill_injection',
+                    )
+
+                state = _skill_dir_state(slug)
+                directory = state['path']
+                if state['exists'] and not state['managed']:
+                    log_error(f"skill dir not unbound-managed, skipping install: {directory}", 'skill_injection')
+                    continue
+                if state['exists'] and state['managed'] and state['content_hash'] == expected:
+                    continue
+
+                created = not state['exists']
+                directory.mkdir(parents=True, exist_ok=True)
+                try:
+                    # Marker first: a marked dir with a stale body is rewritten next run.
+                    (directory / UNBOUND_SKILL_MARKER).write_text('', encoding='utf-8')
+                except OSError:
+                    # A later reconcile reads an unmarked dir as the developer's own
+                    # skill and skips it forever, so drop the empty one we just made.
+                    if created:
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
+                    raise
+
+                # '.SKILL.' hides the partial file from a scan; the fd closes before the
+                # rename because Windows will not replace an open file.
+                fd, tmp = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
+                try:
+                    with os.fdopen(fd, 'wb') as f:
+                        f.write(data)
+                    os.replace(tmp, str(directory / 'SKILL.md'))
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as e:
+                log_error(f"skill injection failed for {str(slug)[:64]}: {e}", 'skill_injection')
+    except Exception as e:
+        log_error(f"skill injection failed: {e}", 'skill_injection')
+
+
+def _skills_lock_acquire():
+    try:
+        SKILLS_SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - SKILLS_SYNC_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = SKILLS_SYNC_STALE_LOCK_SECONDS + 1
+            if age < SKILLS_SYNC_STALE_LOCK_SECONDS:
+                return None
+            try:
+                SKILLS_SYNC_LOCK_PATH.unlink()
+                return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except OSError:
+                return None
+    except OSError:
+        return None
+
+
+def _skills_lock_release(lock_fd):
+    if lock_fd is None:
+        return
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+    try:
+        SKILLS_SYNC_LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+def _sync_skills_once(api_key):
+    lock_fd = _skills_lock_acquire()
+    if lock_fd is None:
+        return
+    try:
+        payload = json.dumps({'installed': installed_skill_report()})
+        result = subprocess.run(
+            ["curl", "-fsSL", "-X", "POST",
+             "-H", f"Authorization: Bearer {api_key}",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", f"{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync"],
+            input=payload.encode(), capture_output=True, timeout=SKILLS_SYNC_TIMEOUT_SECONDS,
+        )
+        if result.returncode != 0 or not result.stdout:
+            return
+        plan = json.loads(result.stdout.decode('utf-8'))
+        if not isinstance(plan, dict):
+            return
+        prune_injected_skills(plan.get('remove'))
+        install_injected_skills(plan.get('install'))
+    except Exception as e:
+        log_error(f"skills sync failed: {e}", 'skill_injection')
+    finally:
+        _skills_lock_release(lock_fd)
+
+
+def _dispatch_skills_sync(api_key):
+    # Detached: the blocking PreToolUse path must not wait on a reconcile.
+    try:
+        if not api_key:
+            return
+        if RUNNING_FROZEN:
+            # sys.executable is the frozen unbound-hook binary itself.
+            cmd = [sys.executable, 'sync-skills',
+                   os.environ.get('UNBOUND_HOOK_TOOL') or 'cursor']
+        else:
+            # The running file, not SELF_SCRIPT_PATH: under MDM the hook executes from an
+            # admin-managed directory and that user-level path does not exist.
+            script = os.path.abspath(__file__)
+            if not os.path.isfile(script):
+                log_error(f"skills sync skipped: script not found at {script}", 'skill_injection')
+                return
+            cmd = [sys.executable, script, '--sync-skills']
+        popen_kwargs = {
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL,
+            'close_fds': True,
+            'env': {**os.environ, 'UNBOUND_CURSOR_API_KEY': api_key},
+        }
+        if os.name == 'nt':
+            popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        subprocess.Popen(cmd, **popen_kwargs)
+    except Exception as e:
+        log_error(f"skills sync dispatch failed: {e}", 'skill_injection')
+
+
+def prune_injected_skills(remove_skills):
+    # Only ever deletes a directory we marked, even if the gateway names another.
+    try:
+        for slug in remove_skills or []:
+            try:
+                if not isinstance(slug, str) or not _safe_skill_segment(slug) or not _SLUG_RE.match(slug):
+                    log_error(f"skill prune rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                directory = CURSOR_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+                if not directory.is_dir():
+                    continue
+                if directory.is_symlink() or not (directory / UNBOUND_SKILL_MARKER).exists():
+                    log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
+                    continue
+                shutil.rmtree(directory)
+            except Exception as e:
+                log_error(f"skill prune failed for {str(slug)[:64]}: {e}", 'skill_injection')
+    except Exception as e:
+        log_error(f"skill prune failed: {e}", 'skill_injection')
+
+
+def _prompt_injection_metadata(event):
+    """Facts a USER_PROMPT skill policy is decided against. Nothing in here may
+    raise: a prompt submission must not fail over a marker file."""
+    metadata = {}
+    try:
+        roots = [r for r in (event.get('workspace_roots') or []) if isinstance(r, str) and r]
+        if roots:
+            metadata['cwd'] = roots[0]
+        _attach_skill_facts(metadata, event)
+        turn_id = _injection_turn_id(event)
+        if turn_id and _turn_guard_read(event.get('conversation_id')) == turn_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"prompt injection metadata failed: {exc}", 'skill_injection')
+    return metadata
+
+
+def _apply_skill_actions(event, api_response, api_key, denied):
+    """The install/prune/guard side effects a policy response carries. `denied`
+    marks the TOOL_USE deny path, where the gateway only ever denies for a skill
+    this device already reported current — so there is nothing to install, only a
+    turn to claim."""
+    if not isinstance(api_response, dict):
+        return
+    try:
+        if api_response.get('inject_skills'):
+            claim = denied or api_response.get('decision') != 'deny'
+            if claim and _inject_skill_slugs(api_response.get('inject_skills')):
+                turn_id = _injection_turn_id(event)
+                if turn_id:
+                    _turn_guard_write(event.get('conversation_id'), turn_id)
+        if api_response.get('remove_skills'):
+            prune_lock = _skills_lock_acquire()
+            if prune_lock is not None:
+                try:
+                    prune_injected_skills(api_response.get('remove_skills'))
+                finally:
+                    _skills_lock_release(prune_lock)
+        if api_response.get('sync_skills'):
+            _dispatch_skills_sync(api_key)
+    except Exception as exc:
+        log_error(f"skill actions failed: {exc}", 'skill_injection')
+
+
 def format_hook_response(api_response):
     """Convert API response to Cursor hook output format (permission/user_message/agent_message)."""
     if not api_response:
@@ -784,6 +1243,11 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     if file_path:
         metadata['file_path'] = file_path
 
+    _attach_skill_facts(metadata, event)
+    turn_id = _injection_turn_id(event)
+    if turn_id and _turn_guard_read(conversation_id) == turn_id:
+        metadata['already_injected_this_turn'] = True
+
     approval_key = f"{tool_name}:{file_path}" if file_path else tool_name
     is_retry = _is_approval_retry(approval_key)
 
@@ -882,6 +1346,10 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             ),
         }
 
+    _apply_skill_actions(
+        event, api_response, api_key,
+        denied=api_response.get('decision') in ('deny', 'block'),
+    )
     return format_hook_response(api_response)
 
 
@@ -1655,6 +2123,11 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
 
     _attach_tool_content_hash(metadata)
 
+    _attach_skill_facts(metadata, event)
+    turn_id = _injection_turn_id(event)
+    if turn_id and _turn_guard_read(conversation_id) == turn_id:
+        metadata['already_injected_this_turn'] = True
+
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
 
@@ -1760,6 +2233,10 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
         if server_cfg:
             _dispatch_mcp_server_scan(mcp_server, server_cfg)
 
+    _apply_skill_actions(
+        event, api_response, api_key,
+        denied=api_response.get('decision') in ('deny', 'block'),
+    )
     return format_hook_response(api_response)
 
 
@@ -1778,13 +2255,21 @@ def process_user_prompt_submit(event, api_key):
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(event),
-        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
+        'pre_tool_use_data': {
+            'tool_name': '',
+            'command': '',
+            'metadata': _prompt_injection_metadata(event),
+        },
     }
     if need_pull_policies:
         request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
     _cache_policies_from_response(api_response)
+    # An allow carrying inject_skills is the in-turn skill instruction; it claims
+    # the turn so a TOOL_USE injection cannot fire a second time inside it.
+    _apply_skill_actions(event, api_response, api_key, denied=False)
     return api_response if api_response else {}
 
 
@@ -3205,7 +3690,11 @@ def main():
     # Get API key (will be None if not set)
     api_key = get_api_key()
     _cached_api_key = api_key
-    
+
+    if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
+        _sync_skills_once(api_key)
+        return
+
     try:
         # Read JSON from stdin
         input_data = sys.stdin.read().strip()
@@ -3230,6 +3719,7 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _check_self_update()
             _dispatch_discovery()
+            _dispatch_skills_sync(api_key)
             print("{}")
             return
         generation_id = event.get('generation_id')
@@ -3267,6 +3757,19 @@ def main():
         if hook_event_name == 'beforeSubmitPrompt':
             # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
+
+            # Allowed, with something for the model: `additional_context` is the
+            # only channel Cursor's beforeSubmitPrompt reads on an allow. The prompt
+            # is still logged first — the turn's own record feeds the recent-prompt
+            # window and the interrupted-request cleanup below.
+            additional_context = (response or {}).get('additionalContext')
+            if additional_context and response.get('decision') != 'deny':
+                append_to_audit_log({
+                    'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
+                    'event': event
+                })
+                print(json.dumps({'additional_context': additional_context}), flush=True)
+                return
 
             # If denied, log the event, transform response for Cursor format and exit
             if response.get('decision') == 'deny':

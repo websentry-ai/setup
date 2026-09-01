@@ -20,6 +20,14 @@ import pytest
 from conftest import REPO, TOOL_PY
 
 MCP_SCAN_TOOLS = ("claude-code", "cursor", "codex")  # copilot has no mcp scan
+# Every tool that reconciles org-managed skills, and the env var its detached
+# child reads the key from. augment ships no skill-injection half.
+SKILLS_SYNC_KEY_ENV = {
+    "claude-code": "UNBOUND_CLAUDE_API_KEY",
+    "copilot": "UNBOUND_COPILOT_API_KEY",
+    "cursor": "UNBOUND_CURSOR_API_KEY",
+    "codex": "UNBOUND_CODEX_API_KEY",
+}
 
 
 @pytest.fixture
@@ -88,25 +96,35 @@ def test_frozen_mcp_scan_exec_contract(frozen_module):
     assert json.loads(env.get("UNBOUND_MCP_SERVER_JSON", "{}")) == server_config
 
 
-@pytest.mark.parametrize("frozen_module", ["claude-code"], indirect=True)
-def test_frozen_skills_sync_exec_contract(frozen_module, monkeypatch):
+@pytest.mark.parametrize("frozen_module", list(SKILLS_SYNC_KEY_ENV), indirect=True)
+def test_frozen_skills_sync_exec_contract(frozen_module, monkeypatch, request):
+    tool = request.node.callspec.params["frozen_module"]
     m, calls = frozen_module
-    monkeypatch.setenv("UNBOUND_HOOK_TOOL", "claude-code")
+    monkeypatch.setenv("UNBOUND_HOOK_TOOL", tool)
     m._dispatch_skills_sync("contract-key")
     assert len(calls) == 1, "expected exactly one skills-sync exec"
     cmd, kwargs = calls[0]
-    assert cmd == [m.sys.executable, "sync-skills", "claude-code"]
+    assert cmd == [m.sys.executable, "sync-skills", tool]
     env = kwargs.get("env") or {}
-    assert env.get("UNBOUND_CLAUDE_API_KEY") == "contract-key"
+    assert env.get(SKILLS_SYNC_KEY_ENV[tool]) == "contract-key"
     assert "contract-key" not in cmd, "key must travel via env, never argv"
 
 
-@pytest.mark.parametrize("frozen_module", ["claude-code"], indirect=True)
-def test_frozen_skills_sync_defaults_the_tool(frozen_module, monkeypatch):
+@pytest.mark.parametrize("frozen_module", list(SKILLS_SYNC_KEY_ENV), indirect=True)
+def test_frozen_skills_sync_defaults_the_tool(frozen_module, monkeypatch, request):
+    tool = request.node.callspec.params["frozen_module"]
     m, calls = frozen_module
     monkeypatch.delenv("UNBOUND_HOOK_TOOL", raising=False)
     m._dispatch_skills_sync("contract-key")
-    assert calls[0][0] == [m.sys.executable, "sync-skills", "claude-code"]
+    assert calls[0][0] == [m.sys.executable, "sync-skills", tool]
+
+
+@pytest.mark.parametrize("frozen_module", list(SKILLS_SYNC_KEY_ENV), indirect=True)
+def test_frozen_skills_sync_contract_is_callable_by_name(frozen_module):
+    """`unbound-hook sync-skills <tool>` resolves both of these off the module."""
+    m, _ = frozen_module
+    assert callable(getattr(m, "_sync_skills_once", None))
+    assert callable(getattr(m, "get_api_key", None))
 
 
 @pytest.mark.parametrize("frozen_module", list(TOOL_PY), indirect=True)
