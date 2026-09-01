@@ -268,6 +268,24 @@ class TestBackfillVscodeUsage(unittest.TestCase):
         self.assertEqual(setup._backfill_entry_data({"data": {"k": 1}}), {"k": 1})
         self.assertEqual(setup._backfill_entry_data("not an entry"), {})
 
+    def test_every_turn_predicate_matches_the_server(self):
+        # The server starts an exchange only on a non-blank STRING content. Anything the
+        # client counts differently shifts record_index_base and the sliced usage/model
+        # arrays, so the ceiling list and the slice boundaries must agree with it exactly.
+        def server_accepts(content):
+            return isinstance(content, str) and bool(content.strip())
+
+        for content in ["hi", "  ", "", "0", "\t\n", "🔥", 5, 0, True, False,
+                        ["x"], {"a": 1}, None, 3.14]:
+            entry = {"type": "user.message", "timestamp": _iso(BASE_MS),
+                     "data": {"content": content}}
+            expected = server_accepts(content)
+            self.assertEqual(setup._backfill_is_user_message(entry), expected, content)
+            self.assertEqual(setup._backfill_exchange_boundaries([entry]) == [0],
+                             expected, content)
+            self.assertEqual(len(setup._backfill_turn_ceilings([entry, entry])) == 2,
+                             expected, content)
+
     def test_turn_ceilings_never_decrease(self):
         # The scan takes the first ceiling a request fits under, so out-of-order transcript
         # stamps must not produce a window that reaches backwards.

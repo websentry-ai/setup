@@ -1112,13 +1112,8 @@ def _backfill_turn_ceilings(entries: List[Dict]) -> List[float]:
     accepts. Turns are divided at their close, not their start, because VS Code stamps a
     request when it is created, fractionally BEFORE the prompt reaches the transcript.
     Dividing on prompts would hand every request to the turn before it."""
-    starts = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict) or entry.get('type') != 'user.message':
-            continue
-        content = _backfill_entry_data(entry).get('content')
-        if isinstance(content, str) and content.strip():
-            starts.append(index)
+    starts = [index for index, entry in enumerate(entries)
+              if _backfill_is_user_message(entry)]
     ceilings: List[float] = []
     previous = float('-inf')
     for position, start in enumerate(starts):
@@ -1501,12 +1496,13 @@ def _backfill_entry_data(entry) -> Dict:
 
 
 def _backfill_is_user_message(entry) -> bool:
-    # Mirror server-side parse_copilot_session: a new exchange starts on a
-    # user.message with non-empty data.content.
+    # Mirror server-side parse_copilot_session: a new exchange starts on a user.message
+    # whose data.content is a non-blank string. Non-string content starts no exchange
+    # there, so counting one here would shift every later record_index.
     if not isinstance(entry, dict) or entry.get('type') != 'user.message':
         return False
     content = _backfill_entry_data(entry).get('content')
-    return bool(content and str(content).strip())
+    return isinstance(content, str) and bool(content.strip())
 
 
 def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
