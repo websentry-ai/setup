@@ -220,7 +220,10 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(mapped["type"], "afterMCPExecution")
         self.assertEqual(mapped["server_name"], "github-mcp-server")
         self.assertEqual(mapped["mcp_tool_name"], "search_code")
-        self.assertNotIn("mcp_server_config", mapped)
+        self.assertEqual(
+            mapped["mcp_server_config"],
+            {"additional_data": {"scope": "copilot-builtin"}},
+        )
 
     def test_other_builtin_mcp_is_reported_without_local_config(self):
         mapped = unbound.map_copilot_tool(
@@ -233,7 +236,10 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         self.assertEqual(mapped["type"], "afterMCPExecution")
         self.assertEqual(mapped["server_name"], "playwright")
         self.assertEqual(mapped["mcp_tool_name"], "browser_navigate")
-        self.assertNotIn("mcp_server_config", mapped)
+        self.assertEqual(
+            mapped["mcp_server_config"],
+            {"additional_data": {"scope": "copilot-builtin"}},
+        )
 
     def test_transcript_mcp_fields_are_used_without_parsing_tool_name(self):
         path = _transcript([

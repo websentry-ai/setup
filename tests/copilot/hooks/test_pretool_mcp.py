@@ -167,7 +167,7 @@ class TestResolveVscodeMcp(unittest.TestCase):
             unbound.resolve_copilot_mcp(
                 "github-mcp-server-search_code", {}
             ),
-            ("github-mcp-server", "search_code", None),
+            ("github-mcp-server", "search_code", {'additional_data': {'scope': 'copilot-builtin'}}),
         )
 
     def test_configured_github_wins_over_builtin_shortcut(self):
@@ -196,7 +196,7 @@ class TestResolveVscodeMcp(unittest.TestCase):
                     unbound.resolve_copilot_mcp(
                         "github-mcp-server-search_code", servers, **explicit
                     ),
-                    ("github-mcp-server", "search_code", None),
+                    ("github-mcp-server", "search_code", {'additional_data': {'scope': 'copilot-builtin'}}),
                 )
 
     def test_longer_configured_server_wins_over_builtin_prefix(self):
@@ -367,7 +367,10 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(pretool["tool_name"], "mcp__github-mcp-server__search_code")
         self.assertEqual(pretool["metadata"]["mcp_server"], "github-mcp-server")
         self.assertEqual(pretool["metadata"]["mcp_tool"], "search_code")
-        self.assertNotIn("mcp_server_config", pretool["metadata"])
+        self.assertEqual(
+            pretool["metadata"]["mcp_server_config"],
+            {"additional_data": {"scope": "copilot-builtin"}},
+        )
 
     def test_unknown_server_dispatches_targeted_scan(self):
         event = {
