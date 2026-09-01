@@ -50,9 +50,11 @@ def run_skills_sync(args) -> int:
         module = load_hook_module(args[0])
         sync = getattr(module, "_sync_skills_once", None)
         read_key = getattr(module, "get_api_key", None)
-        if sync is None or read_key is None:
+        if sync is None:
             return 0
-        api_key = read_key()
+        api_key = read_key() if callable(read_key) else os.getenv(
+            getattr(module, "SKILL_POLICY_API_KEY_ENV", "")
+        )
         if api_key:
             sync(api_key)
     except Exception:

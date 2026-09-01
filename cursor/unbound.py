@@ -17,6 +17,7 @@ import hashlib
 import re
 import sqlite3
 import shutil
+import urllib.request
 import platform
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote, urlparse
@@ -116,16 +117,11 @@ _cached_api_key = None
 _reporting_error = False
 
 
-# Skill policy lifecycle
-import urllib.request
-
-
 SKILL_LOADED_WINDOW = 10
 SKILL_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 
 
 def _skill_policy_transcript_tail(path):
-    """Read a bounded JSONL tail and discard a partial first record."""
     try:
         with open(path, 'rb') as transcript_file:
             size = os.fstat(transcript_file.fileno()).st_size
@@ -463,34 +459,22 @@ def _dispatch_skills_sync(api_key):
 
 def _attach_installed_skill_facts(metadata, event=None):
     installed = installed_skill_report()
-    visible_inventory = globals().get('_skill_policy_visible_inventory')
-    if callable(visible_inventory):
-        try:
-            installed = visible_inventory(event or {}, installed)
-        except Exception as exc:
-            log_error(f"skill visible inventory failed: {exc}", 'skill_injection')
-    if installed:
-        metadata['installed_skills'] = installed
-    loaded_facts = globals().get('_skill_policy_loaded_facts')
-    if callable(loaded_facts):
-        try:
-            facts = loaded_facts(event or {})
-            loaded = facts.get('loaded') if isinstance(facts, dict) else None
-            count = facts.get('session_count') if isinstance(facts, dict) else None
-            if loaded:
-                metadata['loaded_skills'] = sorted(loaded)
-            if isinstance(count, int) and count >= 0:
-                metadata['skills_loaded_this_session'] = count
-        except Exception as exc:
-            log_error(f"skill loaded facts failed: {exc}", 'skill_injection')
-    turn_key = globals().get('_skill_policy_turn_key')
-    if callable(turn_key):
-        try:
-            key = turn_key(event or {})
-            if key and _skill_turn_claim_path(key).exists():
-                metadata['already_injected_this_turn'] = True
-        except Exception:
-            pass
+    if not installed:
+        return
+    metadata['installed_skills'] = installed
+    try:
+        facts = _skill_policy_loaded_facts(event or {})
+        if facts['loaded']:
+            metadata['loaded_skills'] = sorted(facts['loaded'])
+        metadata['skills_loaded_this_session'] = facts['session_count']
+    except Exception as exc:
+        log_error(f"skill loaded facts failed: {exc}", 'skill_injection')
+    try:
+        key = _skill_policy_turn_key(event or {})
+        if key and _skill_turn_claim_path(key).exists():
+            metadata['already_injected_this_turn'] = True
+    except OSError:
+        pass
 
 
 def _skill_policy_native_context(api_response):
@@ -537,60 +521,9 @@ def _cleanup_skill_policy_state():
         pass
 
 
-def _remembered_session_skill_slugs(session_id):
-    if not session_id:
-        return set()
-    path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
-        str(session_id).encode('utf-8', 'replace')
-    ).hexdigest()
-    try:
-        if not path.is_file() or path.stat().st_size > 1024 * 1024:
-            return set()
-        return {
-            slug for slug in path.read_text(encoding='utf-8').splitlines()
-            if _skill_policy_valid_slug(slug)
-        }
-    except OSError:
-        return set()
-
-
-def _finalize_skill_facts(session_id, loaded, observed=None):
-    """Keep the active context window separate from the lifetime session count."""
-    remembered = _remembered_session_skill_slugs(session_id)
-    current = {
-        slug for slug in (loaded or set())
-        if _skill_policy_valid_slug(slug)
-    }
-    session_observed = {
-        slug for slug in (observed if observed is not None else current)
-        if _skill_policy_valid_slug(slug)
-    }
-    missing = sorted(session_observed - remembered)
-    if session_id and missing:
-        path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
-            str(session_id).encode('utf-8', 'replace')
-        ).hexdigest()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-            try:
-                os.write(fd, ''.join(f'{slug}\n' for slug in missing).encode('utf-8'))
-            finally:
-                os.close(fd)
-            remembered.update(missing)
-        except OSError:
-            remembered.update(session_observed)
-    else:
-        remembered.update(session_observed)
-    return {'loaded': current, 'session_count': len(remembered)}
-
-
 def _claim_skill_injection_turn(event):
-    turn_key = globals().get('_skill_policy_turn_key')
-    if not callable(turn_key):
-        return
     try:
-        key = turn_key(event or {})
+        key = _skill_policy_turn_key(event or {})
         if not key:
             return
         path = _skill_turn_claim_path(key)
@@ -604,45 +537,10 @@ def _claim_skill_injection_turn(event):
         pass
 
 
-_PENDING_SKILL_DELIVERY_KEYS = set()
-
-
-def _stage_skill_injection_delivery(event, api_response):
-    if not isinstance(api_response, dict) or not api_response.get('inject_skills'):
-        return
-    turn_key = globals().get('_skill_policy_turn_key')
-    if not callable(turn_key):
-        return
-    try:
-        key = turn_key(event or {})
-        if key:
-            _PENDING_SKILL_DELIVERY_KEYS.add(key)
-    except Exception:
-        pass
-
-
-def _ack_skill_injection_delivery(event, hook_output):
-    output_delivered = globals().get('_skill_policy_output_delivered')
-    if not callable(output_delivered) or not output_delivered(hook_output):
-        return
-    turn_key = globals().get('_skill_policy_turn_key')
-    if not callable(turn_key):
-        return
-    try:
-        key = turn_key(event or {})
-        if not key or key not in _PENDING_SKILL_DELIVERY_KEYS:
-            return
-        _claim_skill_injection_turn(event or {})
-        _PENDING_SKILL_DELIVERY_KEYS.discard(key)
-    except Exception:
-        pass
-
-
-def _apply_skill_lifecycle_actions(api_response, api_key, event=None):
+def _apply_skill_lifecycle_actions(api_response, api_key):
     if not isinstance(api_response, dict):
         return
     try:
-        _stage_skill_injection_delivery(event or {}, api_response)
         if api_response.get('remove_skills'):
             lock_fd = _skills_lock_acquire()
             if lock_fd is not None:
@@ -654,6 +552,8 @@ def _apply_skill_lifecycle_actions(api_response, api_key, event=None):
             _dispatch_skills_sync(api_key)
     except Exception as exc:
         log_error(f"skill lifecycle action failed: {exc}", 'skill_injection')
+
+
 def _skill_policy_turn_key(event):
     conversation = event.get('conversation_id')
     generation = event.get('generation_id')
@@ -669,81 +569,76 @@ def _skill_policy_output_delivered(output):
 
 
 def _skill_policy_loaded_facts(event):
-    conversation = event.get('conversation_id')
-    if not conversation:
-        return _finalize_skill_facts('', set())
-    digest = hashlib.sha256(str(conversation).encode('utf-8', 'replace')).hexdigest()
-    target = SKILL_POLICY_STATE_ROOT / 'cursor-windows' / f'{digest}.json'
-    state = {'turns': [], 'loads': {}}
-    try:
-        saved = json.loads(target.read_text(encoding='utf-8'))
-        if isinstance(saved, dict):
-            turns = saved.get('turns')
-            loads = saved.get('loads')
-            if isinstance(turns, list) and isinstance(loads, dict):
-                state['turns'] = [item for item in turns if isinstance(item, str) and item][-2048:]
-                state['loads'] = {
-                    slug: turn for slug, turn in loads.items()
-                    if _skill_policy_valid_slug(slug) and isinstance(turn, str) and turn
-                }
-    except (OSError, ValueError, TypeError):
-        pass
+    current = set()
+    if event.get('hook_event_name') == 'beforeReadFile':
+        name = _skill_name_from_path(event.get('file_path'), event.get('workspace_roots'))
+        if isinstance(name, str) and name.startswith(UNBOUND_SKILL_PREFIX):
+            slug = name[len(UNBOUND_SKILL_PREFIX):]
+            if _skill_policy_valid_slug(slug):
+                current.add(slug)
 
-    events = []
-    try:
-        for row in load_existing_logs():
-            logged = row.get('event') if isinstance(row, dict) else None
-            if not isinstance(logged, dict):
-                continue
-            if conversation and logged.get('conversation_id') != conversation:
-                continue
-            events.append(logged)
-    except Exception:
-        pass
-    if event.get('hook_event_name') == 'beforeSubmitPrompt':
-        events.append(event)
+    transcript = event.get('transcript_path')
+    if not isinstance(transcript, str) or not transcript:
+        return {'loaded': current, 'session_count': len(current)}
 
-    turns = state['turns']
-    loads = state['loads']
-    known_turns = set(turns)
-    for logged in events:
-        generation = logged.get('generation_id')
-        if not isinstance(generation, str) or not generation:
-            continue
-        if logged.get('hook_event_name') == 'beforeSubmitPrompt':
-            if generation not in known_turns:
-                turns.append(generation)
-                known_turns.add(generation)
-            continue
-        if logged.get('hook_event_name') != 'beforeReadFile':
-            continue
-        name = _skill_name_from_path(logged.get('file_path'), logged.get('workspace_roots'))
-        slug = name[len(UNBOUND_SKILL_PREFIX):] if isinstance(name, str) and name.startswith(UNBOUND_SKILL_PREFIX) else ''
-        if _skill_policy_valid_slug(slug):
-            loads[slug] = generation
-
-    state['turns'] = turns[-2048:]
-    retained = set(state['turns'])
-    state['loads'] = {slug: turn for slug, turn in loads.items() if turn in retained}
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        fd, temp_path = tempfile.mkstemp(dir=str(target.parent), prefix='.window-', suffix='.tmp')
+    loaded = set(current)
+    session_names = set(current)
+    turns = 0
+    in_window = True
+    for raw in reversed(_skill_policy_transcript_tail(transcript)):
         try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as temp_file:
-                json.dump(state, temp_file, sort_keys=True)
-            os.replace(temp_path, target)
+            entry = json.loads(raw)
         except Exception:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if entry.get('role') == 'user':
+            turns += 1
+            if turns > SKILL_LOADED_WINDOW:
+                in_window = False
+            continue
+        if entry.get('role') != 'assistant':
+            continue
+        message = entry.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
+        for part in content if isinstance(content, list) else []:
+            if not isinstance(part, dict) or part.get('type') != 'tool_use' or part.get('name') != 'Read':
+                continue
+            tool_input = part.get('input')
+            path = tool_input.get('path') if isinstance(tool_input, dict) else None
+            name = _skill_name_from_path(path, event.get('workspace_roots'))
+            if not isinstance(name, str) or not name.startswith(UNBOUND_SKILL_PREFIX):
+                continue
+            slug = name[len(UNBOUND_SKILL_PREFIX):]
+            if not _skill_policy_valid_slug(slug):
+                continue
+            session_names.add(slug)
+            if in_window:
+                loaded.add(slug)
+    try:
+        with open(transcript, 'rb') as transcript_file:
+            for raw in transcript_file:
+                try:
+                    entry = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict) or entry.get('role') != 'assistant':
+                    continue
+                message = entry.get('message')
+                content = message.get('content') if isinstance(message, dict) else None
+                for part in content if isinstance(content, list) else []:
+                    if not isinstance(part, dict) or part.get('type') != 'tool_use' or part.get('name') != 'Read':
+                        continue
+                    tool_input = part.get('input')
+                    path = tool_input.get('path') if isinstance(tool_input, dict) else None
+                    name = _skill_name_from_path(path, event.get('workspace_roots'))
+                    if isinstance(name, str) and name.startswith(UNBOUND_SKILL_PREFIX):
+                        slug = name[len(UNBOUND_SKILL_PREFIX):]
+                        if _skill_policy_valid_slug(slug):
+                            session_names.add(slug)
     except OSError:
         pass
-
-    active_turns = set(state['turns'][-(SKILL_LOADED_WINDOW + 1):])
-    loaded = {slug for slug, turn in state['loads'].items() if turn in active_turns}
-    return _finalize_skill_facts(conversation, loaded, set(state['loads']))
+    return {'loaded': loaded, 'session_count': len(session_names)}
 
 
 def _should_report():
@@ -1526,7 +1421,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             ),
         }
 
-    _apply_skill_lifecycle_actions(api_response, api_key, event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     return format_hook_response(api_response)
 
 
@@ -2406,7 +2301,7 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
         if server_cfg:
             _dispatch_mcp_server_scan(mcp_server, server_cfg)
 
-    _apply_skill_lifecycle_actions(api_response, api_key, event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     return format_hook_response(api_response)
 
 
@@ -2441,7 +2336,7 @@ def process_user_prompt_submit(event, api_key):
 
     api_response = send_to_hook_api(request_body, api_key)
     _cache_policies_from_response(api_response)
-    _apply_skill_lifecycle_actions(api_response, api_key, event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     if isinstance(api_response, dict) and api_response.get('decision') not in ('deny', 'block'):
         context = _skill_policy_native_context(api_response)
         if api_response.get('inject_skills') and isinstance(context, str) and context.strip():
@@ -2503,13 +2398,18 @@ def _with_deferred_skill_context(event, response):
     context = _consume_deferred_skill_context(event)
     if not context:
         return response
-    _stage_skill_injection_delivery(event, {'inject_skills': [{'slug': 'deferred'}]})
+    existing = response.get('agent_message')
+    agent_message = '\n\n'.join(
+        part for part in (existing, context)
+        if isinstance(part, str) and part.strip()
+    )
     # Cursor only feeds agent_message to the model on a denied tool call.
     # Deny this first call once, then the agent invokes the skill and retries.
     return {
+        **response,
         'permission': 'deny',
         'user_message': 'Loading a skill required by organization policy. The agent will retry this action.',
-        'agent_message': context,
+        'agent_message': agent_message,
     }
 
 
@@ -4003,7 +3903,8 @@ def main():
         if hook_event_name == 'preToolUse':
             response = _with_deferred_skill_context(event, process_pre_tool_use(event, api_key))
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event, response)
+            if _skill_policy_output_delivered(response):
+                _claim_skill_injection_turn(event)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -4014,7 +3915,8 @@ def main():
                 event, process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             )
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event, response)
+            if _skill_policy_output_delivered(response):
+                _claim_skill_injection_turn(event)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -4028,7 +3930,8 @@ def main():
                 mcp_server=mcp_server, mcp_tool=mcp_tool_name
             ))
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event, response)
+            if _skill_policy_output_delivered(response):
+                _claim_skill_injection_turn(event)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return

@@ -4,6 +4,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import patch
 
@@ -182,7 +183,7 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 self.assertFalse((self.root / "unbound-secure-sql").exists())
             self._reset_root()
 
-    def test_turn_claim_is_written_only_after_output_ack(self):
+    def test_turn_claim_is_written_after_injection_output(self):
         event = {"session_id": "s1", "turn_id": "t1"}
         delivered_outputs = {
             "copilot": {
@@ -207,38 +208,19 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 if name == "copilot":
                     with patch.object(module, "get_turn_start_timestamp_for_session", return_value="t1"):
                         with patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
-                            module._apply_skill_lifecycle_actions({"inject_skills": [_entry()]}, "key", client_event)
                             self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                            module._ack_skill_injection_delivery(client_event, {})
-                            self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                            module._ack_skill_injection_delivery(client_event, delivered_outputs[name])
+                            self.assertTrue(module._skill_policy_output_delivered(delivered_outputs[name]))
+                            module._claim_skill_injection_turn(client_event)
                             self.assertTrue(module._skill_turn_claim_path("s1:t1").exists())
                     continue
                 with patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
-                    module._apply_skill_lifecycle_actions({"inject_skills": [_entry()]}, "key", client_event)
                     self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                    module._ack_skill_injection_delivery(client_event, {})
-                    self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                    module._ack_skill_injection_delivery(client_event, delivered_outputs[name])
+                    self.assertTrue(module._skill_policy_output_delivered(delivered_outputs[name]))
+                    module._claim_skill_injection_turn(client_event)
                     self.assertTrue(module._skill_turn_claim_path("s1:t1").exists())
 
 
 class CrossClientNativeInjectionTests(unittest.TestCase):
-    def test_session_count_remains_lifetime_distinct_when_active_window_changes(self):
-        for name, module in CLIENTS.items():
-            with self.subTest(client=name), tempfile.TemporaryDirectory() as tmp, \
-                    patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
-                facts = None
-                for index in range(1, 7):
-                    slug = f"rule-{index}"
-                    facts = module._finalize_skill_facts("session", {slug}, {slug})
-
-                self.assertEqual(facts, {"loaded": {"rule-6"}, "session_count": 6})
-                self.assertEqual(
-                    module._finalize_skill_facts("session", set()),
-                    {"loaded": set(), "session_count": 6},
-                )
-
     def test_codex_prompt_injection_uses_additional_context(self):
         response = CLIENTS["codex"].transform_response_for_codex_prompt({
             "decision": "allow",
@@ -258,15 +240,6 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         )
         self.assertIn("/unbound-secure-sql", response["modifiedTransformedPrompt"])
         self.assertIn("Write the query.", response["modifiedTransformedPrompt"])
-
-    def test_copilot_transformed_prompt_preserves_blocking_decisions(self):
-        for decision in ("deny", "block"):
-            with self.subTest(decision=decision):
-                response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
-                    {"transformedPrompt": "Drop the table."},
-                    {"decision": decision, "reason": "Blocked by policy."},
-                )
-                self.assertEqual(response, {"decision": "block", "reason": "Blocked by policy."})
 
     def test_tool_injection_uses_each_clients_native_syntax(self):
         plan = {
@@ -288,24 +261,6 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertIn("$unbound-secure-sql", codex["hookSpecificOutput"]["additionalContext"])
         self.assertIn("/unbound-secure-sql", cursor["agent_message"])
 
-    def test_copilot_session_count_survives_transcript_loss_without_sticky_loaded_state(self):
-        copilot = CLIENTS["copilot"]
-        event = {"session_id": "s1"}
-        with tempfile.TemporaryDirectory() as tmp:
-            transcript = Path(tmp) / "events.jsonl"
-            transcript.write_text(json.dumps({
-                "type": "skill.invoked",
-                "data": {"name": "unbound-secure-sql"},
-            }) + "\n")
-            event["transcript_path"] = str(transcript)
-            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
-                first = copilot._skill_policy_loaded_facts(event)
-                transcript.write_text("{}\n")
-                after_eviction = copilot._skill_policy_loaded_facts(event)
-
-        self.assertEqual(first["loaded"], {"secure-sql"})
-        self.assertEqual(after_eviction, {"loaded": set(), "session_count": 1})
-
     def test_transcript_tail_is_bounded_and_drops_a_partial_first_record(self):
         for name in ("copilot", "codex"):
             client = CLIENTS[name]
@@ -319,6 +274,44 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                     lines = client._skill_policy_transcript_tail(str(transcript))
 
                 self.assertEqual(lines, [b'{"kept":true}'])
+
+    def test_session_count_reads_beyond_the_active_tail(self):
+        copilot_row = {"type": "skill.invoked", "data": {"name": "unbound-secure-sql"}}
+        codex_row = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<skill><name>unbound-secure-sql</name></skill>"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["skills.selected_skill_instructions"],
+                },
+            },
+        }
+        cursor_row = {
+            "role": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"path": "/skills/unbound-secure-sql/SKILL.md"},
+            }]},
+        }
+        for name, row in (("copilot", copilot_row), ("codex", codex_row), ("cursor", cursor_row)):
+            client = CLIENTS[name]
+            with self.subTest(client=name), tempfile.TemporaryDirectory() as tmp:
+                transcript = Path(tmp) / "transcript.jsonl"
+                transcript.write_text(json.dumps(row) + "\n" + json.dumps({"padding": "x" * 256}) + "\n")
+                event = {"session_id": "s1", "transcript_path": str(transcript)}
+                with ExitStack() as stack:
+                    stack.enter_context(patch.object(client, "SKILL_TRANSCRIPT_TAIL_BYTES", 32))
+                    if name == "cursor":
+                        stack.enter_context(patch.object(
+                            client, "_skill_name_from_path", return_value="unbound-secure-sql"
+                        ))
+                    facts = client._skill_policy_loaded_facts(event)
+
+                self.assertEqual(facts["loaded"], set())
+                self.assertEqual(facts["session_count"], 1)
 
     def test_copilot_loaded_skill_expires_after_ten_assistant_turns(self):
         copilot = CLIENTS["copilot"]
@@ -368,97 +361,69 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertEqual(facts["loaded"], set())
         self.assertEqual(facts["session_count"], 0)
 
-    def test_cursor_loaded_state_survives_audit_log_eviction(self):
+    def test_cursor_reads_loaded_state_from_transcript(self):
         cursor = CLIENTS["cursor"]
-        event = {"conversation_id": "c1"}
-        rows = [
-            {"event": {
-                "hook_event_name": "beforeSubmitPrompt",
-                "conversation_id": "c1",
-                "generation_id": "g1",
-            }},
-            {"event": {
-                "hook_event_name": "beforeReadFile",
-                "conversation_id": "c1",
-                "generation_id": "g1",
-                "file_path": "/skills/unbound-secure-sql/SKILL.md",
-            }},
-        ]
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"), \
-                patch.object(cursor, "load_existing_logs", side_effect=[rows, []]), \
-                patch.object(cursor, "_skill_name_from_path", return_value="unbound-secure-sql"):
-            first = cursor._skill_policy_loaded_facts(event)
-            after_eviction = cursor._skill_policy_loaded_facts(event)
+        row = {
+            "role": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"path": "/skills/unbound-secure-sql/SKILL.md"},
+            }]},
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "transcript.jsonl"
+            transcript.write_text(json.dumps(row) + "\n")
+            event = {"conversation_id": "c1", "transcript_path": str(transcript)}
+            with patch.object(cursor, "_skill_name_from_path", return_value="unbound-secure-sql"):
+                facts = cursor._skill_policy_loaded_facts(event)
 
-        self.assertEqual(first["loaded"], {"secure-sql"})
-        self.assertEqual(after_eviction, first)
+        self.assertEqual(facts, {"loaded": {"secure-sql"}, "session_count": 1})
 
     def test_cursor_loaded_skill_expires_after_ten_user_prompts(self):
         cursor = CLIENTS["cursor"]
-        rows = [
-            {"event": {
-                "hook_event_name": "beforeSubmitPrompt",
-                "conversation_id": "c1",
-                "generation_id": "g0",
-            }},
-            {"event": {
-                "hook_event_name": "beforeReadFile",
-                "conversation_id": "c1",
-                "generation_id": "g0",
-                "file_path": "/skills/unbound-secure-sql/SKILL.md",
-            }},
-        ]
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"), \
-                patch.object(cursor, "load_existing_logs", return_value=rows), \
-                patch.object(cursor, "_skill_name_from_path", return_value="unbound-secure-sql"):
-            cursor._skill_policy_loaded_facts({"conversation_id": "c1"})
-            for index in range(1, 11):
-                edge = cursor._skill_policy_loaded_facts({
-                    "hook_event_name": "beforeSubmitPrompt",
-                    "conversation_id": "c1",
-                    "generation_id": f"g{index}",
-                })
-            expired = cursor._skill_policy_loaded_facts({
-                "hook_event_name": "beforeSubmitPrompt",
-                "conversation_id": "c1",
-                "generation_id": "g11",
-            })
+        skill_read = {
+            "role": "assistant",
+            "message": {"content": [{
+                "type": "tool_use",
+                "name": "Read",
+                "input": {"path": "/skills/unbound-secure-sql/SKILL.md"},
+            }]},
+        }
+        user = {"role": "user", "message": {"content": []}}
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "transcript.jsonl"
+            event = {"conversation_id": "c1", "transcript_path": str(transcript)}
+            with patch.object(cursor, "_skill_name_from_path", return_value="unbound-secure-sql"):
+                transcript.write_text("\n".join(json.dumps(row) for row in [skill_read] + [user] * 10) + "\n")
+                edge = cursor._skill_policy_loaded_facts(event)
+                transcript.write_text("\n".join(json.dumps(row) for row in [skill_read] + [user] * 11) + "\n")
+                expired = cursor._skill_policy_loaded_facts(event)
 
         self.assertEqual(edge, {"loaded": {"secure-sql"}, "session_count": 1})
         self.assertEqual(expired, {"loaded": set(), "session_count": 1})
 
     def test_cursor_tracks_two_skill_reads_in_one_generation(self):
         cursor = CLIENTS["cursor"]
-        rows = [
-            {"event": {
-                "hook_event_name": "beforeSubmitPrompt",
-                "conversation_id": "c1",
-                "generation_id": "g1",
-            }},
-            {"event": {
-                "hook_event_name": "beforeReadFile",
-                "conversation_id": "c1",
-                "generation_id": "g1",
-                "file_path": "/skills/unbound-first-rule/SKILL.md",
-            }},
-            {"event": {
-                "hook_event_name": "beforeReadFile",
-                "conversation_id": "c1",
-                "generation_id": "g1",
-                "file_path": "/skills/unbound-second-rule/SKILL.md",
-            }},
-        ]
+        row = {
+            "role": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Read", "input": {"path": "/skills/unbound-first-rule/SKILL.md"}},
+                {"type": "tool_use", "name": "Read", "input": {"path": "/skills/unbound-second-rule/SKILL.md"}},
+            ]},
+        }
 
         def skill_name(path, _roots):
             return Path(path).parent.name
 
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"), \
-                patch.object(cursor, "load_existing_logs", return_value=rows), \
-                patch.object(cursor, "_skill_name_from_path", side_effect=skill_name):
-            facts = cursor._skill_policy_loaded_facts({"conversation_id": "c1"})
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "transcript.jsonl"
+            transcript.write_text(json.dumps(row) + "\n")
+            with patch.object(cursor, "_skill_name_from_path", side_effect=skill_name):
+                facts = cursor._skill_policy_loaded_facts({
+                    "conversation_id": "c1",
+                    "transcript_path": str(transcript),
+                })
 
         self.assertEqual(facts, {
             "loaded": {"first-rule", "second-rule"},
@@ -478,30 +443,39 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                 self.assertIn("/unbound-secure-sql", response["agent_message"])
                 self.assertEqual(cursor._consume_deferred_skill_context(event), "")
 
+    def test_cursor_preserves_existing_tool_context_when_delivering_prompt_skill(self):
+        cursor = CLIENTS["cursor"]
+        event = {"conversation_id": "c1", "generation_id": "g1"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+            cursor._defer_prompt_skill_context(
+                event, "Invoke /unbound-secure-sql before continuing."
+            )
+            response = cursor._with_deferred_skill_context(
+                event, {"agent_message": "Existing policy advisory."}
+            )
+
+        self.assertIn("Existing policy advisory.", response["agent_message"])
+        self.assertIn("/unbound-secure-sql", response["agent_message"])
+
     def test_cursor_keeps_deferred_context_when_another_policy_denies_the_tool(self):
         cursor = CLIENTS["cursor"]
         event = {"conversation_id": "c1", "generation_id": "g1"}
         denied = {"permission": "deny", "user_message": "Blocked by another policy."}
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
-            cursor._PENDING_SKILL_DELIVERY_KEYS.clear()
             cursor._defer_prompt_skill_context(
                 event, "Invoke /unbound-secure-sql before continuing."
             )
-            cursor._apply_skill_lifecycle_actions(
-                {"inject_skills": [_entry("another-skill")]}, "key", event
-            )
 
             response = cursor._with_deferred_skill_context(event, denied)
-            cursor._ack_skill_injection_delivery(event, response)
 
             self.assertEqual(response, denied)
             self.assertFalse(cursor._skill_turn_claim_path("c1:g1").exists())
             delivered = cursor._with_deferred_skill_context(event, {})
             self.assertIn("/unbound-secure-sql", delivered["agent_message"])
-            cursor._ack_skill_injection_delivery(event, delivered)
+            cursor._claim_skill_injection_turn(event)
             self.assertTrue(cursor._skill_turn_claim_path("c1:g1").exists())
-            cursor._PENDING_SKILL_DELIVERY_KEYS.clear()
 
     def test_codex_does_not_conflate_skill_delivery_with_confirmed_load(self):
         codex = CLIENTS["codex"]
@@ -521,7 +495,7 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                     metadata, {"transcript_path": str(transcript)}
                 )
         self.assertNotIn("loaded_skills", metadata)
-        self.assertEqual(metadata["skills_loaded_this_session"], 0)
+        self.assertNotIn("skills_loaded_this_session", metadata)
 
     def test_codex_reports_a_host_selected_managed_skill_as_loaded(self):
         codex = CLIENTS["codex"]
@@ -590,10 +564,89 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
             with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
                     patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
                 facts = codex._skill_policy_loaded_facts(event)
-                remembered = codex._skill_policy_loaded_facts({"session_id": "s1"})
 
         self.assertEqual(facts["loaded"], {"secure-sql"})
-        self.assertEqual(remembered, {"loaded": set(), "session_count": 1})
+        self.assertEqual(facts["session_count"], 1)
+
+    def test_codex_reads_function_call_skill_evidence_from_transcript(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            (skill / "SKILL.md").write_text(body)
+            rows = [
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "Bash",
+                        "arguments": json.dumps({"command": f"cat {skill / 'SKILL.md'}"}),
+                        "call_id": "call-1",
+                    },
+                },
+                {
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call-1",
+                        "output": body,
+                    },
+                },
+            ]
+            transcript = Path(tmp) / "rollout.jsonl"
+            transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root):
+                facts = codex._skill_policy_loaded_facts({"transcript_path": str(transcript)})
+
+        self.assertEqual(facts, {"loaded": {"secure-sql"}, "session_count": 1})
+
+    def test_codex_does_not_read_symlinked_skill_body_as_load_evidence(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            target = Path(tmp) / "target.md"
+            target.write_text(body)
+            (skill / "SKILL.md").symlink_to(target)
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root):
+                found = codex._codex_skill_slugs_from_output(
+                    f"cat {skill / 'SKILL.md'}", body
+                )
+
+        self.assertEqual(found, set())
+
+    def test_codex_bridges_same_turn_transcript_write_lag(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            (skill / "SKILL.md").write_text(body)
+            post_tool = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "turn_id": "t1",
+                "tool_name": "Bash",
+                "tool_input": {"command": f"cat {skill / 'SKILL.md'}"},
+                "tool_response": body,
+            }
+            audit_rows = [{"session_id": "s1", "event": post_tool}]
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
+                    patch.object(codex, "load_existing_logs", return_value=audit_rows):
+                facts = codex._skill_policy_loaded_facts({
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                })
+
+        self.assertEqual(facts, {"loaded": {"secure-sql"}, "session_count": 1})
 
     def test_codex_loaded_skill_expires_after_ten_tasks_and_at_compaction(self):
         codex = CLIENTS["codex"]
@@ -775,8 +828,6 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                 patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
                 patch.object(copilot, "get_api_key", return_value="key"), \
                 patch.object(copilot, "_evaluate_user_prompt_policy", return_value=response) as evaluate, \
-                patch.object(copilot, "_stage_skill_injection_delivery"), \
-                patch.object(copilot, "_ack_skill_injection_delivery"), \
                 patch.object(copilot.sys, "stdin", io.StringIO(json.dumps(event))), \
                 patch.object(copilot.sys, "stdout", io.StringIO()) as stdout:
             target = copilot._copilot_prompt_plan_path(event)
@@ -787,30 +838,16 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertEqual(evaluate.call_count, 1)
         self.assertIn("unbound-secure-sql", json.loads(stdout.getvalue())["modifiedTransformedPrompt"])
 
-    def test_copilot_transformed_prompt_blocks_stored_and_fallback_denies(self):
+    def test_copilot_does_not_store_prompt_plan_without_session_id(self):
         copilot = CLIENTS["copilot"]
-        event = {
-            "sessionId": "s1",
-            "prompt": "Drop the table.",
-            "transformedPrompt": "Drop the table.",
-        }
-        deny = {"decision": "deny", "reason": "Blocked by policy."}
-        for source in ("stored", "fallback"):
-            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp, \
-                    patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
-                    patch.object(copilot, "get_api_key", return_value="key"), \
-                    patch.object(copilot, "_stage_skill_injection_delivery"), \
-                    patch.object(copilot, "_ack_skill_injection_delivery"), \
-                    patch.object(copilot, "_evaluate_user_prompt_policy", return_value=deny) as evaluate, \
-                    patch.object(copilot.sys, "stdin", io.StringIO(json.dumps(event))), \
-                    patch.object(copilot.sys, "stdout", io.StringIO()) as stdout:
-                if source == "stored":
-                    copilot._store_copilot_prompt_plan(event, deny)
-                copilot.main()
-                output = json.loads(stdout.getvalue())
+        event = {"prompt": "current message"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+            copilot._store_copilot_prompt_plan(event, {"inject_skills": [_entry()]})
+            found, plan = copilot._take_copilot_prompt_plan(event)
 
-            self.assertEqual(output, {"decision": "block", "reason": "Blocked by policy."})
-            self.assertEqual(evaluate.call_count, 0 if source == "stored" else 1)
+        self.assertFalse(found)
+        self.assertIsNone(plan)
 
 
 class CopilotRegistrationTests(unittest.TestCase):

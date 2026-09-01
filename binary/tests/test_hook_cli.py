@@ -163,6 +163,25 @@ def test_module_crash_fails_open(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "{}"
 
 
+def test_skills_sync_reads_provider_key_without_helper(monkeypatch):
+    from unbound_hook import hook_cmd
+
+    calls = []
+
+    class FakeModule:
+        SKILL_POLICY_API_KEY_ENV = "UNBOUND_CODEX_API_KEY"
+
+        @staticmethod
+        def _sync_skills_once(api_key):
+            calls.append(api_key)
+
+    monkeypatch.setenv("UNBOUND_CODEX_API_KEY", "test-key")
+    monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
+
+    assert hook_cmd.run_skills_sync(["codex"]) == 0
+    assert calls == ["test-key"]
+
+
 def test_version_does_not_read_stdin(sandbox_home):
     # pkg postinstall pre-warms with --version; it must not block on stdin.
     got = run_cli_dev(["--version"], None, sandbox_home, stdin_close=True)

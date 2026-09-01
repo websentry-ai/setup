@@ -17,6 +17,7 @@ import hashlib
 import re
 import sqlite3
 import shutil
+import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
@@ -144,16 +145,11 @@ _cached_api_key = None
 _reporting_error = False
 
 
-# Skill policy lifecycle
-import urllib.request
-
-
 SKILL_LOADED_WINDOW = 10
 SKILL_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 
 
 def _skill_policy_transcript_tail(path):
-    """Read a bounded JSONL tail and discard a partial first record."""
     try:
         with open(path, 'rb') as transcript_file:
             size = os.fstat(transcript_file.fileno()).st_size
@@ -491,34 +487,26 @@ def _dispatch_skills_sync(api_key):
 
 def _attach_installed_skill_facts(metadata, event=None):
     installed = installed_skill_report()
-    visible_inventory = globals().get('_skill_policy_visible_inventory')
-    if callable(visible_inventory):
-        try:
-            installed = visible_inventory(event or {}, installed)
-        except Exception as exc:
-            log_error(f"skill visible inventory failed: {exc}", 'skill_injection')
-    if installed:
-        metadata['installed_skills'] = installed
-    loaded_facts = globals().get('_skill_policy_loaded_facts')
-    if callable(loaded_facts):
-        try:
-            facts = loaded_facts(event or {})
-            loaded = facts.get('loaded') if isinstance(facts, dict) else None
-            count = facts.get('session_count') if isinstance(facts, dict) else None
-            if loaded:
-                metadata['loaded_skills'] = sorted(loaded)
-            if isinstance(count, int) and count >= 0:
-                metadata['skills_loaded_this_session'] = count
-        except Exception as exc:
-            log_error(f"skill loaded facts failed: {exc}", 'skill_injection')
-    turn_key = globals().get('_skill_policy_turn_key')
-    if callable(turn_key):
-        try:
-            key = turn_key(event or {})
-            if key and _skill_turn_claim_path(key).exists():
-                metadata['already_injected_this_turn'] = True
-        except Exception:
-            pass
+    try:
+        installed = _skill_policy_visible_inventory(event or {}, installed)
+    except Exception as exc:
+        log_error(f"skill visible inventory failed: {exc}", 'skill_injection')
+    if not installed:
+        return
+    metadata['installed_skills'] = installed
+    try:
+        facts = _skill_policy_loaded_facts(event or {})
+        if facts['loaded']:
+            metadata['loaded_skills'] = sorted(facts['loaded'])
+        metadata['skills_loaded_this_session'] = facts['session_count']
+    except Exception as exc:
+        log_error(f"skill loaded facts failed: {exc}", 'skill_injection')
+    try:
+        key = _skill_policy_turn_key(event or {})
+        if key and _skill_turn_claim_path(key).exists():
+            metadata['already_injected_this_turn'] = True
+    except OSError:
+        pass
 
 
 def _skill_policy_native_context(api_response):
@@ -565,60 +553,9 @@ def _cleanup_skill_policy_state():
         pass
 
 
-def _remembered_session_skill_slugs(session_id):
-    if not session_id:
-        return set()
-    path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
-        str(session_id).encode('utf-8', 'replace')
-    ).hexdigest()
-    try:
-        if not path.is_file() or path.stat().st_size > 1024 * 1024:
-            return set()
-        return {
-            slug for slug in path.read_text(encoding='utf-8').splitlines()
-            if _skill_policy_valid_slug(slug)
-        }
-    except OSError:
-        return set()
-
-
-def _finalize_skill_facts(session_id, loaded, observed=None):
-    """Keep the active context window separate from the lifetime session count."""
-    remembered = _remembered_session_skill_slugs(session_id)
-    current = {
-        slug for slug in (loaded or set())
-        if _skill_policy_valid_slug(slug)
-    }
-    session_observed = {
-        slug for slug in (observed if observed is not None else current)
-        if _skill_policy_valid_slug(slug)
-    }
-    missing = sorted(session_observed - remembered)
-    if session_id and missing:
-        path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
-            str(session_id).encode('utf-8', 'replace')
-        ).hexdigest()
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(path), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
-            try:
-                os.write(fd, ''.join(f'{slug}\n' for slug in missing).encode('utf-8'))
-            finally:
-                os.close(fd)
-            remembered.update(missing)
-        except OSError:
-            remembered.update(session_observed)
-    else:
-        remembered.update(session_observed)
-    return {'loaded': current, 'session_count': len(remembered)}
-
-
 def _claim_skill_injection_turn(event):
-    turn_key = globals().get('_skill_policy_turn_key')
-    if not callable(turn_key):
-        return
     try:
-        key = turn_key(event or {})
+        key = _skill_policy_turn_key(event or {})
         if not key:
             return
         path = _skill_turn_claim_path(key)
@@ -632,45 +569,10 @@ def _claim_skill_injection_turn(event):
         pass
 
 
-_PENDING_SKILL_DELIVERY_KEYS = set()
-
-
-def _stage_skill_injection_delivery(event, api_response):
-    if not isinstance(api_response, dict) or not api_response.get('inject_skills'):
-        return
-    turn_key = globals().get('_skill_policy_turn_key')
-    if not callable(turn_key):
-        return
-    try:
-        key = turn_key(event or {})
-        if key:
-            _PENDING_SKILL_DELIVERY_KEYS.add(key)
-    except Exception:
-        pass
-
-
-def _ack_skill_injection_delivery(event, hook_output):
-    output_delivered = globals().get('_skill_policy_output_delivered')
-    if not callable(output_delivered) or not output_delivered(hook_output):
-        return
-    turn_key = globals().get('_skill_policy_turn_key')
-    if not callable(turn_key):
-        return
-    try:
-        key = turn_key(event or {})
-        if not key or key not in _PENDING_SKILL_DELIVERY_KEYS:
-            return
-        _claim_skill_injection_turn(event or {})
-        _PENDING_SKILL_DELIVERY_KEYS.discard(key)
-    except Exception:
-        pass
-
-
-def _apply_skill_lifecycle_actions(api_response, api_key, event=None):
+def _apply_skill_lifecycle_actions(api_response, api_key):
     if not isinstance(api_response, dict):
         return
     try:
-        _stage_skill_injection_delivery(event or {}, api_response)
         if api_response.get('remove_skills'):
             lock_fd = _skills_lock_acquire()
             if lock_fd is not None:
@@ -682,6 +584,8 @@ def _apply_skill_lifecycle_actions(api_response, api_key, event=None):
             _dispatch_skills_sync(api_key)
     except Exception as exc:
         log_error(f"skill lifecycle action failed: {exc}", 'skill_injection')
+
+
 def _skill_policy_session_id(event):
     return str(event.get('session_id') or event.get('sessionId') or '')
 
@@ -779,10 +683,9 @@ def _copilot_transcript_path(event):
 
 
 def _skill_policy_loaded_facts(event):
-    session_id = _skill_policy_session_id(event)
     transcript = _copilot_transcript_path(event)
     if not isinstance(transcript, str) or not transcript:
-        return _finalize_skill_facts(session_id, set())
+        return {'loaded': set(), 'session_count': 0}
     loaded = set()
     observed = set()
     try:
@@ -816,7 +719,26 @@ def _skill_policy_loaded_facts(event):
                     loaded.add(slug)
     except OSError:
         pass
-    return _finalize_skill_facts(session_id, loaded, observed)
+    try:
+        with open(transcript, 'rb') as transcript_file:
+            for raw in transcript_file:
+                try:
+                    entry = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict) or entry.get('type') != 'skill.invoked':
+                    continue
+                data = entry.get('data')
+                if not isinstance(data, dict):
+                    continue
+                name = next((data.get(key) for key in ('name', 'skillName', 'skill_name', 'skill')
+                             if isinstance(data.get(key), str) and data.get(key)), '')
+                slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else ''
+                if _skill_policy_valid_slug(slug):
+                    observed.add(slug)
+    except OSError:
+        pass
+    return {'loaded': loaded, 'session_count': len(observed)}
 
 
 def _skill_roots(cwd):
@@ -2841,8 +2763,8 @@ def transform_response_for_copilot_prompt(api_response):
     decision = api_response.get('decision', 'allow')
     reason = api_response.get('reason', '')
 
-    # UserPromptSubmit represents blocked prompts with the 'block' decision.
-    if decision in ('deny', 'block'):
+    # For UserPromptSubmit, 'deny' maps to 'block'
+    if decision == 'deny':
         return {
             'decision': 'block',
             'reason': reason
@@ -2856,7 +2778,7 @@ def transform_response_for_copilot_transformed_prompt(event, api_response):
     if not isinstance(api_response, dict):
         return {}
     if api_response.get('decision') in ('deny', 'block'):
-        return transform_response_for_copilot_prompt(api_response)
+        return {}
     context = _skill_policy_native_context(api_response)
     if not context:
         return {}
@@ -3059,7 +2981,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     ):
         _dispatch_mcp_server_scan(mcp_server, scan_config)
 
-    _apply_skill_lifecycle_actions(api_response, api_key, event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     return transform_response_for_copilot(api_response)
 
 
@@ -3089,12 +3011,14 @@ def _evaluate_user_prompt_policy(event, api_key):
 
     api_response = send_to_hook_api(request_body, api_key)
     _cache_policies_from_response(api_response)
-    _apply_skill_lifecycle_actions(api_response, api_key, event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     return api_response
 
 
 def _copilot_prompt_plan_path(event):
     session_id = _skill_policy_session_id(event)
+    if not session_id:
+        return None
     digest = hashlib.sha256(session_id.encode('utf-8', 'replace')).hexdigest()
     return SKILL_POLICY_STATE_ROOT / 'prompt-plans' / digest
 
@@ -3104,6 +3028,8 @@ def _store_copilot_prompt_plan(event, plan):
         if not isinstance(plan, dict):
             return
         target = _copilot_prompt_plan_path(event)
+        if target is None:
+            return
         target.parent.mkdir(parents=True, exist_ok=True)
         prompt = event.get('prompt') or ''
         stored = {
@@ -3127,6 +3053,8 @@ def _store_copilot_prompt_plan(event, plan):
 
 def _take_copilot_prompt_plan(event):
     target = _copilot_prompt_plan_path(event)
+    if target is None:
+        return False, None
     try:
         stored = json.loads(target.read_text(encoding='utf-8'))
     except OSError:
@@ -4959,16 +4887,17 @@ def main():
             found_plan, gateway_response = _take_copilot_prompt_plan(event)
             if not found_plan:
                 gateway_response = _evaluate_user_prompt_policy(event, api_key)
-            _stage_skill_injection_delivery(event, gateway_response)
             response = transform_response_for_copilot_transformed_prompt(event, gateway_response)
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event, response)
+            if _skill_policy_output_delivered(response):
+                _claim_skill_injection_turn(event)
             return
 
         if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
-            _ack_skill_injection_delivery(event, response)
+            if _skill_policy_output_delivered(response):
+                _claim_skill_injection_turn(event)
             return
 
         if event_name == 'UserPromptSubmit':
