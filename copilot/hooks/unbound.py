@@ -1496,8 +1496,6 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
-    # Copilot ships built-in MCP servers (github-mcp-server, playwright, fetch,
-    # time) with no on-disk config; the hook tags them so they fingerprint by name.
     if safe_additional_data.get('scope') == 'copilot-builtin' and safe_name:
         return f'copilot-builtin:{safe_name.lower()}'
 
@@ -1810,7 +1808,6 @@ def _sanitize_copilot_server_name(name):
 # false-positive relabels of unrelated tools sharing a server's prefix.
 _MCP_NAME_SEPARATORS = ('__', '-')
 _BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright', 'fetch', 'time')
-COPILOT_BUILTIN_SCOPE = 'copilot-builtin'
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
@@ -1970,7 +1967,7 @@ def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None)
         resolved = builtin
     server, tool, config = resolved
     if server in _BUILTIN_MCP_SERVERS and not config:
-        config = {'additional_data': {'scope': COPILOT_BUILTIN_SCOPE}}
+        config = {'additional_data': {'scope': 'copilot-builtin'}}
     return (server, tool, config)
 
 
