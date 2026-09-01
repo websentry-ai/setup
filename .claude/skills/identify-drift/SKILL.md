@@ -168,6 +168,19 @@ gateway_metrics.id ←  prompts.gateway_metrics_id
 | sessions | `prompt_analytics.thread_id` |
 | the user | `gateway_users.email`, matched case-insensitively |
 
+**The unit is the turn.** The hook uploads once per turn, at its end, carrying that
+turn's prompt, replies and tool calls together. So a turn that never arrived is missing
+all three, and reporting them separately says one fault three times while burying the
+one that matters. Findings come in two kinds: turns the database never received, and
+pieces missing from turns it did.
+
+**Nothing is judged before it has had a chance to upload.** Each session carries a
+watermark, the newest stored row it has. Local records after their session's watermark
+may simply not have finished, so they are held back and counted in
+`not_finished_yet` rather than reported. Without this the session running the scan
+reports itself as loss, every time. The audit checks stop at the same mark: that log
+holds its last hundred entries, which on a busy machine is the turn running right now.
+
 **What is compared.** Tokens, user prompts, assistant messages, tool calls, sessions.
 Prompts match on a sha256 of the whitespace-normalised text, computed the same way on
 both sides, so no prompt text crosses the wire. Because a row holds a turn rather than a
@@ -215,6 +228,20 @@ the report's `sessions_not_in_db`, so the narrowing is visible without being ala
 When the stored rows for a tool name no session at all, nothing is in scope and the
 report says so in one line rather than comparing against a window it cannot place.
 
+**The second finding's count is an upper bound.** A turn is grouped locally by the
+prompt that started it, but the hook ends a turn whenever the assistant yields, so one
+local turn can span several stored rows. When one of those rows is missing and another
+is not, the turn reads as received and its missing half is counted as pieces rather
+than as the turn it was. Treat a large count there as "at most this many", and check a
+few against the stored rows before believing all of it.
+
+**Tokens are only compared when the two sides cover the same work.** The stored totals
+are the whole window's, so once anything has been held back -- a turn that never
+arrived, a turn still running, a session the database does not have -- the sums are of
+different things and the difference is arithmetic, not drift. Measured properly they
+reconcile; measured across a gap they reported the same missing turns a second time, as
+a 67% token loss.
+
 Some findings are structural, not faults. Expect them, say so once, and do not
 investigate them:
 
@@ -226,6 +253,7 @@ investigate them:
 | any tool: could not be checked for this window | an aggregate hit the row cap. Re-run over fewer days |
 | any tool: audit log is full | it holds a hundred entries, so absence from it is not evidence |
 | any tool: sessions absent from the database | out of scope by design, and not reported at all |
+| any tool: records after a session's watermark | the turn may not have ended yet. Held back, counted in `not_finished_yet` |
 
 A token difference under 5% is not reported. Above it, the usual cause is work billed
 to no turn: subagent messages outside the turn window, or turns that never uploaded.
@@ -255,7 +283,10 @@ Then one block per issue, in this shape, at most a short paragraph each:
 ```
 
 Order by how much is missing, most first. Name the tool in each title when more than
-one was scanned.
+one was scanned. Report the findings as they come: they are already grouped by cause,
+so do not split one back into a bullet per category, and do not restate the same cause
+in another form. If `not_finished_yet` or `sessions_not_in_db` is non-zero, say so in
+one line after the blocks, because the reader should know what was left out.
 
 If nothing is wrong, the whole report is the header plus `No issues found.` Do not pad
 it with what you checked.

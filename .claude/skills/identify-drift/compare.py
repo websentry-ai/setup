@@ -385,10 +385,15 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
         %s
     """ % where, params)
 
+    # The newest row per session as well as the session itself. A turn only uploads
+    # when it ends, so anything a transcript holds after its session's newest stored
+    # row may simply not have finished yet, and calling that loss reports the run in
+    # progress as a fault -- which it did, every time, for the session doing the run.
     threads = psql(dsn, """
-        SELECT DISTINCT pa.thread_id
+        SELECT pa.thread_id, max(pa.created_at)::text AS last_at
         FROM prompt_analytics pa
         WHERE pa.thread_id IS NOT NULL AND pa.gateway_metrics_id IN (SELECT gm.id %s)%s
+        GROUP BY pa.thread_id
         LIMIT :'cap'
     """ % (owned, within("pa")), params)
 
@@ -457,6 +462,7 @@ def fetch_db(dsn, email, app_label, days, since=None, until=None):
         "input_tokens": int(row.get("input_tokens") or 0),
         "output_tokens": int(row.get("output_tokens") or 0),
         "threads": {r["thread_id"] for r in threads},
+        "thread_last": {r["thread_id"]: r["last_at"] for r in threads},
         "tool_counts": tool_counts,
         "call_ids": ids,
         # Whether ids cover enough of the stored rows to reconcile by identity. Below
@@ -515,6 +521,70 @@ def _ident(value):
     if REDACT:
         return "id:%s" % hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
     return value
+
+
+def _turns(records):
+    """The window's records grouped the way the hook uploads them: one turn per
+    submitted prompt, everything after it belonging to that turn, per session. A turn
+    is the unit that succeeds or fails as a whole, so it is the unit worth reporting.
+    Records before the window's first prompt in a session belong to a turn that
+    started earlier, which is still one turn."""
+    by_session = defaultdict(list)
+    for record in records:
+        by_session[record.get("session")].append(record)
+    out = []
+    for session, items in by_session.items():
+        items.sort(key=lambda r: (r.get("at") or "", r["kind"] != "user_prompt"))
+        opened = []
+        for record in items:
+            if record["kind"] == "user_prompt" or not opened:
+                opened.append({"session": session, "at": record.get("at"),
+                               "records": []})
+            opened[-1]["records"].append(record)
+        # A prompt queued while a turn was running appears here as a turn of its own,
+        # because the transcript files it at the moment it was typed. It is not one:
+        # the turn already running swallowed it, and the hook stores the two together.
+        # A group with no reply and no tool call never ran, so it folds back into the
+        # turn that did. Splitting there reported the dropped queued prompt as a whole
+        # turn lost, which is the wrong fault and the wrong place to look.
+        for group in opened:
+            ran = any(r["kind"] in ("assistant_message", "tool_call")
+                      for r in group["records"])
+            if ran or not out or out[-1]["session"] != session:
+                out.append(group)
+            else:
+                out[-1]["records"].extend(group["records"])
+    return out
+
+
+def _first_excerpt(turn):
+    """Something to find the turn by. Counts alone say a turn was lost without saying
+    which, and the run is only useful if somebody can go and look at it."""
+    for kind in ("user_prompt", "assistant_message"):
+        for record in turn["records"]:
+            if record["kind"] == kind and record.get("text"):
+                return _excerpt(record["text"])
+    for record in turn["records"]:
+        if record.get("call_id"):
+            return "%s (%s)" % (_ident(record["call_id"]), record.get("tool"))
+    return "(nothing quotable)"
+
+
+def _turn_reached_the_database(turn, db):
+    """Whether any part of this turn is stored. One piece is enough: the row exists,
+    so whatever else is missing from it went missing inside a turn that did arrive,
+    which is a different fault from a turn that never arrived at all."""
+    for record in turn["records"]:
+        if record["kind"] == "tool_call" and record.get("call_id") in db["call_ids"]:
+            return True
+        stored = (db["user_digests"] if record["kind"] == "user_prompt"
+                  else db["assistant_digests"] if record["kind"] == "assistant_message"
+                  else None)
+        if stored is None:
+            continue
+        if any(stored.get(_digest(seg)) for seg in _segments(record.get("text"))):
+            return True
+    return False
 
 
 def _segments(text):
@@ -610,6 +680,7 @@ def compare(tool, local, db, days, db_audit=None):
     # sessions are the entire scope and everything else is dropped before comparing.
     in_scope = set(db["threads"])
     local_sessions = set(local["sessions_transcript"]) | set(local["sessions_audit"])
+    out_of_scope = len({s for s in local_sessions if s and s not in in_scope})
     for kind in by_kind:
         by_kind[kind] = [r for r in by_kind[kind] if r.get("session") in in_scope]
     for kind in audit_by_kind:
@@ -628,10 +699,73 @@ def compare(tool, local, db, days, db_audit=None):
                    "per-session drift, so nothing below could be checked.",
         }]
 
+    # ---- what has not had a chance to upload yet -----------------------
+    # Bounded per session, not globally: one session finishing an hour ago says
+    # nothing about another still running.
+    # Parsed, never compared as text: the database renders a timestamp with a space
+    # where a transcript writes a T, and every same-day record then sorts after every
+    # mark. That silently held back the whole window.
+    marks = {session: _parse(value)
+             for session, value in (db.get("thread_last") or {}).items()}
+    def after_its_mark(record):
+        mark = marks.get(record.get("session"))
+        when = _parse(record.get("at"))
+        return bool(mark and when and when > mark)
+
+    held_back = 0
+    # Both sides of it. The audit log holds the last hundred entries, which on a busy
+    # machine is the last few minutes -- almost entirely the turn running right now --
+    # so leaving the audit checks unbounded reported the run in progress as loss no
+    # matter what the transcript checks did.
+    for group in (by_kind, audit_by_kind):
+        for kind in group:
+            keep = [r for r in group[kind] if not after_its_mark(r)]
+            held_back += len(group[kind]) - len(keep)
+            group[kind] = keep
+
+    # ---- turns: the unit that succeeds or fails as a whole ---------------
+    # A turn uploads once, at its end, carrying its prompt, its replies and its tool
+    # calls together. So a turn that never arrived takes all three with it, and
+    # reporting them as three separate gaps says one fault three times and buries the
+    # one that matters: something missing from a turn that did arrive.
+    # Not when an aggregate was capped: deciding a turn never arrived needs the whole
+    # stored set, and a capped one would condemn turns whose rows the cap left out.
+    capped = bool(db["truncated"])
+    turns = [] if capped else _turns(
+        [r for records in by_kind.values() for r in records])
+    reached = [t for t in turns if _turn_reached_the_database(t, db)]
+    lost = [t for t in turns if t not in reached]
+    if not capped:
+        inside = {id(r) for t in reached for r in t["records"]}
+        for kind in by_kind:
+            by_kind[kind] = [r for r in by_kind[kind] if id(r) in inside]
+
+    if lost and db["metrics_rows"]:
+        counts = Counter(r["kind"] for t in lost for r in t["records"])
+        findings.append({
+            "title": "Turns that never reached the database",
+            "where": "%s transcripts -> gateway_metrics" % tool,
+            "evidence": "%d turn(s), holding %d prompt(s), %d reply(s) and %d tool "
+                        "call(s). First at %s, %s"
+                        % (len(lost), counts["user_prompt"],
+                           counts["assistant_message"], counts["tool_call"],
+                           (lost[0]["at"] or "?")[:19], _first_excerpt(lost[0])),
+            "why": "A turn uploads once, when it ends, so all of it is missing "
+                   "together. Everything below is measured inside the turns that did "
+                   "arrive, where a gap means something else.",
+        })
+
     # ---- sessions ------------------------------------------------------
     if "sessions" in db["truncated"] and local_sessions:
         findings.append(_cannot_check("Sessions", "%s -> prompt_analytics.thread_id"
                                       % tool, "sessions"))
+
+    # ---- what is missing from turns that did arrive ---------------------
+    # One finding, not three. A prompt, a reply and a tool call that vanish together
+    # are one turn that failed, already reported above; what is left here is the fault
+    # worth chasing, and splitting it by category said it three times and made a small
+    # real signal look like a large vague one.
+    inside = {}
 
     # ---- prompts -------------------------------------------------------
     prompts_capped = "prompts" in db["truncated"]
@@ -661,16 +795,8 @@ def compare(tool, local, db, days, db_audit=None):
             else:
                 missing_texts.append(r["text"])
         if missing_texts and db["metrics_rows"]:
-            findings.append({
-                "title": "%s recorded locally are absent from the database"
-                         % label.capitalize(),
-                "where": "%s transcripts -> prompts.%s" % (tool, column),
-                "evidence": "%d of %d missing. First: %s"
-                            % (len(missing_texts), present + len(missing_texts),
-                               _excerpt(missing_texts[0])),
-                "why": "The hook either did not capture these, or captured them into a "
-                       "turn that was never uploaded.",
-            })
+            inside[label] = (len(missing_texts), present + len(missing_texts),
+                             _excerpt(missing_texts[0]))
 
     # ---- tool calls ----------------------------------------------------
     local_tools = Counter(r.get("tool") for r in by_kind["tool_call"] if r.get("tool"))
@@ -698,17 +824,10 @@ def compare(tool, local, db, days, db_audit=None):
         absent = [r for r in by_kind["tool_call"]
                   if r.get("call_id") and r["call_id"] not in db["call_ids"]]
         if absent and db["metrics_rows"]:
-            findings.append({
-                "title": "Tool calls made locally are absent from the database",
-                "where": "%s transcripts -> prompt_analytics.parameters->>'tool_use_id'"
-                         % tool,
-                "evidence": "%d of %d call(s) have no stored row. First: %s (%s)"
-                            % (len(absent),
-                               len([r for r in by_kind["tool_call"] if r.get("call_id")]),
-                               _ident(absent[0]["call_id"]), absent[0].get("tool")),
-                "why": "A PreToolUse that failed to upload, or a tool the hook does not "
-                       "handle.",
-            })
+            inside["tool calls"] = (
+                len(absent),
+                len([r for r in by_kind["tool_call"] if r.get("call_id")]),
+                "%s (%s)" % (_ident(absent[0]["call_id"]), absent[0].get("tool")))
     else:
         if local_tools and db["metrics_rows"]:
             # Otherwise an all-clear here would read as "every call is accounted for",
@@ -761,9 +880,30 @@ def compare(tool, local, db, days, db_audit=None):
                    "per message, so the two sides are not comparable here. The prompt "
                    "and tool-call checks above still apply.",
         })
+    # Only when the two sides cover the same work. The stored totals are the window's,
+    # so once anything has been held back -- a turn that never arrived, a turn still
+    # running, a session the database does not have -- the local sum is of one thing
+    # and the stored sum of another, and the difference is arithmetic rather than
+    # drift. Measured properly it reconciles; measured across a gap it reported the
+    # same missing turns a second time, as a 67% token loss.
+    comparable = not lost and not held_back and not out_of_scope
+    if inside:
+        order = ("user prompts", "assistant messages", "tool calls")
+        present = [(k, inside[k]) for k in order if k in inside]
+        findings.append({
+            "title": "Pieces missing from turns the database did receive",
+            "where": "%s transcripts -> prompts, prompt_analytics" % tool,
+            "evidence": "; ".join("%d of %d %s" % (miss, total, name)
+                                  for name, (miss, total, _) in present)
+                        + ". First: %s" % present[0][1][2],
+            "why": "The turn arrived and part of it did not, so this is not a failed "
+                   "upload of the whole turn. Look at what the hook sent for that turn "
+                   "rather than at whether it sent one.",
+        })
+
     for name, local_value, db_value in (("input", local_in, db["input_tokens"]),
                                         ("output", local_out, db["output_tokens"])):
-        if db_value and local_value:
+        if comparable and db_value and local_value:
             drift = abs(local_value - db_value) / float(local_value)
             if drift > 0.05:
                 findings.append({
@@ -999,6 +1139,13 @@ def main():
                 "local_sessions": len(local["sessions_transcript"]),
                 # Local sessions the database has no row for. Not a finding: they are
                 # out of scope, not lost. Counted so the drop is visible.
+                # Records after their session's newest stored row: the turn may not
+                # have ended yet, so they are held back rather than called losses.
+                "not_finished_yet": sum(
+                    1 for r in local["transcript"]
+                    if _parse(db["thread_last"].get(r.get("session")))
+                    and _parse(r.get("at"))
+                    and _parse(r["at"]) > _parse(db["thread_last"][r["session"]])),
                 "sessions_not_in_db": len(
                     (set(local["sessions_transcript"]) | set(local["sessions_audit"]))
                     - set(db["threads"])),

@@ -70,6 +70,7 @@ def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "threads": set(threads),
+        "thread_last": {t: "2099-01-01T00:00:00+00:00" for t in threads},
         "tool_counts": dict(tool_counts if tool_counts is not None else {"Bash": 1}),
         "call_ids": set(call_ids),
         "ids_are_representative": ids_are_representative,
@@ -85,8 +86,28 @@ def db(metrics_rows=1, input_tokens=100, output_tokens=50, threads=("S1",),
 MATCHED_DB = db()
 
 
+MERGED = "Pieces missing from turns the database did receive"
+
+CATEGORY_TITLE = {
+    "user prompts": "User prompts recorded locally are absent from the database",
+    "assistant messages":
+        "Assistant messages recorded locally are absent from the database",
+    "tool calls": "Tool calls made locally are absent from the database",
+}
+
+
 def titles(findings):
-    return [f["title"] for f in findings]
+    """Titles, with the merged finding expanded back into the categories it names. The
+    report says one thing; a test still asserts on the category it is about."""
+    import re as _re
+    out = []
+    for f in findings:
+        out.append(f["title"])
+        if f["title"] == MERGED:
+            for name, title in CATEGORY_TITLE.items():
+                if _re.search(r"\d+ of \d+ %s" % name, f["evidence"]):
+                    out.append(title)
+    return out
 
 
 class TestNothingWrongIsReportedAsNothing(unittest.TestCase):
@@ -155,12 +176,71 @@ class TestRealGapsAreFound(unittest.TestCase):
                          got)
 
     def test_a_prompt_missing_from_a_session_the_database_has_still_counts(self):
-        """The scope narrows to the stored sessions; it does not go quiet inside one."""
-        recent = [rec("user_prompt", text="never sent")]
-        d = db(metrics_rows=500, threads=("S1",), user_texts=(),
+        """The scope narrows to the stored sessions; it does not go quiet inside one.
+        Nothing of this turn arrived, so it is reported as the turn it is."""
+        recent = [rec("user_prompt", text="never sent"),
+                  rec("assistant_message", text="an answer nobody stored")]
+        d = db(metrics_rows=500, threads=("S1",), user_texts=(), assistant_texts=(),
                first_stored_at="2026-08-01 00:00:00+00")
-        got = titles(compare.compare("claude-code", local(recent), d, 14))
+        got = compare.compare("claude-code", local(recent), d, 14)
+        self.assertEqual(titles(got), ["Turns that never reached the database"])
+        self.assertIn("1 turn(s)", got[0]["evidence"])
+
+    def test_a_turn_still_running_is_not_a_loss(self):
+        """It uploads when it ends. Anything after a session's newest stored row may
+        simply not have finished, and calling that loss reported the run in progress
+        as a fault -- every time, for the session doing the run."""
+        t = [rec("user_prompt", at="2026-08-26T05:30:00+00:00", text="hello there"),
+             rec("assistant_message", at="2026-08-26T05:30:00+00:00", text="hi back"),
+             rec("tool_call", at="2026-08-26T09:00:00+00:00", tool="Bash",
+                 call_id="still-going"),
+             rec("assistant_message", at="2026-08-26T09:00:00+00:00",
+                 text="mid flight")]
+        d = db()
+        d["thread_last"] = {"S1": "2026-08-26T06:00:00+00:00"}
+        self.assertEqual(compare.compare("claude-code", local(t, []), d, 3), [])
+
+    def test_the_mark_is_read_as_a_time_not_as_text(self):
+        """The database renders a timestamp with a space where a transcript writes a
+        T. Compared as text, every same-day record sorts after every mark and the
+        whole window is held back in silence."""
+        t = [rec("user_prompt", at="2026-08-26T05:30:00+00:00", text="hello there"),
+             rec("assistant_message", at="2026-08-26T05:30:00+00:00", text="hi back"),
+             rec("tool_call", at="2026-08-26T05:45:00+00:00", tool="Bash",
+                 call_id="dropped")]
+        d = db()
+        d["thread_last"] = {"S1": "2026-08-26 06:00:00+00"}   # as psql renders it
+        got = titles(compare.compare("claude-code", local(t, []), d, 3))
+        self.assertIn("Tool calls made locally are absent from the database", got)
+
+    def test_the_audit_side_stops_at_the_same_mark(self):
+        """The log holds its last hundred entries, which on a busy machine is the turn
+        running right now. Unbounded, the audit checks reported that turn as loss."""
+        a = [rec("tool_call", at="2026-08-26T09:00:00+00:00", tool="Bash",
+                 call_id="still-going")]
+        d = db()
+        d["thread_last"] = {"S1": "2026-08-26 06:00:00+00"}
+        got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT, a),
+                                     d, 3, d))
+        self.assertNotIn("The hook logged tool calls the database never received", got)
+
+    def test_the_same_gap_before_that_mark_is_still_a_loss(self):
+        t = [rec("user_prompt", at="2026-08-26T05:30:00+00:00", text="hello there"),
+             rec("assistant_message", at="2026-08-26T05:30:00+00:00", text="hi back"),
+             rec("tool_call", at="2026-08-26T05:45:00+00:00", tool="Bash",
+                 call_id="dropped")]
+        d = db()
+        d["thread_last"] = {"S1": "2026-08-26T06:00:00+00:00"}
+        got = titles(compare.compare("claude-code", local(t, []), d, 3))
+        self.assertIn("Tool calls made locally are absent from the database", got)
+
+    def test_a_prompt_dropped_inside_a_turn_that_did_arrive(self):
+        """The fault worth chasing, and the one the roll-up must not swallow: the turn
+        is stored, and a prompt queued into it is not. This is the queued-prompt bug."""
+        t = MATCHED_TRANSCRIPT + [rec("user_prompt", text="the queued one")]
+        got = titles(compare.compare("claude-code", local(t), MATCHED_DB, 3))
         self.assertIn("User prompts recorded locally are absent from the database", got)
+        self.assertNotIn("Turns that never reached the database", got)
 
     def test_an_empty_scope_says_so_once_instead_of_per_session(self):
         """Stored rows that name no session leave nothing to place local activity
@@ -310,9 +390,9 @@ class TestAStoredRowHoldsAWholeTurnNotAMessage(unittest.TestCase):
         stored = self._db()
         stored["assistant_digests"] = stored_turn("first reply")
         found = compare.compare("claude-code", local(transcript, []), stored, 3)
-        gap = [f for f in found if f["title"].startswith("Assistant messages")]
+        gap = [f for f in found if f["title"] == MERGED]
         self.assertEqual(len(gap), 1)
-        self.assertIn("1 of 2 missing", gap[0]["evidence"])
+        self.assertIn("1 of 2 assistant messages", gap[0]["evidence"])
 
     def test_prompts_queued_into_one_row_are_not_a_loss(self):
         transcript = [rec("user_prompt", text="do the thing"),
@@ -342,9 +422,9 @@ class TestAStoredRowHoldsAWholeTurnNotAMessage(unittest.TestCase):
         stored = self._db()
         stored["assistant_digests"] = stored_turn("same answer")
         found = compare.compare("claude-code", local(transcript, []), stored, 3)
-        gap = [f for f in found if f["title"].startswith("Assistant messages")]
+        gap = [f for f in found if f["title"] == MERGED]
         self.assertEqual(len(gap), 1)
-        self.assertIn("1 of 2 missing", gap[0]["evidence"])
+        self.assertIn("1 of 2 assistant messages", gap[0]["evidence"])
 
 
 class TestBothSourcesOfACallIdAreRead(unittest.TestCase):
@@ -1030,12 +1110,12 @@ class TestTheTwoSidesCoverTheSameInterval(unittest.TestCase):
         self.assertNotIn("Prompts could not be checked for this window", got)
 
     def test_an_uncapped_full_window_still_reports_the_real_losses(self):
+        """Uncapped and holding none of the turn, so the turn is what is reported."""
         empty = db(threads=("S1",), tool_counts={}, call_ids=(), user_texts=(),
                    assistant_texts=(), ids_are_representative=False)
         got = titles(compare.compare("claude-code", local(MATCHED_TRANSCRIPT),
                                      empty, 14))
-        self.assertIn("User prompts recorded locally are absent from the database", got)
-        self.assertIn("Tool calls made locally are under-recorded (by count)", got)
+        self.assertIn("Turns that never reached the database", got)
 
     def test_an_interval_bounds_the_rows_not_the_request_that_made_them(self):
         """A turn that began before the audit log's first retained entry still writes
