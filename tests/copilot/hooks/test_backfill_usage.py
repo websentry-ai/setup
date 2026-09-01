@@ -9,6 +9,7 @@ stores Copilot keeps them in and ships one usage dict per exchange. Covers:
 """
 
 import json
+from datetime import datetime, timezone
 import os
 import sqlite3
 import tempfile
@@ -60,8 +61,36 @@ def _vscode_tree(tmpdir, session, lines):
     return transcript
 
 
-def _request(prompt=None, completion=None, elapsed=1234):
-    obj = {"timestamp": 1787893680000}
+
+BASE_MS = 1787893680000
+TURN_MS = 10000          # turns start 10s apart
+CLOSE_MS = 5000          # each turn closes 5s after its prompt
+
+
+def _iso(ms):
+    return datetime.fromtimestamp(ms / 1000.0, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _turn_entries(count):
+    """`count` turns, each closing before the next one opens. Requests are stamped inside
+    a turn but BEFORE its prompt, the way VS Code really writes them."""
+    entries = []
+    for turn in range(count):
+        start = BASE_MS + turn * TURN_MS
+        entries.append({"type": "user.message", "timestamp": _iso(start),
+                        "data": {"content": "prompt %d" % turn}})
+        entries.append({"type": "assistant.message", "timestamp": _iso(start + CLOSE_MS),
+                        "data": {"content": "reply %d" % turn}})
+    return entries
+
+
+def _turn_stamp(turn):
+    # 400ms before its own prompt, matching the real journal
+    return BASE_MS + turn * TURN_MS - 400
+
+
+def _request(prompt=None, completion=None, elapsed=1234, turn=0):
+    obj = {"timestamp": _turn_stamp(turn)}
     for key, value in (("promptTokens", prompt), ("completionTokens", completion),
                        ("elapsedMs", elapsed)):
         if value is not None:
@@ -130,16 +159,17 @@ class TestBackfillCliUsage(unittest.TestCase):
 
 
 class TestBackfillVscodeUsage(unittest.TestCase):
-    def _usage(self, lines):
+    def _usage(self, lines, turns=1):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _vscode_tree(tmpdir, SESSION, lines)
-            return setup._backfill_vscode_usage(transcript, SESSION)
+            return setup._backfill_vscode_usage(transcript, SESSION, _turn_entries(turns))
 
     def test_finalised_requests_are_reported_in_order(self):
         usage = self._usage([
             {"kind": 1, "v": {"requests": []}},
-            {"kind": 2, "k": ["requests"], "v": [_request(100, 5), _request(200, 7)]},
-        ])
+            {"kind": 2, "k": ["requests"], "v": [_request(100, 5, turn=0),
+                                                 _request(200, 7, turn=1)]},
+        ], turns=2)
         self.assertEqual([u["input_tokens"] for u in usage], [100, 200])
 
     def test_patches_win_over_the_streaming_values(self):
@@ -152,16 +182,76 @@ class TestBackfillVscodeUsage(unittest.TestCase):
         ])
         self.assertEqual((usage[0]["input_tokens"], usage[0]["output_tokens"]), (44090, 591))
 
-    def test_unfinished_request_truncates_the_list(self):
-        # counts appear mid-stream; without elapsedMs the request is not final
+    def test_an_unfinished_request_leaves_only_its_own_turn_estimated(self):
+        # counts appear mid-stream; without elapsedMs the request is not final. Its turn
+        # reports nothing and is estimated, but the finished turns still report.
         usage = self._usage([
             {"kind": 1, "v": {"requests": []}},
-            {"kind": 2, "k": ["requests"], "v": [_request(100, 5), _request(200, 7, elapsed=None)]},
-        ])
-        self.assertEqual(len(usage), 1)
+            {"kind": 2, "k": ["requests"], "v": [_request(100, 5, turn=0),
+                                                 _request(200, 7, elapsed=None, turn=1)]},
+        ], turns=2)
+        self.assertEqual(len(usage), 2)
+        self.assertEqual(usage[0]["input_tokens"], 100)
+        self.assertEqual(usage[1], {})
+
+    def test_a_turn_sums_every_request_that_ran_inside_it(self):
+        usage = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [
+                dict(_request(100, 5, turn=0)),
+                dict(_request(30, 2, turn=0), **{"timestamp": _turn_stamp(0) + 100})]},
+        ], turns=1)
+        self.assertEqual((usage[0]["input_tokens"], usage[0]["output_tokens"]), (130, 7))
+
+    def test_a_request_is_billed_to_its_own_turn_not_the_next(self):
+        # The whole bug: fewer requests than turns, so position and turn disagree. The
+        # journal holds only turn 1's request; turn 0 must stay estimated.
+        usage = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(200, 7, turn=1)]},
+        ], turns=2)
+        self.assertEqual(usage[0], {})
+        self.assertEqual(usage[1]["input_tokens"], 200)
+
+    def test_an_undated_request_is_billed_to_no_turn(self):
+        undated = _request(100, 5, turn=0)
+        undated.pop("timestamp")
+        usage = self._usage([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [undated]},
+        ], turns=1)
+        self.assertEqual(usage, [{}])
+
+    def test_an_unreadable_stamp_never_aborts_the_run(self):
+        # Fail open: a stamp without an offset takes the platform path, which raises OSError
+        # on Windows for pre-epoch dates. One odd transcript must not kill the whole backfill.
+        entries = _turn_entries(2)
+        with patch.object(setup, "_backfill_epoch", side_effect=OSError("Invalid argument")):
+            usage = self._usage([
+                {"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [_request(100, 5, turn=0)]},
+            ], turns=2)
+            models = setup._backfill_vscode_models(Path("/tmp/x/y.jsonl"), SESSION, entries)
+        self.assertEqual(usage, [])
+        self.assertEqual(models, [])
+
+    def test_turn_ceilings_never_decrease(self):
+        # The scan takes the first ceiling a request fits under, so out-of-order transcript
+        # stamps must not produce a window that reaches backwards.
+        jumbled = [
+            {"type": "user.message", "timestamp": _iso(BASE_MS + 30000), "data": {"content": "a"}},
+            {"type": "assistant.message", "timestamp": _iso(BASE_MS + 40000), "data": {"content": "r"}},
+            {"type": "user.message", "timestamp": _iso(BASE_MS + 10000), "data": {"content": "b"}},
+            {"type": "assistant.message", "timestamp": _iso(BASE_MS + 5000), "data": {"content": "r"}},
+            {"type": "user.message", "timestamp": _iso(BASE_MS + 60000), "data": {"content": "c"}},
+        ]
+        ceilings = setup._backfill_turn_ceilings(jumbled)
+        self.assertEqual(len(ceilings), 3)
+        self.assertTrue(all(ceilings[i] <= ceilings[i + 1] for i in range(len(ceilings) - 1)))
 
     def test_non_transcript_path_is_empty(self):
-        self.assertEqual(setup._backfill_vscode_usage(Path("/tmp/x/y.jsonl"), SESSION), [])
+        self.assertEqual(
+            setup._backfill_vscode_usage(Path("/tmp/x/y.jsonl"), SESSION, _turn_entries(1)), [])
 
 
 class TestBackfillPayload(unittest.TestCase):

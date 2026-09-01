@@ -11,6 +11,7 @@ exchange. Covers:
 """
 
 import json
+from datetime import datetime, timezone
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,8 +35,29 @@ def _vscode_tree(tmpdir, session, lines):
     return transcript
 
 
-def _request(served=None, selected=None):
-    obj = {"timestamp": 1787893680000, "promptTokens": 10,
+BASE_MS = 1787893680000
+TURN_MS = 10000
+CLOSE_MS = 5000
+
+
+def _iso(ms):
+    return datetime.fromtimestamp(ms / 1000.0, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _turn_entries(count):
+    """`count` turns, each closing before the next opens."""
+    entries = []
+    for turn in range(count):
+        start = BASE_MS + turn * TURN_MS
+        entries.append({"type": "user.message", "timestamp": _iso(start),
+                        "data": {"content": "prompt %d" % turn}})
+        entries.append({"type": "assistant.message", "timestamp": _iso(start + CLOSE_MS),
+                        "data": {"content": "reply %d" % turn}})
+    return entries
+
+
+def _request(served=None, selected=None, turn=0):
+    obj = {"timestamp": BASE_MS + turn * TURN_MS - 400, "promptTokens": 10,
            "completionTokens": 2, "elapsedMs": 99}
     if served is not None:
         obj["servedBy"] = served
@@ -45,10 +67,10 @@ def _request(served=None, selected=None):
 
 
 class TestBackfillVscodeModels(unittest.TestCase):
-    def _models(self, lines):
+    def _models(self, lines, turns=1):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _vscode_tree(tmpdir, SESSION, lines)
-            return setup._backfill_vscode_models(transcript, SESSION)
+            return setup._backfill_vscode_models(transcript, SESSION, _turn_entries(turns))
 
     def test_served_model_wins_over_the_selection(self):
         # An 'auto' selection is the whole problem: servedBy names what actually ran.
@@ -79,8 +101,8 @@ class TestBackfillVscodeModels(unittest.TestCase):
         models = self._models([
             {"kind": 1, "v": {"requests": []}},
             {"kind": 2, "k": ["requests"], "v": [
-                _request(), _request(served="claude-sonnet-5")]},
-        ])
+                _request(turn=0), _request(served="claude-sonnet-5", turn=1)]},
+        ], turns=2)
         self.assertEqual(models, ["", "claude-sonnet-5"])
 
     def test_a_patch_wins_over_the_streamed_selection(self):
@@ -95,17 +117,27 @@ class TestBackfillVscodeModels(unittest.TestCase):
         models = self._models([
             {"kind": 1, "v": {"requests": []}},
             {"kind": 2, "k": ["requests"], "v": [
-                _request(served="claude-haiku-4.5"), _request(served="claude-sonnet-5")]},
-        ])
+                _request(served="claude-haiku-4.5", turn=0),
+                _request(served="claude-sonnet-5", turn=1)]},
+        ], turns=2)
         self.assertEqual(models, ["claude-haiku-4.5", "claude-sonnet-5"])
 
+    def test_a_model_is_billed_to_its_own_turn_not_the_next(self):
+        # Fewer requests than turns: position and turn disagree, and the turn wins.
+        models = self._models([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(served="gpt-5-mini", turn=1)]},
+        ], turns=2)
+        self.assertEqual(models, ["", "gpt-5-mini"])
+
     def test_non_transcript_path_is_empty(self):
-        self.assertEqual(setup._backfill_vscode_models(Path("/tmp/x/y.jsonl"), SESSION), [])
+        self.assertEqual(
+            setup._backfill_vscode_models(Path("/tmp/x/y.jsonl"), SESSION, _turn_entries(1)), [])
 
     def test_cli_transcripts_report_nothing(self):
         # The CLI transcript records model_change and per-message models already.
         self.assertEqual(
-            setup._backfill_session_models(Path("/tmp/x/events.jsonl"), SESSION), [])
+            setup._backfill_session_models(Path("/tmp/x/events.jsonl"), SESSION, []), [])
 
 
 class TestBackfillModelsPayload(unittest.TestCase):
