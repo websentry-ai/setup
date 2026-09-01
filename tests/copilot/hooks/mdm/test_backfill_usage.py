@@ -73,7 +73,11 @@ class TestMdmBackfillUsage(unittest.TestCase):
             ]), encoding="utf-8")
             transcript = root / "GitHub.copilot-chat" / "transcripts" / (SESSION + ".jsonl")
             transcript.write_text("", encoding="utf-8")
-            usage = mdm._backfill_vscode_usage(transcript, SESSION)
+            entries = [{"type": "user.message", "timestamp": "2026-08-31T16:12:19.038Z",
+                        "data": {"content": "hi"}},
+                       {"type": "assistant.message", "timestamp": "2026-08-31T16:12:37.414Z",
+                        "data": {"content": "reply"}}]
+            usage = mdm._backfill_vscode_usage(transcript, SESSION, entries)
         self.assertEqual((usage[0]["input_tokens"], usage[0]["output_tokens"]), (44090, 591))
 
     def test_collected_session_carries_usage(self):
