@@ -689,15 +689,28 @@ def _selected_skill_names(payload):
     ]
 
 
-def _read_skill_slugs(payload):
+def _tool_output_text(payload):
+    parts = payload.get('output')
+    if not isinstance(parts, list):
+        return ''
+    return '\n'.join(
+        part['text'] for part in parts
+        if isinstance(part, dict) and isinstance(part.get('text'), str)
+    )
+
+
+def _read_skill_slugs(payload, outputs):
     """Codex has no skill tool: the agent opens SKILL.md with a shell command of
-    its own choosing, so this matches the path under our root, not the command."""
+    its own choosing. The command text is model-chosen, so naming the path proves
+    nothing; the call's own output has to carry the skill body back."""
     text = payload.get('input')
     if not isinstance(text, str) or UNBOUND_SKILL_PREFIX not in text:
         return []
+    call_id = payload.get('call_id')
+    output = outputs.get(call_id, '') if isinstance(call_id, str) else ''
     return [
         slug for slug in SKILL_READ_PATH_RE.findall(text)
-        if _SLUG_RE.match(slug)
+        if _SLUG_RE.match(slug) and 'name: ' + UNBOUND_SKILL_PREFIX + slug in output
     ]
 
 
@@ -714,6 +727,8 @@ def read_skill_facts(event):
         return facts
 
     session_names = set()
+    # The scan runs backwards, so a call's output is read before the call itself.
+    outputs = {}
     turns = 0
     in_window = True
     for raw in reversed(lines):
@@ -741,10 +756,16 @@ def read_skill_facts(event):
             continue
         if entry_type != 'response_item':
             continue
+        if payload_type == 'custom_tool_call_output':
+            call_id = payload.get('call_id')
+            text = _tool_output_text(payload)
+            if isinstance(call_id, str) and text:
+                outputs[call_id] = text
+            continue
         if payload_type == 'message' and payload.get('role') == 'user':
             found = _selected_skill_names(payload)
         elif payload_type == 'custom_tool_call' and payload.get('status') == 'completed':
-            found = _read_skill_slugs(payload)
+            found = _read_skill_slugs(payload, outputs)
         else:
             continue
         for slug in found:
@@ -2046,10 +2067,13 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     # Build metadata with the raw event
     metadata = dict(event)
 
-    _attach_skill_facts(metadata, event)
-    turn_id = _injection_turn_id(event)
-    if turn_id and _turn_guard_read(session_id) == turn_id:
-        metadata['already_injected_this_turn'] = True
+    try:
+        _attach_skill_facts(metadata, event)
+        turn_id = _injection_turn_id(event)
+        if turn_id and _turn_guard_read(session_id) == turn_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"skill facts failed: {exc}", 'skill_injection')
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching

@@ -92,8 +92,8 @@ SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 20
 SKILL_LOADED_WINDOW_PROMPTS = 10
 ATTACHED_SKILLS_MARKER = '<manually_attached_skills>'
-ATTACHED_SKILL_NAME_RE = re.compile(r'^Skill Name:[ \t]*(\S+)', re.MULTILINE)
-SKILL_READ_TOOLS = {'Read', 'ReadFile'}
+ATTACHED_SKILL_ENTRY_RE = re.compile(
+    r'^Skill Name:[ \t]*(\S+)[ \t]*\r?\nPath:[ \t]*(\S+)', re.MULTILINE)
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
@@ -510,15 +510,19 @@ def _safe_skill_segment(value):
         and not any(ch in value for ch in '*?[')
 
 
-def _attached_skill_names(text):
+def _attached_skill_slugs(text):
     """Cursor inlines an attached skill's body into the prompt itself, so an
-    attached skill loads with no file read for us to see."""
-    names = []
+    attached skill loads with no file read for us to see. The marker alone is not
+    proof: a pasted prompt can type it, so the entry needs a Path under our root."""
+    slugs = []
     if not isinstance(text, str) or ATTACHED_SKILLS_MARKER not in text:
-        return names
+        return slugs
     for chunk in text.split(ATTACHED_SKILLS_MARKER)[1:]:
-        names += ATTACHED_SKILL_NAME_RE.findall(chunk)
-    return names
+        for name, path in ATTACHED_SKILL_ENTRY_RE.findall(chunk):
+            slug = _loaded_slug_from_read(path)
+            if slug and name == UNBOUND_SKILL_PREFIX + slug:
+                slugs.append(slug)
+    return slugs
 
 
 def _loaded_slug_from_read(path):
@@ -536,20 +540,49 @@ def _loaded_slug_from_read(path):
     return slug if _SLUG_RE.match(slug) else None
 
 
+def _audit_log_skill_reads(conversation_id):
+    """Cursor writes beforeReadFile itself; an assistant tool_use is only the
+    model's request, and the transcript carries no result to pair it with. Pruning
+    can drop an old read, which costs a re-injection rather than a missed one."""
+    reads = []
+    if not conversation_id:
+        return reads
+    try:
+        logs = load_existing_logs()
+    except OSError:
+        return reads
+    prompts_after = 0
+    for log in reversed(logs):
+        event = log.get('event') if isinstance(log, dict) else None
+        if not isinstance(event, dict) or event.get('conversation_id') != conversation_id:
+            continue
+        hook_event_name = event.get('hook_event_name')
+        if hook_event_name == 'beforeSubmitPrompt':
+            prompts_after += 1
+            continue
+        if hook_event_name != 'beforeReadFile':
+            continue
+        slug = _loaded_slug_from_read(event.get('file_path'))
+        if slug:
+            reads.append((slug, prompts_after <= SKILL_LOADED_WINDOW_PROMPTS))
+    return reads
+
+
 def read_skill_facts(event):
     """`loaded` is in-window; `session_count` ignores it — the tokens were spent
     either way. Cursor emits no compaction marker, so the window is prompts alone."""
     facts = {'loaded': set(), 'session_count': 0}
-    path = event.get('transcript_path')
-    if not isinstance(path, str) or not path:
-        return facts
-    try:
-        with open(path, 'rb') as f:
-            lines = f.read().split(b'\n')
-    except OSError:
-        return facts
+    session_slugs = set()
 
-    session_names = set()
+    path = event.get('transcript_path')
+    lines = []
+    if isinstance(path, str) and path:
+        try:
+            with open(path, 'rb') as f:
+                lines = f.read().split(b'\n')
+        except OSError:
+            lines = []
+
     turns = 0
     in_window = True
     for raw in reversed(lines):
@@ -561,41 +594,31 @@ def read_skill_facts(event):
             continue
         if not isinstance(entry, dict):
             continue
-        role = entry.get('role')
-        content = (entry.get('message') or {}).get('content')
+        if entry.get('role') != 'user':
+            continue
+        message = entry.get('message')
+        content = message.get('content') if isinstance(message, dict) else None
         if not isinstance(content, list):
             continue
-        if role == 'user':
-            # Each user record is one prompt, so it is the turn boundary. Counted
-            # before its own attachments so the newest prompt stays in window.
-            turns += 1
-            if turns > SKILL_LOADED_WINDOW_PROMPTS:
-                in_window = False
-            for part in content:
-                if not isinstance(part, dict):
-                    continue
-                for name in _attached_skill_names(part.get('text')):
-                    if not name.startswith(UNBOUND_SKILL_PREFIX):
-                        continue
-                    session_names.add(name)
-                    if in_window:
-                        facts['loaded'].add(name[len(UNBOUND_SKILL_PREFIX):])
-            continue
-        if role != 'assistant':
-            continue
+        # Each user record is one prompt, so it is the turn boundary. Counted
+        # before its own attachments so the newest prompt stays in window.
+        turns += 1
+        if turns > SKILL_LOADED_WINDOW_PROMPTS:
+            in_window = False
         for part in content:
-            if not isinstance(part, dict) or part.get('type') != 'tool_use':
+            if not isinstance(part, dict):
                 continue
-            if part.get('name') not in SKILL_READ_TOOLS:
-                continue
-            slug = _loaded_slug_from_read((part.get('input') or {}).get('path'))
-            if not slug:
-                continue
-            session_names.add(UNBOUND_SKILL_PREFIX + slug)
-            if in_window:
-                facts['loaded'].add(slug)
+            for slug in _attached_skill_slugs(part.get('text')):
+                session_slugs.add(slug)
+                if in_window:
+                    facts['loaded'].add(slug)
 
-    facts['session_count'] = len(session_names)
+    for slug, read_in_window in _audit_log_skill_reads(event.get('conversation_id')):
+        session_slugs.add(slug)
+        if read_in_window:
+            facts['loaded'].add(slug)
+
+    facts['session_count'] = len(session_slugs)
     return facts
 
 
@@ -1228,10 +1251,13 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     if file_path:
         metadata['file_path'] = file_path
 
-    _attach_skill_facts(metadata, event)
-    turn_id = _injection_turn_id(event)
-    if turn_id and _turn_guard_read(conversation_id) == turn_id:
-        metadata['already_injected_this_turn'] = True
+    try:
+        _attach_skill_facts(metadata, event)
+        turn_id = _injection_turn_id(event)
+        if turn_id and _turn_guard_read(conversation_id) == turn_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"skill facts failed: {exc}", 'skill_injection')
 
     approval_key = f"{tool_name}:{file_path}" if file_path else tool_name
     is_retry = _is_approval_retry(approval_key)
@@ -2107,10 +2133,13 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
 
     _attach_tool_content_hash(metadata)
 
-    _attach_skill_facts(metadata, event)
-    turn_id = _injection_turn_id(event)
-    if turn_id and _turn_guard_read(conversation_id) == turn_id:
-        metadata['already_injected_this_turn'] = True
+    try:
+        _attach_skill_facts(metadata, event)
+        turn_id = _injection_turn_id(event)
+        if turn_id and _turn_guard_read(conversation_id) == turn_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"skill facts failed: {exc}", 'skill_injection')
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)

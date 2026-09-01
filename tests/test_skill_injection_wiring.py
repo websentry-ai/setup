@@ -4,8 +4,9 @@ The unit tests cover each piece; this covers the wiring between them, which is
 where a port goes wrong. Every tool runs as the editor runs it — a subprocess fed
 one event on stdin — against a gateway that records what it was told.
 
-The transcript fixtures are the shapes real sessions produced: `skill.invoked` for
-Copilot, a `Read` tool call for Cursor, an `exec` that opens the SKILL.md for Codex.
+The load fixtures are the shapes real sessions produced: `skill.invoked` for
+Copilot, a `beforeReadFile` hook event for Cursor, an `exec` that opens the SKILL.md
+paired with the output that carried its body back for Codex.
 """
 
 import hashlib
@@ -41,19 +42,28 @@ def _copilot_transcript(home, skills):
 
 
 def _cursor_transcript(home, skills):
-    path = home / "transcript.jsonl"
-    path.write_text(json.dumps({"role": "assistant", "message": {"content": [
-        {"type": "tool_use", "name": "Read",
-         "input": {"path": str(skills / "unbound-secure-sql" / "SKILL.md")}}]}}) + "\n")
-    return str(path)
+    audit = home / ".cursor" / "hooks" / "agent-audit.log"
+    audit.parent.mkdir(parents=True, exist_ok=True)
+    audit.write_text(json.dumps({"timestamp": "t", "event": {
+        "hook_event_name": "beforeReadFile", "conversation_id": "s1",
+        "file_path": str(skills / "unbound-secure-sql" / "SKILL.md")}}) + "\n")
+    return None  # Cursor's evidence is its own hook event, not the transcript.
 
 
 def _codex_transcript(home, skills):
     path = home / "rollout.jsonl"
-    path.write_text(json.dumps({"type": "response_item", "payload": {
-        "type": "custom_tool_call", "status": "completed", "name": "exec",
-        "input": "await tools.exec_command({cmd:\"sed -n '1,240p' %s\"});"
-                 % (skills / "unbound-secure-sql" / "SKILL.md")}}) + "\n")
+    path.write_text("\n".join(json.dumps(entry) for entry in [
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call", "status": "completed", "name": "exec",
+            "call_id": "call-1",
+            "input": "await tools.exec_command({cmd:\"sed -n '1,240p' %s\"});"
+                     % (skills / "unbound-secure-sql" / "SKILL.md")}},
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "call-1", "output": [
+                {"type": "input_text", "text": "Script completed\nOutput:\n"},
+                {"type": "input_text",
+                 "text": "---\nname: unbound-secure-sql\n---\n\n" + BODY}]}},
+    ]) + "\n")
     return str(path)
 
 

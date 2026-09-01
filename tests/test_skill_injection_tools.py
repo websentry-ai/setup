@@ -268,6 +268,12 @@ class CopilotLoadedTests(LoadedSkillsCase, unittest.TestCase):
         self.write([self.invoked("unbound-a"), self.invoked("unbound-b")] + [self.TURN] * 20)
         self.assertEqual(self.facts()["session_count"], 2)
 
+    def test_a_string_data_field_does_not_lose_the_other_facts(self):
+        self.write([{"type": "skill.invoked", "data": "oops"},
+                    {"type": "user.message", "data": "oops"},
+                    self.invoked("unbound-secure-sql")])
+        self.assertEqual(self.loaded(), ["secure-sql"])
+
     def test_derives_the_transcript_from_the_session_id(self):
         home = Path(self._tmp.name) / "copilot-home"
         state = home / "session-state" / "sess-1"
@@ -282,15 +288,38 @@ class CopilotLoadedTests(LoadedSkillsCase, unittest.TestCase):
 class CursorLoadedTests(LoadedSkillsCase, unittest.TestCase):
     tool = "cursor"
 
+    CONVERSATION = "conv-1"
+
     def setUp(self):
         super().setUp()
         self.root = Path(self._tmp.name) / "cursor-skills"
+        self.audit = Path(self._tmp.name) / "agent-audit.log"
         self._saved = self.module.CURSOR_SKILLS_ROOT
+        self._saved_audit = self.module.AUDIT_LOG
         self.module.CURSOR_SKILLS_ROOT = self.root
+        self.module.AUDIT_LOG = self.audit
 
     def tearDown(self):
         self.module.CURSOR_SKILLS_ROOT = self._saved
+        self.module.AUDIT_LOG = self._saved_audit
         super().tearDown()
+
+    def facts(self, **event):
+        event.setdefault("conversation_id", self.CONVERSATION)
+        return super().facts(**event)
+
+    def audit_rows(self, events):
+        self.audit.write_text(
+            "\n".join(json.dumps({"timestamp": "t", "event": e}) for e in events) + "\n",
+            encoding="utf-8")
+
+    def read_row(self, path, conversation_id=None):
+        return {"hook_event_name": "beforeReadFile", "file_path": str(path),
+                "conversation_id": conversation_id or self.CONVERSATION}
+
+    def prompt_row(self):
+        return {"hook_event_name": "beforeSubmitPrompt", "prompt": "next",
+                "conversation_id": self.CONVERSATION}
 
     def user(self, text):
         return {"role": "user", "message": {"content": [{"type": "text", "text": text}]}}
@@ -299,11 +328,11 @@ class CursorLoadedTests(LoadedSkillsCase, unittest.TestCase):
         return {"role": "assistant", "message": {"content": [
             {"type": "tool_use", "name": "Read", "input": {"path": str(path)}}]}}
 
-    def attached(self, name):
+    def attached(self, name, path=None):
         return self.user(
             "<manually_attached_skills>\n"
             "The user has manually attached the following skills to their message.\n\n"
-            f"Skill Name: {name}\nPath: {self.root}/{name}/SKILL.md\n"
+            f"Skill Name: {name}\nPath: {path or self.root / name / 'SKILL.md'}\n"
             "SKILL.md content:\n# body\n")
 
     def test_an_attached_skill_counts_with_no_file_read(self):
@@ -314,24 +343,68 @@ class CursorLoadedTests(LoadedSkillsCase, unittest.TestCase):
         self.write([self.attached("poteto-mode")])
         self.assertEqual(self.loaded(), [])
 
-    def test_a_read_of_our_skill_counts(self):
-        self.write([self.read(self.root / "unbound-secure-sql" / "SKILL.md")])
+    def test_an_attached_block_whose_path_is_outside_our_root_is_ignored(self):
+        elsewhere = Path(self._tmp.name) / "elsewhere" / "unbound-secure-sql" / "SKILL.md"
+        self.write([self.attached("unbound-secure-sql", path=elsewhere)])
+        self.assertEqual(self.loaded(), [])
+
+    def test_an_attached_block_with_no_path_line_is_ignored(self):
+        self.write([self.user(
+            "<manually_attached_skills>\nSkill Name: unbound-secure-sql\n"
+            "SKILL.md content:\n# body\n")])
+        self.assertEqual(self.loaded(), [])
+
+    def test_an_attached_name_that_disagrees_with_its_path_is_ignored(self):
+        self.write([self.attached(
+            "unbound-secure-sql", path=self.root / "unbound-other" / "SKILL.md")])
+        self.assertEqual(self.loaded(), [])
+
+    def test_a_harness_read_of_our_skill_counts(self):
+        self.audit_rows([self.read_row(self.root / "unbound-secure-sql" / "SKILL.md")])
         self.assertEqual(self.loaded(), ["secure-sql"])
 
-    def test_a_read_outside_our_root_does_not_count(self):
+    def test_a_harness_read_outside_our_root_does_not_count(self):
         other = Path(self._tmp.name) / "elsewhere" / "unbound-secure-sql" / "SKILL.md"
-        self.write([self.read(other)])
+        self.audit_rows([self.read_row(other)])
         self.assertEqual(self.loaded(), [])
 
-    def test_a_read_of_a_skill_we_did_not_install_does_not_count(self):
-        self.write([self.read(self.root / "poteto-mode" / "SKILL.md")])
+    def test_a_harness_read_of_a_skill_we_did_not_install_does_not_count(self):
+        self.audit_rows([self.read_row(self.root / "poteto-mode" / "SKILL.md")])
         self.assertEqual(self.loaded(), [])
+
+    def test_a_harness_read_in_another_conversation_does_not_count(self):
+        self.audit_rows([self.read_row(self.root / "unbound-secure-sql" / "SKILL.md",
+                                       conversation_id="conv-other")])
+        self.assertEqual(self.loaded(), [])
+
+    def test_a_model_requested_read_alone_does_not_count(self):
+        # The transcript records the model asking to Read, never a result, so the
+        # request is not evidence the body reached the context.
+        self.write([self.read(self.root / "unbound-secure-sql" / "SKILL.md")])
+        self.assertEqual(self.loaded(), [])
+        self.assertEqual(self.facts()["session_count"], 0)
 
     def test_drops_out_of_the_window(self):
-        self.write([self.read(self.root / "unbound-secure-sql" / "SKILL.md")]
-                   + [self.user("next")] * 11)
+        self.audit_rows([self.read_row(self.root / "unbound-secure-sql" / "SKILL.md")]
+                        + [self.prompt_row()] * 11)
         self.assertEqual(self.loaded(), [])
         self.assertEqual(self.facts()["session_count"], 1)
+
+    def test_stays_in_the_window_at_its_edge(self):
+        self.audit_rows([self.read_row(self.root / "unbound-secure-sql" / "SKILL.md")]
+                        + [self.prompt_row()] * 10)
+        self.assertEqual(self.loaded(), ["secure-sql"])
+
+    def test_a_string_message_does_not_lose_the_other_facts(self):
+        self.write([{"role": "user", "message": "oops"},
+                    self.attached("unbound-secure-sql")])
+        self.assertEqual(self.loaded(), ["secure-sql"])
+
+    def test_a_string_tool_input_does_not_lose_the_other_facts(self):
+        self.write([{"role": "assistant", "message": {"content": [
+                        {"type": "tool_use", "name": "Read", "input": "oops"}]}},
+                    self.attached("unbound-secure-sql")])
+        self.assertEqual(self.loaded(), ["secure-sql"])
 
     def test_no_transcript_path_is_no_facts(self):
         self.assertEqual(self.module.read_skill_facts({}), {"loaded": set(), "session_count": 0})
@@ -370,10 +443,19 @@ class CodexLoadedTests(LoadedSkillsCase, unittest.TestCase):
             "internal_chat_message_metadata_passthrough": {
                 "turn_id": "t", "content_item_kinds": ["skills.selected_skill_instructions"]}}}
 
-    def exec_read(self, path, status="completed"):
+    def exec_read(self, path, status="completed", call_id="call-1"):
         return {"type": "response_item", "payload": {
             "type": "custom_tool_call", "status": status, "name": "exec",
+            "call_id": call_id,
             "input": "const r = await tools.exec_command({cmd:\"sed -n '1,240p' %s\"});" % path}}
+
+    def exec_output(self, name="unbound-secure-sql", call_id="call-1", parts=None):
+        if parts is None:
+            parts = [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                     {"type": "input_text",
+                      "text": f"---\nname: {name}\ndescription: does things\n---\n\n# body\n"}]
+        return {"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": call_id, "output": parts}}
 
     def test_a_dollar_sigil_injection_counts(self):
         self.write([self.selected("unbound-secure-sql")])
@@ -384,18 +466,63 @@ class CodexLoadedTests(LoadedSkillsCase, unittest.TestCase):
         self.assertEqual(self.loaded(), [])
 
     def test_a_model_initiated_read_counts(self):
+        self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md"),
+                    self.exec_output()])
+        self.assertEqual(self.loaded(), ["secure-sql"])
+
+    def test_a_read_with_no_output_does_not_count(self):
+        # The command text is model-chosen, so a no-op exec naming the path is not
+        # evidence the body entered the context.
         self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md")])
+        self.assertEqual(self.loaded(), [])
+        self.assertEqual(self.facts()["session_count"], 0)
+
+    def test_an_output_for_another_call_does_not_count(self):
+        self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md"),
+                    self.exec_output(call_id="call-9")])
+        self.assertEqual(self.loaded(), [])
+
+    def test_an_output_without_the_body_does_not_count(self):
+        self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md"),
+                    self.exec_output(parts=[{"type": "input_text",
+                                             "text": "Script completed\nOutput:\n"}])])
+        self.assertEqual(self.loaded(), [])
+
+    def test_an_output_naming_a_different_skill_does_not_count(self):
+        self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md"),
+                    self.exec_output(name="unbound-other")])
+        self.assertEqual(self.loaded(), [])
+
+    def test_a_non_dict_output_part_does_not_raise(self):
+        self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md"),
+                    self.exec_output(parts=["oops", {"type": "input_text",
+                                                     "text": "name: unbound-secure-sql\n"}])])
         self.assertEqual(self.loaded(), ["secure-sql"])
 
     def test_an_unfinished_read_does_not_count(self):
         self.write([self.exec_read(self.root / "unbound-secure-sql" / "SKILL.md",
-                                   status="in_progress")])
+                                   status="in_progress"),
+                    self.exec_output()])
         self.assertEqual(self.loaded(), [])
 
     def test_a_read_outside_our_root_does_not_count(self):
         other = Path(self._tmp.name) / "elsewhere" / "unbound-secure-sql" / "SKILL.md"
-        self.write([self.exec_read(other)])
+        self.write([self.exec_read(other), self.exec_output()])
         self.assertEqual(self.loaded(), [])
+
+    def test_a_string_input_does_not_lose_the_other_facts(self):
+        broken = {"type": "response_item", "payload": {
+            "type": "custom_tool_call", "status": "completed", "input": {"cmd": "oops"}}}
+        self.write([broken, self.selected("unbound-secure-sql")])
+        self.assertEqual(self.loaded(), ["secure-sql"])
+
+    def test_a_string_message_content_does_not_lose_the_other_facts(self):
+        broken = {"type": "response_item", "payload": {
+            "type": "message", "role": "user", "content": "oops",
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["skills.selected_skill_instructions"]}}}
+        self.write([broken, self.selected("unbound-secure-sql")])
+        self.assertEqual(self.loaded(), ["secure-sql"])
 
     def test_the_installed_catalog_alone_is_not_a_load(self):
         # Codex lists every installed skill in world_state on every session.

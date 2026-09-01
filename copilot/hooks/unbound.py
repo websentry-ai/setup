@@ -2689,10 +2689,13 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             metadata['mcp_server_config'] = mcp_server_config
         _attach_tool_content_hash(metadata)
 
-    _attach_skill_facts(metadata, event)
-    turn_id = _injection_turn_id(event)
-    if turn_id and _turn_guard_read(session_id) == turn_id:
-        metadata['already_injected_this_turn'] = True
+    try:
+        _attach_skill_facts(metadata, event)
+        turn_id = _injection_turn_id(event)
+        if turn_id and _turn_guard_read(session_id) == turn_id:
+            metadata['already_injected_this_turn'] = True
+    except Exception as exc:
+        log_error(f"skill facts failed: {exc}", 'skill_injection')
 
     approval_key = f"{canonical}:{command}"
     is_retry = _is_approval_retry(approval_key)
