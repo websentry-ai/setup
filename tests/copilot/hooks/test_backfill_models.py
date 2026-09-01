@@ -7,11 +7,13 @@ exchange. Covers:
   - _backfill_vscode_models   (servedBy over modelId, namespacing, gaps)
   - _backfill_session_models  (VS Code only; the CLI transcript already names its model)
   - _backfill_collect_session / _backfill_slice_session (payload + boundary-aligned slicing)
-  - _backfill_force_epoch     (org-wide re-walk request)
+  - _backfill_force_config    (org-wide re-walk request + its window)
 """
 
 import json
+from datetime import datetime, timezone
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -34,8 +36,29 @@ def _vscode_tree(tmpdir, session, lines):
     return transcript
 
 
-def _request(served=None, selected=None):
-    obj = {"timestamp": 1787893680000, "promptTokens": 10,
+BASE_MS = 1787893680000
+TURN_MS = 10000
+CLOSE_MS = 5000
+
+
+def _iso(ms):
+    return datetime.fromtimestamp(ms / 1000.0, timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _turn_entries(count):
+    """`count` turns, each closing before the next opens."""
+    entries = []
+    for turn in range(count):
+        start = BASE_MS + turn * TURN_MS
+        entries.append({"type": "user.message", "timestamp": _iso(start),
+                        "data": {"content": "prompt %d" % turn}})
+        entries.append({"type": "assistant.message", "timestamp": _iso(start + CLOSE_MS),
+                        "data": {"content": "reply %d" % turn}})
+    return entries
+
+
+def _request(served=None, selected=None, turn=0):
+    obj = {"timestamp": BASE_MS + turn * TURN_MS - 400, "promptTokens": 10,
            "completionTokens": 2, "elapsedMs": 99}
     if served is not None:
         obj["servedBy"] = served
@@ -45,10 +68,10 @@ def _request(served=None, selected=None):
 
 
 class TestBackfillVscodeModels(unittest.TestCase):
-    def _models(self, lines):
+    def _models(self, lines, turns=1):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = _vscode_tree(tmpdir, SESSION, lines)
-            return setup._backfill_vscode_models(transcript, SESSION)
+            return setup._backfill_vscode_models(transcript, SESSION, _turn_entries(turns))
 
     def test_served_model_wins_over_the_selection(self):
         # An 'auto' selection is the whole problem: servedBy names what actually ran.
@@ -79,8 +102,8 @@ class TestBackfillVscodeModels(unittest.TestCase):
         models = self._models([
             {"kind": 1, "v": {"requests": []}},
             {"kind": 2, "k": ["requests"], "v": [
-                _request(), _request(served="claude-sonnet-5")]},
-        ])
+                _request(turn=0), _request(served="claude-sonnet-5", turn=1)]},
+        ], turns=2)
         self.assertEqual(models, ["", "claude-sonnet-5"])
 
     def test_a_patch_wins_over_the_streamed_selection(self):
@@ -95,17 +118,39 @@ class TestBackfillVscodeModels(unittest.TestCase):
         models = self._models([
             {"kind": 1, "v": {"requests": []}},
             {"kind": 2, "k": ["requests"], "v": [
-                _request(served="claude-haiku-4.5"), _request(served="claude-sonnet-5")]},
-        ])
+                _request(served="claude-haiku-4.5", turn=0),
+                _request(served="claude-sonnet-5", turn=1)]},
+        ], turns=2)
         self.assertEqual(models, ["claude-haiku-4.5", "claude-sonnet-5"])
 
+    def test_a_model_is_billed_to_its_own_turn_not_the_next(self):
+        # Fewer requests than turns: position and turn disagree, and the turn wins.
+        models = self._models([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [_request(served="gpt-5-mini", turn=1)]},
+        ], turns=2)
+        self.assertEqual(models, ["", "gpt-5-mini"])
+
+    def test_a_mid_turn_switch_reports_the_turns_last_model(self):
+        # The live collector reads the turn's last request; the re-walk must agree or the
+        # same turn is costed under two different models.
+        models = self._models([
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [
+                _request(served="claude-haiku-4.5", turn=0),
+                dict(_request(served="gpt-5-mini", turn=0),
+                     **{"timestamp": BASE_MS - 400 + 100})]},
+        ], turns=1)
+        self.assertEqual(models, ["gpt-5-mini"])
+
     def test_non_transcript_path_is_empty(self):
-        self.assertEqual(setup._backfill_vscode_models(Path("/tmp/x/y.jsonl"), SESSION), [])
+        self.assertEqual(
+            setup._backfill_vscode_models(Path("/tmp/x/y.jsonl"), SESSION, _turn_entries(1)), [])
 
     def test_cli_transcripts_report_nothing(self):
         # The CLI transcript records model_change and per-message models already.
         self.assertEqual(
-            setup._backfill_session_models(Path("/tmp/x/events.jsonl"), SESSION), [])
+            setup._backfill_session_models(Path("/tmp/x/events.jsonl"), SESSION, []), [])
 
 
 class TestBackfillModelsPayload(unittest.TestCase):
@@ -146,11 +191,14 @@ class TestBackfillModelsPayload(unittest.TestCase):
                              ["m0", "m1", "m2"][base:base + len(part.get("models", []))])
 
 
-class TestBackfillForceEpoch(unittest.TestCase):
-    def _epoch(self, code, payload):
+class TestBackfillForceConfig(unittest.TestCase):
+    def _config(self, code, payload):
         body = json.dumps(payload).encode("utf-8") if payload is not None else b"not json"
         with patch.object(setup, "_backfill_http_request", lambda *a, **k: (code, body)):
-            return setup._backfill_force_epoch("key", "https://backend")
+            return setup._backfill_force_config("key", "https://backend")
+
+    def _epoch(self, code, payload):
+        return self._config(code, payload)[0]
 
     def test_a_requested_time_is_returned(self):
         self.assertEqual(self._epoch(200, {"force_backfill_requested_epoch": 1787893680.5}),
@@ -170,6 +218,69 @@ class TestBackfillForceEpoch(unittest.TestCase):
         self.assertIsNone(self._epoch(0, {"force_backfill_requested_epoch": 1787893680}))
         self.assertIsNone(self._epoch(200, None))
 
+    def test_a_window_rides_with_the_request(self):
+        self.assertEqual(
+            self._config(200, {"force_backfill_requested_epoch": 1787893680,
+                               "force_backfill_days": 45}),
+            (1787893680.0, 45))
+
+    def test_no_window_leaves_the_installer_default(self):
+        # None, not 30: the caller owns the default, so an old backend behaves as before.
+        for payload in ({"force_backfill_requested_epoch": 1787893680},
+                        {"force_backfill_requested_epoch": 1787893680,
+                         "force_backfill_days": None}):
+            self.assertIsNone(self._config(200, payload)[1], payload)
+
+    def test_an_unusable_window_is_ignored(self):
+        # bool is an int subclass; 0 and negatives would reach back to the epoch.
+        for bad in (True, False, 0, -5, "45", 45.5, [45], {"days": 45}):
+            self.assertIsNone(
+                self._config(200, {"force_backfill_requested_epoch": 1787893680,
+                                   "force_backfill_days": bad})[1], bad)
+
+    def test_a_window_without_a_request_is_never_returned(self):
+        self.assertEqual(self._config(200, {"force_backfill_days": 45}), (None, None))
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestForceWindow(unittest.TestCase):
+    """How far back a forced re-walk reaches on a user-scope install. Without the org's
+    window it cannot pass 30 days, so history an earlier backfill already reached is
+    dropped and never revisited."""
+
+    def _forced_cutoff(self, force_days, persisted=None):
+        """The mtime floor a forced run actually walks from."""
+        # A device that backfilled yesterday, which is what the window widens.
+        persisted = time.time() - 86400 if persisted is None else persisted
+        seen = {}
+
+        def _capture(cutoff_mtime):
+            seen["cutoff"] = cutoff_mtime
+            return iter(())
+
+        with patch.object(setup, "_copilot_home", lambda: Path("/tmp/nope")), \
+                patch.object(setup, "_backfill_read_cutoff", lambda home: persisted), \
+                patch.object(setup, "_backfill_force_config",
+                             lambda *a: (1e12, force_days)), \
+                patch.object(setup, "_backfill_iter_transcripts", _capture), \
+                patch.object(setup, "_backfill_write_cutoff", lambda *a: None):
+            setup.run_backfill("key", "https://backend")
+        return seen["cutoff"]
+
+    def test_the_window_widens_the_walk(self):
+        reach = time.time() - self._forced_cutoff(45)
+        self.assertAlmostEqual(reach / 86400, 45, delta=1)
+
+    def test_no_window_keeps_the_installer_default(self):
+        reach = time.time() - self._forced_cutoff(None)
+        self.assertAlmostEqual(reach / 86400, setup.BACKFILL_MAX_AGE_DAYS, delta=1)
+
+    def test_a_narrow_window_never_gives_up_ground_already_reached(self):
+        # The run advances the cutoff on success, so anything a narrow window skips is
+        # never visited again. Force may widen the walk; it may not shrink it.
+        sixty_days_ago = time.time() - 60 * 86400
+        cutoff = self._forced_cutoff(10, persisted=sixty_days_ago)
+        self.assertAlmostEqual(cutoff, sixty_days_ago, delta=2)
