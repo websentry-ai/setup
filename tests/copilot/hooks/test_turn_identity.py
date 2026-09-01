@@ -1,0 +1,344 @@
+"""
+Tests for per-turn identity and late completion in copilot/hooks/unbound.py.
+
+Copilot writes a turn's tokens and its served model after that turn has already been
+reported, so the numbers have to be sent again later. The second send must land on the
+same row, which means a turn needs an id that does not change when its usage does.
+"""
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from tests.conftest import tool_module
+
+unbound = tool_module("copilot/hooks", "unbound")
+
+SESSION = "sess-turn-identity"
+
+
+def _transcript(tmpdir, entries):
+    path = Path(tmpdir) / "events.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in entries), encoding="utf-8")
+    return path
+
+
+def _user(content, entry_id=None):
+    entry = {"type": "user.message", "data": {"content": content}}
+    if entry_id:
+        entry["id"] = entry_id
+    return entry
+
+
+def _assistant(content):
+    return {"type": "assistant.message", "data": {"content": content}}
+
+
+class TestTurnRequestId(unittest.TestCase):
+    def _id(self, user, assistant, occurrence=0, session=SESSION):
+        digest = unbound.turn_content_digest(user, assistant)
+        return unbound.build_turn_request_id(session, digest, occurrence)
+
+    def test_same_turn_gets_the_same_id(self):
+        # The whole point: re-sending a turn once its tokens land must address the row
+        # the first send created.
+        self.assertEqual(self._id("hi", "hello"), self._id("hi", "hello"))
+
+    def test_usage_is_not_part_of_the_id(self):
+        # The id is built from content alone, so tokens arriving later cannot change it.
+        first = self._id("hi", "hello")
+        self.assertEqual(first, self._id("hi", "hello"))
+
+    def test_different_turns_get_different_ids(self):
+        self.assertNotEqual(self._id("hi", "hello"), self._id("bye", "hello"))
+        self.assertNotEqual(self._id("hi", "hello"), self._id("hi", "goodbye"))
+
+    def test_a_repeated_turn_is_separated_by_occurrence(self):
+        self.assertNotEqual(self._id("hi", "hello", 0), self._id("hi", "hello", 1))
+
+    def test_sessions_do_not_collide(self):
+        self.assertNotEqual(self._id("hi", "hello"), self._id("hi", "hello", session="other"))
+
+    def test_a_prompt_cannot_forge_the_next_turns_digest(self):
+        # NUL-joined, so "ab" + "" and "a" + "b" stay distinct.
+        self.assertNotEqual(unbound.turn_content_digest("ab", ""),
+                            unbound.turn_content_digest("a", "b"))
+
+    def test_the_id_fits_the_request_id_column(self):
+        self.assertEqual(len(self._id("hi", "hello")), 36)
+
+
+class TestRebuildTurnContent(unittest.TestCase):
+    def test_one_turn_is_rebuilt_and_the_next_prompt_ends_it(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _transcript(tmpdir, [
+                _user("first", "p1"), _assistant("reply one"),
+                _user("second", "p2"), _assistant("reply two"),
+            ])
+            self.assertEqual(
+                unbound.rebuild_turn_content(path, SESSION, "p1"), ("first", "reply one"))
+            self.assertEqual(
+                unbound.rebuild_turn_content(path, SESSION, "p2"), ("second", "reply two"))
+
+    def test_multiple_assistant_messages_join(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _transcript(tmpdir, [
+                _user("q", "p1"), _assistant("one"), _assistant("two"),
+            ])
+            self.assertEqual(
+                unbound.rebuild_turn_content(path, SESSION, "p1"), ("q", "one\n\ntwo"))
+
+    def test_an_unknown_prompt_id_rebuilds_nothing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _transcript(tmpdir, [_user("q", "p1"), _assistant("a")])
+            self.assertIsNone(unbound.rebuild_turn_content(path, SESSION, "gone"))
+
+    def test_a_missing_transcript_rebuilds_nothing(self):
+        self.assertIsNone(unbound.rebuild_turn_content("/nope/events.jsonl", SESSION, "p1"))
+        self.assertIsNone(unbound.rebuild_turn_content(None, SESSION, "p1"))
+
+    def test_an_entry_without_an_id_still_resolves(self):
+        # Entries can arrive without an envelope id; the derived id has to match the one
+        # the parser watermarked with, or the turn can never be rebuilt.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            entries = [_user("no id here"), _assistant("reply")]
+            path = _transcript(tmpdir, entries)
+            derived = unbound.turn_prompt_id(entries[0], SESSION, 0, "no id here")
+            self.assertEqual(
+                unbound.rebuild_turn_content(path, SESSION, derived),
+                ("no id here", "reply"))
+
+
+class TestCompletePendingTurn(unittest.TestCase):
+    def _run(self, pending, usage, model, entries=None, final=False, capture=None):
+        sent = []
+        entries = entries or [_user("q", "p1"), _assistant("a")]
+
+        def _usage(path, conv, since, until):
+            if capture is not None:
+                capture.update({"since": since, "until": until})
+            return usage
+
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _transcript(tmpdir, entries)
+            event = {"transcript_path": str(path)}
+            with patch.object(unbound, "pending_turn_usage", _usage), \
+                    patch.object(unbound, "_vscode_turn_model", lambda *a, **k: model), \
+                    patch.object(unbound, "send_to_api",
+                                 lambda ex, key: sent.append(ex) or True):
+                settled = unbound.complete_pending_turn(event, pending, "key", final=final)
+        return settled, sent
+
+    def _pending(self):
+        return {"turn_request_id": "tid-1", "conversation_id": SESSION,
+                "prompt_id": "p1", "since": None, "until": "2026-08-31T00:00:00Z"}
+
+    def test_usage_that_lands_later_is_sent_under_the_original_id(self):
+        settled, sent = self._run(self._pending(), {"input_tokens": 5}, None)
+        self.assertTrue(settled)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["turn_request_id"], "tid-1")
+        self.assertEqual(sent[0]["usage"], {"input_tokens": 5})
+        self.assertEqual(sent[0]["messages"][0]["content"], "q")
+
+    def test_a_model_alone_keeps_waiting_for_the_tokens(self):
+        # VS Code can name the model before it has finished counting. Sending on the model
+        # alone and clearing the slot would lose those tokens permanently.
+        settled, sent = self._run(self._pending(), None, "claude-haiku-4.5")
+        self.assertFalse(settled)
+        self.assertEqual(sent, [])
+
+    def test_session_end_sends_the_model_but_keeps_the_slot(self):
+        # Last chance this session gets, so take what is there. Settled still means the
+        # tokens are in, so the slot survives for anything that runs after.
+        settled, sent = self._run(self._pending(), None, "claude-haiku-4.5", final=True)
+        self.assertFalse(settled)
+        self.assertEqual(sent[0]["model"], "claude-haiku-4.5")
+        self.assertNotIn("usage", sent[0])
+
+    def test_a_send_carrying_tokens_is_what_settles_the_turn(self):
+        settled, sent = self._run(self._pending(), {"input_tokens": 5}, None)
+        self.assertTrue(settled)
+        self.assertEqual(sent[0]["usage"], {"input_tokens": 5})
+
+    def test_tokens_arriving_after_a_model_still_complete_the_turn(self):
+        # The slot survived the model-only round, so the later tokens land on the row.
+        settled, sent = self._run(self._pending(), {"input_tokens": 5}, "claude-haiku-4.5")
+        self.assertTrue(settled)
+        self.assertEqual(sent[0]["usage"], {"input_tokens": 5})
+        self.assertEqual(sent[0]["model"], "claude-haiku-4.5")
+
+    def test_nothing_landed_means_nothing_sent(self):
+        settled, sent = self._run(self._pending(), None, None)
+        self.assertFalse(settled)
+        self.assertEqual(sent, [])
+
+    def test_a_junk_entry_is_dropped_rather_than_retried(self):
+        self.assertEqual(self._run(None, {"input_tokens": 5}, None), (True, []))
+        self.assertEqual(self._run({}, {"input_tokens": 5}, None), (True, []))
+
+    def test_a_turn_gone_from_the_transcript_is_cleared_not_resent(self):
+        # Otherwise the slot would hold a turn that can never be rebuilt and every later
+        # Stop would retry it.
+        pending = dict(self._pending(), prompt_id="vanished")
+        settled, sent = self._run(pending, {"input_tokens": 5}, None)
+        self.assertTrue(settled)
+        self.assertEqual(sent, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+    def test_the_read_is_bounded_by_the_turns_own_window(self):
+        # Not the live path's watermark: by the time a turn is completed, every later
+        # turn has settled too, and a watermark read would hand this turn all of them.
+        capture = {}
+        self._run(self._pending(), {"input_tokens": 5}, None, capture=capture)
+        self.assertEqual(capture.get("until"), "2026-08-31T00:00:00Z")
+
+
+class TestPendingTurnsSurviveLaterTurns(unittest.TestCase):
+    """One slot lost a turn: the next Stop wrote its own pending over the earlier one."""
+
+    def _pending(self, n):
+        return {"turn_request_id": "tid-%d" % n, "conversation_id": SESSION,
+                "prompt_id": "p%d" % n, "since": None, "until": "2026-08-31T00:00:00Z"}
+
+    def _remaining(self, pending_turns, settle):
+        with patch.object(unbound, "get_session_marker",
+                          lambda k: {"pending_turns": pending_turns}), \
+                patch.object(unbound, "complete_pending_turn",
+                             lambda ev, p, key, final=False: settle(p)):
+            return unbound.complete_pending_turns({}, "wm", "key")
+
+    def test_an_unsettled_turn_stays_while_a_later_one_settles(self):
+        turns = [self._pending(1), self._pending(2)]
+        remaining = self._remaining(turns, lambda p: p["turn_request_id"] == "tid-2")
+        self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1"])
+
+    def test_everything_settled_leaves_nothing(self):
+        turns = [self._pending(1), self._pending(2)]
+        self.assertEqual(self._remaining(turns, lambda p: True), [])
+
+    def test_nothing_settled_keeps_them_all_in_order(self):
+        turns = [self._pending(1), self._pending(2)]
+        remaining = self._remaining(turns, lambda p: False)
+        self.assertEqual([p["turn_request_id"] for p in remaining], ["tid-1", "tid-2"])
+
+    def test_the_bound_clears_real_session_lengths(self):
+        # The longest session observed in production ran 301 turns, and VS Code can leave
+        # every one of them pending until SessionEnd. A bound below that would drop the
+        # tokens of exactly the sessions this exists to rescue.
+        self.assertGreater(unbound.MAX_PENDING_TURNS, 301)
+
+
+class TestPendingTurnsReadTheirOwnWindows(unittest.TestCase):
+    """Every pending turn used to read from one shared index, so the first took every
+    settled request and the rest got nothing."""
+
+    def _pending(self, n, since, until):
+        return {"turn_request_id": "tid-%d" % n, "conversation_id": SESSION,
+                "prompt_id": "p%d" % n, "since": since, "until": until}
+
+    def test_each_turn_is_read_with_its_own_boundaries(self):
+        windows = []
+
+        def _usage(path, conv, since, until):
+            windows.append((since, until))
+            return {"input_tokens": 1}
+
+        turns = [self._pending(1, None, "t1"), self._pending(2, "t1", "t2")]
+        with patch.object(unbound, "get_session_marker",
+                          lambda k: {"pending_turns": turns}), \
+                patch.object(unbound, "pending_turn_usage", _usage), \
+                patch.object(unbound, "_vscode_turn_model", lambda *a, **k: None), \
+                patch.object(unbound, "rebuild_turn_content", lambda *a, **k: ("q", "a")), \
+                patch.object(unbound, "send_to_api", lambda ex, key: True):
+            remaining = unbound.complete_pending_turns({}, "wm", "key")
+
+        self.assertEqual(windows, [(None, "t1"), ("t1", "t2")],
+                         "the second turn must not be read with the first's window")
+        self.assertEqual(remaining, [])
+
+
+class TestAwaitVscodeJournal(unittest.TestCase):
+    """Session end is the last chance to catch a journal VS Code writes lazily, so an
+    unchanged first poll means the write has not started, not that it never will."""
+
+    class _Clock:
+        def __init__(self):
+            self.now = 0.0
+            self.slept = 0
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.now += seconds
+            self.slept += 1
+
+    def _await(self, stamps):
+        """stamps: what each _vscode_store_stamp call returns, in order."""
+        clock = self._Clock()
+        seq = iter(stamps)
+        last = [stamps[-1]]
+
+        def _stamp(_path):
+            try:
+                last[0] = next(seq)
+            except StopIteration:
+                pass
+            return last[0]
+
+        with patch.object(unbound, "time", clock), \
+                patch.object(unbound, "_vscode_store_path", lambda *a: Path("/tmp/j.jsonl")), \
+                patch.object(unbound, "_vscode_store_stamp", _stamp):
+            unbound._await_vscode_journal("/tmp/t.jsonl", SESSION)
+        return clock
+
+    def test_it_waits_the_whole_window_when_nothing_is_written(self):
+        clock = self._await([(1, 1)] * 200)
+        expected = unbound._VSCODE_SETTLE_SECONDS / unbound._VSCODE_POLL_SECONDS
+        self.assertGreaterEqual(clock.slept, expected - 1,
+                                "gave up before the window instead of waiting for the write")
+
+    def test_it_returns_once_a_write_lands_and_goes_quiet(self):
+        # grows twice, then settles
+        clock = self._await([(1, 1), (2, 2), (3, 3), (3, 3), (3, 3)])
+        self.assertLess(clock.now, unbound._VSCODE_SETTLE_SECONDS,
+                        "should stop as soon as the journal settles")
+        self.assertGreaterEqual(clock.slept, 3)
+
+
+class TestSessionEndWaitsBeforeReading(unittest.TestCase):
+    """main() is not driven by these tests, so this guards the one thing about it that
+    cannot be recovered if it regresses: at session end the journal wait has to happen
+    before anything reads usage, because the turn ending the session has no later event
+    to be completed by. Asserted on the source, the way the reader block already is."""
+
+    def _main_body(self):
+        path = Path(__file__).resolve().parents[3] / "copilot/hooks/unbound.py"
+        text = path.read_text(encoding="utf-8")
+        return text[text.index("def main():"):]
+
+    def test_the_wait_precedes_the_usage_read(self):
+        body = self._main_body()
+        wait = body.index("_await_vscode_journal(")
+        read = body.index("usage, usage_index = get_turn_usage(")
+        self.assertLess(wait, read,
+                        "session end must settle the journal before reading the last turn")
+
+    def test_the_wait_precedes_completing_earlier_turns(self):
+        body = self._main_body()
+        wait = body.index("_await_vscode_journal(")
+        complete = body.index("complete_pending_turns(")
+        self.assertLess(wait, complete)
+
+    def test_the_wait_is_only_for_session_end(self):
+        body = self._main_body()
+        wait = body.index("_await_vscode_journal(")
+        guard = body.rindex("if event_name == 'SessionEnd':", 0, wait)
+        self.assertLess(wait - guard, 400, "the wait must stay under the SessionEnd guard")

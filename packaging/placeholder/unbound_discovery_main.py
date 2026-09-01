@@ -3,7 +3,7 @@
 
 Stdlib-only stand-in so the release pipeline (WEB-4789) can build, sign,
 package, and smoke-test end-to-end before the real discovery runtime lands.
-The real build checks out websentry-ai/coding-discovery-tool at the SHA in
+The real build checks out websentry-ai/coding-discovery-tool at the ref in
 packaging/discovery.lock and Stream B's .spec points at its entry module.
 
 Contract the LaunchDaemon (WEB-4792) relies on and the real binary must keep:

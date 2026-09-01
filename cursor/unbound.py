@@ -8,7 +8,7 @@ import sys
 import json
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from collections import defaultdict
 from datetime import datetime, timezone
 import tempfile
@@ -17,7 +17,8 @@ import hashlib
 import re
 import sqlite3
 import platform
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional
+from urllib.parse import quote, urlparse
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -32,7 +33,9 @@ DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 
 DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
@@ -969,6 +972,624 @@ def _augment_script_hash(result, cwd):
     return result
 
 
+# KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
+# Fingerprints key the local tool-hash cache; Redis tool scores are separately
+# keyed by tool content hash. Keep fingerprint output aligned with data/gateway.
+
+_MCP_TOOLS_CACHE_FILENAME = 'mcp-tools-cache.json'
+_MCP_TOOLS_CACHE_MAX_BYTES = 2 * 1024 * 1024
+_MCP_CACHE_CODING_TOOL_NAMES = frozenset({'cursor', 'cursor cli'})
+_MCP_CACHE_CODING_TOOL_PREFIXES = ()
+_UNBOUND_CODING_TOOL = 'Cursor'
+
+
+# Canonical MCP fingerprint port. Keep output aligned with the data, gateway,
+# and discovery implementations.
+CLAUDE_BUILTIN_PREFIX = 'claude-builtin:'
+
+CLAUDE_CONNECTOR_SCOPE = 'claude-connector'
+
+# Claude Code sanitizes display names into runtime names (non-alphanumerics -> '_'), so one
+# server arrives under several spellings. chrome/browser/preview stay separate: different tools.
+_CLAUDE_BUILTIN_NAMES = {
+    'computer-use': 'computer-use',
+    'claude-in-chrome': 'claude-in-chrome',
+    'claude-for-chrome': 'claude-in-chrome',
+    'claude-browser': 'claude-browser',
+    'claude-preview': 'claude-preview',
+    'claude-design': 'claude-design',
+    'ccd-session': 'ccd-session',
+    'ccd-session-mgmt': 'ccd-session-mgmt',
+    'ide': 'ide',
+}
+
+_BUILTIN_NAME_SEPARATOR_RE = re.compile(r'[\s_]+')
+
+
+def claude_builtin_identity(name):
+    """Canonical built-in identity for a bare server name, or None."""
+    key = _BUILTIN_NAME_SEPARATOR_RE.sub('-', (name or '').strip().lower())
+    return _CLAUDE_BUILTIN_NAMES.get(key)
+
+CLAUDEAI_NAME_PREFIX = 'claude.ai '
+CLAUDEAI_ALLOWED_ADDITIONAL_DATA = ({}, {'scope': 'claudeai'})
+
+# npm-package runners: the first positional arg is the package to run.
+NPM_RUNNERS = frozenset({'npx', 'npm', 'bunx'})
+# Sub-runners under npx/bunx that are not the package themselves (the real
+# target -- usually a local script -- follows).
+NPX_LOCAL_RUNNERS = frozenset({'tsx', 'ts-node'})
+# npm/bunx subcommands that precede the actual package name.
+NPM_SUBCOMMANDS = frozenset({'exec', 'run', 'run-script', 'x', 'create', 'init', 'install', 'i'})
+# Python-package runners and the sub-commands that precede the package.
+PYPI_RUNNERS = frozenset({'uvx', 'uv', 'pipx'})
+PYPI_SUBCOMMANDS = frozenset({'run', 'tool', 'tool-run'})
+
+# Prompt Security's MCP proxy wraps the real server command after this token.
+PROMPT_SECURITY_BASENAME = 'prompt_security_mcp'
+PROMPT_SECURITY_ARGS_SENTINEL = '__args__'
+
+# Language runtimes that execute a local script given as an arg. They never
+# produce a `bin:` identity -- their script identity is the content hash.
+# Keep in sync with _HOOK_SCRIPT_RUNTIMES in the hook files (setup/*/hooks/unbound.py).
+RUNTIMES = frozenset({
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+})
+
+# Commands that have their own rule (or are runtimes) -- excluded from the
+# catch-all `bin:` tier so they don't double-resolve.
+BIN_SKIP_COMMANDS = (
+    RUNTIMES | NPM_RUNNERS | PYPI_RUNNERS
+    | frozenset({'docker', 'builtin', PROMPT_SECURITY_BASENAME})
+)
+
+# Basenames too generic to identify a product -- `bin:` skips these (they
+# collide across unrelated servers).
+GENERIC_BIN_NAMES = frozenset({
+    'mcp-server', 'mcpserver', 'mcp', 'server', 'main', 'index', 'start', 'app',
+    'run', 'cli', 'bin', 'tool', 'agent', 'my-command', 'my-mcp-server', 'node-repl',
+})
+
+# Shells / build orchestrators / generic launchers. Their basename is not a
+# product identity -- the real server lives in the args (which `bin:` drops) or
+# in a file they exec. They never produce a `bin:` fingerprint.
+LAUNCHER_COMMANDS = frozenset({
+    'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'cmd', 'powershell', 'pwsh',
+    'env', 'cscript', 'wscript', 'make', 'mach', 'task', 'just',
+})
+
+# A command that is itself a local script file (run directly, not via a
+# runtime). Its identity is the file contents, so it routes to the `script:`
+# tier -- never `bin:`.
+_SCRIPT_COMMAND_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+
+
+_LOCAL_PATH_EXT_RE = re.compile(r'\.(js|cjs|mjs|ts|tsx|py|rb|php|dart|sh|rs|go|jar)$', re.IGNORECASE)
+_EXE_SUFFIX_RE = re.compile(r'\.(exe|cmd|bat|com)$')
+_PLATFORM_SUFFIX_RE = re.compile(
+    r'-(darwin|linux|windows|macos|win32|win)(-(arm64|x64|x86|amd64|aarch64))?$'
+)
+
+
+# Scheme default ports, dropped from the identity (mirrors JS URL semantics).
+_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ws': 80, 'wss': 443}
+
+
+def _extract_url_identity(url_value: str) -> Optional[str]:
+    """
+    Normalize a URL into a stable identity string: `host[:port]/path`.
+
+    The path is kept (not stripped) so multi-tenant proxy services like
+    mintmcp.com / composio don't collapse into a single fingerprint when they
+    actually serve different underlying services at different paths. Query and
+    fragment are dropped (those typically carry session/auth params that vary
+    per install).
+
+    Host is lowercased, trailing slashes on path are stripped, empty paths
+    normalize to an absent segment.
+    """
+    if not url_value or not isinstance(url_value, str):
+        return None
+    try:
+        parsed = urlparse(url_value.strip())
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or '').lower()
+    if not host:
+        return None
+
+    # Drop the scheme's default port so `https://h:443/x` and `https://h/x`
+    # share one identity (matches JS `new URL().port`, which omits defaults).
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None and _DEFAULT_PORTS.get((parsed.scheme or '').lower()) == port:
+        port = None
+    host_port = f'{host}:{port}' if port else host
+
+    # Normalize path: drop trailing slashes, drop if empty or just "/"
+    path = (parsed.path or '').rstrip('/')
+    identity = f'{host_port}{path}' if path else host_port
+    return identity
+
+
+def _urls_in_args(args: List[str]) -> List[str]:
+    return [
+        a for a in args
+        if isinstance(a, str) and (a.startswith('http://') or a.startswith('https://'))
+    ]
+
+
+def _command_base(command: Optional[str]) -> str:
+    """Basename of a command, lowercased, with a Windows executable suffix dropped."""
+    if not command:
+        return ''
+    base = re.split(r'[\\/]', command.strip())[-1]
+    return _EXE_SUFFIX_RE.sub('', base.lower())
+
+
+def _unquote(value: str) -> str:
+    """Strip surrounding quotes some clients leave in arg values."""
+    return value.strip('"\'')
+
+
+def _looks_like_local_path(value: str) -> bool:
+    """A path to a local file/script (not a package/identity)."""
+    v = _unquote(value)
+    if v.startswith('http://') or v.startswith('https://'):
+        return False
+    if v.startswith('@'):  # npm scope, not a path
+        return False
+    if v.startswith('git+'):
+        return False
+    if '${' in v:  # env-var path template
+        return True
+    if '/' in v or '\\' in v:
+        return True
+    return bool(_LOCAL_PATH_EXT_RE.search(v))
+
+
+def _npm_package_from_args(args: List[str]) -> Optional[str]:
+    """Find the first @scoped npm package in args, stripped of any @version suffix."""
+    for arg in args:
+        if not isinstance(arg, str) or not arg.startswith('@'):
+            continue
+        second_at = arg.find('@', 1)
+        return arg[:second_at] if second_at != -1 else arg
+    return None
+
+
+def _normalize_npm(pkg: str) -> str:
+    """@scope/name@ver -> @scope/name ; name@ver -> name"""
+    p = _unquote(pkg)
+    if p.startswith('@'):
+        i = p.find('@', 1)
+        return p[:i] if i != -1 else p
+    return p.split('@')[0]
+
+
+def _normalize_pypi(pkg: str) -> str:
+    """Strip a version spec from a Python requirement: name==1, name>=1, name@1."""
+    return re.split(r'[=<>@~!]', _unquote(pkg))[0]
+
+
+def _git_identity(spec: str) -> Optional[str]:
+    """git+https://github.com/owner/repo(.git)(@ref) -> github.com/owner/repo"""
+    s = _unquote(spec)
+    if s.startswith('git+'):
+        s = s[4:]
+    s = re.sub(r'^(https?|ssh|git)://', '', s)
+    s = re.sub(r'^[^/]*@', '', s).replace(':', '/', 1)
+    s = re.sub(r'\.git(@.*)?$', '', s)
+    s = re.sub(r'@[^/]*$', '', s)
+    parts = [p for p in s.split('/') if p]
+    if len(parts) < 3:
+        return None
+    return '/'.join(parts[:3]).lower()
+
+
+def _git_from_args(args: List[str]) -> Optional[str]:
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        t = _unquote(arg)
+        is_git = (
+            t.startswith('git+')
+            or t.startswith('git@')
+            or (re.match(r'^(https?|ssh)://', t) is not None
+                and re.search(r'(github\.com|gitlab\.com|bitbucket\.org)', t) is not None)
+        )
+        if not is_git:
+            continue
+        identity = _git_identity(t)
+        if identity:
+            return identity
+    return None
+
+
+def _package_from_runner_args(args: List[str], skip: frozenset) -> Optional[str]:
+    """First package-looking arg under a runner, skipping flags, the runner's own
+    sub-tokens, and bailing on a local-path arg (that's a script, not a package)."""
+    for arg in args:
+        if not isinstance(arg, str) or arg.startswith('-'):
+            continue
+        t = _unquote(arg)
+        if t in skip:
+            continue
+        if _looks_like_local_path(t):
+            return None
+        return t
+    return None
+
+
+# `docker run` BOOLEAN flags — the closed, stable set that consumes NO value.
+# Everything else that looks like a flag is treated as value-taking, so an
+# unknown or newly-added value flag can never leak its value as the image: it
+# fails toward no fingerprint rather than a wrong one. This is the reliable axis
+# (the value-flag set is open-ended and grows with docker; the boolean set does
+# not). `--flag=value` and attached short values (`-eKEY`) are self-contained.
+DOCKER_BOOLEAN_FLAGS = frozenset({
+    '-i', '--interactive', '-t', '--tty', '-d', '--detach', '-P', '--publish-all',
+    '--rm', '--init', '--privileged', '--read-only', '--no-healthcheck',
+    '--oom-kill-disable', '--disable-content-trust', '--sig-proxy', '-q', '--quiet',
+})
+_DOCKER_SHORT_BOOLEANS = set('itdPq')       # for combined forms: -it, -itd
+_DOCKER_SHORT_VALUES = set('evpwulmhca')    # for attached forms: -eKEY, -p8080
+
+# A docker image candidate, tag and digest already stripped. Repository names are
+# lowercase (docker rejects `docker run FOO`), so this rejects any leaked
+# uppercase value as a final backstop.
+_DOCKER_IMAGE_REF_RE = re.compile(r'[a-z0-9][a-z0-9._:/-]*')
+_DOCKER_DIGEST_RE = re.compile(r'@[A-Za-z0-9]+:[A-Fa-f0-9]+$')  # @sha256:<hex>
+
+
+def _is_docker_image_ref(candidate: str) -> bool:
+    return bool(_DOCKER_IMAGE_REF_RE.fullmatch(candidate))
+
+
+def _docker_flag_consumes_value(arg: str) -> bool:
+    """True when this flag takes the FOLLOWING token as its value (so that token
+    is not the image). Boolean flags and self-contained forms return False;
+    anything unrecognized is assumed value-taking (fail toward null)."""
+    if '=' in arg:
+        return False                        # --flag=value / -e=value (attached)
+    if arg in DOCKER_BOOLEAN_FLAGS:
+        return False
+    if arg.startswith('--'):
+        return True                         # any other long flag: value-taking
+    letters = arg[1:]                        # short flag(s): -x or bundle -xyz
+    if letters and all(c in _DOCKER_SHORT_BOOLEANS for c in letters):
+        return False                        # combined booleans, e.g. -it, -itd
+    if len(letters) > 1 and letters[0] in _DOCKER_SHORT_VALUES:
+        return False                        # attached value, e.g. -eKEY, -p8080
+    return True                             # -e / -p (separate value) or unknown
+
+
+def _normalize_docker_image(arg: str) -> str:
+    image = _unquote(arg)
+    image = _DOCKER_DIGEST_RE.sub('', image)     # drop @sha256:<digest>
+    return re.sub(r':[^/]+$', '', image)         # drop :tag, keep registry/repo
+
+
+def _docker_image_from_args(args: List[str]) -> Optional[str]:
+    # Skip each value flag's next token; the first bare, lowercase image-ref-shaped
+    # token is the image. Unknown flags are assumed value-taking, so a leaked value
+    # never becomes the fingerprint.
+    if 'run' not in args:
+        return None
+    run_idx = args.index('run')
+    skip_next = False
+    for arg in args[run_idx + 1:]:
+        if not isinstance(arg, str):
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith('-'):
+            if _docker_flag_consumes_value(arg):
+                skip_next = True
+            continue
+        image = _normalize_docker_image(arg)
+        if _is_docker_image_ref(image):
+            return image
+    return None
+
+
+def _command_is_script_file(command: str) -> bool:
+    """True when the command is itself a local script file (e.g. `.../bin.sh`)."""
+    base = re.split(r'[\\/]', command.strip())[-1]
+    return bool(_SCRIPT_COMMAND_RE.search(base))
+
+
+def _normalize_bin(command: str) -> Optional[str]:
+    """Basename of a bespoke binary, normalized for cross-platform collapse. Drops
+    the path, executable suffix, and platform/arch suffix; None when generic."""
+    b = re.split(r'[\\/]', command.strip())[-1].lower()
+    b = _EXE_SUFFIX_RE.sub('', b)
+    b = _PLATFORM_SUFFIX_RE.sub('', b)
+    b = b.strip(' -_')
+    if not b or b in GENERIC_BIN_NAMES:
+        return None
+    return b
+
+
+def compute_fingerprint(
+    name: Optional[str],
+    command: Optional[str],
+    url: Optional[str],
+    args: Optional[List[str]],
+    additional_data: Optional[Dict[str, Any]],
+    script_hash: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Derive a stable fingerprint for an MCP server.
+
+    The function is a priority chain: the first signal that yields a result wins.
+    `script_hash`, when provided, is the client-computed content hash of a local
+    script (the gateway/control plane cannot read the file itself).
+    Returns None when no signal is extractable.
+    """
+    safe_name = name or ''
+    safe_args = args or []
+    safe_additional_data = additional_data or {}
+    base = _command_base(command)
+
+    # 0. Prompt Security proxy: the real server command follows `__args__`.
+    #    Unwrap and fingerprint the inner command instead of the wrapper.
+    if base == PROMPT_SECURITY_BASENAME and PROMPT_SECURITY_ARGS_SENTINEL in safe_args:
+        idx = safe_args.index(PROMPT_SECURITY_ARGS_SENTINEL)
+        if idx + 1 < len(safe_args):
+            inner = safe_args[idx + 1:]
+            inner_cmd = inner[0] if inner else None
+            inner_url = inner_cmd if inner_cmd and inner_cmd.startswith(('http://', 'https://')) else None
+            return compute_fingerprint(
+                name=safe_name,
+                command=None if inner_url else inner_cmd,
+                url=inner_url,
+                args=inner[1:],
+                additional_data=safe_additional_data,
+                script_hash=script_hash,
+            )
+
+    # Claude desktop OAuth remote connector. Named by a per-registration UUID at
+    # runtime; the client hook resolves the display name and tags the config
+    # scope="claude-connector" so every instance of e.g. "Gmail" groups by name.
+    # This wins over the url branch below: the connector carries a per-registration
+    # url, but the device sweep that seeds the keeper omits it, so fingerprinting
+    # by url here would never match claude-connector:<name>.
+    if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
+        return f'claude-connector:{safe_name.lower()}'
+
+    # First-party built-ins arrive as a bare name (no command/url/args); collapse
+    # separator variants to one identity so aliases share a fingerprint.
+    if not command and not url and not safe_args:
+        builtin = claude_builtin_identity(safe_name)
+        if builtin:
+            return f'{CLAUDE_BUILTIN_PREFIX}{builtin}'
+
+    # 1. url field -> url:<host[:port]/path>
+    if url:
+        identity = _extract_url_identity(url)
+        if identity:
+            return f'url:{identity}'
+
+    # 2. URLs inside args -> url-arg:<identity> (only if all URLs resolve to a single identity)
+    url_args = _urls_in_args(safe_args)
+    if url_args:
+        identities = {_extract_url_identity(u) for u in url_args}
+        identities.discard(None)
+        if len(identities) == 1:
+            return f'url-arg:{next(iter(identities))}'
+        if len(identities) > 1:
+            return None
+
+    # 3. git+ install spec in args (npx/uvx git installs)
+    git = _git_from_args(safe_args)
+    if git:
+        return f'git:{git}'
+
+    # 4. @scoped npm package anywhere in args (command-agnostic, original rule)
+    scoped_npm = _npm_package_from_args(safe_args)
+    if scoped_npm:
+        return f'npm:{scoped_npm}'
+
+    # 5. npm package run via npx / npm / bunx (bare or quoted-scoped)
+    if base in NPM_RUNNERS:
+        pkg = _package_from_runner_args(safe_args, NPX_LOCAL_RUNNERS | NPM_SUBCOMMANDS | RUNTIMES)
+        if pkg:
+            return f'npm:{_normalize_npm(pkg)}'
+
+    # 6. Python package run via uvx / uv / pipx
+    if base in PYPI_RUNNERS:
+        pkg = _package_from_runner_args(safe_args, PYPI_SUBCOMMANDS)
+        if pkg:
+            return f'pypi:{_normalize_pypi(pkg)}'
+
+    # 7. docker run <image> (skip `docker mcp ...`, the Docker MCP gateway CLI)
+    if base == 'docker' and (not safe_args or safe_args[0] != 'mcp'):
+        image = _docker_image_from_args(safe_args)
+        if image:
+            return f'docker:{image}'
+
+    # 8. IntelliJ plugin-managed server. Parser still checks literal "builtin"
+    # (that's what coding-discovery-tool/.../jetbrains/mcp_config_extractor.py writes);
+    # the prefix is intellij: for accurate semantic labeling.
+    if command == 'builtin' and safe_name:
+        return f'intellij:{safe_name.lower()}'
+
+    # 9. Claude.ai native integration. Two name forms arrive: the hook-resolved
+    # display ("claude.ai Atlassian") and the raw runtime key
+    # ("claude_ai_Atlassian") when hook resolution missed — e.g. the first-time
+    # `authenticate` call, before the connector is in claudeAiMcpEverConnected.
+    # Reconstruct the display form from the raw key so both fingerprint the same.
+    if (
+        not command
+        and not safe_args
+        and safe_additional_data in CLAUDEAI_ALLOWED_ADDITIONAL_DATA
+    ):
+        if safe_name.startswith(CLAUDEAI_NAME_PREFIX):
+            return f'claudeai:{safe_name.lower()}'
+        raw_key = re.fullmatch(r'claude_ai_(.+)', safe_name)
+        if raw_key:
+            rest = re.sub(r'_+', ' ', raw_key.group(1)).strip().lower()
+            if rest:
+                return f'claudeai:{CLAUDEAI_NAME_PREFIX}{rest}'
+
+    # (Claude desktop OAuth remote connector is handled above the url branch —
+    # scope="claude-connector" groups by name regardless of the per-registration url.)
+
+    # 11. Local script identified by client-supplied content hash. Covers both
+    #     runtime+file (`node x.js`) and a script run directly (`.../bin.sh`).
+    #     Ignore empty / punctuation-only values (e.g. "", "/", "///") -> None.
+    clean_hash = (script_hash or '').strip()
+    if re.fullmatch(r'[a-f0-9]{64}', clean_hash, re.IGNORECASE):
+        return f'script:{clean_hash.lower()}'
+
+    # 12. Bespoke local binary -- basename only, args dropped (they carry
+    #     per-user paths/ids that would explode cardinality). Skips runtimes,
+    #     launchers/shells, and script files (those are script-tier identities).
+    if (
+        command
+        and base not in BIN_SKIP_COMMANDS
+        and base not in LAUNCHER_COMMANDS
+        and not _command_is_script_file(command)
+    ):
+        bin_name = _normalize_bin(command)
+        if bin_name:
+            return f'bin:{bin_name}'
+
+    return None
+
+def compute_mcp_cache_key(name, command, url, args, additional_data=None, script_hash=None):
+    if name is not None and not isinstance(name, str):
+        return None
+    if url is not None and not isinstance(url, str):
+        return None
+    if command is not None and not isinstance(command, str):
+        return None
+    if args is not None and (
+        not isinstance(args, list)
+        or any(not isinstance(arg, str) for arg in args)
+    ):
+        return None
+    if additional_data is not None and not isinstance(additional_data, dict):
+        return None
+    return compute_fingerprint(
+        name=name, command=command, url=url, args=args,
+        additional_data=additional_data, script_hash=script_hash,
+    )
+
+
+def _unbound_state_dir_candidates():
+    candidates = [Path.home() / '.unbound']
+    if hasattr(os, 'getuid'):
+        candidates.append(Path(f'/var/tmp/unbound-{os.getuid()}'))
+    else:
+        candidates.append(Path(tempfile.gettempdir()) / 'unbound')
+    return candidates
+
+
+def _read_mcp_tools_cache():
+    home_state_dir = Path.home() / '.unbound'
+    newest_cache = {}
+    newest_mtime = -1.0
+    for state_dir in _unbound_state_dir_candidates():
+        try:
+            if state_dir != home_state_dir:
+                if state_dir.is_symlink() or not state_dir.is_dir():
+                    continue
+                if hasattr(os, 'getuid'):
+                    state_dir_stat = state_dir.stat()
+                    if state_dir_stat.st_uid != os.getuid() or state_dir_stat.st_mode & 0o077:
+                        continue
+            path = state_dir / _MCP_TOOLS_CACHE_FILENAME
+            if not path.is_file():
+                continue
+            with open(path, 'rb') as f:
+                data = f.read(_MCP_TOOLS_CACHE_MAX_BYTES + 1)
+            if len(data) > _MCP_TOOLS_CACHE_MAX_BYTES:
+                continue
+            parsed = json.loads(data.decode('utf-8'))
+            if isinstance(parsed, dict):
+                mtime = path.stat().st_mtime
+                if mtime > newest_mtime:
+                    newest_cache = parsed
+                    newest_mtime = mtime
+        except Exception:
+            continue
+    return newest_cache
+
+
+def _mcp_cache_entries_for_user(tools):
+    username = Path.home().name
+    entries = []
+    for key, by_user in tools.items():
+        if not isinstance(key, str) or not isinstance(by_user, dict):
+            continue
+        k = key.strip().lower()
+        if k in _MCP_CACHE_CODING_TOOL_NAMES or k.startswith(_MCP_CACHE_CODING_TOOL_PREFIXES):
+            entry = by_user.get(username)
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+_CONTENT_HASH_RE = re.compile(r'^[a-f0-9]{64}$', re.IGNORECASE)
+
+
+def _lookup_tool_content_hash(server_name, mcp_tool, server_cfg):
+    try:
+        if not server_name or not mcp_tool or not isinstance(server_cfg, dict):
+            return None
+        cache_key = server_cfg.get('_unbound_fingerprint')
+        if not isinstance(cache_key, str) or not cache_key:
+            cache_key = compute_mcp_cache_key(
+                name=server_name,
+                command=server_cfg.get('command'),
+                url=server_cfg.get('url'),
+                args=server_cfg.get('args'),
+                additional_data=server_cfg.get('additional_data'),
+                script_hash=server_cfg.get('scriptHash'),
+            )
+        if not cache_key:
+            return None
+        tools = _read_mcp_tools_cache().get('tools')
+        if not isinstance(tools, dict):
+            return None
+        for entry in _mcp_cache_entries_for_user(tools):
+            by_tool = entry.get(cache_key)
+            if not isinstance(by_tool, dict):
+                continue
+            content_hash = by_tool.get(mcp_tool)
+            if isinstance(content_hash, str) and _CONTENT_HASH_RE.match(content_hash):
+                return content_hash
+        return None
+    except Exception:
+        return None
+
+
+def _attach_tool_content_hash(metadata):
+    try:
+        original_cfg = metadata.get('mcp_server_config')
+        server_cfg = dict(original_cfg) if isinstance(original_cfg, dict) else {}
+        content_hash = _lookup_tool_content_hash(
+            metadata.get('mcp_server'), metadata.get('mcp_tool'), server_cfg
+        )
+        server_cfg.pop('_unbound_fingerprint', None)
+        if content_hash:
+            server_cfg['tool_content_hash'] = content_hash
+        if isinstance(original_cfg, dict) or content_hash:
+            metadata['mcp_server_config'] = server_cfg
+    except Exception:
+        pass
+
+
+# ───────────────────────── end MCP tool risk-scoring section ─────────────────
+
+
 def _read_mcp_server_config(server_name, config_path):
     """
     Read an MCP server's config (url, command, args) from a config file.
@@ -1033,6 +1654,8 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
 
     if mcp_tool is not None:
         metadata['mcp_tool'] = mcp_tool
+
+    _attach_tool_content_hash(metadata)
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -2385,9 +3008,39 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
-def _install_sh_is_stale():
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _discovery_installer():
+    if _is_windows():
+        return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
+    return DISCOVERY_INSTALL_SH, DISCOVERY_INSTALL_URL
+
+
+def _windows_system32_path(*parts: str) -> str:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise OSError("SystemRoot is not set")
+    root = PureWindowsPath(system_root)
+    if not root.is_absolute():
+        raise OSError("SystemRoot is not absolute")
+    return str(root.joinpath("System32", *parts))
+
+
+def _discovery_command(installer_path: Path, backend_url: str):
+    if _is_windows():
+        return [
+            _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+            "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+        ]
+    return ["bash", str(installer_path), "--domain", backend_url]
+
+
+def _discovery_installer_is_stale(installer_path: Path) -> bool:
     try:
-        return (time.time() - DISCOVERY_INSTALL_SH.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
+        return (time.time() - installer_path.stat().st_mtime) > DISCOVERY_INSTALL_SH_TTL_SECONDS
     except OSError:
         return True
 
@@ -2440,6 +3093,7 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                     "UNBOUND_API_KEY": api_key,
                     "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
                     "UNBOUND_MCP_SERVER_NAME": server_name,
+                    "UNBOUND_CODING_TOOL": _UNBOUND_CODING_TOOL,
                     "UNBOUND_MCP_DOMAIN": backend_url},
         }
         if os.name == "nt":
@@ -2487,7 +3141,7 @@ def _dispatch_discovery() -> None:
             _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
-        except FileExistsError:
+        except OSError:
             try:
                 age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
             except OSError:
@@ -2495,11 +3149,12 @@ def _dispatch_discovery() -> None:
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                DISCOVERY_DISPATCH_PATH.unlink()
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
                 _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
-            except (FileExistsError, OSError):
+            except OSError as e:
+                log_error(f"discovery gate: dispatch claim failed: {type(e).__name__} errno={e.errno}", 'discovery_gate')
                 return
 
         try:
@@ -2526,30 +3181,34 @@ def _dispatch_discovery() -> None:
                     return
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
+                installer_path, installer_url = _discovery_installer()
                 DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if _install_sh_is_stale():
+                if _discovery_installer_is_stale(installer_path):
                     fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
                     os.close(fd)
                     tmp = Path(_tmp)
+                    curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(tmp), DISCOVERY_INSTALL_URL],
+                        [curl, "-fsSL", "-o", str(tmp), installer_url],
                         capture_output=True, timeout=30,
                     )
                     if r.returncode == 0:
-                        os.chmod(tmp, 0o755)
-                        os.replace(tmp, DISCOVERY_INSTALL_SH)
+                        if not _is_windows():
+                            os.chmod(tmp, 0o755)
+                        os.replace(tmp, installer_path)
                     else:
                         tmp.unlink(missing_ok=True)
-                        if not DISCOVERY_INSTALL_SH.exists():
-                            log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                        if not installer_path.exists():
+                            log_error(f"discovery {installer_path.name} download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
                             return
-                        log_error(f"discovery install.sh refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                        log_error(f"discovery {installer_path.name} refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                discovery_cmd = _discovery_command(installer_path, backend_url)
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DOMAIN": backend_url}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:

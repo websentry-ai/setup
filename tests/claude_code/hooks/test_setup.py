@@ -247,6 +247,7 @@ class TestMdmBackfillCutoff(unittest.TestCase):
 
         homes = [(f"u{i}", home) for i, home in enumerate(collect_by_home)]
         with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
+             patch.object(mdm, "_backfill_force_config", return_value=(None, None)), \
              patch.object(mdm, "_backfill_send_sessions", return_value=send_result):
             mdm.run_backfill("key", "https://backend", homes)
         return writes
@@ -256,7 +257,7 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         mdm = self._load_mdm()
         good, bad = Path("/home/good"), Path("/home/bad")
         # good: collected, empty, not capped; bad: collection failed (None)
-        writes = self._run(mdm, {good: ([], False), bad: None}, send_result=(0, 0, 0))
+        writes = self._run(mdm, {good: ([], False, False), bad: None}, send_result=(0, 0, 0))
         self.assertIn(good, writes)
         self.assertNotIn(bad, writes)
 
@@ -266,7 +267,7 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         home = Path("/home/alice")
         writes = self._run(
             mdm,
-            {home: ([{"session_id": "s1", "entries": [{}]}], False)},
+            {home: ([{"session_id": "s1", "entries": [{}]}], False, False)},
             send_result=(1, 1, 0),
         )
         self.assertEqual(writes, [home])
@@ -277,7 +278,7 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         home = Path("/home/alice")
         writes = self._run(
             mdm,
-            {home: ([{"session_id": "s1", "entries": [{}]}], False)},
+            {home: ([{"session_id": "s1", "entries": [{}]}], False, False)},
             send_result=(1, 0, 1),  # one chunk failed
         )
         self.assertEqual(writes, [])
@@ -290,8 +291,8 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         writes = self._run(
             mdm,
             {
-                capped_home: ([{"session_id": "s1", "entries": [{}]}], True),
-                ok_home: ([{"session_id": "s2", "entries": [{}]}], False),
+                capped_home: ([{"session_id": "s1", "entries": [{}]}], True, False),
+                ok_home: ([{"session_id": "s2", "entries": [{}]}], False, False),
             },
             send_result=(2, 1, 0),
         )

@@ -1051,8 +1051,48 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     return code, out[:sep]
 
 
-def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
-    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
+def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[float], Optional[int]]:
+    """When the organization last asked every device to re-walk its full history, and how
+    far back that walk should reach. Either may be None.
+
+    A device honours the request only if its own last backfill predates it, so the request
+    expires by itself once each device has acted on it -- nobody has to switch it back off.
+    The window is optional: without one the walk uses this installer's own default, which
+    is what every device did before the organization could set it."""
+    try:
+        code, body = _backfill_http_request(
+            # tool_type is a metrics label only; the request itself is org-wide.
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/config/"
+            f"?tool_type={BACKFILL_TOOL_TYPE}",
+            method='GET',
+            headers=_backfill_edr_headers({'Authorization': f'Bearer {api_key}'}),
+            timeout=15,
+        )
+        if code < 200 or code >= 300:
+            debug_print(f"backfill config request failed: HTTP {code}")
+            return None, None
+        config = json.loads(body.decode('utf-8'))
+        requested = config.get('force_backfill_requested_epoch')
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            return None, None
+        days = config.get('force_backfill_days')
+        # bool is an int subclass, so True would otherwise read as a one-day window.
+        if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+            days = None
+        return float(requested), days
+    except Exception as e:
+        debug_print(f"backfill config read failed: {e}")
+        return None, None
+
+
+def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
+                           force: bool = False) -> bool:
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if force:
+        # Marks this upload as the org's requested re-walk. The server still checks the
+        # request itself, so this only narrows what force applies to; it cannot grant it.
+        payload['force'] = True
+    payload_bytes = json.dumps(payload).encode('utf-8')
 
     auth_headers = _backfill_edr_headers({
         'Authorization': f'Bearer {api_key}',
@@ -1198,6 +1238,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     globally stable per (org, tool, session, record_index)."""
     session_id = session.get('session_id')
     entries = session.get('entries') or []
+    # A slice is a fresh dict, so the identity has to be carried over explicitly or
+    # an oversized session silently loses the attribution the whole change is for.
+    identity = {k: session[k] for k in ('device_serial', 'user_email') if session.get(k)}
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -1221,6 +1264,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': [],
+            **identity,
         }).encode('utf-8'))
         cum = wrap
         cursor = start_idx
@@ -1239,13 +1283,183 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        yield {
+        slice_payload = {
             'session_id': session_id,
             'record_index_base': record_index_base,
             'entries': entries[start_idx:last_fit_end],
         }
+        slice_payload.update(identity)
+        yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
+
+
+_DESKTOP_SESSION_MAX_BYTES = 512 * 1024
+_IS_JUNCTION = getattr(os.path, 'isjunction', None)
+
+
+def _is_reparse_point(path: Path) -> bool:
+    """Symlink, or a Windows directory junction. os.path.islink reports False for
+    junctions and os.path.isjunction only exists on 3.12+, so both are checked and
+    an unreadable path is treated as suspect."""
+    try:
+        if path.is_symlink():
+            return True
+        return bool(_IS_JUNCTION and _IS_JUNCTION(path))
+    except OSError:
+        return True
+
+
+def _claude_desktop_support_dirs(home: Path) -> List[Path]:
+    """Claude Desktop app support dir(s) for a home. Team/SSO desktop sessions
+    cache the active account's oauthAccount under local-agent-mode-sessions/ here.
+
+    Taken from unbound.py, keyed off `home` instead of Path.home()/APPDATA: MDM
+    backfill walks every profile, so per-process paths would resolve to the
+    admin's for all of them. On Windows APPDATA is that user's
+    <home>\AppData\Roaming.
+    """
+    system = platform.system().lower()
+    if system == 'darwin':
+        return [home / 'Library' / 'Application Support' / 'Claude']
+    if system == 'windows':
+        # MSIX/Store installs never write %APPDATA%\Claude — Windows redirects it
+        # to a per-package LocalCache. Verified on a Windows Server 2022 box where
+        # only the second path existed. Both are listed; missing ones are skipped.
+        appdata = home / 'AppData'
+        return [
+            appdata / 'Roaming' / 'Claude',
+            appdata / 'Local' / 'Packages' / 'Claude_pzs8sxrjxfjjc' / 'LocalCache' / 'Roaming' / 'Claude',
+        ]
+    return [home / '.config' / 'Claude']
+
+
+def _desktop_session_email(home: Path) -> Optional[str]:
+    """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
+    oauthAccount into ~/.claude.json (anthropics/claude-code#57026) but does write
+    the active account's oauthAccount (with emailAddress) into each per-session
+    sandbox config. These configs are sandbox-writable and thus untrusted, so the
+    email is returned only when every session that carries one agrees on a single
+    address; any disagreement (multiple accounts, or a forged/injected config) or
+    failure yields None, so backfill sends a blank email rather than a wrong one.
+    Best effort — never raises. Copied from unbound.py, keyed off `home`."""
+    timed = []
+    try:
+        bases = _claude_desktop_support_dirs(home)
+    except Exception:
+        return None
+    for base in bases:
+        # These live under a user-writable AppData. On Windows _run_as_user cannot
+        # fork, so the MDM script globs every profile while still elevated; a planted
+        # junction would otherwise walk SYSTEM out of the profile. Transcript
+        # collection already skips symlinks, this mirrors that.
+        if _is_reparse_point(base):
+            debug_print("skipping reparse-point desktop support dir")
+            continue
+        try:
+            base_real = base.resolve(strict=True)
+        except OSError:
+            continue
+        try:
+            # list() forces the lazy glob traversal to happen inside this guard —
+            # a mid-iteration traversal error (e.g. an unreadable subdir) then only
+            # skips this base instead of aborting the whole scan.
+            candidates = list((base / 'local-agent-mode-sessions').glob('*/*/local_*/.claude/.claude.json'))
+        except Exception:
+            continue
+        for path in candidates:
+            # stat per file so one unreadable/vanished entry can't poison the sort.
+            try:
+                if not path.is_file() or _is_reparse_point(path):
+                    continue
+                # Resolving and re-containing catches a junction at any level of the
+                # globbed path, not just the leaf.
+                path.resolve(strict=True).relative_to(base_real)
+                timed.append((path.stat().st_mtime, path))
+            except (OSError, ValueError):
+                continue
+    timed.sort(key=lambda t: t[0], reverse=True)
+    found = None
+    found_key = None
+    for _, path in timed:
+        # A session that exists but can't be read (oversized, IO/parse error) is a
+        # blind spot — it could belong to a different account, so we can't verify
+        # agreement. Return blank rather than fall through to a possibly-stale email.
+        # Bound the read itself (read MAX+1 bytes) rather than trusting a separate
+        # stat(): a rewrite-after-stat race can't feed an unbounded file into read.
+        try:
+            with open(path, 'rb') as f:
+                data = f.read(_DESKTOP_SESSION_MAX_BYTES + 1)
+            if len(data) > _DESKTOP_SESSION_MAX_BYTES:
+                return None
+            oauth = json.loads(data.decode('utf-8')).get('oauthAccount')
+        except Exception:
+            return None
+        if not isinstance(oauth, dict):
+            continue
+        raw = oauth.get('emailAddress')
+        email = raw.strip() if isinstance(raw, str) else ''
+        if not email:
+            continue
+        key = email.lower()
+        if found_key is None:
+            found, found_key = email, key
+        elif key != found_key:
+            return None  # accounts disagree — blank over wrong
+    return found
+
+
+def _backfill_account_email(home: Path) -> Optional[str]:
+    """Signed-in email for a home, in the same order read_account_identity uses:
+    oauthAccount in ~/.claude.json first, then the Team/SSO desktop session cache.
+
+    Team/SSO desktop never hydrates oauthAccount, so skipping the fallback would
+    leave exactly those users unattributed — the case this change exists to fix.
+    """
+    email = None
+    try:
+        account_file = home / '.claude.json'
+        # Same reason the desktop-session scan is guarded: on Windows _run_as_user
+        # cannot fork, so this read happens as SYSTEM across every profile. A link
+        # planted here would otherwise pull another user's address into this
+        # profile's sessions. Containment rather than refusal, so a dotfiles symlink
+        # inside the same home still resolves.
+        if _is_reparse_point(account_file):
+            account_file.resolve(strict=True).relative_to(home.resolve(strict=True))
+        config = json.loads(account_file.read_text(encoding='utf-8'))
+        oauth = config.get('oauthAccount')
+        if isinstance(oauth, dict):
+            raw = oauth.get('emailAddress')
+            if isinstance(raw, str) and raw.strip():
+                email = raw.strip()
+    except FileNotFoundError:
+        debug_print("no .claude.json for this home")
+    except Exception as e:
+        debug_print(f"could not read oauthAccount: {e!r}")
+    if not email:
+        try:
+            email = _desktop_session_email(home)
+        except Exception as e:
+            debug_print(f"desktop session email lookup failed: {e!r}")
+            email = None
+    if not email:
+        debug_print("no signed-in email resolved; backfill will send none")
+    return email
+
+
+def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email: Optional[str]) -> None:
+    """Carry the device serial and signed-in email alongside the sessions.
+
+    Without them the server attributes replayed history to whichever application
+    owns the upload key, which under MDM is the admin's rather than the person who
+    actually ran the session. Either field may be absent; the server maps on what
+    it gets.
+    """
+    for session in sessions:
+        if serial:
+            session['device_serial'] = serial
+        if email:
+            session['user_email'] = email
 
 
 def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> None:
@@ -1255,10 +1469,23 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
         return
 
     try:
+        # The signed-in email and the desktop session cache are keyed off the home
+        # dir; only the transcripts and the cutoff follow the config dir.
+        home = Path.home()
         if config_dir is None:
-            config_dir = Path.home() / '.claude'
+            config_dir = home / '.claude'
         started_at = time.time()
         cutoff_mtime = _backfill_read_cutoff(config_dir)
+        force_epoch, force_days = _backfill_force_config(api_key, backend_url)
+        forced = force_epoch is not None and force_epoch > cutoff_mtime
+        if forced:
+            # The organization's window when it set one, otherwise this installer's own
+            # default. Widen only: a window narrower than what this device had already
+            # reached would skip the band in between, and the successful run then advances
+            # the cutoff past it, so that history is never visited again.
+            window = started_at - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            cutoff_mtime = min(cutoff_mtime, window)
+            print("[backfill] Re-reading full history at your organization's request.")
         projects_root = config_dir / 'projects'
         sessions: List[Dict] = []
         capped = False
@@ -1273,6 +1500,7 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
                 session = _backfill_collect_session(transcript_path)
                 if session:
                     sessions.append(session)
+        _backfill_attach_identity(sessions, get_device_identifier(), _backfill_account_email(home))
         if not sessions:
             _backfill_write_cutoff(config_dir, started_at)
             print("[backfill] No past sessions found.")
@@ -1291,7 +1519,7 @@ def run_backfill(api_key: str, backend_url: str, config_dir: Path = None) -> Non
             if not current_chunk:
                 return
             chunks_total += 1
-            if _backfill_upload_chunk(api_key, backend_url, current_chunk):
+            if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
                 chunks_sent += 1
                 for s in current_chunk:
                     sessions_sent_ids.add(s.get('session_id'))

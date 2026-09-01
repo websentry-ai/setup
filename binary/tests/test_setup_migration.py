@@ -195,6 +195,8 @@ def test_setup_backfill_flag_runs_backfill_for_supporting_tools(env):
     assert rc == 0
     # claude-code, codex, copilot have run_backfill; cursor prints unsupported.
     assert len(env["backfilled"]) == 3
+    copilot_args = next(args for args in env["backfilled"] if len(args) == 4)
+    assert "def read_copilot_mcp_servers" in copilot_args[3]
 
 
 def test_setup_requires_api_key(env, capsys):

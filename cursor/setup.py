@@ -371,6 +371,22 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
     return True
 
 
+def find_cursor_exe() -> Optional[str]:
+    """Path to Cursor.exe, or None. A bare name would make the shell pop an error dialog."""
+    # Fixed install roots only. shutil.which prepends the CWD on Windows, so a Cursor.exe
+    # dropped in the working directory would win the lookup.
+    local_appdata = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    system_drive = os.environ.get("SystemDrive", "C:")
+    candidates = [
+        Path(local_appdata) / "Programs" / "cursor" / "Cursor.exe",
+        Path(system_drive + "\\Program Files") / "cursor" / "Cursor.exe",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def restart_cursor() -> bool:
     """Attempt to restart Cursor IDE."""
     system = platform.system().lower()
@@ -414,19 +430,19 @@ def restart_cursor() -> bool:
                 return False
 
         elif system == "windows":
-            # Windows: Use taskkill and start
+            exe = find_cursor_exe()
+            if exe is None:
+                print("Restart Cursor")
+                return False
             print("\n🔄 Restarting Cursor IDE...")
             subprocess.run(["taskkill", "/F", "/IM", "Cursor.exe"],
                          capture_output=True, timeout=5)
             time.sleep(1)
-            proc = subprocess.Popen(["start", "cursor"],
-                                  shell=True,
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-            # Give it a moment to start
+            proc = subprocess.Popen([exe],
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
             time.sleep(0.5)
-            # start command returns immediately, so check if process started
-            if proc.poll() is None or proc.returncode == 0:
+            if proc.poll() is None:
                 print("✅ Cursor restarted")
                 return True
             else:

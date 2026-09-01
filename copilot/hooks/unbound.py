@@ -9,13 +9,21 @@ import json
 import os
 import platform
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
 import tempfile
 import time
 import hashlib
 import re
-from urllib.parse import urlsplit, urlunsplit
+import sqlite3
+import uuid
+from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
+
+
+def _copilot_home():
+    return Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
+
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -31,7 +39,9 @@ DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
+DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
+DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
 APPROVAL_POLL_PHASES = (
@@ -42,7 +52,7 @@ APPROVAL_POLL_PHASES = (
 )
 
 # Use user's home directory for logs
-LOG_DIR = Path.home() / ".copilot" / "hooks"
+LOG_DIR = _copilot_home() / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
@@ -63,59 +73,15 @@ SELF_UPDATE_LOCK_PATH = LOG_DIR / ".self_update.lock"
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
-# Copilot tool names (VS Code agent mode + CLI) translated to the canonical
-# gateway vocabulary. Covers both surfaces: VS Code's model-facing tool names
-# and the CLI's shell/glob/grep/view/write tools. Anything not listed here and
-# not an MCP tool falls through map_copilot_tool's afterMCPExecution branch and
-# is scored by the action-based rubric (reads/benign stay low).
-SHELL_TOOLS = {'bash', 'shell', 'run_in_terminal', 'runInTerminal', 'terminal', 'send_to_terminal'}
-READ_TOOLS = {
-    'read_file', 'readFile', 'view', 'cat', 'list_dir', 'listDirectory',
-    'read_project_structure', 'read_notebook_cell_output',
-    'get_notebook_summary', 'copilot_getNotebookSummary', 'view_image',
-}
-WRITE_TOOLS = {
-    'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file',
-    'create_directory',
-}
+SHELL_TOOLS = {'bash', 'shell', 'powershell', 'run_in_terminal', 'runInTerminal', 'terminal'}
+READ_TOOLS = {'read_file', 'readFile', 'view', 'cat'}
+WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
 EDIT_TOOLS = {
-    'str_replace', 'edit', 'edit_file', 'editFile', 'edit_files', 'apply_patch',
-    'insert_edit', 'insert_edit_into_file', 'replace_string_in_file',
-    'multi_replace_string_in_file', 'edit_notebook_file',
+    'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit',
+    'replace_string_in_file',
 }
 
-# Copilot terminal/search tools mapped to a synthetic shell command for analytics.
-# `x or ''` (not `.get(k, '')`) so a present-but-None value coerces to ''.
-TERMINAL_LIKE_TOOLS = {
-    'get_terminal_output':   lambda a: 'true',
-    'kill_terminal':         lambda a: 'true',
-    'terminal_last_command': lambda a: 'true',
-    'terminal_selection':    lambda a: 'true',
-    'get_task_output':       lambda a: 'true',
-    'get_changed_files':     lambda a: 'git status',
-    'grep_search':           lambda a: f"grep {a.get('query') or ''} {a.get('includePattern') or ''}".strip(),
-    'grep':                  lambda a: f"grep {a.get('pattern') or a.get('query') or ''}".strip(),
-    'file_search':           lambda a: f"find {a.get('query') or ''}".strip(),
-    'glob':                  lambda a: f"find {a.get('pattern') or a.get('query') or ''}".strip(),
-}
-
-# Copilot orchestration / planning / UI / memory tools — no security-relevant
-# action of their own; dropped (not emitted as analytics), the same way Claude
-# Code's Task/Agent tools are not scored. A subagent's real actions are reported
-# and scored as their own tool calls, so scoring the wrapper double-counts.
-INTERNAL_TOOLS = {
-    # subagents / agent control
-    'execution_subagent', 'explore_subagent', 'search_subagent', 'runSubagent',
-    'run_task', 'switch_agent',
-    # planning / intent / memory / tool discovery
-    'manage_todo_list', 'report_intent', 'memory', 'resolve_memory_file_uri',
-    'tool_search',
-    # VS Code editor meta / UI confirmations
-    'run_vscode_command', 'get_vscode_api', 'get_project_setup_info',
-    'vscode_askQuestions', 'vscode_get_confirmation',
-    'vscode_get_confirmation_with_options', 'vscode_get_terminal_confirmation',
-}
-ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}  # MCP tools (mcp*) are always checked separately
+ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
 # when the tool reports it, otherwise a deterministic synthetic one. The backend
@@ -138,6 +104,17 @@ AUDIT_LOG_TOTAL_LIMIT = 100
 # event: every existing reader filters by its own event name and skips it, and
 # cleanup_old_logs prunes it per-session like any other row (no new file, no new state).
 FORWARDED_TOOLS_EVENT = '_unbound_forwarded'
+# Distinguishes 'carry the old value forward' from 'clear it'.
+_UNSET = object()
+# Safety net, not the working bound. Entries drop themselves as soon as their tokens
+# land or their turn leaves the transcript, so the list tracks a session's unsettled
+# turns and can never exceed its length. This only exists so a pathological session
+# cannot grow the marker without limit. Sized against real sessions rather than a guess:
+# 57 turns at p95 and 301 at the observed maximum, and VS Code sometimes writes the whole
+# journal only as the session closes, which leaves every turn of a long session pending
+# until SessionEnd. Each entry is a handful of short strings, so 500 is well under a
+# hundred kilobytes.
+MAX_PENDING_TURNS = 500
 
 # Ensure log directory exists
 try:
@@ -553,6 +530,21 @@ def append_to_audit_log(event_data):
         pass
 
 
+def stop_session_key(event):
+    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
+    path FIRST -- it is constant for a session and present on every Stop that builds an
+    exchange -- so the key never flips between Stops that do and don't carry session_id
+    (which would split the watermark and resend the whole history). Falls back to
+    session_id only when there is no transcript path."""
+    # Type-checked because the floor lookup runs this over historical audit-log rows, and
+    # a non-string path there would raise out of the Stop handler and drop the exchange.
+    tp = event.get('transcript_path')
+    if isinstance(tp, str) and tp:
+        p = Path(tp)
+        return p.parent.name if p.stem == 'events' else p.stem
+    return event.get('session_id') or event.get('sessionId')
+
+
 def cleanup_old_logs():
     """Manage log file size by keeping only the most recent session's entries once the
     audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
@@ -571,10 +563,15 @@ def cleanup_old_logs():
     markers = [log for log in logs if _is_marker(log)]
     entries = [log for log in logs if not _is_marker(log)]
 
+    # Grouped by stop_session_key, the same identity the usage-window floor looks Stops up
+    # by. Grouping on the payload session_id instead would drop a Stop that omits it, and
+    # the next window would lose its lower bound and recount the session from the start.
+    # The two agree whenever session_id is present: for both surfaces the transcript path
+    # ends in the session id.
     session_order = []
     seen_sessions = set()
     for log in entries:
-        session_id = log.get('event', {}).get('session_id')
+        session_id = stop_session_key(log.get('event', {}))
         if session_id and session_id not in seen_sessions:
             session_order.append(session_id)
             seen_sessions.add(session_id)
@@ -582,7 +579,7 @@ def cleanup_old_logs():
     if len(session_order) > 1:
         most_recent_session = session_order[-1]
         kept = [log for log in entries
-                if log.get('event', {}).get('session_id') == most_recent_session]
+                if stop_session_key(log.get('event', {})) == most_recent_session]
     elif len(entries) > AUDIT_LOG_TOTAL_LIMIT:
         kept = entries[-AUDIT_LOG_TOTAL_LIMIT:]
     else:
@@ -590,19 +587,6 @@ def cleanup_old_logs():
     # Always keep the watermark markers (one small consolidated row per session; the
     # active session's is always the newest), bounded to the most recent sessions.
     save_logs(kept + markers[-20:])
-
-
-def stop_session_key(event):
-    """Stable per-session key for the forwarded-tool watermark. Derived from the transcript
-    path FIRST -- it is constant for a session and present on every Stop that builds an
-    exchange -- so the key never flips between Stops that do and don't carry session_id
-    (which would split the watermark and resend the whole history). Falls back to
-    session_id only when there is no transcript path."""
-    tp = event.get('transcript_path')
-    if tp:
-        p = Path(tp)
-        return p.parent.name if p.stem == 'events' else p.stem
-    return event.get('session_id') or event.get('sessionId')
 
 
 def get_forwarded_state(session_id):
@@ -616,9 +600,9 @@ def get_forwarded_state(session_id):
     the whole endpoint is untrusted; the gateway/proxy plane and its server-side dedup are
     the integrity backstop. Keyed on bare ids only for that reason (never trusted for
     enforcement)."""
-    sent, last_sig, prompted = set(), None, set()
+    sent, last_sig, prompted, usage_index = set(), None, set(), 0
     if not session_id:
-        return sent, last_sig, prompted
+        return sent, last_sig, prompted, usage_index
     for log in load_existing_logs():
         event = log.get('event', {})
         if event.get('hook_event_name') != FORWARDED_TOOLS_EVENT:
@@ -638,10 +622,14 @@ def get_forwarded_state(session_id):
         prompt_ids = event.get('forwarded_prompt_ids')
         if isinstance(prompt_ids, list):
             prompted.update(prompt_ids)
-    return sent, last_sig, prompted
+        reported = event.get('usage_request_index')
+        if isinstance(reported, int) and reported > usage_index:
+            usage_index = reported
+    return sent, last_sig, prompted, usage_index
 
 
-def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None):
+def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None,
+                             turn_digests=None, pending_turns=_UNSET):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -665,6 +653,12 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
                 merged_prompts.update(old_prompts)
             if text_sig is None:
                 text_sig = ev.get('text_sig')  # carry forward the last known text sig
+            if usage_index is None:
+                usage_index = ev.get('usage_request_index')
+            if turn_digests is None:
+                turn_digests = ev.get('turn_digests')
+            if pending_turns is _UNSET:
+                pending_turns = ev.get('pending_turns')
             continue  # drop the old marker; a fresh consolidated one is appended below
         kept.append(log)
     kept.append({
@@ -675,6 +669,13 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
             'forwarded_tool_ids': sorted(merged),
             'forwarded_prompt_ids': sorted(merged_prompts),
             'text_sig': text_sig,
+            'usage_request_index': usage_index if isinstance(usage_index, int) else 0,
+            # Digests of turns already sent, so a repeated prompt-and-reply gets its own
+            # occurrence rather than colliding with the earlier one.
+            'turn_digests': turn_digests if isinstance(turn_digests, list) else [],
+            # Turns sent whose tokens or model had not landed yet. Each holds an id and
+            # a window, never prompt text: the turn is rebuilt from the transcript.
+            'pending_turns': (pending_turns if pending_turns is not _UNSET else []) or [],
         },
     })
     save_logs(kept)
@@ -740,6 +741,205 @@ def get_turn_start_timestamp_for_session(session_id):
     return turn_start or completed_start
 
 
+def _transcript_path_for_session(event):
+    """SessionEnd carries sessionId, timestamp, cwd and reason but no transcript path, so
+    recover it from the newest event of this session that had one. Matched by
+    stop_session_key, the identity the window floor and log cleanup also use, so a row that
+    omits session_id is not passed over."""
+    key = stop_session_key(event)
+    if not key:
+        return None
+    for log in reversed(load_existing_logs()):
+        logged = log.get('event', {})
+        if stop_session_key(logged) != key:
+            continue
+        path = logged.get('transcript_path')
+        if isinstance(path, str) and path:
+            return path
+    return None
+
+
+def turn_content_digest(user_prompt, assistant_prompt):
+    """Digest of what both this hook and the server-side transcript parser can see of one
+    turn. NUL-joined so a prompt ending where the reply begins cannot forge another
+    turn's digest. KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service."""
+    return hashlib.sha256(
+        (user_prompt or '').encode('utf-8') + b'\x00' + (assistant_prompt or '').encode('utf-8')
+    ).hexdigest()
+
+
+def build_turn_request_id(session_id, digest, occurrence):
+    """Stable id for one turn, keyed on content rather than position.
+
+    Position is not usable: a turn that never reached the gateway is in the transcript
+    and not in our history, so counting turns would map one turn's tokens onto its
+    neighbour. Content is the same on both sides by construction. `occurrence` separates
+    turns whose prompt AND reply are byte-identical inside one session."""
+    return str(uuid.uuid5(
+        uuid.NAMESPACE_OID,
+        'turn:copilot:%s:%s:%d' % (session_id, digest, occurrence),
+    ))
+
+
+def exchange_turn_content(exchange):
+    """(user prompt, assistant text) of an exchange, in the shape the digest is taken over."""
+    user_prompt = ''
+    assistant_prompt = ''
+    for message in (exchange or {}).get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') == 'user':
+            user_prompt = message.get('content') or ''
+        elif message.get('role') == 'assistant':
+            assistant_prompt = message.get('content') or ''
+    return user_prompt, assistant_prompt
+
+
+def get_session_marker(session_key):
+    """The consolidated per-session marker, or an empty dict."""
+    if not session_key:
+        return {}
+    for log in reversed(load_existing_logs()):
+        event = log.get('event', {})
+        if (event.get('hook_event_name') == FORWARDED_TOOLS_EVENT
+                and event.get('session_id') == session_key):
+            return event
+    return {}
+
+
+def turn_prompt_id(entry, conversation_id, index, content):
+    """Stable id for a user prompt entry. An entry without an envelope id still has to be
+    watermarked, or every later Stop re-selects it and re-uploads its text with the
+    current turn."""
+    return entry.get('id') or 'unb-' + hashlib.sha256(
+        ('%s\x1f%d\x1f%s' % (conversation_id or '', index, content or ''))
+        .encode('utf-8', 'replace')).hexdigest()[:24]
+
+
+def complete_pending_turns(event, wm_key, api_key, final=False):
+    """Complete every turn still waiting on its numbers; return those still waiting.
+
+    A list rather than one slot: a turn whose tokens have not landed by the next Stop
+    would otherwise be displaced by that Stop's own pending turn, and its tokens lost."""
+    pending_turns = get_session_marker(wm_key).get('pending_turns') or []
+    return [p for p in pending_turns
+            if not complete_pending_turn(event, p, api_key, final)]
+
+
+def complete_pending_turn(event, pending, api_key, final=False):
+    """Re-send an earlier turn once its tokens or model have landed.
+
+    Copilot writes both after the turn has already been reported, so its own Stop had
+    nothing to send. The re-send carries the id the turn was sent with, so the control
+    plane fills that row rather than adding a second one. Returns True when the turn is
+    settled and can be dropped."""
+    if not isinstance(pending, dict) or not pending.get('turn_request_id'):
+        return True
+
+    transcript_path = event.get('transcript_path')
+    conversation_id = pending.get('conversation_id')
+    # By the turn's own window, never by the live path's watermark: every turn after this
+    # one has settled by now, and a watermark read would hand this turn all of them.
+    usage = pending_turn_usage(transcript_path, conversation_id,
+                               pending.get('since'), pending.get('until'))
+    model = _vscode_turn_model(transcript_path, conversation_id,
+                               pending.get('since'), pending.get('until'))
+    # Tokens are the point, and VS Code can expose a model before it has finished
+    # accounting. Sending on the model alone and clearing the slot would lose those
+    # tokens permanently, so a model-only result waits -- except at SessionEnd, which is
+    # the last chance this session gets.
+    if not usage and not (final and model):
+        return False
+
+    content = rebuild_turn_content(transcript_path, conversation_id, pending.get('prompt_id'))
+    if content is None:
+        # The turn is no longer in the transcript, so nothing can be rebuilt for it.
+        return True
+    user_prompt, assistant_prompt = content
+
+    exchange = {
+        'conversation_id': conversation_id,
+        'model': model or 'auto',
+        'messages': [{'role': 'user', 'content': user_prompt},
+                     {'role': 'assistant', 'content': assistant_prompt}],
+        'turn_request_id': pending['turn_request_id'],
+        'requestInitialized': pending.get('since') or pending.get('until'),
+        'requestCompleted': pending.get('until'),
+    }
+    if usage:
+        exchange['usage'] = usage
+    if not send_to_api(exchange, api_key):
+        return False
+    # Settled means the tokens are in, not merely that something was sent. A model-only
+    # send is progress, so the slot stays and any later event for this session can still
+    # attach them; re-sending fills the same row and changes nothing.
+    return bool(usage)
+
+
+def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
+    """(user prompt, assistant text) for one earlier turn, or None.
+
+    Anchored on the turn's own prompt entry rather than a time window: transcript entries
+    carry no timestamp, and the turn ends where the next user prompt begins. Reads the
+    transcript again rather than keeping the text on disk, so no prompt text is persisted."""
+    if not transcript_path or not prompt_id:
+        return None
+    try:
+        entries = []
+        with open(transcript_path, 'r', encoding='utf-8') as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entries.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception as e:
+        log_error('turn rebuild read failed: %s' % e, 'usage')
+        return None
+
+    user_prompt = None
+    assistant_parts = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            continue
+        entry_type = entry.get('type')
+        data = entry.get('data') or {}
+        if entry_type == 'user.message':
+            if user_prompt is not None:
+                break  # the next prompt closes the turn
+            content = data.get('content')
+            if turn_prompt_id(entry, conversation_id, index, content) == prompt_id:
+                user_prompt = content or ''
+        elif entry_type == 'assistant.message' and user_prompt is not None:
+            content = data.get('content')
+            if isinstance(content, str) and content:
+                assistant_parts.append(content)
+    if user_prompt is None:
+        return None
+    return user_prompt, '\n\n'.join(assistant_parts)
+
+
+def get_previous_stop_timestamp_for_session(event):
+    """Close of the previous turn, which is the floor of this turn's usage window. The Stop
+    being handled is already logged, so the one before it is that floor. Keyed by
+    stop_session_key rather than the payload's session_id: a Stop that omits session_id
+    would match no earlier Stop, lose its floor, and recount every earlier request in the
+    session."""
+    key = stop_session_key(event)
+    if not key:
+        return None
+    stops = [log.get('timestamp') for log in load_existing_logs()
+             if log.get('event', {}).get('hook_event_name') == 'Stop'
+             and stop_session_key(log.get('event', {})) == key]
+    # A Stop is already logged by the time it is handled, so its own row is the last one.
+    # SessionEnd is a different event, so every Stop in the log precedes it.
+    if event.get('hook_event_name') == 'Stop':
+        return stops[-2] if len(stops) > 1 else None
+    return stops[-1] if stops else None
+
+
 def _build_user_prompt_payload(recent_user_prompts):
     last = recent_user_prompts[-1] if recent_user_prompts else None
     return {
@@ -751,6 +951,8 @@ def _build_user_prompt_payload(recent_user_prompts):
 def canonical_tool_name(raw):
     """Translate a Copilot tool name to the canonical gateway vocabulary.
     Returns '' when the tool is not security-relevant."""
+    if not isinstance(raw, str):
+        return ''
     # The Copilot CLI emits Claude-style canonical names directly (Read / Write
     # / Edit / Bash); only the VS Code agent uses the lowercase vocabulary in
     # the sets below. Pass canonical names through, otherwise every CLI
@@ -766,7 +968,7 @@ def canonical_tool_name(raw):
         return 'Write'
     if raw in EDIT_TOOLS:
         return 'Edit'
-    if raw.startswith('mcp'):
+    if raw.lower().startswith('mcp_'):
         # MCP tools pass through unchanged — the gateway matches on the raw name.
         return raw
     return ''
@@ -791,7 +993,7 @@ def _vscode_user_dirs():
 
 # Plugin-bundle `.mcp.json` paths (VS Code agentPlugins + Copilot CLI); never merged
 # into mcp.json, so scan them. Not capped — a dropped config would fail open.
-def _plugin_mcp_config_paths(home):
+def _plugin_mcp_config_paths(home=None):
     paths = []
     for user_dir in _vscode_user_dirs():
         try:
@@ -799,39 +1001,61 @@ def _plugin_mcp_config_paths(home):
         except OSError:
             pass
     try:
-        paths.extend(sorted((home / ".copilot" / "installed-plugins").glob("*/.mcp.json")))
+        plugin_root = home / ".copilot" if home is not None else _copilot_home()
+        paths.extend(sorted((plugin_root / "installed-plugins").glob("*/.mcp.json")))
     except OSError:
         pass
     return paths
 
 
-# All Copilot MCP config locations, ordered for the last-wins merge in
-# read_copilot_mcp_servers: workspace (untrusted) < plugins < trusted (user/global/CLI).
+def _workspace_mcp_config_paths(cwd):
+    if not cwd:
+        return []
+    try:
+        current = Path(cwd).resolve()
+    except OSError:
+        current = Path(cwd)
+    directories = []
+    found_git_root = False
+    while True:
+        directories.append(current)
+        try:
+            if (current / ".git").exists():
+                found_git_root = True
+                break
+        except OSError:
+            break
+        if current.parent == current:
+            break
+        current = current.parent
+    if not found_git_root:
+        directories = directories[:1]
+    paths = [directories[0] / ".vscode" / "mcp.json"]
+    for directory in reversed(directories):
+        paths.append(directory / ".github" / "mcp.json")
+        paths.append(directory / ".mcp.json")
+    return paths
+
+
 def _copilot_mcp_config_paths(cwd=None, plugins=None):
     home = Path.home()
-
-    workspace = []
-    if cwd:
-        workspace.append(Path(cwd) / ".vscode" / "mcp.json")
-        workspace.append(Path(cwd) / ".mcp.json")
-
-    trusted = []
+    user = []
     for user_dir in _vscode_user_dirs():
-        trusted.append(user_dir / "mcp.json")
-        trusted.append(user_dir / "settings.json")
+        user.append(user_dir / "mcp.json")
+        user.append(user_dir / "settings.json")
         profiles = user_dir / "profiles"
         try:
             if profiles.is_dir():
                 for profile in sorted(profiles.iterdir()):
-                    trusted.append(profile / "mcp.json")
+                    user.append(profile / "mcp.json")
         except OSError:
             pass
-    trusted.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
-    trusted.append(home / ".copilot" / "mcp-config.json")
+    user.append(home / ".config" / "github-copilot" / "intellij" / "mcp.json")
+    user.append(_copilot_home() / "mcp-config.json")
 
     if plugins is None:
-        plugins = _plugin_mcp_config_paths(home)
-    return workspace + plugins + trusted
+        plugins = _plugin_mcp_config_paths()
+    return user + _workspace_mcp_config_paths(cwd) + plugins
 
 _JSONC_COMMENT_RE = re.compile(
     r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
@@ -868,165 +1092,659 @@ def _parse_jsonc(text):
         return None
 
 
-_TOKEN_RE = re.compile(
-    r'sk-[A-Za-z0-9_\-]{6,}'
-    r'|gh[opsur]_[A-Za-z0-9]{20,}'
-    r'|github_pat_[A-Za-z0-9_]{20,}'
-    r'|xox[baprs]-[A-Za-z0-9-]{10,}'
-    r'|AKIA[0-9A-Z]{16}'
-    r'|AIza[0-9A-Za-z_\-]{20,}'
-)
-_REDACTED = '***'
-
-
-# Reduce any url to scheme://host[:port]/path — the only part the gateway
-# fingerprints. Userinfo and query/fragment (which carry credentials, any
-# scheme) are dropped; known token shapes in the path are masked.
-def _redact_url(url):
-    if not isinstance(url, str):
-        return url
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return _REDACTED
-    host = parts.hostname
-    if not parts.scheme or not host:
-        return _REDACTED
-    netloc = f"{host}:{parts.port}" if parts.port else host
-    return urlunsplit((parts.scheme, netloc, _TOKEN_RE.sub(_REDACTED, parts.path), '', ''))
-
-
-# Allowlist: forward only fingerprint-relevant args (urls, @npm packages); drop
-# everything else so no secret can ride along. Urls are credential-stripped.
-def _redact_args(args):
-    if not isinstance(args, list):
-        return args
-    kept = []
-    for arg in args:
-        if not isinstance(arg, str):
-            continue
-        if '://' in arg:
-            kept.append(_redact_url(arg))
-        elif arg.startswith('@'):
-            kept.append(arg)
-    return kept
-
-
-def _sanitize_mcp_server_fields(server, cwd=None):
+def _extract_mcp_server_fields(server):
     if not isinstance(server, dict):
         return None
-    result = {}
-    if server.get('url'):
-        result['url'] = _redact_url(server['url'])
-    if server.get('command'):
-        result['command'] = server['command']
-    if server.get('args'):
-        result['args'] = _redact_args(server['args'])
-    if server.get('type'):
-        result['type'] = server['type']
-    if not result:
-        return None
-    
-    script_hash = _compute_script_hash(server.get('command'), server.get('args'), cwd)
-    if script_hash:
-        result['scriptHash'] = script_hash
-    return result
+    result = {
+        key: server[key]
+        for key in ('url', 'command', 'args', 'type')
+        if server.get(key)
+    }
+    return result or None
 
 
 _MCP_CONFIG_MAX_BYTES = 1_000_000
 
+# KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
+# Fingerprints key the local tool-hash cache; Redis tool scores are separately
+# keyed by tool content hash. Keep fingerprint output aligned with data/gateway.
 
-_HOOK_SCRIPT_RUNTIMES = {
+_MCP_TOOLS_CACHE_FILENAME = 'mcp-tools-cache.json'
+_MCP_TOOLS_CACHE_MAX_BYTES = 2 * 1024 * 1024
+_MCP_CACHE_CODING_TOOL_NAMES = frozenset({'github copilot cli'})
+_MCP_CACHE_CODING_TOOL_PREFIXES = ('github copilot',)
+_UNBOUND_CODING_TOOL = 'GitHub Copilot CLI'
+
+
+# Canonical MCP fingerprint port. Keep output aligned with the data, gateway,
+# and discovery implementations.
+CLAUDE_BUILTIN_PREFIX = 'claude-builtin:'
+
+CLAUDE_CONNECTOR_SCOPE = 'claude-connector'
+
+# Claude Code sanitizes display names into runtime names (non-alphanumerics -> '_'), so one
+# server arrives under several spellings. chrome/browser/preview stay separate: different tools.
+_CLAUDE_BUILTIN_NAMES = {
+    'computer-use': 'computer-use',
+    'claude-in-chrome': 'claude-in-chrome',
+    'claude-for-chrome': 'claude-in-chrome',
+    'claude-browser': 'claude-browser',
+    'claude-preview': 'claude-preview',
+    'claude-design': 'claude-design',
+    'ccd-session': 'ccd-session',
+    'ccd-session-mgmt': 'ccd-session-mgmt',
+    'ide': 'ide',
+}
+
+_BUILTIN_NAME_SEPARATOR_RE = re.compile(r'[\s_]+')
+
+
+def claude_builtin_identity(name):
+    """Canonical built-in identity for a bare server name, or None."""
+    key = _BUILTIN_NAME_SEPARATOR_RE.sub('-', (name or '').strip().lower())
+    return _CLAUDE_BUILTIN_NAMES.get(key)
+
+CLAUDEAI_NAME_PREFIX = 'claude.ai '
+CLAUDEAI_ALLOWED_ADDITIONAL_DATA = ({}, {'scope': 'claudeai'})
+
+# npm-package runners: the first positional arg is the package to run.
+NPM_RUNNERS = frozenset({'npx', 'npm', 'bunx'})
+# Sub-runners under npx/bunx that are not the package themselves (the real
+# target -- usually a local script -- follows).
+NPX_LOCAL_RUNNERS = frozenset({'tsx', 'ts-node'})
+# npm/bunx subcommands that precede the actual package name.
+NPM_SUBCOMMANDS = frozenset({'exec', 'run', 'run-script', 'x', 'create', 'init', 'install', 'i'})
+# Python-package runners and the sub-commands that precede the package.
+PYPI_RUNNERS = frozenset({'uvx', 'uv', 'pipx'})
+PYPI_SUBCOMMANDS = frozenset({'run', 'tool', 'tool-run'})
+
+# Prompt Security's MCP proxy wraps the real server command after this token.
+PROMPT_SECURITY_BASENAME = 'prompt_security_mcp'
+PROMPT_SECURITY_ARGS_SENTINEL = '__args__'
+
+# Language runtimes that execute a local script given as an arg. They never
+# produce a `bin:` identity -- their script identity is the content hash.
+# Keep in sync with _HOOK_SCRIPT_RUNTIMES in the hook files (setup/*/hooks/unbound.py).
+RUNTIMES = frozenset({
     'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
     'ruby', 'dart', 'php', 'perl', 'rscript',
-}
-_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
-_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+})
+
+# Commands that have their own rule (or are runtimes) -- excluded from the
+# catch-all `bin:` tier so they don't double-resolve.
+BIN_SKIP_COMMANDS = (
+    RUNTIMES | NPM_RUNNERS | PYPI_RUNNERS
+    | frozenset({'docker', 'builtin', PROMPT_SECURITY_BASENAME})
+)
+
+# Basenames too generic to identify a product -- `bin:` skips these (they
+# collide across unrelated servers).
+GENERIC_BIN_NAMES = frozenset({
+    'mcp-server', 'mcpserver', 'mcp', 'server', 'main', 'index', 'start', 'app',
+    'run', 'cli', 'bin', 'tool', 'agent', 'my-command', 'my-mcp-server', 'node-repl',
+})
+
+# Shells / build orchestrators / generic launchers. Their basename is not a
+# product identity -- the real server lives in the args (which `bin:` drops) or
+# in a file they exec. They never produce a `bin:` fingerprint.
+LAUNCHER_COMMANDS = frozenset({
+    'sh', 'bash', 'zsh', 'fish', 'dash', 'ksh', 'cmd', 'powershell', 'pwsh',
+    'env', 'cscript', 'wscript', 'make', 'mach', 'task', 'just',
+})
+
+# A command that is itself a local script file (run directly, not via a
+# runtime). Its identity is the file contents, so it routes to the `script:`
+# tier -- never `bin:`.
+_SCRIPT_COMMAND_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
 
 
-def _hook_command_basename(command):
-    base = re.split(r'[\\/]', (command or '').strip())[-1]
-    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+_LOCAL_PATH_EXT_RE = re.compile(r'\.(js|cjs|mjs|ts|tsx|py|rb|php|dart|sh|rs|go|jar)$', re.IGNORECASE)
+_EXE_SUFFIX_RE = re.compile(r'\.(exe|cmd|bat|com)$')
+_PLATFORM_SUFFIX_RE = re.compile(
+    r'-(darwin|linux|windows|macos|win32|win)(-(arm64|x64|x86|amd64|aarch64))?$'
+)
 
 
-def _hook_looks_like_path(value):
-    v = (value or '').strip().strip('"\'')
-    if v.startswith(('http://', 'https://', '@', 'git+')):
-        return False
-    # Only treat an arg as a local script if it has a recognised script
-    # extension. Previously any '/'-containing arg matched, which let a crafted
-    # runtime config (e.g. `python3 /etc/passwd`) read arbitrary non-script files.
-    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+# Scheme default ports, dropped from the identity (mirrors JS URL semantics).
+_DEFAULT_PORTS = {'http': 80, 'https': 443, 'ws': 80, 'wss': 443}
 
 
-def _hook_candidate_script(command, args):
-    """The local script this config runs: the file arg under a runtime, or the
-    command itself when it's a script file. None for packages/urls/binaries."""
-    base = _hook_command_basename(command or '')
-    if base in _HOOK_SCRIPT_RUNTIMES:
-        for a in (args or []):
-            if not isinstance(a, str) or a.startswith('-'):
-                continue
-            t = a.strip().strip('"\'')
-            if t in _HOOK_RUNNER_SUBTOKENS:
-                continue
-            if _hook_looks_like_path(t):
-                return t
+def _extract_url_identity(url_value: str) -> Optional[str]:
+    """
+    Normalize a URL into a stable identity string: `host[:port]/path`.
+
+    The path is kept (not stripped) so multi-tenant proxy services like
+    mintmcp.com / composio don't collapse into a single fingerprint when they
+    actually serve different underlying services at different paths. Query and
+    fragment are dropped (those typically carry session/auth params that vary
+    per install).
+
+    Host is lowercased, trailing slashes on path are stripped, empty paths
+    normalize to an absent segment.
+    """
+    if not url_value or not isinstance(url_value, str):
         return None
-    if command and _HOOK_SCRIPT_EXT_RE.search(base):
-        return command
+    try:
+        parsed = urlparse(url_value.strip())
+    except ValueError:
+        return None
+
+    host = (parsed.hostname or '').lower()
+    if not host:
+        return None
+
+    # Drop the scheme's default port so `https://h:443/x` and `https://h/x`
+    # share one identity (matches JS `new URL().port`, which omits defaults).
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    if port is not None and _DEFAULT_PORTS.get((parsed.scheme or '').lower()) == port:
+        port = None
+    host_port = f'{host}:{port}' if port else host
+
+    # Normalize path: drop trailing slashes, drop if empty or just "/"
+    path = (parsed.path or '').rstrip('/')
+    identity = f'{host_port}{path}' if path else host_port
+    return identity
+
+
+def _urls_in_args(args: List[str]) -> List[str]:
+    return [
+        a for a in args
+        if isinstance(a, str) and (a.startswith('http://') or a.startswith('https://'))
+    ]
+
+
+def _command_base(command: Optional[str]) -> str:
+    """Basename of a command, lowercased, with a Windows executable suffix dropped."""
+    if not command:
+        return ''
+    base = re.split(r'[\\/]', command.strip())[-1]
+    return _EXE_SUFFIX_RE.sub('', base.lower())
+
+
+def _unquote(value: str) -> str:
+    """Strip surrounding quotes some clients leave in arg values."""
+    return value.strip('"\'')
+
+
+def _looks_like_local_path(value: str) -> bool:
+    """A path to a local file/script (not a package/identity)."""
+    v = _unquote(value)
+    if v.startswith('http://') or v.startswith('https://'):
+        return False
+    if v.startswith('@'):  # npm scope, not a path
+        return False
+    if v.startswith('git+'):
+        return False
+    if '${' in v:  # env-var path template
+        return True
+    if '/' in v or '\\' in v:
+        return True
+    return bool(_LOCAL_PATH_EXT_RE.search(v))
+
+
+def _npm_package_from_args(args: List[str]) -> Optional[str]:
+    """Find the first @scoped npm package in args, stripped of any @version suffix."""
+    for arg in args:
+        if not isinstance(arg, str) or not arg.startswith('@'):
+            continue
+        second_at = arg.find('@', 1)
+        return arg[:second_at] if second_at != -1 else arg
     return None
 
 
-_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+def _normalize_npm(pkg: str) -> str:
+    """@scope/name@ver -> @scope/name ; name@ver -> name"""
+    p = _unquote(pkg)
+    if p.startswith('@'):
+        i = p.find('@', 1)
+        return p[:i] if i != -1 else p
+    return p.split('@')[0]
 
 
-def _compute_script_hash(command, args, cwd):
-    """sha256 of the local script's contents, or None when it isn't a resolvable
-    local script. Matches what the backend recomputes from the uploaded body, so
-    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
-    Capped so all clients agree on the hash for large scripts."""
+def _normalize_pypi(pkg: str) -> str:
+    """Strip a version spec from a Python requirement: name==1, name>=1, name@1."""
+    return re.split(r'[=<>@~!]', _unquote(pkg))[0]
+
+
+def _git_identity(spec: str) -> Optional[str]:
+    """git+https://github.com/owner/repo(.git)(@ref) -> github.com/owner/repo"""
+    s = _unquote(spec)
+    if s.startswith('git+'):
+        s = s[4:]
+    s = re.sub(r'^(https?|ssh|git)://', '', s)
+    s = re.sub(r'^[^/]*@', '', s).replace(':', '/', 1)
+    s = re.sub(r'\.git(@.*)?$', '', s)
+    s = re.sub(r'@[^/]*$', '', s)
+    parts = [p for p in s.split('/') if p]
+    if len(parts) < 3:
+        return None
+    return '/'.join(parts[:3]).lower()
+
+
+def _git_from_args(args: List[str]) -> Optional[str]:
+    for arg in args:
+        if not isinstance(arg, str):
+            continue
+        t = _unquote(arg)
+        is_git = (
+            t.startswith('git+')
+            or t.startswith('git@')
+            or (re.match(r'^(https?|ssh)://', t) is not None
+                and re.search(r'(github\.com|gitlab\.com|bitbucket\.org)', t) is not None)
+        )
+        if not is_git:
+            continue
+        identity = _git_identity(t)
+        if identity:
+            return identity
+    return None
+
+
+def _package_from_runner_args(args: List[str], skip: frozenset) -> Optional[str]:
+    """First package-looking arg under a runner, skipping flags, the runner's own
+    sub-tokens, and bailing on a local-path arg (that's a script, not a package)."""
+    for arg in args:
+        if not isinstance(arg, str) or arg.startswith('-'):
+            continue
+        t = _unquote(arg)
+        if t in skip:
+            continue
+        if _looks_like_local_path(t):
+            return None
+        return t
+    return None
+
+
+# `docker run` BOOLEAN flags — the closed, stable set that consumes NO value.
+# Everything else that looks like a flag is treated as value-taking, so an
+# unknown or newly-added value flag can never leak its value as the image: it
+# fails toward no fingerprint rather than a wrong one. This is the reliable axis
+# (the value-flag set is open-ended and grows with docker; the boolean set does
+# not). `--flag=value` and attached short values (`-eKEY`) are self-contained.
+DOCKER_BOOLEAN_FLAGS = frozenset({
+    '-i', '--interactive', '-t', '--tty', '-d', '--detach', '-P', '--publish-all',
+    '--rm', '--init', '--privileged', '--read-only', '--no-healthcheck',
+    '--oom-kill-disable', '--disable-content-trust', '--sig-proxy', '-q', '--quiet',
+})
+_DOCKER_SHORT_BOOLEANS = set('itdPq')       # for combined forms: -it, -itd
+_DOCKER_SHORT_VALUES = set('evpwulmhca')    # for attached forms: -eKEY, -p8080
+
+# A docker image candidate, tag and digest already stripped. Repository names are
+# lowercase (docker rejects `docker run FOO`), so this rejects any leaked
+# uppercase value as a final backstop.
+_DOCKER_IMAGE_REF_RE = re.compile(r'[a-z0-9][a-z0-9._:/-]*')
+_DOCKER_DIGEST_RE = re.compile(r'@[A-Za-z0-9]+:[A-Fa-f0-9]+$')  # @sha256:<hex>
+
+
+def _is_docker_image_ref(candidate: str) -> bool:
+    return bool(_DOCKER_IMAGE_REF_RE.fullmatch(candidate))
+
+
+def _docker_flag_consumes_value(arg: str) -> bool:
+    """True when this flag takes the FOLLOWING token as its value (so that token
+    is not the image). Boolean flags and self-contained forms return False;
+    anything unrecognized is assumed value-taking (fail toward null)."""
+    if '=' in arg:
+        return False                        # --flag=value / -e=value (attached)
+    if arg in DOCKER_BOOLEAN_FLAGS:
+        return False
+    if arg.startswith('--'):
+        return True                         # any other long flag: value-taking
+    letters = arg[1:]                        # short flag(s): -x or bundle -xyz
+    if letters and all(c in _DOCKER_SHORT_BOOLEANS for c in letters):
+        return False                        # combined booleans, e.g. -it, -itd
+    if len(letters) > 1 and letters[0] in _DOCKER_SHORT_VALUES:
+        return False                        # attached value, e.g. -eKEY, -p8080
+    return True                             # -e / -p (separate value) or unknown
+
+
+def _normalize_docker_image(arg: str) -> str:
+    image = _unquote(arg)
+    image = _DOCKER_DIGEST_RE.sub('', image)     # drop @sha256:<digest>
+    return re.sub(r':[^/]+$', '', image)         # drop :tag, keep registry/repo
+
+
+def _docker_image_from_args(args: List[str]) -> Optional[str]:
+    # Skip each value flag's next token; the first bare, lowercase image-ref-shaped
+    # token is the image. Unknown flags are assumed value-taking, so a leaked value
+    # never becomes the fingerprint.
+    if 'run' not in args:
+        return None
+    run_idx = args.index('run')
+    skip_next = False
+    for arg in args[run_idx + 1:]:
+        if not isinstance(arg, str):
+            continue
+        if skip_next:
+            skip_next = False
+            continue
+        if arg.startswith('-'):
+            if _docker_flag_consumes_value(arg):
+                skip_next = True
+            continue
+        image = _normalize_docker_image(arg)
+        if _is_docker_image_ref(image):
+            return image
+    return None
+
+
+def _command_is_script_file(command: str) -> bool:
+    """True when the command is itself a local script file (e.g. `.../bin.sh`)."""
+    base = re.split(r'[\\/]', command.strip())[-1]
+    return bool(_SCRIPT_COMMAND_RE.search(base))
+
+
+def _normalize_bin(command: str) -> Optional[str]:
+    """Basename of a bespoke binary, normalized for cross-platform collapse. Drops
+    the path, executable suffix, and platform/arch suffix; None when generic."""
+    b = re.split(r'[\\/]', command.strip())[-1].lower()
+    b = _EXE_SUFFIX_RE.sub('', b)
+    b = _PLATFORM_SUFFIX_RE.sub('', b)
+    b = b.strip(' -_')
+    if not b or b in GENERIC_BIN_NAMES:
+        return None
+    return b
+
+
+def compute_fingerprint(
+    name: Optional[str],
+    command: Optional[str],
+    url: Optional[str],
+    args: Optional[List[str]],
+    additional_data: Optional[Dict[str, Any]],
+    script_hash: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Derive a stable fingerprint for an MCP server.
+
+    The function is a priority chain: the first signal that yields a result wins.
+    `script_hash`, when provided, is the client-computed content hash of a local
+    script (the gateway/control plane cannot read the file itself).
+    Returns None when no signal is extractable.
+    """
+    safe_name = name or ''
+    safe_args = args or []
+    safe_additional_data = additional_data or {}
+    base = _command_base(command)
+
+    # 0. Prompt Security proxy: the real server command follows `__args__`.
+    #    Unwrap and fingerprint the inner command instead of the wrapper.
+    if base == PROMPT_SECURITY_BASENAME and PROMPT_SECURITY_ARGS_SENTINEL in safe_args:
+        idx = safe_args.index(PROMPT_SECURITY_ARGS_SENTINEL)
+        if idx + 1 < len(safe_args):
+            inner = safe_args[idx + 1:]
+            inner_cmd = inner[0] if inner else None
+            inner_url = inner_cmd if inner_cmd and inner_cmd.startswith(('http://', 'https://')) else None
+            return compute_fingerprint(
+                name=safe_name,
+                command=None if inner_url else inner_cmd,
+                url=inner_url,
+                args=inner[1:],
+                additional_data=safe_additional_data,
+                script_hash=script_hash,
+            )
+
+    # Claude desktop OAuth remote connector. Named by a per-registration UUID at
+    # runtime; the client hook resolves the display name and tags the config
+    # scope="claude-connector" so every instance of e.g. "Gmail" groups by name.
+    # This wins over the url branch below: the connector carries a per-registration
+    # url, but the device sweep that seeds the keeper omits it, so fingerprinting
+    # by url here would never match claude-connector:<name>.
+    if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
+        return f'claude-connector:{safe_name.lower()}'
+
+    # First-party built-ins arrive as a bare name (no command/url/args); collapse
+    # separator variants to one identity so aliases share a fingerprint.
+    if not command and not url and not safe_args:
+        builtin = claude_builtin_identity(safe_name)
+        if builtin:
+            return f'{CLAUDE_BUILTIN_PREFIX}{builtin}'
+
+    # 1. url field -> url:<host[:port]/path>
+    if url:
+        identity = _extract_url_identity(url)
+        if identity:
+            return f'url:{identity}'
+
+    # 2. URLs inside args -> url-arg:<identity> (only if all URLs resolve to a single identity)
+    url_args = _urls_in_args(safe_args)
+    if url_args:
+        identities = {_extract_url_identity(u) for u in url_args}
+        identities.discard(None)
+        if len(identities) == 1:
+            return f'url-arg:{next(iter(identities))}'
+        if len(identities) > 1:
+            return None
+
+    # 3. git+ install spec in args (npx/uvx git installs)
+    git = _git_from_args(safe_args)
+    if git:
+        return f'git:{git}'
+
+    # 4. @scoped npm package anywhere in args (command-agnostic, original rule)
+    scoped_npm = _npm_package_from_args(safe_args)
+    if scoped_npm:
+        return f'npm:{scoped_npm}'
+
+    # 5. npm package run via npx / npm / bunx (bare or quoted-scoped)
+    if base in NPM_RUNNERS:
+        pkg = _package_from_runner_args(safe_args, NPX_LOCAL_RUNNERS | NPM_SUBCOMMANDS | RUNTIMES)
+        if pkg:
+            return f'npm:{_normalize_npm(pkg)}'
+
+    # 6. Python package run via uvx / uv / pipx
+    if base in PYPI_RUNNERS:
+        pkg = _package_from_runner_args(safe_args, PYPI_SUBCOMMANDS)
+        if pkg:
+            return f'pypi:{_normalize_pypi(pkg)}'
+
+    # 7. docker run <image> (skip `docker mcp ...`, the Docker MCP gateway CLI)
+    if base == 'docker' and (not safe_args or safe_args[0] != 'mcp'):
+        image = _docker_image_from_args(safe_args)
+        if image:
+            return f'docker:{image}'
+
+    # 8. IntelliJ plugin-managed server. Parser still checks literal "builtin"
+    # (that's what coding-discovery-tool/.../jetbrains/mcp_config_extractor.py writes);
+    # the prefix is intellij: for accurate semantic labeling.
+    if command == 'builtin' and safe_name:
+        return f'intellij:{safe_name.lower()}'
+
+    # 9. Claude.ai native integration. Two name forms arrive: the hook-resolved
+    # display ("claude.ai Atlassian") and the raw runtime key
+    # ("claude_ai_Atlassian") when hook resolution missed — e.g. the first-time
+    # `authenticate` call, before the connector is in claudeAiMcpEverConnected.
+    # Reconstruct the display form from the raw key so both fingerprint the same.
+    if (
+        not command
+        and not safe_args
+        and safe_additional_data in CLAUDEAI_ALLOWED_ADDITIONAL_DATA
+    ):
+        if safe_name.startswith(CLAUDEAI_NAME_PREFIX):
+            return f'claudeai:{safe_name.lower()}'
+        raw_key = re.fullmatch(r'claude_ai_(.+)', safe_name)
+        if raw_key:
+            rest = re.sub(r'_+', ' ', raw_key.group(1)).strip().lower()
+            if rest:
+                return f'claudeai:{CLAUDEAI_NAME_PREFIX}{rest}'
+
+    # (Claude desktop OAuth remote connector is handled above the url branch —
+    # scope="claude-connector" groups by name regardless of the per-registration url.)
+
+    # 11. Local script identified by client-supplied content hash. Covers both
+    #     runtime+file (`node x.js`) and a script run directly (`.../bin.sh`).
+    #     Ignore empty / punctuation-only values (e.g. "", "/", "///") -> None.
+    clean_hash = (script_hash or '').strip()
+    if re.fullmatch(r'[a-f0-9]{64}', clean_hash, re.IGNORECASE):
+        return f'script:{clean_hash.lower()}'
+
+    # 12. Bespoke local binary -- basename only, args dropped (they carry
+    #     per-user paths/ids that would explode cardinality). Skips runtimes,
+    #     launchers/shells, and script files (those are script-tier identities).
+    if (
+        command
+        and base not in BIN_SKIP_COMMANDS
+        and base not in LAUNCHER_COMMANDS
+        and not _command_is_script_file(command)
+    ):
+        bin_name = _normalize_bin(command)
+        if bin_name:
+            return f'bin:{bin_name}'
+
+    return None
+
+def compute_mcp_cache_key(name, command, url, args, additional_data=None, script_hash=None):
+    if name is not None and not isinstance(name, str):
+        return None
+    if url is not None and not isinstance(url, str):
+        return None
+    if command is not None and not isinstance(command, str):
+        return None
+    if args is not None and (
+        not isinstance(args, list)
+        or any(not isinstance(arg, str) for arg in args)
+    ):
+        return None
+    if additional_data is not None and not isinstance(additional_data, dict):
+        return None
+    return compute_fingerprint(
+        name=name, command=command, url=url, args=args,
+        additional_data=additional_data, script_hash=script_hash,
+    )
+
+
+def _unbound_state_dir_candidates():
+    candidates = [Path.home() / '.unbound']
+    if hasattr(os, 'getuid'):
+        candidates.append(Path(f'/var/tmp/unbound-{os.getuid()}'))
+    else:
+        candidates.append(Path(tempfile.gettempdir()) / 'unbound')
+    return candidates
+
+
+def _read_mcp_tools_cache():
+    home_state_dir = Path.home() / '.unbound'
+    newest_cache = {}
+    newest_mtime = -1.0
+    for state_dir in _unbound_state_dir_candidates():
+        try:
+            if state_dir != home_state_dir:
+                if state_dir.is_symlink() or not state_dir.is_dir():
+                    continue
+                if hasattr(os, 'getuid'):
+                    state_dir_stat = state_dir.stat()
+                    if state_dir_stat.st_uid != os.getuid() or state_dir_stat.st_mode & 0o077:
+                        continue
+            path = state_dir / _MCP_TOOLS_CACHE_FILENAME
+            if not path.is_file():
+                continue
+            with open(path, 'rb') as f:
+                data = f.read(_MCP_TOOLS_CACHE_MAX_BYTES + 1)
+            if len(data) > _MCP_TOOLS_CACHE_MAX_BYTES:
+                continue
+            parsed = json.loads(data.decode('utf-8'))
+            if isinstance(parsed, dict):
+                mtime = path.stat().st_mtime
+                if mtime > newest_mtime:
+                    newest_cache = parsed
+                    newest_mtime = mtime
+        except Exception:
+            continue
+    return newest_cache
+
+
+def _mcp_cache_entries_for_user(tools):
+    username = Path.home().name
+    entries = []
+    for key, by_user in tools.items():
+        if not isinstance(key, str) or not isinstance(by_user, dict):
+            continue
+        k = key.strip().lower()
+        if k in _MCP_CACHE_CODING_TOOL_NAMES or k.startswith(_MCP_CACHE_CODING_TOOL_PREFIXES):
+            entry = by_user.get(username)
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return entries
+
+
+_CONTENT_HASH_RE = re.compile(r'^[a-f0-9]{64}$', re.IGNORECASE)
+
+
+def _lookup_tool_content_hash(server_name, mcp_tool, server_cfg):
     try:
-        cand = _hook_candidate_script(command, args)
-        if not cand:
+        if not server_name or not mcp_tool or not isinstance(server_cfg, dict):
             return None
-        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
-        if '${' in path:  # an env var we couldn't expand -> can't resolve
+        cache_key = compute_mcp_cache_key(
+            name=server_name,
+            command=server_cfg.get('command'),
+            url=server_cfg.get('url'),
+            args=server_cfg.get('args'),
+            additional_data=server_cfg.get('additional_data'),
+            script_hash=server_cfg.get('scriptHash'),
+        )
+        if not cache_key:
             return None
-        if not os.path.isabs(path) and cwd:
-            path = os.path.join(cwd, path)
-        if not os.path.isfile(path):
+        tools = _read_mcp_tools_cache().get('tools')
+        if not isinstance(tools, dict):
             return None
-        h = hashlib.sha256()
-        remaining = _HOOK_MAX_SCRIPT_BYTES
-        with open(path, 'rb') as f:
-            while remaining > 0:
-                chunk = f.read(min(65536, remaining))
-                if not chunk:
-                    break
-                h.update(chunk)
-                remaining -= len(chunk)
-        return h.hexdigest()
+        for entry in _mcp_cache_entries_for_user(tools):
+            by_tool = entry.get(cache_key)
+            if not isinstance(by_tool, dict):
+                continue
+            content_hash = by_tool.get(mcp_tool)
+            if isinstance(content_hash, str) and _CONTENT_HASH_RE.match(content_hash):
+                return content_hash
+        return None
     except Exception:
         return None
 
 
-def _augment_script_hash(result, cwd):
-    """Add scriptHash to an MCP server config when it runs a local script, so the
-    gateway can fingerprint it as `script:<hash>`."""
-    if result and result.get('command'):
-        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
-        if script_hash:
-            result['scriptHash'] = script_hash
-    return result
+def _attach_tool_content_hash(metadata):
+    try:
+        original_cfg = metadata.get('mcp_server_config')
+        server_cfg = dict(original_cfg) if isinstance(original_cfg, dict) else {}
+        content_hash = _lookup_tool_content_hash(
+            metadata.get('mcp_server'), metadata.get('mcp_tool'), server_cfg
+        )
+        if content_hash:
+            server_cfg['tool_content_hash'] = content_hash
+        if isinstance(original_cfg, dict) or content_hash:
+            metadata['mcp_server_config'] = server_cfg
+    except Exception:
+        pass
+
+
+# ───────────────────────── end MCP tool risk-scoring section ─────────────────
+
+
+def _mcp_servers_from_config(config, allow_bare=False):
+    raw = config.get('servers')
+    if not isinstance(raw, dict):
+        raw = config.get('mcpServers')
+    if not isinstance(raw, dict):
+        nested = config.get('mcp')
+        raw = nested.get('servers') if isinstance(nested, dict) else None
+    if not isinstance(raw, dict) and allow_bare:
+        raw = {
+            name: value for name, value in config.items()
+            if isinstance(value, dict)
+            and any(key in value for key in ('command', 'url', 'type', 'args'))
+        }
+    return raw if isinstance(raw, dict) else None
 
 
 def read_copilot_mcp_servers(cwd=None):
     servers = {}
+    server_sources = {}
+    ambiguous_names = set()
     plugin_names = set()
     # Match plugin bundles by exact path (a substring check could misclassify).
-    plugin_list = _plugin_mcp_config_paths(Path.home())
+    plugin_list = _plugin_mcp_config_paths()
     plugin_paths = set(plugin_list)
+    workspace_paths = set(_workspace_mcp_config_paths(cwd))
     for config_path in _copilot_mcp_config_paths(cwd, plugin_list):
         try:
             if not config_path.exists():
@@ -1037,20 +1755,18 @@ def read_copilot_mcp_servers(cwd=None):
                 config = _parse_jsonc(f.read())
             if not isinstance(config, dict):
                 continue
-            raw = config.get('servers')
-            if not isinstance(raw, dict):
-                raw = config.get('mcpServers')
-            if not isinstance(raw, dict):
-                nested = config.get('mcp')
-                raw = nested.get('servers') if isinstance(nested, dict) else None
+            allow_bare = config_path.name == '.mcp.json' or (
+                config_path.name == 'mcp.json' and config_path.parent.name == '.github'
+            )
+            raw = _mcp_servers_from_config(config, allow_bare=allow_bare)
             if not isinstance(raw, dict):
                 continue
             is_plugin = config_path in plugin_paths
-            # Hash a plugin's relative script against its own bundle, not cwd,
-            # so the fingerprint is correct and not workspace-spoofable.
-            base = config_path.parent if is_plugin else cwd
+            source = 'plugin' if is_plugin else (
+                'workspace' if config_path in workspace_paths else 'user'
+            )
             for name, server in raw.items():
-                fields = _sanitize_mcp_server_fields(server, base) or {}
+                fields = _extract_mcp_server_fields(server) or {}
                 # Surface only genuine plugin-vs-plugin name clashes (name only).
                 if is_plugin:
                     if name in plugin_names and servers.get(name) != fields:
@@ -1058,7 +1774,19 @@ def read_copilot_mcp_servers(cwd=None):
                             f"copilot mcp plugin name collision: {name}", 'mcp_plugin'
                         )
                     plugin_names.add(name)
-                servers[name] = fields
+                previous_source = server_sources.get(name)
+                if name in ambiguous_names:
+                    continue
+                if (
+                    previous_source is not None
+                    and previous_source != source
+                    and servers.get(name) != fields
+                ):
+                    servers[name] = None
+                    ambiguous_names.add(name)
+                elif previous_source is None or previous_source == source:
+                    servers[name] = fields
+                server_sources[name] = source
         except Exception as e:
             # Missing files are skipped above without raising; this only fires on
             # a genuine read failure, so it's worth surfacing for diagnosis.
@@ -1076,20 +1804,18 @@ def _sanitize_copilot_server_name(name):
 # and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
 # false-positive relabels of unrelated tools sharing a server's prefix.
 _MCP_NAME_SEPARATORS = ('__', '-')
+_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright', 'fetch', 'time')
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
+_VSCODE_TRUNCATED_SERVER_LENGTH = 13
 
 
-# Resolve (server, tool, config) from a Copilot tool name. The mcp__ form is
-# self-delimiting; the bare form is matched against configured server names.
-# Matching is case-insensitive (Copilot lowercases nothing, configs vary case)
-# and the longest server match wins; ties resolve to config/iteration order.
 def detect_mcp_call(raw_tool, mcp_servers):
     if not raw_tool:
         return (None, None, None)
 
-    if raw_tool.startswith('mcp__'):
+    if raw_tool.lower().startswith('mcp__'):
         parts = raw_tool[len('mcp__'):].split('__', 1)
         server = parts[0]
         mcp_tool = parts[1] if len(parts) >= 2 else ''
@@ -1102,15 +1828,14 @@ def detect_mcp_call(raw_tool, mcp_servers):
             if len(candidate) < _MIN_MCP_SERVER_NAME:
                 continue
             cand_lower = candidate.lower()
-            if raw_lower == cand_lower:
-                mcp_tool = ''
-            elif raw_lower.startswith(cand_lower):
-                remainder = raw_tool[len(candidate):]
-                sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
-                if sep is None:
-                    continue
-                mcp_tool = remainder[len(sep):]
-            else:
+            if not raw_lower.startswith(cand_lower):
+                continue
+            remainder = raw_tool[len(candidate):]
+            sep = next((s for s in _MCP_NAME_SEPARATORS if remainder.startswith(s)), None)
+            if sep is None:
+                continue
+            mcp_tool = remainder[len(sep):]
+            if not mcp_tool:
                 continue
             if best is None or len(candidate) > best[0]:
                 best = (len(candidate), server_name, mcp_tool)
@@ -1133,62 +1858,115 @@ def _vscode_server_aliases(server_name):
     return {a for a in aliases if len(a) >= _MIN_MCP_SERVER_NAME}
 
 
-def _vscode_fingerprint_key(config):
-    """Coarse identity used to decide if two configured servers are really the same
-    one (mirrors the gateway's url-first / command+args fingerprint priority).
-    Returns None when identity can't be established."""
-    if not config:
-        return None
-    if config.get('url'):
-        return ('url', config['url'])
-    if config.get('command'):
-        return ('cmd', config['command'], tuple(config.get('args') or []))
-    return None
-
-
 def _resolve_vscode_mcp(raw_tool, mcp_servers):
     """Resolve (server, tool, config) from a VS Code `mcp_<server>_<tool>` name,
     tolerating truncation; longest server-prefix wins, exact beats truncated on ties.
-    If a *different* server also matches and can't be proven to be the same server
-    (identical fingerprint config), the token is ambiguous -> unresolved (don't
-    guess); same-config duplicates (e.g. two keys for one server) still resolve."""
-    if not raw_tool.startswith('mcp_') or raw_tool.startswith('mcp__'):
+    If a different server also matches and has a different resolved config, the
+    token is ambiguous and remains unresolved. Duplicate keys with the same config
+    still resolve."""
+    raw_lower = raw_tool.lower()
+    if not raw_lower.startswith('mcp_') or raw_lower.startswith('mcp__'):
         return (None, None, None)
     body = raw_tool[len('mcp_'):]
     body_lower = body.lower()
-    segments = body.split('_')
     candidates = []  # (server_portion_len, exact_flag, server_name, tool)
     for server_name in mcp_servers:
         for alias in _vscode_server_aliases(server_name):
             if body_lower.startswith(alias + '_'):
-                cand = (len(alias), 1, server_name, body[len(alias) + 1:])
+                remainder = body[len(alias):]
+                separator_length = 2 if remainder.startswith('__') else 1
+                cand = (len(alias), 1, server_name, remainder[separator_length:])
             else:
                 cand = None
-                for k in range(len(segments) - 1, 0, -1):
-                    left = '_'.join(segments[:k])
-                    if len(left) >= _MIN_MCP_SERVER_NAME and alias.startswith(left.lower()):
-                        cand = (len(left), 0, server_name, '_'.join(segments[k:]))
-                        break
+                truncated = alias[:_VSCODE_TRUNCATED_SERVER_LENGTH]
+                if (
+                    len(alias) > _VSCODE_TRUNCATED_SERVER_LENGTH
+                    and body_lower.startswith(truncated + '_')
+                ):
+                    cand = (
+                        len(truncated), 0, server_name,
+                        body[len(truncated) + 1:],
+                    )
             if cand is not None and cand[3]:
                 candidates.append(cand)
     if not candidates:
         return (None, None, None)
     best = max(candidates, key=lambda c: c[:2])
-    best_key = _vscode_fingerprint_key(mcp_servers.get(best[2]))
+    best_config = mcp_servers.get(best[2])
     for cand in candidates:
         if cand[2] == best[2]:
             continue
-        other_key = _vscode_fingerprint_key(mcp_servers.get(cand[2]))
-        if best_key is None or other_key is None or other_key != best_key:
+        if best_config is None or mcp_servers.get(cand[2]) != best_config:
             return (None, None, None)
     return (best[2], best[3], mcp_servers.get(best[2]))
+
+
+def _explicit_mcp_identity_matches(raw_tool, server_name, tool_name):
+    if not all(isinstance(value, str) and 0 < len(value) <= 512
+               for value in (raw_tool, server_name, tool_name)):
+        return False
+    raw_lower = raw_tool.lower()
+    cli_name = (
+        f'{_sanitize_copilot_server_name(server_name)}-'
+        f'{_sanitize_copilot_server_name(tool_name)}'
+    ).lower()
+    if raw_lower == cli_name:
+        return True
+    if raw_lower == f'mcp__{server_name}__{tool_name}'.lower():
+        return True
+    if not raw_lower.startswith('mcp_') or raw_lower.startswith('mcp__'):
+        return False
+    body = _vscode_sanitize(raw_tool[4:])
+    tool_token = _vscode_sanitize(tool_name)
+    for separator in ('__', '_'):
+        suffix = separator + tool_token
+        if not tool_token or not body.endswith(suffix):
+            continue
+        server_token = body[:-len(suffix)]
+        if len(server_token) < _MIN_MCP_SERVER_NAME:
+            continue
+        if any(
+            alias == server_token
+            or (
+                len(alias) > _VSCODE_TRUNCATED_SERVER_LENGTH
+                and server_token == alias[:_VSCODE_TRUNCATED_SERVER_LENGTH]
+            )
+            for alias in _vscode_server_aliases(server_name)
+        ):
+            return True
+    return False
+
+
+def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None):
+    lowered = (raw_tool or '').lower()
+    builtin = (None, None, None)
+    for server in _BUILTIN_MCP_SERVERS:
+        prefix = server + '-'
+        if lowered.startswith(prefix):
+            tool = raw_tool[len(prefix):]
+            if tool:
+                builtin = (server, tool, mcp_servers.get(server))
+                break
+    if _explicit_mcp_identity_matches(raw_tool, server_name, tool_name) and (
+        builtin[0] is None
+        or len(_sanitize_copilot_server_name(server_name)) >= len(builtin[0])
+    ):
+        return (server_name, tool_name, mcp_servers.get(server_name))
+    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
+        configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
+    else:
+        configured = detect_mcp_call(raw_tool, mcp_servers)
+    if builtin[0] is not None and (
+        configured[0] is None
+        or len(_sanitize_copilot_server_name(configured[0])) < len(builtin[0])
+    ):
+        return builtin
+    return configured
 
 
 def extract_command_for_pretool(canonical, tool_input):
     """Extract the policy-check command from tool_input keyed by canonical tool type."""
     if canonical == 'Bash':
-        # Shell tools key the payload differently: run_in_terminal/bash use
-        # `command`; send_to_terminal and some variants use `input`/`text`.
         # `value` holds an unparseable raw payload preserved by _normalize_arguments.
         # Try all so the policy check never sees an empty command for a real
         # shell execution.
@@ -1401,65 +2179,52 @@ def process_pre_tool_use(event, api_key):
 def _evaluate_pre_tool_use_policies(event, api_key):
     """Run the gateway policy check for a PreToolUse event."""
     raw_tool = event.get('tool_name') or event.get('toolName') or ''
+    if not isinstance(raw_tool, str):
+        return {}
     # VS Code can hand toolArgs over as a JSON string. Every reader below calls
     # tool_input.get(), so normalize once here — a raw str raised out of the hook, and a
     # hook that raises fails open, so the tool ran with no policy check at all.
     tool_input = _normalize_arguments(event.get('tool_input') or event.get('toolArgs') or {})
     session_id = event.get('session_id') or event.get('sessionId')
 
-    # Translate the Copilot tool name to the canonical gateway vocabulary.
+    explicit_server = event.get('mcp_server_name') or event.get('mcpServerName')
+    explicit_tool = event.get('mcp_tool_name') or event.get('mcpToolName')
+    explicit_mcp = (
+        isinstance(explicit_server, str) and bool(explicit_server)
+        and isinstance(explicit_tool, str) and bool(explicit_tool)
+    )
     canonical = canonical_tool_name(raw_tool)
-    is_mcp = canonical.startswith('mcp')
+    is_mcp = canonical.lower().startswith('mcp_')
     mcp_server = mcp_tool = mcp_server_config = None
+    scan_config = None
 
-    # VS Code's `mcp_<server>_<tool>` form: canonical_tool_name() leaves the `mcp`
-    # prefix as-is so the bare-tool detection below is skipped; resolve the server
-    # here and forward its config so the gateway can fingerprint it.
-    if is_mcp and raw_tool.startswith('mcp_') and not raw_tool.startswith('mcp__'):
+    if explicit_mcp or is_mcp or canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
         mcp_servers = read_copilot_mcp_servers(event.get('cwd'))
-        mcp_server, mcp_tool, mcp_server_config = _resolve_vscode_mcp(raw_tool, mcp_servers)
-        if mcp_server is not None:
+        mcp_server, mcp_tool, mcp_server_config = resolve_copilot_mcp(
+            raw_tool,
+            mcp_servers,
+            explicit_server,
+            explicit_tool,
+        )
+        if mcp_server is None:
+            if canonical not in ALLOWED_NON_MCP_HOOK_NAMES and not is_mcp:
+                return {}
+            if is_mcp:
+                log_error(
+                    f"copilot mcp unresolved session={session_id} tool={raw_tool}",
+                    'mcp_match',
+                )
+        else:
+            is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
+            if isinstance(mcp_server_config, dict):
+                scan_config = mcp_server_config
             log_error(
-                f"copilot vscode mcp detected session={session_id} tool={raw_tool} "
+                f"copilot mcp detected session={session_id} tool={raw_tool} "
                 f"server={mcp_server} mcp_tool={mcp_tool} "
                 f"config={'yes' if mcp_server_config else 'no'}",
                 'mcp_match',
             )
-        else:
-            # Unmappable server: fall through to the gateway with mcp_server unset
-            # (not a short-circuit) so its other policies/logging/metering still run;
-            # the allow-list isn't evaluated without a resolved server (fail-open).
-            log_error(f"copilot vscode mcp UNRESOLVED session={session_id} tool={raw_tool}", 'mcp_match')
-
-    if not is_mcp and canonical not in ALLOWED_NON_MCP_HOOK_NAMES:
-        cwd = event.get('cwd')
-        mcp_servers = read_copilot_mcp_servers(cwd)
-        mcp_server, mcp_tool, mcp_server_config = detect_mcp_call(raw_tool, mcp_servers)
-        if mcp_server is None:
-            # A bare (non-mcp__) tool can only be resolved against the MCP config.
-            # If no config was readable, a genuine MCP call can't be identified
-            # and would slip the allow-list — surface that distinctly so the
-            # potential bypass is observable rather than silent. Skip known-benign
-            # native tools so the log isn't noisy.
-            if raw_tool and raw_tool not in INTERNAL_TOOLS and raw_tool not in TERMINAL_LIKE_TOOLS:
-                if not mcp_servers and not raw_tool.startswith('mcp__'):
-                    log_error(
-                        f"copilot mcp UNRESOLVED (no readable MCP config) tool={raw_tool}",
-                        'mcp_config',
-                    )
-                else:
-                    log_error(f"copilot pre_tool_use unmatched tool={raw_tool}", 'mcp_match')
-            return {}
-        is_mcp = True
-        canonical = f"mcp__{mcp_server}__{mcp_tool}"
-        # Names only — never args/config (those can carry secrets).
-        log_error(
-            f"copilot mcp detected session={session_id} tool={raw_tool} "
-            f"server={mcp_server} mcp_tool={mcp_tool} "
-            f"config={'yes' if mcp_server_config else 'no'}",
-            'mcp_match',
-        )
 
     cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
@@ -1490,6 +2255,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         metadata['mcp_tool'] = mcp_tool
         if mcp_server_config:
             metadata['mcp_server_config'] = mcp_server_config
+        _attach_tool_content_hash(metadata)
 
     approval_key = f"{canonical}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -1573,6 +2339,14 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                 'do not modify them in any way. Retry exactly once — the second attempt will wait for the approval.'
             ),
         })
+
+    if (
+        is_mcp
+        and api_response.get('decision') != 'deny'
+        and api_response.get('unknown_mcp_server')
+        and scan_config
+    ):
+        _dispatch_mcp_server_scan(mcp_server, scan_config)
 
     return transform_response_for_copilot(api_response)
 
@@ -2171,7 +2945,7 @@ def _normalize_arguments(arguments):
 def _extract_patch_target_path(args):
     """`apply_patch` carries the target file inside its patch `input` text rather
     than a filePath/path arg. Pull the first `*** {Add|Update|Delete} File: <path>`
-    so the edit is scored like insert_edit_into_file / create_file instead of being
+    so the edit is scored like other file edits instead of being
     dropped for want of a path. Returns '' when no path line is present."""
     text = args.get('input') or args.get('patch') or args.get('diff') or ''
     if not isinstance(text, str):
@@ -2180,10 +2954,11 @@ def _extract_patch_target_path(args):
     return m.group(1).strip() if m else ''
 
 
-def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None):
+def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
+                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
-    Returns None for internal orchestration tools (intentionally not emitted).
+    Returns None for internal and unsupported native tools.
 
     When `shell_state` ({'dir': <path>} tracked across the turn) and
     `root_projects` (per-repo origin cache) are provided, each entry gets a
@@ -2191,7 +2966,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     file path (relative paths joined onto the shell dir), shell entries from
     absolute paths in the command or the tracked shell dir.
     """
-    if name in INTERNAL_TOOLS:
+    if not isinstance(name, str) or not name:
         return None
     shell_state = shell_state if shell_state is not None else {}
     root_projects = root_projects if root_projects is not None else {}
@@ -2205,11 +2980,8 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
         return os.path.normpath(os.path.join(base, path)) if base else None
 
     project = None
-    if name in SHELL_TOOLS or name in TERMINAL_LIKE_TOOLS:
-        if name in SHELL_TOOLS:
-            command = args.get('command') or args.get('input') or args.get('text') or ''
-        else:
-            command = TERMINAL_LIKE_TOOLS[name](args)
+    if name in SHELL_TOOLS:
+        command = args.get('command') or args.get('input') or args.get('text') or ''
         entry = {
             'type': 'afterShellExecution',
             'command': command,
@@ -2247,12 +3019,30 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             abs_path = None
         project = _project_for_paths([os.path.dirname(abs_path)] if abs_path else [], root_projects)
     else:
+        mcp_servers = mcp_servers or {}
+        lowered_name = name.lower()
+        mcp_server, mcp_tool, mcp_server_config = resolve_copilot_mcp(
+            name, mcp_servers, mcp_server_name, mcp_tool_name
+        )
+        if mcp_server is None and not lowered_name.startswith('mcp_'):
+            return None
         entry = {
             'type': 'afterMCPExecution',
             'tool_name': name,
             'tool_input': args,
             'result_json': result_content or '',
         }
+        if mcp_server is not None:
+            entry['server_name'] = mcp_server
+            entry['mcp_tool_name'] = mcp_tool
+            metadata = {
+                'mcp_server': mcp_server,
+                'mcp_tool': mcp_tool,
+                'mcp_server_config': mcp_server_config,
+            }
+            _attach_tool_content_hash(metadata)
+            if metadata.get('mcp_server_config'):
+                entry['mcp_server_config'] = metadata['mcp_server_config']
         try:
             candidates = [p for p in _ABS_PATH_RE.findall(json.dumps(args)) if not _is_system_checkout_path(p)]
         except Exception:
@@ -2264,6 +3054,419 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
     if project:
         mapped['project'] = project
     return mapped
+
+
+_USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
+# COPILOT_HOME replaces the whole ~/.copilot path (GitHub Copilot CLI config-dir reference).
+_COPILOT_STORE = _copilot_home() / 'session-store.db'
+# Stop fires before VS Code finishes a response; the counts are written during the stream
+# and finalised after it, with elapsedMs written last. Observed lead from Stop to a finished
+# response: 1.1s to 9.8s. Exceeding this bound is not data loss -- the watermark holds and a
+# later Stop reports the turn. The Stop hook's budget is 60s.
+_VSCODE_SETTLE_SECONDS = 10.0
+_VSCODE_POLL_SECONDS = 0.25
+_VSCODE_MAX_LINES = 50000
+_VSCODE_MAX_LINE_CHARS = 1 << 20
+# No separator, drive letter or dot-only name can appear, so an id can only ever name a
+# file directly inside chatSessions/ and cannot escape it by construction.
+_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
+                           'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+# On Windows these resolve to devices wherever they appear, so opening one would attach to
+# the device and hang the hook rather than miss a file.
+_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
+                                   + ['com%d' % n for n in range(1, 10)]
+                                   + ['lpt%d' % n for n in range(1, 10)])
+
+
+def _is_regular_file(path):
+    """A FIFO or device node here would block the hook for its whole budget, so opening is
+    gated on a real file rather than on mere existence. Symlinks are followed: anything able
+    to plant one inside the user's own home could edit this script instead."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _safe_path_component(value):
+    return (isinstance(value, str) and 1 <= len(value) <= 128
+            and not set(value) - _SAFE_ID_CHARS and value not in ('.', '..')
+            and value.split('.')[0].lower() not in _RESERVED_DEVICE_NAMES)
+
+
+def _capped_lines(handle, max_lines, max_chars):
+    """Lines from an untrusted journal, bounded in count and in length. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen.
+    In text mode the readline hint counts characters, so utf-8 bounds the bytes at 4x that.
+    Draining an oversize line is charged against the same budget, so the whole read costs at
+    most max_lines readline calls however the file is shaped."""
+    count = 0
+    while count < max_lines:
+        line = handle.readline(max_chars)
+        if not line:
+            return
+        count += 1
+        if len(line) >= max_chars and not line.endswith('\n'):
+            while count < max_lines:  # drop the rest of an oversize line rather than buffer it
+                rest = handle.readline(max_chars)
+                count += 1
+                if not rest or rest.endswith('\n'):
+                    break
+            continue
+        yield line
+
+
+def _epoch(value):
+    """Audit-log stamps carry a local offset; Copilot's stores use Z or epoch millis."""
+    if value is None or value == '' or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > 10_000_000_000 else float(value)
+    try:
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _in_window(created, since, until):
+    """Half-open (previous Stop, this Stop], so consecutive Stops partition the session
+    instead of re-counting the same requests."""
+    return created is not None and created <= until and (since is None or created > since)
+
+
+def _cli_turn_usage(conversation_id, since, until):
+    """Per-request tokens the CLI writes to its own store within seconds of each call.
+    Its input_tokens counts both cache tiers, so they come back out to leave fresh input."""
+    if not conversation_id or not _is_regular_file(_COPILOT_STORE):
+        return None
+    conn = None
+    try:
+        conn = sqlite3.connect(str(_COPILOT_STORE), timeout=1.0)
+        conn.execute('PRAGMA query_only = 1')
+        # Copilot builds older than this table are silent, not an error worth logging each Stop.
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                            " AND name = 'assistant_usage_events'").fetchone():
+            return None
+        rows = conn.execute(
+            'SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, created_at'
+            ' FROM assistant_usage_events WHERE session_id = ?', (conversation_id,)).fetchall()
+        # Totals stay inside the guard: a non-numeric column would otherwise raise past the
+        # Stop handler and drop the whole exchange, not just its usage.
+        totals = dict((field, 0) for field in _USAGE_FIELDS)
+        for row_input, row_output, cache_read, cache_write, created_at in rows:
+            created = _epoch(created_at)
+            if not _in_window(created, since, until):
+                continue
+            cache_read = max(int(cache_read or 0), 0)
+            cache_write = max(int(cache_write or 0), 0)
+            totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
+            totals['output_tokens'] += max(int(row_output or 0), 0)
+            totals['cache_read_input_tokens'] += cache_read
+            totals['cache_creation_input_tokens'] += cache_write
+    except Exception as e:
+        log_error('cli usage read failed: %s' % e, 'usage')
+        return None
+    finally:
+        if conn is not None:
+            conn.close()
+    return totals
+
+
+def _vscode_store_path(transcript_path, conversation_id):
+    """VS Code keeps per-request tokens in its own chat store, beside the copilot-chat
+    transcript directory the hook reads. The transcripts themselves carry no tokens."""
+    if not transcript_path or not _safe_path_component(conversation_id):
+        return None
+    parent = Path(transcript_path).parent
+    if parent.name != 'transcripts':
+        return None
+    path = parent.parent.parent / 'chatSessions' / (conversation_id + '.jsonl')
+    return path if _is_regular_file(path) else None
+
+
+def _merge_vscode_request(requests, index, obj):
+    if not isinstance(obj, dict):
+        return
+    entry = requests.setdefault(index, {})
+    for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs', 'modelId'):
+        if obj.get(field) is not None:
+            entry[field] = obj[field]
+    # The model that actually served the request. Written with the response, so it lands
+    # later than modelId, which is set when the request is created.
+    result = obj.get('result')
+    if isinstance(result, dict):
+        for round_ in (result.get('metadata') or {}).get('toolCallRounds') or []:
+            if isinstance(round_, dict) and round_.get('modelId'):
+                entry['servedBy'] = round_['modelId']
+
+
+def _vscode_requests(path):
+    """Final state of the chat journal: a base snapshot, then whole requests appended and
+    later patched field by field, so the last write for each field wins."""
+    requests = {}
+    next_index = 0
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            for line in _capped_lines(handle, _VSCODE_MAX_LINES, _VSCODE_MAX_LINE_CHARS):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key = entry.get('k')
+                value = entry.get('v')
+                if key is None:
+                    for obj in (value or {}).get('requests') or []:
+                        _merge_vscode_request(requests, next_index, obj)
+                        next_index += 1
+                    continue
+                keypath = [str(part) for part in key] if isinstance(key, list) else [str(key)]
+                if keypath == ['requests'] and isinstance(value, list):
+                    for obj in value:
+                        _merge_vscode_request(requests, next_index, obj)
+                        next_index += 1
+                elif len(keypath) == 3 and keypath[0] == 'requests':
+                    try:
+                        index = int(keypath[1])
+                    except ValueError:
+                        continue
+                    _merge_vscode_request(requests, index, {keypath[2]: value})
+    except Exception as e:
+        log_error('vscode usage read failed: %s' % e, 'usage')
+        return None
+    return requests
+
+
+def _vscode_turn_model(transcript_path, conversation_id, previous_stop, turn_end):
+    """Model for the turn this Stop is reporting. VS Code records it per request, so a
+    mid-session switch is picked up; the transcript the exchange is built from carries no
+    model at all, which is why every row otherwise reads 'auto'.
+
+    Windowed to this turn, the same way usage is: from the previous Stop to this one. The
+    journal is written lazily, so at this Stop the turn's own request may not be there yet.
+    Without the lower bound the newest request would then be the PREVIOUS turn's, and its
+    model would be reported here as though it were this one's -- a confidently wrong answer
+    where saying nothing is correct. Reporting nothing leaves the row at 'auto'.
+
+    Prefer the model that served the request, which names the real model behind an 'auto'
+    pick but only lands once the response completes. The selection is there from the moment
+    the prompt is sent, so an explicitly chosen model is reported even without it."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None
+    requests = _vscode_requests(path)
+    if not requests:
+        return None
+    since, until = _epoch(previous_stop), _epoch(turn_end)
+    if until is None:
+        return None
+    windowed = [i for i in requests
+                if _in_window(_epoch(requests[i].get('timestamp')), since, until)]
+    if not windowed:
+        return None
+    entry = requests[max(windowed)]
+    served = entry.get('servedBy')
+    if isinstance(served, str) and served:
+        return served
+    selected = entry.get('modelId')
+    if isinstance(selected, str) and selected:
+        # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
+        return selected.split('/', 1)[-1] or None
+    return None
+
+
+def _vscode_turn_usage(transcript_path, conversation_id, start_index, since=None, until=None):
+    """Usage for requests from start_index on, stopping at the first whose tokens are not
+    written yet. VS Code fills them in after Stop fires, and the lead grows with turn
+    length, so an unfinished request is left for a later Stop rather than skipped. Returns
+    (usage, next index to report, whether a request is still being written at that index).
+    No cache split is reported.
+
+    Position alone does not say which turn a request belongs to: one that settles after its
+    own turn's Stop is still unread at the next one, so `since`/`until` decide what this
+    turn may count."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None, start_index, False
+    requests = _vscode_requests(path)
+    if requests is None:
+        return None, start_index, False
+    totals = dict((field, 0) for field in _USAGE_FIELDS)
+    index = max(int(start_index or 0), 0)
+    lo, hi = _epoch(since), _epoch(until)
+    # Guarded: a non-numeric count in the journal would otherwise raise past the Stop
+    # handler and drop the whole exchange, not just its usage.
+    try:
+        while index in requests:
+            entry = requests[index]
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            # elapsedMs is written after the final counts, so it is the only reliable signal
+            # that they have stopped climbing; the counts themselves appear mid-stream.
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                break
+            created = _epoch(entry.get('timestamp'))
+            # Past this turn's close the requests belong to turns not yet reported, so the
+            # watermark stops here. Nothing is pending: what remains is a later turn's work,
+            # not this one's, and waiting on it would stall the hook for the settle window.
+            if hi is not None and created is not None and created > hi:
+                return totals, index, False
+            # An earlier turn's late request is read here but not counted here; it is left
+            # to that turn's own windowed completion. The index still advances past it.
+            if hi is None or _in_window(created, lo, hi):
+                totals['input_tokens'] += max(int(prompt), 0)
+                totals['output_tokens'] += max(int(completion), 0)
+            index += 1
+    except (TypeError, ValueError) as e:
+        log_error('vscode usage totals failed: %s' % e, 'usage')
+        return None, start_index, False
+    return totals, index, index in requests
+
+
+def _await_vscode_journal(transcript_path, conversation_id):
+    """Wait out the settle window for a journal that has not finished being written.
+
+    Only worth doing at session end. Mid-session an unwritten journal means a later Stop
+    reports the turn, but at session end there is no later Stop, and VS Code sometimes
+    writes the whole journal only as the session closes."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return
+    stamp = _vscode_store_stamp(path)
+    deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
+    written = False
+    while time.monotonic() < deadline:
+        time.sleep(_VSCODE_POLL_SECONDS)
+        current = _vscode_store_stamp(path)
+        if current is not None and current != stamp:
+            # Still being written. Keep waiting for it to go quiet rather than reading a
+            # half-written turn.
+            stamp = current
+            written = True
+            continue
+        if written:
+            return  # it grew and has now settled
+        # Unchanged so far means the write has not started, which is the case worth
+        # waiting out here: returning now would give up on a journal VS Code writes a
+        # few seconds into the close.
+
+
+def _vscode_windowed_usage(transcript_path, conversation_id, since, until):
+    """Usage for the requests belonging to one past turn, chosen by the window it ran in.
+
+    A deferred turn cannot use the index the live path uses. That reader takes every
+    settled request from a point onward, which is right for a Stop reporting the turn that
+    just ended and wrong for a turn completed later, when the requests of every turn after
+    it have settled too and the first read would swallow them all."""
+    path = _vscode_store_path(transcript_path, conversation_id)
+    if not path:
+        return None
+    requests = _vscode_requests(path)
+    if not requests:
+        return None
+    lo, hi = _epoch(since), _epoch(until)
+    if hi is None:
+        return None
+    totals = dict((field, 0) for field in _USAGE_FIELDS)
+    found = False
+    # Guarded for the same reason the index reader is: a non-numeric count in the journal
+    # must not raise past the hook.
+    try:
+        for index in sorted(requests):
+            entry = requests[index]
+            if not _in_window(_epoch(entry.get('timestamp')), lo, hi):
+                continue
+            prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+            # elapsedMs is written after the final counts, so a request without it is
+            # still climbing and is left out rather than counted low.
+            if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                continue
+            totals['input_tokens'] += max(int(prompt), 0)
+            totals['output_tokens'] += max(int(completion), 0)
+            found = True
+    except (TypeError, ValueError) as e:
+        log_error('vscode windowed usage failed: %s' % e, 'usage')
+        return None
+    if not found:
+        return None
+    totals['total_tokens'] = sum(totals[field] for field in _USAGE_FIELDS)
+    return totals
+
+
+def pending_turn_usage(transcript_path, conversation_id, since, until):
+    """Usage for one turn being completed after the fact, by its own window on either
+    surface. Both stores stamp every request, so neither needs the live path's watermark."""
+    if transcript_path and Path(transcript_path).stem == 'events':
+        usage = _cli_turn_usage(conversation_id, _epoch(since), _epoch(until))
+        if usage and any(usage.values()):
+            usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
+            return usage
+        return None
+    return _vscode_windowed_usage(transcript_path, conversation_id, since, until)
+
+
+def _vscode_store_stamp(path):
+    """(mtime, size) of the chat journal, or None when it cannot be stat'd."""
+    if not path:
+        return None
+    try:
+        st = path.stat()
+        return (st.st_mtime, st.st_size)
+    except OSError:
+        return None
+
+
+def _vscode_settled_usage(transcript_path, conversation_id, start_index, since=None, until=None):
+    """Wait for this turn to finish being written. Stop fires before the response ends, so
+    a first read usually has nothing to report. Giving up is safe: the watermark does not
+    advance, so a later Stop reports the turn instead.
+
+    A turn being completed after the fact does not come through here at all; it reads by
+    its own window, because by then every later turn has settled too."""
+    usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
+                                                    start_index, since, until)
+    # Wait only while a request is mid-write. With nothing pending there is nothing to wait
+    # for, and blocking every quiet Stop for the full window would be pure cost.
+    if usage is None or next_index > start_index or not pending:
+        return usage, next_index
+    path = _vscode_store_path(transcript_path, conversation_id)
+    stamp = _vscode_store_stamp(path)
+    deadline = time.monotonic() + _VSCODE_SETTLE_SECONDS
+    while time.monotonic() < deadline:
+        time.sleep(_VSCODE_POLL_SECONDS)
+        # Re-parse only when the journal actually grew; polling alone would otherwise
+        # re-read the whole file once per interval for the length of the wait.
+        current = _vscode_store_stamp(path)
+        if current is not None and current == stamp:
+            continue
+        stamp = current
+        usage, next_index, _pending = _vscode_turn_usage(transcript_path, conversation_id,
+                                                         start_index, since, until)
+        if usage is None or next_index > start_index:
+            break
+    return usage, next_index
+
+
+def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, usage_index=0):
+    """Exact usage for the turn, read from the local store behind whichever surface wrote
+    the transcript -- Copilot forwards none, so without this the backend estimates from
+    visible text and misses cache reads, tool definitions and system instructions.
+    Windowed from the previous Stop rather than from this turn's prompt: Copilot fires a
+    Stop per agent turn, so an open-ended window re-counts requests on every Stop, and a
+    prompt-floored one drops the requests that land in the gap before the next prompt is
+    logged. Consecutive Stops therefore partition the session exactly."""
+    if transcript_path and Path(transcript_path).stem == 'events':
+        since, until = _epoch(previous_stop), _epoch(turn_end)
+        usage = None if until is None else _cli_turn_usage(conversation_id, since, until)
+        next_index = usage_index
+    else:
+        usage, next_index = _vscode_settled_usage(transcript_path, conversation_id,
+                                                  usage_index, previous_stop, turn_end)
+    if not usage or not any(usage.values()):
+        return None, next_index
+    usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)
+    return usage, next_index
 
 
 def build_exchange_from_transcript(transcript_path, fallback_session_id, session_start_model=None,
@@ -2335,9 +3538,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             # An entry without an envelope id still has to be watermarked, or every later
             # Stop re-selects it and re-uploads its text with the current turn. Keyed the
             # same way turn_id is when its id is missing.
-            message_id = entry.get('id') or 'unb-' + hashlib.sha256(
-                ('%s\x1f%d\x1f%s' % (conversation_id or '', i, content or ''))
-                .encode('utf-8', 'replace')).hexdigest()[:24]
+            message_id = turn_prompt_id(entry, conversation_id, i, content)
             if message_id in already_prompted:
                 continue
             if turn_start_index < 0:
@@ -2372,7 +3573,14 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     def _register(call_id):
         if call_id not in tool_data:
-            tool_data[call_id] = {'name': '', 'arguments': {}, 'result': None, 'success': None}
+            tool_data[call_id] = {
+                'name': '',
+                'arguments': {},
+                'result': None,
+                'success': None,
+                'mcp_server_name': None,
+                'mcp_tool_name': None,
+            }
             tool_calls.append(call_id)
         return tool_data[call_id]
 
@@ -2394,6 +3602,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     continue
                 call = _register(call_id)
                 call['name'] = req.get('name') or call['name']
+                if req.get('mcpServerName'):
+                    call['mcp_server_name'] = req['mcpServerName']
+                if req.get('mcpToolName'):
+                    call['mcp_tool_name'] = req['mcpToolName']
                 call['arguments'] = _normalize_arguments(req.get('arguments'))
 
         elif entry_type == 'skill.invoked':
@@ -2406,6 +3618,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             call = _register(call_id)
             if data.get('toolName'):
                 call['name'] = data['toolName']
+            if data.get('mcpServerName'):
+                call['mcp_server_name'] = data['mcpServerName']
+            if data.get('mcpToolName'):
+                call['mcp_tool_name'] = data['mcpToolName']
             if data.get('arguments') is not None:
                 call['arguments'] = _normalize_arguments(data.get('arguments'))
 
@@ -2424,6 +3640,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     # cwd; origin lookups are cached once per repo across the turn.
     shell_state = {'dir': cwd}
     root_projects = {}
+    mcp_servers = read_copilot_mcp_servers(cwd)
     forwarded_now = set()
     for call_id in tool_calls:
         call = tool_data[call_id]
@@ -2438,7 +3655,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     shell_state['dir'] = _next_shell_dir(command, shell_state.get('dir'))
             continue
         mapped = map_copilot_tool(call['name'], call['arguments'], call['result'],
-                                  shell_state=shell_state, root_projects=root_projects)
+                                  shell_state=shell_state, root_projects=root_projects,
+                                  mcp_servers=mcp_servers,
+                                  mcp_server_name=call['mcp_server_name'],
+                                  mcp_tool_name=call['mcp_tool_name'])
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.
@@ -2687,6 +3907,72 @@ def _check_self_update() -> None:
         log_error(f"self_update error: {e}", 'self_update')
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _discovery_installer():
+    if _is_windows():
+        return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
+    return DISCOVERY_INSTALL_SH, DISCOVERY_INSTALL_URL
+
+
+def _windows_system32_path(*parts: str) -> str:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise OSError("SystemRoot is not set")
+    root = PureWindowsPath(system_root)
+    if not root.is_absolute():
+        raise OSError("SystemRoot is not absolute")
+    return str(root.joinpath("System32", *parts))
+
+
+def _discovery_command(installer_path: Path, backend_url: str):
+    if _is_windows():
+        return [
+            _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+            "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+        ]
+    return ["bash", str(installer_path), "--domain", backend_url]
+
+
+def _ensure_discovery_installer(
+    installer_path=None,
+    installer_url=None,
+):
+    installer_path = installer_path or DISCOVERY_INSTALL_SH
+    installer_url = installer_url or DISCOVERY_INSTALL_URL
+    if installer_path.exists():
+        return True
+    DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    fd, temporary_path = tempfile.mkstemp(dir=str(DISCOVERY_INSTALL_DIR), suffix='.tmp')
+    os.close(fd)
+    try:
+        curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
+        result = subprocess.run(
+            [curl, "-fsSL", "-o", temporary_path, installer_url],
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            log_error(
+                f"discovery {installer_path.name} download failed: "
+                + result.stderr.decode(errors='replace')[:200],
+                'discovery_gate',
+            )
+            return False
+        if installer_path == DISCOVERY_INSTALL_SH:
+            os.chmod(temporary_path, 0o755)
+        os.replace(temporary_path, installer_path)
+        return True
+    finally:
+        try:
+            os.unlink(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
 def _dispatch_discovery() -> None:
     try:
         cache = {}
@@ -2722,7 +4008,7 @@ def _dispatch_discovery() -> None:
             _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
-        except FileExistsError:
+        except OSError:
             try:
                 age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
             except OSError:
@@ -2730,11 +4016,12 @@ def _dispatch_discovery() -> None:
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                DISCOVERY_DISPATCH_PATH.unlink()
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
                 _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
-            except (FileExistsError, OSError):
+            except OSError as e:
+                log_error(f"discovery gate: dispatch claim failed: {type(e).__name__} errno={e.errno}", 'discovery_gate')
                 return
 
         try:
@@ -2761,22 +4048,16 @@ def _dispatch_discovery() -> None:
                     return
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
-                DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if not DISCOVERY_INSTALL_SH.exists():
-                    r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(DISCOVERY_INSTALL_SH), DISCOVERY_INSTALL_URL],
-                        capture_output=True, timeout=30,
-                    )
-                    if r.returncode != 0:
-                        log_error(f"discovery install.sh download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                        return
-                    os.chmod(DISCOVERY_INSTALL_SH, 0o755)
-                discovery_cmd = ["bash", str(DISCOVERY_INSTALL_SH), "--domain", backend_url]
+                installer_path, installer_url = _discovery_installer()
+                if not _ensure_discovery_installer(installer_path, installer_url):
+                    return
+                discovery_cmd = _discovery_command(installer_path, backend_url)
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.
             popen_kwargs = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
                             "stdin": subprocess.DEVNULL, "close_fds": True,
-                            "env": {**os.environ, "UNBOUND_API_KEY": api_key}}
+                            "env": {**os.environ, "UNBOUND_API_KEY": api_key,
+                                    "UNBOUND_DOMAIN": backend_url}}
             if os.name == "nt":
                 popen_kwargs["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
             else:
@@ -2802,6 +4083,53 @@ def _dispatch_discovery() -> None:
                 pass
     except Exception as e:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
+
+
+def _dispatch_mcp_server_scan(server_name, server_config):
+    if not server_name or not isinstance(server_config, dict):
+        return
+    try:
+        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+            unbound_config = json.load(f)
+        api_key = unbound_config.get("api_key")
+        backend_url = unbound_config.get("base_url")
+        if not api_key or not backend_url:
+            return
+
+        if RUNNING_FROZEN:
+            if not os.path.isfile(FROZEN_DISCOVERY_BIN):
+                return
+            scan_cmd = [FROZEN_DISCOVERY_BIN, "mcp-scan", "--name", server_name,
+                        "--domain", backend_url]
+        else:
+            if not _ensure_discovery_installer():
+                return
+            scan_cmd = [
+                "bash", str(DISCOVERY_INSTALL_SH), "mcp-scan", "--name", server_name,
+                "--domain", backend_url,
+            ]
+
+        popen_kwargs = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+            "env": {
+                **os.environ,
+                "UNBOUND_API_KEY": api_key,
+                "UNBOUND_MCP_SERVER_JSON": json.dumps(server_config),
+                "UNBOUND_CODING_TOOL": _UNBOUND_CODING_TOOL,
+            },
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
+        else:
+            popen_kwargs["start_new_session"] = True
+        subprocess.Popen(scan_cmd, **popen_kwargs)
+    except Exception as exc:
+        log_error(f"mcp scan dispatch failed for {server_name}: {exc}", 'mcp_server')
 
 
 def main():
@@ -2856,12 +4184,20 @@ def main():
         }
         append_to_audit_log(log_entry)
 
-        if event_name == 'Stop':
-            session_id = event.get('session_id')
+        if event_name in ('Stop', 'SessionEnd'):
+            # Copilot sends the conversation id under either spelling and SessionEnd uses
+            # the camelCase one. The turn-start and session-model lookups key on it, so
+            # reading only the snake_case name would cost the exchange its start time and
+            # its model attribution.
+            session_id = event.get('session_id') or event.get('sessionId')
+            if event_name == 'SessionEnd' and not event.get('transcript_path'):
+                recovered = _transcript_path_for_session(event)
+                if recovered:
+                    event = dict(event, transcript_path=recovered)
             # Watermark key mirrors the exchange's session fallback, so get/record stay
             # consistent even when the Stop payload omits session_id.
             wm_key = stop_session_key(event)
-            already_forwarded, last_text_sig, already_prompted = get_forwarded_state(wm_key)
+            already_forwarded, last_text_sig, already_prompted, usage_index = get_forwarded_state(wm_key)
             exchange, forwarded_now, text_sig, prompts_now = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
@@ -2869,20 +4205,92 @@ def main():
                 already_forwarded=already_forwarded,
                 already_prompted=already_prompted,
             )
-            # Send only when there is something new -- new tool calls OR new assistant
-            # text -- so a pure replay Stop is a no-op, but a Stop that appended new text
-            # (even with no new tools) is still sent and logged.
-            if exchange and (forwarded_now or text_sig != last_text_sig):
+            # Resolved before the send gate so a turn whose tokens landed too late for its
+            # own Stop can ride this one. A Stop with nothing new builds no exchange at all,
+            # so there is never anything to attach deferred usage to on a pure replay: it
+            # waits for the next real turn, and a session that ends first loses it.
+            if event_name == 'SessionEnd':
+                # Before anything reads, because this is the last chance for every turn in
+                # the session including the one ending it. Waiting after the read would
+                # leave that turn a pending entry no later event will ever process.
+                _await_vscode_journal(event.get('transcript_path'),
+                                      (exchange or {}).get('conversation_id') or session_id)
+
+            usage = None
+            if exchange:
+                previous_stop = get_previous_stop_timestamp_for_session(event)
+                usage, usage_index = get_turn_usage(
+                    event.get('transcript_path'), exchange.get('conversation_id'),
+                    previous_stop, timestamp, usage_index)
+                # After the usage settle, not before: that wait is for this same journal
+                # being written, so resolving the model here sees anything it waited for.
+                turn_model = _vscode_turn_model(event.get('transcript_path'),
+                                                exchange.get('conversation_id'),
+                                                previous_stop, timestamp)
+                if turn_model:
+                    exchange['model'] = turn_model
+            # Send only when there is something new -- new tool calls, new assistant text,
+            # or usage carried over from an earlier turn -- so a pure replay Stop is a
+            # no-op, but a Stop that appended new text (even with no new tools) is sent.
+            # The same gate makes SessionEnd a no-op unless the session ended with a turn
+            # that no Stop ever reported; a turn already sent is left alone, because usage
+            # is part of the backend's request id and re-sending would add a row, not
+            # complete the existing one.
+            # Earlier turns whose numbers arrived after their own Stop are completed here,
+            # before this turn is handled, so each turn carries its own tokens.
+            was_pending = get_session_marker(wm_key).get('pending_turns') or []
+            still_pending = complete_pending_turns(
+                event, wm_key, api_key, final=(event_name == 'SessionEnd'))
+
+            if exchange and (forwarded_now or text_sig != last_text_sig or usage):
                 # Turn boundaries from event-fire times
                 request_initialized = get_turn_start_timestamp_for_session(session_id)
                 if request_initialized:
                     exchange['requestInitialized'] = request_initialized
                 exchange['requestCompleted'] = timestamp
+                if usage:
+                    exchange['usage'] = usage
+
+                # Content, not position: the id has to survive being sent again once the
+                # tokens land, and a turn that never reached the gateway would shift every
+                # position after it.
+                marker = get_session_marker(wm_key)
+                digests = marker.get('turn_digests') or []
+                user_prompt, assistant_prompt = exchange_turn_content(exchange)
+                digest = turn_content_digest(user_prompt, assistant_prompt)
+                turn_request_id = build_turn_request_id(session_id, digest, digests.count(digest))
+                exchange['turn_request_id'] = turn_request_id
+
                 # Record only after the send succeeds, so a failed send retries next Stop
                 # (the backend dedups). Updates the text signature too, even with no new
                 # tools, so an unchanged later Stop becomes a no-op.
                 if send_to_api(exchange, api_key):
-                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now)
+                    # One slot, holding an id and a window, never prompt text. Kept only
+                    # while something is still missing, so a complete turn leaves nothing
+                    # behind for the next Stop to re-send.
+                    # Only one prompt can anchor a rebuild: the rebuild reads from that
+                    # prompt to the next one, so a turn opened by several prompts would be
+                    # cut short. Those turns simply go uncompleted.
+                    anchor = next(iter(prompts_now)) if len(prompts_now) == 1 else None
+                    # 'auto' is the unresolved model, not a missing one: a CLI turn takes
+                    # its model from the transcript and is already settled.
+                    incomplete = not usage or exchange.get('model') in (None, '', 'auto')
+                    pending_turns = list(still_pending)
+                    if incomplete and anchor:
+                        pending_turns.append({
+                            'turn_request_id': turn_request_id,
+                            'conversation_id': exchange.get('conversation_id'),
+                            'prompt_id': anchor,
+                            'since': previous_stop,
+                            'until': timestamp,
+                        })
+                    record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now,
+                                              usage_index, digests + [digest],
+                                              pending_turns[-MAX_PENDING_TURNS:])
+            elif still_pending != was_pending:
+                # Nothing new this Stop, but some turns settled; drop just those.
+                record_forwarded_tool_ids(wm_key, set(), None, None, None, None,
+                                          still_pending)
             cleanup_old_logs()
 
         # Output required by Copilot hooks

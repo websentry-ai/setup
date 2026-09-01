@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import random
 import stat
 import sys
 import platform
@@ -31,6 +32,7 @@ if platform.system().lower() == "windows":
 HOOKS_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/hooks.json"
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/cursor/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
+MDM_RETRY_JITTER_SECONDS = 30  # spreads a fleet-wide MDM push so retries do not re-synchronise
 
 
 def normalize_url(value: str) -> str:
@@ -805,6 +807,20 @@ def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL) -> Tuple[bool, bool]:
     return True, hooks_changed
 
 
+def find_cursor_exe() -> Optional[str]:
+    """Machine-wide Cursor.exe, or None. A bare name would make the shell pop an error dialog."""
+    # Machine-wide only: this script runs elevated, and a per-user AppData path, a PATH
+    # lookup or shutil.which (which prepends the CWD on Windows) would let any local user
+    # plant a binary we then launch as SYSTEM. Cursor installed per-user is simply not
+    # restarted here; the caller prints the manual line instead.
+    system_drive = os.environ.get("SystemDrive", "C:")
+    for base in ("Program Files", "Program Files (x86)"):
+        candidate = Path(system_drive + "\\" + base) / "cursor" / "Cursor.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def restart_cursor() -> bool:
     """Attempt to restart Cursor IDE."""
     system = platform.system().lower()
@@ -842,16 +858,19 @@ def restart_cursor() -> bool:
                 return False
 
         elif system == "windows":
+            exe = find_cursor_exe()
+            if exe is None:
+                print("Restart Cursor")
+                return False
             print("\n🔄 Restarting Cursor IDE...")
             subprocess.run(["taskkill", "/F", "/IM", "Cursor.exe"],
                            capture_output=True, timeout=5)
             time.sleep(1)
-            proc = subprocess.Popen(["start", "cursor"],
-                                    shell=True,
+            proc = subprocess.Popen([exe],
                                     stdout=subprocess.DEVNULL,
                                     stderr=subprocess.DEVNULL)
             time.sleep(0.5)
-            if proc.poll() is None or proc.returncode == 0:
+            if proc.poll() is None:
                 print("✅ Cursor restarted")
                 return True
             else:
@@ -972,11 +991,12 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
     debug_print(f"Fetching API key from: {url}")
 
     try:
+        time.sleep(random.uniform(0, MDM_RETRY_JITTER_SECONDS))
         result = subprocess.run(
-            ["curl", "-fsSL", "-w", "\n%{http_code}", "--max-time", "30", "--retry", "3", "--retry-delay", "2", "--retry-connrefused", "-H", f"Authorization: Bearer {auth_api_key}", url],
+            ["curl", "-fsSL", "-w", "\n%{http_code}", "--max-time", "30", "--retry", "7", "--retry-max-time", "180", "--retry-connrefused", "-H", f"Authorization: Bearer {auth_api_key}", url],
             capture_output=True,
             text=True,
-            timeout=140
+            timeout=300
         )
 
         output_lines = result.stdout.strip().split('\n')

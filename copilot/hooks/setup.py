@@ -9,12 +9,15 @@ import urllib.parse
 import time
 import webbrowser
 from pathlib import Path
-from typing import Tuple, Optional, Dict, List
+from typing import Any, Tuple, Optional, Dict, List
 import threading
 import http.server
+import importlib.util
 import socketserver
 import socket
 import json
+import sqlite3
+from datetime import datetime
 
 SCRIPT_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/copilot/hooks/unbound.py"
 DEFAULT_GATEWAY_URL = "https://api.getunbound.ai"
@@ -28,6 +31,10 @@ BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 
 DEBUG = False
+
+
+def _copilot_home() -> Path:
+    return Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
 
 
 def debug_print(message: str) -> None:
@@ -336,7 +343,7 @@ def rewrite_gateway_url_in_file(path: Path, gateway_url: str) -> None:
 
 
 def setup_hooks(gateway_url: str = DEFAULT_GATEWAY_URL):
-    hooks_dir = Path.home() / ".copilot" / "hooks"
+    hooks_dir = _copilot_home() / "hooks"
     script_path = hooks_dir / "unbound.py"
 
     print("\n📥 Downloading unbound.py script...")
@@ -373,6 +380,9 @@ def _copilot_hooks_config(script_path: Path) -> dict:
         "PreToolUse": 600,
         "PostToolUse": 30,
         "Stop": 60,
+        # Copilot aliases this to its internal sessionEnd. It closes the gap where a
+        # session ends before a final Stop fires, leaving the last turn unreported.
+        "SessionEnd": 60,
     }
 
     hooks = {}
@@ -394,8 +404,8 @@ def _copilot_hooks_config(script_path: Path) -> dict:
 def configure_copilot_hooks() -> bool:
     """Write ~/.copilot/hooks/unbound.json. Unbound owns this file and overwrites
     it wholesale; other *.json files in the directory are left untouched."""
-    hooks_path = Path.home() / ".copilot" / "hooks" / "unbound.json"
-    script_path = Path.home() / ".copilot" / "hooks" / "unbound.py"
+    hooks_path = _copilot_home() / "hooks" / "unbound.json"
+    script_path = _copilot_home() / "hooks" / "unbound.py"
 
     try:
         hooks_path.parent.mkdir(parents=True, exist_ok=True)
@@ -438,12 +448,12 @@ def clear_setup() -> bool:
         print("Failed to clear API_KEY")
         any_failed = True
 
-    _r = _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.py", "Copilot unbound.py hook")
+    _r = _clear_path(_copilot_home() / "hooks" / "unbound.py", "Copilot unbound.py hook")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
         any_failed = True
-    _r = _clear_path(Path.home() / ".copilot" / "hooks" / "unbound.json", "Copilot unbound.json hooks config")
+    _r = _clear_path(_copilot_home() / "hooks" / "unbound.json", "Copilot unbound.json hooks config")
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
@@ -566,7 +576,7 @@ def detect_install_state() -> str:
     Unbound setup already exists on this device, else 'fresh'. User-level setups
     are never tamper-eligible, so 'tampered' is never reported."""
     try:
-        return "persisted" if (Path.home() / ".copilot" / "hooks" / "unbound.py").exists() else "fresh"
+        return "persisted" if (_copilot_home() / "hooks" / "unbound.py").exists() else "fresh"
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return "fresh"
@@ -603,11 +613,100 @@ def _backfill_session_id_from_path(transcript_path: Path) -> Optional[str]:
     return name or None
 
 
+_BACKFILL_HOOK_MODULE = None
+_BACKFILL_HOOK_PATH = None
+
+
+def _backfill_load_hook_module():
+    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_PATH
+    hook_path = _copilot_home() / "hooks" / "unbound.py"
+    if _BACKFILL_HOOK_MODULE is not None and _BACKFILL_HOOK_PATH == hook_path:
+        return _BACKFILL_HOOK_MODULE
+    if not hook_path.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location("unbound_copilot_backfill_hook", hook_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _BACKFILL_HOOK_MODULE = module
+        _BACKFILL_HOOK_PATH = hook_path
+        return module
+    except Exception as exc:
+        debug_print(f"could not load installed hook for MCP resolution: {exc}")
+        return None
+
+
+def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, Any]]:
+    hook = _backfill_load_hook_module()
+    if hook is None:
+        return {}
+    try:
+        cwd = None
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            candidate = entry.get("cwd") or data.get("cwd")
+            if isinstance(candidate, str) and candidate:
+                cwd = candidate
+                break
+        mcp_servers = hook.read_copilot_mcp_servers(cwd)
+        provenance = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            data = entry.get("data") or {}
+            requests = data.get("toolRequests") if entry.get("type") == "assistant.message" else None
+            if entry.get("type") == "tool.execution_start":
+                requests = [{
+                    "toolCallId": data.get("toolCallId"),
+                    "name": data.get("toolName"),
+                    "arguments": data.get("arguments"),
+                    "mcpServerName": data.get("mcpServerName"),
+                    "mcpToolName": data.get("mcpToolName"),
+                }]
+            for request in requests or []:
+                if not isinstance(request, dict):
+                    continue
+                call_id = request.get("toolCallId")
+                tool_name = request.get("name")
+                if not isinstance(call_id, str) or not isinstance(tool_name, str):
+                    continue
+                arguments = request.get("arguments")
+                normalizer = getattr(hook, "_normalize_arguments", None)
+                if callable(normalizer):
+                    arguments = normalizer(arguments)
+                elif not isinstance(arguments, dict):
+                    arguments = {}
+                mapped = hook.map_copilot_tool(
+                    tool_name, arguments, "", mcp_servers=mcp_servers,
+                    mcp_server_name=request.get("mcpServerName"),
+                    mcp_tool_name=request.get("mcpToolName"),
+                )
+                if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
+                    continue
+                server_name = mapped.get("server_name")
+                if isinstance(server_name, str) and server_name:
+                    item = {
+                        "tool_name": tool_name,
+                        "server_name": server_name,
+                    }
+                    mcp_tool_name = mapped.get("mcp_tool_name")
+                    if isinstance(mcp_tool_name, str) and mcp_tool_name:
+                        item["mcp_tool_name"] = mcp_tool_name
+                    mcp_server_config = mapped.get("mcp_server_config")
+                    if isinstance(mcp_server_config, dict) and mcp_server_config:
+                        item["mcp_server_config"] = mcp_server_config
+                    provenance[call_id] = item
+        return provenance
+    except Exception as exc:
+        debug_print(f"could not resolve backfill MCP calls: {exc}")
+        return {}
+
+
 def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
-    """Read a transcript and return {session_id, entries} for server-side parsing.
-    The client only JSON-decodes lines and resolves a session id (preferring the
-    session.start payload, falling back to the path). All semantic parsing
-    happens server-side in webapp.services.coding_tools_backfill_service."""
     entries = []
     session_id = None
     try:
@@ -624,7 +723,7 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
                 entries.append(entry)
                 if not session_id and isinstance(entry, dict):
                     if entry.get('type') == 'session.start':
-                        sid = (entry.get('data') or {}).get('sessionId')
+                        sid = _backfill_entry_data(entry).get('sessionId')
                         if sid:
                             session_id = sid
     except (OSError, UnicodeDecodeError):
@@ -637,7 +736,321 @@ def _backfill_collect_session(transcript_path: Path) -> Optional[Dict]:
 
     if not session_id or not entries:
         return None
-    return {'session_id': session_id, 'entries': entries}
+    session = {'session_id': session_id, 'entries': entries}
+    mcp_tool_provenance = _backfill_mcp_tool_provenance(entries)
+    if mcp_tool_provenance:
+        session['mcp_tool_provenance'] = mcp_tool_provenance
+    usage = _backfill_session_usage(transcript_path, session_id, entries)
+    # any(), not truthiness: every turn now gets a slot, and a list of empty ones says
+    # nothing the backend cannot work out itself.
+    if any(usage):
+        session['usage'] = usage
+    models = _backfill_session_models(transcript_path, session_id, entries)
+    if any(models):
+        session['models'] = models
+    return session
+
+
+# KEEP IN SYNC: copilot/hooks/unbound.py's usage readers. Same stores, same cache and
+# finality rules; historical sessions are already final so there is no waiting here.
+_BACKFILL_USAGE_FIELDS = ('input_tokens', 'output_tokens',
+                          'cache_read_input_tokens', 'cache_creation_input_tokens')
+# No separator, drive letter or dot-only name can appear, so an id can only ever name a
+# file directly inside chatSessions/ and cannot escape it by construction.
+_BACKFILL_SAFE_ID_CHARS = frozenset('abcdefghijklmnopqrstuvwxyz'
+                                    'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-')
+# On Windows these resolve to devices wherever they appear, so opening one would attach to
+# the device and hang the run rather than miss a file.
+_BACKFILL_RESERVED_DEVICE_NAMES = frozenset(['con', 'prn', 'aux', 'nul']
+                                            + ['com%d' % n for n in range(1, 10)]
+                                            + ['lpt%d' % n for n in range(1, 10)])
+_BACKFILL_MAX_LINE_CHARS = 1 << 20
+
+
+def _backfill_is_regular_file(path: Path) -> bool:
+    """A FIFO or device node here would block the run, so opening is gated on a real file
+    rather than on mere existence. Symlinks are followed: anything able to plant one inside
+    the user's own home could edit this script instead."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _backfill_safe_path_component(value) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= 128
+            and not set(value) - _BACKFILL_SAFE_ID_CHARS and value not in ('.', '..')
+            and value.split('.')[0].lower() not in _BACKFILL_RESERVED_DEVICE_NAMES)
+
+
+def _backfill_capped_lines(handle, max_lines, max_chars):
+    """Lines from an untrusted journal, bounded in count and in length. A count cap alone
+    does not bound memory: one oversized line is still read whole before the count is seen.
+    In text mode the readline hint counts characters, so utf-8 bounds the bytes at 4x that.
+    Draining an oversize line is charged against the same budget, so the whole read costs at
+    most max_lines readline calls however the file is shaped."""
+    count = 0
+    while count < max_lines:
+        line = handle.readline(max_chars)
+        if not line:
+            return
+        count += 1
+        if len(line) >= max_chars and not line.endswith('\n'):
+            while count < max_lines:  # drop the rest of an oversize line rather than buffer it
+                rest = handle.readline(max_chars)
+                count += 1
+                if not rest or rest.endswith('\n'):
+                    break
+            continue
+        yield line
+
+
+def _backfill_cli_usage(transcript_path: Path, session_id: str) -> List[Dict]:
+    """Per-turn usage from the CLI's own store, ordered by turn. Its input_tokens counts
+    both cache tiers, so they come back out to leave the fresh input the gateway prices."""
+    # <copilot home>/session-state/<id>/events.jsonl: the store sits beside session-state,
+    # so a relocated COPILOT_HOME and MDM's per-user homes both resolve from the path.
+    parents = transcript_path.parents
+    if len(parents) < 3:
+        return []
+    store = parents[2] / 'session-store.db'
+    if not _backfill_is_regular_file(store):
+        return []
+    conn = None
+    try:
+        conn = sqlite3.connect(str(store), timeout=1.0)
+        conn.execute('PRAGMA query_only = 1')
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                            " AND name = 'assistant_usage_events'").fetchone():
+            return []
+        rows = conn.execute(
+            'SELECT turn_index, input_tokens, output_tokens, cache_read_tokens,'
+            ' cache_write_tokens FROM assistant_usage_events WHERE session_id = ?'
+            ' ORDER BY turn_index, id', (session_id,)).fetchall()
+        # Totals stay inside the guard: a non-numeric column would otherwise raise out of
+        # the collector and abort the whole backfill run.
+        by_turn: Dict = {}
+        for turn, row_input, row_output, cache_read, cache_write in rows:
+            totals = by_turn.setdefault(turn if isinstance(turn, int) else 0,
+                                        dict((f, 0) for f in _BACKFILL_USAGE_FIELDS))
+            cache_read = max(int(cache_read or 0), 0)
+            cache_write = max(int(cache_write or 0), 0)
+            totals['input_tokens'] += max(int(row_input or 0) - cache_read - cache_write, 0)
+            totals['output_tokens'] += max(int(row_output or 0), 0)
+            totals['cache_read_input_tokens'] += cache_read
+            totals['cache_creation_input_tokens'] += cache_write
+    except Exception as e:
+        debug_print(f"backfill cli usage read failed: {e}")
+        return []
+    finally:
+        if conn is not None:
+            conn.close()
+    return [by_turn[t] for t in sorted(by_turn)]
+
+
+def _backfill_vscode_store(transcript_path: Path, session_id: str) -> Optional[Path]:
+    """VS Code's chat journal for a session, a sibling of the copilot-chat transcript
+    directory, or None when the path is not a VS Code transcript."""
+    if transcript_path.parent.name != 'transcripts':
+        return None
+    if not _backfill_safe_path_component(session_id):
+        return None
+    store = transcript_path.parent.parent.parent / 'chatSessions' / (session_id + '.jsonl')
+    return store if _backfill_is_regular_file(store) else None
+
+
+def _backfill_vscode_requests(store: Path) -> Dict:
+    """Requests by ordinal, replayed from the append-only journal: a base snapshot
+    followed by path-keyed patches, last write wins."""
+    requests: Dict = {}
+    next_index = 0
+
+    def _merge(index, obj):
+        if not isinstance(obj, dict):
+            return
+        entry = requests.setdefault(index, {})
+        for field in ('promptTokens', 'completionTokens', 'timestamp', 'elapsedMs',
+                      'servedBy', 'modelId'):
+            if obj.get(field) is not None:
+                entry[field] = obj[field]
+
+    try:
+        with open(store, 'r', encoding='utf-8') as handle:
+            for line in _backfill_capped_lines(handle, BACKFILL_MAX_LINES_PER_FILE,
+                                               _BACKFILL_MAX_LINE_CHARS):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                key, value = record.get('k'), record.get('v')
+                if key is None:
+                    for obj in (value or {}).get('requests') or []:
+                        _merge(next_index, obj)
+                        next_index += 1
+                    continue
+                keypath = [str(part) for part in key] if isinstance(key, list) else [str(key)]
+                if keypath == ['requests'] and isinstance(value, list):
+                    for obj in value:
+                        _merge(next_index, obj)
+                        next_index += 1
+                elif len(keypath) == 3 and keypath[0] == 'requests':
+                    try:
+                        _merge(int(keypath[1]), {keypath[2]: value})
+                    except ValueError:
+                        continue
+    except Exception as e:
+        debug_print(f"backfill vscode journal read failed: {e}")
+        return {}
+    return requests
+
+
+def _backfill_epoch(value):
+    """Journal stamps are epoch millis, transcript stamps are ISO with a Z or an offset."""
+    if value is None or value == '' or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return value / 1000.0 if value > 10_000_000_000 else float(value)
+    try:
+        # A stamp without an offset takes the platform path, which raises OSError on
+        # Windows for pre-epoch dates; naming it keeps an odd transcript from aborting a run.
+        return datetime.fromisoformat(str(value).replace('Z', '+00:00')).timestamp()
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
+
+def _backfill_turn_ceilings(entries: List[Dict]) -> List[float]:
+    """Close of each turn, counted the way the backend counts them: one per user.message it
+    accepts. Turns are divided at their close, not their start, because VS Code stamps a
+    request when it is created, fractionally BEFORE the prompt reaches the transcript.
+    Dividing on prompts would hand every request to the turn before it."""
+    starts = [index for index, entry in enumerate(entries)
+              if _backfill_is_user_message(entry)]
+    ceilings: List[float] = []
+    previous = float('-inf')
+    for position, start in enumerate(starts):
+        if position + 1 >= len(starts):
+            ceilings.append(float('inf'))
+            continue
+        latest = None
+        for entry in entries[start:starts[position + 1]]:
+            stamp = _backfill_epoch(entry.get('timestamp')) if isinstance(entry, dict) else None
+            if stamp is not None and (latest is None or stamp > latest):
+                latest = stamp
+        # An undated turn closes where the last one did, so it claims nothing rather than
+        # swallowing its neighbours. Never earlier than the turn before it: the scan below
+        # takes the first ceiling a request fits under, which needs them non-decreasing.
+        latest = previous if latest is None else max(latest, previous)
+        ceilings.append(latest)
+        previous = latest
+    return ceilings
+
+
+def _backfill_requests_by_turn(requests: Dict, ceilings: List[float]) -> Dict:
+    """Journal requests grouped by the turn whose window they ran in. An undated request
+    belongs to no turn: better an estimate than someone else's tokens."""
+    by_turn: Dict = {}
+    for index in sorted(requests):
+        entry = requests[index]
+        stamp = _backfill_epoch(entry.get('timestamp'))
+        if stamp is None:
+            continue
+        for turn, ceiling in enumerate(ceilings):
+            if stamp <= ceiling:
+                by_turn.setdefault(turn, []).append(entry)
+                break
+    return by_turn
+
+
+def _backfill_vscode_usage(transcript_path: Path, session_id: str,
+                           entries: List[Dict]) -> List[Dict]:
+    """Per-turn usage from VS Code's own chat store, one entry per turn the backend counts.
+    elapsedMs is written after the final counts, so it is what marks a request finished; the
+    counts alone appear mid-stream and climb. A turn with nothing finished reports {} and is
+    estimated. No cache split."""
+    store = _backfill_vscode_store(transcript_path, session_id)
+    if store is None:
+        return []
+    usage: List[Dict] = []
+    # Guarded: a non-numeric count or an unreadable stamp in the journal would otherwise
+    # raise out of the collector and abort the whole backfill run, not just this session.
+    try:
+        ceilings = _backfill_turn_ceilings(entries)
+        if not ceilings:
+            return []
+        by_turn = _backfill_requests_by_turn(_backfill_vscode_requests(store), ceilings)
+        for turn in range(len(ceilings)):
+            totals = dict((f, 0) for f in _BACKFILL_USAGE_FIELDS)
+            counted = False
+            for entry in by_turn.get(turn, []):
+                prompt, completion = entry.get('promptTokens'), entry.get('completionTokens')
+                if prompt is None or completion is None or entry.get('elapsedMs') is None:
+                    continue
+                totals['input_tokens'] += max(int(prompt), 0)
+                totals['output_tokens'] += max(int(completion), 0)
+                counted = True
+            usage.append(totals if counted else {})
+    except (TypeError, ValueError, OSError, OverflowError) as e:
+        debug_print(f"backfill vscode usage totals failed: {e}")
+        return []
+    return usage
+
+
+def _backfill_vscode_models(transcript_path: Path, session_id: str,
+                            entries: List[Dict]) -> List[str]:
+    """Model per request, in journal order. The transcript carries none at all, which is
+    why these rows otherwise read 'auto'. Prefer the model that served the request, which
+    names the real one behind an 'auto' pick; the selection is there either way. Gaps stay
+    as '' so positions still line up with the transcript's exchanges."""
+    store = _backfill_vscode_store(transcript_path, session_id)
+    if store is None:
+        return []
+    models = []
+    # Same guard as the usage collector: a model name is never worth aborting a run for.
+    try:
+        ceilings = _backfill_turn_ceilings(entries)
+        if not ceilings:
+            return []
+        by_turn = _backfill_requests_by_turn(_backfill_vscode_requests(store), ceilings)
+        for turn in range(len(ceilings)):
+            name = ''
+            # The turn's last request, matching the live collector, so a mid-turn model
+            # switch is costed the same whether the row came from a hook or a re-walk.
+            for entry in by_turn.get(turn, [])[-1:]:
+                served = entry.get('servedBy')
+                if isinstance(served, str) and served:
+                    name = served
+                    break
+                selected = entry.get('modelId')
+                if isinstance(selected, str) and selected:
+                    # Selections are namespaced (copilot/claude-haiku-4.5); the catalog is not.
+                    name = selected.split('/', 1)[-1]
+            models.append(name)
+    except (TypeError, ValueError, OSError, OverflowError) as e:
+        debug_print(f"backfill vscode models failed: {e}")
+        return []
+    return models
+
+
+def _backfill_session_usage(transcript_path: Path, session_id: str,
+                            entries: List[Dict]) -> List[Dict]:
+    """One usage dict per exchange, in transcript order. Copilot forwards no usage, so
+    without this the backend tiktoken-estimates from visible text and misses cache reads,
+    tool definitions and system instructions."""
+    if transcript_path.stem == 'events':
+        return _backfill_cli_usage(transcript_path, session_id)
+    return _backfill_vscode_usage(transcript_path, session_id, entries)
+
+
+def _backfill_session_models(transcript_path: Path, session_id: str,
+                             entries: List[Dict]) -> List[str]:
+    """One model name per exchange, in transcript order. Only VS Code needs this: the CLI
+    transcript records model_change and per-message models, which the server already reads."""
+    if transcript_path.stem == 'events':
+        return []
+    return _backfill_vscode_models(transcript_path, session_id, entries)
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -688,8 +1101,48 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     return code, out[:sep]
 
 
-def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict]) -> bool:
-    payload_bytes = json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}).encode('utf-8')
+def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[float], Optional[int]]:
+    """When the organization last asked every device to re-walk its full history, and how
+    far back that walk should reach. Either may be None.
+
+    A device honours the request only if its own last backfill predates it, so the request
+    expires by itself once each device has acted on it -- nobody has to switch it back off.
+    The window is optional: without one the walk uses this installer's own default, which
+    is what every device did before the organization could set it."""
+    try:
+        code, body = _backfill_http_request(
+            # tool_type is a metrics label only; the request itself is org-wide.
+            f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/config/"
+            f"?tool_type={BACKFILL_TOOL_TYPE}",
+            method='GET',
+            headers=_backfill_edr_headers({'Authorization': f'Bearer {api_key}'}),
+            timeout=15,
+        )
+        if code < 200 or code >= 300:
+            debug_print(f"backfill config request failed: HTTP {code}")
+            return None, None
+        config = json.loads(body.decode('utf-8'))
+        requested = config.get('force_backfill_requested_epoch')
+        if isinstance(requested, bool) or not isinstance(requested, (int, float)):
+            return None, None
+        days = config.get('force_backfill_days')
+        # bool is an int subclass, so True would otherwise read as a one-day window.
+        if isinstance(days, bool) or not isinstance(days, int) or days < 1:
+            days = None
+        return float(requested), days
+    except Exception as e:
+        debug_print(f"backfill config read failed: {e}")
+        return None, None
+
+
+def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
+                           force: bool = False) -> bool:
+    payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
+    if force:
+        # Marks this upload as the org's requested re-walk. The server still checks the
+        # request itself, so this only narrows what force applies to; it cannot grant it.
+        payload['force'] = True
+    payload_bytes = json.dumps(payload).encode('utf-8')
 
     auth_headers = _backfill_edr_headers({
         'Authorization': f'Bearer {api_key}',
@@ -767,8 +1220,8 @@ def _backfill_vscode_workspace_roots() -> List[Path]:
     return bases
 
 
-def _backfill_state_path(home: Path) -> Path:
-    return home / '.copilot' / 'hooks' / BACKFILL_STATE_FILE
+def _backfill_state_path(copilot_home: Path) -> Path:
+    return copilot_home / 'hooks' / BACKFILL_STATE_FILE
 
 
 def _backfill_read_cutoff(home: Path) -> float:
@@ -816,7 +1269,7 @@ def _backfill_should_include(p: Path, cutoff_mtime: float) -> bool:
 
 
 def _backfill_iter_transcripts(cutoff_mtime: float):
-    cli_root = Path.home() / '.copilot' / 'session-state'
+    cli_root = _copilot_home() / 'session-state'
     if cli_root.exists():
         for p in cli_root.glob('*/events.jsonl'):
             if _backfill_should_include(p, cutoff_mtime):
@@ -829,17 +1282,42 @@ def _backfill_iter_transcripts(cutoff_mtime: float):
                 yield p
 
 
+def _backfill_entry_data(entry) -> Dict:
+    """A transcript entry's data object. It is whatever the JSONL held, so a truthy
+    non-dict must never reach .get(): that raises past the collectors and stops every
+    remaining session from being backfilled."""
+    data = entry.get('data') if isinstance(entry, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
 def _backfill_is_user_message(entry) -> bool:
-    # Mirror server-side parse_copilot_session: a new exchange starts on a
-    # user.message with non-empty data.content.
+    # Mirror server-side parse_copilot_session: a new exchange starts on a user.message
+    # whose data.content is a non-blank string. Non-string content starts no exchange
+    # there, so counting one here would shift every later record_index.
     if not isinstance(entry, dict) or entry.get('type') != 'user.message':
         return False
-    content = (entry.get('data') or {}).get('content')
-    return bool(content and str(content).strip())
+    content = _backfill_entry_data(entry).get('content')
+    return isinstance(content, str) and bool(content.strip())
 
 
 def _backfill_exchange_boundaries(entries: List[Dict]) -> List[int]:
     return [i for i, entry in enumerate(entries) if _backfill_is_user_message(entry)]
+
+
+def _backfill_tool_call_ids(entries: List[Dict]):
+    call_ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        data = _backfill_entry_data(entry)
+        if entry.get('type') == 'assistant.message':
+            for request in data.get('toolRequests') or []:
+                if isinstance(request, dict) and isinstance(request.get('toolCallId'), str):
+                    call_ids.add(request['toolCallId'])
+        elif entry.get('type') in ('tool.execution_start', 'tool.execution_complete'):
+            if isinstance(data.get('toolCallId'), str):
+                call_ids.add(data['toolCallId'])
+    return call_ids
 
 
 def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
@@ -850,6 +1328,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
     globally stable per (org, tool, session, record_index)."""
     session_id = session.get('session_id')
     entries = session.get('entries') or []
+    session_usage = session.get('usage') or []
+    session_models = session.get('models') or []
+    session_provenance = session.get('mcp_tool_provenance') or {}
     try:
         if len(json.dumps(session).encode('utf-8')) <= max_chunk_bytes:
             yield session
@@ -891,11 +1372,46 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
             return
 
-        yield {
-            'session_id': session_id,
-            'record_index_base': record_index_base,
-            'entries': entries[start_idx:last_fit_end],
-        }
+        fit_ends = [end_idx for end_idx in ends if end_idx <= last_fit_end]
+        slice_payload = None
+        while fit_ends:
+            candidate_end = fit_ends.pop()
+            candidate_count = sum(
+                1 for boundary in boundaries if start_idx <= boundary < candidate_end
+            )
+            candidate_entries = entries[start_idx:candidate_end]
+            candidate = {
+                'session_id': session_id,
+                'record_index_base': record_index_base,
+                'entries': candidate_entries,
+            }
+            usage_slice = session_usage[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if usage_slice:
+                candidate['usage'] = usage_slice
+            models_slice = session_models[
+                record_index_base:record_index_base + candidate_count
+            ]
+            if any(models_slice):
+                candidate['models'] = models_slice
+            call_ids = _backfill_tool_call_ids(candidate_entries)
+            provenance_slice = {
+                call_id: session_provenance[call_id]
+                for call_id in call_ids
+                if call_id in session_provenance
+            }
+            if provenance_slice:
+                candidate['mcp_tool_provenance'] = provenance_slice
+            if len(json.dumps(candidate).encode('utf-8')) <= max_chunk_bytes:
+                slice_payload = candidate
+                last_fit_end = candidate_end
+                last_fit_base_count = candidate_count
+                break
+        if slice_payload is None:
+            debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            return
+        yield slice_payload
         record_index_base += last_fit_base_count
         start_idx = last_fit_end
 
@@ -907,9 +1423,19 @@ def run_backfill(api_key: str, backend_url: str) -> None:
         return
 
     try:
-        home = Path.home()
+        home = _copilot_home()
         started_at = time.time()
         cutoff_mtime = _backfill_read_cutoff(home)
+        force_epoch, force_days = _backfill_force_config(api_key, backend_url)
+        forced = force_epoch is not None and force_epoch > cutoff_mtime
+        if forced:
+            # The organization's window when it set one, otherwise this installer's own
+            # default. Widen only: a window narrower than what this device had already
+            # reached would skip the band in between, and the successful run then advances
+            # the cutoff past it, so that history is never visited again.
+            window = started_at - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+            cutoff_mtime = min(cutoff_mtime, window)
+            print("[backfill] Re-reading full history at your organization's request.")
         sessions: List[Dict] = []
         capped = False
         for transcript_path in sorted(_backfill_iter_transcripts(cutoff_mtime)):
@@ -940,7 +1466,7 @@ def run_backfill(api_key: str, backend_url: str) -> None:
             if not current_chunk:
                 return
             chunks_total += 1
-            if _backfill_upload_chunk(api_key, backend_url, current_chunk):
+            if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
                 chunks_sent += 1
                 for s in current_chunk:
                     sessions_sent_ids.add(s.get('session_id'))

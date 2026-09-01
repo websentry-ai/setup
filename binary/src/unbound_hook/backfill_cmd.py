@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 
 from ._loader import load_mdm_setup_module
+from ._resources import hook_source_path
 
 BACKFILL_TOOLS_DEFAULT = ("claude-code", "codex")
 BACKFILL_CAPABLE = ("claude-code", "codex", "copilot")
@@ -116,11 +117,13 @@ def run(argv) -> int:
             try:
                 total_sessions = 0
                 for username, home_dir in user_homes:
+                    # No force config is fetched here: a dry-run runs without
+                    # credentials, so these counts are the unforced floor.
                     result = m._run_as_user(username, m._backfill_collect_sessions, home_dir)
                     if result is None:
                         print(f"  {username}: unreadable (skipped)")
                         continue
-                    sessions, capped = result
+                    sessions, capped, _forced = result
                     total_sessions += len(sessions)
                     note = " (capped — more remain)" if capped else ""
                     print(f"  {username}: {len(sessions)} session(s) eligible{note}")
@@ -134,7 +137,11 @@ def run(argv) -> int:
                 exit_code = 1
             continue
         try:
-            m.run_backfill(api_key, backend_url, user_homes)
+            if tool == "copilot":
+                hook_source = hook_source_path(tool).read_text(encoding="utf-8")
+                m.run_backfill(api_key, backend_url, user_homes, hook_source)
+            else:
+                m.run_backfill(api_key, backend_url, user_homes)
         except Exception as e:
             print(f"[backfill] {tool}: failed: {e}", file=sys.stderr)
             exit_code = 1
