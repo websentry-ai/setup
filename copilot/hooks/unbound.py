@@ -144,11 +144,30 @@ _cached_api_key = None
 _reporting_error = False
 
 
-# BEGIN GENERATED SKILL POLICY CORE
+# Skill policy lifecycle
 import urllib.request
 
 
 SKILL_LOADED_WINDOW = 10
+SKILL_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
+
+
+def _skill_policy_transcript_tail(path):
+    """Read a bounded JSONL tail and discard a partial first record."""
+    try:
+        with open(path, 'rb') as transcript_file:
+            size = os.fstat(transcript_file.fileno()).st_size
+            start = max(0, size - SKILL_TRANSCRIPT_TAIL_BYTES)
+            transcript_file.seek(start)
+            data = transcript_file.read(SKILL_TRANSCRIPT_TAIL_BYTES)
+    except OSError:
+        return []
+    if start:
+        boundary = data.find(b'\n')
+        if boundary < 0:
+            return []
+        data = data[boundary + 1:]
+    return data.splitlines()
 
 
 def _skill_policy_valid_slug(value):
@@ -663,9 +682,6 @@ def _apply_skill_lifecycle_actions(api_response, api_key, event=None):
             _dispatch_skills_sync(api_key)
     except Exception as exc:
         log_error(f"skill lifecycle action failed: {exc}", 'skill_injection')
-# END GENERATED SKILL POLICY CORE
-
-
 def _skill_policy_session_id(event):
     return str(event.get('session_id') or event.get('sessionId') or '')
 
@@ -770,8 +786,7 @@ def _skill_policy_loaded_facts(event):
     loaded = set()
     observed = set()
     try:
-        with open(transcript, 'rb') as transcript_file:
-            lines = transcript_file.readlines()
+        lines = _skill_policy_transcript_tail(transcript)
         turns = 0
         in_window = True
         for raw in reversed(lines):

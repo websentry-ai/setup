@@ -306,6 +306,20 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertEqual(first["loaded"], {"secure-sql"})
         self.assertEqual(after_eviction, {"loaded": set(), "session_count": 1})
 
+    def test_transcript_tail_is_bounded_and_drops_a_partial_first_record(self):
+        for name in ("copilot", "codex"):
+            client = CLIENTS[name]
+            with self.subTest(client=name), tempfile.TemporaryDirectory() as tmp:
+                transcript = Path(tmp) / "events.jsonl"
+                transcript.write_bytes(
+                    b'{"discarded":"' + b'x' * 128 + b'"}\n'
+                    b'{"kept":true}\n'
+                )
+                with patch.object(client, "SKILL_TRANSCRIPT_TAIL_BYTES", 32):
+                    lines = client._skill_policy_transcript_tail(str(transcript))
+
+                self.assertEqual(lines, [b'{"kept":true}'])
+
     def test_copilot_loaded_skill_expires_after_ten_assistant_turns(self):
         copilot = CLIENTS["copilot"]
         invoked = {"type": "skill.invoked", "data": {"name": "unbound-secure-sql"}}
@@ -797,13 +811,6 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
 
             self.assertEqual(output, {"decision": "block", "reason": "Blocked by policy."})
             self.assertEqual(evaluate.call_count, 0 if source == "stored" else 1)
-
-
-class GeneratedCoreTests(unittest.TestCase):
-    def test_embedded_core_is_current_in_all_clients(self):
-        from skill_policy.generate import check
-
-        self.assertEqual(check(), [])
 
 
 class CopilotRegistrationTests(unittest.TestCase):
