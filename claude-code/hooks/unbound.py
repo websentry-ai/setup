@@ -5,7 +5,7 @@ import base64
 import json
 import os
 import subprocess
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import time
@@ -4649,10 +4649,21 @@ def _discovery_installer():
     return DISCOVERY_INSTALL_SH, DISCOVERY_INSTALL_URL
 
 
+def _windows_system32_path(*parts: str) -> str:
+    system_root = os.environ.get("SystemRoot")
+    if not system_root:
+        raise OSError("SystemRoot is not set")
+    root = PureWindowsPath(system_root)
+    if not root.is_absolute():
+        raise OSError("SystemRoot is not absolute")
+    return str(root.joinpath("System32", *parts))
+
+
 def _discovery_command(installer_path: Path, backend_url: str):
     if _is_windows():
         return [
-            "powershell", "-NoProfile", "-NonInteractive",
+            _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+            "-NoProfile", "-NonInteractive",
             "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
         ]
     return ["bash", str(installer_path), "--domain", backend_url]
@@ -5690,8 +5701,9 @@ def _dispatch_discovery() -> None:
                     fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
                     os.close(fd)
                     tmp = Path(_tmp)
+                    curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
                     r = subprocess.run(
-                        ["curl", "-fsSL", "-o", str(tmp), installer_url],
+                        [curl, "-fsSL", "-o", str(tmp), installer_url],
                         capture_output=True, timeout=30,
                     )
                     if r.returncode == 0:

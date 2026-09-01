@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+from pathlib import Path
 
 import pytest
 
@@ -43,6 +44,7 @@ def windows_hook(request, tmp_path, monkeypatch):
     install_ps1.write_text("param()\n", encoding="utf-8")
 
     monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(hook, "UNBOUND_CONFIG_PATH", config_path)
     monkeypatch.setattr(hook, "DISCOVERY_CACHE_PATH", state_dir / "cache.json")
     monkeypatch.setattr(hook, "DISCOVERY_LOCK_PATH", state_dir / "discovery.lock")
@@ -76,7 +78,7 @@ def test_windows_discovery_uses_powershell_installer(windows_hook):
     assert len(calls) == 1
     command, kwargs = calls[0]
     assert command == [
-        "powershell",
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
         "-NoProfile",
         "-NonInteractive",
         "-ExecutionPolicy",
@@ -86,6 +88,28 @@ def test_windows_discovery_uses_powershell_installer(windows_hook):
     ]
     assert kwargs["env"]["UNBOUND_API_KEY"] == "test-key"
     assert kwargs["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
+
+
+def test_windows_discovery_download_uses_system_curl(windows_hook, monkeypatch):
+    hook, calls, install_ps1 = windows_hook
+    install_ps1.unlink()
+    run_calls = []
+
+    class Result:
+        returncode = 0
+        stderr = b""
+
+    def record_run(command, **kwargs):
+        run_calls.append((command, kwargs))
+        Path(command[command.index("-o") + 1]).write_text("param()\n", encoding="utf-8")
+        return Result()
+
+    monkeypatch.setattr(hook.subprocess, "run", record_run)
+    hook._dispatch_discovery()
+
+    assert len(run_calls) == 1
+    assert run_calls[0][0][0] == r"C:\Windows\System32\curl.exe"
+    assert len(calls) == 1
 
 
 def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):
