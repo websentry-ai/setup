@@ -3275,12 +3275,16 @@ def _vscode_turn_model(transcript_path, conversation_id, previous_stop, turn_end
     return None
 
 
-def _vscode_turn_usage(transcript_path, conversation_id, start_index):
+def _vscode_turn_usage(transcript_path, conversation_id, start_index, since=None, until=None):
     """Usage for requests from start_index on, stopping at the first whose tokens are not
     written yet. VS Code fills them in after Stop fires, and the lead grows with turn
     length, so an unfinished request is left for a later Stop rather than skipped. Returns
     (usage, next index to report, whether a request is still being written at that index).
-    No cache split is reported."""
+    No cache split is reported.
+
+    Position alone does not say which turn a request belongs to: one that settles after its
+    own turn's Stop is still unread at the next one, so `since`/`until` decide what this
+    turn may count."""
     path = _vscode_store_path(transcript_path, conversation_id)
     if not path:
         return None, start_index, False
@@ -3289,6 +3293,7 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
         return None, start_index, False
     totals = dict((field, 0) for field in _USAGE_FIELDS)
     index = max(int(start_index or 0), 0)
+    lo, hi = _epoch(since), _epoch(until)
     # Guarded: a non-numeric count in the journal would otherwise raise past the Stop
     # handler and drop the whole exchange, not just its usage.
     try:
@@ -3299,8 +3304,17 @@ def _vscode_turn_usage(transcript_path, conversation_id, start_index):
             # that they have stopped climbing; the counts themselves appear mid-stream.
             if prompt is None or completion is None or entry.get('elapsedMs') is None:
                 break
-            totals['input_tokens'] += max(int(prompt), 0)
-            totals['output_tokens'] += max(int(completion), 0)
+            created = _epoch(entry.get('timestamp'))
+            # Past this turn's close the requests belong to turns not yet reported, so the
+            # watermark stops here. Nothing is pending: what remains is a later turn's work,
+            # not this one's, and waiting on it would stall the hook for the settle window.
+            if hi is not None and created is not None and created > hi:
+                return totals, index, False
+            # An earlier turn's late request is read here but not counted here; it is left
+            # to that turn's own windowed completion. The index still advances past it.
+            if hi is None or _in_window(created, lo, hi):
+                totals['input_tokens'] += max(int(prompt), 0)
+                totals['output_tokens'] += max(int(completion), 0)
             index += 1
     except (TypeError, ValueError) as e:
         log_error('vscode usage totals failed: %s' % e, 'usage')
@@ -3401,7 +3415,7 @@ def _vscode_store_stamp(path):
         return None
 
 
-def _vscode_settled_usage(transcript_path, conversation_id, start_index):
+def _vscode_settled_usage(transcript_path, conversation_id, start_index, since=None, until=None):
     """Wait for this turn to finish being written. Stop fires before the response ends, so
     a first read usually has nothing to report. Giving up is safe: the watermark does not
     advance, so a later Stop reports the turn instead.
@@ -3409,7 +3423,7 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index):
     A turn being completed after the fact does not come through here at all; it reads by
     its own window, because by then every later turn has settled too."""
     usage, next_index, pending = _vscode_turn_usage(transcript_path, conversation_id,
-                                                    start_index)
+                                                    start_index, since, until)
     # Wait only while a request is mid-write. With nothing pending there is nothing to wait
     # for, and blocking every quiet Stop for the full window would be pure cost.
     if usage is None or next_index > start_index or not pending:
@@ -3426,7 +3440,7 @@ def _vscode_settled_usage(transcript_path, conversation_id, start_index):
             continue
         stamp = current
         usage, next_index, _pending = _vscode_turn_usage(transcript_path, conversation_id,
-                                                         start_index)
+                                                         start_index, since, until)
         if usage is None or next_index > start_index:
             break
     return usage, next_index
@@ -3446,7 +3460,7 @@ def get_turn_usage(transcript_path, conversation_id, previous_stop, turn_end, us
         next_index = usage_index
     else:
         usage, next_index = _vscode_settled_usage(transcript_path, conversation_id,
-                                                  usage_index)
+                                                  usage_index, previous_stop, turn_end)
     if not usage or not any(usage.values()):
         return None, next_index
     usage['total_tokens'] = sum(usage[field] for field in _USAGE_FIELDS)

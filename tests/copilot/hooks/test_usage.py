@@ -262,6 +262,119 @@ def _request(ts_ms=1787893680000, prompt=None, completion=None, elapsed=1234):
     return obj
 
 
+# One turn's request and the next turn's, either side of the Stop that divides them.
+T0_REQUEST = 1787893680000
+STOP0 = 1787893690000
+T1_REQUEST = 1787893700000
+STOP1 = 1787893710000
+
+
+class TestVscodeUsageWindow(unittest.TestCase):
+    """A request settles after its own turn's Stop, so it is still unread at the next one.
+    Position cannot tell the two turns apart; the turn's own window has to."""
+
+    def _usage(self, lines, start_index=0, since=None, until=None):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, lines)
+            usage, nxt, _pending = unbound._vscode_turn_usage(
+                transcript, SESSION, start_index, since, until)
+            return usage, nxt
+
+    def _through_get_turn_usage(self, lines, previous_stop, turn_end, start_index=0):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, lines)
+            return unbound.get_turn_usage(transcript, SESSION, previous_stop, turn_end,
+                                          start_index)
+
+    @staticmethod
+    def _two_turns():
+        return [
+            {"kind": 1, "v": {"requests": []}},
+            {"kind": 2, "k": ["requests"], "v": [
+                _request(ts_ms=T0_REQUEST, prompt=100, completion=5),
+                _request(ts_ms=T1_REQUEST, prompt=200, completion=7)]},
+        ]
+
+    def test_a_late_request_is_not_billed_to_the_next_turn(self):
+        # The whole bug: at turn 1's Stop, turn 0's request has finally settled and is the
+        # first one the index reaches. It belongs to turn 0.
+        usage, nxt = self._usage(self._two_turns(), since=STOP0, until=STOP1)
+        self.assertEqual(usage["input_tokens"], 200)
+        self.assertEqual(usage["output_tokens"], 7)
+        self.assertEqual(nxt, 2)
+
+    def test_a_turn_counts_the_request_that_ran_inside_it(self):
+        usage, nxt = self._usage(self._two_turns(), until=STOP0)
+        self.assertEqual(usage["input_tokens"], 100)
+        self.assertEqual(usage["output_tokens"], 5)
+        # Stops at its own close: the next turn's request is not consumed here.
+        self.assertEqual(nxt, 1)
+
+    def test_the_index_advances_past_a_request_this_turn_may_not_count(self):
+        # Skipped, not re-examined: its own turn finds it by window, not by index.
+        usage, nxt = self._usage(
+            [{"kind": 1, "v": {"requests": []}},
+             {"kind": 2, "k": ["requests"], "v": [
+                 _request(ts_ms=T0_REQUEST, prompt=100, completion=5)]}],
+            since=STOP0, until=STOP1)
+        self.assertEqual(usage["input_tokens"], 0)
+        self.assertEqual(nxt, 1)
+
+    def test_get_turn_usage_reports_nothing_rather_than_the_previous_turn(self):
+        # Production entry point: an empty read leaves the turn to its own completion.
+        usage, nxt = self._through_get_turn_usage(
+            [{"kind": 1, "v": {"requests": []}},
+             {"kind": 2, "k": ["requests"], "v": [
+                 _request(ts_ms=T0_REQUEST, prompt=100, completion=5)]}],
+            previous_stop=STOP0, turn_end=STOP1)
+        self.assertIsNone(usage)
+        self.assertEqual(nxt, 1)
+
+    def test_get_turn_usage_reports_the_turns_own_request(self):
+        usage, _nxt = self._through_get_turn_usage(
+            self._two_turns(), previous_stop=STOP0, turn_end=STOP1)
+        self.assertEqual(usage["input_tokens"], 200)
+
+    def test_a_later_turns_request_is_not_something_to_wait_for(self):
+        # pending drives a 10s settle wait inside the Stop hook. A request beyond this
+        # turn's close is the next turn's work, so this turn has nothing to wait on.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, [
+                {"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [
+                    _request(ts_ms=T1_REQUEST, prompt=200, completion=7)]},
+            ])
+            _usage, nxt, pending = unbound._vscode_turn_usage(
+                transcript, SESSION, 0, None, STOP0)
+        self.assertFalse(pending)
+        self.assertEqual(nxt, 0)
+
+    def test_an_unwritten_request_is_still_worth_waiting_for(self):
+        # The other side of the same signal: mid-write means wait.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            transcript = _journal(tmpdir, SESSION, [
+                {"kind": 1, "v": {"requests": []}},
+                {"kind": 2, "k": ["requests"], "v": [
+                    _request(ts_ms=T0_REQUEST, prompt=100, elapsed=None)]},
+            ])
+            _usage, nxt, pending = unbound._vscode_turn_usage(
+                transcript, SESSION, 0, None, STOP0)
+        self.assertTrue(pending)
+        self.assertEqual(nxt, 0)
+
+    def test_an_undated_request_is_never_billed_to_a_windowed_turn(self):
+        # Better estimated than confidently wrong: an entry with no timestamp cannot be
+        # placed in any turn, so no turn claims it.
+        undated = _request(prompt=100, completion=5)
+        undated.pop("timestamp")
+        usage, nxt = self._usage(
+            [{"kind": 1, "v": {"requests": []}},
+             {"kind": 2, "k": ["requests"], "v": [undated]}],
+            since=STOP0, until=STOP1)
+        self.assertEqual(usage["input_tokens"], 0)
+        self.assertEqual(nxt, 1)
+
+
 class TestVscodeUsage(unittest.TestCase):
     """Index-driven: report contiguous finished requests, leave the rest for a later Stop."""
 
