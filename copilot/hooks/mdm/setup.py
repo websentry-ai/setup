@@ -909,7 +909,7 @@ def _backfill_collect_session(
                 entries.append(entry)
                 if not session_id and isinstance(entry, dict):
                     if entry.get('type') == 'session.start':
-                        sid = (entry.get('data') or {}).get('sessionId')
+                        sid = _backfill_entry_data(entry).get('sessionId')
                         if sid:
                             session_id = sid
     except (OSError, UnicodeDecodeError):
@@ -1116,10 +1116,7 @@ def _backfill_turn_ceilings(entries: List[Dict]) -> List[float]:
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict) or entry.get('type') != 'user.message':
             continue
-        # data is whatever the JSONL held: a truthy non-dict would raise on .get() and
-        # take every remaining session down with it.
-        data = entry.get('data')
-        content = data.get('content') if isinstance(data, dict) else None
+        content = _backfill_entry_data(entry).get('content')
         if isinstance(content, str) and content.strip():
             starts.append(index)
     ceilings: List[float] = []
@@ -1495,12 +1492,20 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
     return True
 
 
+def _backfill_entry_data(entry) -> Dict:
+    """A transcript entry's data object. It is whatever the JSONL held, so a truthy
+    non-dict must never reach .get(): that raises past the collectors and stops every
+    remaining session from being backfilled."""
+    data = entry.get('data') if isinstance(entry, dict) else None
+    return data if isinstance(data, dict) else {}
+
+
 def _backfill_is_user_message(entry) -> bool:
     # Mirror server-side parse_copilot_session: a new exchange starts on a
     # user.message with non-empty data.content.
     if not isinstance(entry, dict) or entry.get('type') != 'user.message':
         return False
-    content = (entry.get('data') or {}).get('content')
+    content = _backfill_entry_data(entry).get('content')
     return bool(content and str(content).strip())
 
 
@@ -1513,7 +1518,7 @@ def _backfill_tool_call_ids(entries: List[Dict]):
     for entry in entries:
         if not isinstance(entry, dict):
             continue
-        data = entry.get('data') or {}
+        data = _backfill_entry_data(entry)
         if entry.get('type') == 'assistant.message':
             for request in data.get('toolRequests') or []:
                 if isinstance(request, dict) and isinstance(request.get('toolCallId'), str):

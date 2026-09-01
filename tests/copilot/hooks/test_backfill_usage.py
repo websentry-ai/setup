@@ -250,6 +250,24 @@ class TestBackfillVscodeUsage(unittest.TestCase):
             # only the well-formed prompt counts as a turn
             self.assertEqual(len(ceilings), 1, bad)
 
+    def test_malformed_message_data_never_aborts_the_slicing_path(self):
+        # Every reader of the raw entries is exposed, not just the turn-ceiling one:
+        # boundaries, tool-call ids and the oversized-session split all take the same input.
+        bad = [{"type": "user.message", "data": "a string"},
+               {"type": "assistant.message", "data": ["a", "list"]},
+               {"type": "tool.execution_start", "data": 42},
+               {"type": "user.message", "data": {"content": "real prompt"}}]
+        self.assertEqual(setup._backfill_exchange_boundaries(bad), [3])
+        self.assertEqual(setup._backfill_tool_call_ids(bad), set())
+        list(setup._backfill_slice_session({"session_id": SESSION, "entries": bad}, 10))
+        self.assertEqual(len(setup._backfill_turn_ceilings(bad)), 1)
+
+    def test_entry_data_is_only_ever_a_dict(self):
+        for bad in ("s", ["l"], 42, True, 3.14, None, object()):
+            self.assertEqual(setup._backfill_entry_data({"data": bad}), {})
+        self.assertEqual(setup._backfill_entry_data({"data": {"k": 1}}), {"k": 1})
+        self.assertEqual(setup._backfill_entry_data("not an entry"), {})
+
     def test_turn_ceilings_never_decrease(self):
         # The scan takes the first ceiling a request fits under, so out-of-order transcript
         # stamps must not produce a window that reaches backwards.
