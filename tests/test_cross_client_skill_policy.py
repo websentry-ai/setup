@@ -58,6 +58,17 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 self.assertFalse(directory.exists())
             self._reset_root()
 
+    def test_inventory_ignores_marked_directories_outside_managed_namespace(self):
+        for name, module in CLIENTS.items():
+            with self.subTest(client=name), patch.object(module, "MANAGED_SKILLS_ROOT", self.root):
+                directory = self.root / "not-unbound-prefixed"
+                directory.mkdir(parents=True)
+                (directory / module.UNBOUND_SKILL_MARKER).touch()
+                (directory / "SKILL.md").write_text("developer-owned\n")
+
+                self.assertEqual(module.installed_skill_report(), [])
+            self._reset_root()
+
     def test_never_overwrites_or_prunes_an_unmanaged_skill(self):
         for name, module in CLIENTS.items():
             with self.subTest(client=name), patch.object(module, "MANAGED_SKILLS_ROOT", self.root):
@@ -213,6 +224,21 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
 
 
 class CrossClientNativeInjectionTests(unittest.TestCase):
+    def test_session_count_remains_lifetime_distinct_when_active_window_changes(self):
+        for name, module in CLIENTS.items():
+            with self.subTest(client=name), tempfile.TemporaryDirectory() as tmp, \
+                    patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = None
+                for index in range(1, 7):
+                    slug = f"rule-{index}"
+                    facts = module._finalize_skill_facts("session", {slug}, {slug})
+
+                self.assertEqual(facts, {"loaded": {"rule-6"}, "session_count": 6})
+                self.assertEqual(
+                    module._finalize_skill_facts("session", set()),
+                    {"loaded": set(), "session_count": 6},
+                )
+
     def test_codex_prompt_injection_uses_additional_context(self):
         response = CLIENTS["codex"].transform_response_for_codex_prompt({
             "decision": "allow",
@@ -262,7 +288,7 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertIn("$unbound-secure-sql", codex["hookSpecificOutput"]["additionalContext"])
         self.assertIn("/unbound-secure-sql", cursor["agent_message"])
 
-    def test_copilot_loaded_state_survives_transcript_tail_eviction(self):
+    def test_copilot_session_count_survives_transcript_loss_without_sticky_loaded_state(self):
         copilot = CLIENTS["copilot"]
         event = {"session_id": "s1"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,7 +304,23 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                 after_eviction = copilot._skill_policy_loaded_facts(event)
 
         self.assertEqual(first["loaded"], {"secure-sql"})
-        self.assertEqual(after_eviction, first)
+        self.assertEqual(after_eviction, {"loaded": set(), "session_count": 1})
+
+    def test_copilot_loaded_skill_expires_after_ten_assistant_turns(self):
+        copilot = CLIENTS["copilot"]
+        invoked = {"type": "skill.invoked", "data": {"name": "unbound-secure-sql"}}
+        turn = {"type": "assistant.turn_start", "data": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "events.jsonl"
+            event = {"session_id": "s1", "transcript_path": str(transcript)}
+            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                transcript.write_text("\n".join(json.dumps(row) for row in [invoked] + [turn] * 10) + "\n")
+                edge = copilot._skill_policy_loaded_facts(event)
+                transcript.write_text("\n".join(json.dumps(row) for row in [invoked] + [turn] * 11) + "\n")
+                expired = copilot._skill_policy_loaded_facts(event)
+
+        self.assertEqual(edge, {"loaded": {"secure-sql"}, "session_count": 1})
+        self.assertEqual(expired, {"loaded": set(), "session_count": 1})
 
     def test_copilot_finds_the_normal_cli_transcript_without_an_event_path(self):
         copilot = CLIENTS["copilot"]
@@ -315,20 +357,99 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
     def test_cursor_loaded_state_survives_audit_log_eviction(self):
         cursor = CLIENTS["cursor"]
         event = {"conversation_id": "c1"}
-        row = {"event": {
-            "hook_event_name": "beforeReadFile",
-            "conversation_id": "c1",
-            "file_path": "/skills/unbound-secure-sql/SKILL.md",
-        }}
+        rows = [
+            {"event": {
+                "hook_event_name": "beforeSubmitPrompt",
+                "conversation_id": "c1",
+                "generation_id": "g1",
+            }},
+            {"event": {
+                "hook_event_name": "beforeReadFile",
+                "conversation_id": "c1",
+                "generation_id": "g1",
+                "file_path": "/skills/unbound-secure-sql/SKILL.md",
+            }},
+        ]
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"), \
-                patch.object(cursor, "load_existing_logs", side_effect=[[row], []]), \
+                patch.object(cursor, "load_existing_logs", side_effect=[rows, []]), \
                 patch.object(cursor, "_skill_name_from_path", return_value="unbound-secure-sql"):
             first = cursor._skill_policy_loaded_facts(event)
             after_eviction = cursor._skill_policy_loaded_facts(event)
 
         self.assertEqual(first["loaded"], {"secure-sql"})
         self.assertEqual(after_eviction, first)
+
+    def test_cursor_loaded_skill_expires_after_ten_user_prompts(self):
+        cursor = CLIENTS["cursor"]
+        rows = [
+            {"event": {
+                "hook_event_name": "beforeSubmitPrompt",
+                "conversation_id": "c1",
+                "generation_id": "g0",
+            }},
+            {"event": {
+                "hook_event_name": "beforeReadFile",
+                "conversation_id": "c1",
+                "generation_id": "g0",
+                "file_path": "/skills/unbound-secure-sql/SKILL.md",
+            }},
+        ]
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"), \
+                patch.object(cursor, "load_existing_logs", return_value=rows), \
+                patch.object(cursor, "_skill_name_from_path", return_value="unbound-secure-sql"):
+            cursor._skill_policy_loaded_facts({"conversation_id": "c1"})
+            for index in range(1, 11):
+                edge = cursor._skill_policy_loaded_facts({
+                    "hook_event_name": "beforeSubmitPrompt",
+                    "conversation_id": "c1",
+                    "generation_id": f"g{index}",
+                })
+            expired = cursor._skill_policy_loaded_facts({
+                "hook_event_name": "beforeSubmitPrompt",
+                "conversation_id": "c1",
+                "generation_id": "g11",
+            })
+
+        self.assertEqual(edge, {"loaded": {"secure-sql"}, "session_count": 1})
+        self.assertEqual(expired, {"loaded": set(), "session_count": 1})
+
+    def test_cursor_tracks_two_skill_reads_in_one_generation(self):
+        cursor = CLIENTS["cursor"]
+        rows = [
+            {"event": {
+                "hook_event_name": "beforeSubmitPrompt",
+                "conversation_id": "c1",
+                "generation_id": "g1",
+            }},
+            {"event": {
+                "hook_event_name": "beforeReadFile",
+                "conversation_id": "c1",
+                "generation_id": "g1",
+                "file_path": "/skills/unbound-first-rule/SKILL.md",
+            }},
+            {"event": {
+                "hook_event_name": "beforeReadFile",
+                "conversation_id": "c1",
+                "generation_id": "g1",
+                "file_path": "/skills/unbound-second-rule/SKILL.md",
+            }},
+        ]
+
+        def skill_name(path, _roots):
+            return Path(path).parent.name
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"), \
+                patch.object(cursor, "load_existing_logs", return_value=rows), \
+                patch.object(cursor, "_skill_name_from_path", side_effect=skill_name):
+            facts = cursor._skill_policy_loaded_facts({"conversation_id": "c1"})
+
+        self.assertEqual(facts, {
+            "loaded": {"first-rule", "second-rule"},
+            "session_count": 2,
+        })
 
     def test_cursor_defers_prompt_injection_to_next_tool_context(self):
         cursor = CLIENTS["cursor"]
@@ -458,7 +579,98 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                 remembered = codex._skill_policy_loaded_facts({"session_id": "s1"})
 
         self.assertEqual(facts["loaded"], {"secure-sql"})
-        self.assertEqual(remembered, facts)
+        self.assertEqual(remembered, {"loaded": set(), "session_count": 1})
+
+    def test_codex_loaded_skill_expires_after_ten_tasks_and_at_compaction(self):
+        codex = CLIENTS["codex"]
+        selected = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "<skill><name>unbound-secure-sql</name></skill>"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["skills.selected_skill_instructions"],
+                },
+            },
+        }
+        task = {"type": "event_msg", "payload": {"type": "task_started"}}
+        compacted = {"type": "event_msg", "payload": {"type": "context_compacted"}}
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "rollout.jsonl"
+            event = {"session_id": "s1", "transcript_path": str(transcript)}
+            with patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                transcript.write_text("\n".join(json.dumps(row) for row in [selected] + [task] * 10) + "\n")
+                edge = codex._skill_policy_loaded_facts(event)
+                transcript.write_text("\n".join(json.dumps(row) for row in [selected] + [task] * 11) + "\n")
+                expired = codex._skill_policy_loaded_facts(event)
+                transcript.write_text("\n".join(json.dumps(row) for row in [selected, task, compacted, task]) + "\n")
+                after_compaction = codex._skill_policy_loaded_facts(event)
+
+        self.assertEqual(edge, {"loaded": {"secure-sql"}, "session_count": 1})
+        self.assertEqual(expired, {"loaded": set(), "session_count": 1})
+        self.assertEqual(after_compaction, {"loaded": set(), "session_count": 1})
+
+    def test_codex_compaction_keeps_only_post_compaction_skill_active(self):
+        codex = CLIENTS["codex"]
+
+        def selected(slug):
+            return {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": f"<skill><name>unbound-{slug}</name></skill>"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "content_item_kinds": ["skills.selected_skill_instructions"],
+                    },
+                },
+            }
+
+        rows = [
+            selected("old-rule"),
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+            {"type": "compacted"},
+            selected("new-rule"),
+            {"type": "event_msg", "payload": {"type": "task_started"}},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "rollout.jsonl"
+            transcript.write_text("\n".join(json.dumps(row) for row in rows) + "\n")
+            with patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = codex._skill_policy_loaded_facts({
+                    "session_id": "s1",
+                    "transcript_path": str(transcript),
+                })
+
+        self.assertEqual(facts, {"loaded": {"new-rule"}, "session_count": 2})
+
+    def test_codex_accepts_a_long_exact_skill_prefix_but_not_frontmatter_only(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\n" + "important rule\n" * 400
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            (skill / "SKILL.md").write_text(body)
+            base = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Bash",
+                "tool_input": {"command": f"sed -n '1,240p' {skill / 'SKILL.md'}"},
+            }
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
+                    patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                prefix = codex._skill_policy_loaded_facts({**base, "tool_response": body[:2048]})
+                frontmatter = codex._skill_policy_loaded_facts({
+                    **base,
+                    "session_id": "s2",
+                    "tool_response": "---\nname: unbound-secure-sql\n---\n",
+                })
+
+        self.assertEqual(prefix["loaded"], {"secure-sql"})
+        self.assertEqual(frontmatter["loaded"], set())
 
     def test_codex_does_not_trust_skill_path_without_body_in_tool_response(self):
         codex = CLIENTS["codex"]
@@ -537,10 +749,33 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertTrue(found)
         self.assertEqual(plan["inject_skills"][0]["slug"], "secure-sql")
 
+    def test_copilot_corrupt_prompt_plan_falls_back_to_gateway(self):
+        copilot = CLIENTS["copilot"]
+        event = {
+            "sessionId": "s1",
+            "prompt": "current message",
+            "transformedPrompt": "current message",
+        }
+        response = {"decision": "allow", "inject_skills": [_entry()]}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
+                patch.object(copilot, "get_api_key", return_value="key"), \
+                patch.object(copilot, "_evaluate_user_prompt_policy", return_value=response) as evaluate, \
+                patch.object(copilot, "_stage_skill_injection_delivery"), \
+                patch.object(copilot, "_ack_skill_injection_delivery"), \
+                patch.object(copilot.sys, "stdin", io.StringIO(json.dumps(event))), \
+                patch.object(copilot.sys, "stdout", io.StringIO()) as stdout:
+            target = copilot._copilot_prompt_plan_path(event)
+            target.parent.mkdir(parents=True)
+            target.write_text("{corrupt")
+            copilot.main()
+
+        self.assertEqual(evaluate.call_count, 1)
+        self.assertIn("unbound-secure-sql", json.loads(stdout.getvalue())["modifiedTransformedPrompt"])
+
     def test_copilot_transformed_prompt_blocks_stored_and_fallback_denies(self):
         copilot = CLIENTS["copilot"]
         event = {
-            "hook_event_name": "userPromptTransformed",
             "sessionId": "s1",
             "prompt": "Drop the table.",
             "transformedPrompt": "Drop the table.",

@@ -106,6 +106,9 @@ _reporting_error = False
 import urllib.request
 
 
+SKILL_LOADED_WINDOW = 10
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -127,7 +130,9 @@ def _managed_skill_dirs():
 
 def _managed_skill_slug(directory):
     name = directory.name
-    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    if not name.startswith(UNBOUND_SKILL_PREFIX):
+        return None
+    slug = name[len(UNBOUND_SKILL_PREFIX):]
     return slug if _skill_policy_valid_slug(slug) else None
 
 
@@ -499,7 +504,7 @@ def _cleanup_skill_policy_state():
         pass
 
 
-def _remembered_loaded_skills(session_id):
+def _remembered_session_skill_slugs(session_id):
     if not session_id:
         return set()
     path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
@@ -516,13 +521,18 @@ def _remembered_loaded_skills(session_id):
         return set()
 
 
-def _remember_loaded_skill_facts(session_id, observed):
-    remembered = _remembered_loaded_skills(session_id)
+def _finalize_skill_facts(session_id, loaded, observed=None):
+    """Keep the active context window separate from the lifetime session count."""
+    remembered = _remembered_session_skill_slugs(session_id)
     current = {
-        slug for slug in (observed or set())
+        slug for slug in (loaded or set())
         if _skill_policy_valid_slug(slug)
     }
-    missing = sorted(current - remembered)
+    session_observed = {
+        slug for slug in (observed if observed is not None else current)
+        if _skill_policy_valid_slug(slug)
+    }
+    missing = sorted(session_observed - remembered)
     if session_id and missing:
         path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
             str(session_id).encode('utf-8', 'replace')
@@ -536,10 +546,10 @@ def _remember_loaded_skill_facts(session_id, observed):
                 os.close(fd)
             remembered.update(missing)
         except OSError:
-            remembered.update(current)
+            remembered.update(session_observed)
     else:
-        remembered.update(current)
-    return {'loaded': remembered, 'session_count': len(remembered)}
+        remembered.update(session_observed)
+    return {'loaded': current, 'session_count': len(remembered)}
 
 
 def _claim_skill_injection_turn(event):
@@ -647,19 +657,23 @@ def _codex_selected_skill_slugs(payload):
     }
 
 
-def _codex_post_tool_skill_slugs(event):
-    if event.get('hook_event_name') != 'PostToolUse' or event.get('tool_name') != 'Bash':
-        return set()
-    tool_input = event.get('tool_input')
-    command = tool_input.get('command') if isinstance(tool_input, dict) else None
-    response = event.get('tool_response')
-    if isinstance(response, dict):
-        response = response.get('stdout') or response.get('content')
-    if not isinstance(command, str) or not isinstance(response, str):
-        return set()
-    if len(response.encode('utf-8', 'replace')) > 2 * 1024 * 1024:
-        return set()
+def _codex_output_text(payload):
+    output = payload.get('output') if isinstance(payload, dict) else None
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return ''
+    return '\n'.join(
+        part.get('text', '') for part in output
+        if isinstance(part, dict) and isinstance(part.get('text'), str)
+    )
 
+
+def _codex_skill_slugs_from_output(command, output):
+    if not isinstance(command, str) or not isinstance(output, str):
+        return set()
+    if len(output.encode('utf-8', 'replace')) > 2 * 1024 * 1024:
+        return set()
     observed = set()
     for directory in _managed_skill_dirs():
         slug = _managed_skill_slug(directory)
@@ -670,42 +684,82 @@ def _codex_post_tool_skill_slugs(event):
             content = skill_path.read_text(encoding='utf-8')
         except (OSError, UnicodeError):
             continue
-        if content and content in response:
+        output_body = output.strip()
+        if content in output or (
+            len(output_body.encode('utf-8')) >= 128
+            and content.startswith(output_body)
+        ):
             observed.add(slug)
     return observed
+
+
+def _codex_post_tool_skill_slugs(event):
+    if event.get('hook_event_name') != 'PostToolUse' or event.get('tool_name') != 'Bash':
+        return set()
+    tool_input = event.get('tool_input')
+    command = tool_input.get('command') if isinstance(tool_input, dict) else None
+    response = event.get('tool_response')
+    if isinstance(response, dict):
+        response = response.get('stdout') or response.get('content')
+    return _codex_skill_slugs_from_output(command, response)
 
 
 def _skill_policy_loaded_facts(event):
     session_id = event.get('session_id')
     transcript = event.get('transcript_path')
-    observed = _codex_post_tool_skill_slugs(event)
+    current = _codex_post_tool_skill_slugs(event)
     if not isinstance(transcript, str) or not transcript or transcript == 'undefined':
-        return _remember_loaded_skill_facts(session_id, observed)
+        return _finalize_skill_facts(session_id, current, current)
+    loaded = set(current)
+    observed = set(current)
     try:
         with open(transcript, 'rb') as transcript_file:
-            transcript_file.seek(0, os.SEEK_END)
-            size = transcript_file.tell()
-            transcript_file.seek(max(0, size - 1024 * 1024))
-            if size > 1024 * 1024:
-                transcript_file.readline()
             lines = transcript_file.readlines()
-        for raw in lines:
+        outputs = {}
+        turns = 0
+        in_window = True
+        for raw in reversed(lines):
             try:
                 entry = json.loads(raw)
             except Exception:
                 continue
-            if not isinstance(entry, dict) or entry.get('type') != 'response_item':
+            if not isinstance(entry, dict):
                 continue
+            entry_type = entry.get('type')
             payload = entry.get('payload')
-            if (
-                isinstance(payload, dict)
-                and payload.get('type') == 'message'
-                and payload.get('role') == 'user'
-            ):
-                observed.update(_codex_selected_skill_slugs(payload))
+            payload_type = payload.get('type') if isinstance(payload, dict) else None
+            if entry_type == 'compacted' or (entry_type == 'event_msg' and payload_type == 'context_compacted'):
+                in_window = False
+                continue
+            if entry_type == 'event_msg':
+                if payload_type == 'task_started':
+                    turns += 1
+                    if turns > SKILL_LOADED_WINDOW:
+                        in_window = False
+                continue
+            if entry_type != 'response_item' or not isinstance(payload, dict):
+                continue
+            if payload_type == 'custom_tool_call_output':
+                call_id = payload.get('call_id')
+                text = _codex_output_text(payload)
+                if isinstance(call_id, str) and text:
+                    outputs[call_id] = text
+                continue
+            if payload_type == 'message' and payload.get('role') == 'user':
+                found = _codex_selected_skill_slugs(payload)
+            elif payload_type == 'custom_tool_call' and payload.get('status') == 'completed':
+                command = payload.get('input')
+                call_id = payload.get('call_id')
+                output = outputs.get(call_id, '') if isinstance(call_id, str) else ''
+                found = _codex_skill_slugs_from_output(command, output)
+            else:
+                continue
+            observed.update(found)
+            if in_window:
+                loaded.update(found)
     except OSError:
         pass
-    return _remember_loaded_skill_facts(session_id, observed)
+    return _finalize_skill_facts(session_id, loaded, observed)
 
 
 def _should_report():

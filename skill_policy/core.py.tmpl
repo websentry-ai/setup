@@ -2,6 +2,9 @@
 import urllib.request
 
 
+SKILL_LOADED_WINDOW = 10
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -23,7 +26,9 @@ def _managed_skill_dirs():
 
 def _managed_skill_slug(directory):
     name = directory.name
-    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    if not name.startswith(UNBOUND_SKILL_PREFIX):
+        return None
+    slug = name[len(UNBOUND_SKILL_PREFIX):]
     return slug if _skill_policy_valid_slug(slug) else None
 
 
@@ -395,7 +400,7 @@ def _cleanup_skill_policy_state():
         pass
 
 
-def _remembered_loaded_skills(session_id):
+def _remembered_session_skill_slugs(session_id):
     if not session_id:
         return set()
     path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
@@ -412,13 +417,18 @@ def _remembered_loaded_skills(session_id):
         return set()
 
 
-def _remember_loaded_skill_facts(session_id, observed):
-    remembered = _remembered_loaded_skills(session_id)
+def _finalize_skill_facts(session_id, loaded, observed=None):
+    """Keep the active context window separate from the lifetime session count."""
+    remembered = _remembered_session_skill_slugs(session_id)
     current = {
-        slug for slug in (observed or set())
+        slug for slug in (loaded or set())
         if _skill_policy_valid_slug(slug)
     }
-    missing = sorted(current - remembered)
+    session_observed = {
+        slug for slug in (observed if observed is not None else current)
+        if _skill_policy_valid_slug(slug)
+    }
+    missing = sorted(session_observed - remembered)
     if session_id and missing:
         path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
             str(session_id).encode('utf-8', 'replace')
@@ -432,10 +442,10 @@ def _remember_loaded_skill_facts(session_id, observed):
                 os.close(fd)
             remembered.update(missing)
         except OSError:
-            remembered.update(current)
+            remembered.update(session_observed)
     else:
-        remembered.update(current)
-    return {'loaded': remembered, 'session_count': len(remembered)}
+        remembered.update(session_observed)
+    return {'loaded': current, 'session_count': len(remembered)}
 
 
 def _claim_skill_injection_turn(event):

@@ -120,6 +120,9 @@ _reporting_error = False
 import urllib.request
 
 
+SKILL_LOADED_WINDOW = 10
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -141,7 +144,9 @@ def _managed_skill_dirs():
 
 def _managed_skill_slug(directory):
     name = directory.name
-    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    if not name.startswith(UNBOUND_SKILL_PREFIX):
+        return None
+    slug = name[len(UNBOUND_SKILL_PREFIX):]
     return slug if _skill_policy_valid_slug(slug) else None
 
 
@@ -513,7 +518,7 @@ def _cleanup_skill_policy_state():
         pass
 
 
-def _remembered_loaded_skills(session_id):
+def _remembered_session_skill_slugs(session_id):
     if not session_id:
         return set()
     path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
@@ -530,13 +535,18 @@ def _remembered_loaded_skills(session_id):
         return set()
 
 
-def _remember_loaded_skill_facts(session_id, observed):
-    remembered = _remembered_loaded_skills(session_id)
+def _finalize_skill_facts(session_id, loaded, observed=None):
+    """Keep the active context window separate from the lifetime session count."""
+    remembered = _remembered_session_skill_slugs(session_id)
     current = {
-        slug for slug in (observed or set())
+        slug for slug in (loaded or set())
         if _skill_policy_valid_slug(slug)
     }
-    missing = sorted(current - remembered)
+    session_observed = {
+        slug for slug in (observed if observed is not None else current)
+        if _skill_policy_valid_slug(slug)
+    }
+    missing = sorted(session_observed - remembered)
     if session_id and missing:
         path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
             str(session_id).encode('utf-8', 'replace')
@@ -550,10 +560,10 @@ def _remember_loaded_skill_facts(session_id, observed):
                 os.close(fd)
             remembered.update(missing)
         except OSError:
-            remembered.update(current)
+            remembered.update(session_observed)
     else:
-        remembered.update(current)
-    return {'loaded': remembered, 'session_count': len(remembered)}
+        remembered.update(session_observed)
+    return {'loaded': current, 'session_count': len(remembered)}
 
 
 def _claim_skill_injection_turn(event):
@@ -644,23 +654,80 @@ def _skill_policy_output_delivered(output):
 
 def _skill_policy_loaded_facts(event):
     conversation = event.get('conversation_id')
-    names = set()
+    if not conversation:
+        return _finalize_skill_facts('', set())
+    digest = hashlib.sha256(str(conversation).encode('utf-8', 'replace')).hexdigest()
+    target = SKILL_POLICY_STATE_ROOT / 'cursor-windows' / f'{digest}.json'
+    state = {'turns': [], 'loads': {}}
+    try:
+        saved = json.loads(target.read_text(encoding='utf-8'))
+        if isinstance(saved, dict):
+            turns = saved.get('turns')
+            loads = saved.get('loads')
+            if isinstance(turns, list) and isinstance(loads, dict):
+                state['turns'] = [item for item in turns if isinstance(item, str) and item][-2048:]
+                state['loads'] = {
+                    slug: turn for slug, turn in loads.items()
+                    if _skill_policy_valid_slug(slug) and isinstance(turn, str) and turn
+                }
+    except (OSError, ValueError, TypeError):
+        pass
+
+    events = []
     try:
         for row in load_existing_logs():
             logged = row.get('event') if isinstance(row, dict) else None
-            if not isinstance(logged, dict) or logged.get('hook_event_name') != 'beforeReadFile':
+            if not isinstance(logged, dict):
                 continue
             if conversation and logged.get('conversation_id') != conversation:
                 continue
-            name = _skill_name_from_path(logged.get('file_path'), logged.get('workspace_roots'))
-            if isinstance(name, str) and name.startswith(UNBOUND_SKILL_PREFIX):
-                names.add(name)
+            events.append(logged)
     except Exception:
         pass
-    return _remember_loaded_skill_facts(
-        conversation,
-        {name[len(UNBOUND_SKILL_PREFIX):] for name in names},
-    )
+    if event.get('hook_event_name') == 'beforeSubmitPrompt':
+        events.append(event)
+
+    turns = state['turns']
+    loads = state['loads']
+    known_turns = set(turns)
+    for logged in events:
+        generation = logged.get('generation_id')
+        if not isinstance(generation, str) or not generation:
+            continue
+        if logged.get('hook_event_name') == 'beforeSubmitPrompt':
+            if generation not in known_turns:
+                turns.append(generation)
+                known_turns.add(generation)
+            continue
+        if logged.get('hook_event_name') != 'beforeReadFile':
+            continue
+        name = _skill_name_from_path(logged.get('file_path'), logged.get('workspace_roots'))
+        slug = name[len(UNBOUND_SKILL_PREFIX):] if isinstance(name, str) and name.startswith(UNBOUND_SKILL_PREFIX) else ''
+        if _skill_policy_valid_slug(slug):
+            loads[slug] = generation
+
+    state['turns'] = turns[-2048:]
+    retained = set(state['turns'])
+    state['loads'] = {slug: turn for slug, turn in loads.items() if turn in retained}
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(dir=str(target.parent), prefix='.window-', suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as temp_file:
+                json.dump(state, temp_file, sort_keys=True)
+            os.replace(temp_path, target)
+        except Exception:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        pass
+
+    active_turns = set(state['turns'][-(SKILL_LOADED_WINDOW + 1):])
+    loaded = {slug for slug, turn in state['loads'].items() if turn in active_turns}
+    return _finalize_skill_facts(conversation, loaded, set(state['loads']))
 
 
 def _should_report():

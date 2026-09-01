@@ -148,6 +148,9 @@ _reporting_error = False
 import urllib.request
 
 
+SKILL_LOADED_WINDOW = 10
+
+
 def _skill_policy_valid_slug(value):
     return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
 
@@ -169,7 +172,9 @@ def _managed_skill_dirs():
 
 def _managed_skill_slug(directory):
     name = directory.name
-    slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else name
+    if not name.startswith(UNBOUND_SKILL_PREFIX):
+        return None
+    slug = name[len(UNBOUND_SKILL_PREFIX):]
     return slug if _skill_policy_valid_slug(slug) else None
 
 
@@ -541,7 +546,7 @@ def _cleanup_skill_policy_state():
         pass
 
 
-def _remembered_loaded_skills(session_id):
+def _remembered_session_skill_slugs(session_id):
     if not session_id:
         return set()
     path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
@@ -558,13 +563,18 @@ def _remembered_loaded_skills(session_id):
         return set()
 
 
-def _remember_loaded_skill_facts(session_id, observed):
-    remembered = _remembered_loaded_skills(session_id)
+def _finalize_skill_facts(session_id, loaded, observed=None):
+    """Keep the active context window separate from the lifetime session count."""
+    remembered = _remembered_session_skill_slugs(session_id)
     current = {
-        slug for slug in (observed or set())
+        slug for slug in (loaded or set())
         if _skill_policy_valid_slug(slug)
     }
-    missing = sorted(current - remembered)
+    session_observed = {
+        slug for slug in (observed if observed is not None else current)
+        if _skill_policy_valid_slug(slug)
+    }
+    missing = sorted(session_observed - remembered)
     if session_id and missing:
         path = SKILL_POLICY_STATE_ROOT / 'loaded' / hashlib.sha256(
             str(session_id).encode('utf-8', 'replace')
@@ -578,10 +588,10 @@ def _remember_loaded_skill_facts(session_id, observed):
                 os.close(fd)
             remembered.update(missing)
         except OSError:
-            remembered.update(current)
+            remembered.update(session_observed)
     else:
-        remembered.update(current)
-    return {'loaded': remembered, 'session_count': len(remembered)}
+        remembered.update(session_observed)
+    return {'loaded': current, 'session_count': len(remembered)}
 
 
 def _claim_skill_injection_turn(event):
@@ -756,22 +766,28 @@ def _skill_policy_loaded_facts(event):
     session_id = _skill_policy_session_id(event)
     transcript = _copilot_transcript_path(event)
     if not isinstance(transcript, str) or not transcript:
-        return _remember_loaded_skill_facts(session_id, set())
-    names = set()
+        return _finalize_skill_facts(session_id, set())
+    loaded = set()
+    observed = set()
     try:
         with open(transcript, 'rb') as transcript_file:
-            transcript_file.seek(0, os.SEEK_END)
-            size = transcript_file.tell()
-            transcript_file.seek(max(0, size - 1024 * 1024))
-            if size > 1024 * 1024:
-                transcript_file.readline()
             lines = transcript_file.readlines()
-        for raw in lines:
+        turns = 0
+        in_window = True
+        for raw in reversed(lines):
             try:
                 entry = json.loads(raw)
             except Exception:
                 continue
-            if not isinstance(entry, dict) or entry.get('type') != 'skill.invoked':
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get('type')
+            if entry_type == 'assistant.turn_start':
+                turns += 1
+                if turns > SKILL_LOADED_WINDOW:
+                    in_window = False
+                continue
+            if entry_type != 'skill.invoked':
                 continue
             data = entry.get('data')
             if not isinstance(data, dict):
@@ -780,13 +796,12 @@ def _skill_policy_loaded_facts(event):
                          if isinstance(data.get(key), str) and data.get(key)), '')
             slug = name[len(UNBOUND_SKILL_PREFIX):] if name.startswith(UNBOUND_SKILL_PREFIX) else ''
             if _skill_policy_valid_slug(slug):
-                names.add(name)
+                observed.add(slug)
+                if in_window:
+                    loaded.add(slug)
     except OSError:
         pass
-    return _remember_loaded_skill_facts(
-        session_id,
-        {name[len(UNBOUND_SKILL_PREFIX):] for name in names},
-    )
+    return _finalize_skill_facts(session_id, loaded, observed)
 
 
 def _skill_roots(cwd):
@@ -2833,6 +2848,17 @@ def transform_response_for_copilot_transformed_prompt(event, api_response):
     return {'modifiedTransformedPrompt': f"{context}\n\n{transformed}"}
 
 
+def _copilot_event_name(event):
+    name = event.get('hook_event_name') or event.get('hookEventName')
+    if name:
+        return name
+    # Copilot 1.0.82 omits the event-name field from userPromptTransformed,
+    # while still sending both the original and transformed prompt fields.
+    if isinstance(event.get('transformedPrompt'), str) and isinstance(event.get('prompt'), str):
+        return 'userPromptTransformed'
+    return None
+
+
 def process_pre_tool_use(event, api_key):
     """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them."""
     gate = _repo_gate_evaluate(event)
@@ -3091,7 +3117,7 @@ def _take_copilot_prompt_plan(event):
     except OSError:
         return False, None
     except Exception:
-        return True, {}
+        return False, None
     prompt = event.get('prompt') or ''
     prompt_hash = hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest()
     if not isinstance(stored, dict) or stored.get('prompt_sha256') != prompt_hash:
@@ -3106,9 +3132,9 @@ def _take_copilot_prompt_plan(event):
     try:
         claimed = json.loads(claim.read_text(encoding='utf-8'))
         value = claimed.get('plan') if isinstance(claimed, dict) else None
-        return True, value if isinstance(value, dict) else {}
+        return (True, value) if isinstance(value, dict) else (False, None)
     except Exception:
-        return True, {}
+        return False, None
     finally:
         try:
             claim.unlink()
@@ -4901,7 +4927,7 @@ def main():
             print("{}")
             return
 
-        event_name = event.get('hook_event_name') or event.get('hookEventName')
+        event_name = _copilot_event_name(event)
 
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
