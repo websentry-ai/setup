@@ -639,12 +639,40 @@ def _codex_selected_skill_slugs(payload):
     }
 
 
+def _codex_post_tool_skill_slugs(event):
+    if event.get('hook_event_name') != 'PostToolUse' or event.get('tool_name') != 'Bash':
+        return set()
+    tool_input = event.get('tool_input')
+    command = tool_input.get('command') if isinstance(tool_input, dict) else None
+    response = event.get('tool_response')
+    if isinstance(response, dict):
+        response = response.get('stdout') or response.get('content')
+    if not isinstance(command, str) or not isinstance(response, str):
+        return set()
+    if len(response.encode('utf-8', 'replace')) > 2 * 1024 * 1024:
+        return set()
+
+    observed = set()
+    for directory in _managed_skill_dirs():
+        slug = _managed_skill_slug(directory)
+        skill_path = directory / 'SKILL.md'
+        if not slug or str(skill_path) not in command:
+            continue
+        try:
+            content = skill_path.read_text(encoding='utf-8')
+        except (OSError, UnicodeError):
+            continue
+        if content and content in response:
+            observed.add(slug)
+    return observed
+
+
 def _skill_policy_loaded_facts(event):
     session_id = event.get('session_id')
     transcript = event.get('transcript_path')
+    observed = _codex_post_tool_skill_slugs(event)
     if not isinstance(transcript, str) or not transcript or transcript == 'undefined':
-        return _remember_loaded_skill_facts(session_id, set())
-    observed = set()
+        return _remember_loaded_skill_facts(session_id, observed)
     try:
         with open(transcript, 'rb') as transcript_file:
             transcript_file.seek(0, os.SEEK_END)
@@ -3936,6 +3964,9 @@ def main():
         }
 
         append_to_audit_log(log_entry)
+
+        if hook_event_name == 'PostToolUse' and session_id:
+            _skill_policy_loaded_facts(event)
 
         if hook_event_name == 'Stop' and session_id:
             process_stop_event(event, api_key)

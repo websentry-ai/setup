@@ -393,6 +393,53 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertEqual(facts["loaded"], set())
         self.assertEqual(facts["session_count"], 0)
 
+    def test_codex_reports_a_completed_managed_skill_read_as_loaded(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            (skill / "SKILL.md").write_text(body)
+            event = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Bash",
+                "tool_input": {"command": f"cat {skill / 'SKILL.md'}"},
+                "tool_response": body,
+            }
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
+                    patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = codex._skill_policy_loaded_facts(event)
+                remembered = codex._skill_policy_loaded_facts({"session_id": "s1"})
+
+        self.assertEqual(facts["loaded"], {"secure-sql"})
+        self.assertEqual(remembered, facts)
+
+    def test_codex_does_not_trust_skill_path_without_body_in_tool_response(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            (skill / "SKILL.md").write_text(body)
+            event = {
+                "hook_event_name": "PostToolUse",
+                "session_id": "s1",
+                "tool_name": "Bash",
+                "tool_input": {"command": f"echo {skill / 'SKILL.md'}"},
+                "tool_response": str(skill / "SKILL.md"),
+            }
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
+                    patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
+                facts = codex._skill_policy_loaded_facts(event)
+
+        self.assertEqual(facts["loaded"], set())
+        self.assertEqual(facts["session_count"], 0)
+
     def test_user_prompt_skill_facts_include_the_project_directory(self):
         cases = (
             (
