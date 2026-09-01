@@ -2,6 +2,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -109,6 +110,29 @@ def test_windows_discovery_download_uses_system_curl(windows_hook, monkeypatch):
 
     assert len(run_calls) == 1
     assert run_calls[0][0][0] == r"C:\Windows\System32\curl.exe"
+    assert len(calls) == 1
+
+
+def test_dispatch_claim_recovers_from_permission_error(windows_hook, monkeypatch):
+    hook, calls, _install_ps1 = windows_hook
+    marker = hook.DISCOVERY_DISPATCH_PATH
+    marker.write_text("", encoding="utf-8")
+    os.utime(marker, (0, 0))
+
+    real_open = os.open
+    denied = []
+
+    def deny_first_claim(path, *args, **kwargs):
+        if str(path) == str(marker) and not denied:
+            denied.append(True)
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(hook.os, "open", deny_first_claim)
+
+    hook._dispatch_discovery()
+
+    assert denied
     assert len(calls) == 1
 
 
