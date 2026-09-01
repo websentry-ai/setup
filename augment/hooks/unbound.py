@@ -1344,6 +1344,11 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
+    # Copilot ships built-in MCP servers (github-mcp-server, playwright, fetch,
+    # time) with no on-disk config; the hook tags them so they fingerprint by name.
+    if safe_additional_data.get('scope') == 'copilot-builtin' and safe_name:
+        return f'copilot-builtin:{safe_name.lower()}'
+
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
     if not command and not url and not safe_args:
