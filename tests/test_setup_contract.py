@@ -179,3 +179,39 @@ class TestEveryForceRequestReader:
         module = load_module(relpath)
         assert self._read(module, {"force_backfill_requested_epoch": 1787893680},
                           code=500) == (None, None)
+
+
+MDM_BACKFILLERS = [s for s in BACKFILLERS if "/mdm/" in s]
+
+
+class TestCollectorShapeMatchesEveryUnpacker:
+    """The managed collector is unpacked by the installer AND by the packaged
+    `unbound-hook backfill --dry-run`. Both must agree on how many values it
+    returns, or the odd one out raises ValueError at runtime."""
+
+    @staticmethod
+    def _return_arities(path, fn_name):
+        import ast
+        tree = ast.parse((REPO / path).read_text(encoding="utf-8"))
+        fn = next(n for n in ast.walk(tree)
+                  if isinstance(n, ast.FunctionDef) and n.name == fn_name)
+        return {len(n.value.elts) if isinstance(n.value, ast.Tuple) else 1
+                for n in ast.walk(fn) if isinstance(n, ast.Return) and n.value is not None}
+
+    @pytest.mark.parametrize("relpath", MDM_BACKFILLERS)
+    def test_every_exit_returns_the_same_number_of_values(self, relpath):
+        # An early return that is one value short is invisible until a device hits
+        # exactly that path, and its ValueError aborts the whole run.
+        arities = self._return_arities(relpath, "_backfill_collect_sessions")
+        assert arities == {3}, f"{relpath}: mixed arities {sorted(arities)}"
+
+    def test_the_packaged_dry_run_unpacks_what_the_collectors_return(self):
+        import ast
+        path = "binary/src/unbound_hook/backfill_cmd.py"
+        src = (REPO / path).read_text(encoding="utf-8")
+        targets = [n.targets[0] for n in ast.walk(ast.parse(src))
+                   if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Tuple)
+                   and isinstance(n.value, ast.Name) and n.value.id == "result"]
+        assert targets, f"{path}: no `<tuple> = result` unpack found — did it get renamed?"
+        for t in targets:
+            assert len(t.elts) == 3, f"{path}: unpacks {len(t.elts)}, collectors return 3"
