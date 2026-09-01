@@ -78,21 +78,17 @@ EXCHANGE_NATIVE_TOOLS = {'Delete'}            # postToolUse → included in exch
 SKILL_SEARCH_DIRS = (('.cursor', 'skills'), ('.agents', 'skills'),
                      ('.claude', 'skills'), ('.codex', 'skills'))
 
-# ── skill-injection policy (org-managed skills) ───────────────────────────────
-# Cursor reads personal skills from ~/.cursor/skills. Its own managed store is a
-# separate root, ~/.cursor/skills-cursor, which we never touch.
+# Cursor's own managed store is a separate root (~/.cursor/skills-cursor); never touch it.
 CURSOR_SKILLS_ROOT = Path.home() / '.cursor' / 'skills'
 UNBOUND_SKILL_PREFIX = 'unbound-'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
-# Suffixed per tool: the lock guards ONE skills root, and Cursor's is not Claude
-# Code's. A shared lock would make either tool's reconcile a silent no-op while
-# the other held it.
+# A shared lock across tools would make one reconcile a silent no-op while the
+# other held it, and each tool guards a different skills root.
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync-cursor.lock'
 INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn-cursor'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 20
-SKILL_LOADED_WINDOW = 10
-# Cursor's own wording, written by Cursor into the prompt it sends the model.
+SKILL_LOADED_WINDOW_PROMPTS = 10
 ATTACHED_SKILLS_MARKER = '<manually_attached_skills>'
 ATTACHED_SKILL_NAME_RE = re.compile(r'^Skill Name:[ \t]*(\S+)', re.MULTILINE)
 SKILL_READ_TOOLS = {'Read', 'ReadFile'}
@@ -505,16 +501,16 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
 
 def _safe_skill_segment(value):
     """A path segment safe to join: no traversal, no separators, no glob
-    metacharacters, and nothing Windows reads as a drive or UNC root."""
+    metacharacters, and nothing Windows reads as a drive or UNC root, which
+    joinpath would treat as absolute and use to escape containment."""
     return bool(value) and '/' not in value and '\\' not in value \
         and '..' not in value and ':' not in value \
         and not any(ch in value for ch in '*?[')
 
 
 def _attached_skill_names(text):
-    """Skills Cursor inlined into the prompt under <manually_attached_skills>.
-    Cursor writes that block itself, and it tells the model the body is already
-    inlined — so an attached skill loads with no file read for us to see."""
+    """Cursor inlines an attached skill's body into the prompt itself, so an
+    attached skill loads with no file read for us to see."""
     names = []
     if not isinstance(text, str) or ATTACHED_SKILLS_MARKER not in text:
         return names
@@ -524,20 +520,14 @@ def _attached_skill_names(text):
 
 
 def _loaded_slug_from_read(path):
-    """The slug when `path` is the SKILL.md of a skill we installed, else None.
-    Anchored at our own root: a read anywhere else is the agent browsing files,
-    which is most of what SKILL.md reads actually are."""
+    """Anchored at our own root: most SKILL.md reads are the agent browsing files,
+    not a load."""
     if not isinstance(path, str) or not path:
         return None
-    try:
-        parts = Path(path).parts
-    except (TypeError, ValueError):
+    candidate = Path(path)
+    if candidate.name != 'SKILL.md' or candidate.parent.parent != CURSOR_SKILLS_ROOT:
         return None
-    if len(parts) < 3 or parts[-1] != 'SKILL.md':
-        return None
-    if Path(*parts[:-2]) != CURSOR_SKILLS_ROOT:
-        return None
-    directory = parts[-2]
+    directory = candidate.parent.name
     if not directory.startswith(UNBOUND_SKILL_PREFIX):
         return None
     slug = directory[len(UNBOUND_SKILL_PREFIX):]
@@ -545,13 +535,8 @@ def _loaded_slug_from_read(path):
 
 
 def read_skill_facts(event):
-    """`loaded` is what was loaded inside the last SKILL_LOADED_WINDOW prompts;
-    `session_count` ignores the window because the file is append-only and the
-    tokens were spent either way.
-
-    Cursor loads a skill two ways and both are harness-written, never model text:
-    it inlines an attached skill into the prompt, or the agent reads the SKILL.md.
-    Cursor emits no compaction marker, so the window is prompts alone."""
+    """`loaded` is in-window; `session_count` ignores it — the tokens were spent
+    either way. Cursor emits no compaction marker, so the window is prompts alone."""
     facts = {'loaded': set(), 'session_count': 0}
     path = event.get('transcript_path')
     if not isinstance(path, str) or not path:
@@ -582,7 +567,7 @@ def read_skill_facts(event):
             # Each user record is one prompt, so it is the turn boundary. Counted
             # before its own attachments so the newest prompt stays in window.
             turns += 1
-            if turns > SKILL_LOADED_WINDOW:
+            if turns > SKILL_LOADED_WINDOW_PROMPTS:
                 in_window = False
             for part in content:
                 if not isinstance(part, dict):
@@ -658,10 +643,9 @@ def _turn_guard_write(session_id, turn_id):
 
 
 def _injection_turn_id(event):
-    """Turn identity for the injection guard. `generation_id` is one submit-to-stop
-    cycle, so it names the turn exactly. A turn without one gets no guard rather
-    than a shared id, which would suppress injection across every unnamed turn."""
-    return str(event.get('generation_id') or '')
+    """None means no guard: one shared id would suppress injection across every unnamed turn."""
+    generation_id = event.get('generation_id')
+    return str(generation_id) if generation_id else None
 
 
 def _inject_skill_slugs(inject_skills):
@@ -693,7 +677,6 @@ def _attach_skill_facts(metadata, event):
     it would re-inject on every turn for a slug we may never overwrite."""
     installed_skills = installed_skill_report()
     if not installed_skills:
-        # Nothing installed means nothing to suppress or count, so skip the read.
         return
     metadata['installed_skills'] = installed_skills
     facts = read_skill_facts(event)
@@ -877,7 +860,6 @@ def _dispatch_skills_sync(api_key):
 
 
 def prune_injected_skills(remove_skills):
-    # Only ever deletes a directory we marked, even if the gateway names another.
     try:
         for slug in remove_skills or []:
             try:
@@ -914,20 +896,21 @@ def _prompt_injection_metadata(event):
     return metadata
 
 
-def _apply_skill_actions(event, api_response, api_key, denied):
-    """The install/prune/guard side effects a policy response carries. `denied`
-    marks the TOOL_USE deny path, where the gateway only ever denies for a skill
-    this device already reported current — so there is nothing to install, only a
-    turn to claim."""
+def _claim_injection_turn(event, api_response):
+    """Remember the turn, so a second injection cannot fire inside it."""
+    if not _inject_skill_slugs(api_response.get('inject_skills')):
+        return
+    turn_id = _injection_turn_id(event)
+    if turn_id:
+        _turn_guard_write(event.get('conversation_id'), turn_id)
+
+
+def _apply_skill_response_actions(event, api_response, api_key):
+    """Prune and reconcile as the policy response asks. Installs nothing: the only
+    install path is the reconcile itself."""
     if not isinstance(api_response, dict):
         return
     try:
-        if api_response.get('inject_skills'):
-            claim = denied or api_response.get('decision') != 'deny'
-            if claim and _inject_skill_slugs(api_response.get('inject_skills')):
-                turn_id = _injection_turn_id(event)
-                if turn_id:
-                    _turn_guard_write(event.get('conversation_id'), turn_id)
         if api_response.get('remove_skills'):
             prune_lock = _skills_lock_acquire()
             if prune_lock is not None:
@@ -1346,10 +1329,9 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             ),
         }
 
-    _apply_skill_actions(
-        event, api_response, api_key,
-        denied=api_response.get('decision') in ('deny', 'block'),
-    )
+    if api_response.get('decision') in ('deny', 'block'):
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return format_hook_response(api_response)
 
 
@@ -2233,10 +2215,9 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
         if server_cfg:
             _dispatch_mcp_server_scan(mcp_server, server_cfg)
 
-    _apply_skill_actions(
-        event, api_response, api_key,
-        denied=api_response.get('decision') in ('deny', 'block'),
-    )
+    if api_response.get('decision') in ('deny', 'block'):
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return format_hook_response(api_response)
 
 
@@ -2269,7 +2250,9 @@ def process_user_prompt_submit(event, api_key):
     _cache_policies_from_response(api_response)
     # An allow carrying inject_skills is the in-turn skill instruction; it claims
     # the turn so a TOOL_USE injection cannot fire a second time inside it.
-    _apply_skill_actions(event, api_response, api_key, denied=False)
+    if api_response and api_response.get('decision') != 'deny':
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return api_response if api_response else {}
 
 
@@ -3758,9 +3741,7 @@ def main():
             # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
 
-            # Allowed, with something for the model: `additional_context` is the
-            # only channel Cursor's beforeSubmitPrompt reads on an allow. The prompt
-            # is still logged first — the turn's own record feeds the recent-prompt
+            # Logged before the print: the turn's own record feeds the recent-prompt
             # window and the interrupted-request cleanup below.
             additional_context = (response or {}).get('additionalContext')
             if additional_context and response.get('decision') != 'deny':

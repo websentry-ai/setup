@@ -91,16 +91,13 @@ SKILL_SEARCH_DIRS = (('.copilot', 'skills'), ('.github', 'skills'),
                      ('.agents', 'skills'), ('.claude', 'skills'))
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 
-# ── skill-injection policy (org-managed skills) ───────────────────────────────
-# Copilot resolves personal skills from ~/.copilot/skills and ~/.agents/skills
-# (`copilot skill --help`). We own the first only, so a skill we install is
-# never confused with one the developer dropped in the shared .agents root.
+# Copilot also reads ~/.agents/skills; we own ~/.copilot/skills only, so an
+# installed skill is never confused with one the developer dropped there.
 COPILOT_SKILLS_ROOT = _copilot_home() / 'skills'
 UNBOUND_SKILL_PREFIX = 'unbound-'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
-# Suffixed per tool: the lock guards ONE skills root, and Copilot's is not
-# Claude Code's. A shared lock would make either tool's reconcile a silent no-op
-# while the other held it.
+# A shared lock across tools would make one reconcile a silent no-op while the
+# other held it, and each tool guards a different skills root.
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync-copilot.lock'
 INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn-copilot'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
@@ -353,9 +350,8 @@ def _skill_event_name(data):
 
 
 def _copilot_transcript_path(event):
-    """The session's event stream. Only Stop carries `transcript_path`, and the
-    turn we are deciding has not reached one, so fall back to the CLI's layout:
-    <copilot home>/session-state/<session_id>/events.jsonl."""
+    """Only Stop carries `transcript_path` and this turn has not reached one, so
+    fall back to <copilot home>/session-state/<session_id>/events.jsonl."""
     for path in (event.get('transcript_path'), _transcript_path_for_session(event)):
         if isinstance(path, str) and path and os.path.exists(path):
             return path
@@ -370,12 +366,8 @@ def _copilot_transcript_path(event):
 
 
 def read_skill_facts(event):
-    """`loaded` is what was loaded inside the last SKILL_LOADED_WINDOW assistant
-    turns; `session_count` ignores the window because the file is append-only and
-    the tokens were spent either way.
-
-    Copilot emits no compaction marker, so unlike Claude Code there is no
-    boundary to stop at — the window is turns alone."""
+    """`loaded` is in-window; `session_count` ignores it — the tokens were spent
+    either way. Copilot emits no compaction marker, so the window is turns alone."""
     facts = {'loaded': set(), 'session_count': 0}
     path = _copilot_transcript_path(event)
     if not path:
@@ -409,9 +401,8 @@ def read_skill_facts(event):
         if entry_type == 'skill.invoked':
             name = _skill_event_name(data)
         elif entry_type == 'user.message':
-            # Copilot loads a skill named as `/slug` in the prompt. That token is
-            # the user's own text, never the model's, so it cannot be self-served
-            # the way an assistant message could.
+            # The `/slug` token is the user's own text, never the model's, so
+            # it cannot be self-served the way an assistant message could.
             content = data.get('content') if isinstance(data, dict) else None
             if isinstance(content, str):
                 for match in SKILL_INVOKE_RE.finditer(content):
@@ -477,11 +468,8 @@ def _turn_guard_write(session_id, turn_id):
 
 
 def _injection_turn_id(event):
-    """Turn identity for the injection guard: the timestamp of the turn's first
-    UserPromptSubmit, which main() logs before it processes the prompt. A turn the
-    log cannot name gets no guard rather than a shared one, because one id shared
-    by every unnamed turn would suppress injection across all of them."""
-    return get_turn_start_timestamp_for_session(_hook_session_id(event)) or ''
+    """None means no guard: one shared id would suppress injection across every unnamed turn."""
+    return get_turn_start_timestamp_for_session(_hook_session_id(event)) or None
 
 
 def _inject_skill_slugs(inject_skills):
@@ -513,7 +501,6 @@ def _attach_skill_facts(metadata, event):
     it would re-inject on every turn for a slug we may never overwrite."""
     installed_skills = installed_skill_report()
     if not installed_skills:
-        # Nothing installed means nothing to suppress or count, so skip the read.
         return
     metadata['installed_skills'] = installed_skills
     facts = read_skill_facts(event)
@@ -697,7 +684,6 @@ def _dispatch_skills_sync(api_key):
 
 
 def prune_injected_skills(remove_skills):
-    # Only ever deletes a directory we marked, even if the gateway names another.
     try:
         for slug in remove_skills or []:
             try:
@@ -734,20 +720,21 @@ def _prompt_injection_metadata(event):
     return metadata
 
 
-def _apply_skill_actions(event, api_response, api_key, denied):
-    """The install/prune/guard side effects a policy response carries. `denied`
-    marks the TOOL_USE deny path, where the gateway only ever denies for a skill
-    this device already reported current — so there is nothing to install, only a
-    turn to claim."""
+def _claim_injection_turn(event, api_response):
+    """Remember the turn, so a second injection cannot fire inside it."""
+    if not _inject_skill_slugs(api_response.get('inject_skills')):
+        return
+    turn_id = _injection_turn_id(event)
+    if turn_id:
+        _turn_guard_write(_hook_session_id(event), turn_id)
+
+
+def _apply_skill_response_actions(event, api_response, api_key):
+    """Prune and reconcile as the policy response asks. Installs nothing: the only
+    install path is the reconcile itself."""
     if not isinstance(api_response, dict):
         return
     try:
-        if api_response.get('inject_skills'):
-            claim = denied or api_response.get('decision') != 'deny'
-            if claim and _inject_skill_slugs(api_response.get('inject_skills')):
-                turn_id = _injection_turn_id(event)
-                if turn_id:
-                    _turn_guard_write(_hook_session_id(event), turn_id)
         if api_response.get('remove_skills'):
             prune_lock = _skills_lock_acquire()
             if prune_lock is not None:
@@ -2593,8 +2580,7 @@ def transform_response_for_copilot_prompt(api_response):
             'reason': reason
         }
 
-    # additionalContext feeds the model (a skill instruction, or the spend-limit
-    # warning); the user sees user_notice when the gateway sends one.
+    # systemMessage falls back to additionalContext when the gateway sends no user_notice.
     additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
@@ -2797,10 +2783,9 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     ):
         _dispatch_mcp_server_scan(mcp_server, scan_config)
 
-    _apply_skill_actions(
-        event, api_response, api_key,
-        denied=api_response.get('decision') == 'deny',
-    )
+    if api_response.get('decision') == 'deny':
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return transform_response_for_copilot(api_response)
 
 
@@ -2832,7 +2817,9 @@ def process_user_prompt_submit(event, api_key):
     _cache_policies_from_response(api_response)
     # An allow carrying inject_skills is the in-turn skill instruction; it claims
     # the turn so a TOOL_USE injection cannot fire a second time inside it.
-    _apply_skill_actions(event, api_response, api_key, denied=False)
+    if api_response and api_response.get('decision') != 'deny':
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return transform_response_for_copilot_prompt(api_response)
 
 

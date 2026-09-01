@@ -20,8 +20,7 @@ import pytest
 from conftest import REPO, TOOL_PY
 
 MCP_SCAN_TOOLS = ("claude-code", "cursor", "codex")  # copilot has no mcp scan
-# Every tool that reconciles org-managed skills, and the env var its detached
-# child reads the key from. augment ships no skill-injection half.
+# augment ships no skill-injection half.
 SKILLS_SYNC_KEY_ENV = {
     "claude-code": "UNBOUND_CLAUDE_API_KEY",
     "copilot": "UNBOUND_COPILOT_API_KEY",

@@ -35,14 +35,11 @@ SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
 
-# ── skill-injection policy (org-managed skills) ───────────────────────────────
-# Codex resolves personal skills from <CODEX_HOME>/skills, defaulting to ~/.codex.
 CODEX_SKILLS_ROOT = Path(os.environ.get('CODEX_HOME') or (Path.home() / '.codex')) / 'skills'
 UNBOUND_SKILL_PREFIX = 'unbound-'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
-# Suffixed per tool: the lock guards ONE skills root, and Codex's is not Claude
-# Code's. A shared lock would make either tool's reconcile a silent no-op while
-# the other held it.
+# A shared lock across tools would make one reconcile a silent no-op while the
+# other held it, and each tool guards a different skills root.
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync-codex.lock'
 INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn-codex'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
@@ -673,9 +670,7 @@ def send_to_hook_api(request_body: Dict, api_key: str) -> Dict:
 
 
 def _selected_skill_names(payload):
-    """Slugs Codex itself injected. Typing `$slug` makes the CLI append a synthetic
-    user message holding the whole SKILL.md, tagged with this content kind. Host
-    written, so model output cannot forge one."""
+    """Host-written, so model output cannot forge one."""
     names = []
     meta = payload.get('internal_chat_message_metadata_passthrough')
     kinds = meta.get('content_item_kinds') if isinstance(meta, dict) else None
@@ -685,7 +680,6 @@ def _selected_skill_names(payload):
         text = part.get('text') if isinstance(part, dict) else None
         if isinstance(text, str):
             names += SELECTED_SKILL_NAME_RE.findall(text)
-    # A `$slug` injection names skills we do not manage too; only ours count.
     return [
         name[len(UNBOUND_SKILL_PREFIX):] for name in names
         if name.startswith(UNBOUND_SKILL_PREFIX)
@@ -694,10 +688,8 @@ def _selected_skill_names(payload):
 
 
 def _read_skill_slugs(payload):
-    """Slugs whose SKILL.md this tool call read. Codex has no skill tool: unless the
-    user typed `$slug`, the agent loads a skill by reading the file with the shell,
-    and the command it picks is its own. So this matches on the one part that is
-    ours - the absolute path under our own skills root - rather than on the command."""
+    """Codex has no skill tool: the agent opens SKILL.md with a shell command of
+    its own choosing, so this matches the path under our root, not the command."""
     text = payload.get('input')
     if not isinstance(text, str) or UNBOUND_SKILL_PREFIX not in text:
         return []
@@ -708,10 +700,7 @@ def _read_skill_slugs(payload):
 
 
 def read_skill_facts(event):
-    """`loaded` is in-window and pre-compaction; `session_count` ignores both.
-
-    A compaction drops the skill body back out of context, so a load before one no
-    longer counts as loaded - the same rule Claude Code applies at its own boundary."""
+    """`loaded` is in-window and pre-compaction; `session_count` ignores both."""
     facts = {'loaded': set(), 'session_count': 0}
     path = event.get('transcript_path')
     if not isinstance(path, str) or not path or path == 'undefined':
@@ -811,10 +800,9 @@ def _turn_guard_write(session_id, turn_id):
 
 
 def _injection_turn_id(event):
-    """Turn identity for the injection guard. Codex names the turn on the event. A
-    turn without one gets no guard rather than a shared id, which would suppress
-    injection across every unnamed turn."""
-    return str(event.get('turn_id') or '')
+    """None means no guard: one shared id would suppress injection across every unnamed turn."""
+    turn_id = event.get('turn_id')
+    return str(turn_id) if turn_id else None
 
 
 def _inject_skill_slugs(inject_skills):
@@ -846,7 +834,6 @@ def _attach_skill_facts(metadata, event):
     it would re-inject on every turn for a slug we may never overwrite."""
     installed_skills = installed_skill_report()
     if not installed_skills:
-        # Nothing installed means nothing to suppress or count, so skip the read.
         return
     metadata['installed_skills'] = installed_skills
     facts = read_skill_facts(event)
@@ -1030,7 +1017,6 @@ def _dispatch_skills_sync(api_key):
 
 
 def prune_injected_skills(remove_skills):
-    # Only ever deletes a directory we marked, even if the gateway names another.
     try:
         for slug in remove_skills or []:
             try:
@@ -1051,9 +1037,7 @@ def prune_injected_skills(remove_skills):
 
 
 def get_api_key():
-    """Read the API key from env, falling back to ~/.unbound/config.json. The
-    frozen `unbound-hook sync-skills codex` path resolves this by name, and the
-    detached child inherits no shell environment of its own."""
+    """The frozen `unbound-hook sync-skills codex` path resolves this by name."""
     key = os.getenv('UNBOUND_CODEX_API_KEY')
     if key:
         return key
@@ -1084,20 +1068,21 @@ def _prompt_injection_metadata(event):
     return metadata
 
 
-def _apply_skill_actions(event, api_response, api_key, denied):
-    """The install/prune/guard side effects a policy response carries. `denied`
-    marks the TOOL_USE deny path, where the gateway only ever denies for a skill
-    this device already reported current — so there is nothing to install, only a
-    turn to claim."""
+def _claim_injection_turn(event, api_response):
+    """Remember the turn, so a second injection cannot fire inside it."""
+    if not _inject_skill_slugs(api_response.get('inject_skills')):
+        return
+    turn_id = _injection_turn_id(event)
+    if turn_id:
+        _turn_guard_write(event.get('session_id'), turn_id)
+
+
+def _apply_skill_response_actions(event, api_response, api_key):
+    """Prune and reconcile as the policy response asks. Installs nothing: the only
+    install path is the reconcile itself."""
     if not isinstance(api_response, dict):
         return
     try:
-        if api_response.get('inject_skills'):
-            claim = denied or api_response.get('decision') != 'deny'
-            if claim and _inject_skill_slugs(api_response.get('inject_skills')):
-                turn_id = _injection_turn_id(event)
-                if turn_id:
-                    _turn_guard_write(event.get('session_id'), turn_id)
         if api_response.get('remove_skills'):
             prune_lock = _skills_lock_acquire()
             if prune_lock is not None:
@@ -2164,10 +2149,9 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg)
 
-    _apply_skill_actions(
-        event, api_response, api_key,
-        denied=api_response.get('decision') == 'deny',
-    )
+    if api_response.get('decision') == 'deny':
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return transform_response_for_codex(api_response)
 
 
@@ -2200,7 +2184,9 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     _cache_policies_from_response(api_response)
     # An allow carrying inject_skills is the in-turn skill instruction; it claims
     # the turn so a TOOL_USE injection cannot fire a second time inside it.
-    _apply_skill_actions(event, api_response, api_key, denied=False)
+    if api_response and api_response.get('decision') != 'deny':
+        _claim_injection_turn(event, api_response)
+    _apply_skill_response_actions(event, api_response, api_key)
     return transform_response_for_codex_prompt(api_response)
 
 

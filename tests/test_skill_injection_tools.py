@@ -13,23 +13,18 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from tests.conftest import tool_module
 
 TOOLS = {
-    "copilot": "copilot/hooks",
-    "cursor": "cursor",
-    "codex": "codex/hooks",
+    "copilot": ("copilot/hooks", "COPILOT_SKILLS_ROOT"),
+    "cursor": ("cursor", "CURSOR_SKILLS_ROOT"),
+    "codex": ("codex/hooks", "CODEX_SKILLS_ROOT"),
 }
 
-MODULES = {name: tool_module(path) for name, path in TOOLS.items()}
-
-
-def skills_root(module):
-    for attr in ("COPILOT_SKILLS_ROOT", "CURSOR_SKILLS_ROOT", "CODEX_SKILLS_ROOT"):
-        root = getattr(module, attr, None)
-        if root is not None:
-            return root
-    raise AssertionError("tool module exposes no skills root")
+MODULES = {name: tool_module(path) for name, (path, _) in TOOLS.items()}
+ROOT_ATTR = {name: attr for name, (_, attr) in TOOLS.items()}
 
 
 def body(text="# skill\n"):
@@ -37,192 +32,182 @@ def body(text="# skill\n"):
             "sha256": hashlib.sha256(text.encode()).hexdigest()}
 
 
-class SkillsRootCase(unittest.TestCase):
-    """Points a tool's skills root at a scratch directory for the duration."""
+class Sandbox:
+    """A tool's skills root, sync lock and turn guard, all pointed at scratch."""
 
-    tool = None
-
-    def setUp(self):
-        self.module = MODULES[self.tool]
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name) / "skills"
+    def __init__(self, module, attr, base):
+        self.module = module
+        self.attr = attr
+        self.root = base / "skills"
         self.root.mkdir(parents=True)
-        self._attr = next(a for a in ("COPILOT_SKILLS_ROOT", "CURSOR_SKILLS_ROOT", "CODEX_SKILLS_ROOT")
-                          if getattr(self.module, a, None) is not None)
-        self._saved = getattr(self.module, self._attr)
-        setattr(self.module, self._attr, self.root)
-        self._lock = Path(self._tmp.name) / "sync.lock"
-        self._saved_lock = self.module.SKILLS_SYNC_LOCK_PATH
-        self.module.SKILLS_SYNC_LOCK_PATH = self._lock
-        self._guard = Path(self._tmp.name) / "turn-guard"
-        self._saved_guard = self.module.INJECTION_TURN_GUARD_DIR
-        self.module.INJECTION_TURN_GUARD_DIR = self._guard
-
-    def tearDown(self):
-        setattr(self.module, self._attr, self._saved)
-        self.module.SKILLS_SYNC_LOCK_PATH = self._saved_lock
-        self.module.INJECTION_TURN_GUARD_DIR = self._saved_guard
-        self._tmp.cleanup()
+        self.lock = base / "sync.lock"
+        self.guard = base / "turn-guard"
 
     def installed(self, slug):
         return self.root / (self.module.UNBOUND_SKILL_PREFIX + slug)
 
 
-class InstallTests(SkillsRootCase):
-    def test_installs_body_marker_and_reports_it(self):
-        self.module.install_injected_skills([body()])
-        directory = self.installed("secure-sql")
-        self.assertEqual((directory / "SKILL.md").read_text(), "# skill\n")
-        self.assertTrue((directory / self.module.UNBOUND_SKILL_MARKER).exists())
-        self.assertEqual(self.module.installed_skill_report(),
-                         [{"slug": "secure-sql", "sha256": body()["sha256"]}])
-
-    def test_leaves_no_partial_file_behind(self):
-        self.module.install_injected_skills([body()])
-        names = sorted(p.name for p in self.installed("secure-sql").iterdir())
-        self.assertEqual(names, [self.module.UNBOUND_SKILL_MARKER, "SKILL.md"])
-
-    def test_rewrites_a_stale_body(self):
-        self.module.install_injected_skills([body("old\n")])
-        self.module.install_injected_skills([body("new\n")])
-        self.assertEqual((self.installed("secure-sql") / "SKILL.md").read_text(), "new\n")
-
-    def test_never_overwrites_a_dir_we_do_not_own(self):
-        directory = self.installed("secure-sql")
-        directory.mkdir(parents=True)
-        (directory / "SKILL.md").write_text("mine\n")
-        self.module.install_injected_skills([body()])
-        self.assertEqual((directory / "SKILL.md").read_text(), "mine\n")
-
-    def test_rejects_a_traversing_slug(self):
-        entry = dict(body(), slug="../escape")
-        self.module.install_injected_skills([entry])
-        self.assertEqual(list(self.root.iterdir()), [])
-
-    def test_rejects_an_empty_body(self):
-        self.module.install_injected_skills([dict(body(), content="")])
-        self.assertEqual(list(self.root.iterdir()), [])
-
-    def test_installs_the_bytes_in_hand_over_a_wrong_wire_hash(self):
-        self.module.install_injected_skills([dict(body("real\n"), sha256="0" * 64)])
-        directory = self.installed("secure-sql")
-        self.assertEqual((directory / "SKILL.md").read_text(), "real\n")
-        self.assertEqual(self.module.installed_skill_report()[0]["sha256"],
-                         hashlib.sha256(b"real\n").hexdigest())
+@pytest.fixture(params=sorted(TOOLS), ids=sorted(TOOLS))
+def sandbox(request, tmp_path, monkeypatch):
+    module = MODULES[request.param]
+    box = Sandbox(module, ROOT_ATTR[request.param], tmp_path)
+    monkeypatch.setattr(module, box.attr, box.root)
+    monkeypatch.setattr(module, "SKILLS_SYNC_LOCK_PATH", box.lock)
+    monkeypatch.setattr(module, "INJECTION_TURN_GUARD_DIR", box.guard)
+    return box
 
 
-class PruneTests(SkillsRootCase):
-    def test_removes_only_what_we_marked(self):
-        self.module.install_injected_skills([body()])
-        self.module.prune_injected_skills(["secure-sql"])
-        self.assertFalse(self.installed("secure-sql").exists())
-
-    def test_keeps_an_unmarked_dir_of_the_same_name(self):
-        directory = self.installed("secure-sql")
-        directory.mkdir(parents=True)
-        (directory / "SKILL.md").write_text("mine\n")
-        self.module.prune_injected_skills(["secure-sql"])
-        self.assertTrue(directory.exists())
-
-    def test_rejects_a_traversing_slug(self):
-        victim = self.root.parent / "victim"
-        victim.mkdir()
-        self.module.prune_injected_skills(["../victim"])
-        self.assertTrue(victim.exists())
+def _plan(plan):
+    class Result:
+        returncode = 0
+        stdout = json.dumps(plan).encode()
+    return Result()
 
 
-class ReportTests(SkillsRootCase):
-    def test_ignores_a_dir_without_our_marker(self):
-        (self.root / "unbound-handwritten").mkdir()
-        (self.root / "unbound-handwritten" / "SKILL.md").write_text("x\n")
-        self.assertEqual(self.module.installed_skill_report(), [])
-
-    def test_empty_when_the_root_does_not_exist(self):
-        setattr(self.module, self._attr, self.root / "missing")
-        self.assertEqual(self.module.installed_skill_report(), [])
+def test_installs_body_marker_and_reports_it(sandbox):
+    sandbox.module.install_injected_skills([body()])
+    directory = sandbox.installed("secure-sql")
+    assert (directory / "SKILL.md").read_text() == "# skill\n"
+    assert (directory / sandbox.module.UNBOUND_SKILL_MARKER).exists()
+    assert sandbox.module.installed_skill_report() == [
+        {"slug": "secure-sql", "sha256": body()["sha256"]}]
 
 
-class SyncTests(SkillsRootCase):
-    def _plan(self, plan):
-        class Result:
-            returncode = 0
-            stdout = json.dumps(plan).encode()
-        return Result()
-
-    def test_applies_the_plan(self):
-        with patch.object(self.module.subprocess, "run", return_value=self._plan(
-                {"install": [body()], "remove": []})):
-            self.module._sync_skills_once("key")
-        self.assertTrue((self.installed("secure-sql") / "SKILL.md").exists())
-
-    def test_prunes_before_it_installs(self):
-        self.module.install_injected_skills([body()])
-        with patch.object(self.module.subprocess, "run", return_value=self._plan(
-                {"install": [], "remove": ["secure-sql"]})):
-            self.module._sync_skills_once("key")
-        self.assertFalse(self.installed("secure-sql").exists())
-
-    def test_a_held_lock_stops_a_second_reconcile(self):
-        self._lock.parent.mkdir(parents=True, exist_ok=True)
-        self._lock.write_text("")
-        with patch.object(self.module.subprocess, "run") as run:
-            self.module._sync_skills_once("key")
-        run.assert_not_called()
-
-    def test_releases_the_lock_when_the_call_fails(self):
-        with patch.object(self.module.subprocess, "run", side_effect=OSError("boom")):
-            self.module._sync_skills_once("key")
-        self.assertFalse(self._lock.exists())
-
-    def test_a_non_dict_plan_changes_nothing(self):
-        class Result:
-            returncode = 0
-            stdout = b'["not-a-plan"]'
-        with patch.object(self.module.subprocess, "run", return_value=Result()):
-            self.module._sync_skills_once("key")
-        self.assertEqual(list(self.root.iterdir()), [])
-
-    def test_dispatch_is_a_no_op_without_a_key(self):
-        with patch.object(self.module.subprocess, "Popen") as popen:
-            self.module._dispatch_skills_sync("")
-        popen.assert_not_called()
-
-    def test_dispatch_passes_the_key_by_env_only(self):
-        with patch.object(self.module.subprocess, "Popen") as popen:
-            self.module._dispatch_skills_sync("secret")
-        cmd, kwargs = popen.call_args[0][0], popen.call_args[1]
-        self.assertIn("--sync-skills", cmd)
-        self.assertNotIn("secret", " ".join(cmd))
-        self.assertIn("secret", kwargs["env"].values())
+def test_leaves_no_partial_file_behind(sandbox):
+    sandbox.module.install_injected_skills([body()])
+    names = sorted(f.name for f in sandbox.installed("secure-sql").iterdir())
+    assert names == [sandbox.module.UNBOUND_SKILL_MARKER, "SKILL.md"]
 
 
-class TurnGuardTests(SkillsRootCase):
-    def test_round_trips_per_session(self):
-        self.module._turn_guard_write("session-a", "turn-1")
-        self.module._turn_guard_write("session-b", "turn-9")
-        self.assertEqual(self.module._turn_guard_read("session-a"), "turn-1")
-        self.assertEqual(self.module._turn_guard_read("session-b"), "turn-9")
-
-    def test_unknown_session_reads_empty(self):
-        self.assertEqual(self.module._turn_guard_read("nobody"), "")
+def test_rewrites_a_stale_body(sandbox):
+    sandbox.module.install_injected_skills([body("old\n")])
+    sandbox.module.install_injected_skills([body("new\n")])
+    assert (sandbox.installed("secure-sql") / "SKILL.md").read_text() == "new\n"
 
 
-def _tool_case(base, tool):
-    return type(f"{base.__name__}_{tool}", (base,), {"tool": tool})
+def test_never_overwrites_a_dir_we_do_not_own(sandbox):
+    directory = sandbox.installed("secure-sql")
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("mine\n")
+    sandbox.module.install_injected_skills([body()])
+    assert (directory / "SKILL.md").read_text() == "mine\n"
 
 
-for _base in (InstallTests, PruneTests, ReportTests, SyncTests, TurnGuardTests):
-    for _tool in TOOLS:
-        globals()[f"{_base.__name__}_{_tool}"] = _tool_case(_base, _tool)
-    del globals()[_base.__name__]
-# The loop names would otherwise be collected as a bare, tool-less test class.
-del _base, _tool
+def test_install_rejects_a_traversing_slug(sandbox):
+    sandbox.module.install_injected_skills([dict(body(), slug="../escape")])
+    assert list(sandbox.root.iterdir()) == []
 
 
-class LoadedSkillsCase(unittest.TestCase):
-    """The per-tool half: what each tool writes down when a skill is loaded.
+def test_install_rejects_an_empty_body(sandbox):
+    sandbox.module.install_injected_skills([dict(body(), content="")])
+    assert list(sandbox.root.iterdir()) == []
 
-    Every fixture below is the shape a real session produced, not an invented one."""
+
+def test_installs_the_bytes_in_hand_over_a_wrong_wire_hash(sandbox):
+    sandbox.module.install_injected_skills([dict(body("real\n"), sha256="0" * 64)])
+    assert (sandbox.installed("secure-sql") / "SKILL.md").read_text() == "real\n"
+    assert (sandbox.module.installed_skill_report()[0]["sha256"]
+            == hashlib.sha256(b"real\n").hexdigest())
+
+
+def test_prune_removes_only_what_we_marked(sandbox):
+    sandbox.module.install_injected_skills([body()])
+    sandbox.module.prune_injected_skills(["secure-sql"])
+    assert not sandbox.installed("secure-sql").exists()
+
+
+def test_prune_keeps_an_unmarked_dir_of_the_same_name(sandbox):
+    directory = sandbox.installed("secure-sql")
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text("mine\n")
+    sandbox.module.prune_injected_skills(["secure-sql"])
+    assert directory.exists()
+
+
+def test_prune_rejects_a_traversing_slug(sandbox):
+    victim = sandbox.root.parent / "victim"
+    victim.mkdir()
+    sandbox.module.prune_injected_skills(["../victim"])
+    assert victim.exists()
+
+
+def test_report_ignores_a_dir_without_our_marker(sandbox):
+    (sandbox.root / "unbound-handwritten").mkdir()
+    (sandbox.root / "unbound-handwritten" / "SKILL.md").write_text("x\n")
+    assert sandbox.module.installed_skill_report() == []
+
+
+def test_report_is_empty_when_the_root_does_not_exist(sandbox, monkeypatch):
+    monkeypatch.setattr(sandbox.module, sandbox.attr, sandbox.root / "missing")
+    assert sandbox.module.installed_skill_report() == []
+
+
+def test_sync_applies_the_plan(sandbox):
+    with patch.object(sandbox.module.subprocess, "run",
+                      return_value=_plan({"install": [body()], "remove": []})):
+        sandbox.module._sync_skills_once("key")
+    assert (sandbox.installed("secure-sql") / "SKILL.md").exists()
+
+
+def test_sync_prunes_before_it_installs(sandbox):
+    sandbox.module.install_injected_skills([body()])
+    with patch.object(sandbox.module.subprocess, "run",
+                      return_value=_plan({"install": [], "remove": ["secure-sql"]})):
+        sandbox.module._sync_skills_once("key")
+    assert not sandbox.installed("secure-sql").exists()
+
+
+def test_a_held_lock_stops_a_second_reconcile(sandbox):
+    sandbox.lock.parent.mkdir(parents=True, exist_ok=True)
+    sandbox.lock.write_text("")
+    with patch.object(sandbox.module.subprocess, "run") as run:
+        sandbox.module._sync_skills_once("key")
+    run.assert_not_called()
+
+
+def test_sync_releases_the_lock_when_the_call_fails(sandbox):
+    with patch.object(sandbox.module.subprocess, "run", side_effect=OSError("boom")):
+        sandbox.module._sync_skills_once("key")
+    assert not sandbox.lock.exists()
+
+
+def test_a_non_dict_plan_changes_nothing(sandbox):
+    class Result:
+        returncode = 0
+        stdout = b'["not-a-plan"]'
+    with patch.object(sandbox.module.subprocess, "run", return_value=Result()):
+        sandbox.module._sync_skills_once("key")
+    assert list(sandbox.root.iterdir()) == []
+
+
+def test_dispatch_is_a_no_op_without_a_key(sandbox):
+    with patch.object(sandbox.module.subprocess, "Popen") as popen:
+        sandbox.module._dispatch_skills_sync("")
+    popen.assert_not_called()
+
+
+def test_dispatch_passes_the_key_by_env_only(sandbox):
+    with patch.object(sandbox.module.subprocess, "Popen") as popen:
+        sandbox.module._dispatch_skills_sync("secret")
+    cmd, kwargs = popen.call_args[0][0], popen.call_args[1]
+    assert "--sync-skills" in cmd
+    assert "secret" not in " ".join(cmd)
+    assert "secret" in kwargs["env"].values()
+
+
+def test_turn_guard_round_trips_per_session(sandbox):
+    sandbox.module._turn_guard_write("session-a", "turn-1")
+    sandbox.module._turn_guard_write("session-b", "turn-9")
+    assert sandbox.module._turn_guard_read("session-a") == "turn-1"
+    assert sandbox.module._turn_guard_read("session-b") == "turn-9"
+
+
+def test_turn_guard_unknown_session_reads_empty(sandbox):
+    assert sandbox.module._turn_guard_read("nobody") == ""
+
+
+class LoadedSkillsCase:
+    """Every fixture below is the shape a real session produced, not an invented one."""
 
     tool = None
 
@@ -247,7 +232,7 @@ class LoadedSkillsCase(unittest.TestCase):
         return sorted(self.facts(**event)["loaded"])
 
 
-class CopilotLoadedTests(LoadedSkillsCase):
+class CopilotLoadedTests(LoadedSkillsCase, unittest.TestCase):
     tool = "copilot"
 
     TURN = {"type": "assistant.turn_start", "data": {}}
@@ -294,7 +279,7 @@ class CopilotLoadedTests(LoadedSkillsCase):
         self.assertEqual(sorted(facts["loaded"]), ["secure-sql"])
 
 
-class CursorLoadedTests(LoadedSkillsCase):
+class CursorLoadedTests(LoadedSkillsCase, unittest.TestCase):
     tool = "cursor"
 
     def setUp(self):
@@ -352,7 +337,7 @@ class CursorLoadedTests(LoadedSkillsCase):
         self.assertEqual(self.module.read_skill_facts({}), {"loaded": set(), "session_count": 0})
 
 
-class CodexLoadedTests(LoadedSkillsCase):
+class CodexLoadedTests(LoadedSkillsCase, unittest.TestCase):
     tool = "codex"
 
     def setUp(self):
@@ -431,6 +416,3 @@ class CodexLoadedTests(LoadedSkillsCase):
     def test_undefined_transcript_path_is_no_facts(self):
         self.assertEqual(self.module.read_skill_facts({"transcript_path": "undefined"}),
                          {"loaded": set(), "session_count": 0})
-
-
-del LoadedSkillsCase

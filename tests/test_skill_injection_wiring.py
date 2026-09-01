@@ -164,7 +164,6 @@ def _run(tool, payload, home, gateway_url):
 
 
 def _reconcile(tool, home, gateway_url):
-    """SessionStart, then wait for the detached child to land the body."""
     _run(tool, tool["session_start"], home, gateway_url)
     skills = home / tool["skills_rel"]
     body = skills / "unbound-secure-sql" / "SKILL.md"
