@@ -543,3 +543,104 @@ class TestMatcherParityAcrossTrees(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestResolveClaudeConfigDir(unittest.TestCase):
+    """CLAUDE_CONFIG_DIR env > --config-dir arg > ~/.claude."""
+
+    def test_env_beats_arg_and_home(self):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
+        self.assertEqual(result, Path(os.path.abspath("/env/cc")))
+
+    def test_arg_used_when_no_env(self):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
+        self.assertEqual(result, Path(os.path.abspath("/arg/cc")))
+
+    def test_env_used_when_no_arg(self):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "/env/cc"}):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path(os.path.abspath("/env/cc")))
+
+    def test_home_default_when_arg_and_env_absent(self):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path.home() / ".claude")
+
+    def test_relative_value_is_absolutized(self):
+        result = setup._resolve_claude_config_dir(["x", "--config-dir", "rel/cc"])
+        self.assertEqual(result, Path(os.path.abspath("rel/cc")))
+
+    def test_leading_tilde_stays_literal(self):
+        # Claude Code creates a literal "~" directory rather than expanding it,
+        # so expanding here would install where Claude never looks.
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "~/cc"}):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path(os.path.abspath("~/cc")))
+        self.assertNotEqual(result, Path.home() / "cc")
+
+    def test_blank_env_falls_back_to_home(self):
+        with patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": "   "}):
+            result = setup._resolve_claude_config_dir(["x"])
+        self.assertEqual(result, Path.home() / ".claude")
+
+    def test_equals_form_of_config_dir_arg(self):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir=/arg/cc"])
+        self.assertEqual(result, Path(os.path.abspath("/arg/cc")))
+
+    def test_arg_without_env_still_resolves_to_the_arg(self):
+        # The install honours --config-dir, but Claude Code keys off the env var
+        # alone, so main() warns that these hooks will not be read.
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True):
+            result = setup._resolve_claude_config_dir(["x", "--config-dir", "/arg/cc"])
+        self.assertEqual(result, Path(os.path.abspath("/arg/cc")))
+
+
+
+class TestInstallUnderResolvedDir(unittest.TestCase):
+    """Hooks + settings + baked command must land under the resolved config dir."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.home = Path(self.tmp) / "home"
+        self.home.mkdir(parents=True)
+        self.config_dir = Path(self.tmp) / "custom-cc"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_settings_and_hook_command_under_config_dir(self):
+        with patch.object(Path, "home", staticmethod(lambda: self.home)), \
+             patch.object(setup, "download_file", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+            self.assertTrue(setup.setup_hooks(config_dir=self.config_dir))
+            self.assertTrue(setup.configure_claude_settings(config_dir=self.config_dir))
+
+        hook_path = self.config_dir / "hooks" / "unbound.py"
+        settings_path = self.config_dir / "settings.json"
+        self.assertTrue(hook_path.exists())
+        self.assertTrue(settings_path.exists())
+        settings = json.loads(settings_path.read_text())
+        cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, str(hook_path))
+        self.assertNotIn(str(self.home / ".claude"), cmd)
+
+    def test_backward_compat_no_env_uses_home_claude(self):
+        env = {k: v for k, v in os.environ.items() if k != "CLAUDE_CONFIG_DIR"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(Path, "home", staticmethod(lambda: self.home)), \
+             patch.object(setup, "download_file", lambda url, dest: dest.parent.mkdir(parents=True, exist_ok=True) or dest.write_text("# hook") or True):
+            config_dir = setup._resolve_claude_config_dir(["x"])
+            self.assertTrue(setup.setup_hooks(config_dir=config_dir))
+            self.assertTrue(setup.configure_claude_settings(config_dir=config_dir))
+
+        hook_path = self.home / ".claude" / "hooks" / "unbound.py"
+        self.assertTrue(hook_path.exists())
+        settings = json.loads((self.home / ".claude" / "settings.json").read_text())
+        cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, str(hook_path))
