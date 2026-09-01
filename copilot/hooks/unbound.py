@@ -18,7 +18,7 @@ import re
 import sqlite3
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 def _copilot_home():
@@ -2428,6 +2428,9 @@ def _get_git_origin_org_repo(cwd):
     path = _github_remote_path(url)
     if not path:
         return (None, None)
+    # Repo/org names can contain spaces (e.g. Azure DevOps); the URL path
+    # arrives percent-encoded, so decode before splitting into org/repo.
+    path = unquote(path)
     parts = path.split('/')
     if len(parts) < 2:
         return (None, None)

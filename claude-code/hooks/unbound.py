@@ -14,7 +14,7 @@ import re
 import shutil
 import tempfile
 import platform
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -3452,6 +3452,10 @@ def _get_git_origin_org_repo(cwd: str) -> tuple:
         return (None, None)
     org = _parse_github_org(url)
     repo = _parse_github_repo(url)
+    # Repo/org names can contain spaces (e.g. Azure DevOps); they arrive
+    # percent-encoded in the remote URL, so decode to the human form.
+    org = unquote(org) if org else org
+    repo = unquote(repo) if repo else repo
     return (org.lower() if org else None, repo.lower() if repo else None)
 
 
