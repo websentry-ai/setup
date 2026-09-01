@@ -30,10 +30,6 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
-DISCOVERY_WINDOWS_STATE_DIR = Path(tempfile.gettempdir()) / "unbound"
-DISCOVERY_WINDOWS_CACHE_PATH = DISCOVERY_WINDOWS_STATE_DIR / "discovery-cache.json"
-DISCOVERY_WINDOWS_LOCK_PATH = DISCOVERY_WINDOWS_STATE_DIR / "discovery.lock"
-DISCOVERY_WINDOWS_DISPATCH_PATH = DISCOVERY_WINDOWS_STATE_DIR / "discovery.dispatch.lock"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
@@ -3016,44 +3012,6 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-def _discovery_state_paths():
-    """Match discovery's %TEMP% fallback when MDM owns ~/.unbound on Windows."""
-    home_paths = (
-        DISCOVERY_CACHE_PATH,
-        DISCOVERY_LOCK_PATH,
-        DISCOVERY_DISPATCH_PATH,
-    )
-    if not _is_windows():
-        return home_paths
-
-    windows_paths = (
-        DISCOVERY_WINDOWS_CACHE_PATH,
-        DISCOVERY_WINDOWS_LOCK_PATH,
-        DISCOVERY_WINDOWS_DISPATCH_PATH,
-    )
-    last_error = None
-    for paths in (home_paths, windows_paths):
-        state_dir = paths[0].parent
-        probe_path = None
-        try:
-            state_dir.mkdir(parents=True, exist_ok=True)
-            fd, probe_path = tempfile.mkstemp(
-                dir=str(state_dir), prefix=".discovery-state.", suffix=".tmp"
-            )
-            os.close(fd)
-            return paths
-        except OSError as exc:
-            last_error = exc
-        finally:
-            if probe_path is not None:
-                try:
-                    os.unlink(probe_path)
-                except OSError:
-                    pass
-
-    raise OSError("no writable discovery state directory") from last_error
-
-
 def _discovery_installer():
     if _is_windows():
         return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
@@ -3139,11 +3097,10 @@ def _dispatch_mcp_server_scan(server_name, server_config):
 
 def _dispatch_discovery() -> None:
     try:
-        cache_path, lock_path, dispatch_path = _discovery_state_paths()
         cache = {}
-        if cache_path.exists():
+        if DISCOVERY_CACHE_PATH.exists():
             try:
-                with cache_path.open("r", encoding="utf-8") as f:
+                with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
                     cache = json.load(f) or {}
             except (OSError, json.JSONDecodeError):
                 cache = {}
@@ -3159,9 +3116,9 @@ def _dispatch_discovery() -> None:
             except ValueError:
                 pass
 
-        if lock_path.exists():
+        if DISCOVERY_LOCK_PATH.exists():
             try:
-                age = time.time() - lock_path.stat().st_mtime
+                age = time.time() - DISCOVERY_LOCK_PATH.stat().st_mtime
             except OSError:
                 age = DISCOVERY_STALE_LOCK_SECONDS + 1
             if age < DISCOVERY_STALE_LOCK_SECONDS:
@@ -3170,19 +3127,19 @@ def _dispatch_discovery() -> None:
         # Atomic dispatch claim — first hook to create the marker wins;
         # concurrent peers bail to avoid duplicate fork-detached Popens.
         try:
-            _dispatch_fd = os.open(str(dispatch_path),
+            _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
         except FileExistsError:
             try:
-                age = time.time() - dispatch_path.stat().st_mtime
+                age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
             except OSError:
                 age = DISCOVERY_DISPATCH_TTL_SECONDS + 1
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                dispatch_path.unlink()
-                _dispatch_fd = os.open(str(dispatch_path),
+                DISCOVERY_DISPATCH_PATH.unlink()
+                _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
             except (FileExistsError, OSError):
@@ -3252,14 +3209,14 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = cache_path.with_suffix(".tmp")
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
+            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, cache_path)
+            os.replace(tmp, DISCOVERY_CACHE_PATH)
         finally:
             try:
-                dispatch_path.unlink(missing_ok=True)
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
             except OSError:
                 pass
     except Exception as e:

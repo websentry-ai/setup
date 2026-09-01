@@ -2,7 +2,6 @@
 
 import importlib.util
 import json
-import os
 
 import pytest
 
@@ -48,25 +47,6 @@ def windows_hook(request, tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "DISCOVERY_CACHE_PATH", state_dir / "cache.json")
     monkeypatch.setattr(hook, "DISCOVERY_LOCK_PATH", state_dir / "discovery.lock")
     monkeypatch.setattr(hook, "DISCOVERY_DISPATCH_PATH", state_dir / "dispatch.lock")
-    windows_state_dir = tmp_path / "windows-temp"
-    monkeypatch.setattr(
-        hook,
-        "DISCOVERY_WINDOWS_CACHE_PATH",
-        windows_state_dir / "cache.json",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        hook,
-        "DISCOVERY_WINDOWS_LOCK_PATH",
-        windows_state_dir / "discovery.lock",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        hook,
-        "DISCOVERY_WINDOWS_DISPATCH_PATH",
-        windows_state_dir / "dispatch.lock",
-        raising=False,
-    )
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_DIR", installer_dir)
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_SH", install_sh)
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_PS1", install_ps1, raising=False)
@@ -121,26 +101,3 @@ def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):
         "--domain",
         "https://backend.example",
     ]
-
-
-def test_windows_discovery_state_falls_back_from_unwritable_home(windows_hook, monkeypatch):
-    hook, calls, _install_ps1 = windows_hook
-    home_state_dir = hook.DISCOVERY_CACHE_PATH.parent
-    real_mkstemp = hook.tempfile.mkstemp
-
-    def reject_home_probe(*args, **kwargs):
-        directory = kwargs.get("dir")
-        if directory is None and args:
-            directory = args[0]
-        if directory is not None and os.fspath(directory) == os.fspath(home_state_dir):
-            raise PermissionError(13, "Permission denied", os.fspath(home_state_dir))
-        return real_mkstemp(*args, **kwargs)
-
-    monkeypatch.setattr(hook.tempfile, "mkstemp", reject_home_probe)
-
-    hook._dispatch_discovery()
-
-    assert len(calls) == 1
-    assert hook.DISCOVERY_WINDOWS_CACHE_PATH.exists()
-    assert not hook.DISCOVERY_CACHE_PATH.exists()
-    assert not hook.DISCOVERY_WINDOWS_DISPATCH_PATH.exists()
