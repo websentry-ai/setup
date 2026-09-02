@@ -3110,9 +3110,6 @@ def _dispatch_mcp_server_scan(server_name, server_config):
         return
 
 
-DISCOVERY_MARKER_STALE_SECONDS = 60
-
-
 def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
     """None if the dir can hold discovery state, else why not. Clears a stale marker."""
     try:
@@ -3146,7 +3143,7 @@ def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]
             return "cache file unreadable"
         # A fresh marker means a peer is mid-dispatch; only a stale one must be clearable.
         marker = path / DISCOVERY_DISPATCH_PATH.name
-        if marker.exists() and (time.time() - marker.stat().st_mtime) >= DISCOVERY_MARKER_STALE_SECONDS:
+        if marker.exists() and (time.time() - marker.stat().st_mtime) >= DISCOVERY_DISPATCH_TTL_SECONDS:
             marker.unlink()
         return None
     except OSError as e:
