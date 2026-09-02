@@ -19,14 +19,6 @@ from ._resources import TOOLS
 from ._loader import load_hook_module
 
 
-SKILL_API_KEY_ENVS = {
-    "claude-code": "UNBOUND_CLAUDE_API_KEY",
-    "cursor": "UNBOUND_CURSOR_API_KEY",
-    "copilot": "UNBOUND_COPILOT_API_KEY",
-    "codex": "UNBOUND_CODEX_API_KEY",
-}
-
-
 def run(args) -> int:
     if not args or args[0] not in TOOLS:
         # Unknown/missing tool: never block the editor over a bad registration.
@@ -57,9 +49,10 @@ def run_skills_sync(args) -> int:
     try:
         module = load_hook_module(args[0])
         sync = getattr(module, "_sync_skills_once", None)
-        if sync is None:
+        read_key = getattr(module, "get_api_key", None)
+        if sync is None or read_key is None:
             return 0
-        api_key = os.getenv(SKILL_API_KEY_ENVS.get(args[0], ""))
+        api_key = read_key()
         if api_key:
             sync(api_key)
     except Exception:

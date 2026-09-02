@@ -3933,6 +3933,10 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
+def get_api_key():
+    return os.getenv('UNBOUND_CODEX_API_KEY')
+
+
 def main():
     global _cached_api_key
     api_key = os.getenv('UNBOUND_CODEX_API_KEY')

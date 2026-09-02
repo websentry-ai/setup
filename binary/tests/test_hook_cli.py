@@ -163,23 +163,21 @@ def test_module_crash_fails_open(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "{}"
 
 
-@pytest.mark.parametrize("tool,key_env", [
-    ("claude-code", "UNBOUND_CLAUDE_API_KEY"),
-    ("cursor", "UNBOUND_CURSOR_API_KEY"),
-    ("copilot", "UNBOUND_COPILOT_API_KEY"),
-    ("codex", "UNBOUND_CODEX_API_KEY"),
-])
-def test_skills_sync_reads_provider_key_from_env(monkeypatch, tool, key_env):
+@pytest.mark.parametrize("tool", ["claude-code", "cursor", "copilot", "codex"])
+def test_skills_sync_uses_provider_key_reader(monkeypatch, tool):
     from unbound_hook import hook_cmd
 
     calls = []
 
     class FakeModule:
         @staticmethod
+        def get_api_key():
+            return "test-key"
+
+        @staticmethod
         def _sync_skills_once(api_key):
             calls.append(api_key)
 
-    monkeypatch.setenv(key_env, "test-key")
     monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
 
     assert hook_cmd.run_skills_sync([tool]) == 0
