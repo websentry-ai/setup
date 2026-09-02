@@ -180,15 +180,12 @@ class TestResolveVscodeMcp(unittest.TestCase):
              {"additional_data": {"scope": "copilot-builtin"}}),
         )
 
-    def test_unseeded_builtins_are_not_tagged(self):
-        for raw, server, tool in (
-            ("fetch-fetch_url", "fetch", "fetch_url"),
-            ("time-get_current_time", "time", "get_current_time"),
-        ):
+    def test_fetch_and_time_are_not_builtins(self):
+        for raw in ("fetch-fetch_url", "time-get_current_time"):
             with self.subTest(raw=raw):
                 self.assertEqual(
                     unbound.resolve_copilot_mcp(raw, {}),
-                    (server, tool, None),
+                    (None, None, None),
                 )
 
     def test_configured_github_wins_over_builtin_shortcut(self):

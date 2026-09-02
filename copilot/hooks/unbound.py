@@ -1808,10 +1808,9 @@ def _sanitize_copilot_server_name(name):
 # and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
 # false-positive relabels of unrelated tools sharing a server's prefix.
 _MCP_NAME_SEPARATORS = ('__', '-')
-_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright', 'fetch', 'time')
-# Only names with a seeded canonical-group link may be scope-tagged: an unseeded
+# Only builtins with a seeded canonical-group link belong here: an unseeded
 # copilot-builtin fingerprint has no metadata row, so the gateway retry-loops forever.
-_SCOPE_TAGGED_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright')
+_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright')
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
@@ -1972,7 +1971,7 @@ def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None)
         ):
             resolved = builtin
     server, tool, config = resolved
-    if server in _SCOPE_TAGGED_BUILTIN_MCP_SERVERS and not config and server not in mcp_servers:
+    if server in _BUILTIN_MCP_SERVERS and not config and server not in mcp_servers:
         config = {'additional_data': {'scope': 'copilot-builtin'}}
     return (server, tool, config)
 
