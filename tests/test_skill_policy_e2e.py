@@ -139,7 +139,7 @@ def _wait_for(path):
 
 
 @pytest.mark.parametrize(
-    "client,start_event,skill_path,prompt_event,native_token",
+    "client,start_event,skill_path,prompt_event",
     [
         (
             "codex",
@@ -147,7 +147,6 @@ def _wait_for(path):
             Path(".agents/skills/unbound-secure-sql/SKILL.md"),
             {"hook_event_name": "UserPromptSubmit", "session_id": "s1", "turn_id": "t1",
              "prompt": "Write a database query."},
-            "$unbound-secure-sql",
         ),
         (
             "cursor",
@@ -155,12 +154,11 @@ def _wait_for(path):
             Path(".cursor/skills/unbound-secure-sql/SKILL.md"),
             {"hook_event_name": "beforeSubmitPrompt", "conversation_id": "s1", "generation_id": "g1",
              "prompt": "Write a database query."},
-            "/unbound-secure-sql",
         ),
     ],
 )
-def test_session_sync_then_native_prompt_injection(
-    tmp_path, gateway, client, start_event, skill_path, prompt_event, native_token
+def test_session_sync_then_prompt_injection(
+    tmp_path, gateway, client, start_event, skill_path, prompt_event
 ):
     home = tmp_path / client
     home.mkdir()
@@ -175,7 +173,9 @@ def test_session_sync_then_native_prompt_injection(
     assert prompted.returncode == 0, prompted.stderr
     if client == "codex":
         output = json.loads(prompted.stdout)
-        assert native_token in output["hookSpecificOutput"]["additionalContext"]
+        assert output["hookSpecificOutput"]["additionalContext"] == (
+            "Invoke the skill unbound-secure-sql before answering."
+        )
     else:
         # Cursor cannot mutate prompt context. It carries the instruction to the
         # first allowed tool hook through an atomic, one-shot pending claim.
@@ -188,7 +188,7 @@ def test_session_sync_then_native_prompt_injection(
         }, home, gateway)
         output = json.loads(tool.stdout)
         assert output["permission"] == "deny"
-        assert native_token in output["agent_message"]
+        assert output["agent_message"] == "Invoke the skill unbound-secure-sql before answering."
 
 
 def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, gateway):
@@ -229,7 +229,7 @@ def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, g
         "transformedPrompt": "Write a database query.",
     }, home, gateway)
     output = json.loads(transformed.stdout)
-    assert "/unbound-secure-sql" in output["modifiedTransformedPrompt"]
+    assert "Invoke the skill unbound-secure-sql before answering." in output["modifiedTransformedPrompt"]
     assert output["modifiedTransformedPrompt"].endswith("Write a database query.")
 
 

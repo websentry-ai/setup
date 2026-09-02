@@ -44,7 +44,6 @@ SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'codex'
 SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CODEX_API_KEY'
-SKILL_POLICY_INVOKE_PREFIX = '$'
 CODEX_SELECTED_SKILL_KIND = 'skills.selected_skill_instructions'
 CODEX_SELECTED_SKILL_NAME_RE = re.compile(r'<name>\s*([^<\s][^<]*?)\s*</name>')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
@@ -463,23 +462,6 @@ def _attach_installed_skill_facts(metadata, event=None):
         pass
 
 
-def _skill_policy_native_context(api_response):
-    if not isinstance(api_response, dict):
-        return ''
-    context = api_response.get('additionalContext')
-    context = context.strip() if isinstance(context, str) else ''
-    instructions = []
-    entries = api_response.get('inject_skills')
-    for entry in entries if isinstance(entries, list) else []:
-        slug = entry.get('slug') if isinstance(entry, dict) else None
-        if not _skill_policy_valid_slug(slug):
-            continue
-        token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}{slug}'
-        if token not in context:
-            instructions.append(f'Invoke {token} before continuing.')
-    return ' '.join(part for part in (context, ' '.join(instructions)) if part)
-
-
 def _skill_turn_claim_path(key):
     digest = hashlib.sha256(str(key).encode('utf-8', 'replace')).hexdigest()
     return SKILL_POLICY_STATE_ROOT / 'turn-claims' / digest
@@ -546,15 +528,6 @@ def _skill_policy_turn_key(event):
     return f'{session}:{turn}' if session and turn else ''
 
 
-def _skill_policy_output_delivered(output):
-    if not isinstance(output, dict):
-        return False
-    specific = output.get('hookSpecificOutput')
-    context = specific.get('additionalContext') if isinstance(specific, dict) else None
-    token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}'
-    return isinstance(context, str) and token in context
-
-
 def _codex_selected_skill_slugs(payload):
     metadata = payload.get('internal_chat_message_metadata_passthrough')
     kinds = metadata.get('content_item_kinds') if isinstance(metadata, dict) else None
@@ -603,39 +576,28 @@ def _codex_skill_slugs_from_output(command, output):
         except (OSError, UnicodeError):
             continue
         output_body = output.strip()
+        output_size = len(output_body.encode('utf-8'))
+        content_size = len(content.encode('utf-8'))
         if content in output or (
-            len(output_body.encode('utf-8')) >= 128
+            output_size >= 128
+            and output_size * 10 >= content_size * 9
             and content.startswith(output_body)
         ):
             observed.add(slug)
     return observed
 
 
-def _codex_post_tool_skill_slugs(event):
-    if event.get('hook_event_name') != 'PostToolUse' or event.get('tool_name') != 'Bash':
+def _codex_completed_command_skill_slugs(payload):
+    if not isinstance(payload, dict) or payload.get('type') != 'item_completed':
         return set()
-    tool_input = event.get('tool_input')
-    command = tool_input.get('command') if isinstance(tool_input, dict) else None
-    response = event.get('tool_response')
-    if isinstance(response, dict):
-        response = response.get('stdout') or response.get('content')
-    return _codex_skill_slugs_from_output(command, response)
-
-
-def _codex_same_turn_skill_slugs(event):
-    session_id = event.get('session_id')
-    turn_id = event.get('turn_id')
-    if not session_id or not turn_id:
+    item = payload.get('item')
+    if not isinstance(item, dict) or item.get('type') != 'CommandExecution':
         return set()
-    found = set()
-    for row in reversed(load_existing_logs()):
-        if not isinstance(row, dict) or row.get('session_id') != session_id:
-            continue
-        logged = row.get('event')
-        if not isinstance(logged, dict) or logged.get('turn_id') != turn_id:
-            continue
-        found.update(_codex_post_tool_skill_slugs(logged))
-    return found
+    command = item.get('command')
+    if isinstance(command, list):
+        command = ' '.join(str(part) for part in command)
+    output = item.get('aggregated_output') or item.get('stdout') or item.get('formatted_output')
+    return _codex_skill_slugs_from_output(command, output)
 
 
 def _codex_session_skill_slugs(transcript):
@@ -648,10 +610,15 @@ def _codex_session_skill_slugs(transcript):
                     entry = json.loads(raw)
                 except Exception:
                     continue
-                if not isinstance(entry, dict) or entry.get('type') != 'response_item':
+                if not isinstance(entry, dict):
                     continue
                 payload = entry.get('payload')
                 if not isinstance(payload, dict):
+                    continue
+                if entry.get('type') == 'event_msg':
+                    found.update(_codex_completed_command_skill_slugs(payload))
+                    continue
+                if entry.get('type') != 'response_item':
                     continue
                 payload_type = payload.get('type')
                 if payload_type == 'message' and payload.get('role') == 'user':
@@ -676,11 +643,10 @@ def _codex_session_skill_slugs(transcript):
 
 def _skill_policy_loaded_facts(event):
     transcript = event.get('transcript_path')
-    current = _codex_post_tool_skill_slugs(event) | _codex_same_turn_skill_slugs(event)
     if not isinstance(transcript, str) or not transcript or transcript == 'undefined':
-        return {'loaded': current, 'session_count': len(current)}
-    loaded = set(current)
-    session_names = set(current)
+        return {'loaded': set(), 'session_count': 0}
+    loaded = set()
+    session_names = set()
     try:
         lines = _skill_policy_transcript_tail(transcript)
         outputs = {}
@@ -704,6 +670,11 @@ def _skill_policy_loaded_facts(event):
                     turns += 1
                     if turns > SKILL_LOADED_WINDOW:
                         in_window = False
+                    continue
+                found = _codex_completed_command_skill_slugs(payload)
+                session_names.update(found)
+                if in_window:
+                    loaded.update(found)
                 continue
             if entry_type != 'response_item' or not isinstance(payload, dict):
                 continue
@@ -1313,7 +1284,7 @@ def transform_response_for_codex(api_response: Dict) -> Dict:
         return {}
 
     reason = api_response.get('reason', '') or 'Blocked by organization policy.'
-    additional_context = _skill_policy_native_context(api_response)
+    additional_context = api_response.get('additionalContext', '')
 
     hook_output = {
         'hookEventName': 'PreToolUse',
@@ -1345,7 +1316,7 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
     # warning "you've used $X of your $Y limit"): Codex hooks are
     # Claude-parity — additionalContext feeds the model, systemMessage shows
     # the same text to the user.
-    additional_context = _skill_policy_native_context(api_response)
+    additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
             'hookSpecificOutput': {
@@ -2345,6 +2316,12 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg)
 
+    if (
+        api_response.get('decision') == 'deny'
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
     _apply_skill_lifecycle_actions(api_response, api_key)
     return transform_response_for_codex(api_response)
 
@@ -2377,6 +2354,13 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
 
     api_response = send_to_hook_api(request_body, api_key)
     _cache_policies_from_response(api_response)
+    if (
+        isinstance(api_response, dict)
+        and api_response.get('decision') not in ('deny', 'block')
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
     _apply_skill_lifecycle_actions(api_response, api_key)
     return transform_response_for_codex_prompt(api_response)
 
@@ -3988,8 +3972,6 @@ def main():
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
-            if _skill_policy_output_delivered(response):
-                _claim_skill_injection_turn(event)
             return
 
         # Handle UserPromptSubmit - check policy before processing
@@ -4005,8 +3987,6 @@ def main():
                     'event': event
                 })
                 print(json.dumps(response), flush=True)
-                if _skill_policy_output_delivered(response):
-                    _claim_skill_injection_turn(event)
                 return
 
             # Allowed but with hook output to emit (e.g. the spend-limit
@@ -4019,8 +3999,6 @@ def main():
                     'event': event
                 })
                 print(json.dumps(response), flush=True)
-                if _skill_policy_output_delivered(response):
-                    _claim_skill_injection_turn(event)
                 return
 
             # If allowed, continue to log the event (output printed at end)

@@ -102,7 +102,6 @@ SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'copilot'
 SKILL_POLICY_API_KEY_ENV = 'UNBOUND_COPILOT_API_KEY'
-SKILL_POLICY_INVOKE_PREFIX = '/'
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
@@ -509,23 +508,6 @@ def _attach_installed_skill_facts(metadata, event=None):
         pass
 
 
-def _skill_policy_native_context(api_response):
-    if not isinstance(api_response, dict):
-        return ''
-    context = api_response.get('additionalContext')
-    context = context.strip() if isinstance(context, str) else ''
-    instructions = []
-    entries = api_response.get('inject_skills')
-    for entry in entries if isinstance(entries, list) else []:
-        slug = entry.get('slug') if isinstance(entry, dict) else None
-        if not _skill_policy_valid_slug(slug):
-            continue
-        token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}{slug}'
-        if token not in context:
-            instructions.append(f'Invoke {token} before continuing.')
-    return ' '.join(part for part in (context, ' '.join(instructions)) if part)
-
-
 def _skill_turn_claim_path(key):
     digest = hashlib.sha256(str(key).encode('utf-8', 'replace')).hexdigest()
     return SKILL_POLICY_STATE_ROOT / 'turn-claims' / digest
@@ -596,21 +578,6 @@ def _skill_policy_turn_key(event):
         return ''
     anchor = get_turn_start_timestamp_for_session(session_id) or event.get('promptId') or event.get('prompt_id')
     return f'{session_id}:{anchor}' if anchor else ''
-
-
-def _skill_policy_output_delivered(output):
-    if not isinstance(output, dict):
-        return False
-    token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}'
-    transformed = output.get('modifiedTransformedPrompt')
-    if isinstance(transformed, str) and token in transformed:
-        return True
-    reason = output.get('permissionDecisionReason')
-    return (
-        output.get('permissionDecision') in ('deny', 'ask')
-        and isinstance(reason, str)
-        and token in reason
-    )
 
 
 def _copilot_inventory_path(session_id):
@@ -2729,7 +2696,7 @@ def transform_response_for_copilot(api_response):
 
     decision = api_response.get('decision', 'allow')
     reason = api_response.get('reason', '')
-    additional_context = _skill_policy_native_context(api_response)
+    additional_context = api_response.get('additionalContext', '')
 
     # On 'allow', emit no decision ({}) so Copilot falls through to the user's
     # local config/rules instead of force-allowing over them. Copilot preToolUse
@@ -2764,7 +2731,7 @@ def transform_response_for_copilot_prompt(api_response):
     reason = api_response.get('reason', '')
 
     # For UserPromptSubmit, 'deny' maps to 'block'
-    if decision == 'deny':
+    if decision in ('deny', 'block'):
         return {
             'decision': 'block',
             'reason': reason
@@ -2778,8 +2745,8 @@ def transform_response_for_copilot_transformed_prompt(event, api_response):
     if not isinstance(api_response, dict):
         return {}
     if api_response.get('decision') in ('deny', 'block'):
-        return {}
-    context = _skill_policy_native_context(api_response)
+        return transform_response_for_copilot_prompt(api_response)
+    context = api_response.get('additionalContext', '')
     if not context:
         return {}
     return {'modifiedTransformedPrompt': f"{context}\n\n{transformed}"}
@@ -2981,6 +2948,12 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     ):
         _dispatch_mcp_server_scan(mcp_server, scan_config)
 
+    if (
+        api_response.get('decision') == 'deny'
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
     _apply_skill_lifecycle_actions(api_response, api_key)
     return transform_response_for_copilot(api_response)
 
@@ -4889,15 +4862,13 @@ def main():
                 gateway_response = _evaluate_user_prompt_policy(event, api_key)
             response = transform_response_for_copilot_transformed_prompt(event, gateway_response)
             print(json.dumps(response), flush=True)
-            if _skill_policy_output_delivered(response):
+            if response.get('modifiedTransformedPrompt') and gateway_response.get('inject_skills'):
                 _claim_skill_injection_turn(event)
             return
 
         if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
             print(json.dumps(response), flush=True)
-            if _skill_policy_output_delivered(response):
-                _claim_skill_injection_turn(event)
             return
 
         if event_name == 'UserPromptSubmit':

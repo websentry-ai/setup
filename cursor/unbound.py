@@ -89,7 +89,6 @@ SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
 SKILL_POLICY_TOOL = 'cursor'
 SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CURSOR_API_KEY'
-SKILL_POLICY_INVOKE_PREFIX = '/'
 POLICY_CACHE_FILE = LOG_DIR / ".policy_cache.json"
 CURSOR_MCP_CONFIG_PATH = Path.home() / ".cursor" / "mcp.json"
 CACHE_TTL_SECONDS = 300
@@ -477,23 +476,6 @@ def _attach_installed_skill_facts(metadata, event=None):
         pass
 
 
-def _skill_policy_native_context(api_response):
-    if not isinstance(api_response, dict):
-        return ''
-    context = api_response.get('additionalContext')
-    context = context.strip() if isinstance(context, str) else ''
-    instructions = []
-    entries = api_response.get('inject_skills')
-    for entry in entries if isinstance(entries, list) else []:
-        slug = entry.get('slug') if isinstance(entry, dict) else None
-        if not _skill_policy_valid_slug(slug):
-            continue
-        token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}{slug}'
-        if token not in context:
-            instructions.append(f'Invoke {token} before continuing.')
-    return ' '.join(part for part in (context, ' '.join(instructions)) if part)
-
-
 def _skill_turn_claim_path(key):
     digest = hashlib.sha256(str(key).encode('utf-8', 'replace')).hexdigest()
     return SKILL_POLICY_STATE_ROOT / 'turn-claims' / digest
@@ -558,14 +540,6 @@ def _skill_policy_turn_key(event):
     conversation = event.get('conversation_id')
     generation = event.get('generation_id')
     return f'{conversation}:{generation}' if conversation and generation else ''
-
-
-def _skill_policy_output_delivered(output):
-    if not isinstance(output, dict) or output.get('permission') != 'deny':
-        return False
-    message = output.get('agent_message')
-    token = f'{SKILL_POLICY_INVOKE_PREFIX}{UNBOUND_SKILL_PREFIX}'
-    return isinstance(message, str) and token in message
 
 
 def _skill_policy_loaded_facts(event):
@@ -1026,7 +1000,7 @@ def format_hook_response(api_response):
         return {}
     decision = api_response.get('decision', 'allow')
     reason = api_response.get('reason', '')
-    additional_context = _skill_policy_native_context(api_response)
+    additional_context = api_response.get('additionalContext', '')
     # On 'allow', emit no permission so Cursor uses its normal flow instead of the hook force-approving (keep any advisory context).
     if decision not in ('deny', 'block'):
         return {'agent_message': additional_context} if additional_context else {}
@@ -1421,6 +1395,12 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             ),
         }
 
+    if (
+        api_response.get('decision') == 'deny'
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
     _apply_skill_lifecycle_actions(api_response, api_key)
     return format_hook_response(api_response)
 
@@ -2301,6 +2281,12 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
         if server_cfg:
             _dispatch_mcp_server_scan(mcp_server, server_cfg)
 
+    if (
+        api_response.get('decision') == 'deny'
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
     _apply_skill_lifecycle_actions(api_response, api_key)
     return format_hook_response(api_response)
 
@@ -2338,7 +2324,7 @@ def process_user_prompt_submit(event, api_key):
     _cache_policies_from_response(api_response)
     _apply_skill_lifecycle_actions(api_response, api_key)
     if isinstance(api_response, dict) and api_response.get('decision') not in ('deny', 'block'):
-        context = _skill_policy_native_context(api_response)
+        context = api_response.get('additionalContext', '')
         if api_response.get('inject_skills') and isinstance(context, str) and context.strip():
             _defer_prompt_skill_context(event, context)
     return api_response if api_response else {}
@@ -2399,10 +2385,10 @@ def _with_deferred_skill_context(event, response):
     if not context:
         return response
     existing = response.get('agent_message')
-    agent_message = '\n\n'.join(
-        part for part in (existing, context)
-        if isinstance(part, str) and part.strip()
+    agent_message = existing if existing == context else '\n\n'.join(
+        part for part in (existing, context) if isinstance(part, str) and part.strip()
     )
+    _claim_skill_injection_turn(event)
     # Cursor only feeds agent_message to the model on a denied tool call.
     # Deny this first call once, then the agent invokes the skill and retries.
     return {
@@ -3903,8 +3889,6 @@ def main():
         if hook_event_name == 'preToolUse':
             response = _with_deferred_skill_context(event, process_pre_tool_use(event, api_key))
             print(json.dumps(response), flush=True)
-            if _skill_policy_output_delivered(response):
-                _claim_skill_injection_turn(event)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -3915,8 +3899,6 @@ def main():
                 event, process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             )
             print(json.dumps(response), flush=True)
-            if _skill_policy_output_delivered(response):
-                _claim_skill_injection_turn(event)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -3930,8 +3912,6 @@ def main():
                 mcp_server=mcp_server, mcp_tool=mcp_tool_name
             ))
             print(json.dumps(response), flush=True)
-            if _skill_policy_output_delivered(response):
-                _claim_skill_injection_turn(event)
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return

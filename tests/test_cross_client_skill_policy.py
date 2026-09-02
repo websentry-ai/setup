@@ -183,23 +183,8 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                 self.assertFalse((self.root / "unbound-secure-sql").exists())
             self._reset_root()
 
-    def test_turn_claim_is_written_after_injection_output(self):
+    def test_turn_claim_is_written_for_each_provider(self):
         event = {"session_id": "s1", "turn_id": "t1"}
-        delivered_outputs = {
-            "copilot": {
-                "permissionDecision": "deny",
-                "permissionDecisionReason": "Invoke /unbound-secure-sql before continuing.",
-            },
-            "cursor": {
-                "permission": "deny",
-                "agent_message": "Invoke /unbound-secure-sql before continuing.",
-            },
-            "codex": {
-                "hookSpecificOutput": {
-                    "additionalContext": "Invoke $unbound-secure-sql before continuing.",
-                },
-            },
-        }
         for name, module in CLIENTS.items():
             with self.subTest(client=name), tempfile.TemporaryDirectory() as tmp:
                 client_event = dict(event)
@@ -209,39 +194,50 @@ class CrossClientSkillLifecycleTests(unittest.TestCase):
                     with patch.object(module, "get_turn_start_timestamp_for_session", return_value="t1"):
                         with patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
                             self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                            self.assertTrue(module._skill_policy_output_delivered(delivered_outputs[name]))
                             module._claim_skill_injection_turn(client_event)
                             self.assertTrue(module._skill_turn_claim_path("s1:t1").exists())
                     continue
                 with patch.object(module, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
                     self.assertFalse(module._skill_turn_claim_path("s1:t1").exists())
-                    self.assertTrue(module._skill_policy_output_delivered(delivered_outputs[name]))
                     module._claim_skill_injection_turn(client_event)
                     self.assertTrue(module._skill_turn_claim_path("s1:t1").exists())
 
 
-class CrossClientNativeInjectionTests(unittest.TestCase):
-    def test_codex_prompt_injection_uses_additional_context(self):
+class CrossClientInjectionContextTests(unittest.TestCase):
+    def test_codex_prompt_forwards_gateway_context_unchanged(self):
+        context = "Invoke the skill unbound-secure-sql before answering."
         response = CLIENTS["codex"].transform_response_for_codex_prompt({
             "decision": "allow",
-            "additionalContext": "Invoke the skill unbound-secure-sql before answering.",
+            "additionalContext": context,
             "inject_skills": [_entry()],
         })
-        self.assertIn("$unbound-secure-sql", response["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(response["hookSpecificOutput"]["additionalContext"], context)
 
-    def test_copilot_transformed_prompt_can_inject_slash_skill(self):
+    def test_copilot_transformed_prompt_forwards_gateway_context_unchanged(self):
+        context = "Invoke the skill unbound-secure-sql before answering."
         response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
             {"transformedPrompt": "Write the query."},
             {
                 "decision": "allow",
-                "additionalContext": "Invoke the skill unbound-secure-sql before answering.",
+                "additionalContext": context,
                 "inject_skills": [_entry()],
             },
         )
-        self.assertIn("/unbound-secure-sql", response["modifiedTransformedPrompt"])
-        self.assertIn("Write the query.", response["modifiedTransformedPrompt"])
+        self.assertEqual(response["modifiedTransformedPrompt"], f"{context}\n\nWrite the query.")
 
-    def test_tool_injection_uses_each_clients_native_syntax(self):
+    def test_copilot_transformed_prompt_preserves_gateway_blocks(self):
+        for decision in ("deny", "block"):
+            with self.subTest(decision=decision):
+                response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
+                    {"transformedPrompt": "Write the query."},
+                    {"decision": decision, "reason": "Blocked by policy."},
+                )
+                self.assertEqual(
+                    response,
+                    {"decision": "block", "reason": "Blocked by policy."},
+                )
+
+    def test_tool_injection_forwards_gateway_context_unchanged(self):
         plan = {
             "decision": "deny",
             "reason": "Load the required skill.",
@@ -252,14 +248,10 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         codex = CLIENTS["codex"].transform_response_for_codex(plan)
         cursor = CLIENTS["cursor"].format_hook_response(plan)
 
-        self.assertIn("/unbound-secure-sql", copilot["hookSpecificOutput"]["additionalContext"])
-        self.assertIn("/unbound-secure-sql", copilot["permissionDecisionReason"])
-        self.assertIn(
-            "/unbound-secure-sql",
-            copilot["hookSpecificOutput"]["permissionDecisionReason"],
-        )
-        self.assertIn("$unbound-secure-sql", codex["hookSpecificOutput"]["additionalContext"])
-        self.assertIn("/unbound-secure-sql", cursor["agent_message"])
+        context = plan["additionalContext"]
+        self.assertEqual(copilot["hookSpecificOutput"]["additionalContext"], context)
+        self.assertEqual(codex["hookSpecificOutput"]["additionalContext"], context)
+        self.assertEqual(cursor["agent_message"], context)
 
     def test_transcript_tail_is_bounded_and_drops_a_partial_first_record(self):
         for name in ("copilot", "codex"):
@@ -545,7 +537,7 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
         self.assertEqual(facts["loaded"], set())
         self.assertEqual(facts["session_count"], 0)
 
-    def test_codex_reports_a_completed_managed_skill_read_as_loaded(self):
+    def test_codex_ignores_post_tool_events_without_transcript_evidence(self):
         codex = CLIENTS["codex"]
         body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
         with tempfile.TemporaryDirectory() as tmp:
@@ -565,8 +557,7 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
                     patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
                 facts = codex._skill_policy_loaded_facts(event)
 
-        self.assertEqual(facts["loaded"], {"secure-sql"})
-        self.assertEqual(facts["session_count"], 1)
+        self.assertEqual(facts, {"loaded": set(), "session_count": 0})
 
     def test_codex_reads_function_call_skill_evidence_from_transcript(self):
         codex = CLIENTS["codex"]
@@ -603,6 +594,34 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
 
         self.assertEqual(facts, {"loaded": {"secure-sql"}, "session_count": 1})
 
+    def test_codex_reads_completed_command_skill_evidence_from_transcript(self):
+        codex = CLIENTS["codex"]
+        body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "skills"
+            skill = root / "unbound-secure-sql"
+            skill.mkdir(parents=True)
+            (skill / ".unbound-managed").touch()
+            (skill / "SKILL.md").write_text(body)
+            row = {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "item": {
+                        "type": "CommandExecution",
+                        "command": ["/bin/zsh", "-lc", f"sed -n '1,240p' {skill / 'SKILL.md'}"],
+                        "stdout": body,
+                        "aggregated_output": body,
+                    },
+                },
+            }
+            transcript = Path(tmp) / "rollout.jsonl"
+            transcript.write_text(json.dumps(row) + "\n")
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root):
+                facts = codex._skill_policy_loaded_facts({"transcript_path": str(transcript)})
+
+        self.assertEqual(facts, {"loaded": {"secure-sql"}, "session_count": 1})
+
     def test_codex_does_not_read_symlinked_skill_body_as_load_evidence(self):
         codex = CLIENTS["codex"]
         body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
@@ -621,7 +640,7 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
 
         self.assertEqual(found, set())
 
-    def test_codex_bridges_same_turn_transcript_write_lag(self):
+    def test_codex_does_not_read_skill_facts_from_the_audit_log(self):
         codex = CLIENTS["codex"]
         body = "---\nname: unbound-secure-sql\n---\n\nCheck every query.\n"
         with tempfile.TemporaryDirectory() as tmp:
@@ -630,23 +649,15 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / ".unbound-managed").touch()
             (skill / "SKILL.md").write_text(body)
-            post_tool = {
-                "hook_event_name": "PostToolUse",
-                "session_id": "s1",
-                "turn_id": "t1",
-                "tool_name": "Bash",
-                "tool_input": {"command": f"cat {skill / 'SKILL.md'}"},
-                "tool_response": body,
-            }
-            audit_rows = [{"session_id": "s1", "event": post_tool}]
             with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
-                    patch.object(codex, "load_existing_logs", return_value=audit_rows):
+                    patch.object(codex, "load_existing_logs") as load_logs:
                 facts = codex._skill_policy_loaded_facts({
                     "session_id": "s1",
                     "turn_id": "t1",
                 })
 
-        self.assertEqual(facts, {"loaded": {"secure-sql"}, "session_count": 1})
+        self.assertEqual(facts, {"loaded": set(), "session_count": 0})
+        load_logs.assert_not_called()
 
     def test_codex_loaded_skill_expires_after_ten_tasks_and_at_compaction(self):
         codex = CLIENTS["codex"]
@@ -712,7 +723,7 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
 
         self.assertEqual(facts, {"loaded": {"new-rule"}, "session_count": 2})
 
-    def test_codex_accepts_a_long_exact_skill_prefix_but_not_frontmatter_only(self):
+    def test_codex_requires_most_of_a_long_skill_body(self):
         codex = CLIENTS["codex"]
         body = "---\nname: unbound-secure-sql\n---\n\n" + "important rule\n" * 400
         with tempfile.TemporaryDirectory() as tmp:
@@ -721,23 +732,17 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / ".unbound-managed").touch()
             (skill / "SKILL.md").write_text(body)
-            base = {
-                "hook_event_name": "PostToolUse",
-                "session_id": "s1",
-                "tool_name": "Bash",
-                "tool_input": {"command": f"sed -n '1,240p' {skill / 'SKILL.md'}"},
-            }
-            with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
-                    patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
-                prefix = codex._skill_policy_loaded_facts({**base, "tool_response": body[:2048]})
-                frontmatter = codex._skill_policy_loaded_facts({
-                    **base,
-                    "session_id": "s2",
-                    "tool_response": "---\nname: unbound-secure-sql\n---\n",
-                })
+            command = f"sed -n '1,240p' {skill / 'SKILL.md'}"
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root):
+                short_prefix = codex._codex_skill_slugs_from_output(command, body[:2048])
+                long_prefix = codex._codex_skill_slugs_from_output(command, body[:int(len(body) * 0.95)])
+                frontmatter = codex._codex_skill_slugs_from_output(
+                    command, "---\nname: unbound-secure-sql\n---\n"
+                )
 
-        self.assertEqual(prefix["loaded"], {"secure-sql"})
-        self.assertEqual(frontmatter["loaded"], set())
+        self.assertEqual(short_prefix, set())
+        self.assertEqual(long_prefix, {"secure-sql"})
+        self.assertEqual(frontmatter, set())
 
     def test_codex_does_not_trust_skill_path_without_body_in_tool_response(self):
         codex = CLIENTS["codex"]
@@ -748,19 +753,11 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
             skill.mkdir(parents=True)
             (skill / ".unbound-managed").touch()
             (skill / "SKILL.md").write_text(body)
-            event = {
-                "hook_event_name": "PostToolUse",
-                "session_id": "s1",
-                "tool_name": "Bash",
-                "tool_input": {"command": f"echo {skill / 'SKILL.md'}"},
-                "tool_response": str(skill / "SKILL.md"),
-            }
-            with patch.object(codex, "MANAGED_SKILLS_ROOT", root), \
-                    patch.object(codex, "SKILL_POLICY_STATE_ROOT", Path(tmp) / "state"):
-                facts = codex._skill_policy_loaded_facts(event)
+            command = f"echo {skill / 'SKILL.md'}"
+            with patch.object(codex, "MANAGED_SKILLS_ROOT", root):
+                facts = codex._codex_skill_slugs_from_output(command, str(skill / "SKILL.md"))
 
-        self.assertEqual(facts["loaded"], set())
-        self.assertEqual(facts["session_count"], 0)
+        self.assertEqual(facts, set())
 
     def test_user_prompt_skill_facts_include_the_project_directory(self):
         cases = (
@@ -823,7 +820,11 @@ class CrossClientNativeInjectionTests(unittest.TestCase):
             "prompt": "current message",
             "transformedPrompt": "current message",
         }
-        response = {"decision": "allow", "inject_skills": [_entry()]}
+        response = {
+            "decision": "allow",
+            "additionalContext": "Invoke the skill unbound-secure-sql before answering.",
+            "inject_skills": [_entry()],
+        }
         with tempfile.TemporaryDirectory() as tmp, \
                 patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
                 patch.object(copilot, "get_api_key", return_value="key"), \
