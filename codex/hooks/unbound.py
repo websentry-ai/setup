@@ -472,14 +472,16 @@ def _cleanup_skill_policy_state():
     try:
         if not SKILL_POLICY_STATE_ROOT.is_dir():
             return
-        checked = 0
         for directory in SKILL_POLICY_STATE_ROOT.iterdir():
             if not directory.is_dir() or directory.is_symlink():
                 continue
+            # Budget per directory: one busy directory must not consume the whole
+            # sweep and leave every later one uncollected.
+            checked = 0
             for entry in directory.iterdir():
                 checked += 1
                 if checked > 1000:
-                    return
+                    break
                 try:
                     if entry.is_file() and entry.stat().st_mtime < cutoff:
                         entry.unlink()
