@@ -4,6 +4,7 @@ import sys
 import base64
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
@@ -80,7 +81,7 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
-DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_DISPATCH_TTL_SECONDS = 60
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
@@ -2280,6 +2281,10 @@ def compute_fingerprint(
     # by url here would never match claude-connector:<name>.
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
+
+    if (safe_additional_data.get('scope') == 'copilot-builtin' and safe_name
+            and not command and not url and not safe_args):
+        return f'copilot-builtin:{safe_name.lower()}'
 
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
@@ -5483,8 +5488,91 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
         log_error('mcp diagnostic dispatch failed for %s: %s' % (server_name, exc), 'mcp_server')
 
 
+def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
+    """None if the dir can hold discovery state, else why not. Clears a stale marker."""
+    try:
+        posix = hasattr(os, "getuid")
+        if private:
+            # Windows st_mode is synthetic (0o777, never sticky), so the POSIX
+            # world-writable check there would reject every candidate.
+            if posix:
+                try:
+                    pst = os.lstat(str(path.parent))
+                    if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
+                        return "fallback parent world-writable and not sticky"
+                except OSError:
+                    pass
+            try:
+                st = os.lstat(str(path))
+                if path.is_symlink() or not stat.S_ISDIR(st.st_mode):
+                    return "fallback dir is a symlink or not a dir"
+                if posix and st.st_uid != os.getuid():
+                    return "fallback dir foreign-owned"
+            except FileNotFoundError:
+                pass
+        if private and posix:
+            # Create with the mode so a symlink planted after the lstat cannot be
+            # chmod-ed through; a pre-existing dir was validated above.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(str(path), 0o700)
+            except FileExistsError:
+                pass
+            if os.lstat(str(path)).st_mode & 0o077:
+                return "fallback dir not private"
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        if not os.access(str(path), os.W_OK | os.X_OK):
+            return "dir not writable"
+        # os.access cannot see a Windows ACL denial; an actual write can.
+        fd, probe = tempfile.mkstemp(prefix=".probe.", dir=str(path))
+        os.close(fd)
+        os.unlink(probe)
+        cache_file = path / DISCOVERY_CACHE_PATH.name
+        if cache_file.exists() and not os.access(str(cache_file), os.R_OK):
+            return "cache file unreadable"
+        # Non-destructive: a poisoned marker denies the open, a live peer's does not.
+        marker = path / DISCOVERY_DISPATCH_PATH.name
+        if marker.exists():
+            os.close(os.open(str(marker), os.O_WRONLY))
+        return None
+    except OSError as e:
+        return "%s errno=%s" % (type(e).__name__, e.errno)
+
+
+def _relocate_state_dir(reason: str) -> bool:
+    """Repoint cache/lock/marker at the temp fallback. True if it moved."""
+    global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
+    current = DISCOVERY_DISPATCH_PATH.parent
+    if _is_windows():
+        fallback = Path(tempfile.gettempdir()) / "unbound"
+    else:
+        fallback = Path("/var/tmp/unbound-%d" % os.getuid())
+    fallback_reason = ("same as current" if fallback == current
+                       else _state_dir_reject_reason(fallback, private=True))
+    # Paths carry the OS username; log the candidate, not the path (see #281).
+    if fallback_reason is not None:
+        log_error("discovery gate: no usable state dir (home: %s / fallback: %s)"
+                  % (reason, fallback_reason), 'discovery_gate')
+        return False
+    log_error("discovery gate: home state dir unusable (%s); using fallback" % reason,
+              'discovery_gate')
+    DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
+    DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
+    DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
+    return True
+
+
+def _resolve_state_dir() -> None:
+    """Relocate before dispatching if the current state dir is unusable."""
+    reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
+    if reason is not None:
+        _relocate_state_dir(reason)
+
+
 def _dispatch_discovery() -> None:
     try:
+        _resolve_state_dir()
         cache: Dict = {}
         if DISCOVERY_CACHE_PATH.exists():
             try:
@@ -5600,11 +5688,18 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
             DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
+                                       dir=str(DISCOVERY_CACHE_PATH.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, sort_keys=True)
+                os.replace(tmp, DISCOVERY_CACHE_PATH)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
