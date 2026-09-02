@@ -3922,7 +3922,7 @@ def main():
             response = process_user_prompt_submit(event, api_key)
 
             # If denied, log the event, transform response for Cursor format and exit
-            if response.get('decision') in ('deny', 'block'):
+            if response.get('decision') == 'deny':
                 append_to_audit_log({
                     'timestamp': datetime.now().astimezone().isoformat().replace('+00:00', 'Z'),
                     'event': event
