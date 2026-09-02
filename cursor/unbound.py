@@ -21,7 +21,7 @@ import shutil
 import urllib.request
 import platform
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
@@ -2495,6 +2495,9 @@ def _get_git_origin_org_repo(cwd):
     path = _github_remote_path(url)
     if not path:
         return (None, None)
+    # Repo/org names can contain spaces (e.g. Azure DevOps); the URL path
+    # arrives percent-encoded, so decode before splitting into org/repo.
+    path = unquote(path)
     parts = path.split('/')
     if len(parts) < 2:
         return (None, None)
