@@ -12,8 +12,7 @@ MDM setup sources. Nuitka 2.8 sets neither, so this shim provides both
 before unbound_hook is imported:
 
   * sys.frozen = True  -> the vendored modules' frozen-mode gates engage
-    (no self-update fetch, discovery via the local binary), identical to the
-    PyInstaller artifact.
+    (discovery via the local binary), identical to the PyInstaller artifact.
   * sys._MEIPASS = <dist dir>  -> resource_root() resolves to
     <dist>/vendored/, where build-nuitka.sh places the same data files the
     .spec's VENDORED list places under PyInstaller's _MEIPASS.

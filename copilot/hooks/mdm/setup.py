@@ -1751,7 +1751,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state() -> Optional[str]:
     """Inspect each user's ~/.copilot/hooks BEFORE it gets overwritten.
-    Existence-based: the self-update rewrites these files, so content checks
+    Existence-based: these files change across versions, so content checks
     are unreliable — only file existence is trustworthy. Per user, the pair is
     the unbound.json config and the unbound.py hook script. 'fresh' (no user
     has either file), 'persisted' (at least one user has both), 'tampered' (any
