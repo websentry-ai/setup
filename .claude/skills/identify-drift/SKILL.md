@@ -13,57 +13,63 @@ This is how queued prompts and unattributed subagent tokens were found.
 
 ---
 
-## 1. Ask, in this order
+## 1. What to settle before scanning
 
-Ask all of it before doing any work. Use one AskUserQuestion per item so the answers
-stay separable.
+Settle these without asking where you can. The point is a quick answer, so only put a
+question to the operator when the answer is not already on the machine.
 
-**Environment.** `development`, `staging`, or `production`.
+**Email.** Whose activity to check. `~/.unbound/config.json` holds an `email`; use it.
+Ask only when that file has none, and ask for nothing else at the same time.
 
-**Window.** How many days back. **Maximum 14.** Refuse a larger number and ask again;
-scanning further is slow and the audit log will not reach that far anyway.
+**Environment.** `staging` unless the operator said production, or said something only
+production can answer. Prod rows are customer data.
 
-**Tools.** Any combination of `claude-code`, `cursor`, `copilot`, `codex`, `augment`.
-Offer multi-select.
+**Tools.** Any of `claude-code`, `cursor`, `copilot`, `codex`, `augment`. Default to
+the ones this machine actually has transcripts for rather than asking; scanning a tool
+that was never used costs a directory listing and finds nothing.
 
-**Email.** Whose activity to check. If `~/.unbound/config.json` holds an `email`,
-offer it as the default rather than asking cold.
+**Window.** 7 days unless the operator named one. **Maximum 14** -- refuse a larger
+number, because the audit log will not reach that far anyway.
 
 ---
 
 ## 2. Get a database connection
 
-This skill never carries connection details. It takes a DSN and uses it; where that
-DSN comes from is the operator's business, and for anything other than a local
-development database it should be a read-only role reached through the company's
-normal audited access path.
+**Use the `access-db` skill.** Prefer the copy in the sibling `ai-gateway-data`
+repository (`../ai-gateway-data/.claude/skills/access-db`); fall back to the one in
+the operator's own config (`~/.claude/skills/access-db`). It exists so this skill does
+not have to ask anything about connections: it prints one command, the operator runs
+it and completes the MFA prompt, and the tunnel is up. Never open a tunnel yourself
+and never complete an MFA prompt on somebody's behalf.
 
-**Never ask for, type, or echo a password.** This skill runs inside the hooks it is
-checking: what you put in a prompt or a Bash command is captured into the transcripts,
-the audit log and the stored prompt rows that the comparison then reads. A password
-handled here would be sitting in the very data being audited. `compare.py` refuses a
-DSN that carries one, in the userinfo and in the query string alike. If a connection
-needs a password, the operator puts it in `~/.pgpass` (which libpq requires be
-owner-only) or names a file with `?passfile=`, and the DSN stays passwordless.
+The ports and names are fixed, so nothing here needs a question:
 
-The DSN is the only thing that decides where this connects and how. `compare.py`
-starts psql from an environment stripped of every `PG*` variable, so an inherited
-`PGHOST`, `PGSSLMODE` or `PGSERVICE` cannot send it somewhere the DSN did not name.
-Anything but a loopback host gets `sslmode=verify-full` unless the DSN names a mode
-itself, so the server is authenticated and not merely encrypted to. Pass
-`?sslrootcert=` alongside it when the certificate needs a specific root. The modes
-that allow a plaintext session are refused outright.
+| Env | Command for the operator to run | DSN once it is up |
+|---|---|---|
+| staging | `tsh proxy db gateway-data-staging-read-replica --db-user=reporting_ro --db-name=gateway_staging --tunnel --port=15433 --mfa-mode=platform` | `postgres://reporting_ro@127.0.0.1:15433/gateway_staging` |
+| prod | `tsh proxy db gateway-data-prod-read-replica --db-user=reporting_ro --db-name=gateway_data --tunnel --port=15432 --mfa-mode=platform` | `postgres://reporting_ro@127.0.0.1:15432/gateway_data` |
 
-**development.** A local Postgres. Read the database name, user, host and port from
-`ai-gateway-data/.env` (`DATABASE_NAME`, `DATABASE_USER`, `DATABASE_HOST`,
-`DATABASE_PORT`) and build a passwordless DSN from those. Do not read or copy
-`DATABASE_PASSWORD`. Do not assume names; they differ between machines.
+`reporting_ro` is read-only, enforced server-side. `--mfa-mode=platform` is not
+optional: without it the ceremony goes to the browser, the phone answers `No passkey
+found`, and psql then reports `connection refused` -- which is noise, the MFA routing
+is the cause. The tunnel dies when the operator closes it and expires on its own, so
+if a later query says `connection refused`, hand them the same command again rather
+than debugging it. `uia read-prod-db --shell` is the human-driven equivalent, but it
+picks its own port, so the raw command above is what this skill uses.
 
-**staging / production.** Ask the operator to open their usual read-only tunnel and
-to say when it is up. The tunnel authenticates them, so its DSN is host, port, user
-and database only. Wait for them; never open a tunnel yourself and never complete an
-MFA prompt on their behalf. If they ask how, point them at the internal
-database-access runbook rather than repeating it here.
+There is no password anywhere in this, which is what the tooling wants: `compare.py`
+refuses a DSN carrying one, in the userinfo and in the query string alike. Never ask
+for, type, or echo a password -- this skill runs inside the hooks it is checking, so
+anything typed here lands in the transcripts and stored rows the comparison then reads.
+
+**development.** A local Postgres, no tunnel. Read `DATABASE_NAME`, `DATABASE_USER`,
+`DATABASE_HOST` and `DATABASE_PORT` from `ai-gateway-data/.env` and build a
+passwordless DSN from those. Do not read or copy `DATABASE_PASSWORD`. Do not assume
+names; they differ between machines.
+
+`compare.py` starts psql from an environment stripped of every `PG*` variable, so an
+inherited `PGHOST`, `PGSSLMODE` or `PGSERVICE` cannot send it somewhere the DSN did
+not name. A loopback tunnel is exempt from `sslmode=verify-full`; anything else is not.
 
 Production rows are customer data. Keep them in the run: do not write them to disk
 beyond the temporary files this skill uses, and keep the excerpts in the report to the
@@ -78,25 +84,24 @@ trap 'rm -rf "$WORK"' EXIT              # and there is no reason to leave them b
 python3 .claude/skills/identify-drift/scan_local.py \
   --tools <tools> --days <n> --out "$WORK/local.json"
 
-export IDENTIFY_DRIFT_DSN="<passwordless dsn>"      # never on the command line:
+export IDENTIFY_DRIFT_DSN="postgres://reporting_ro@127.0.0.1:15433/gateway_staging"
+                                                   # never on the command line:
                                                    # arguments are visible in ps
 python3 .claude/skills/identify-drift/compare.py \
   --local "$WORK/local.json" \
-  --email "<email>" --environment "<env>" \
+  --email "<email>" --environment staging \
   --out "$WORK/report.json"                        # not a shell redirect: that
                                                    # would use the umask
 ```
 
-If it refuses the `psql` it found, that is the check working, not a bug. Whoever can
-write the binary, the file a symlink points at, or any directory above either, can
-change what this hands the database connection to. A package-manager prefix is often
-shared this way.
-
-`--psql` names a different one; it is checked the same way, so it is a way to point at
-a better binary and not a way to skip the question. If the operator has no such binary
-and accepts the risk, `--allow-shared-psql` runs the shared one and says on stderr
-which path was accepted. Ask them before using it, and never reach for it to make a
-refusal go away.
+The psql it runs is checked first: whoever can write that binary, the file a symlink
+points at, or any directory above either, can change what is handed the database
+connection. On a managed Mac the only psql usually sits in a package-manager prefix
+the admin group can write, so the check refuses and the run stops. That is the check
+working, but it is not a question worth interrupting a scan for, so settle it in the
+command rather than mid-run: `--psql` names a binary in a directory nobody else can
+write, and `--allow-shared-psql` accepts the shared one and prints on stderr which
+path was accepted. Say which one is being used and why when reporting.
 
 `--out` creates both files owner-only, and refuses a symlink at the destination. The
 scan holds every prompt and reply in the window and the report quotes excerpts from
@@ -115,6 +120,13 @@ the database and diffs the three.
 ## 4. What the two sides are
 
 You do not need to read the scripts to work here. This is everything they know.
+
+A user record is only counted as a prompt when the person actually sent it. Claude
+Code files everything under the user role -- injected reminders, slash-command
+expansions, command output, task notifications -- and marks the real submissions with
+`promptSource`. Only `typed` and `queued` are prompts. A file that marks nothing is an
+older format and all of its prompts are kept, since filtering on a field it never
+writes would read as total loss.
 
 **Local.** `scan_local.py` normalises every tool into one record shape: `kind`, `session`,
 `at`, plus `text`, `tool`, `call_id`, or token counts. `kind` is one of `user_prompt`,
@@ -151,15 +163,32 @@ gateway_metrics.id ←  prompts.gateway_metrics_id
 |---|---|
 | the window | `gateway_metrics.request_initialized_at`. There is no `created_at` |
 | tokens | `gateway_metrics.input_token_size`, `output_token_size` |
-| prompts | `prompts.prompt`, a JSON object with `user_prompt` and `assistant_prompt` |
-| tool calls | `prompt_analytics.tool_name`, and `parameters->>'tool_use_id'` where present |
+| prompts | `prompts.prompt`, a JSON object with `user_prompt` and `assistant_prompt`. One row is a whole turn: `user_prompt` joins the prompts queued during it with a blank line, and `assistant_prompt` is `{content, tool_use}` where `content` joins the turn's replies the same way |
+| tool calls | `prompt_analytics.tool_name`, and `parameters->>'tool_use_id'` where present, plus `assistant_prompt`'s own `tool_use[].tool_use_id` |
 | sessions | `prompt_analytics.thread_id` |
 | the user | `gateway_users.email`, matched case-insensitively |
 
+**The unit is the turn.** The hook uploads once per turn, at its end, carrying that
+turn's prompt, replies and tool calls together. So a turn that never arrived is missing
+all three, and reporting them separately says one fault three times while burying the
+one that matters. Findings come in two kinds: turns the database never received, and
+pieces missing from turns it did.
+
+**Nothing is judged before it has had a chance to upload.** Each session carries a
+watermark, the newest stored row it has. Local records after their session's watermark
+may simply not have finished, so they are held back and counted in
+`not_finished_yet` rather than reported. Without this the session running the scan
+reports itself as loss, every time. The audit checks stop at the same mark: that log
+holds its last hundred entries, which on a busy machine is the turn running right now.
+
 **What is compared.** Tokens, user prompts, assistant messages, tool calls, sessions.
 Prompts match on a sha256 of the whitespace-normalised text, computed the same way on
-both sides, so no prompt text crosses the wire. Tool calls match on `tool_use_id` when
-both sides carry one, and by count when they do not.
+both sides, so no prompt text crosses the wire. Because a row holds a turn rather than a
+message, both sides are split on their newline joins first and matched segment by
+segment; a record counts as stored only when every segment it splits into is. Tool calls
+match on `tool_use_id` when both sides carry one, and by count when they do not. Both
+stored sources of an id are read: the pre-tool hook writes a row per call, the stop hook
+sends the turn's whole list, and the second is the larger.
 
 ---
 
@@ -183,20 +212,35 @@ Direction tells you where to look:
 | in audit log, not in the database | the upload lost it, ingest or network |
 | in the database, not locally | duplicate, or attributed to the wrong user |
 
-**The database decides what is in scope.** A tool runs whether or not anyone
-installed the integration, so a machine can hold months of transcripts the gateway was
-never told about. Comparing those would report every prompt in them as lost.
+**Only the sessions the database has are compared, and a session it does not have is
+never a finding.** A tool runs whether or not anyone installed the integration,
+configuration moves between environments, and a machine can hold months of transcripts
+the gateway was never told about, so an absent session says nothing about drift: it
+may never have been instrumented, may have run against another environment, or may
+predate the install. Chasing those produces noise and no bugs.
 
-Where the stored rows name their sessions, sessions the database has never heard of
-are excluded from every comparison. The audit log separates the two reasons: a session
-with audit entries and no stored rows lost everything on the way up and is reported;
-a session with neither was never instrumented and is not.
+What is worth reporting is a session the database does hold that is missing pieces of
+itself -- a prompt, a reply, or a tool call that should be inside a turn it did
+receive. So the stored sessions are the whole scope, and every local record outside
+them is dropped before anything is compared. The count of what was dropped appears in
+the report's `sessions_not_in_db`, so the narrowing is visible without being alarming.
 
-Most stored rows carry no `thread_id` for some tools, so that scoping is not always
-available. When it is not, the first stored row for the tool is the floor instead:
-nothing older than it was ever uploaded, so local activity older than it cannot have
-been lost. Either way the report says how much was excluded and why, rather than
-quietly dropping it.
+When the stored rows for a tool name no session at all, nothing is in scope and the
+report says so in one line rather than comparing against a window it cannot place.
+
+**The second finding's count is an upper bound.** A turn is grouped locally by the
+prompt that started it, but the hook ends a turn whenever the assistant yields, so one
+local turn can span several stored rows. When one of those rows is missing and another
+is not, the turn reads as received and its missing half is counted as pieces rather
+than as the turn it was. Treat a large count there as "at most this many", and check a
+few against the stored rows before believing all of it.
+
+**Tokens are only compared when the two sides cover the same work.** The stored totals
+are the whole window's, so once anything has been held back -- a turn that never
+arrived, a turn still running, a session the database does not have -- the sums are of
+different things and the difference is arithmetic, not drift. Measured properly they
+reconcile; measured across a gap they reported the same missing turns a second time, as
+a 67% token loss.
 
 Some findings are structural, not faults. Expect them, say so once, and do not
 investigate them:
@@ -208,8 +252,8 @@ investigate them:
 | augment: no transcript to compare | it keeps none, so only the upload direction is checkable |
 | any tool: could not be checked for this window | an aggregate hit the row cap. Re-run over fewer days |
 | any tool: audit log is full | it holds a hundred entries, so absence from it is not evidence |
-| any tool: sessions were never instrumented | the tool ran before the hook was installed. Not a loss |
-| any tool: activity predates the first upload | same, for tools whose rows do not name their session |
+| any tool: sessions absent from the database | out of scope by design, and not reported at all |
+| any tool: records after a session's watermark | the turn may not have ended yet. Held back, counted in `not_finished_yet` |
 
 A token difference under 5% is not reported. Above it, the usual cause is work billed
 to no turn: subagent messages outside the turn window, or turns that never uploaded.
@@ -239,7 +283,10 @@ Then one block per issue, in this shape, at most a short paragraph each:
 ```
 
 Order by how much is missing, most first. Name the tool in each title when more than
-one was scanned.
+one was scanned. Report the findings as they come: they are already grouped by cause,
+so do not split one back into a bullet per category, and do not restate the same cause
+in another form. If `not_finished_yet` or `sessions_not_in_db` is non-zero, say so in
+one line after the blocks, because the reader should know what was left out.
 
 If nothing is wrong, the whole report is the header plus `No issues found.` Do not pad
 it with what you checked.

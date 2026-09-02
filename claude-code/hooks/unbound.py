@@ -20,9 +20,14 @@ from urllib.parse import urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
-ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
-LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
+# Claude Code reads CLAUDE_CONFIG_DIR verbatim and resolves it against the cwd,
+# without expanding a leading "~". Expanding it here would put the hook's files
+# under $HOME while Claude read a literal "~" dir. Blank is treated as unset.
+_env_config_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+_CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Path.home() / ".claude"
+AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
+ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
+LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
@@ -34,7 +39,7 @@ SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
 
 UNBOUND_SKILL_PREFIX = 'unbound-'
-CLAUDE_SKILLS_ROOT = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude')) / 'skills'
+CLAUDE_SKILLS_ROOT = _CONFIG_DIR / 'skills'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
 INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn'
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
@@ -44,20 +49,22 @@ SKILL_LOADED_WINDOW = 10
 # unbound-<slug> is the skill name, so the slug carries the spec's name rules.
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
+
 # CoWork built-in tools that are exposed under mcp__
 COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'workspace', 'cowork', 'cowork-onboarding', 'visualize',
     'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
 })
 
-# CLAUDE_CONFIG_DIR relocates .claude.json entirely; read the file Claude uses.
-CLAUDE_MCP_CONFIG_PATH = (
-    Path(os.environ['CLAUDE_CONFIG_DIR']) / '.claude.json'
-    if os.environ.get('CLAUDE_CONFIG_DIR')
-    else Path.home() / '.claude.json'
-)
-CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
-POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
+# Claude keeps .claude.json beside the config dir when relocated, and directly
+# in the home dir otherwise — it is not nested under the default ~/.claude.
+CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if _env_config_dir else (Path.home() / ".claude.json")
+# Claude Code lets CLAUDE_CODE_PLUGIN_CACHE_DIR override the plugin root outright,
+# and falls back to <config dir>/plugins otherwise.
+_env_plugin_dir = (os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or "").strip()
+_PLUGIN_ROOT = Path(os.path.abspath(_env_plugin_dir)) if _env_plugin_dir else _CONFIG_DIR / "plugins"
+CLAUDE_PLUGIN_CACHE_DIR = _PLUGIN_ROOT / "cache"
+POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
 # write, and the gate keeps no state on disk at all.
@@ -88,7 +95,7 @@ SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/hea
 SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
 SELF_UPDATE_LOCK_TTL_SECONDS = 30
 SELF_UPDATE_CURL_TIMEOUT = 10
-SELF_SCRIPT_PATH = Path.home() / ".claude" / "hooks" / "unbound.py"
+SELF_SCRIPT_PATH = _CONFIG_DIR / "hooks" / "unbound.py"
 SELF_UPDATE_STATE_PATH = SELF_SCRIPT_PATH.parent / ".self_update_check"
 SELF_UPDATE_LOCK_PATH = SELF_SCRIPT_PATH.parent / ".self_update.lock"
 
@@ -111,7 +118,7 @@ MCP_DIAG_STAMP_DIR = Path.home() / ".unbound" / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
 MCP_DIAG_VERSION = "v3"
 MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
-_DIAG_CLAUDE_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
+_DIAG_CLAUDE_DIR = _CONFIG_DIR
 
 _cached_api_key = None
 _reporting_error = False
@@ -319,7 +326,7 @@ def append_to_audit_log(event_data: Dict):
         pass
 
 
-_APPROVAL_MARKER_FILE = Path.home() / ".claude" / "hooks" / ".approval_pending"
+_APPROVAL_MARKER_FILE = _CONFIG_DIR / "hooks" / ".approval_pending"
 
 
 def _is_approval_retry(command: str) -> bool:
@@ -2280,6 +2287,10 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
+    if (safe_additional_data.get('scope') == 'copilot-builtin' and safe_name
+            and not command and not url and not safe_args):
+        return f'copilot-builtin:{safe_name.lower()}'
+
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
     if not command and not url and not safe_args:
@@ -4107,25 +4118,28 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         # A prefixed skill never falls back to the bare name — "slack:standup"
         # and a personal "standup" are different skills.
         nested = segments
-        roots = []
-        if cwd:
-            roots = _trusted_ancestors(Path(cwd))
-        roots.append(Path.home())
+        roots = _trusted_ancestors(Path(cwd)) if cwd else []
 
-        for root in roots:
-            for skill_dir in SKILL_SEARCH_DIRS:
-                base = root.joinpath(*nested, *skill_dir)
-                candidate = base / name / 'SKILL.md'
-                if candidate.is_file():
-                    return str(candidate)
-                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
-                # Several bundles sharing a name is ambiguous, so resolve
-                # nothing rather than attach the wrong path to a join key.
-                matches = sorted(base.glob('*/%s/SKILL.md' % name))
-                if len(matches) > 1:
-                    return None
-                if matches:
-                    return str(matches[0])
+        bases = [root.joinpath(*nested, *skill_dir)
+                 for root in roots for skill_dir in SKILL_SEARCH_DIRS]
+        # User-level skills live in <config dir>/skills — where the sync writes them
+        # and where Claude Code reads them. It stands in for ~/.claude/skills rather
+        # than following it: after a move the sync stops refreshing the old copy, so
+        # searching there first would pin resolution to whatever it last held.
+        bases.append(CLAUDE_SKILLS_ROOT.joinpath(*nested))
+
+        for base in bases:
+            candidate = base / name / 'SKILL.md'
+            if candidate.is_file():
+                return str(candidate)
+            # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+            # Several bundles sharing a name is ambiguous, so resolve
+            # nothing rather than attach the wrong path to a join key.
+            matches = sorted(base.glob('*/%s/SKILL.md' % name))
+            if len(matches) > 1:
+                return None
+            if matches:
+                return str(matches[0])
         return None
     except Exception:
         return None
@@ -5656,7 +5670,7 @@ def _dispatch_discovery() -> None:
             _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
-        except FileExistsError:
+        except OSError:
             try:
                 age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
             except OSError:
@@ -5664,11 +5678,12 @@ def _dispatch_discovery() -> None:
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                DISCOVERY_DISPATCH_PATH.unlink()
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
                 _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
-            except (FileExistsError, OSError):
+            except OSError as e:
+                log_error(f"discovery gate: dispatch claim failed: {type(e).__name__} errno={e.errno}", 'discovery_gate')
                 return
 
         try:

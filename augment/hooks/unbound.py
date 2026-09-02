@@ -1344,6 +1344,10 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
+    if (safe_additional_data.get('scope') == 'copilot-builtin' and safe_name
+            and not command and not url and not safe_args):
+        return f'copilot-builtin:{safe_name.lower()}'
+
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
     if not command and not url and not safe_args:
@@ -3511,7 +3515,7 @@ def _dispatch_discovery() -> None:
             _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
-        except FileExistsError:
+        except OSError:
             try:
                 age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
             except OSError:
@@ -3519,11 +3523,12 @@ def _dispatch_discovery() -> None:
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                DISCOVERY_DISPATCH_PATH.unlink()
+                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
                 _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
-            except (FileExistsError, OSError):
+            except OSError as e:
+                log_error(f"discovery gate: dispatch claim failed: {type(e).__name__} errno={e.errno}", 'discovery_gate')
                 return
 
         try:

@@ -117,11 +117,13 @@ def run(argv) -> int:
             try:
                 total_sessions = 0
                 for username, home_dir in user_homes:
+                    # No force config is fetched here: a dry-run runs without
+                    # credentials, so these counts are the unforced floor.
                     result = m._run_as_user(username, m._backfill_collect_sessions, home_dir)
                     if result is None:
                         print(f"  {username}: unreadable (skipped)")
                         continue
-                    sessions, capped = result
+                    sessions, capped, _forced = result
                     total_sessions += len(sessions)
                     note = " (capped — more remain)" if capped else ""
                     print(f"  {username}: {len(sessions)} session(s) eligible{note}")

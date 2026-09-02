@@ -167,8 +167,26 @@ class TestResolveVscodeMcp(unittest.TestCase):
             unbound.resolve_copilot_mcp(
                 "github-mcp-server-search_code", {}
             ),
-            ("github-mcp-server", "search_code", None),
+            ("github-mcp-server", "search_code", {'additional_data': {'scope': 'copilot-builtin'}}),
         )
+
+    def test_builtin_github_tagged_when_explicit_identity_matches(self):
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-search_code", {},
+                server_name="github-mcp-server", tool_name="search_code",
+            ),
+            ("github-mcp-server", "search_code",
+             {"additional_data": {"scope": "copilot-builtin"}}),
+        )
+
+    def test_fetch_and_time_are_not_builtins(self):
+        for raw in ("fetch-fetch_url", "time-get_current_time"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    unbound.resolve_copilot_mcp(raw, {}),
+                    (None, None, None),
+                )
 
     def test_configured_github_wins_over_builtin_shortcut(self):
         servers = {
@@ -196,7 +214,7 @@ class TestResolveVscodeMcp(unittest.TestCase):
                     unbound.resolve_copilot_mcp(
                         "github-mcp-server-search_code", servers, **explicit
                     ),
-                    ("github-mcp-server", "search_code", None),
+                    ("github-mcp-server", "search_code", {'additional_data': {'scope': 'copilot-builtin'}}),
                 )
 
     def test_longer_configured_server_wins_over_builtin_prefix(self):
@@ -367,7 +385,10 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(pretool["tool_name"], "mcp__github-mcp-server__search_code")
         self.assertEqual(pretool["metadata"]["mcp_server"], "github-mcp-server")
         self.assertEqual(pretool["metadata"]["mcp_tool"], "search_code")
-        self.assertNotIn("mcp_server_config", pretool["metadata"])
+        self.assertEqual(
+            pretool["metadata"]["mcp_server_config"],
+            {"additional_data": {"scope": "copilot-builtin"}},
+        )
 
     def test_unknown_server_dispatches_targeted_scan(self):
         event = {
@@ -387,6 +408,23 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         dispatch.assert_called_once()
         self.assertEqual(dispatch.call_args.args[0], "microsoft/markitdown")
         self.assertEqual(dispatch.call_args.args[1]["command"], "uvx")
+
+    def test_builtin_scope_config_does_not_dispatch_targeted_scan(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "github-mcp-server-search_code",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "s",
+        }
+        gateway = unittest.mock.Mock(return_value={
+            "decision": "allow",
+            "unknown_mcp_server": True,
+        })
+        with patch.object(unbound, "read_copilot_mcp_servers", return_value={}), \
+             patch.object(unbound, "send_to_hook_api", gateway), \
+             patch.object(unbound, "_dispatch_mcp_server_scan") as dispatch:
+            unbound.process_pre_tool_use(event, "K")
+
+        dispatch.assert_not_called()
 
     def test_denied_unknown_server_does_not_dispatch_targeted_scan(self):
         event = {
