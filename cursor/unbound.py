@@ -30,7 +30,7 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
-DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_DISPATCH_TTL_SECONDS = 60
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
@@ -3110,8 +3110,76 @@ def _dispatch_mcp_server_scan(server_name, server_config):
         return
 
 
+DISCOVERY_MARKER_STALE_SECONDS = 60
+
+
+def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
+    """None if the dir can hold discovery state, else why not. Clears a stale marker."""
+    try:
+        if private:
+            try:
+                pst = os.lstat(str(path.parent))
+                if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
+                    return "fallback parent world-writable and not sticky"
+            except OSError:
+                pass
+            if path.is_symlink():
+                return "fallback dir is a symlink"
+            try:
+                if os.lstat(str(path)).st_uid != os.getuid():
+                    return "fallback dir foreign-owned"
+            except FileNotFoundError:
+                pass
+        path.mkdir(parents=True, exist_ok=True)
+        if private:
+            os.chmod(str(path), 0o700)
+            if os.lstat(str(path)).st_mode & 0o077:
+                return "fallback dir not private"
+        if not os.access(str(path), os.W_OK | os.X_OK):
+            return "dir not writable"
+        # os.access cannot see a Windows ACL denial; an actual write can.
+        fd, probe = tempfile.mkstemp(prefix=".probe.", dir=str(path))
+        os.close(fd)
+        os.unlink(probe)
+        cache_file = path / DISCOVERY_CACHE_PATH.name
+        if cache_file.exists() and not os.access(str(cache_file), os.R_OK):
+            return "cache file unreadable"
+        # A fresh marker means a peer is mid-dispatch; only a stale one must be clearable.
+        marker = path / DISCOVERY_DISPATCH_PATH.name
+        if marker.exists() and (time.time() - marker.stat().st_mtime) >= DISCOVERY_MARKER_STALE_SECONDS:
+            marker.unlink()
+        return None
+    except OSError as e:
+        return "%s errno=%s" % (type(e).__name__, e.errno)
+
+
+def _resolve_state_dir() -> None:
+    """Repoint cache/lock/marker at the first usable dir, mirroring the agent's fallback."""
+    global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
+    current = DISCOVERY_DISPATCH_PATH.parent
+    reason = _state_dir_reject_reason(current)
+    if reason is None:
+        return
+    if _is_windows():
+        fallback, private = Path(tempfile.gettempdir()) / "unbound", False
+    else:
+        fallback, private = Path("/var/tmp/unbound-%d" % os.getuid()), True
+    fallback_reason = ("same as current" if fallback == current
+                       else _state_dir_reject_reason(fallback, private))
+    if fallback_reason is not None:
+        log_error("discovery gate: no usable state dir (%s: %s / %s: %s)"
+                  % (current, reason, fallback, fallback_reason), 'discovery_gate')
+        return
+    log_error("discovery gate: state dir %s unusable (%s); using %s" % (current, reason, fallback),
+              'discovery_gate')
+    DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
+    DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
+    DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
+
+
 def _dispatch_discovery() -> None:
     try:
+        _resolve_state_dir()
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
             try:
@@ -3226,11 +3294,18 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
             DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
+                                       dir=str(DISCOVERY_CACHE_PATH.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, sort_keys=True)
+                os.replace(tmp, DISCOVERY_CACHE_PATH)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)

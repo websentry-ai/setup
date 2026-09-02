@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,105 @@ def test_dispatch_claim_recovers_from_permission_error(windows_hook, monkeypatch
 
     assert denied
     assert len(calls) == 1
+
+
+def test_state_dir_healthy_home_is_not_relocated(windows_hook):
+    hook, calls, _install_ps1 = windows_hook
+    state_dir = hook.DISCOVERY_DISPATCH_PATH.parent
+
+    hook._dispatch_discovery()
+
+    assert hook.DISCOVERY_DISPATCH_PATH.parent == state_dir
+    assert hook.DISCOVERY_CACHE_PATH.parent == state_dir
+    assert hook.DISCOVERY_LOCK_PATH.parent == state_dir
+    assert len(calls) == 1
+
+
+def test_state_dir_denied_relocates_and_stamps_debounce(windows_hook, monkeypatch, tmp_path):
+    hook, calls, _install_ps1 = windows_hook
+    denied = hook.DISCOVERY_DISPATCH_PATH.parent
+    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
+
+    real_access = os.access
+    monkeypatch.setattr(
+        hook.os, "access",
+        lambda path, mode, *a, **k: False if str(path) == str(denied) else real_access(path, mode, *a, **k),
+    )
+
+    hook._dispatch_discovery()
+
+    assert hook.DISCOVERY_DISPATCH_PATH.parent != denied
+    assert hook.DISCOVERY_CACHE_PATH.parent == hook.DISCOVERY_DISPATCH_PATH.parent
+    assert hook.DISCOVERY_LOCK_PATH.parent == hook.DISCOVERY_DISPATCH_PATH.parent
+    assert len(calls) == 1
+    assert json.loads(hook.DISCOVERY_CACHE_PATH.read_text(encoding="utf-8"))["last_run_at"]
+
+
+def test_state_dir_unclearable_marker_relocates(windows_hook, monkeypatch, tmp_path):
+    hook, calls, _install_ps1 = windows_hook
+    poisoned = hook.DISCOVERY_DISPATCH_PATH
+    poisoned.write_text("", encoding="utf-8")
+    os.utime(poisoned, (0, 0))
+    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
+
+    real_unlink = Path.unlink
+
+    def deny_poisoned(self, *a, **k):
+        if str(self) == str(poisoned):
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(self, *a, **k)
+
+    monkeypatch.setattr(Path, "unlink", deny_poisoned)
+
+    hook._dispatch_discovery()
+
+    assert hook.DISCOVERY_DISPATCH_PATH != poisoned
+    assert poisoned.exists()
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("age", [0, 30])
+def test_state_dir_keeps_fresh_marker_of_a_live_peer(windows_hook, age):
+    hook, calls, _install_ps1 = windows_hook
+    marker = hook.DISCOVERY_DISPATCH_PATH
+    marker.write_text("", encoding="utf-8")
+    stamp = time.time() - age
+    os.utime(marker, (stamp, stamp))
+
+    hook._dispatch_discovery()
+
+    assert hook.DISCOVERY_DISPATCH_PATH.parent == marker.parent
+    assert calls == []
+
+
+def test_state_dir_private_candidate_is_hardened(windows_hook, tmp_path):
+    hook, _calls, _install_ps1 = windows_hook
+
+    good = tmp_path / "unbound-uid"
+    assert hook._state_dir_reject_reason(good, private=True) is None
+    assert good.stat().st_mode & 0o077 == 0
+
+    dangling = tmp_path / "linked"
+    dangling.symlink_to(tmp_path / "nowhere")
+    assert hook._state_dir_reject_reason(dangling, private=True) == "fallback dir is a symlink"
+
+    world_writable = tmp_path / "ws"
+    world_writable.mkdir()
+    os.chmod(world_writable, 0o777)
+    assert hook._state_dir_reject_reason(world_writable / "x", private=True) is not None
+
+
+def test_state_dir_both_candidates_unusable_is_logged(windows_hook, monkeypatch, tmp_path):
+    hook, _calls, _install_ps1 = windows_hook
+    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
+    monkeypatch.setattr(hook.os, "access", lambda path, mode, *a, **k: False)
+
+    logged = []
+    monkeypatch.setattr(hook, "log_error", lambda msg, *a, **k: logged.append(msg))
+
+    hook._dispatch_discovery()
+
+    assert any("no usable state dir" in msg for msg in logged)
 
 
 def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):
