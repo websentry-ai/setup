@@ -55,6 +55,7 @@ def windows_hook(request, tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_SH", install_sh)
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_PS1", install_ps1, raising=False)
     monkeypatch.setattr(hook, "log_error", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
 
     calls = []
 
@@ -152,7 +153,6 @@ def test_state_dir_healthy_home_is_not_relocated(windows_hook):
 def test_state_dir_denied_relocates_and_stamps_debounce(windows_hook, monkeypatch, tmp_path):
     hook, calls, _install_ps1 = windows_hook
     denied = hook.DISCOVERY_DISPATCH_PATH.parent
-    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
 
     real_access = os.access
     monkeypatch.setattr(
@@ -174,16 +174,15 @@ def test_state_dir_unclearable_marker_relocates(windows_hook, monkeypatch, tmp_p
     poisoned = hook.DISCOVERY_DISPATCH_PATH
     poisoned.write_text("", encoding="utf-8")
     os.utime(poisoned, (0, 0))
-    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
 
-    real_unlink = Path.unlink
+    real_open = os.open
 
-    def deny_poisoned(self, *a, **k):
-        if str(self) == str(poisoned):
+    def deny_poisoned(path, *a, **k):
+        if str(path) == str(poisoned):
             raise PermissionError(13, "Permission denied")
-        return real_unlink(self, *a, **k)
+        return real_open(path, *a, **k)
 
-    monkeypatch.setattr(Path, "unlink", deny_poisoned)
+    monkeypatch.setattr(hook.os, "open", deny_poisoned)
 
     hook._dispatch_discovery()
 
@@ -225,7 +224,6 @@ def test_state_dir_private_candidate_is_hardened(windows_hook, tmp_path):
 
 def test_state_dir_both_candidates_unusable_is_logged(windows_hook, monkeypatch, tmp_path):
     hook, _calls, _install_ps1 = windows_hook
-    monkeypatch.setattr(hook.tempfile, "gettempdir", lambda: str(tmp_path / "temp"))
     monkeypatch.setattr(hook.os, "access", lambda path, mode, *a, **k: False)
 
     logged = []
@@ -234,6 +232,33 @@ def test_state_dir_both_candidates_unusable_is_logged(windows_hook, monkeypatch,
     hook._dispatch_discovery()
 
     assert any("no usable state dir" in msg for msg in logged)
+
+
+def test_debounce_holds_across_sessions_after_relocation(windows_hook, monkeypatch):
+    hook, calls, _ = windows_hook
+    poisoned = hook.DISCOVERY_DISPATCH_PATH
+    poisoned.write_text("", encoding="utf-8")
+    os.utime(poisoned, (0, 0))
+
+    real_open = os.open
+
+    def deny(path, *a, **k):
+        if str(path) == str(poisoned):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *a, **k)
+
+    monkeypatch.setattr(hook.os, "open", deny)
+
+    hook._dispatch_discovery()          # session 1: relocates, dispatches
+    assert len(calls) == 1
+
+    # session 2: fresh process => module constants are back at ~/.unbound
+    hook.DISCOVERY_CACHE_PATH = poisoned.parent / "cache.json"
+    hook.DISCOVERY_LOCK_PATH = poisoned.parent / "discovery.lock"
+    hook.DISCOVERY_DISPATCH_PATH = poisoned
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1, "24h debounce did not hold: dispatched again"
 
 
 def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):

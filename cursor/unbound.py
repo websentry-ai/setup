@@ -3141,22 +3141,19 @@ def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]
         cache_file = path / DISCOVERY_CACHE_PATH.name
         if cache_file.exists() and not os.access(str(cache_file), os.R_OK):
             return "cache file unreadable"
-        # A fresh marker means a peer is mid-dispatch; only a stale one must be clearable.
+        # Non-destructive: a poisoned marker denies the open, a live peer's does not.
         marker = path / DISCOVERY_DISPATCH_PATH.name
-        if marker.exists() and (time.time() - marker.stat().st_mtime) >= DISCOVERY_DISPATCH_TTL_SECONDS:
-            marker.unlink()
+        if marker.exists():
+            os.close(os.open(str(marker), os.O_WRONLY))
         return None
     except OSError as e:
         return "%s errno=%s" % (type(e).__name__, e.errno)
 
 
-def _resolve_state_dir() -> None:
-    """Repoint cache/lock/marker at the first usable dir, mirroring the agent's fallback."""
+def _relocate_state_dir(reason: str) -> bool:
+    """Repoint cache/lock/marker at the temp fallback. True if it moved."""
     global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
     current = DISCOVERY_DISPATCH_PATH.parent
-    reason = _state_dir_reject_reason(current)
-    if reason is None:
-        return
     if _is_windows():
         fallback, private = Path(tempfile.gettempdir()) / "unbound", False
     else:
@@ -3166,12 +3163,20 @@ def _resolve_state_dir() -> None:
     if fallback_reason is not None:
         log_error("discovery gate: no usable state dir (%s: %s / %s: %s)"
                   % (current, reason, fallback, fallback_reason), 'discovery_gate')
-        return
+        return False
     log_error("discovery gate: state dir %s unusable (%s); using %s" % (current, reason, fallback),
               'discovery_gate')
     DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
     DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
     DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
+    return True
+
+
+def _resolve_state_dir() -> None:
+    """Relocate before dispatching if the current state dir is unusable."""
+    reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
+    if reason is not None:
+        _relocate_state_dir(reason)
 
 
 def _dispatch_discovery() -> None:
