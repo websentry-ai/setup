@@ -33,6 +33,13 @@ EVENT_PAYLOADS = {
                         "tool_input": {"command": "git status"},
                         "tool_response": {"output": "clean"}},
         "UserPromptSubmit": {**S, "hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+        "userPromptTransformed": {
+            **S,
+            "hook_event_name": "userPromptTransformed",
+            "sessionId": "test-session",
+            "prompt": "hello",
+            "transformedPrompt": "hello",
+        },
         "Stop": {**S, "hook_event_name": "Stop"},
         "SessionStart": {**S, "hook_event_name": "SessionStart"},
         "SessionEnd": {**S, "hook_event_name": "SessionEnd"},
@@ -154,6 +161,27 @@ def test_module_crash_fails_open(monkeypatch, capsys):
     monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
     assert hook_cmd.run(["cursor"]) == 0
     assert capsys.readouterr().out.strip() == "{}"
+
+
+@pytest.mark.parametrize("tool", ["claude-code", "cursor", "copilot", "codex"])
+def test_skills_sync_uses_provider_key_reader(monkeypatch, tool):
+    from unbound_hook import hook_cmd
+
+    calls = []
+
+    class FakeModule:
+        @staticmethod
+        def get_api_key():
+            return "test-key"
+
+        @staticmethod
+        def _sync_skills_once(api_key):
+            calls.append(api_key)
+
+    monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
+
+    assert hook_cmd.run_skills_sync([tool]) == 0
+    assert calls == ["test-key"]
 
 
 def test_version_does_not_read_stdin(sandbox_home):
