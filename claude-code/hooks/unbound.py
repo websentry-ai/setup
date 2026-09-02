@@ -4,6 +4,7 @@ import sys
 import base64
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
@@ -20,9 +21,14 @@ from urllib.parse import urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
-AUDIT_LOG = Path.home() / ".claude" / "hooks" / "agent-audit.log"
-ERROR_LOG = Path.home() / ".claude" / "hooks" / "error.log"
-LAST_REPORT_FILE = Path.home() / ".claude" / "hooks" / ".last_error_report"
+# Claude Code reads CLAUDE_CONFIG_DIR verbatim and resolves it against the cwd,
+# without expanding a leading "~". Expanding it here would put the hook's files
+# under $HOME while Claude read a literal "~" dir. Blank is treated as unset.
+_env_config_dir = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip()
+_CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Path.home() / ".claude"
+AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
+ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
+LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
 ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
 NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
 MCP_TOOL_PREFIX = 'mcp__'
@@ -34,7 +40,7 @@ SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.claude', 'skills'),)
 
 UNBOUND_SKILL_PREFIX = 'unbound-'
-CLAUDE_SKILLS_ROOT = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude')) / 'skills'
+CLAUDE_SKILLS_ROOT = _CONFIG_DIR / 'skills'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
 INJECTION_TURN_GUARD_DIR = Path.home() / '.unbound' / 'injection-turn'
 SKILLS_SYNC_LOCK_PATH = Path.home() / '.unbound' / 'skills-sync.lock'
@@ -44,20 +50,22 @@ SKILL_LOADED_WINDOW = 10
 # unbound-<slug> is the skill name, so the slug carries the spec's name rules.
 _SLUG_RE = re.compile(r'^[a-z0-9]+(?:-[a-z0-9]+)*$')
 
+
 # CoWork built-in tools that are exposed under mcp__
 COWORK_BUILTIN_MCP_SERVERS = frozenset({
     'workspace', 'cowork', 'cowork-onboarding', 'visualize',
     'scheduled-tasks', 'plugins', 'mcp-registry', 'session_info', 'skills',
 })
 
-# CLAUDE_CONFIG_DIR relocates .claude.json entirely; read the file Claude uses.
-CLAUDE_MCP_CONFIG_PATH = (
-    Path(os.environ['CLAUDE_CONFIG_DIR']) / '.claude.json'
-    if os.environ.get('CLAUDE_CONFIG_DIR')
-    else Path.home() / '.claude.json'
-)
-CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
-POLICY_CACHE_FILE = Path.home() / ".claude" / "hooks" / ".policy_cache.json"
+# Claude keeps .claude.json beside the config dir when relocated, and directly
+# in the home dir otherwise — it is not nested under the default ~/.claude.
+CLAUDE_MCP_CONFIG_PATH = (_CONFIG_DIR / ".claude.json") if _env_config_dir else (Path.home() / ".claude.json")
+# Claude Code lets CLAUDE_CODE_PLUGIN_CACHE_DIR override the plugin root outright,
+# and falls back to <config dir>/plugins otherwise.
+_env_plugin_dir = (os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR") or "").strip()
+_PLUGIN_ROOT = Path(os.path.abspath(_env_plugin_dir)) if _env_plugin_dir else _CONFIG_DIR / "plugins"
+CLAUDE_PLUGIN_CACHE_DIR = _PLUGIN_ROOT / "cache"
+POLICY_CACHE_FILE = _CONFIG_DIR / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
 # write, and the gate keeps no state on disk at all.
@@ -73,7 +81,7 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
-DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_DISPATCH_TTL_SECONDS = 60
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
@@ -84,19 +92,13 @@ DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
-SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/claude-code/hooks/unbound.py"
-SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
-SELF_UPDATE_LOCK_TTL_SECONDS = 30
-SELF_UPDATE_CURL_TIMEOUT = 10
-SELF_SCRIPT_PATH = Path.home() / ".claude" / "hooks" / "unbound.py"
-SELF_UPDATE_STATE_PATH = SELF_SCRIPT_PATH.parent / ".self_update_check"
-SELF_UPDATE_LOCK_PATH = SELF_SCRIPT_PATH.parent / ".self_update.lock"
+SELF_SCRIPT_PATH = _CONFIG_DIR / "hooks" / "unbound.py"
 
 # Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
 # binary must make ZERO network calls other than the backend/gateway APIs:
-# self-update is owned by the MDM package (never in-place), and discovery runs
-# from the locally installed binary instead of a GitHub-fetched install.sh.
-# UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without freezing.
+# discovery runs from the locally installed binary instead of a GitHub-fetched
+# install.sh. UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without
+# freezing.
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
@@ -111,7 +113,7 @@ MCP_DIAG_STAMP_DIR = Path.home() / ".unbound" / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
 MCP_DIAG_VERSION = "v3"
 MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
-_DIAG_CLAUDE_DIR = Path(os.environ.get('CLAUDE_CONFIG_DIR') or (Path.home() / '.claude'))
+_DIAG_CLAUDE_DIR = _CONFIG_DIR
 
 _cached_api_key = None
 _reporting_error = False
@@ -319,7 +321,7 @@ def append_to_audit_log(event_data: Dict):
         pass
 
 
-_APPROVAL_MARKER_FILE = Path.home() / ".claude" / "hooks" / ".approval_pending"
+_APPROVAL_MARKER_FILE = _CONFIG_DIR / "hooks" / ".approval_pending"
 
 
 def _is_approval_retry(command: str) -> bool:
@@ -2280,6 +2282,10 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
+    if (safe_additional_data.get('scope') == 'copilot-builtin' and safe_name
+            and not command and not url and not safe_args):
+        return f'copilot-builtin:{safe_name.lower()}'
+
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
     if not command and not url and not safe_args:
@@ -4107,25 +4113,28 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
         # A prefixed skill never falls back to the bare name — "slack:standup"
         # and a personal "standup" are different skills.
         nested = segments
-        roots = []
-        if cwd:
-            roots = _trusted_ancestors(Path(cwd))
-        roots.append(Path.home())
+        roots = _trusted_ancestors(Path(cwd)) if cwd else []
 
-        for root in roots:
-            for skill_dir in SKILL_SEARCH_DIRS:
-                base = root.joinpath(*nested, *skill_dir)
-                candidate = base / name / 'SKILL.md'
-                if candidate.is_file():
-                    return str(candidate)
-                # Bundled skills sit one level deeper (skills/<bundle>/<name>).
-                # Several bundles sharing a name is ambiguous, so resolve
-                # nothing rather than attach the wrong path to a join key.
-                matches = sorted(base.glob('*/%s/SKILL.md' % name))
-                if len(matches) > 1:
-                    return None
-                if matches:
-                    return str(matches[0])
+        bases = [root.joinpath(*nested, *skill_dir)
+                 for root in roots for skill_dir in SKILL_SEARCH_DIRS]
+        # User-level skills live in <config dir>/skills — where the sync writes them
+        # and where Claude Code reads them. It stands in for ~/.claude/skills rather
+        # than following it: after a move the sync stops refreshing the old copy, so
+        # searching there first would pin resolution to whatever it last held.
+        bases.append(CLAUDE_SKILLS_ROOT.joinpath(*nested))
+
+        for base in bases:
+            candidate = base / name / 'SKILL.md'
+            if candidate.is_file():
+                return str(candidate)
+            # Bundled skills sit one level deeper (skills/<bundle>/<name>).
+            # Several bundles sharing a name is ambiguous, so resolve
+            # nothing rather than attach the wrong path to a join key.
+            matches = sorted(base.glob('*/%s/SKILL.md' % name))
+            if len(matches) > 1:
+                return None
+            if matches:
+                return str(matches[0])
         return None
     except Exception:
         return None
@@ -4496,147 +4505,6 @@ def get_api_key():
     except Exception as e:
         log_error(f"Failed to read config file: {e}", 'config')
         return None
-
-
-_GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')
-_BAKED_GATEWAY_RE = re.compile(r'os\.environ\.get\(\s*"UNBOUND_GATEWAY_URL"\s*,\s*"([^"]*)"')
-
-
-def _is_valid_gateway_url(url: str) -> bool:
-    if not url or any(c in url for c in '"\\\n\r\x00'):
-        return False
-    return bool(_GATEWAY_URL_RE.fullmatch(url))
-
-
-def _baked_gateway_url(text: str) -> str:
-    # read baked url, not env
-    match = _BAKED_GATEWAY_RE.search(text)
-    return match.group(1) if match else ""
-
-
-def _rebake_gateway_url(text: str, gateway_url: str) -> str:
-    # rewrite only the env-var default, nothing else
-    return _BAKED_GATEWAY_RE.sub(
-        lambda m: m.group(0).replace(f'"{m.group(1)}"', f'"{gateway_url}"'),
-        text,
-        count=1,
-    )
-
-
-def _self_update_due() -> bool:
-    try:
-        return (time.time() - SELF_UPDATE_STATE_PATH.stat().st_mtime) >= SELF_UPDATE_INTERVAL_SECONDS
-    except OSError:
-        return True
-
-
-def _acquire_self_update_lock() -> bool:
-    try:
-        if SELF_UPDATE_LOCK_PATH.exists():
-            if (time.time() - SELF_UPDATE_LOCK_PATH.stat().st_mtime) < SELF_UPDATE_LOCK_TTL_SECONDS:
-                return False
-            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
-        fd = os.open(str(SELF_UPDATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return True
-    except (FileExistsError, OSError):
-        return False
-
-
-def _download_latest_hook():
-    try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL],
-            capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
-        )
-        if result.returncode != 0 or not result.stdout:
-            return None
-        return result.stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def _replace_self(new_bytes: bytes) -> None:
-    try:
-        mode = SELF_SCRIPT_PATH.stat().st_mode
-    except OSError:
-        mode = 0o755
-    fd, tmp_path = tempfile.mkstemp(dir=str(SELF_SCRIPT_PATH.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(new_bytes)
-        os.replace(tmp_path, SELF_SCRIPT_PATH)
-        os.chmod(SELF_SCRIPT_PATH, mode | 0o111)
-    except OSError as e:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        log_error(f"self_update replace failed: {e}", 'self_update')
-
-
-def _check_self_update() -> None:
-    if RUNNING_FROZEN:
-        # Binary deployments are updated by the MDM package, never in place.
-        return
-    # Under MDM the hook runs from an admin-managed location we can't write to,
-    # so SELF_SCRIPT_PATH (user-level) is not the file executing — updating it
-    # would only write a dead copy the managed settings never run. The daily MDM
-    # cron refreshes the managed script instead. Only self-update when we are
-    # actually running the user-level script (subscription installs).
-    try:
-        running = os.path.normcase(str(Path(__file__).resolve()))
-        target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
-    except Exception as e:
-        log_error(f"self_update skipped: could not resolve script path: {e}", 'self_update')
-        return
-    if running != target:
-        # Running from a managed/enterprise location (MDM) — the daily cron owns
-        # updates there; skipping is expected, not an error.
-        return
-    # refresh hook from main, throttled per interval
-    try:
-        if not _self_update_due():
-            return
-        try:
-            SELF_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return
-        if not _acquire_self_update_lock():
-            return
-        try:
-            SELF_UPDATE_STATE_PATH.touch()
-            try:
-                local_bytes = SELF_SCRIPT_PATH.read_bytes()
-                gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
-            except OSError:
-                # self file gone — heal by re-pulling; recover tenant url
-                # from the running instance, no local file to read it from
-                local_bytes = None
-                gateway_url = UNBOUND_GATEWAY_URL
-            if not _is_valid_gateway_url(gateway_url):
-                log_error("self_update skipped: invalid gateway url", 'self_update')
-                return
-
-            payload = _download_latest_hook()
-            if not payload:
-                return
-            remote_text = payload.decode("utf-8", errors="replace")
-            if "UNBOUND_GATEWAY_URL" not in remote_text:
-                log_error("self_update skipped: bad download", 'self_update')
-                return
-
-            new_text = _rebake_gateway_url(remote_text, gateway_url)
-            if _baked_gateway_url(new_text) != gateway_url:
-                log_error("self_update skipped: gateway url not preserved", 'self_update')
-                return
-            new_bytes = new_text.encode("utf-8")
-            if local_bytes is None or hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
-                _replace_self(new_bytes)
-        finally:
-            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
-    except Exception as e:
-        log_error(f"self_update error: {e}", 'self_update')
 
 
 def _is_windows() -> bool:
@@ -5620,8 +5488,91 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
         log_error('mcp diagnostic dispatch failed for %s: %s' % (server_name, exc), 'mcp_server')
 
 
+def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
+    """None if the dir can hold discovery state, else why not. Clears a stale marker."""
+    try:
+        posix = hasattr(os, "getuid")
+        if private:
+            # Windows st_mode is synthetic (0o777, never sticky), so the POSIX
+            # world-writable check there would reject every candidate.
+            if posix:
+                try:
+                    pst = os.lstat(str(path.parent))
+                    if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
+                        return "fallback parent world-writable and not sticky"
+                except OSError:
+                    pass
+            try:
+                st = os.lstat(str(path))
+                if path.is_symlink() or not stat.S_ISDIR(st.st_mode):
+                    return "fallback dir is a symlink or not a dir"
+                if posix and st.st_uid != os.getuid():
+                    return "fallback dir foreign-owned"
+            except FileNotFoundError:
+                pass
+        if private and posix:
+            # Create with the mode so a symlink planted after the lstat cannot be
+            # chmod-ed through; a pre-existing dir was validated above.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(str(path), 0o700)
+            except FileExistsError:
+                pass
+            if os.lstat(str(path)).st_mode & 0o077:
+                return "fallback dir not private"
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        if not os.access(str(path), os.W_OK | os.X_OK):
+            return "dir not writable"
+        # os.access cannot see a Windows ACL denial; an actual write can.
+        fd, probe = tempfile.mkstemp(prefix=".probe.", dir=str(path))
+        os.close(fd)
+        os.unlink(probe)
+        cache_file = path / DISCOVERY_CACHE_PATH.name
+        if cache_file.exists() and not os.access(str(cache_file), os.R_OK):
+            return "cache file unreadable"
+        # Non-destructive: a poisoned marker denies the open, a live peer's does not.
+        marker = path / DISCOVERY_DISPATCH_PATH.name
+        if marker.exists():
+            os.close(os.open(str(marker), os.O_WRONLY))
+        return None
+    except OSError as e:
+        return "%s errno=%s" % (type(e).__name__, e.errno)
+
+
+def _relocate_state_dir(reason: str) -> bool:
+    """Repoint cache/lock/marker at the temp fallback. True if it moved."""
+    global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
+    current = DISCOVERY_DISPATCH_PATH.parent
+    if _is_windows():
+        fallback = Path(tempfile.gettempdir()) / "unbound"
+    else:
+        fallback = Path("/var/tmp/unbound-%d" % os.getuid())
+    fallback_reason = ("same as current" if fallback == current
+                       else _state_dir_reject_reason(fallback, private=True))
+    # Paths carry the OS username; log the candidate, not the path (see #281).
+    if fallback_reason is not None:
+        log_error("discovery gate: no usable state dir (home: %s / fallback: %s)"
+                  % (reason, fallback_reason), 'discovery_gate')
+        return False
+    log_error("discovery gate: home state dir unusable (%s); using fallback" % reason,
+              'discovery_gate')
+    DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
+    DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
+    DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
+    return True
+
+
+def _resolve_state_dir() -> None:
+    """Relocate before dispatching if the current state dir is unusable."""
+    reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
+    if reason is not None:
+        _relocate_state_dir(reason)
+
+
 def _dispatch_discovery() -> None:
     try:
+        _resolve_state_dir()
         cache: Dict = {}
         if DISCOVERY_CACHE_PATH.exists():
             try:
@@ -5737,11 +5688,18 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
             DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
+                                       dir=str(DISCOVERY_CACHE_PATH.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, sort_keys=True)
+                os.replace(tmp, DISCOVERY_CACHE_PATH)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
@@ -5783,7 +5741,6 @@ def main():
         # SessionStart fires once per session — TTL gate for discovery and housekeeping
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
-            _check_self_update()
             _dispatch_discovery()
             _dispatch_skills_sync(api_key)
             print("{}")

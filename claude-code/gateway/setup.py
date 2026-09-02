@@ -270,15 +270,16 @@ def _command_targets_hook(command: str, target: Path) -> bool:
     return os.path.normcase(os.path.normpath(tokens[0])) == normalized_target
 
 
-def _is_unbound_hook_command(command) -> bool:
+def _is_unbound_hook_command(command, config_dir: Path = None) -> bool:
     """Whether a settings.json hook entry runs the Unbound hook. The hooks installer
     writes the interpreter, quoting and separators of the platform it ran on, so the
     command is tokenised and the path compared rather than matched as a substring."""
+    config_dir = config_dir or (Path.home() / ".claude")
     return isinstance(command, str) and _command_targets_hook(
-        command, Path.home() / ".claude" / "hooks" / "unbound.py")
+        command, config_dir / "hooks" / "unbound.py")
 
 
-def _strip_unbound_hooks(settings: dict) -> None:
+def _strip_unbound_hooks(settings: dict, config_dir: Path = None) -> None:
     """Drop the Unbound entries from settings["hooks"], leaving every other hook in place
     and removing only the groups and the block our entries emptied."""
     hooks = settings.get("hooks")
@@ -297,7 +298,7 @@ def _strip_unbound_hooks(settings: dict) -> None:
                 kept_groups.append(group)
                 continue
             kept = [e for e in entries
-                    if not (isinstance(e, dict) and _is_unbound_hook_command(e.get("command")))]
+                    if not (isinstance(e, dict) and _is_unbound_hook_command(e.get("command"), config_dir))]
             if not kept:
                 continue
             group["hooks"] = kept
@@ -310,20 +311,27 @@ def _strip_unbound_hooks(settings: dict) -> None:
         del settings["hooks"]
 
 
-def _is_unbound_key_helper_setting(value) -> bool:
-    """Whether settings.json's apiKeyHelper is the one this setup writes. The expanded
-    form counts too: the setup writes the ~ form, but a device may already carry the
-    expanded one."""
+def _is_unbound_key_helper_setting(value, config_dir: Path = None) -> bool:
+    """Whether settings.json's apiKeyHelper is the one this setup writes. The setup
+    writes the portable ~ form for the default dir and an absolute path for a relocated
+    one, and a device may already carry the expanded default; all three count."""
+    config_dir = config_dir or (Path.home() / ".claude")
     if not isinstance(value, str):
         return False
+    default_helper = Path.home() / ".claude" / "anthropic_key.sh"
+    active_helper = config_dir / "anthropic_key.sh"
     candidate = value.strip()
-    if candidate not in (UNBOUND_KEY_HELPER_SETTING,
-                         str(Path.home() / ".claude" / "anthropic_key.sh")):
+    # Judge the file the setting actually names, not the active dir's — a portable
+    # ~ form left over from a default install points at ~/.claude either way.
+    if candidate in (UNBOUND_KEY_HELPER_SETTING, str(default_helper)):
+        target = default_helper
+    elif candidate == str(active_helper):
+        target = active_helper
+    else:
         return False
     # The path is a name anyone could choose, so the script there decides. Nothing there
     # means our own removal already ran; a dangling helper is broken either way.
-    path = Path.home() / ".claude" / "anthropic_key.sh"
-    return not path.exists() or _is_unbound_key_helper_file(path)
+    return not target.exists() or _is_unbound_key_helper_file(target)
 
 
 def _is_unbound_key_helper_file(path: Path) -> bool:
@@ -448,9 +456,22 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
         return False
 
 
-def remove_hooks_unbound_script() -> None:
-    """Remove ~/.claude/hooks/unbound.py if present (leftover from hooks setup)."""
-    script_path = Path.home() / ".claude" / "hooks" / "unbound.py"
+def _resolve_claude_config_dir(config_dir_arg: Optional[str] = None) -> Path:
+    """Resolve Claude Code's config dir: $CLAUDE_CONFIG_DIR (env wins), else the
+    --config-dir arg the CLI forwards, else the default ~/.claude."""
+    value = (os.environ.get("CLAUDE_CONFIG_DIR") or "").strip() or None
+    if not value and config_dir_arg:
+        value = config_dir_arg.strip() or None
+    if not value:
+        return Path.home() / ".claude"
+    # Verbatim, as Claude Code reads it: a literal "~" must not be expanded.
+    return Path(os.path.abspath(value))
+
+
+def remove_hooks_unbound_script(config_dir: Path = None) -> None:
+    """Remove <config_dir>/hooks/unbound.py if present (leftover from hooks setup)."""
+    config_dir = config_dir or (Path.home() / ".claude")
+    script_path = config_dir / "hooks" / "unbound.py"
     if script_path.exists():
         try:
             script_path.unlink()
@@ -459,12 +480,12 @@ def remove_hooks_unbound_script() -> None:
             debug_print(f"Failed to remove {script_path}: {e}")
 
 
-def setup_claude_key_helper() -> bool:
+def setup_claude_key_helper(config_dir: Path = None) -> bool:
     """
-    Create ~/.claude/anthropic_key.sh that echoes UNBOUND_API_KEY and
-    update ~/.claude/settings.json with apiKeyHelper pointing to that script.
+    Create <config_dir>/anthropic_key.sh that echoes UNBOUND_API_KEY and
+    update <config_dir>/settings.json with apiKeyHelper pointing to that script.
     """
-    claude_dir = Path.home() / ".claude"
+    claude_dir = config_dir or (Path.home() / ".claude")
     settings_path = claude_dir / "settings.json"
     key_helper_path = claude_dir / "anthropic_key.sh"
 
@@ -490,10 +511,12 @@ def setup_claude_key_helper() -> bool:
 
         # Our hook and the gateway cannot both drive Claude Code, so ours goes before
         # apiKeyHelper is added. Only ours: a hook the user installed is not ours to drop.
-        _strip_unbound_hooks(settings)
+        _strip_unbound_hooks(settings, claude_dir)
 
-        # Update apiKeyHelper
-        settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
+        if claude_dir.resolve() == (Path.home() / ".claude").resolve():
+            settings["apiKeyHelper"] = "~/.claude/anthropic_key.sh"
+        else:
+            settings["apiKeyHelper"] = str(key_helper_path)
 
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         return True
@@ -594,18 +617,19 @@ def _clear_path(path: Path, label: str) -> str:
         return "failed"
 
 
-def remove_api_key_helper_setting() -> str:
+def remove_api_key_helper_setting(config_dir: Path = None) -> str:
     """Remove apiKeyHelper from settings.json.
 
     Returns "cleared", "not_found", or "failed".
     """
-    settings_path = Path.home() / ".claude" / "settings.json"
+    config_dir = config_dir or (Path.home() / ".claude")
+    settings_path = config_dir / "settings.json"
     if not settings_path.exists():
         return "not_found"
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
             settings = json.load(f)
-        if not _is_unbound_key_helper_setting(settings.get("apiKeyHelper")):
+        if not _is_unbound_key_helper_setting(settings.get("apiKeyHelper"), config_dir):
             return "not_found"
         del settings["apiKeyHelper"]
         with open(settings_path, "w", encoding="utf-8") as f:
@@ -617,8 +641,9 @@ def remove_api_key_helper_setting() -> str:
         return "failed"
 
 
-def clear_setup() -> bool:
+def clear_setup(config_dir: Path = None) -> bool:
     """Undo all changes made by the setup script."""
+    config_dir = config_dir or (Path.home() / ".claude")
     print("=" * 60)
     print("Claude Code - Clearing Setup")
     print("=" * 60)
@@ -636,7 +661,7 @@ def clear_setup() -> bool:
             print(f"Failed to clear {label}")
             any_failed = True
 
-    key_helper = Path.home() / ".claude" / "anthropic_key.sh"
+    key_helper = config_dir / "anthropic_key.sh"
     _r = (_clear_path(key_helper, "Claude anthropic_key.sh")
           if _is_unbound_key_helper_file(key_helper) else "not_found")
     if _r == "cleared":
@@ -644,12 +669,26 @@ def clear_setup() -> bool:
     elif _r == "failed":
         any_failed = True
 
-    settings_status = remove_api_key_helper_setting()
+    settings_status = remove_api_key_helper_setting(config_dir)
     if settings_status == "cleared":
         any_cleared = True
     elif settings_status == "failed":
         print("Failed to clear apiKeyHelper in settings.json")
         any_failed = True
+
+    # When the config dir was relocated, also strip enforcement left behind in the
+    # default ~/.claude so clearing leaves nothing that fires if Claude later runs
+    # without CLAUDE_CONFIG_DIR set.
+    default_dir = Path.home() / ".claude"
+    if config_dir.resolve() != default_dir.resolve():
+        # Same ownership check the primary path uses: a helper of this name that we
+        # did not write belongs to whoever did, and clearing must not delete it.
+        legacy_helper = default_dir / "anthropic_key.sh"
+        if (_is_unbound_key_helper_file(legacy_helper)
+                and _clear_path(legacy_helper, "Claude anthropic_key.sh (~/.claude)") == "cleared"):
+            any_cleared = True
+        if remove_api_key_helper_setting(default_dir) == "cleared":
+            any_cleared = True
 
     if any_cleared:
         print("Cleared")
@@ -763,12 +802,13 @@ def get_device_identifier() -> Optional[str]:
         return None
 
 
-def detect_install_state() -> str:
+def detect_install_state(config_dir: Path = None) -> str:
     """User-level install state (informational): 'persisted' if this tool's
     Unbound setup already exists on this device, else 'fresh'. User-level setups
     are never tamper-eligible, so 'tampered' is never reported."""
+    config_dir = config_dir or (Path.home() / ".claude")
     try:
-        return "persisted" if (Path.home() / ".claude" / "anthropic_key.sh").exists() else "fresh"
+        return "persisted" if (config_dir / "anthropic_key.sh").exists() else "fresh"
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return "fresh"
@@ -841,16 +881,34 @@ def main():
     parser.add_argument("--clear", action="store_true", help="Undo all changes made by the setup script")
     parser.add_argument("--debug", action="store_true", help="Show detailed debug information")
     parser.add_argument("--api-key", dest="api_key", help="API key (skip browser auth)")
+    parser.add_argument("--config-dir", dest="config_dir", help="Claude Code config dir (defaults to $CLAUDE_CONFIG_DIR or ~/.claude)")
     args, _ = parser.parse_known_args()
     args.gateway_url = normalize_url(args.gateway_url)
     args.backend_url = normalize_url(args.backend_url)
+
+    config_dir = _resolve_claude_config_dir(args.config_dir)
+    # Claude Code resolves CLAUDE_CONFIG_DIR against the current directory when it
+    # is set but empty, instead of falling back to ~/.claude, so installing to the
+    # default would be invisible to it.
+    _raw_cfg = os.environ.get("CLAUDE_CONFIG_DIR")
+    if _raw_cfg is not None and not _raw_cfg.strip():
+        print("\n\u26a0\ufe0f  CLAUDE_CONFIG_DIR is set but empty. Claude Code reads that as a path "
+              "relative to the current directory, not as ~/.claude, so it will not load this "
+              "install. Unset the variable, or point it at a real directory.")
+    # Claude Code picks its config dir from the environment alone. An install aimed
+    # somewhere else by --config-dir is one it will never read, so say so rather than
+    # reporting success over a key helper that cannot be found.
+    if args.config_dir and not (_raw_cfg or "").strip():
+        print(f"\n\u26a0\ufe0f  --config-dir set to {config_dir} but CLAUDE_CONFIG_DIR is not set in the "
+              "environment. Claude Code reads only the environment variable, so it will not load "
+              "this install. Export CLAUDE_CONFIG_DIR to the same path.")
 
     if args.debug:
         DEBUG = True
         debug_print("Debug mode enabled")
 
     if args.clear:
-        return clear_setup()
+        return clear_setup(config_dir)
 
     if check_enterprise_hooks_conflict():
         print("\n❌ Skipped — Claude Code is managed by your organization (MDM).")
@@ -876,7 +934,7 @@ def main():
             pass
 
     # Remove leftover hooks setup artifacts
-    remove_hooks_unbound_script()
+    remove_hooks_unbound_script(config_dir)
 
     api_key = args.api_key
     if not api_key:
@@ -928,12 +986,12 @@ def main():
         return False
     debug_print("ANTHROPIC_BASE_URL set successfully")
 
-    _install_state = detect_install_state()
+    _install_state = detect_install_state(config_dir)
     _device_id = get_device_identifier()
 
     # Configure Claude Code helper files
     debug_print("Setting up Claude key helper...")
-    if not setup_claude_key_helper():
+    if not setup_claude_key_helper(config_dir):
         return False
     debug_print("Claude key helper configured")
     

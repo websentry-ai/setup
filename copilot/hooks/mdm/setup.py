@@ -685,7 +685,7 @@ def _write_file(path: Path, data: str, mode: int) -> None:
 
 
 def _copilot_hooks_config(script_path: Path) -> Dict:
-    """Build the ~/.copilot/hooks/unbound.json config for the 5 Copilot events.
+    """Build the ~/.copilot/hooks/unbound.json config for Copilot events.
     Copilot delivers hook_event_name in the payload, so no per-event env is needed."""
     bash_cmd = f'"{script_path}"'
     launcher = "py -3" if shutil.which("py") else "python"
@@ -1751,7 +1751,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state() -> Optional[str]:
     """Inspect each user's ~/.copilot/hooks BEFORE it gets overwritten.
-    Existence-based: the self-update rewrites these files, so content checks
+    Existence-based: these files change across versions, so content checks
     are unreliable — only file existence is trustworthy. Per user, the pair is
     the unbound.json config and the unbound.py hook script. 'fresh' (no user
     has either file), 'persisted' (at least one user has both), 'tampered' (any

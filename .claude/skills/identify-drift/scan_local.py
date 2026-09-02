@@ -130,10 +130,26 @@ def _file_time(path):
         return None
 
 
+def _is_submission(prompt_source, tagged):
+    """A user record is a prompt only if the person sent it. The rest of what lands
+    under the user role -- injected reminders, slash-command expansions, command
+    output, task notifications -- was never submitted, so the hook never saw it and
+    counting it as absent from the database invents losses by the dozen. Newer
+    transcripts mark every real submission; older ones mark nothing, and filtering on
+    a field a file never writes would drop every prompt in it and read as total loss,
+    so the mark is only trusted in a file that uses it."""
+    return prompt_source in ("typed", "queued") if tagged else True
+
+
 def scan_claude_code(since):
     for path in (HOME / ".claude/projects").glob("*/*.jsonl"):
         session = path.stem
+        # Held back until the file has been read: whether it marks its submissions is
+        # only known once every record has been seen, and a file is read once.
+        prompts, tagged = [], False
         for entry in _lines(path):
+            if entry.get("type") == "user" and entry.get("promptSource"):
+                tagged = True
             when = _ts(entry.get("timestamp")) or _file_time(path)
             if not when or when < since:
                 continue
@@ -141,8 +157,8 @@ def scan_claude_code(since):
             message = entry.get("message") or {}
             if kind == "user":
                 text = _text_of(message.get("content"))
-                if text:
-                    yield _rec("user_prompt", session, when, text=text)
+                if text and not entry.get("isMeta"):
+                    prompts.append((when, text, entry.get("promptSource")))
             elif kind == "assistant":
                 text = _text_of(message.get("content"))
                 if text:
@@ -159,6 +175,9 @@ def scan_claude_code(since):
                                output=usage.get("output_tokens", 0),
                                cache_read=usage.get("cache_read_input_tokens", 0),
                                cache_write=usage.get("cache_creation_input_tokens", 0))
+        for when, text, prompt_source in prompts:
+            if _is_submission(prompt_source, tagged):
+                yield _rec("user_prompt", session, when, text=text)
 
 
 def scan_cursor(since):

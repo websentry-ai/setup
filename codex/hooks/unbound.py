@@ -3,6 +3,7 @@
 import sys
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
@@ -11,7 +12,9 @@ import time
 import hashlib
 import re
 import tempfile
+import shutil
 import base64
+import urllib.request
 from urllib.parse import urlparse
 
 
@@ -33,6 +36,17 @@ MCP_TOOL_PREFIX = 'mcp__'
 SKILL_TOOL_NAME = 'Skill'
 SKILL_SEARCH_DIRS = (('.agents', 'skills'), ('.codex', 'skills'))
 SKILL_INVOKE_RE = re.compile(r'(?:^|\s)\$([A-Za-z0-9][A-Za-z0-9._:-]*)')
+MANAGED_SKILLS_ROOT = Path.home() / '.agents' / 'skills'
+UNBOUND_SKILL_PREFIX = 'unbound-'
+UNBOUND_SKILL_MARKER = '.unbound-managed'
+SKILL_POLICY_STATE_ROOT = Path.home() / '.unbound' / 'skill-policy' / 'codex'
+SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
+SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
+SKILLS_SYNC_TIMEOUT_SECONDS = 10
+SKILL_POLICY_TOOL = 'codex'
+SKILL_POLICY_API_KEY_ENV = 'UNBOUND_CODEX_API_KEY'
+CODEX_SELECTED_SKILL_KIND = 'skills.selected_skill_instructions'
+CODEX_SELECTED_SKILL_NAME_RE = re.compile(r'<name>\s*([^<\s][^<]*?)\s*</name>')
 POLICY_CACHE_FILE = Path.home() / ".codex" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
 # Repo-scope gate. Straying outside the allowed org is blocked on the first
@@ -49,7 +63,7 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
-DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_DISPATCH_TTL_SECONDS = 60
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
@@ -59,19 +73,11 @@ DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/codi
 DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 
-SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/codex/hooks/unbound.py"
-SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
-SELF_UPDATE_LOCK_TTL_SECONDS = 30
-SELF_UPDATE_CURL_TIMEOUT = 8
-SELF_SCRIPT_PATH = Path.home() / ".codex" / "hooks" / "unbound.py"
-SELF_UPDATE_STATE_PATH = SELF_SCRIPT_PATH.parent / ".self_update_check"
-SELF_UPDATE_LOCK_PATH = SELF_SCRIPT_PATH.parent / ".self_update.lock"
-
 # Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
 # binary must make ZERO network calls other than the backend/gateway APIs:
-# self-update is owned by the MDM package (never in-place), and discovery runs
-# from the locally installed binary instead of a GitHub-fetched install.sh.
-# UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without freezing.
+# discovery runs from the locally installed binary instead of a GitHub-fetched
+# install.sh. UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without
+# freezing.
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
@@ -87,6 +93,613 @@ _APPROVAL_MARKER_FILE = Path.home() / ".codex" / "hooks" / ".approval_pending"
 
 _cached_api_key = None
 _reporting_error = False
+
+
+SKILL_LOADED_WINDOW = 10
+SKILL_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
+
+
+def _skill_policy_transcript_tail(path):
+    try:
+        with open(path, 'rb') as transcript_file:
+            size = os.fstat(transcript_file.fileno()).st_size
+            start = max(0, size - SKILL_TRANSCRIPT_TAIL_BYTES)
+            transcript_file.seek(start)
+            data = transcript_file.read(SKILL_TRANSCRIPT_TAIL_BYTES)
+    except OSError:
+        return []
+    if start:
+        boundary = data.find(b'\n')
+        if boundary < 0:
+            return []
+        data = data[boundary + 1:]
+    return data.splitlines()
+
+
+def _skill_policy_valid_slug(value):
+    return isinstance(value, str) and bool(re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?', value))
+
+
+def _managed_skill_dirs():
+    try:
+        return sorted(
+            (
+                entry for entry in MANAGED_SKILLS_ROOT.iterdir()
+                if entry.is_dir() and not entry.is_symlink()
+                and (entry / UNBOUND_SKILL_MARKER).is_file()
+                and not (entry / UNBOUND_SKILL_MARKER).is_symlink()
+            ),
+            key=lambda entry: entry.name,
+        )
+    except Exception:
+        return []
+
+
+def _managed_skill_slug(directory):
+    name = directory.name
+    if not name.startswith(UNBOUND_SKILL_PREFIX):
+        return None
+    slug = name[len(UNBOUND_SKILL_PREFIX):]
+    return slug if _skill_policy_valid_slug(slug) else None
+
+
+def installed_skill_report():
+    report = []
+    for directory in _managed_skill_dirs():
+        slug = _managed_skill_slug(directory)
+        if not slug:
+            continue
+        skill_file = directory / 'SKILL.md'
+        if skill_file.is_symlink():
+            continue
+        try:
+            digest = hashlib.sha256(skill_file.read_bytes()).hexdigest()
+        except OSError:
+            continue
+        report.append({'slug': slug, 'sha256': digest})
+    return report
+
+
+def _managed_skill_state(slug):
+    directory = MANAGED_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+    state = {'path': directory, 'exists': False, 'managed': False, 'sha256': None}
+    try:
+        state['exists'] = directory.is_dir()
+        if state['exists']:
+            marker = directory / UNBOUND_SKILL_MARKER
+            skill_file = directory / 'SKILL.md'
+            state['managed'] = (
+                not directory.is_symlink()
+                and marker.is_file()
+                and not marker.is_symlink()
+                and not skill_file.is_symlink()
+            )
+            if state['managed']:
+                state['sha256'] = hashlib.sha256(skill_file.read_bytes()).hexdigest()
+    except Exception:
+        pass
+    return state
+
+
+def _valid_skill_entry(entry):
+    if not isinstance(entry, dict):
+        return False
+    slug = entry.get('slug')
+    content = entry.get('content')
+    if not _skill_policy_valid_slug(slug) or not isinstance(content, str) or not content:
+        return False
+    data = content.encode('utf-8')
+    if len(data) > 1024 * 1024:
+        return False
+    wire_hash = entry.get('sha256')
+    if (
+        not isinstance(wire_hash, str)
+        or not re.fullmatch(r'[0-9a-f]{64}', wire_hash)
+        or wire_hash != hashlib.sha256(data).hexdigest()
+    ):
+        return False
+    state = _managed_skill_state(slug)
+    return not state['exists'] or state['managed']
+
+
+def _valid_skill_plan(plan):
+    if not isinstance(plan, dict):
+        return False
+    installs = plan.get('install', [])
+    removals = plan.get('remove', [])
+    if not isinstance(installs, list) or not isinstance(removals, list):
+        return False
+    install_slugs = []
+    for entry in installs:
+        if not _valid_skill_entry(entry):
+            return False
+        install_slugs.append(entry['slug'])
+    if len(install_slugs) != len(set(install_slugs)):
+        return False
+    if any(not _skill_policy_valid_slug(slug) for slug in removals):
+        return False
+    if len(removals) != len(set(removals)):
+        return False
+    return not set(install_slugs).intersection(removals)
+
+
+def install_injected_skills(inject_skills):
+    succeeded = True
+    try:
+        entries = inject_skills if isinstance(inject_skills, list) else []
+        for entry in entries:
+            slug = entry.get('slug') if isinstance(entry, dict) else None
+            try:
+                content = entry.get('content') if isinstance(entry, dict) else None
+                if not _skill_policy_valid_slug(slug):
+                    log_error(f"skill injection rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    succeeded = False
+                    continue
+                if not isinstance(content, str) or not content:
+                    log_error(f"skill injection rejected empty content for slug: {slug}", 'skill_injection')
+                    succeeded = False
+                    continue
+                data = content.encode('utf-8')
+                if len(data) > 1024 * 1024:
+                    log_error(f"skill injection rejected oversized content for slug: {slug}", 'skill_injection')
+                    succeeded = False
+                    continue
+                expected = hashlib.sha256(data).hexdigest()
+                wire_hash = entry.get('sha256')
+                if (
+                    not isinstance(wire_hash, str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', wire_hash)
+                    or wire_hash != expected
+                ):
+                    log_error(f"skill injection hash mismatch for {slug}", 'skill_injection')
+                    succeeded = False
+                    continue
+
+                state = _managed_skill_state(slug)
+                directory = state['path']
+                if state['exists'] and not state['managed']:
+                    log_error(f"skill dir not unbound-managed, skipping install: {directory}", 'skill_injection')
+                    succeeded = False
+                    continue
+                if state['managed'] and state['sha256'] == expected:
+                    continue
+
+                created = not state['exists']
+                directory.mkdir(parents=True, exist_ok=True)
+                if created:
+                    try:
+                        marker_fd = os.open(
+                            str(directory / UNBOUND_SKILL_MARKER),
+                            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                            0o600,
+                        )
+                        os.close(marker_fd)
+                    except OSError:
+                        try:
+                            directory.rmdir()
+                        except OSError:
+                            pass
+                        raise
+
+                fd, temp_path = tempfile.mkstemp(dir=str(directory), prefix='.SKILL.', suffix='.tmp')
+                try:
+                    with os.fdopen(fd, 'wb') as temp_file:
+                        temp_file.write(data)
+                    os.replace(temp_path, str(directory / 'SKILL.md'))
+                except Exception:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
+                    raise
+            except Exception as exc:
+                log_error(f"skill injection failed for {str(slug)[:64]}: {exc}", 'skill_injection')
+                succeeded = False
+    except Exception as exc:
+        log_error(f"skill injection failed: {exc}", 'skill_injection')
+        succeeded = False
+    return succeeded
+
+
+def prune_injected_skills(remove_skills):
+    try:
+        entries = remove_skills if isinstance(remove_skills, list) else []
+        for slug in entries:
+            try:
+                if not _skill_policy_valid_slug(slug):
+                    log_error(f"skill prune rejected slug: {str(slug)[:64]!r}", 'skill_injection')
+                    continue
+                directory = MANAGED_SKILLS_ROOT / (UNBOUND_SKILL_PREFIX + slug)
+                if not directory.is_dir():
+                    continue
+                marker = directory / UNBOUND_SKILL_MARKER
+                if directory.is_symlink() or not marker.is_file() or marker.is_symlink():
+                    log_error(f"skill dir not unbound-managed, skipping prune: {directory}", 'skill_injection')
+                    continue
+                shutil.rmtree(directory)
+            except Exception as exc:
+                log_error(f"skill prune failed for {str(slug)[:64]}: {exc}", 'skill_injection')
+    except Exception as exc:
+        log_error(f"skill prune failed: {exc}", 'skill_injection')
+
+
+def _skills_lock_acquire():
+    try:
+        SKILLS_SYNC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                age = time.time() - SKILLS_SYNC_LOCK_PATH.stat().st_mtime
+            except OSError:
+                age = SKILLS_SYNC_STALE_LOCK_SECONDS + 1
+            if age < SKILLS_SYNC_STALE_LOCK_SECONDS:
+                return None
+            try:
+                SKILLS_SYNC_LOCK_PATH.unlink()
+                return os.open(str(SKILLS_SYNC_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except OSError:
+                return None
+    except OSError:
+        return None
+
+
+def _skills_lock_release(lock_fd):
+    if lock_fd is None:
+        return
+    try:
+        os.close(lock_fd)
+    except OSError:
+        pass
+    try:
+        SKILLS_SYNC_LOCK_PATH.unlink()
+    except OSError:
+        pass
+
+
+class _SkillSyncNoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+        return None
+
+
+def _request_skill_sync(api_key, payload):
+    request = urllib.request.Request(
+        f'{UNBOUND_GATEWAY_URL}/v1/hooks/skills/sync',
+        data=json.dumps(payload).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    opener = urllib.request.build_opener(_SkillSyncNoRedirects())
+    try:
+        with opener.open(request, timeout=SKILLS_SYNC_TIMEOUT_SECONDS) as response:
+            body = response.read(4 * 1024 * 1024 + 1)
+    except Exception as exc:
+        log_error(f'skills sync request failed: {type(exc).__name__}', 'skill_injection')
+        return None
+    if not body or len(body) > 4 * 1024 * 1024:
+        return None
+    try:
+        plan = json.loads(body.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return plan if isinstance(plan, dict) else None
+
+
+def _sync_skills_once(api_key):
+    lock_fd = _skills_lock_acquire()
+    if lock_fd is None:
+        return
+    try:
+        plan = _request_skill_sync(api_key, {'installed': installed_skill_report()})
+        if plan is None:
+            return
+        if not _valid_skill_plan(plan):
+            log_error('skills sync rejected invalid plan', 'skill_injection')
+            return
+        if not install_injected_skills(plan.get('install', [])):
+            return
+        prune_injected_skills(plan.get('remove', []))
+    except Exception as exc:
+        log_error(f'skills sync failed: {type(exc).__name__}', 'skill_injection')
+    finally:
+        _skills_lock_release(lock_fd)
+
+
+def _dispatch_skills_sync(api_key):
+    try:
+        if not api_key:
+            return
+        if RUNNING_FROZEN:
+            command = [sys.executable, 'sync-skills', SKILL_POLICY_TOOL]
+        else:
+            script = os.path.abspath(__file__)
+            if not os.path.isfile(script):
+                return
+            command = [sys.executable, script, '--sync-skills']
+        kwargs = {
+            'stdin': subprocess.DEVNULL,
+            'stdout': subprocess.DEVNULL,
+            'stderr': subprocess.DEVNULL,
+            'close_fds': True,
+            'env': {**os.environ, SKILL_POLICY_API_KEY_ENV: api_key},
+        }
+        if os.name == 'nt':
+            kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs['start_new_session'] = True
+        subprocess.Popen(command, **kwargs)
+    except Exception as exc:
+        log_error(f"skills sync dispatch failed: {exc}", 'skill_injection')
+
+
+def _attach_installed_skill_facts(metadata, event=None):
+    installed = installed_skill_report()
+    if not installed:
+        return
+    metadata['installed_skills'] = installed
+    try:
+        facts = _skill_policy_loaded_facts(event or {})
+        if facts['loaded']:
+            metadata['loaded_skills'] = sorted(facts['loaded'])
+        metadata['skills_loaded_this_session'] = facts['session_count']
+    except Exception as exc:
+        log_error(f"skill loaded facts failed: {exc}", 'skill_injection')
+    try:
+        key = _skill_policy_turn_key(event or {})
+        if key and _skill_turn_claim_path(key).exists():
+            metadata['already_injected_this_turn'] = True
+    except OSError:
+        pass
+
+
+def _skill_turn_claim_path(key):
+    digest = hashlib.sha256(str(key).encode('utf-8', 'replace')).hexdigest()
+    return SKILL_POLICY_STATE_ROOT / 'turn-claims' / digest
+
+
+def _cleanup_skill_policy_state():
+    cutoff = time.time() - 7 * 24 * 3600
+    try:
+        if not SKILL_POLICY_STATE_ROOT.is_dir():
+            return
+        for directory in SKILL_POLICY_STATE_ROOT.iterdir():
+            if not directory.is_dir() or directory.is_symlink():
+                continue
+            # Budget per directory: one busy directory must not consume the whole
+            # sweep and leave every later one uncollected.
+            checked = 0
+            for entry in directory.iterdir():
+                checked += 1
+                if checked > 1000:
+                    break
+                try:
+                    if entry.is_file() and entry.stat().st_mtime < cutoff:
+                        entry.unlink()
+                except OSError:
+                    continue
+    except OSError:
+        pass
+
+
+def _claim_skill_injection_turn(event):
+    try:
+        key = _skill_policy_turn_key(event or {})
+        if not key:
+            return
+        path = _skill_turn_claim_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            return
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _apply_skill_lifecycle_actions(api_response, api_key):
+    if not isinstance(api_response, dict):
+        return
+    try:
+        if api_response.get('remove_skills'):
+            lock_fd = _skills_lock_acquire()
+            if lock_fd is not None:
+                try:
+                    prune_injected_skills(api_response.get('remove_skills'))
+                finally:
+                    _skills_lock_release(lock_fd)
+        if api_response.get('sync_skills'):
+            _dispatch_skills_sync(api_key)
+    except Exception as exc:
+        log_error(f"skill lifecycle action failed: {exc}", 'skill_injection')
+
+
+def _skill_policy_turn_key(event):
+    session = event.get('session_id')
+    turn = event.get('turn_id') or event.get('prompt_id')
+    return f'{session}:{turn}' if session and turn else ''
+
+
+def _codex_selected_skill_slugs(payload):
+    metadata = payload.get('internal_chat_message_metadata_passthrough')
+    kinds = metadata.get('content_item_kinds') if isinstance(metadata, dict) else None
+    if not isinstance(kinds, list) or CODEX_SELECTED_SKILL_KIND not in kinds:
+        return set()
+    names = []
+    for part in payload.get('content') or []:
+        text = part.get('text') if isinstance(part, dict) else None
+        if isinstance(text, str):
+            names.extend(CODEX_SELECTED_SKILL_NAME_RE.findall(text))
+    return {
+        name[len(UNBOUND_SKILL_PREFIX):]
+        for name in names
+        if name.startswith(UNBOUND_SKILL_PREFIX)
+        and _skill_policy_valid_slug(name[len(UNBOUND_SKILL_PREFIX):])
+    }
+
+
+def _codex_output_text(payload):
+    output = payload.get('output') if isinstance(payload, dict) else None
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, list):
+        return ''
+    return '\n'.join(
+        part.get('text', '') for part in output
+        if isinstance(part, dict) and isinstance(part.get('text'), str)
+    )
+
+
+def _codex_skill_slugs_from_output(command, output):
+    if not isinstance(command, str) or not isinstance(output, str):
+        return set()
+    if len(output.encode('utf-8', 'replace')) > 2 * 1024 * 1024:
+        return set()
+    observed = set()
+    for directory in _managed_skill_dirs():
+        slug = _managed_skill_slug(directory)
+        skill_path = directory / 'SKILL.md'
+        if not slug or str(skill_path) not in command:
+            continue
+        if skill_path.is_symlink():
+            continue
+        try:
+            content = skill_path.read_text(encoding='utf-8')
+        except (OSError, UnicodeError):
+            continue
+        output_body = output.strip()
+        output_size = len(output_body.encode('utf-8'))
+        content_size = len(content.encode('utf-8'))
+        if content in output or (
+            output_size >= 128
+            and output_size * 10 >= content_size * 9
+            and content.startswith(output_body)
+        ):
+            observed.add(slug)
+    return observed
+
+
+def _codex_completed_command_skill_slugs(payload):
+    if not isinstance(payload, dict) or payload.get('type') != 'item_completed':
+        return set()
+    item = payload.get('item')
+    if not isinstance(item, dict) or item.get('type') != 'CommandExecution':
+        return set()
+    command = item.get('command')
+    if isinstance(command, list):
+        command = ' '.join(str(part) for part in command)
+    output = item.get('aggregated_output') or item.get('stdout') or item.get('formatted_output')
+    return _codex_skill_slugs_from_output(command, output)
+
+
+def _codex_session_skill_slugs(transcript):
+    found = set()
+    calls = {}
+    try:
+        with open(transcript, 'rb') as transcript_file:
+            for raw in transcript_file:
+                try:
+                    entry = json.loads(raw)
+                except Exception:
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                payload = entry.get('payload')
+                if not isinstance(payload, dict):
+                    continue
+                if entry.get('type') == 'event_msg':
+                    found.update(_codex_completed_command_skill_slugs(payload))
+                    continue
+                if entry.get('type') != 'response_item':
+                    continue
+                payload_type = payload.get('type')
+                if payload_type == 'message' and payload.get('role') == 'user':
+                    found.update(_codex_selected_skill_slugs(payload))
+                    continue
+                if payload_type in ('custom_tool_call', 'function_call'):
+                    call_id = payload.get('call_id')
+                    command = payload.get('input') if payload_type == 'custom_tool_call' else payload.get('arguments')
+                    if isinstance(call_id, str) and isinstance(command, str) and 'SKILL.md' in command:
+                        calls[call_id] = command
+                    continue
+                if payload_type not in ('custom_tool_call_output', 'function_call_output'):
+                    continue
+                call_id = payload.get('call_id')
+                command = calls.pop(call_id, '') if isinstance(call_id, str) else ''
+                if command:
+                    found.update(_codex_skill_slugs_from_output(command, _codex_output_text(payload)))
+    except OSError:
+        pass
+    return found
+
+
+def _skill_policy_loaded_facts(event):
+    transcript = event.get('transcript_path')
+    if not isinstance(transcript, str) or not transcript or transcript == 'undefined':
+        return {'loaded': set(), 'session_count': 0}
+    loaded = set()
+    session_names = set()
+    try:
+        lines = _skill_policy_transcript_tail(transcript)
+        outputs = {}
+        turns = 0
+        in_window = True
+        for raw in reversed(lines):
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(entry, dict):
+                continue
+            entry_type = entry.get('type')
+            payload = entry.get('payload')
+            payload_type = payload.get('type') if isinstance(payload, dict) else None
+            if entry_type == 'compacted' or (entry_type == 'event_msg' and payload_type == 'context_compacted'):
+                in_window = False
+                continue
+            if entry_type == 'event_msg':
+                if payload_type == 'task_started':
+                    turns += 1
+                    if turns > SKILL_LOADED_WINDOW:
+                        in_window = False
+                    continue
+                found = _codex_completed_command_skill_slugs(payload)
+                session_names.update(found)
+                if in_window:
+                    loaded.update(found)
+                continue
+            if entry_type != 'response_item' or not isinstance(payload, dict):
+                continue
+            if payload_type in ('custom_tool_call_output', 'function_call_output'):
+                call_id = payload.get('call_id')
+                text = _codex_output_text(payload)
+                if isinstance(call_id, str) and text:
+                    outputs[call_id] = text
+                continue
+            if payload_type == 'message' and payload.get('role') == 'user':
+                found = _codex_selected_skill_slugs(payload)
+            elif payload_type == 'custom_tool_call' and payload.get('status') == 'completed':
+                command = payload.get('input')
+                call_id = payload.get('call_id')
+                output = outputs.get(call_id, '') if isinstance(call_id, str) else ''
+                found = _codex_skill_slugs_from_output(command, output)
+            elif payload_type == 'function_call':
+                command = payload.get('arguments')
+                call_id = payload.get('call_id')
+                output = outputs.get(call_id, '') if isinstance(call_id, str) else ''
+                found = _codex_skill_slugs_from_output(command, output)
+            else:
+                continue
+            session_names.update(found)
+            if in_window:
+                loaded.update(found)
+    except OSError:
+        pass
+    session_names.update(_codex_session_skill_slugs(transcript))
+    return {'loaded': loaded, 'session_count': len(session_names)}
 
 
 def _should_report():
@@ -696,8 +1309,9 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
 
     # Allowed with injected context (e.g. the spend-limit alert-threshold
     # warning "you've used $X of your $Y limit"): Codex hooks are
-    # Claude-parity — additionalContext feeds the model, systemMessage shows
-    # the same text to the user.
+    # Claude-parity — additionalContext feeds the model, while the user sees
+    # user_notice when the gateway sends one (a skill instruction's admin
+    # message), else the same text.
     additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
@@ -705,7 +1319,7 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
                 'hookEventName': 'UserPromptSubmit',
                 'additionalContext': additional_context,
             },
-            'systemMessage': additional_context,
+            'systemMessage': api_response.get('user_notice') or additional_context,
         }
 
     return {}
@@ -1187,6 +1801,10 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
+    if (safe_additional_data.get('scope') == 'copilot-builtin' and safe_name
+            and not command and not url and not safe_args):
+        return f'copilot-builtin:{safe_name.lower()}'
+
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
     if not command and not url and not safe_args:
@@ -1596,6 +2214,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
 
     # Build metadata with the raw event
     metadata = dict(event)
+    _attach_installed_skill_facts(metadata, event)
 
     if is_mcp:
         # Parse mcp__<server>__<tool> to extract server and tool for gateway matching
@@ -1697,6 +2316,13 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         if server_cfg:
             _dispatch_mcp_server_scan(metadata.get('mcp_server', ''), server_cfg)
 
+    if (
+        api_response.get('decision') == 'deny'
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     return transform_response_for_codex(api_response)
 
 
@@ -1709,19 +2335,33 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     cache = load_policy_cache()
     need_pull_policies = cache is None or is_cache_stale(cache)
 
+    metadata = {}
+    cwd = event.get('cwd')
+    if isinstance(cwd, str) and cwd:
+        metadata['cwd'] = cwd
     request_body = {
         'conversation_id': session_id,
         'unbound_app_label': 'codex',
         'model': model,
         'event_name': 'user_prompt',
         'account_identity': build_account_identity(),
-        'messages': [{'role': 'user', 'content': prompt}] if prompt else []
+        'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
+        'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': metadata},
     }
+    _attach_installed_skill_facts(request_body['pre_tool_use_data']['metadata'], event)
     if need_pull_policies:
         request_body['pull_policies'] = True
 
     api_response = send_to_hook_api(request_body, api_key)
     _cache_policies_from_response(api_response)
+    if (
+        isinstance(api_response, dict)
+        and api_response.get('decision') not in ('deny', 'block')
+        and api_response.get('inject_skills')
+        and api_response.get('additionalContext')
+    ):
+        _claim_skill_injection_turn(event)
+    _apply_skill_lifecycle_actions(api_response, api_key)
     return transform_response_for_codex_prompt(api_response)
 
 
@@ -2926,146 +3566,6 @@ def process_stop_event(event: Dict, api_key: str):
     send_to_api(exchange, api_key)
 
 
-_GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')
-_BAKED_GATEWAY_RE = re.compile(r'os\.environ\.get\(\s*"UNBOUND_GATEWAY_URL"\s*,\s*"([^"]*)"')
-
-def _is_valid_gateway_url(url: str) -> bool:
-    if not url or any(c in url for c in '"\\\n\r\x00'):
-        return False
-    return bool(_GATEWAY_URL_RE.fullmatch(url))
-
-
-def _baked_gateway_url(text: str) -> str:
-    # read baked url, not env
-    match = _BAKED_GATEWAY_RE.search(text)
-    return match.group(1) if match else ""
-
-
-def _rebake_gateway_url(text: str, gateway_url: str) -> str:
-    # rewrite only the env-var default, nothing else
-    return _BAKED_GATEWAY_RE.sub(
-        lambda m: m.group(0).replace(f'"{m.group(1)}"', f'"{gateway_url}"'),
-        text,
-        count=1,
-    )
-
-
-def _self_update_due() -> bool:
-    try:
-        return (time.time() - SELF_UPDATE_STATE_PATH.stat().st_mtime) >= SELF_UPDATE_INTERVAL_SECONDS
-    except OSError:
-        return True
-
-
-def _acquire_self_update_lock() -> bool:
-    try:
-        if SELF_UPDATE_LOCK_PATH.exists():
-            if (time.time() - SELF_UPDATE_LOCK_PATH.stat().st_mtime) < SELF_UPDATE_LOCK_TTL_SECONDS:
-                return False
-            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
-        fd = os.open(str(SELF_UPDATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return True
-    except (FileExistsError, OSError):
-        return False
-
-
-def _download_latest_hook():
-    try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL],
-            capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
-        )
-        if result.returncode != 0 or not result.stdout:
-            return None
-        return result.stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def _replace_self(new_bytes: bytes) -> None:
-    try:
-        mode = SELF_SCRIPT_PATH.stat().st_mode
-    except OSError:
-        mode = 0o755
-    fd, tmp_path = tempfile.mkstemp(dir=str(SELF_SCRIPT_PATH.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(new_bytes)
-        os.replace(tmp_path, SELF_SCRIPT_PATH)
-        os.chmod(SELF_SCRIPT_PATH, mode | 0o111)
-    except OSError as e:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        log_error(f"self_update replace failed: {e}", 'self_update')
-
-
-def _check_self_update() -> None:
-    if RUNNING_FROZEN:
-        # Binary deployments are updated by the MDM package, never in place.
-        return
-    # Under MDM the hook runs from an admin-managed location we can't write to,
-    # so SELF_SCRIPT_PATH (user-level) is not the file executing — updating it
-    # would only write a dead copy the managed settings never run. The daily MDM
-    # cron refreshes the managed script instead. Only self-update when we are
-    # actually running the user-level script (subscription installs).
-    try:
-        running = os.path.normcase(str(Path(__file__).resolve()))
-        target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
-    except Exception as e:
-        log_error(f"self_update skipped: could not resolve script path: {e}", 'self_update')
-        return
-    if running != target:
-        # Running from a managed/enterprise location (MDM) — the daily cron owns
-        # updates there; skipping is expected, not an error.
-        return
-    # refresh hook from main, throttled per interval
-    try:
-        if not _self_update_due():
-            return
-        try:
-            SELF_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return
-        if not _acquire_self_update_lock():
-            return
-        try:
-            SELF_UPDATE_STATE_PATH.touch()  # one attempt per interval
-            try:
-                local_bytes = SELF_SCRIPT_PATH.read_bytes()
-                gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
-            except OSError:
-                # self file gone — heal by re-pulling; recover tenant url
-                # from the running instance, no local file to read it from
-                local_bytes = None
-                gateway_url = UNBOUND_GATEWAY_URL
-            if not _is_valid_gateway_url(gateway_url):
-                log_error("self_update skipped: invalid gateway url", 'self_update')
-                return
-
-            payload = _download_latest_hook()
-            if not payload:
-                return
-            remote_text = payload.decode("utf-8", errors="replace")
-            if "UNBOUND_GATEWAY_URL" not in remote_text:
-                log_error("self_update skipped: bad download", 'self_update')
-                return
-
-            new_text = _rebake_gateway_url(remote_text, gateway_url)
-            if _baked_gateway_url(new_text) != gateway_url:
-                log_error("self_update skipped: gateway url not preserved", 'self_update')
-                return
-            new_bytes = new_text.encode("utf-8")
-            if local_bytes is None or hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
-                _replace_self(new_bytes)
-        finally:
-            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
-    except Exception as e:
-        log_error(f"self_update error: {e}", 'self_update')
-
-
 def _is_windows() -> bool:
     return os.name == "nt"
 
@@ -3164,8 +3664,91 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
         return
 
 
+def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
+    """None if the dir can hold discovery state, else why not. Clears a stale marker."""
+    try:
+        posix = hasattr(os, "getuid")
+        if private:
+            # Windows st_mode is synthetic (0o777, never sticky), so the POSIX
+            # world-writable check there would reject every candidate.
+            if posix:
+                try:
+                    pst = os.lstat(str(path.parent))
+                    if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
+                        return "fallback parent world-writable and not sticky"
+                except OSError:
+                    pass
+            try:
+                st = os.lstat(str(path))
+                if path.is_symlink() or not stat.S_ISDIR(st.st_mode):
+                    return "fallback dir is a symlink or not a dir"
+                if posix and st.st_uid != os.getuid():
+                    return "fallback dir foreign-owned"
+            except FileNotFoundError:
+                pass
+        if private and posix:
+            # Create with the mode so a symlink planted after the lstat cannot be
+            # chmod-ed through; a pre-existing dir was validated above.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(str(path), 0o700)
+            except FileExistsError:
+                pass
+            if os.lstat(str(path)).st_mode & 0o077:
+                return "fallback dir not private"
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        if not os.access(str(path), os.W_OK | os.X_OK):
+            return "dir not writable"
+        # os.access cannot see a Windows ACL denial; an actual write can.
+        fd, probe = tempfile.mkstemp(prefix=".probe.", dir=str(path))
+        os.close(fd)
+        os.unlink(probe)
+        cache_file = path / DISCOVERY_CACHE_PATH.name
+        if cache_file.exists() and not os.access(str(cache_file), os.R_OK):
+            return "cache file unreadable"
+        # Non-destructive: a poisoned marker denies the open, a live peer's does not.
+        marker = path / DISCOVERY_DISPATCH_PATH.name
+        if marker.exists():
+            os.close(os.open(str(marker), os.O_WRONLY))
+        return None
+    except OSError as e:
+        return "%s errno=%s" % (type(e).__name__, e.errno)
+
+
+def _relocate_state_dir(reason: str) -> bool:
+    """Repoint cache/lock/marker at the temp fallback. True if it moved."""
+    global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
+    current = DISCOVERY_DISPATCH_PATH.parent
+    if _is_windows():
+        fallback = Path(tempfile.gettempdir()) / "unbound"
+    else:
+        fallback = Path("/var/tmp/unbound-%d" % os.getuid())
+    fallback_reason = ("same as current" if fallback == current
+                       else _state_dir_reject_reason(fallback, private=True))
+    # Paths carry the OS username; log the candidate, not the path (see #281).
+    if fallback_reason is not None:
+        log_error("discovery gate: no usable state dir (home: %s / fallback: %s)"
+                  % (reason, fallback_reason), 'discovery_gate')
+        return False
+    log_error("discovery gate: home state dir unusable (%s); using fallback" % reason,
+              'discovery_gate')
+    DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
+    DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
+    DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
+    return True
+
+
+def _resolve_state_dir() -> None:
+    """Relocate before dispatching if the current state dir is unusable."""
+    reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
+    if reason is not None:
+        _relocate_state_dir(reason)
+
+
 def _dispatch_discovery() -> None:
     try:
+        _resolve_state_dir()
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
             try:
@@ -3280,11 +3863,18 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
             DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
+                                       dir=str(DISCOVERY_CACHE_PATH.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, sort_keys=True)
+                os.replace(tmp, DISCOVERY_CACHE_PATH)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
@@ -3294,10 +3884,18 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
+def get_api_key():
+    return os.getenv('UNBOUND_CODEX_API_KEY')
+
+
 def main():
     global _cached_api_key
     api_key = os.getenv('UNBOUND_CODEX_API_KEY')
     _cached_api_key = api_key
+
+    if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
+        _sync_skills_once(api_key)
+        return
 
     try:
         input_data = sys.stdin.read().strip()
@@ -3317,8 +3915,9 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if hook_event_name == "SessionStart":
-            _check_self_update()
+            _cleanup_skill_policy_state()
             _dispatch_discovery()
+            _dispatch_skills_sync(api_key)
             print("{}")
             return
         session_id = event.get('session_id')
