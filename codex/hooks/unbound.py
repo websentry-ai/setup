@@ -1316,8 +1316,9 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
 
     # Allowed with injected context (e.g. the spend-limit alert-threshold
     # warning "you've used $X of your $Y limit"): Codex hooks are
-    # Claude-parity — additionalContext feeds the model, systemMessage shows
-    # the same text to the user.
+    # Claude-parity — additionalContext feeds the model, while the user sees
+    # user_notice when the gateway sends one (a skill instruction's admin
+    # message), else the same text.
     additional_context = api_response.get('additionalContext', '')
     if additional_context:
         return {
@@ -1325,7 +1326,7 @@ def transform_response_for_codex_prompt(api_response: Dict) -> Dict:
                 'hookEventName': 'UserPromptSubmit',
                 'additionalContext': additional_context,
             },
-            'systemMessage': additional_context,
+            'systemMessage': api_response.get('user_notice') or additional_context,
         }
 
     return {}

@@ -213,23 +213,19 @@ class CrossClientInjectionContextTests(unittest.TestCase):
         })
         self.assertEqual(response["hookSpecificOutput"]["additionalContext"], context)
 
-    def test_copilot_transformed_prompt_forwards_gateway_context_unchanged(self):
+    def test_copilot_prompt_forwards_gateway_context_unchanged(self):
         context = "Invoke the skill unbound-secure-sql before answering."
-        response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
-            {"transformedPrompt": "Write the query."},
-            {
-                "decision": "allow",
-                "additionalContext": context,
-                "inject_skills": [_entry()],
-            },
-        )
-        self.assertEqual(response["modifiedTransformedPrompt"], f"{context}\n\nWrite the query.")
+        response = CLIENTS["copilot"].transform_response_for_copilot_prompt({
+            "decision": "allow",
+            "additionalContext": context,
+            "inject_skills": [_entry()],
+        })
+        self.assertEqual(response["additionalContext"], context)
 
-    def test_copilot_transformed_prompt_preserves_gateway_blocks(self):
+    def test_copilot_prompt_preserves_gateway_blocks(self):
         for decision in ("deny", "block"):
             with self.subTest(decision=decision):
-                response = CLIENTS["copilot"].transform_response_for_copilot_transformed_prompt(
-                    {"transformedPrompt": "Write the query."},
+                response = CLIENTS["copilot"].transform_response_for_copilot_prompt(
                     {"decision": decision, "reason": "Blocked by policy."},
                 )
                 self.assertEqual(
@@ -433,7 +429,50 @@ class CrossClientInjectionContextTests(unittest.TestCase):
                 response = cursor._with_deferred_skill_context(event, {})
                 self.assertEqual(response["permission"], "deny")
                 self.assertIn("/unbound-secure-sql", response["agent_message"])
-                self.assertEqual(cursor._consume_deferred_skill_context(event), "")
+                self.assertEqual(cursor._consume_deferred_skill_context(event), ("", ""))
+
+    def test_codex_shows_the_admin_notice_not_the_model_instruction(self):
+        instruction = "ORGANIZATION POLICY: you MUST invoke unbound-secure-sql first."
+        notice = "Policy PROMPT-C requires unbound-secure-sql before this request."
+        response = CLIENTS["codex"].transform_response_for_codex_prompt({
+            "decision": "allow",
+            "additionalContext": instruction,
+            "user_notice": notice,
+            "inject_skills": [_entry()],
+        })
+        self.assertEqual(response["hookSpecificOutput"]["additionalContext"], instruction)
+        self.assertEqual(response["systemMessage"], notice)
+
+    def test_codex_falls_back_to_context_when_no_notice(self):
+        instruction = "You've used $80 of your $100 limit."
+        response = CLIENTS["codex"].transform_response_for_codex_prompt({
+            "decision": "allow",
+            "additionalContext": instruction,
+        })
+        self.assertEqual(response["systemMessage"], instruction)
+
+    def test_cursor_shows_the_admin_notice_to_the_user(self):
+        cursor = CLIENTS["cursor"]
+        event = {"conversation_id": "c1", "generation_id": "g1"}
+        notice = "Policy PROMPT-C requires unbound-secure-sql before this request."
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+            cursor._defer_prompt_skill_context(
+                event, "Invoke /unbound-secure-sql before continuing.", notice
+            )
+            response = cursor._with_deferred_skill_context(event, {})
+        self.assertEqual(response["user_message"], notice)
+
+    def test_cursor_falls_back_when_the_gateway_sends_no_notice(self):
+        cursor = CLIENTS["cursor"]
+        event = {"conversation_id": "c1", "generation_id": "g1"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(cursor, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+            cursor._defer_prompt_skill_context(
+                event, "Invoke /unbound-secure-sql before continuing."
+            )
+            response = cursor._with_deferred_skill_context(event, {})
+        self.assertIn("organization policy", response["user_message"])
 
     def test_cursor_preserves_existing_tool_context_when_delivering_prompt_skill(self):
         cursor = CLIENTS["cursor"]
@@ -798,61 +837,71 @@ class CrossClientInjectionContextTests(unittest.TestCase):
             metadata = request["pre_tool_use_data"]["metadata"]
             self.assertEqual(metadata["cwd"], expected)
 
-    def test_copilot_keeps_plan_for_the_matching_batched_message(self):
+
+class CopilotVisibleInventoryTests(unittest.TestCase):
+    """Copilot discovers skills once per session, so a skill installed mid-session
+    must not be advertised as installed until the next one."""
+
+    def _snapshot(self, tmp, report):
         copilot = CLIENTS["copilot"]
-        submitted = {"session_id": "s1", "prompt": "current message"}
-        preceding = {"sessionId": "s1", "prompt": "preceding message"}
-        current = {"sessionId": "s1", "prompt": "current message"}
+        event = {"session_id": "s1"}
+        with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
+                patch.object(copilot, "installed_skill_report", return_value=report):
+            copilot._snapshot_copilot_skill_inventory(event)
+        return event
+
+    def test_skill_present_at_session_start_is_visible(self):
+        copilot = CLIENTS["copilot"]
+        physical = [{"slug": "secure-sql", "sha256": "a" * 64}]
+        with tempfile.TemporaryDirectory() as tmp:
+            event = self._snapshot(tmp, physical)
+            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+                self.assertEqual(
+                    copilot._skill_policy_visible_inventory(event, physical), physical
+                )
+
+    def test_skill_installed_after_session_start_is_hidden(self):
+        copilot = CLIENTS["copilot"]
+        late = {"slug": "late-arrival", "sha256": "b" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            event = self._snapshot(tmp, [])
+            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+                self.assertEqual(
+                    copilot._skill_policy_visible_inventory(event, [late]), []
+                )
+
+    def test_skill_edited_after_session_start_is_hidden(self):
+        copilot = CLIENTS["copilot"]
+        old = {"slug": "secure-sql", "sha256": "a" * 64}
+        edited = {"slug": "secure-sql", "sha256": "c" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            event = self._snapshot(tmp, [old])
+            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+                self.assertEqual(
+                    copilot._skill_policy_visible_inventory(event, [edited]), []
+                )
+
+    def test_skill_removed_from_disk_is_not_reported(self):
+        copilot = CLIENTS["copilot"]
+        gone = {"slug": "secure-sql", "sha256": "a" * 64}
+        with tempfile.TemporaryDirectory() as tmp:
+            event = self._snapshot(tmp, [gone])
+            with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
+                self.assertEqual(copilot._skill_policy_visible_inventory(event, []), [])
+
+    def test_missing_snapshot_falls_back_to_physical(self):
+        copilot = CLIENTS["copilot"]
+        physical = [{"slug": "secure-sql", "sha256": "a" * 64}]
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
-                copilot._store_copilot_prompt_plan(submitted, {"inject_skills": [_entry()]})
-                found, plan = copilot._take_copilot_prompt_plan(preceding)
-                self.assertTrue(found)
-                self.assertEqual(plan, {})
-                found, plan = copilot._take_copilot_prompt_plan(current)
-        self.assertTrue(found)
-        self.assertEqual(plan["inject_skills"][0]["slug"], "secure-sql")
-
-    def test_copilot_corrupt_prompt_plan_falls_back_to_gateway(self):
-        copilot = CLIENTS["copilot"]
-        event = {
-            "sessionId": "s1",
-            "prompt": "current message",
-            "transformedPrompt": "current message",
-        }
-        response = {
-            "decision": "allow",
-            "additionalContext": "Invoke the skill unbound-secure-sql before answering.",
-            "inject_skills": [_entry()],
-        }
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)), \
-                patch.object(copilot, "get_api_key", return_value="key"), \
-                patch.object(copilot, "_evaluate_user_prompt_policy", return_value=response) as evaluate, \
-                patch.object(copilot.sys, "stdin", io.StringIO(json.dumps(event))), \
-                patch.object(copilot.sys, "stdout", io.StringIO()) as stdout:
-            target = copilot._copilot_prompt_plan_path(event)
-            target.parent.mkdir(parents=True)
-            target.write_text("{corrupt")
-            copilot.main()
-
-        self.assertEqual(evaluate.call_count, 1)
-        self.assertIn("unbound-secure-sql", json.loads(stdout.getvalue())["modifiedTransformedPrompt"])
-
-    def test_copilot_does_not_store_prompt_plan_without_session_id(self):
-        copilot = CLIENTS["copilot"]
-        event = {"prompt": "current message"}
-        with tempfile.TemporaryDirectory() as tmp, \
-                patch.object(copilot, "SKILL_POLICY_STATE_ROOT", Path(tmp)):
-            copilot._store_copilot_prompt_plan(event, {"inject_skills": [_entry()]})
-            found, plan = copilot._take_copilot_prompt_plan(event)
-
-        self.assertFalse(found)
-        self.assertIsNone(plan)
+                self.assertEqual(
+                    copilot._skill_policy_visible_inventory({"session_id": "s9"}, physical),
+                    physical,
+                )
 
 
 class CopilotRegistrationTests(unittest.TestCase):
-    def test_transformed_prompt_is_registered_by_every_installer(self):
+    def test_prompt_context_rides_user_prompt_submit_alone(self):
         installers = (
             tool_module("copilot/hooks", "setup"),
             tool_module("copilot/hooks/mdm", "setup"),
@@ -861,7 +910,7 @@ class CopilotRegistrationTests(unittest.TestCase):
             with self.subTest(installer=installer.__name__):
                 hooks = installer._copilot_hooks_config(Path("/tmp/unbound.py"))["hooks"]
                 self.assertIn("UserPromptSubmit", hooks)
-                self.assertIn("userPromptTransformed", hooks)
+                self.assertNotIn("userPromptTransformed", hooks)
 
 
 if __name__ == "__main__":

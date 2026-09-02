@@ -2328,7 +2328,7 @@ def process_user_prompt_submit(event, api_key):
     if isinstance(api_response, dict) and api_response.get('decision') not in ('deny', 'block'):
         context = api_response.get('additionalContext', '')
         if api_response.get('inject_skills') and isinstance(context, str) and context.strip():
-            _defer_prompt_skill_context(event, context)
+            _defer_prompt_skill_context(event, context, api_response.get('user_notice'))
     return api_response if api_response else {}
 
 
@@ -2341,16 +2341,19 @@ def _deferred_skill_context_path(event):
     return SKILL_POLICY_STATE_ROOT / 'pending' / digest
 
 
-def _defer_prompt_skill_context(event, context):
+def _defer_prompt_skill_context(event, context, notice=None):
     try:
         if not isinstance(context, str) or not context.strip():
             return
         target = _deferred_skill_context_path(event)
         target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {'context': context.strip()}
+        if isinstance(notice, str) and notice.strip():
+            payload['notice'] = notice.strip()
         fd, temp_path = tempfile.mkstemp(dir=str(target.parent), prefix='.pending-', suffix='.tmp')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as temp_file:
-                temp_file.write(context.strip())
+                json.dump(payload, temp_file)
             os.replace(temp_path, target)
         except Exception:
             try:
@@ -2368,22 +2371,32 @@ def _consume_deferred_skill_context(event):
     try:
         os.replace(target, claim)
     except OSError:
-        return ''
+        return '', ''
     try:
-        return claim.read_text(encoding='utf-8').strip()
+        raw = claim.read_text(encoding='utf-8').strip()
     except OSError:
-        return ''
+        return '', ''
     finally:
         try:
             claim.unlink()
         except OSError:
             pass
+    try:
+        stored = json.loads(raw)
+    except Exception:
+        # Pre-JSON pending files held the bare context and carried no notice.
+        return raw, ''
+    if not isinstance(stored, dict):
+        return '', ''
+    context = stored.get('context')
+    notice = stored.get('notice')
+    return (context if isinstance(context, str) else ''), (notice if isinstance(notice, str) else '')
 
 
 def _with_deferred_skill_context(event, response):
     if not isinstance(response, dict) or response.get('permission') == 'deny':
         return response
-    context = _consume_deferred_skill_context(event)
+    context, notice = _consume_deferred_skill_context(event)
     if not context:
         return response
     existing = response.get('agent_message')
@@ -2396,7 +2409,7 @@ def _with_deferred_skill_context(event, response):
     return {
         **response,
         'permission': 'deny',
-        'user_message': 'Loading a skill required by organization policy. The agent will retry this action.',
+        'user_message': notice or 'Loading a skill required by organization policy. The agent will retry this action.',
         'agent_message': agent_message,
     }
 
