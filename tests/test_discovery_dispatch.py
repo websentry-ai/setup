@@ -214,7 +214,11 @@ def test_state_dir_private_candidate_is_hardened(windows_hook, tmp_path):
 
     dangling = tmp_path / "linked"
     dangling.symlink_to(tmp_path / "nowhere")
-    assert hook._state_dir_reject_reason(dangling, private=True) == "fallback dir is a symlink"
+    assert "symlink" in hook._state_dir_reject_reason(dangling, private=True)
+
+    not_a_dir = tmp_path / "regular-file"
+    not_a_dir.write_text("", encoding="utf-8")
+    assert hook._state_dir_reject_reason(not_a_dir, private=True) is not None
 
     world_writable = tmp_path / "ws"
     world_writable.mkdir()

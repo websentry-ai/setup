@@ -3,6 +3,7 @@
 import sys
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
@@ -3482,25 +3483,37 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
 def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
     """None if the dir can hold discovery state, else why not. Clears a stale marker."""
     try:
+        posix = hasattr(os, "getuid")
         if private:
+            # Windows st_mode is synthetic (0o777, never sticky), so the POSIX
+            # world-writable check there would reject every candidate.
+            if posix:
+                try:
+                    pst = os.lstat(str(path.parent))
+                    if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
+                        return "fallback parent world-writable and not sticky"
+                except OSError:
+                    pass
             try:
-                pst = os.lstat(str(path.parent))
-                if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
-                    return "fallback parent world-writable and not sticky"
-            except OSError:
-                pass
-            if path.is_symlink():
-                return "fallback dir is a symlink"
-            try:
-                if os.lstat(str(path)).st_uid != os.getuid():
+                st = os.lstat(str(path))
+                if path.is_symlink() or not stat.S_ISDIR(st.st_mode):
+                    return "fallback dir is a symlink or not a dir"
+                if posix and st.st_uid != os.getuid():
                     return "fallback dir foreign-owned"
             except FileNotFoundError:
                 pass
-        path.mkdir(parents=True, exist_ok=True)
-        if private:
-            os.chmod(str(path), 0o700)
+        if private and posix:
+            # Create with the mode so a symlink planted after the lstat cannot be
+            # chmod-ed through; a pre-existing dir was validated above.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(str(path), 0o700)
+            except FileExistsError:
+                pass
             if os.lstat(str(path)).st_mode & 0o077:
                 return "fallback dir not private"
+        else:
+            path.mkdir(parents=True, exist_ok=True)
         if not os.access(str(path), os.W_OK | os.X_OK):
             return "dir not writable"
         # os.access cannot see a Windows ACL denial; an actual write can.
@@ -3524,16 +3537,17 @@ def _relocate_state_dir(reason: str) -> bool:
     global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
     current = DISCOVERY_DISPATCH_PATH.parent
     if _is_windows():
-        fallback, private = Path(tempfile.gettempdir()) / "unbound", False
+        fallback = Path(tempfile.gettempdir()) / "unbound"
     else:
-        fallback, private = Path("/var/tmp/unbound-%d" % os.getuid()), True
+        fallback = Path("/var/tmp/unbound-%d" % os.getuid())
     fallback_reason = ("same as current" if fallback == current
-                       else _state_dir_reject_reason(fallback, private))
+                       else _state_dir_reject_reason(fallback, private=True))
+    # Paths carry the OS username; log the candidate, not the path (see #281).
     if fallback_reason is not None:
-        log_error("discovery gate: no usable state dir (%s: %s / %s: %s)"
-                  % (current, reason, fallback, fallback_reason), 'discovery_gate')
+        log_error("discovery gate: no usable state dir (home: %s / fallback: %s)"
+                  % (reason, fallback_reason), 'discovery_gate')
         return False
-    log_error("discovery gate: state dir %s unusable (%s); using %s" % (current, reason, fallback),
+    log_error("discovery gate: home state dir unusable (%s); using fallback" % reason,
               'discovery_gate')
     DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
     DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
