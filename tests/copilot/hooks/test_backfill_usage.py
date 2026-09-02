@@ -384,6 +384,7 @@ class TestBackfillPayload(unittest.TestCase):
                 "tool_name": "github-mcp-server-search_code",
                 "server_name": "github-mcp-server",
                 "mcp_tool_name": "search_code",
+                "mcp_server_config": {"additional_data": {"scope": "copilot-builtin"}},
             },
         })
 

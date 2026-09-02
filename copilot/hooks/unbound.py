@@ -1809,6 +1809,9 @@ def _sanitize_copilot_server_name(name):
 # false-positive relabels of unrelated tools sharing a server's prefix.
 _MCP_NAME_SEPARATORS = ('__', '-')
 _BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright', 'fetch', 'time')
+# Only names with a seeded canonical-group link may be scope-tagged: an unseeded
+# copilot-builtin fingerprint has no metadata row, so the gateway retry-loops forever.
+_SCOPE_TAGGED_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright')
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
@@ -1951,23 +1954,25 @@ def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None)
             if tool:
                 builtin = (server, tool, mcp_servers.get(server))
                 break
+    resolved = None
     if _explicit_mcp_identity_matches(raw_tool, server_name, tool_name) and (
         builtin[0] is None
         or len(_sanitize_copilot_server_name(server_name)) >= len(builtin[0])
     ):
-        return (server_name, tool_name, mcp_servers.get(server_name))
-    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
-        configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
-    else:
-        configured = detect_mcp_call(raw_tool, mcp_servers)
-    resolved = configured
-    if builtin[0] is not None and (
-        configured[0] is None
-        or len(_sanitize_copilot_server_name(configured[0])) < len(builtin[0])
-    ):
-        resolved = builtin
+        resolved = (server_name, tool_name, mcp_servers.get(server_name))
+    if resolved is None:
+        if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
+            configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
+        else:
+            configured = detect_mcp_call(raw_tool, mcp_servers)
+        resolved = configured
+        if builtin[0] is not None and (
+            configured[0] is None
+            or len(_sanitize_copilot_server_name(configured[0])) < len(builtin[0])
+        ):
+            resolved = builtin
     server, tool, config = resolved
-    if server in _BUILTIN_MCP_SERVERS and not config and server not in mcp_servers:
+    if server in _SCOPE_TAGGED_BUILTIN_MCP_SERVERS and not config and server not in mcp_servers:
         config = {'additional_data': {'scope': 'copilot-builtin'}}
     return (server, tool, config)
 

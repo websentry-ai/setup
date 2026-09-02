@@ -304,7 +304,10 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
         tool_use = exchange["messages"][1]["tool_use"]
         self.assertEqual(tool_use[0]["server_name"], "github-mcp-server")
         self.assertEqual(tool_use[0]["mcp_tool_name"], "search_code")
-        self.assertNotIn("mcp_server_config", tool_use[0])
+        self.assertEqual(
+            tool_use[0]["mcp_server_config"],
+            {"additional_data": {"scope": "copilot-builtin"}},
+        )
 
     def test_invalid_explicit_mcp_fields_fall_back_without_breaking_stop(self):
         path = _transcript([

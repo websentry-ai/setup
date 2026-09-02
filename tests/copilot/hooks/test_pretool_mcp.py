@@ -170,6 +170,27 @@ class TestResolveVscodeMcp(unittest.TestCase):
             ("github-mcp-server", "search_code", {'additional_data': {'scope': 'copilot-builtin'}}),
         )
 
+    def test_builtin_github_tagged_when_explicit_identity_matches(self):
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                "github-mcp-server-search_code", {},
+                server_name="github-mcp-server", tool_name="search_code",
+            ),
+            ("github-mcp-server", "search_code",
+             {"additional_data": {"scope": "copilot-builtin"}}),
+        )
+
+    def test_unseeded_builtins_are_not_tagged(self):
+        for raw, server, tool in (
+            ("fetch-fetch_url", "fetch", "fetch_url"),
+            ("time-get_current_time", "time", "get_current_time"),
+        ):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    unbound.resolve_copilot_mcp(raw, {}),
+                    (server, tool, None),
+                )
+
     def test_configured_github_wins_over_builtin_shortcut(self):
         servers = {
             "github-mcp-server": {"url": "https://company.example/mcp"},
