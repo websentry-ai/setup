@@ -96,7 +96,7 @@ SKILL_INVOKE_RE = re.compile(r'(?:^|\s)/([A-Za-z0-9][A-Za-z0-9._:-]*)')
 MANAGED_SKILLS_ROOT = _copilot_home() / 'skills'
 UNBOUND_SKILL_PREFIX = 'unbound-'
 UNBOUND_SKILL_MARKER = '.unbound-managed'
-SKILL_POLICY_STATE_ROOT = _copilot_home() / 'hooks' / 'skill-policy'
+SKILL_POLICY_STATE_ROOT = Path.home() / '.unbound' / 'skill-policy' / 'copilot'
 SKILLS_SYNC_LOCK_PATH = SKILL_POLICY_STATE_ROOT / 'sync.lock'
 SKILLS_SYNC_STALE_LOCK_SECONDS = 5 * 60
 SKILLS_SYNC_TIMEOUT_SECONDS = 10
@@ -611,6 +611,9 @@ def _snapshot_copilot_skill_inventory(event):
 
 
 def _skill_policy_visible_inventory(event, physical):
+    """Copilot answers a skill installed mid-session with "Skill not found" and does
+    not fall back to a file search the way Cursor does, so report only what was on
+    disk at SessionStart and let the rest land in the next session."""
     session_id = _skill_policy_session_id(event)
     if not session_id:
         return physical
