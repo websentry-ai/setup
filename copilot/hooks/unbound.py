@@ -1496,6 +1496,10 @@ def compute_fingerprint(
     if safe_additional_data.get('scope') == CLAUDE_CONNECTOR_SCOPE and safe_name:
         return f'claude-connector:{safe_name.lower()}'
 
+    if (safe_additional_data.get('scope') == 'copilot-builtin' and safe_name
+            and not command and not url and not safe_args):
+        return f'copilot-builtin:{safe_name.lower()}'
+
     # First-party built-ins arrive as a bare name (no command/url/args); collapse
     # separator variants to one identity so aliases share a fingerprint.
     if not command and not url and not safe_args:
@@ -1804,7 +1808,9 @@ def _sanitize_copilot_server_name(name):
 # and '__' (Claude-style). The loose set previously here ('_', '/', '.') caused
 # false-positive relabels of unrelated tools sharing a server's prefix.
 _MCP_NAME_SEPARATORS = ('__', '-')
-_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright', 'fetch', 'time')
+# Only builtins with a seeded canonical-group link belong here: an unseeded
+# copilot-builtin fingerprint has no metadata row, so the gateway retry-loops forever.
+_BUILTIN_MCP_SERVERS = ('github-mcp-server', 'playwright')
 # A server name must be at least this long to anchor a bare-name match, so a
 # one-char config entry can't swallow arbitrary tool names.
 _MIN_MCP_SERVER_NAME = 2
@@ -1947,21 +1953,27 @@ def resolve_copilot_mcp(raw_tool, mcp_servers, server_name=None, tool_name=None)
             if tool:
                 builtin = (server, tool, mcp_servers.get(server))
                 break
+    resolved = None
     if _explicit_mcp_identity_matches(raw_tool, server_name, tool_name) and (
         builtin[0] is None
         or len(_sanitize_copilot_server_name(server_name)) >= len(builtin[0])
     ):
-        return (server_name, tool_name, mcp_servers.get(server_name))
-    if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
-        configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
-    else:
-        configured = detect_mcp_call(raw_tool, mcp_servers)
-    if builtin[0] is not None and (
-        configured[0] is None
-        or len(_sanitize_copilot_server_name(configured[0])) < len(builtin[0])
-    ):
-        return builtin
-    return configured
+        resolved = (server_name, tool_name, mcp_servers.get(server_name))
+    if resolved is None:
+        if lowered.startswith('mcp_') and not lowered.startswith('mcp__'):
+            configured = _resolve_vscode_mcp(raw_tool, mcp_servers)
+        else:
+            configured = detect_mcp_call(raw_tool, mcp_servers)
+        resolved = configured
+        if builtin[0] is not None and (
+            configured[0] is None
+            or len(_sanitize_copilot_server_name(configured[0])) < len(builtin[0])
+        ):
+            resolved = builtin
+    server, tool, config = resolved
+    if server in _BUILTIN_MCP_SERVERS and not config and server not in mcp_servers:
+        config = {'additional_data': {'scope': 'copilot-builtin'}}
+    return (server, tool, config)
 
 
 def extract_command_for_pretool(canonical, tool_input):
@@ -2217,7 +2229,12 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         else:
             is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
-            if isinstance(mcp_server_config, dict):
+            if isinstance(mcp_server_config, dict) and (
+                (mcp_server_config.get('additional_data') or {}).get('scope')
+                != 'copilot-builtin'
+            ):
+                # A builtin has nothing on disk; its targeted scan can only
+                # ever report unknown_config_shape.
                 scan_config = mcp_server_config
             log_error(
                 f"copilot mcp detected session={session_id} tool={raw_tool} "
