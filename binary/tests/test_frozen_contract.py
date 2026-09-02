@@ -20,6 +20,12 @@ import pytest
 from conftest import REPO, TOOL_PY
 
 MCP_SCAN_TOOLS = ("claude-code", "cursor", "codex")  # copilot has no mcp scan
+SKILL_SYNC_TOOLS = {
+    "claude-code": "UNBOUND_CLAUDE_API_KEY",
+    "cursor": "UNBOUND_CURSOR_API_KEY",
+    "copilot": "UNBOUND_COPILOT_API_KEY",
+    "codex": "UNBOUND_CODEX_API_KEY",
+}
 
 
 @pytest.fixture
@@ -88,16 +94,20 @@ def test_frozen_mcp_scan_exec_contract(frozen_module):
     assert json.loads(env.get("UNBOUND_MCP_SERVER_JSON", "{}")) == server_config
 
 
-@pytest.mark.parametrize("frozen_module", ["claude-code"], indirect=True)
-def test_frozen_skills_sync_exec_contract(frozen_module, monkeypatch):
+@pytest.mark.parametrize(
+    ("frozen_module", "tool"),
+    [(tool, tool) for tool in SKILL_SYNC_TOOLS],
+    indirect=["frozen_module"],
+)
+def test_frozen_skills_sync_exec_contract(frozen_module, monkeypatch, tool):
     m, calls = frozen_module
-    monkeypatch.setenv("UNBOUND_HOOK_TOOL", "claude-code")
+    monkeypatch.setenv("UNBOUND_HOOK_TOOL", tool)
     m._dispatch_skills_sync("contract-key")
     assert len(calls) == 1, "expected exactly one skills-sync exec"
     cmd, kwargs = calls[0]
-    assert cmd == [m.sys.executable, "sync-skills", "claude-code"]
+    assert cmd == [m.sys.executable, "sync-skills", tool]
     env = kwargs.get("env") or {}
-    assert env.get("UNBOUND_CLAUDE_API_KEY") == "contract-key"
+    assert env.get(SKILL_SYNC_TOOLS[tool]) == "contract-key"
     assert "contract-key" not in cmd, "key must travel via env, never argv"
 
 

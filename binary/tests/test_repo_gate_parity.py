@@ -1123,7 +1123,6 @@ def _augment_session_start(augment, cwd):
     event = {'hook_event_name': 'SessionStart', 'session_id': 'S1',
              'workspace_roots': [cwd] if cwd else []}
     with patch.object(augment, '_device_serial', MagicMock()), \
-         patch.object(augment, '_check_self_update', MagicMock()), \
          patch.object(augment, '_dispatch_discovery', MagicMock()):
         out, _, _ = _run_main(augment, event)
     return out
@@ -1483,7 +1482,6 @@ def test_augment_session_start_advisory_files_no_incident(augment, repos, monkey
     event = {'hook_event_name': 'SessionStart', 'session_id': 'S1',
              'workspace_roots': [repos.out_scope]}
     with patch.object(augment, '_device_serial', MagicMock()), \
-         patch.object(augment, '_check_self_update', MagicMock()), \
          patch.object(augment, '_dispatch_discovery', MagicMock()):
         out, _, _ = _run_main(augment, event, posts=posts)
     assert 'acme/widgets' in out['hookSpecificOutput']['additionalContext']

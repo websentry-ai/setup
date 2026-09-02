@@ -33,6 +33,13 @@ EVENT_PAYLOADS = {
                         "tool_input": {"command": "git status"},
                         "tool_response": {"output": "clean"}},
         "UserPromptSubmit": {**S, "hook_event_name": "UserPromptSubmit", "prompt": "hello"},
+        "userPromptTransformed": {
+            **S,
+            "hook_event_name": "userPromptTransformed",
+            "sessionId": "test-session",
+            "prompt": "hello",
+            "transformedPrompt": "hello",
+        },
         "Stop": {**S, "hook_event_name": "Stop"},
         "SessionStart": {**S, "hook_event_name": "SessionStart"},
         "SessionEnd": {**S, "hook_event_name": "SessionEnd"},
@@ -156,6 +163,27 @@ def test_module_crash_fails_open(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "{}"
 
 
+@pytest.mark.parametrize("tool", ["claude-code", "cursor", "copilot", "codex"])
+def test_skills_sync_uses_provider_key_reader(monkeypatch, tool):
+    from unbound_hook import hook_cmd
+
+    calls = []
+
+    class FakeModule:
+        @staticmethod
+        def get_api_key():
+            return "test-key"
+
+        @staticmethod
+        def _sync_skills_once(api_key):
+            calls.append(api_key)
+
+    monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
+
+    assert hook_cmd.run_skills_sync([tool]) == 0
+    assert calls == ["test-key"]
+
+
 def test_version_does_not_read_stdin(sandbox_home):
     # pkg postinstall pre-warms with --version; it must not block on stdin.
     got = run_cli_dev(["--version"], None, sandbox_home, stdin_close=True)
@@ -168,10 +196,9 @@ def test_version_does_not_read_stdin(sandbox_home):
     ("copilot", "SessionStart"), ("codex", "SessionStart"),
 ])
 def test_frozen_session_start_makes_no_downloads(tool, event, discovery_enabled_home):
-    """SessionStart is the event that triggers self-update + discovery. In
-    frozen mode, with discovery enabled for the org, the hook must neither
-    download install.sh nor write self-update state — it logs the missing
-    local discovery binary and moves on."""
+    """SessionStart is the event that triggers discovery. In frozen mode, with
+    discovery enabled for the org, the hook must not download install.sh — it
+    logs the missing local discovery binary and moves on."""
     home = discovery_enabled_home
     payload = json.dumps({**EVENT_PAYLOADS[tool][event]})
     got = run_cli_dev(["hook", tool, event], payload, home,
@@ -179,8 +206,6 @@ def test_frozen_session_start_makes_no_downloads(tool, event, discovery_enabled_
     assert got.returncode == 0
     install_sh = home / ".local" / "share" / "unbound" / "install.sh"
     assert not install_sh.exists(), "frozen hook downloaded install.sh"
-    for state in home.rglob(".self_update_check"):
-        pytest.fail(f"frozen hook wrote self-update state: {state}")
     err_logs = list(home.rglob("error.log"))
     assert err_logs, "expected the missing-discovery-binary skip to be logged"
     combined = "".join(p.read_text() for p in err_logs)
@@ -193,7 +218,6 @@ def test_frozen_binary_session_start_makes_no_downloads(discovery_enabled_home):
     got = run_binary(["hook", "claude-code", "SessionStart"], payload, home)
     assert got.returncode == 0
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
-    assert not (home / ".claude" / "hooks" / ".self_update_check").exists()
 
 
 def test_mcp_diagnostic_subcommand_fails_open(sandbox_home):

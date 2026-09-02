@@ -2160,7 +2160,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
-    Existence-based: the self-update rewrites these files, so content checks
+    Existence-based: these files change across versions, so content checks
     are unreliable — only file existence is trustworthy.
     'fresh' (config absent), 'persisted' (config + unbound.py both present),
     'tampered' (config present but hook script missing), or None on any error.
