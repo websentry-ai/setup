@@ -20,6 +20,11 @@ from urllib.parse import urlparse
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
+HOOK_REVISION = "2026-09-02.1"
+try:
+    HOOK_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+except Exception:
+    HOOK_SHA256 = "unknown"
 # Claude Code reads CLAUDE_CONFIG_DIR verbatim and resolves it against the cwd,
 # without expanding a leading "~". Expanding it here would put the hook's files
 # under $HOME while Claude read a literal "~" dir. Blank is treated as unset.
@@ -80,6 +85,7 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
+DISCOVERY_WINDOWS_STATE_DIR = Path(tempfile.gettempdir()) / "unbound"
 DISCOVERY_DISPATCH_TTL_SECONDS = 10
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
@@ -156,6 +162,8 @@ def report_error_to_gateway(message, category='general', api_key=None):
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
             'hook_source': 'claude-code',
+            'hook_revision': HOOK_REVISION,
+            'hook_sha256': HOOK_SHA256,
         })
         proc = subprocess.Popen(
             ["curl", "-fsSL", "-X", "POST",
@@ -4653,6 +4661,16 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _discovery_state_paths():
+    if not _is_windows():
+        return DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
+    return (
+        DISCOVERY_WINDOWS_STATE_DIR / DISCOVERY_CACHE_PATH.name,
+        DISCOVERY_WINDOWS_STATE_DIR / DISCOVERY_LOCK_PATH.name,
+        DISCOVERY_WINDOWS_STATE_DIR / DISCOVERY_DISPATCH_PATH.name,
+    )
+
+
 def _discovery_installer():
     if _is_windows():
         return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
@@ -5632,10 +5650,12 @@ def _dispatch_mcp_diagnostic(server_name, cwd, api_key):
 
 def _dispatch_discovery() -> None:
     try:
+        cache_path, lock_path, dispatch_path = _discovery_state_paths()
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
         cache: Dict = {}
-        if DISCOVERY_CACHE_PATH.exists():
+        if cache_path.exists():
             try:
-                with DISCOVERY_CACHE_PATH.open("r", encoding="utf-8") as f:
+                with cache_path.open("r", encoding="utf-8") as f:
                     cache = json.load(f) or {}
             except (OSError, json.JSONDecodeError):
                 cache = {}
@@ -5651,31 +5671,33 @@ def _dispatch_discovery() -> None:
             except ValueError:
                 pass
 
-        if DISCOVERY_LOCK_PATH.exists():
-            try:
-                age = time.time() - DISCOVERY_LOCK_PATH.stat().st_mtime
-            except OSError:
-                age = DISCOVERY_STALE_LOCK_SECONDS + 1
-            if age < DISCOVERY_STALE_LOCK_SECONDS:
-                return
+        lock_paths = (DISCOVERY_LOCK_PATH, lock_path) if _is_windows() else (lock_path,)
+        for active_lock_path in lock_paths:
+            if active_lock_path.exists():
+                try:
+                    age = time.time() - active_lock_path.stat().st_mtime
+                except OSError:
+                    age = DISCOVERY_STALE_LOCK_SECONDS + 1
+                if age < DISCOVERY_STALE_LOCK_SECONDS:
+                    return
 
         # Atomic dispatch claim — first hook to create the marker wins;
         # concurrent peers bail to avoid duplicate fork-detached Popens.
         # The marker is removed right after the fork (or on any failure path).
         try:
-            _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+            _dispatch_fd = os.open(str(dispatch_path),
                                    os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
             os.close(_dispatch_fd)
         except OSError:
             try:
-                age = time.time() - DISCOVERY_DISPATCH_PATH.stat().st_mtime
+                age = time.time() - dispatch_path.stat().st_mtime
             except OSError:
                 age = DISCOVERY_DISPATCH_TTL_SECONDS + 1
             if age < DISCOVERY_DISPATCH_TTL_SECONDS:
                 return
             try:
-                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
-                _dispatch_fd = os.open(str(DISCOVERY_DISPATCH_PATH),
+                dispatch_path.unlink(missing_ok=True)
+                _dispatch_fd = os.open(str(dispatch_path),
                                        os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
                 os.close(_dispatch_fd)
             except OSError as e:
@@ -5747,14 +5769,13 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
-            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
             with tmp.open("w", encoding="utf-8") as f:
                 json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            os.replace(tmp, cache_path)
         finally:
             try:
-                DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
+                dispatch_path.unlink(missing_ok=True)
             except OSError:
                 pass
     except Exception as e:

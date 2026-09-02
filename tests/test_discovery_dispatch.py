@@ -50,6 +50,12 @@ def windows_hook(request, tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "DISCOVERY_CACHE_PATH", state_dir / "cache.json")
     monkeypatch.setattr(hook, "DISCOVERY_LOCK_PATH", state_dir / "discovery.lock")
     monkeypatch.setattr(hook, "DISCOVERY_DISPATCH_PATH", state_dir / "dispatch.lock")
+    monkeypatch.setattr(
+        hook,
+        "DISCOVERY_WINDOWS_STATE_DIR",
+        tmp_path / "windows-state",
+        raising=False,
+    )
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_DIR", installer_dir)
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_SH", install_sh)
     monkeypatch.setattr(hook, "DISCOVERY_INSTALL_PS1", install_ps1, raising=False)
@@ -115,7 +121,8 @@ def test_windows_discovery_download_uses_system_curl(windows_hook, monkeypatch):
 
 def test_dispatch_claim_recovers_from_permission_error(windows_hook, monkeypatch):
     hook, calls, _install_ps1 = windows_hook
-    marker = hook.DISCOVERY_DISPATCH_PATH
+    _cache_path, _lock_path, marker = hook._discovery_state_paths()
+    marker.parent.mkdir(parents=True)
     marker.write_text("", encoding="utf-8")
     os.utime(marker, (0, 0))
 
@@ -134,6 +141,79 @@ def test_dispatch_claim_recovers_from_permission_error(windows_hook, monkeypatch
 
     assert denied
     assert len(calls) == 1
+
+
+def test_windows_system_owned_home_marker_does_not_block_dispatch(
+    windows_hook, monkeypatch
+):
+    hook, calls, _install_ps1 = windows_hook
+    home_marker = hook.DISCOVERY_DISPATCH_PATH
+    home_marker.write_text("", encoding="utf-8")
+    os.utime(home_marker, (0, 0))
+
+    real_open = os.open
+    real_unlink = Path.unlink
+
+    def deny_home_claim(path, *args, **kwargs):
+        if str(path) == str(home_marker):
+            raise PermissionError(13, "Permission denied")
+        return real_open(path, *args, **kwargs)
+
+    def deny_home_unlink(path, *args, **kwargs):
+        if path == home_marker:
+            raise PermissionError(13, "Permission denied")
+        return real_unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(hook.os, "open", deny_home_claim)
+    monkeypatch.setattr(Path, "unlink", deny_home_unlink)
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert home_marker.exists()
+
+
+def test_windows_still_respects_active_home_discovery_lock(windows_hook):
+    hook, calls, _install_ps1 = windows_hook
+    hook.DISCOVERY_LOCK_PATH.write_text("1", encoding="utf-8")
+
+    hook._dispatch_discovery()
+
+    assert calls == []
+
+
+def test_error_report_identifies_executing_hook_file(windows_hook, monkeypatch):
+    hook, _calls, _install_ps1 = windows_hook
+    payloads = []
+    monkeypatch.setattr(hook, "_should_report", lambda: True)
+    monkeypatch.setattr(hook, "_reporting_error", False)
+
+    if hasattr(hook, "curl_with_auth"):
+        def capture_curl(_headers, _args, **kwargs):
+            payloads.append(kwargs["input"])
+
+        monkeypatch.setattr(hook, "curl_with_auth", capture_curl)
+    else:
+        class Input:
+            def write(self, data):
+                payloads.append(data)
+
+            def close(self):
+                pass
+
+        class Process:
+            stdin = Input()
+
+        monkeypatch.setattr(hook.subprocess, "Popen", lambda *_args, **_kwargs: Process())
+
+    hook.report_error_to_gateway("test error", "discovery_gate", "test-key")
+
+    assert len(payloads) == 1
+    payload = json.loads(payloads[0])
+    assert payload["hook_revision"] == "2026-09-02.1"
+    assert payload["hook_sha256"] == hook.HOOK_SHA256
+    assert len(payload["hook_sha256"]) == 64
+    int(payload["hook_sha256"], 16)
 
 
 def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):
