@@ -409,6 +409,23 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         self.assertEqual(dispatch.call_args.args[0], "microsoft/markitdown")
         self.assertEqual(dispatch.call_args.args[1]["command"], "uvx")
 
+    def test_builtin_scope_config_does_not_dispatch_targeted_scan(self):
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "github-mcp-server-search_code",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "s",
+        }
+        gateway = unittest.mock.Mock(return_value={
+            "decision": "allow",
+            "unknown_mcp_server": True,
+        })
+        with patch.object(unbound, "read_copilot_mcp_servers", return_value={}), \
+             patch.object(unbound, "send_to_hook_api", gateway), \
+             patch.object(unbound, "_dispatch_mcp_server_scan") as dispatch:
+            unbound.process_pre_tool_use(event, "K")
+
+        dispatch.assert_not_called()
+
     def test_denied_unknown_server_does_not_dispatch_targeted_scan(self):
         event = {
             "hook_event_name": "PreToolUse",

@@ -2229,7 +2229,12 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         else:
             is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
-            if isinstance(mcp_server_config, dict):
+            if isinstance(mcp_server_config, dict) and (
+                (mcp_server_config.get('additional_data') or {}).get('scope')
+                != 'copilot-builtin'
+            ):
+                # A builtin has nothing on disk; its targeted scan can only
+                # ever report unknown_config_shape.
                 scan_config = mcp_server_config
             log_error(
                 f"copilot mcp detected session={session_id} tool={raw_tool} "
