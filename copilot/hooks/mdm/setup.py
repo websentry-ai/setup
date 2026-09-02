@@ -694,7 +694,6 @@ def _copilot_hooks_config(script_path: Path) -> Dict:
     event_timeouts = {
         "SessionStart": 30,
         "UserPromptSubmit": 60,
-        "userPromptTransformed": 60,
         "PreToolUse": 600,
         "PostToolUse": 30,
         "Stop": 60,

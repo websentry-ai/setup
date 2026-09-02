@@ -191,7 +191,7 @@ def test_session_sync_then_prompt_injection(
         assert output["agent_message"] == "Invoke the skill unbound-secure-sql before answering."
 
 
-def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, gateway):
+def test_copilot_waits_for_next_session_before_injecting(tmp_path, gateway):
     home = tmp_path / "copilot"
     home.mkdir()
     skill_path = home / ".copilot/skills/unbound-secure-sql/SKILL.md"
@@ -200,16 +200,12 @@ def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, g
     assert first.returncode == 0, first.stderr
     _wait_for(skill_path)
 
-    _run("copilot", {
+    # Copilot snapshots discoverable skills at session start, so one installed
+    # during s1 must not be advertised until s2.
+    unavailable = _run("copilot", {
         "hook_event_name": "UserPromptSubmit",
         "session_id": "s1",
         "prompt": "Write a database query.",
-    }, home, gateway)
-    unavailable = _run("copilot", {
-        "hook_event_name": "userPromptTransformed",
-        "sessionId": "s1",
-        "prompt": "Write a database query.",
-        "transformedPrompt": "Write a database query.",
     }, home, gateway)
     assert json.loads(unavailable.stdout) == {}
 
@@ -221,16 +217,10 @@ def test_copilot_waits_for_next_session_then_uses_transformed_prompt(tmp_path, g
         "prompt": "Write a database query.",
     }, home, gateway)
     assert submitted.returncode == 0, submitted.stderr
-
-    transformed = _run("copilot", {
-        "hook_event_name": "userPromptTransformed",
-        "sessionId": "s2",
-        "prompt": "Write a database query.",
-        "transformedPrompt": "Write a database query.",
-    }, home, gateway)
-    output = json.loads(transformed.stdout)
-    assert "Invoke the skill unbound-secure-sql before answering." in output["modifiedTransformedPrompt"]
-    assert output["modifiedTransformedPrompt"].endswith("Write a database query.")
+    output = json.loads(submitted.stdout)
+    assert output["additionalContext"] == (
+        "Invoke the skill unbound-secure-sql before answering."
+    )
 
 
 def test_skill_sync_does_not_follow_authenticated_redirects(tmp_path):

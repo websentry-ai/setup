@@ -518,14 +518,16 @@ def _cleanup_skill_policy_state():
     try:
         if not SKILL_POLICY_STATE_ROOT.is_dir():
             return
-        checked = 0
         for directory in SKILL_POLICY_STATE_ROOT.iterdir():
             if not directory.is_dir() or directory.is_symlink():
                 continue
+            # Budget per directory: one busy directory must not consume the whole
+            # sweep and leave every later one uncollected.
+            checked = 0
             for entry in directory.iterdir():
                 checked += 1
                 if checked > 1000:
-                    return
+                    break
                 try:
                     if entry.is_file() and entry.stat().st_mtime < cutoff:
                         entry.unlink()
@@ -2737,19 +2739,11 @@ def transform_response_for_copilot_prompt(api_response):
             'reason': reason
         }
 
+    additional_context = api_response.get('additionalContext', '')
+    if additional_context:
+        return {'additionalContext': additional_context}
+
     return {}
-
-
-def transform_response_for_copilot_transformed_prompt(event, api_response):
-    transformed = event.get('transformedPrompt') or event.get('prompt') or ''
-    if not isinstance(api_response, dict):
-        return {}
-    if api_response.get('decision') in ('deny', 'block'):
-        return transform_response_for_copilot_prompt(api_response)
-    context = api_response.get('additionalContext', '')
-    if not context:
-        return {}
-    return {'modifiedTransformedPrompt': f"{context}\n\n{transformed}"}
 
 
 def _copilot_event_name(event):
@@ -2988,80 +2982,12 @@ def _evaluate_user_prompt_policy(event, api_key):
     return api_response
 
 
-def _copilot_prompt_plan_path(event):
-    session_id = _skill_policy_session_id(event)
-    if not session_id:
-        return None
-    digest = hashlib.sha256(session_id.encode('utf-8', 'replace')).hexdigest()
-    return SKILL_POLICY_STATE_ROOT / 'prompt-plans' / digest
-
-
-def _store_copilot_prompt_plan(event, plan):
-    try:
-        if not isinstance(plan, dict):
-            return
-        target = _copilot_prompt_plan_path(event)
-        if target is None:
-            return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        prompt = event.get('prompt') or ''
-        stored = {
-            'prompt_sha256': hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest(),
-            'plan': plan,
-        }
-        fd, temp_path = tempfile.mkstemp(dir=str(target.parent), prefix='.plan-', suffix='.tmp')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as temp_file:
-                json.dump(stored, temp_file)
-            os.replace(temp_path, target)
-        except Exception:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
-    except Exception as exc:
-        log_error(f"copilot prompt plan store failed: {exc}", 'skill_injection')
-
-
-def _take_copilot_prompt_plan(event):
-    target = _copilot_prompt_plan_path(event)
-    if target is None:
-        return False, None
-    try:
-        stored = json.loads(target.read_text(encoding='utf-8'))
-    except OSError:
-        return False, None
-    except Exception:
-        return False, None
-    prompt = event.get('prompt') or ''
-    prompt_hash = hashlib.sha256(prompt.encode('utf-8', 'replace')).hexdigest()
-    if not isinstance(stored, dict) or stored.get('prompt_sha256') != prompt_hash:
-        # userPromptTransformed also fires for preceding batched messages. Keep
-        # the plan for the message UserPromptSubmit actually evaluated.
-        return True, {}
-    claim = target.with_name(f'{target.name}.claim-{os.getpid()}')
-    try:
-        os.replace(target, claim)
-    except OSError:
-        return True, {}
-    try:
-        claimed = json.loads(claim.read_text(encoding='utf-8'))
-        value = claimed.get('plan') if isinstance(claimed, dict) else None
-        return (True, value) if isinstance(value, dict) else (False, None)
-    except Exception:
-        return False, None
-    finally:
-        try:
-            claim.unlink()
-        except OSError:
-            pass
-
-
 def process_user_prompt_submit(event, api_key):
     api_response = _evaluate_user_prompt_policy(event, api_key)
-    _store_copilot_prompt_plan(event, api_response)
-    return transform_response_for_copilot_prompt(api_response)
+    response = transform_response_for_copilot_prompt(api_response)
+    if response.get('additionalContext') and api_response.get('inject_skills'):
+        _claim_skill_injection_turn(event)
+    return response
 
 
 def _strip_git_suffix(segment):
@@ -3093,7 +3019,6 @@ def _git_origin_url(cwd):
     if result.returncode != 0:
         return None
     return result.stdout.strip()
-
 
 
 def _remote_host(remote_url):
@@ -3252,7 +3177,6 @@ def _git_path_opt_targets(command, shell_dir):
     return targets
 
 
-
 def _next_shell_dir(command, shell_dir):
     """Follow the last `cd` in `command`; unchanged on no cd or any error."""
     try:
@@ -3390,10 +3314,6 @@ REPO_GATE_BLOCK_CONTEXT = (
     'attempt to achieve the same result using alternative tools, file operations, '
     'or workarounds. Inform the user and stop.'
 )
-
-
-
-
 
 
 def _repo_gate_command(tool_input):
@@ -4856,14 +4776,10 @@ def main():
             print("{}")
             return
 
+        # Skill context rides UserPromptSubmit's additionalContext. Configs written
+        # before that still register this event, so answer them until setup rewrites.
         if event_name == 'userPromptTransformed':
-            found_plan, gateway_response = _take_copilot_prompt_plan(event)
-            if not found_plan:
-                gateway_response = _evaluate_user_prompt_policy(event, api_key)
-            response = transform_response_for_copilot_transformed_prompt(event, gateway_response)
-            print(json.dumps(response), flush=True)
-            if response.get('modifiedTransformedPrompt') and gateway_response.get('inject_skills'):
-                _claim_skill_injection_turn(event)
+            print("{}")
             return
 
         if event_name in ('PreToolUse', 'preToolUse'):
