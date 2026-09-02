@@ -1041,7 +1041,7 @@ def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, seri
 
 def detect_install_state() -> Optional[str]:
     """Inspect the enterprise hooks.json target BEFORE it gets overwritten.
-    Existence-based: the self-update rewrites these files, so content checks
+    Existence-based: these files change across versions, so content checks
     are unreliable — only file existence is trustworthy.
     'fresh' (config absent), 'persisted' (config + unbound.py both present),
     'tampered' (config present but hook script missing), or None on any error."""

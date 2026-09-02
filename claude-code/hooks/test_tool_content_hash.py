@@ -322,8 +322,8 @@ class TestDispatchPassesCodingTool(unittest.TestCase):
 
 
 class TestCrossHookSectionConsistency(unittest.TestCase):
-    """The risk-scoring section is embedded per hook (single-file self-update
-    constraint). It must stay byte-identical across variants, modulo the three
+    """The risk-scoring section is embedded per hook (each hook ships as one
+    self-contained file). It must stay byte-identical across variants, modulo the three
     per-hook coding-tool constants."""
 
     START = '# KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies'

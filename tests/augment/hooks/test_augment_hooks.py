@@ -639,8 +639,7 @@ class TestMainDispatch(_HomeTmp):
 
     def test_session_start_returns_empty_object(self):
         pr = None
-        with patch.object(unbound, "_check_self_update"), \
-             patch.object(unbound, "_dispatch_discovery"):
+        with patch.object(unbound, "_dispatch_discovery"):
             pr = self._run_main({"hook_event_name": "SessionStart", "conversation_id": "s"})
         self.assertEqual(pr.call_args[0][0], "{}")
 

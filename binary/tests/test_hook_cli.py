@@ -196,10 +196,9 @@ def test_version_does_not_read_stdin(sandbox_home):
     ("copilot", "SessionStart"), ("codex", "SessionStart"),
 ])
 def test_frozen_session_start_makes_no_downloads(tool, event, discovery_enabled_home):
-    """SessionStart is the event that triggers self-update + discovery. In
-    frozen mode, with discovery enabled for the org, the hook must neither
-    download install.sh nor write self-update state — it logs the missing
-    local discovery binary and moves on."""
+    """SessionStart is the event that triggers discovery. In frozen mode, with
+    discovery enabled for the org, the hook must not download install.sh — it
+    logs the missing local discovery binary and moves on."""
     home = discovery_enabled_home
     payload = json.dumps({**EVENT_PAYLOADS[tool][event]})
     got = run_cli_dev(["hook", tool, event], payload, home,
@@ -207,8 +206,6 @@ def test_frozen_session_start_makes_no_downloads(tool, event, discovery_enabled_
     assert got.returncode == 0
     install_sh = home / ".local" / "share" / "unbound" / "install.sh"
     assert not install_sh.exists(), "frozen hook downloaded install.sh"
-    for state in home.rglob(".self_update_check"):
-        pytest.fail(f"frozen hook wrote self-update state: {state}")
     err_logs = list(home.rglob("error.log"))
     assert err_logs, "expected the missing-discovery-binary skip to be logged"
     combined = "".join(p.read_text() for p in err_logs)
@@ -221,7 +218,6 @@ def test_frozen_binary_session_start_makes_no_downloads(discovery_enabled_home):
     got = run_binary(["hook", "claude-code", "SessionStart"], payload, home)
     assert got.returncode == 0
     assert not (home / ".local" / "share" / "unbound" / "install.sh").exists()
-    assert not (home / ".claude" / "hooks" / ".self_update_check").exists()
 
 
 def test_mcp_diagnostic_subcommand_fails_open(sandbox_home):
