@@ -4399,13 +4399,7 @@ def _is_windows() -> bool:
 
 
 def _machine_env(name: str) -> Optional[str]:
-    """Read an env var from a scope only an admin/SYSTEM can write. On
-    Windows, os.getenv() merges HKCU over HKLM, so a non-admin user's
-    per-user `setx NAME value` (no /M) silently shadows the machine-wide
-    value MDM wrote with `setx NAME value /M` -- go straight to HKLM
-    instead. On POSIX there is no such per-user override of a machine-wide
-    var (personal installs write shell rc files, not a global scope), so
-    os.environ is already the right source."""
+    """Windows: read HKLM directly, since os.getenv() would let a per-user setx shadow it."""
     if not _is_windows():
         return os.environ.get(name)
     try:
@@ -4538,9 +4532,7 @@ def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]
 
 
 def _relocate_state_dir(reason: str) -> Optional[str]:
-    """Repoint cache/lock/marker at the temp fallback. Returns the relocation
-    log message on success, so the caller can defer logging past the debounce
-    check; None if no usable fallback was found (already logged here)."""
+    """Repoints cache/lock/marker at the fallback; returns the log message to defer."""
     global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
     current = DISCOVERY_DISPATCH_PATH.parent
     if _is_windows():
@@ -4561,8 +4553,7 @@ def _relocate_state_dir(reason: str) -> Optional[str]:
 
 
 def _resolve_state_dir() -> Optional[str]:
-    """Relocate before dispatching if the current state dir is unusable.
-    Returns the relocation log message, if any."""
+    """Relocates if the state dir is unusable; returns the relocation message, if any."""
     reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
     if reason is not None:
         return _relocate_state_dir(reason)
@@ -4637,8 +4628,7 @@ def _dispatch_discovery() -> None:
             api_key = unbound_config.get("api_key")
             backend_url = unbound_config.get("base_url")
             if not (api_key and backend_url):
-                # Resolve as a unit: never pair a config-sourced field with an
-                # env-sourced one -- they carry different trust levels.
+                # Resolve as a unit -- never pair a config field with an env field.
                 api_key = _machine_env('UNBOUND_COPILOT_API_KEY')
                 backend_url = _machine_env('UNBOUND_BACKEND_URL')
                 if backend_url and not backend_url.startswith("https://"):

@@ -58,9 +58,7 @@ def windows_hook(request, tmp_path, monkeypatch):
     install_ps1.write_text("param()\n", encoding="utf-8")
 
     monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
-    # _machine_env reads real HKLM on Windows; there is no registry to read
-    # here, so stand in with os.environ -- the HKLM-vs-HKCU guarantee itself
-    # is verified separately against a real Windows machine, not in CI.
+    # no real registry here; HKLM-vs-HKCU is verified separately on Windows
     monkeypatch.setattr(hook, "_machine_env", lambda name: os.environ.get(name), raising=False)
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(hook, "UNBOUND_CONFIG_PATH", config_path)
@@ -338,9 +336,7 @@ def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, 
 
 
 def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkeypatch):
-    """A leftover per-user env var from a prior personal install must not
-    outrank a freshly-written, readable config.json (e.g. after MDM enrolls
-    a device that previously had a subscription install)."""
+    """A stale personal-install env var must not outrank a readable config.json."""
     hook, calls, _install_ps1 = windows_hook
     tool = request.node.callspec.params["windows_hook"]
 
@@ -354,10 +350,26 @@ def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkey
     assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
 
 
+def test_partial_config_does_not_mix_with_env(request, windows_hook, monkeypatch):
+    """Must not dispatch with file's api_key + env's base_url -- no mixing sources."""
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    hook.UNBOUND_CONFIG_PATH.write_text(
+        json.dumps({"api_key": "file-key"}), encoding="utf-8"
+    )
+    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "env-key")
+    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://env.example")
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "env-key"
+    assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://env.example"
+
+
 class _FakeWinReg:
-    """Stands in for the winreg module so the HKLM-read path is exercised
-    without a real Windows registry. Injected via sys.modules -- the hook's
-    `import winreg` inside _machine_env picks this up instead of failing."""
+    """Stands in for winreg via sys.modules so the HKLM-read path is exercised."""
 
     HKEY_LOCAL_MACHINE = object()
 
@@ -381,13 +393,7 @@ class _FakeWinReg:
 
 @pytest.mark.parametrize("tool", sorted(HOOKS))
 def test_machine_env_reads_hklm_not_the_merged_process_env(tool, monkeypatch):
-    """Regression guard for the HKCU-shadowing fix: _machine_env must read
-    Windows' machine (HKLM) hive directly and never fall back to
-    os.getenv()/os.environ, which merges in a per-user (HKCU) override. A
-    revert to os.getenv() here would silently reopen the credential-redirect
-    finding from PR #295's security review, and this is the one thing the
-    windows_hook fixture's _machine_env stub can't catch, since it replaces
-    _machine_env outright."""
+    """_machine_env must read HKLM directly, never the merged process env."""
     spec = importlib.util.spec_from_file_location(
         "machine_env_check_%s" % tool.replace("-", "_"), HOOKS[tool]
     )
