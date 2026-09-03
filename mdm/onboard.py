@@ -9,9 +9,10 @@ Unbound MDM onboarding — runs all six steps in one shot:
   5. Augment MDM setup
   6. Coding-discovery scan
 
-Steps 1-5 use --api-key (admin MDM key). Step 6 uses --discovery-key (a
-separate discovery-specific key). The two are different credentials and the
-backend distinguishes them; passing one in place of the other will be rejected.
+All six steps use --api-key (the admin MDM key). The backend accepts the
+admin key for discovery uploads, so a separate discovery key is no longer
+needed. --discovery-key is still accepted for back-compat (deprecated) and,
+when given, is used for step 6 in place of the admin key.
 
 Backfill must be explicitly enabled via --backfill flag (typically passed from
 PowerShell's -Backfill parameter). When enabled, it seeds Claude Code and Codex
@@ -23,8 +24,10 @@ Copilot, and Augment have no historical transcript store to backfill.
 Usage:
 
   sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" \
-      --api-key YOUR_ADMIN_API_KEY \
-      --discovery-key YOUR_DISCOVERY_KEY
+      --api-key YOUR_ADMIN_API_KEY
+
+Optional (deprecated): --discovery-key <key> runs the discovery scan with a
+separate key instead of the admin key.
 
 Optional overrides for tenant deployments (passed to MDM tools and reused as
 the discovery --domain):
@@ -104,8 +107,8 @@ USAGE = (
     "Usage:\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" \\\n"
     "      --api-key YOUR_ADMIN_API_KEY \\\n"
-    "      --discovery-key YOUR_DISCOVERY_KEY \\\n"
-    "      [--backend-url <url>] [--gateway-url <url>] [--skip-managed-settings]\n"
+    "      [--discovery-key <key>] [--backend-url <url>] [--gateway-url <url>]\n"
+    "      [--skip-managed-settings]\n"
     "\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" --clear\n"
 )
@@ -341,6 +344,15 @@ def parse_args(argv: list) -> tuple:
     return discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings
 
 
+def _flag_value(args: list, flag: str):
+    """Value following `flag` in args, or None if absent or given no value."""
+    try:
+        i = args.index(flag)
+    except ValueError:
+        return None
+    return args[i + 1] if i + 1 < len(args) else None
+
+
 def main() -> int:
     args = sys.argv[1:]
 
@@ -353,14 +365,16 @@ def main() -> int:
     # Validate flags. --clear short-circuits the key checks: nothing to
     # authenticate, just remove the configuration.
     if not is_clear:
-        if "--api-key" not in mdm_args:
+        api_key = _flag_value(mdm_args, "--api-key")
+        if not api_key:
             print("Error: --api-key is required (the MDM admin key).\n", file=sys.stderr)
             print(USAGE, file=sys.stderr)
             return 1
+        # The backend accepts the admin key for discovery uploads, and the
+        # dashboard-generated onboard command no longer includes a discovery
+        # key. An explicit --discovery-key still wins (back-compat).
         if not discovery_key:
-            print("Error: --discovery-key is required (separate from --api-key).\n", file=sys.stderr)
-            print(USAGE, file=sys.stderr)
-            return 1
+            discovery_key = api_key
 
     if not check_admin_privileges():
         if platform.system().lower() == "windows":

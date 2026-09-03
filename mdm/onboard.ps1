@@ -26,7 +26,8 @@
     The MDM admin API key (required unless -Clear is specified)
 
 .PARAMETER DiscoveryKey
-    The discovery-specific API key, separate from ApiKey (required unless -Clear is specified)
+    Deprecated, optional: a separate key for the coding-discovery scan. Defaults to
+    ApiKey — the backend accepts the admin key for discovery uploads.
 
 .PARAMETER BackendUrl
     Backend URL override for tenant deployments (default: https://backend.getunbound.ai)
@@ -49,20 +50,20 @@
     Remove MDM configuration for all four tools (no discovery scan, no backfill)
 
 .EXAMPLE
-    # Standard onboarding with both keys
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+    # Standard onboarding
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/windows/onboard" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY
 
 .EXAMPLE
     # With backfill of historical transcripts (opt-in)
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -Backfill
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/windows/onboard" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -Backfill
 
 .EXAMPLE
     # Tenant deployment with custom URLs
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -BackendUrl "https://backend.example.com" -GatewayUrl "https://api.example.com"
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/windows/onboard" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -BackendUrl "https://backend.example.com" -GatewayUrl "https://api.example.com"
 
 .EXAMPLE
     # Clear MDM setup
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -Clear
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/windows/onboard" -OutFile onboard.ps1; .\onboard.ps1 -Clear
 
 .NOTES
     Requires: Python 3, Administrator privileges
@@ -141,11 +142,7 @@ function Main {
     # Validate parameters (unless -Clear is specified)
     if (-not $Clear) {
         if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-            Exit-WithError "-ApiKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
-        }
-
-        if ([string]::IsNullOrWhiteSpace($DiscoveryKey)) {
-            Exit-WithError "-DiscoveryKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
+            Exit-WithError "-ApiKey is required. Usage: Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/windows/onboard' -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_API_KEY"
         }
     }
 
@@ -174,8 +171,15 @@ function Main {
         } else {
             $pythonArgs += "--api-key"
             $pythonArgs += $ApiKey
+            # -DiscoveryKey is deprecated: the backend accepts the admin key for
+            # discovery uploads, so it defaults to ApiKey. Passed explicitly so
+            # the fallback holds whichever onboard.py revision is fetched.
+            $discoveryKeyArg = $DiscoveryKey
+            if ([string]::IsNullOrWhiteSpace($discoveryKeyArg)) {
+                $discoveryKeyArg = $ApiKey
+            }
             $pythonArgs += "--discovery-key"
-            $pythonArgs += $DiscoveryKey
+            $pythonArgs += $discoveryKeyArg
         }
 
         # URL overrides apply to both normal and clear modes
