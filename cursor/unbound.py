@@ -3476,19 +3476,18 @@ def process_stop_event(generation_id, api_key=None):
 
 
 def get_api_key():
-    """Get API key from env var or ~/.unbound/config.json."""
-    key = os.getenv('UNBOUND_CURSOR_API_KEY')
-    if key:
-        return key
+    """Read API key from ~/.unbound/config.json (freshest), falling back to env."""
     try:
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
-            return json.loads(f.read()).get('api_key')
+            key = json.loads(f.read()).get('api_key')
+        if key:
+            return key
     except FileNotFoundError:
-        return None
+        pass
     except Exception as e:
         log_error(f"Failed to read config file: {e}", 'config')
-        return None
+    return _machine_env('UNBOUND_CURSOR_API_KEY')
 
 
 def _is_windows() -> bool:

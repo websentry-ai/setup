@@ -2900,7 +2900,7 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
         if (gate or {}).get('decision') != 'deny':
             return
         # main() already resolved the key; the fallback covers entry points that skip it.
-        api_key = _cached_api_key or os.getenv('UNBOUND_CODEX_API_KEY')
+        api_key = _cached_api_key or get_api_key()
         if not api_key:
             return
         policy = _repo_gate_binding_policy(block_policies)
@@ -3932,12 +3932,12 @@ def _dispatch_discovery() -> None:
 
 
 def get_api_key():
-    return os.getenv('UNBOUND_CODEX_API_KEY')
+    return _machine_env('UNBOUND_CODEX_API_KEY')
 
 
 def main():
     global _cached_api_key
-    api_key = os.getenv('UNBOUND_CODEX_API_KEY')
+    api_key = _machine_env('UNBOUND_CODEX_API_KEY')
     _cached_api_key = api_key
 
     if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':

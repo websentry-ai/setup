@@ -3214,26 +3214,26 @@ def process_stop_event(event: Dict, api_key: str):
 
 
 def get_api_key():
-    """Read API key from env, falling back to ~/.unbound/config.json.
+    """Read API key from ~/.unbound/config.json, falling back to env.
 
-    GUI launchers spawn the hook without inheriting shell-profile env vars, so
-    setup.py also writes the key to ~/.unbound/config.json as a tier-2 lookup
-    (shared with unbound-cli)."""
-    key = os.getenv('UNBOUND_AUGMENT_API_KEY')
-    if key:
-        return key
+    File is authoritative and freshest (setup.py rewrites it on every MDM
+    run); env is a fallback for launch contexts that never see it -- GUI
+    launchers spawn the hook without inheriting shell-profile env vars
+    (shared with unbound-cli) -- and for a device whose config.json is
+    briefly unreadable."""
     try:
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
-            return json.loads(f.read()).get('api_key')
+            key = json.loads(f.read()).get('api_key')
+        if key:
+            return key
     except FileNotFoundError:
-        return None
+        pass
     except json.JSONDecodeError as e:
         log_error(f"~/.unbound/config.json is not valid JSON: {e}", 'config')
-        return None
     except Exception as e:
         log_error(f"Failed to read config file: {e}", 'config')
-        return None
+    return _machine_env('UNBOUND_AUGMENT_API_KEY')
 
 
 def _is_windows() -> bool:
