@@ -208,9 +208,12 @@ function Main {
             $pythonArgs += "--skip-managed-settings"
         }
 
-        # Execute the Python script and capture exit code
+        # Execute the Python script. Its stdout flows straight to the host
+        # because Main is invoked bare at the entry point; the exit code is
+        # stashed script-scoped instead of returned. (`$x = Main` would capture
+        # the Python output into $x and `exit` on that array reports 0.)
         & $pythonCmd @pythonArgs
-        $exitCode = $LASTEXITCODE
+        $script:pythonExitCode = $LASTEXITCODE
 
     } finally {
         # Clean up temporary files
@@ -221,13 +224,12 @@ function Main {
             Remove-Item $tempPyFile -ErrorAction SilentlyContinue
         }
     }
-
-    # Return the exit code
-    return $exitCode
 }
 
-# Entry point - capture exit code from Main
-$exitCode = Main
+# Entry point. Defaults to failure so anything that stops Main before Python
+# runs can never report success to the caller (e.g. Intune remediation).
+$script:pythonExitCode = 1
+Main
 
 # Self-destruct: Remove this script file after execution completes
 # This allows users to run without manual cleanup: Invoke-WebRequest ... -OutFile onboard.ps1; .\onboard.ps1 -ApiKey ...
@@ -236,4 +238,4 @@ if ($MyInvocation.MyCommand.Path) {
 }
 
 # Exit with the Python script's exit code
-exit $exitCode
+exit $script:pythonExitCode
