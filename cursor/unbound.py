@@ -3572,8 +3572,14 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key") or _machine_env('UNBOUND_CURSOR_API_KEY')
-        backend_url = unbound_config.get("base_url") or _machine_env('UNBOUND_BACKEND_URL')
+        api_key = unbound_config.get("api_key")
+        backend_url = unbound_config.get("base_url")
+        if not (api_key and backend_url):
+            api_key = _machine_env('UNBOUND_CURSOR_API_KEY')
+            backend_url = _machine_env('UNBOUND_BACKEND_URL')
+            if backend_url and not backend_url.startswith("https://"):
+                log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
+                backend_url = None
         if not api_key or not backend_url:
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return

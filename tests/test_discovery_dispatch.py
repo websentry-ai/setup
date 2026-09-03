@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -351,3 +352,64 @@ def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkey
     assert len(calls) == 1
     assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "test-key"
     assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
+
+
+class _FakeWinReg:
+    """Stands in for the winreg module so the HKLM-read path is exercised
+    without a real Windows registry. Injected via sys.modules -- the hook's
+    `import winreg` inside _machine_env picks this up instead of failing."""
+
+    HKEY_LOCAL_MACHINE = object()
+
+    class _Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    @classmethod
+    def OpenKey(cls, hive, path):
+        return cls._Key()
+
+    @staticmethod
+    def QueryValueEx(key, name):
+        if name == "UNBOUND_TEST_VAR":
+            return ("hklm-value", 1)
+        raise OSError("not found")
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_machine_env_reads_hklm_not_the_merged_process_env(tool, monkeypatch):
+    """Regression guard for the HKCU-shadowing fix: _machine_env must read
+    Windows' machine (HKLM) hive directly and never fall back to
+    os.getenv()/os.environ, which merges in a per-user (HKCU) override. A
+    revert to os.getenv() here would silently reopen the credential-redirect
+    finding from PR #295's security review, and this is the one thing the
+    windows_hook fixture's _machine_env stub can't catch, since it replaces
+    _machine_env outright."""
+    spec = importlib.util.spec_from_file_location(
+        "machine_env_check_%s" % tool.replace("-", "_"), HOOKS[tool]
+    )
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+
+    monkeypatch.setitem(sys.modules, "winreg", _FakeWinReg())
+    monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setenv("UNBOUND_TEST_VAR", "hkcu-shadow-value")
+
+    assert hook._machine_env("UNBOUND_TEST_VAR") == "hklm-value"
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_machine_env_uses_os_environ_on_posix(tool, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "machine_env_posix_%s" % tool.replace("-", "_"), HOOKS[tool]
+    )
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+
+    monkeypatch.setattr(hook, "_is_windows", lambda: False, raising=False)
+    monkeypatch.setenv("UNBOUND_TEST_VAR", "posix-value")
+
+    assert hook._machine_env("UNBOUND_TEST_VAR") == "posix-value"
