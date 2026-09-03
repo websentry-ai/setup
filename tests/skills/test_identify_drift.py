@@ -756,8 +756,7 @@ class TestAnUndatedRecordStillHasAnAge(unittest.TestCase):
 
     def test_a_records_own_timestamp_still_wins(self):
         """The file time is a fallback, not an override."""
-        from pathlib import Path
-        stamp = "2026-08-20T10:00:00+00:00"
+        stamp = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
         body = _json_line({"role": "user", "timestamp": stamp,
                            "message": {"content": [{"type": "text", "text": "dated"}]}})
         got = self._scan(self._cursor_transcript(1, body))
