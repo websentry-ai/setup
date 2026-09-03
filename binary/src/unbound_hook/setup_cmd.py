@@ -42,7 +42,7 @@ DISCOVERY_KILL_GRACE_SECONDS = 120
 SETUP_TOOLS = ("claude-code", "cursor", "codex", "copilot", "augment")
 
 USAGE = (
-    "Usage: unbound-hook setup --api-key <admin_key> [--discovery-key <key>]\n"
+    "Usage: unbound-hook setup --api-key <admin_key>\n"
     "           [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]\n"
     "           [--app_name <name>] [--backfill] [--tools t1,t2,...]\n"
     "           [--skip-managed-settings]   # claude-code only\n"
@@ -52,7 +52,6 @@ USAGE = (
 def _parse_args(argv):
     opts = {
         "api_key": None,
-        "discovery_key": None,
         "backend_url": "https://backend.getunbound.ai",
         "gateway_url": "https://api.getunbound.ai",
         "frontend_url": None,
@@ -66,8 +65,10 @@ def _parse_args(argv):
         a = argv[i]
         if a == "--api-key" and i + 1 < len(argv):
             opts["api_key"] = argv[i + 1]; i += 2
-        elif a == "--discovery-key" and i + 1 < len(argv):
-            opts["discovery_key"] = argv[i + 1]; i += 2
+        elif a == "--discovery-key":
+            # Accepted and ignored so older callers keep working. A valueless
+            # flag must not swallow the flag that follows it.
+            i += 2 if i + 1 < len(argv) and not argv[i + 1].startswith("--") else 1
         elif a == "--backend-url" and i + 1 < len(argv):
             opts["backend_url"] = argv[i + 1]; i += 2
         elif a == "--gateway-url" and i + 1 < len(argv):
@@ -814,18 +815,33 @@ def _setup_copilot(opts):
     return ("configured", None)
 
 
+def _fetch_device_owner_key(opts):
+    """Resolve the API key of the user this device belongs to, from its hardware
+    serial. Replaces the org discovery key: the scan authenticates as the owner,
+    so the device is attributed to them. Returns None when it can't be resolved."""
+    m = _module("claude-code")
+    device_id = m.get_device_identifier()
+    if not device_id:
+        return None
+    return m.fetch_api_key_from_mdm(
+        opts["backend_url"], opts["app_name"], opts["api_key"], device_id,
+        app_type="default",
+    )
+
+
 def _run_discovery(opts):
     """Run the locally installed discovery binary (no install.sh download).
     Mirrors onboard.py's process-group + backstop-kill discipline."""
-    if not opts["discovery_key"]:
-        return ("skipped", "no --discovery-key provided")
     if not DISCOVERY_BINARY.is_file():
         return ("deferred", f"discovery binary not installed at {DISCOVERY_BINARY}")
+    scan_key = _fetch_device_owner_key(opts)
+    if not scan_key:
+        return ("skipped", "could not resolve the device owner's key from the serial")
     # Key via env, never argv — the scan runs up to 90 min and argv is
     # visible to every local user via ps (same contract the hook modules'
     # frozen discovery dispatch uses).
     cmd = [str(DISCOVERY_BINARY), "--domain", opts["backend_url"]]
-    env = {**os.environ, "UNBOUND_API_KEY": opts["discovery_key"]}
+    env = {**os.environ, "UNBOUND_API_KEY": scan_key}
     backstop = DISCOVERY_TIMEOUT_SECONDS + DISCOVERY_KILL_GRACE_SECONDS
     try:
         proc = subprocess.Popen(cmd, start_new_session=True, env=env)

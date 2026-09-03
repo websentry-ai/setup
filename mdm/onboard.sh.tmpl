@@ -169,7 +169,9 @@ else
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --api-key)       API_KEY="$2"; shift 2 ;;
-      --discovery-key) DISCOVERY_KEY="$2"; shift 2 ;;
+      # Deprecated and ignored. Consumed with or without a value so a valueless
+      # flag neither aborts under `set -u` nor swallows the flag after it.
+      --discovery-key) if [[ "${2:-}" == --* || $# -lt 2 ]]; then shift; else DISCOVERY_KEY="$2"; shift 2; fi ;;
       --backend-url)   BACKEND_URL="$2"; shift 2 ;;
       --gateway-url)   GATEWAY_URL="$2"; shift 2 ;;
       --clear)         CLEAR=1; shift ;;
@@ -202,7 +204,10 @@ fi
 # --- Preflight ---------------------------------------------------------------
 CURRENT_STEP="preflight"
 [[ $EUID -eq 0 ]] || { echo "must run as root (Jamf runs scripts as root)" >&2; exit 1; }
-[[ -n "$API_KEY" && -n "$DISCOVERY_KEY" ]] || { echo "--api-key and --discovery-key are required" >&2; exit 2; }
+[[ -n "$API_KEY" ]] || { echo "--api-key is required" >&2; exit 2; }
+# Accepted and ignored so Jamf policies that still fill the key slot keep working:
+# the scan authenticates as the device owner, resolved from the hardware serial.
+[[ -n "$DISCOVERY_KEY" ]] && echo "--discovery-key is deprecated and ignored" >&2
 os_major="$(sw_vers -productVersion | cut -d. -f1)"
 [[ "$os_major" -ge $MIN_MACOS_MAJOR ]] || { echo "macOS $os_major < required $MIN_MACOS_MAJOR" >&2; exit 1; }
 avail_mb="$(df -Pm / | awk 'NR==2{print $4}')"
@@ -269,7 +274,6 @@ skip_managed_flag=""
 [[ $SKIP_MANAGED -eq 1 ]] && skip_managed_flag="--skip-managed-settings"
 "$PREFIX/current/unbound-hook/unbound-hook" setup \
   --api-key "$API_KEY" \
-  --discovery-key "$DISCOVERY_KEY" \
   --backend-url "$BACKEND_URL" \
   --gateway-url "$GATEWAY_URL" \
   $backfill_flag $skip_managed_flag
