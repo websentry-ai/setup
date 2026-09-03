@@ -453,7 +453,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
             unbound, "RUNNING_FROZEN", True
         ), patch.object(unbound.os.path, "isfile", return_value=True), patch.object(
             unbound.subprocess, "Popen"
-        ) as popen:
+        ) as popen, patch.dict(os.environ, {"UNBOUND_COPILOT_API_KEY": ""}):
             unbound._dispatch_mcp_server_scan(
                 "microsoft/markitdown", {"command": "uvx", "args": ["markitdown-mcp"]}
             )

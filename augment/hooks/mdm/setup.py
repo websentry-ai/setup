@@ -744,7 +744,10 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
     _repair_user_ownership(username, [config_dir, config_file])
 
     def _write():
-        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if platform.system().lower() != "windows":
             try:
                 os.chmod(config_dir, 0o700)
@@ -1249,6 +1252,7 @@ def clear_setup() -> bool:
         failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_AUGMENT_API_KEY")
+            remove_env_var_from_user(username, home_dir, "UNBOUND_BACKEND_URL")
             remove_hook_logs_for_user(username, home_dir)
             if status == "cleared":
                 cleared += 1
@@ -1421,6 +1425,11 @@ def main():
         print("Failed to set UNBOUND_AUGMENT_API_KEY")
         return False
     debug_print("UNBOUND_AUGMENT_API_KEY set successfully")
+
+    url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
+    if not url_ok:
+        print("Failed to set UNBOUND_BACKEND_URL")
+        return False
 
     # Write the per-user unbound config now (needed by the managed hook; harmless
     # before the managed write). User-level hook REMOVAL is deferred until the

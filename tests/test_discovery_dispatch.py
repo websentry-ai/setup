@@ -19,6 +19,14 @@ HOOKS = {
     "augment": REPO / "augment" / "hooks" / "unbound.py",
 }
 
+TOOL_API_KEY_ENV = {
+    "claude-code": "UNBOUND_CLAUDE_API_KEY",
+    "cursor": "UNBOUND_CURSOR_API_KEY",
+    "copilot": "UNBOUND_COPILOT_API_KEY",
+    "codex": "UNBOUND_CODEX_API_KEY",
+    "augment": "UNBOUND_AUGMENT_API_KEY",
+}
+
 
 @pytest.fixture(params=sorted(HOOKS))
 def windows_hook(request, tmp_path, monkeypatch):
@@ -29,6 +37,9 @@ def windows_hook(request, tmp_path, monkeypatch):
     hook = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hook)
     assert hook.RUNNING_FROZEN is False
+
+    monkeypatch.delenv(TOOL_API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
 
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -278,3 +289,44 @@ def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):
         "--domain",
         "https://backend.example",
     ]
+
+
+def test_unreadable_config_falls_back_to_env(request, windows_hook, monkeypatch):
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    real_open = Path.open
+
+    def deny_config(self, *a, **k):
+        if self == hook.UNBOUND_CONFIG_PATH:
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(Path, "open", deny_config)
+    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "env-key")
+    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://backend.example")
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "env-key"
+
+
+def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, monkeypatch):
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    real_open = Path.open
+
+    def deny_config(self, *a, **k):
+        if self == hook.UNBOUND_CONFIG_PATH:
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(Path, "open", deny_config)
+    monkeypatch.delenv(TOOL_API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
+
+    hook._dispatch_discovery()
+
+    assert calls == []

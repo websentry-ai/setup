@@ -535,7 +535,10 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str) -
     config_file = config_dir / "config.json"
 
     def _write():
-        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if platform.system().lower() != "windows":
             os.chmod(config_dir, 0o700)
         config = {}
