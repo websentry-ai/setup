@@ -37,7 +37,7 @@ def env(tmp_path, monkeypatch):
         monkeypatch.setattr(m, "check_admin_privileges", lambda: True)
         monkeypatch.setattr(m, "get_device_identifier", lambda: "TESTSERIAL1")
         monkeypatch.setattr(m, "fetch_api_key_from_mdm",
-                            lambda base, app, auth, dev: "per-device-key")
+                            lambda base, app, auth, dev, app_type=None: "per-device-key")
         monkeypatch.setattr(m, "notify_setup_complete",
                             lambda *a, **k: notified.append((a, k)))
         if hasattr(m, "run_backfill"):
@@ -62,6 +62,13 @@ def env(tmp_path, monkeypatch):
     bootouts = []
     monkeypatch.setattr(migration, "_bootout_legacy_agents",
                         lambda username, uid, h, log: bootouts.append((username, uid)))
+    # Discovery needs no key any more: it resolves the device owner from the
+    # serial and runs the locally installed binary. Stand in a no-op binary so
+    # the step exercises that path instead of deferring on a missing file.
+    discovery_bin = tmp_path / "unbound-discovery"
+    discovery_bin.write_text("#!/bin/sh\nexit 0\n")
+    discovery_bin.chmod(0o755)
+    monkeypatch.setattr(setup_cmd, "DISCOVERY_BINARY", discovery_bin)
     return {"tmp": tmp_path, "home": home, "modules": modules,
             "notified": notified, "backfilled": backfilled, "bootouts": bootouts}
 
@@ -72,7 +79,7 @@ def _cmd(tool, event):
 
 def test_setup_full_run_configures_everything(env):
     rc = setup_cmd.run(["--api-key", "admin-key"])
-    assert rc == 0  # discovery skipped (no key) is not a failure
+    assert rc == 0  # every component configured, discovery included
 
     # claude-code managed settings — exact structure incl. the historical
     # PreToolUse 15000 (vs 60 elsewhere) and async flags.
@@ -731,3 +738,20 @@ def test_skip_managed_settings_defers_when_the_strip_fails(env, capsys):
     assert "deferred (managed settings update failed)" in out
     assert "Failed to strip existing Unbound hooks" in out
     assert settings_path.read_text() == "{ not json ", "must not clobber what it cannot parse"
+
+
+# The discovery key is retired. Legacy Jamf policies still pass it to the binary,
+# so every form must parse and be ignored — an unknown argument exits 2 and fails
+# the whole enrollment.
+@pytest.mark.parametrize("argv", [
+    ["--api-key", "K", "--discovery-key", "STALE"],
+    ["--api-key", "K", "--discovery-key"],
+    ["--discovery-key", "--api-key", "K"],
+    ["--discovery-key", "", "--api-key", "K"],
+    ["--discovery-key", "STALE", "--api-key", "K", "--backfill"],
+])
+def test_setup_parses_and_ignores_a_stale_discovery_key(argv):
+    opts = setup_cmd._parse_args(argv)
+    assert opts is not None, "a stale --discovery-key must never be an unknown argument"
+    assert opts["api_key"] == "K"
+    assert "discovery_key" not in opts

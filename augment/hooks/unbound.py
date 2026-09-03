@@ -3,6 +3,7 @@
 import sys
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
 from datetime import datetime, timezone
@@ -12,7 +13,7 @@ import hashlib
 import re
 import tempfile
 import platform
-from urllib.parse import urlparse, urlsplit, urlunsplit
+from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(
@@ -77,7 +78,7 @@ DISCOVERY_STALE_LOCK_SECONDS = 15 * 60
 DISCOVERY_CACHE_PATH = Path.home() / ".unbound" / "discovery-cache.json"
 DISCOVERY_LOCK_PATH = Path.home() / ".unbound" / "discovery.lock"
 DISCOVERY_DISPATCH_PATH = Path.home() / ".unbound" / "discovery.dispatch.lock"
-DISCOVERY_DISPATCH_TTL_SECONDS = 10
+DISCOVERY_DISPATCH_TTL_SECONDS = 60
 DISCOVERY_INSTALL_DIR = Path.home() / ".local" / "share" / "unbound"
 DISCOVERY_INSTALL_SH = DISCOVERY_INSTALL_DIR / "install.sh"
 DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
@@ -88,19 +89,11 @@ DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
-SELF_UPDATE_URL = "https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/augment/hooks/unbound.py"
-SELF_UPDATE_INTERVAL_SECONDS = 2 * 3600
-SELF_UPDATE_LOCK_TTL_SECONDS = 30
-SELF_UPDATE_CURL_TIMEOUT = 10
-SELF_SCRIPT_PATH = Path.home() / ".augment" / "hooks" / "unbound.py"
-SELF_UPDATE_STATE_PATH = SELF_SCRIPT_PATH.parent / ".self_update_check"
-SELF_UPDATE_LOCK_PATH = SELF_SCRIPT_PATH.parent / ".self_update.lock"
-
 # Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
 # binary must make ZERO network calls other than the backend/gateway APIs:
-# self-update is owned by the MDM package (never in-place), and discovery runs
-# from the locally installed binary instead of a GitHub-fetched install.sh.
-# UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without freezing.
+# discovery runs from the locally installed binary instead of a GitHub-fetched
+# install.sh. UNBOUND_HOOK_FROZEN=1 lets tests exercise these gates without
+# freezing.
 RUNNING_FROZEN = bool(getattr(sys, "frozen", False)) or os.environ.get("UNBOUND_HOOK_FROZEN") == "1"
 FROZEN_DISCOVERY_BIN = "/opt/unbound/current/unbound-discovery/unbound-discovery"
 
@@ -2329,6 +2322,9 @@ def _get_git_origin_org_repo(cwd: str) -> tuple:
     path = _github_remote_path(url)
     if not path:
         return (None, None)
+    # Repo/org names can contain spaces (e.g. Azure DevOps); the URL path
+    # arrives percent-encoded, so decode before splitting into org/repo.
+    path = unquote(path)
     parts = path.split('/')
     if len(parts) < 2:
         return (None, None)
@@ -3240,147 +3236,6 @@ def get_api_key():
         return None
 
 
-_GATEWAY_URL_RE = re.compile(r'^https?://[A-Za-z0-9._\-]+(:\d+)?(/[A-Za-z0-9._/\-]*)?$')
-_BAKED_GATEWAY_RE = re.compile(r'os\.environ\.get\(\s*"UNBOUND_GATEWAY_URL"\s*,\s*"([^"]*)"')
-
-
-def _is_valid_gateway_url(url: str) -> bool:
-    if not url or any(c in url for c in '"\\\n\r\x00'):
-        return False
-    return bool(_GATEWAY_URL_RE.fullmatch(url))
-
-
-def _baked_gateway_url(text: str) -> str:
-    # read baked url, not env
-    match = _BAKED_GATEWAY_RE.search(text)
-    return match.group(1) if match else ""
-
-
-def _rebake_gateway_url(text: str, gateway_url: str) -> str:
-    # rewrite only the env-var default, nothing else
-    return _BAKED_GATEWAY_RE.sub(
-        lambda m: m.group(0).replace(f'"{m.group(1)}"', f'"{gateway_url}"'),
-        text,
-        count=1,
-    )
-
-
-def _self_update_due() -> bool:
-    try:
-        return (time.time() - SELF_UPDATE_STATE_PATH.stat().st_mtime) >= SELF_UPDATE_INTERVAL_SECONDS
-    except OSError:
-        return True
-
-
-def _acquire_self_update_lock() -> bool:
-    try:
-        if SELF_UPDATE_LOCK_PATH.exists():
-            if (time.time() - SELF_UPDATE_LOCK_PATH.stat().st_mtime) < SELF_UPDATE_LOCK_TTL_SECONDS:
-                return False
-            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
-        fd = os.open(str(SELF_UPDATE_LOCK_PATH), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        os.close(fd)
-        return True
-    except (FileExistsError, OSError):
-        return False
-
-
-def _download_latest_hook():
-    try:
-        result = subprocess.run(
-            ["curl", "-fsSL", "--max-time", str(SELF_UPDATE_CURL_TIMEOUT), SELF_UPDATE_URL],
-            capture_output=True, timeout=SELF_UPDATE_CURL_TIMEOUT + 5,
-        )
-        if result.returncode != 0 or not result.stdout:
-            return None
-        return result.stdout
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-
-def _replace_self(new_bytes: bytes) -> None:
-    try:
-        mode = SELF_SCRIPT_PATH.stat().st_mode
-    except OSError:
-        mode = 0o755
-    fd, tmp_path = tempfile.mkstemp(dir=str(SELF_SCRIPT_PATH.parent), suffix=".tmp")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(new_bytes)
-        os.replace(tmp_path, SELF_SCRIPT_PATH)
-        os.chmod(SELF_SCRIPT_PATH, mode | 0o111)
-    except OSError as e:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        log_error(f"self_update replace failed: {e}", 'self_update')
-
-
-def _check_self_update() -> None:
-    if RUNNING_FROZEN:
-        # Binary deployments are updated by the MDM package, never in place.
-        return
-    # Under MDM the hook runs from an admin-managed location we can't write to,
-    # so SELF_SCRIPT_PATH (user-level) is not the file executing — updating it
-    # would only write a dead copy the managed settings never run. The daily MDM
-    # cron refreshes the managed script instead. Only self-update when we are
-    # actually running the user-level script (subscription installs).
-    try:
-        running = os.path.normcase(str(Path(__file__).resolve()))
-        target = os.path.normcase(str(SELF_SCRIPT_PATH.resolve()))
-    except Exception as e:
-        log_error(f"self_update skipped: could not resolve script path: {e}", 'self_update')
-        return
-    if running != target:
-        # Running from a managed/enterprise location (MDM) — the daily cron owns
-        # updates there; skipping is expected, not an error.
-        return
-    # refresh hook from main, throttled per interval
-    try:
-        if not _self_update_due():
-            return
-        try:
-            SELF_SCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            return
-        if not _acquire_self_update_lock():
-            return
-        try:
-            SELF_UPDATE_STATE_PATH.touch()
-            try:
-                local_bytes = SELF_SCRIPT_PATH.read_bytes()
-                gateway_url = _baked_gateway_url(local_bytes.decode("utf-8", errors="replace"))
-            except OSError:
-                # self file gone — heal by re-pulling; recover tenant url
-                # from the running instance, no local file to read it from
-                local_bytes = None
-                gateway_url = UNBOUND_GATEWAY_URL
-            if not _is_valid_gateway_url(gateway_url):
-                log_error("self_update skipped: invalid gateway url", 'self_update')
-                return
-
-            payload = _download_latest_hook()
-            if not payload:
-                return
-            remote_text = payload.decode("utf-8", errors="replace")
-            if "UNBOUND_GATEWAY_URL" not in remote_text:
-                log_error("self_update skipped: bad download", 'self_update')
-                return
-
-            new_text = _rebake_gateway_url(remote_text, gateway_url)
-            if _baked_gateway_url(new_text) != gateway_url:
-                log_error("self_update skipped: gateway url not preserved", 'self_update')
-                return
-            new_bytes = new_text.encode("utf-8")
-            if local_bytes is None or hashlib.sha256(new_bytes).digest() != hashlib.sha256(local_bytes).digest():
-                _replace_self(new_bytes)
-        finally:
-            SELF_UPDATE_LOCK_PATH.unlink(missing_ok=True)
-    except Exception as e:
-        log_error(f"self_update error: {e}", 'self_update')
-
-
 def _is_windows() -> bool:
     return os.name == "nt"
 
@@ -3479,8 +3334,91 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
         return
 
 
+def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]:
+    """None if the dir can hold discovery state, else why not. Clears a stale marker."""
+    try:
+        posix = hasattr(os, "getuid")
+        if private:
+            # Windows st_mode is synthetic (0o777, never sticky), so the POSIX
+            # world-writable check there would reject every candidate.
+            if posix:
+                try:
+                    pst = os.lstat(str(path.parent))
+                    if (pst.st_mode & 0o002) and not (pst.st_mode & 0o1000):
+                        return "fallback parent world-writable and not sticky"
+                except OSError:
+                    pass
+            try:
+                st = os.lstat(str(path))
+                if path.is_symlink() or not stat.S_ISDIR(st.st_mode):
+                    return "fallback dir is a symlink or not a dir"
+                if posix and st.st_uid != os.getuid():
+                    return "fallback dir foreign-owned"
+            except FileNotFoundError:
+                pass
+        if private and posix:
+            # Create with the mode so a symlink planted after the lstat cannot be
+            # chmod-ed through; a pre-existing dir was validated above.
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.mkdir(str(path), 0o700)
+            except FileExistsError:
+                pass
+            if os.lstat(str(path)).st_mode & 0o077:
+                return "fallback dir not private"
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        if not os.access(str(path), os.W_OK | os.X_OK):
+            return "dir not writable"
+        # os.access cannot see a Windows ACL denial; an actual write can.
+        fd, probe = tempfile.mkstemp(prefix=".probe.", dir=str(path))
+        os.close(fd)
+        os.unlink(probe)
+        cache_file = path / DISCOVERY_CACHE_PATH.name
+        if cache_file.exists() and not os.access(str(cache_file), os.R_OK):
+            return "cache file unreadable"
+        # Non-destructive: a poisoned marker denies the open, a live peer's does not.
+        marker = path / DISCOVERY_DISPATCH_PATH.name
+        if marker.exists():
+            os.close(os.open(str(marker), os.O_WRONLY))
+        return None
+    except OSError as e:
+        return "%s errno=%s" % (type(e).__name__, e.errno)
+
+
+def _relocate_state_dir(reason: str) -> bool:
+    """Repoint cache/lock/marker at the temp fallback. True if it moved."""
+    global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
+    current = DISCOVERY_DISPATCH_PATH.parent
+    if _is_windows():
+        fallback = Path(tempfile.gettempdir()) / "unbound"
+    else:
+        fallback = Path("/var/tmp/unbound-%d" % os.getuid())
+    fallback_reason = ("same as current" if fallback == current
+                       else _state_dir_reject_reason(fallback, private=True))
+    # Paths carry the OS username; log the candidate, not the path (see #281).
+    if fallback_reason is not None:
+        log_error("discovery gate: no usable state dir (home: %s / fallback: %s)"
+                  % (reason, fallback_reason), 'discovery_gate')
+        return False
+    log_error("discovery gate: home state dir unusable (%s); using fallback" % reason,
+              'discovery_gate')
+    DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
+    DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
+    DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
+    return True
+
+
+def _resolve_state_dir() -> None:
+    """Relocate before dispatching if the current state dir is unusable."""
+    reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
+    if reason is not None:
+        _relocate_state_dir(reason)
+
+
 def _dispatch_discovery() -> None:
     try:
+        _resolve_state_dir()
         cache: Dict = {}
         if DISCOVERY_CACHE_PATH.exists():
             try:
@@ -3596,11 +3534,18 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            tmp = DISCOVERY_CACHE_PATH.with_suffix(".tmp")
             DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2, sort_keys=True)
-            os.replace(tmp, DISCOVERY_CACHE_PATH)
+            fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
+                                       dir=str(DISCOVERY_CACHE_PATH.parent))
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, indent=2, sort_keys=True)
+                os.replace(tmp, DISCOVERY_CACHE_PATH)
+            finally:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
@@ -3657,7 +3602,6 @@ def main():
         # debounced discovery scan dispatch.
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
-            _check_self_update()
             _dispatch_discovery()
             print(json.dumps(_repo_gate_session_start_output(event)), flush=True)
             return

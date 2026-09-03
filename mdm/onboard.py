@@ -9,9 +9,10 @@ Unbound MDM onboarding — runs all six steps in one shot:
   5. Augment MDM setup
   6. Coding-discovery scan
 
-Steps 1-5 use --api-key (admin MDM key). Step 6 uses --discovery-key (a
-separate discovery-specific key). The two are different credentials and the
-backend distinguishes them; passing one in place of the other will be rejected.
+Every step uses --api-key (the admin MDM key). The discovery scan authenticates
+as the device's owner, whose key is resolved from the hardware serial, so no
+separate discovery key is needed. --discovery-key is still accepted so existing
+MDM policies keep working, but it is ignored.
 
 Backfill must be explicitly enabled via --backfill flag (typically passed from
 PowerShell's -Backfill parameter). When enabled, it seeds Claude Code and Codex
@@ -23,8 +24,7 @@ Copilot, and Augment have no historical transcript store to backfill.
 Usage:
 
   sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" \
-      --api-key YOUR_ADMIN_API_KEY \
-      --discovery-key YOUR_DISCOVERY_KEY
+      --api-key YOUR_ADMIN_API_KEY
 
 Optional overrides for tenant deployments (passed to MDM tools and reused as
 the discovery --domain):
@@ -45,12 +45,16 @@ Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
 """
 
+import json
 import os
 import platform
+import random
 import signal
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
 
 # On Windows, when this script runs as a child of the MDM onboard wrapper its
 # stdout is a non-console pipe defaulting to the legacy code page (cp1252),
@@ -100,11 +104,13 @@ DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
 
+# Spread a fleet-wide Jamf push across a window, like the per-tool MDM scripts.
+MDM_RETRY_JITTER_SECONDS = 5
+
 USAGE = (
     "Usage:\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" \\\n"
     "      --api-key YOUR_ADMIN_API_KEY \\\n"
-    "      --discovery-key YOUR_DISCOVERY_KEY \\\n"
     "      [--backend-url <url>] [--gateway-url <url>] [--skip-managed-settings]\n"
     "\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" --clear\n"
@@ -242,10 +248,154 @@ def _terminate_discovery_tree(proc, grace: int = DISCOVERY_KILL_GRACE_SECONDS) -
         print(f"[Discovery] [{host}] discovery not reaped within 10s of SIGKILL.", file=sys.stderr)
 
 
-def run_discovery(discovery_key: str, backend_url: str) -> bool:
+def get_device_identifier():
+    """Hardware serial, resolved exactly as the per-tool MDM scripts resolve it
+    (claude-code/hooks/mdm/setup.py). Steps 1-5 enroll the device under this
+    value, so step 6 must use the same one or the backend resolves two owners
+    for one machine. Each probe gets its own try so a missing tool falls through
+    to the next instead of aborting the chain."""
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+            # "Serial Number" label is localized and fails on non-English macOS.
+            result = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split("\n"):
+                    if "IOPlatformSerialNumber" in line:
+                        parts = line.split("=")
+                        if len(parts) >= 2:
+                            serial = parts[1].strip().strip('"').strip()
+                            if serial:
+                                return serial
+            return None
+
+        if system == "linux":
+            try:
+                result = subprocess.run(
+                    ["dmidecode", "-s", "system-serial-number"],
+                    capture_output=True, text=True, timeout=10,
+                    stderr=subprocess.DEVNULL,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                pass
+            for machine_id_path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+                try:
+                    with open(machine_id_path, "r", encoding="utf-8") as f:
+                        machine_id = f.read().strip()
+                    if machine_id:
+                        return machine_id
+                except Exception:
+                    continue
+            try:
+                result = subprocess.run(["hostname"], capture_output=True, text=True, timeout=10)
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                pass
+            return None
+
+        if system == "windows":
+            try:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                pass
+            try:
+                import winreg
+                with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                    r"SOFTWARE\Microsoft\Cryptography") as key:
+                    value, _ = winreg.QueryValueEx(key, "MachineGuid")
+                    if value:
+                        return str(value).strip()
+            except Exception:
+                pass
+            try:
+                import socket
+                return socket.gethostname()
+            except Exception:
+                return None
+    except Exception as e:
+        print(f"[Discovery] device identifier probe failed: {e}", file=sys.stderr)
+        return None
+    return None
+
+
+def fetch_device_owner_key(admin_api_key: str, backend_url: str):
+    """Resolves the API key of the user this device belongs to, from its hardware
+    serial. This is what replaces the org discovery key: the scan authenticates as
+    the owner, so the device is attributed to them. Returns None on any failure."""
+    serial = get_device_identifier()
+    if not serial:
+        print(
+            "❌ [Discovery] could not read this device's hardware serial number, "
+            "so its owner cannot be resolved.",
+            file=sys.stderr,
+        )
+        return None
+
+    url = (
+        f"{backend_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/"
+        f"?serial_number={urllib.parse.quote(serial)}&app_type=default"
+    )
+    # -q first: this runs as root, so it must not inherit TLS-weakening defaults
+    # from an ambient curlrc.
+    # Retries and jitter match the per-tool MDM scripts: a fleet-wide enrollment
+    # hits this endpoint from every device at once, and it mints a key.
+    time.sleep(random.uniform(0, MDM_RETRY_JITTER_SECONDS))
+    # The admin key goes in via stdin (`-H @-`), never argv: this runs on a
+    # multi-user host where /proc/<pid>/cmdline and `ps` are world-readable for
+    # the whole retry window, and this key can mint a key for any serial.
+    cmd = ["curl", "-q", "-sSL", "-w", "\n%{http_code}", "--max-time", "30",
+           "--retry", "7", "--retry-max-time", "180", "--retry-connrefused",
+           "-H", "@-", "--", url]
+    try:
+        result = subprocess.run(cmd, input=f"Authorization: Bearer {admin_api_key}\n",
+                                capture_output=True, text=True, timeout=300)
+    except Exception as e:
+        print(f"❌ [Discovery] device-owner key lookup failed: {e}", file=sys.stderr)
+        return None
+    lines = result.stdout.strip().split("\n")
+    if result.returncode != 0 or len(lines) < 2:
+        stderr = result.stderr.strip()
+        print(
+            f"❌ [Discovery] device-owner key lookup failed: curl exited "
+            f"{result.returncode}: {stderr or 'no stderr'}",
+            file=sys.stderr,
+        )
+        return None
+    http_code, body = lines[-1], "\n".join(lines[:-1])
+    if http_code != "200":
+        # Status only: MDM policy logs retain this, and the body is a
+        # key-minting endpoint's response.
+        print(f"❌ [Discovery] device-owner key lookup failed with status {http_code}.",
+              file=sys.stderr)
+        return None
+    try:
+        owner_key = json.loads(body).get("api_key")
+    except Exception:
+        print("❌ [Discovery] device-owner key lookup returned invalid JSON.", file=sys.stderr)
+        return None
+    if not owner_key:
+        print("❌ [Discovery] the backend did not return a key for this device.", file=sys.stderr)
+        return None
+    return owner_key
+
+
+def run_discovery(scan_key: str, backend_url: str) -> bool:
     """Downloads and runs the coding-discovery installer. Mac/Linux use
-    install.sh via bash; Windows uses install.ps1 via PowerShell. Both accept
-    the discovery key + backend URL (called --domain by the discovery tool)."""
+    install.sh via bash; Windows uses install.ps1 via PowerShell. Both read the
+    scan key from UNBOUND_API_KEY and take the backend URL as --domain."""
     is_windows = platform.system().lower() == "windows"
     url = DISCOVERY_INSTALL_PS1 if is_windows else DISCOVERY_INSTALL_SH
     try:
@@ -262,12 +412,15 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
         if is_windows:
             cmd = [
                 "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp_path,
-                "-ApiKey", discovery_key,
                 "-Domain", backend_url,
             ]
         else:
             os.chmod(tmp_path, 0o755)
-            cmd = ["bash", tmp_path, "--api-key", discovery_key, "--domain", backend_url]
+            cmd = ["bash", tmp_path, "--domain", backend_url]
+        # Key via env, never argv — the scan runs for hours and argv is visible
+        # to every local user via ps. Both installers read UNBOUND_API_KEY.
+        # Same contract as the binary path's _run_discovery.
+        scan_env = {**os.environ, "UNBOUND_API_KEY": scan_key}
         # NOTE: we deliberately do NOT pass --timeout. install.sh is fetched from
         # coding-discovery-tool/main, and an older discovery there would reject an
         # unknown --timeout flag (argparse exits non-zero) and fail every
@@ -283,7 +436,7 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
         # lock), not just the direct child. Orphaning a stuck discovery would
         # leave its lock held by a live PID, which nothing else can recover.
         popen_kwargs = {"start_new_session": True} if not is_windows else {}
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = subprocess.Popen(cmd, env=scan_env, **popen_kwargs)
         try:
             return proc.wait(timeout=backstop) == 0
         except subprocess.TimeoutExpired:
@@ -303,16 +456,17 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
 
 
 def parse_args(argv: list) -> tuple:
-    """Splits argv into (discovery_key, mdm_args, backend_url, is_clear,
+    """Splits argv into (api_key, discovery_key, mdm_args, backend_url, is_clear,
     skip_managed_settings).
 
     --discovery-key is consumed here and NOT forwarded to the per-tool MDM
     scripts (they don't recognize it; would error). --skip-managed-settings is
     consumed too and re-added per tool, since only Claude Code acts on it.
-    Everything else passes through. We also peek at --backend-url to default
-    discovery's --domain.
+    Everything else passes through. We also peek at --api-key (to resolve the
+    device owner) and --backend-url (to default discovery's --domain).
     """
-    discovery_key = None
+    api_key = None
+    discovery_key = None   # deprecated; "" when the flag came with no value
     backend_url = None
     is_clear = False
     skip_managed_settings = False
@@ -320,8 +474,21 @@ def parse_args(argv: list) -> tuple:
     i = 0
     while i < len(argv):
         token = argv[i]
-        if token == "--discovery-key" and i + 1 < len(argv):
-            discovery_key = argv[i + 1]
+        if token == "--discovery-key":
+            # Consumed with or without a value, so a valueless flag neither
+            # reaches the per-tool MDM scripts (they reject unknown arguments)
+            # nor swallows the flag that follows it.
+            if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                discovery_key = argv[i + 1]
+                i += 2
+            else:
+                discovery_key = ""
+                i += 1
+            continue
+        if token == "--api-key" and i + 1 < len(argv):
+            api_key = argv[i + 1]
+            mdm_args.append(token)
+            mdm_args.append(argv[i + 1])
             i += 2
             continue
         if token == "--backend-url" and i + 1 < len(argv):
@@ -338,7 +505,7 @@ def parse_args(argv: list) -> tuple:
             is_clear = True
         mdm_args.append(token)
         i += 1
-    return discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings
+    return api_key, discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings
 
 
 def main() -> int:
@@ -348,19 +515,23 @@ def main() -> int:
         print(USAGE, file=sys.stderr)
         return 1
 
-    discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings = parse_args(args)
+    api_key, discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings = parse_args(args)
 
     # Validate flags. --clear short-circuits the key checks: nothing to
     # authenticate, just remove the configuration.
     if not is_clear:
-        if "--api-key" not in mdm_args:
+        if not api_key:
             print("Error: --api-key is required (the MDM admin key).\n", file=sys.stderr)
             print(USAGE, file=sys.stderr)
             return 1
-        if not discovery_key:
-            print("Error: --discovery-key is required (separate from --api-key).\n", file=sys.stderr)
-            print(USAGE, file=sys.stderr)
-            return 1
+
+    # Accepted and ignored so MDM policies that still pass it keep working.
+    if discovery_key is not None:
+        print(
+            "Warning: --discovery-key is deprecated and ignored — the scan uses the "
+            "device owner's key, resolved from the hardware serial.",
+            file=sys.stderr,
+        )
 
     if not check_admin_privileges():
         if platform.system().lower() == "windows":
@@ -386,9 +557,16 @@ def main() -> int:
             failures.append(name)
 
     # Discovery is a one-shot scan — skip it on --clear (nothing to remove).
+    discovery_skipped = False
     if not is_clear:
         print(f"\n{'=' * 60}\n[Discovery] coding-tool scan\n{'=' * 60}\n")
-        if not run_discovery(discovery_key, backend_url or DEFAULT_BACKEND_URL):
+        discovery_backend = backend_url or DEFAULT_BACKEND_URL
+        scan_key = fetch_device_owner_key(api_key, discovery_backend)
+        if not scan_key:
+            # No owner, no scan — but the tool installs above are done and
+            # sound. Skipped, not failed, matching `unbound-hook setup`.
+            discovery_skipped = True
+        elif not run_discovery(scan_key, discovery_backend):
             failures.append("Discovery")
 
     print(f"\n{'=' * 60}")
@@ -396,7 +574,9 @@ def main() -> int:
         print(f"❌ MDM onboarding finished with {len(failures)} failure(s): {', '.join(failures)}")
         print("Re-run the failed step's individual command to retry.")
         return 1
-    steps = [name for name, *_ in TOOLS] + ([] if is_clear else ["Discovery"])
+    steps = [name for name, *_ in TOOLS]
+    if not is_clear:
+        steps.append("Discovery (skipped)" if discovery_skipped else "Discovery")
     print(f"✅ MDM onboarding complete: {', '.join(steps)}")
     return 0
 

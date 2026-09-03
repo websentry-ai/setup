@@ -1284,7 +1284,7 @@ def clear_setup() -> bool:
 
 def detect_install_state() -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
-    Existence-based: the self-update rewrites these files, so content checks
+    Existence-based: these files change across versions, so content checks
     are unreliable — only file existence is trustworthy.
     'fresh' (config absent), 'persisted' (config + unbound.py both present),
     'tampered' (config present but hook script missing), or None on any error."""

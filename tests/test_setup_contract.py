@@ -30,6 +30,14 @@ def _has(relpath, name):
 
 CLEARABLE = [s for s in SETUPS if _has(s, "clear_setup")]
 
+# Every tool's hook script, keyed by the path a reader would name it by.
+HOOKS = sorted(
+    str(p.relative_to(REPO))
+    for p in REPO.glob("*/**/unbound.py")
+    if "node_modules" not in p.parts and "binary" not in p.parts
+    and "tests" not in p.parts and "packaging" not in p.parts
+)
+
 
 def test_the_inventory_is_not_empty():
     """A glob that silently matched nothing would make this whole file vacuous."""
@@ -216,6 +224,19 @@ class TestCollectorShapeMatchesEveryUnpacker:
         assert targets, f"{path}: no `<tuple> = result` unpack found — did it get renamed?"
         for t in targets:
             assert len(t.elts) == 3, f"{path}: unpacks {len(t.elts)}, collectors return 3"
+
+
+def test_every_hook_is_in_the_inventory():
+    """A glob that silently matched nothing would make the check below vacuous."""
+    assert len(HOOKS) == 5, HOOKS
+
+
+@pytest.mark.parametrize("relpath", HOOKS)
+def test_no_hook_fetches_its_own_source(relpath):
+    # A hook is replaced by re-running its installer, never by rewriting itself:
+    # naming this repo's raw URL is how an in-script updater comes back.
+    assert "raw.githubusercontent.com/websentry-ai/setup" not in (
+        REPO / relpath).read_text(encoding="utf-8")
 
 
 # Installers that ship an unbound.py, and so can report which version is deployed.

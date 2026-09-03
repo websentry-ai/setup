@@ -416,8 +416,9 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         return False, False
 
 
-def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
-    params = f"serial_number={device_id}&app_type=claude-code"
+def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str,
+                           app_type: str = "claude-code") -> Optional[str]:
+    params = f"serial_number={device_id}&app_type={app_type}"
     if app_name:
         params = f"app_name={app_name}&{params}"
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
@@ -2161,7 +2162,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
 
 def detect_install_state(skip_settings: bool = False) -> Optional[str]:
     """Inspect the managed-settings target BEFORE it gets overwritten.
-    Existence-based: the self-update rewrites these files, so content checks
+    Existence-based: these files change across versions, so content checks
     are unreliable — only file existence is trustworthy.
     'fresh' (config absent), 'persisted' (config + unbound.py both present),
     'tampered' (config present but hook script missing), or None on any error.

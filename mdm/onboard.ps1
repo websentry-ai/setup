@@ -26,7 +26,8 @@
     The MDM admin API key (required unless -Clear is specified)
 
 .PARAMETER DiscoveryKey
-    The discovery-specific API key, separate from ApiKey (required unless -Clear is specified)
+    Deprecated and ignored. The discovery scan authenticates as the device's owner,
+    resolved from the hardware serial. Still accepted so existing MDM policies keep working.
 
 .PARAMETER BackendUrl
     Backend URL override for tenant deployments (default: https://backend.getunbound.ai)
@@ -49,16 +50,16 @@
     Remove MDM configuration for all four tools (no discovery scan, no backfill)
 
 .EXAMPLE
-    # Standard onboarding with both keys
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+    # Standard onboarding
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY
 
 .EXAMPLE
     # With backfill of historical transcripts (opt-in)
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -Backfill
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -Backfill
 
 .EXAMPLE
     # Tenant deployment with custom URLs
-    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -DiscoveryKey YOUR_DISCOVERY_KEY -BackendUrl "https://backend.example.com" -GatewayUrl "https://api.example.com"
+    Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_KEY -BackendUrl "https://backend.example.com" -GatewayUrl "https://api.example.com"
 
 .EXAMPLE
     # Clear MDM setup
@@ -141,12 +142,12 @@ function Main {
     # Validate parameters (unless -Clear is specified)
     if (-not $Clear) {
         if ([string]::IsNullOrWhiteSpace($ApiKey)) {
-            Exit-WithError "-ApiKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
+            Exit-WithError "-ApiKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY"
         }
+    }
 
-        if ([string]::IsNullOrWhiteSpace($DiscoveryKey)) {
-            Exit-WithError "-DiscoveryKey is required. Usage: & ([scriptblock]::Create((iwr 'https://getunbound.ai/setup/mdm/onboard.ps1' -UseBasicParsing).Content)) -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY"
-        }
+    if (-not [string]::IsNullOrWhiteSpace($DiscoveryKey)) {
+        Write-Warning "-DiscoveryKey is deprecated and ignored - the scan uses the device owner's key, resolved from the hardware serial."
     }
 
     # Find Python
@@ -174,8 +175,6 @@ function Main {
         } else {
             $pythonArgs += "--api-key"
             $pythonArgs += $ApiKey
-            $pythonArgs += "--discovery-key"
-            $pythonArgs += $DiscoveryKey
         }
 
         # URL overrides apply to both normal and clear modes

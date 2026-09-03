@@ -6,7 +6,7 @@ transcript backfill, and deregistration. Spike results: `SPIKE.md`.
 
 ```
 unbound-hook hook <tool> [<event>]     # claude-code | cursor | copilot | codex
-unbound-hook setup --api-key <admin_key> [--discovery-key <key>]
+unbound-hook setup --api-key <admin_key>
                    [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]
                    [--app_name <name>] [--backfill] [--tools t1,t2]
                    [--skip-managed-settings]   # claude-code only
@@ -36,8 +36,6 @@ exit 0) — this process sits between the user and their editor.
 
 When `sys.frozen` (or `UNBOUND_HOOK_FROZEN=1` for tests):
 
-- `_check_self_update` no-ops — the MDM pkg owns binary updates; no
-  raw.githubusercontent fetch ever
 - `_dispatch_discovery` / `_dispatch_mcp_server_scan` run
   `/opt/unbound/current/unbound-discovery/unbound-discovery` directly
   (`--domain` / `mcp-scan --name --domain`, same env contract as the
