@@ -7,6 +7,7 @@ import shutil
 import sys
 import platform
 import subprocess
+import hashlib
 import json
 import tempfile
 import time
@@ -743,7 +744,10 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
     _repair_user_ownership(username, [config_dir, config_file])
 
     def _write():
-        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         if platform.system().lower() != "windows":
             try:
                 os.chmod(config_dir, 0o700)
@@ -1299,7 +1303,17 @@ def detect_install_state() -> Optional[str]:
         return None
 
 
-def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None):
+def hook_script_hash(script_path) -> Optional[str]:
+    """sha256 of the hook script this run installed, so the backend can tell which
+    hook version a device is running. None when absent or unreadable."""
+    try:
+        return hashlib.sha256(Path(script_path).read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
+                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None):
     """Notify backend that tool setup completed. Never fails the setup."""
     try:
         url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
@@ -1308,6 +1322,10 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
             body["install_state"] = install_state
         if serial_number is not None:
             body["serial_number"] = serial_number
+        if hook_hash is not None:
+            body["hook_hash"] = hook_hash
+        if install_mode is not None:
+            body["install_mode"] = install_mode
         data = json.dumps(body)
         # X-API-KEY off-argv via 0600 temp header file; body off-argv via stdin.
         curl_with_auth(
@@ -1407,6 +1425,11 @@ def main():
         return False
     debug_print("UNBOUND_AUGMENT_API_KEY set successfully")
 
+    url_ok, _ = set_env_var_system_wide("UNBOUND_BACKEND_URL", base_url)
+    if not url_ok:
+        print("Failed to set UNBOUND_BACKEND_URL")
+        return False
+
     # Write the per-user unbound config now (needed by the managed hook; harmless
     # before the managed write). User-level hook REMOVAL is deferred until the
     # managed hooks are confirmed in place — see below.
@@ -1438,7 +1461,8 @@ def main():
     print("Setup Complete!")
     print("=" * 60)
 
-    notify_setup_complete(api_key, "augment_code", backend_url=base_url, install_state=state, serial_number=device_id)
+    notify_setup_complete(api_key, "augment_code", backend_url=base_url, install_state=state, serial_number=device_id,
+                          hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"), install_mode="mdm")
 
     return True
 

@@ -26,6 +26,7 @@ SKILL_SYNC_TOOLS = {
     "copilot": "UNBOUND_COPILOT_API_KEY",
     "codex": "UNBOUND_CODEX_API_KEY",
 }
+API_KEY_ENV = {**SKILL_SYNC_TOOLS, "augment": "UNBOUND_AUGMENT_API_KEY"}
 
 
 @pytest.fixture
@@ -34,6 +35,8 @@ def frozen_module(tmp_path, monkeypatch, request):
     filesystem touchpoints sandboxed and subprocess.Popen recorded."""
     tool = request.param
     monkeypatch.setenv("UNBOUND_HOOK_FROZEN", "1")
+    monkeypatch.delenv(API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
     spec = importlib.util.spec_from_file_location(
         f"frozen_contract_{tool.replace('-', '_')}", str(TOOL_PY[tool]))
     m = importlib.util.module_from_spec(spec)

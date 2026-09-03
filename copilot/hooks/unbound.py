@@ -4398,6 +4398,25 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _machine_env(name: str) -> Optional[str]:
+    """Windows: read HKLM directly, since os.getenv() would let a per-user setx shadow it."""
+    if not _is_windows():
+        return os.environ.get(name)
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return value
+    except OSError:
+        return None
+
+
 def _discovery_installer():
     if _is_windows():
         return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
@@ -4512,8 +4531,8 @@ def _state_dir_reject_reason(path: Path, private: bool = False) -> Optional[str]
         return "%s errno=%s" % (type(e).__name__, e.errno)
 
 
-def _relocate_state_dir(reason: str) -> bool:
-    """Repoint cache/lock/marker at the temp fallback. True if it moved."""
+def _relocate_state_dir(reason: str) -> Optional[str]:
+    """Repoints cache/lock/marker at the fallback; returns the log message to defer."""
     global DISCOVERY_CACHE_PATH, DISCOVERY_LOCK_PATH, DISCOVERY_DISPATCH_PATH
     current = DISCOVERY_DISPATCH_PATH.parent
     if _is_windows():
@@ -4526,25 +4545,24 @@ def _relocate_state_dir(reason: str) -> bool:
     if fallback_reason is not None:
         log_error("discovery gate: no usable state dir (home: %s / fallback: %s)"
                   % (reason, fallback_reason), 'discovery_gate')
-        return False
-    log_error("discovery gate: home state dir unusable (%s); using fallback" % reason,
-              'discovery_gate')
+        return None
     DISCOVERY_CACHE_PATH = fallback / DISCOVERY_CACHE_PATH.name
     DISCOVERY_LOCK_PATH = fallback / DISCOVERY_LOCK_PATH.name
     DISCOVERY_DISPATCH_PATH = fallback / DISCOVERY_DISPATCH_PATH.name
-    return True
+    return "discovery gate: home state dir unusable (%s); using fallback" % reason
 
 
-def _resolve_state_dir() -> None:
-    """Relocate before dispatching if the current state dir is unusable."""
+def _resolve_state_dir() -> Optional[str]:
+    """Relocates if the state dir is unusable; returns the relocation message, if any."""
     reason = _state_dir_reject_reason(DISCOVERY_DISPATCH_PATH.parent)
     if reason is not None:
-        _relocate_state_dir(reason)
+        return _relocate_state_dir(reason)
+    return None
 
 
 def _dispatch_discovery() -> None:
     try:
-        _resolve_state_dir()
+        relocation_message = _resolve_state_dir()
         cache = {}
         if DISCOVERY_CACHE_PATH.exists():
             try:
@@ -4563,6 +4581,9 @@ def _dispatch_discovery() -> None:
                     return
             except ValueError:
                 pass
+
+        if relocation_message:
+            log_error(relocation_message, 'discovery_gate')
 
         if DISCOVERY_LOCK_PATH.exists():
             try:
@@ -4595,19 +4616,29 @@ def _dispatch_discovery() -> None:
                 return
 
         try:
+            unbound_config = {}
             try:
                 with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
                     unbound_config = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
-                log_error(f"discovery gate: could not read {UNBOUND_CONFIG_PATH}: {e}", 'discovery_gate')
-                return
+                log_error("discovery gate: config unreadable, trying env: %s errno=%s"
+                          % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
+            if not isinstance(unbound_config, dict):
+                unbound_config = {}
             api_key = unbound_config.get("api_key")
             backend_url = unbound_config.get("base_url")
+            if not (api_key and backend_url):
+                # Resolve as a unit -- never pair a config field with an env field.
+                api_key = _machine_env('UNBOUND_COPILOT_API_KEY')
+                backend_url = _machine_env('UNBOUND_BACKEND_URL')
+                if backend_url and not backend_url.startswith("https://"):
+                    log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')
+                    backend_url = None
             if not api_key:
-                log_error("discovery gate: api_key missing in ~/.unbound/config.json", 'discovery_gate')
+                log_error("discovery gate: no api_key in env or config", 'discovery_gate')
                 return
             if not backend_url:
-                log_error("discovery gate: base_url missing in ~/.unbound/config.json", 'discovery_gate')
+                log_error("discovery gate: no base_url in config or env", 'discovery_gate')
                 return
 
             if RUNNING_FROZEN:
@@ -4641,18 +4672,22 @@ def _dispatch_discovery() -> None:
             # Stamp last_run_at only after Popen succeeds so a launch failure
             # (missing bash, EPERM, ENOMEM, etc.) doesn't burn the 24h window.
             cache["last_run_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-            fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
-                                       dir=str(DISCOVERY_CACHE_PATH.parent))
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(cache, f, indent=2, sort_keys=True)
-                os.replace(tmp, DISCOVERY_CACHE_PATH)
-            finally:
+                DISCOVERY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+                fd, tmp = tempfile.mkstemp(prefix=".discovery-cache.", suffix=".tmp",
+                                           dir=str(DISCOVERY_CACHE_PATH.parent))
                 try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(cache, f, indent=2, sort_keys=True)
+                    os.replace(tmp, DISCOVERY_CACHE_PATH)
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+            except OSError as e:
+                log_error("discovery gate: cache stamp failed: %s errno=%s"
+                          % (type(e).__name__, e.errno), 'discovery_gate')
         finally:
             try:
                 DISCOVERY_DISPATCH_PATH.unlink(missing_ok=True)
@@ -4666,10 +4701,23 @@ def _dispatch_mcp_server_scan(server_name, server_config):
     if not server_name or not isinstance(server_config, dict):
         return
     try:
-        with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
-            unbound_config = json.load(f)
+        unbound_config = {}
+        try:
+            with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
+                unbound_config = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            log_error("mcp scan dispatch: config unreadable, trying env: %s errno=%s"
+                      % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
+        if not isinstance(unbound_config, dict):
+            unbound_config = {}
         api_key = unbound_config.get("api_key")
         backend_url = unbound_config.get("base_url")
+        if not (api_key and backend_url):
+            api_key = _machine_env('UNBOUND_COPILOT_API_KEY')
+            backend_url = _machine_env('UNBOUND_BACKEND_URL')
+            if backend_url and not backend_url.startswith("https://"):
+                log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
+                backend_url = None
         if not api_key or not backend_url:
             return
 

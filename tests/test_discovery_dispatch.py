@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import os
+import sys
 import time
 from pathlib import Path
 
@@ -19,6 +20,14 @@ HOOKS = {
     "augment": REPO / "augment" / "hooks" / "unbound.py",
 }
 
+TOOL_API_KEY_ENV = {
+    "claude-code": "UNBOUND_CLAUDE_API_KEY",
+    "cursor": "UNBOUND_CURSOR_API_KEY",
+    "copilot": "UNBOUND_COPILOT_API_KEY",
+    "codex": "UNBOUND_CODEX_API_KEY",
+    "augment": "UNBOUND_AUGMENT_API_KEY",
+}
+
 
 @pytest.fixture(params=sorted(HOOKS))
 def windows_hook(request, tmp_path, monkeypatch):
@@ -29,6 +38,9 @@ def windows_hook(request, tmp_path, monkeypatch):
     hook = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(hook)
     assert hook.RUNNING_FROZEN is False
+
+    monkeypatch.delenv(TOOL_API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
 
     state_dir = tmp_path / "state"
     state_dir.mkdir()
@@ -46,6 +58,8 @@ def windows_hook(request, tmp_path, monkeypatch):
     install_ps1.write_text("param()\n", encoding="utf-8")
 
     monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    # no real registry here; HKLM-vs-HKCU is verified separately on Windows
+    monkeypatch.setattr(hook, "_machine_env", lambda name: os.environ.get(name), raising=False)
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(hook, "UNBOUND_CONFIG_PATH", config_path)
     monkeypatch.setattr(hook, "DISCOVERY_CACHE_PATH", state_dir / "cache.json")
@@ -278,3 +292,130 @@ def test_non_windows_discovery_keeps_bash_installer(windows_hook, monkeypatch):
         "--domain",
         "https://backend.example",
     ]
+
+
+def test_unreadable_config_falls_back_to_env(request, windows_hook, monkeypatch):
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    real_open = Path.open
+
+    def deny_config(self, *a, **k):
+        if self == hook.UNBOUND_CONFIG_PATH:
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(Path, "open", deny_config)
+    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "env-key")
+    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://backend.example")
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "env-key"
+
+
+def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, monkeypatch):
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    real_open = Path.open
+
+    def deny_config(self, *a, **k):
+        if self == hook.UNBOUND_CONFIG_PATH:
+            raise PermissionError(13, "Permission denied")
+        return real_open(self, *a, **k)
+
+    monkeypatch.setattr(Path, "open", deny_config)
+    monkeypatch.delenv(TOOL_API_KEY_ENV[tool], raising=False)
+    monkeypatch.delenv("UNBOUND_BACKEND_URL", raising=False)
+
+    hook._dispatch_discovery()
+
+    assert calls == []
+
+
+def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkeypatch):
+    """A stale personal-install env var must not outrank a readable config.json."""
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "stale-personal-install-key")
+    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://stale.example")
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "test-key"
+    assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
+
+
+def test_partial_config_does_not_mix_with_env(request, windows_hook, monkeypatch):
+    """Must not dispatch with file's api_key + env's base_url -- no mixing sources."""
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    hook.UNBOUND_CONFIG_PATH.write_text(
+        json.dumps({"api_key": "file-key"}), encoding="utf-8"
+    )
+    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "env-key")
+    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://env.example")
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "env-key"
+    assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://env.example"
+
+
+class _FakeWinReg:
+    """Stands in for winreg via sys.modules so the HKLM-read path is exercised."""
+
+    HKEY_LOCAL_MACHINE = object()
+
+    class _Key:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    @classmethod
+    def OpenKey(cls, hive, path):
+        return cls._Key()
+
+    @staticmethod
+    def QueryValueEx(key, name):
+        if name == "UNBOUND_TEST_VAR":
+            return ("hklm-value", 1)
+        raise OSError("not found")
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_machine_env_reads_hklm_not_the_merged_process_env(tool, monkeypatch):
+    """_machine_env must read HKLM directly, never the merged process env."""
+    spec = importlib.util.spec_from_file_location(
+        "machine_env_check_%s" % tool.replace("-", "_"), HOOKS[tool]
+    )
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+
+    monkeypatch.setitem(sys.modules, "winreg", _FakeWinReg())
+    monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setenv("UNBOUND_TEST_VAR", "hkcu-shadow-value")
+
+    assert hook._machine_env("UNBOUND_TEST_VAR") == "hklm-value"
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_machine_env_uses_os_environ_on_posix(tool, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "machine_env_posix_%s" % tool.replace("-", "_"), HOOKS[tool]
+    )
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+
+    monkeypatch.setattr(hook, "_is_windows", lambda: False, raising=False)
+    monkeypatch.setenv("UNBOUND_TEST_VAR", "posix-value")
+
+    assert hook._machine_env("UNBOUND_TEST_VAR") == "posix-value"
