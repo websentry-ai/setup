@@ -529,11 +529,10 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         return False, False
 
 
-def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str,
-                           app_type: str = "augment_code") -> Optional[str]:
+def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
     # URL-encode params: device_id (a serial number) and app_name can contain
     # '&', ' ', '=', etc., which would otherwise inject/truncate query params.
-    query = [("serial_number", device_id), ("app_type", app_type)]
+    query = [("serial_number", device_id), ("app_type", "augment_code")]
     if app_name:
         query.insert(0, ("app_name", app_name))
     params = urllib.parse.urlencode(query)

@@ -353,11 +353,15 @@ def fetch_device_owner_key(admin_api_key: str, backend_url: str):
     # Retries and jitter match the per-tool MDM scripts: a fleet-wide enrollment
     # hits this endpoint from every device at once, and it mints a key.
     time.sleep(random.uniform(0, MDM_RETRY_JITTER_SECONDS))
+    # The admin key goes in via stdin (`-H @-`), never argv: this runs on a
+    # multi-user host where /proc/<pid>/cmdline and `ps` are world-readable for
+    # the whole retry window, and this key can mint a key for any serial.
     cmd = ["curl", "-q", "-sSL", "-w", "\n%{http_code}", "--max-time", "30",
            "--retry", "7", "--retry-max-time", "180", "--retry-connrefused",
-           "-H", f"Authorization: Bearer {admin_api_key}", "--", url]
+           "-H", "@-", "--", url]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, input=f"Authorization: Bearer {admin_api_key}\n",
+                                capture_output=True, text=True, timeout=300)
     except Exception as e:
         print(f"❌ [Discovery] device-owner key lookup failed: {e}", file=sys.stderr)
         return None
@@ -372,7 +376,9 @@ def fetch_device_owner_key(admin_api_key: str, backend_url: str):
         return None
     http_code, body = lines[-1], "\n".join(lines[:-1])
     if http_code != "200":
-        print(f"❌ [Discovery] device-owner key lookup failed with status {http_code}: {body}",
+        # Status only: MDM policy logs retain this, and the body is a
+        # key-minting endpoint's response.
+        print(f"❌ [Discovery] device-owner key lookup failed with status {http_code}.",
               file=sys.stderr)
         return None
     try:
@@ -388,8 +394,8 @@ def fetch_device_owner_key(admin_api_key: str, backend_url: str):
 
 def run_discovery(scan_key: str, backend_url: str) -> bool:
     """Downloads and runs the coding-discovery installer. Mac/Linux use
-    install.sh via bash; Windows uses install.ps1 via PowerShell. Both accept
-    the scan key + backend URL (called --domain by the discovery tool)."""
+    install.sh via bash; Windows uses install.ps1 via PowerShell. Both read the
+    scan key from UNBOUND_API_KEY and take the backend URL as --domain."""
     is_windows = platform.system().lower() == "windows"
     url = DISCOVERY_INSTALL_PS1 if is_windows else DISCOVERY_INSTALL_SH
     try:
@@ -406,12 +412,15 @@ def run_discovery(scan_key: str, backend_url: str) -> bool:
         if is_windows:
             cmd = [
                 "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", tmp_path,
-                "-ApiKey", scan_key,
                 "-Domain", backend_url,
             ]
         else:
             os.chmod(tmp_path, 0o755)
-            cmd = ["bash", tmp_path, "--api-key", scan_key, "--domain", backend_url]
+            cmd = ["bash", tmp_path, "--domain", backend_url]
+        # Key via env, never argv — the scan runs for hours and argv is visible
+        # to every local user via ps. Both installers read UNBOUND_API_KEY.
+        # Same contract as the binary path's _run_discovery.
+        scan_env = {**os.environ, "UNBOUND_API_KEY": scan_key}
         # NOTE: we deliberately do NOT pass --timeout. install.sh is fetched from
         # coding-discovery-tool/main, and an older discovery there would reject an
         # unknown --timeout flag (argparse exits non-zero) and fail every
@@ -427,7 +436,7 @@ def run_discovery(scan_key: str, backend_url: str) -> bool:
         # lock), not just the direct child. Orphaning a stuck discovery would
         # leave its lock held by a live PID, which nothing else can recover.
         popen_kwargs = {"start_new_session": True} if not is_windows else {}
-        proc = subprocess.Popen(cmd, **popen_kwargs)
+        proc = subprocess.Popen(cmd, env=scan_env, **popen_kwargs)
         try:
             return proc.wait(timeout=backstop) == 0
         except subprocess.TimeoutExpired:
