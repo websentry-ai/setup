@@ -1252,7 +1252,6 @@ def clear_setup() -> bool:
         failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_AUGMENT_API_KEY")
-            remove_env_var_from_user(username, home_dir, "UNBOUND_BACKEND_URL")
             remove_hook_logs_for_user(username, home_dir)
             if status == "cleared":
                 cleared += 1

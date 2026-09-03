@@ -4686,7 +4686,7 @@ def _dispatch_mcp_server_scan(server_name, server_config):
         if not isinstance(unbound_config, dict):
             unbound_config = {}
         api_key = os.getenv('UNBOUND_COPILOT_API_KEY') or unbound_config.get("api_key")
-        backend_url = unbound_config.get("base_url")
+        backend_url = unbound_config.get("base_url") or os.getenv('UNBOUND_BACKEND_URL')
         if not api_key or not backend_url:
             return
 

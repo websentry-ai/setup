@@ -1848,7 +1848,6 @@ def clear_setup() -> bool:
         hooks_failed = 0
         for username, home_dir in user_homes:
             status = remove_env_var_from_user(username, home_dir, "UNBOUND_COPILOT_API_KEY")
-            remove_env_var_from_user(username, home_dir, "UNBOUND_BACKEND_URL")
             if status == "cleared":
                 env_cleared += 1
             elif status == "not_found":

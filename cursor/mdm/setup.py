@@ -933,7 +933,6 @@ def clear_setup() -> bool:
     system = platform.system().lower()
     if system == "windows":
         status = remove_env_var_on_windows("UNBOUND_CURSOR_API_KEY")
-        remove_env_var_on_windows("UNBOUND_BACKEND_URL")
         if status == "cleared":
             print("Cleared")
         elif status == "not_found":
@@ -952,7 +951,6 @@ def clear_setup() -> bool:
             failed = 0
             for username, home_dir in user_homes:
                 status = remove_env_var_from_user(username, home_dir, "UNBOUND_CURSOR_API_KEY")
-                remove_env_var_from_user(username, home_dir, "UNBOUND_BACKEND_URL")
                 if status == "cleared":
                     cleared += 1
                 elif status == "not_found":

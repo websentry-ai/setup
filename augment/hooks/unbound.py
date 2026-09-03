@@ -3292,7 +3292,7 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
         if not isinstance(unbound_config, dict):
             unbound_config = {}
         api_key = os.getenv('UNBOUND_AUGMENT_API_KEY') or unbound_config.get("api_key")
-        backend_url = unbound_config.get("base_url")
+        backend_url = unbound_config.get("base_url") or os.getenv('UNBOUND_BACKEND_URL')
         if not api_key or not backend_url:
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
