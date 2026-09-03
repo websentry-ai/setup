@@ -6,7 +6,7 @@ transcript backfill, and deregistration. Spike results: `SPIKE.md`.
 
 ```
 unbound-hook hook <tool> [<event>]     # claude-code | cursor | copilot | codex
-unbound-hook setup --api-key <admin_key> [--discovery-key <key>]
+unbound-hook setup --api-key <admin_key>
                    [--backend-url <url>] [--gateway-url <url>] [--frontend-url <url>]
                    [--app_name <name>] [--backfill] [--tools t1,t2]
                    [--skip-managed-settings]   # claude-code only

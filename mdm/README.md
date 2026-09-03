@@ -6,9 +6,9 @@ Runs all five MDM setup steps for an admin device enrollment in one shot:
 2. **Cursor** MDM setup
 3. **Codex** MDM setup
 4. **GitHub Copilot** MDM setup
-5. **Coding-discovery** scan (separate repo, separate API key)
+5. **Coding-discovery** scan (separate repo)
 
-Steps 1–4 use `--api-key` (the admin MDM key). Step 5 uses `--discovery-key` (a separate discovery-specific key — the two are different credentials and the backend distinguishes them).
+Every step uses `--api-key` (the admin MDM key). The discovery scan authenticates as the device's owner, whose key is resolved from the hardware serial, so no separate discovery key is needed. `--discovery-key` / `-DiscoveryKey` is still accepted so existing MDM policies keep working, but it is ignored.
 
 Each step runs in its own subprocess; a failure in one does not abort the others. A summary at the end lists which steps succeeded and which failed.
 
@@ -17,7 +17,7 @@ Each step runs in its own subprocess; a failure in one does not abort the others
 MDM setup requires Administrator privileges. Download and execute the PowerShell wrapper:
 
 ```powershell
-Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/windows/onboard' -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_API_KEY -DiscoveryKey YOUR_DISCOVERY_KEY
+Invoke-WebRequest -Uri 'https://getunbound.ai/setup/mdm/windows/onboard' -OutFile onboard.ps1; .\onboard.ps1 -ApiKey YOUR_ADMIN_API_KEY
 ```
 
 The wrapper automatically:
@@ -29,13 +29,13 @@ The wrapper automatically:
 Optional parameters:
 ```powershell
 # Tenant deployment URLs
-.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -BackendUrl https://backend.example.com -GatewayUrl https://api.example.com
+.\onboard.ps1 -ApiKey YOUR_KEY -BackendUrl https://backend.example.com -GatewayUrl https://api.example.com
 
 # Enable backfill of historical transcripts (opt-in)
-.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -Backfill
+.\onboard.ps1 -ApiKey YOUR_KEY -Backfill
 
 # Claude Code only: install the hook script, leave managed-settings.json alone
-.\onboard.ps1 -ApiKey YOUR_KEY -DiscoveryKey YOUR_KEY -SkipManagedSettings
+.\onboard.ps1 -ApiKey YOUR_KEY -SkipManagedSettings
 ```
 
 ### Clearing Setup (Windows)
@@ -50,14 +50,12 @@ MDM setup requires root privileges. Pass the script to `python3 -c` via command 
 
 ```bash
 sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" \
-    --api-key YOUR_ADMIN_API_KEY \
-    --discovery-key YOUR_DISCOVERY_KEY
+    --api-key YOUR_ADMIN_API_KEY
 ```
 
 ```bash
 sudo python3 -c "$(curl -fsSL https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/mdm/onboard.py)" \
-    --api-key YOUR_ADMIN_API_KEY \
-    --discovery-key YOUR_DISCOVERY_KEY
+    --api-key YOUR_ADMIN_API_KEY
 ```
 
 Optional overrides for tenant deployments: `--backend-url <url>`, `--gateway-url <url>` (defaults: `https://backend.getunbound.ai`, `https://api.getunbound.ai`). The `--backend-url` value also becomes the discovery scan's `--domain`.
