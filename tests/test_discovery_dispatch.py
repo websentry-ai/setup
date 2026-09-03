@@ -57,6 +57,10 @@ def windows_hook(request, tmp_path, monkeypatch):
     install_ps1.write_text("param()\n", encoding="utf-8")
 
     monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    # _machine_env reads real HKLM on Windows; there is no registry to read
+    # here, so stand in with os.environ -- the HKLM-vs-HKCU guarantee itself
+    # is verified separately against a real Windows machine, not in CI.
+    monkeypatch.setattr(hook, "_machine_env", lambda name: os.environ.get(name), raising=False)
     monkeypatch.setenv("SystemRoot", r"C:\Windows")
     monkeypatch.setattr(hook, "UNBOUND_CONFIG_PATH", config_path)
     monkeypatch.setattr(hook, "DISCOVERY_CACHE_PATH", state_dir / "cache.json")

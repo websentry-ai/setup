@@ -3240,6 +3240,31 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _machine_env(name: str) -> Optional[str]:
+    """Read an env var from a scope only an admin/SYSTEM can write. On
+    Windows, os.getenv() merges HKCU over HKLM, so a non-admin user's
+    per-user `setx NAME value` (no /M) silently shadows the machine-wide
+    value MDM wrote with `setx NAME value /M` -- go straight to HKLM
+    instead. On POSIX there is no such per-user override of a machine-wide
+    var (personal installs write shell rc files, not a global scope), so
+    os.environ is already the right source."""
+    if not _is_windows():
+        return os.environ.get(name)
+    try:
+        import winreg
+    except ImportError:
+        return None
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, name)
+            return value
+    except OSError:
+        return None
+
+
 def _discovery_installer():
     if _is_windows():
         return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
@@ -3287,12 +3312,13 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
         try:
             with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
                 unbound_config = json.load(f)
-        except (OSError, json.JSONDecodeError):
-            pass
+        except (OSError, json.JSONDecodeError) as e:
+            log_error("mcp scan dispatch: config unreadable, trying env: %s errno=%s"
+                      % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key") or os.getenv('UNBOUND_AUGMENT_API_KEY')
-        backend_url = unbound_config.get("base_url") or os.getenv('UNBOUND_BACKEND_URL')
+        api_key = unbound_config.get("api_key") or _machine_env('UNBOUND_AUGMENT_API_KEY')
+        backend_url = unbound_config.get("base_url") or _machine_env('UNBOUND_BACKEND_URL')
         if not api_key or not backend_url:
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
@@ -3481,12 +3507,13 @@ def _dispatch_discovery() -> None:
             try:
                 with UNBOUND_CONFIG_PATH.open("r", encoding="utf-8") as f:
                     unbound_config = json.load(f)
-            except (OSError, json.JSONDecodeError):
-                pass
+            except (OSError, json.JSONDecodeError) as e:
+                log_error("discovery gate: config unreadable, trying env: %s errno=%s"
+                          % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("api_key") or os.getenv('UNBOUND_AUGMENT_API_KEY')
-            backend_url = unbound_config.get("base_url") or os.getenv('UNBOUND_BACKEND_URL')
+            api_key = unbound_config.get("api_key") or _machine_env('UNBOUND_AUGMENT_API_KEY')
+            backend_url = unbound_config.get("base_url") or _machine_env('UNBOUND_BACKEND_URL')
             if not api_key:
                 log_error("discovery gate: no api_key in env or config", 'discovery_gate')
                 return
