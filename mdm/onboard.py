@@ -9,9 +9,16 @@ Unbound MDM onboarding — runs all six steps in one shot:
   5. Augment MDM setup
   6. Coding-discovery scan
 
-Steps 1-5 use --api-key (admin MDM key). Step 6 uses --discovery-key (a
-separate discovery-specific key). The two are different credentials and the
-backend distinguishes them; passing one in place of the other will be rejected.
+Steps 1-5 use --api-key (the admin MDM key). Step 6 must run with the DEVICE
+OWNER's key: the backend attributes a discovery report authenticated with an
+application key to that key's owner and skips the MDM serial lookup, so a scan
+run with the admin key would file every device under the admin. onboard.py
+therefore exchanges the admin key + hardware serial for the owner's key via
+/api/v1/automations/mdm/get_application_api_key/ (the same exchange the
+per-tool MDM scripts perform) and scans with that. If the exchange fails (no
+serial, HTTP error, no api_key in the response) the Discovery step is reported
+as failed; it never falls back to the admin key. --discovery-key <key>
+(deprecated) skips the exchange and scans with the given key.
 
 Backfill must be explicitly enabled via --backfill flag (typically passed from
 PowerShell's -Backfill parameter). When enabled, it seeds Claude Code and Codex
@@ -23,8 +30,10 @@ Copilot, and Augment have no historical transcript store to backfill.
 Usage:
 
   sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" \
-      --api-key YOUR_ADMIN_API_KEY \
-      --discovery-key YOUR_DISCOVERY_KEY
+      --api-key YOUR_ADMIN_API_KEY
+
+Optional (deprecated): --discovery-key <key> scans with the given key instead
+of the device owner's key resolved from the admin key + hardware serial.
 
 Optional overrides for tenant deployments (passed to MDM tools and reused as
 the discovery --domain):
@@ -45,12 +54,17 @@ Each step runs in its own subprocess so a failure in one doesn't abort the
 others. A summary at the end lists which steps succeeded and which failed.
 """
 
+import json
 import os
 import platform
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
 
 # On Windows, when this script runs as a child of the MDM onboard wrapper its
 # stdout is a non-console pipe defaulting to the legacy code page (cp1252),
@@ -99,13 +113,15 @@ TOOLS = [
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
 DISCOVERY_INSTALL_PS1 = f"{_RAW_DISCOVERY}/install.ps1"
 DEFAULT_BACKEND_URL = "https://backend.getunbound.ai"
+KEY_EXCHANGE_TIMEOUT_SECONDS = 20
+KEY_EXCHANGE_ATTEMPTS = 2
 
 USAGE = (
     "Usage:\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" \\\n"
     "      --api-key YOUR_ADMIN_API_KEY \\\n"
-    "      --discovery-key YOUR_DISCOVERY_KEY \\\n"
-    "      [--backend-url <url>] [--gateway-url <url>] [--skip-managed-settings]\n"
+    "      [--discovery-key <key>] [--backend-url <url>] [--gateway-url <url>]\n"
+    "      [--skip-managed-settings]\n"
     "\n"
     "  sudo python3 -c \"$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)\" --clear\n"
 )
@@ -302,6 +318,142 @@ def run_discovery(discovery_key: str, backend_url: str) -> bool:
             pass
 
 
+def _run_stdout(cmd: list) -> str:
+    """Stripped stdout of `cmd`, or "" on any failure (missing binary,
+    non-zero exit, timeout). Serial probing is best-effort per source."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _serial_darwin():
+    # IOPlatformSerialNumber is locale-stable; system_profiler's label is not.
+    for line in _run_stdout(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]).split("\n"):
+        if "IOPlatformSerialNumber" in line:
+            parts = line.split("=")
+            if len(parts) >= 2:
+                serial = parts[1].strip().strip('"').strip()
+                if serial:
+                    return serial
+    return None
+
+
+def _serial_linux():
+    serial = _run_stdout(["dmidecode", "-s", "system-serial-number"])
+    if serial:
+        return serial
+    try:
+        with open("/sys/class/dmi/id/product_serial", encoding="utf-8") as f:
+            serial = f.read().strip()
+    except OSError:
+        return None
+    return serial or None
+
+
+def _serial_windows():
+    # Same chain as get_device_identifier() in claude-code/hooks/mdm/setup.py,
+    # copied rather than imported (this script is standalone): BIOS serial,
+    # then the MachineGuid, then the hostname.
+    serial = _run_stdout([
+        "powershell", "-NoProfile", "-Command",
+        "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber",
+    ])
+    if serial:
+        return serial
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Cryptography") as key:
+            value, _ = winreg.QueryValueEx(key, "MachineGuid")
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    return socket.gethostname() or None
+
+
+def get_device_serial():
+    """Hardware serial as the per-tool MDM scripts report it, so the discovery
+    scan is attributed to the same device owner. None if it can't be read."""
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            return _serial_darwin()
+        if system == "linux":
+            return _serial_linux()
+        if system == "windows":
+            return _serial_windows()
+    except Exception:
+        return None
+    return None
+
+
+def fetch_owner_key(api_key: str, backend_url: str, serial: str) -> str:
+    """Exchanges the admin key + device serial for the device owner's
+    application key. Raises RuntimeError naming the cause on any failure."""
+    params = urllib.parse.urlencode({"serial_number": serial, "app_type": "default"})
+    url = f"{backend_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {api_key}",
+        "User-Agent": "unbound-mdm-onboard/1.1",
+    })
+    last_error = None
+    for _attempt in range(KEY_EXCHANGE_ATTEMPTS):
+        try:
+            with urllib.request.urlopen(req, timeout=KEY_EXCHANGE_TIMEOUT_SECONDS) as resp:
+                body = resp.read()
+            break
+        except urllib.error.HTTPError as e:
+            last_error = f"HTTP {e.code}"
+        except Exception as e:
+            last_error = str(e) or type(e).__name__
+    else:
+        raise RuntimeError(
+            f"key exchange failed after {KEY_EXCHANGE_ATTEMPTS} attempts: {last_error}"
+        )
+    try:
+        data = json.loads(body)
+    except ValueError:
+        raise RuntimeError("key exchange returned invalid JSON")
+    owner_key = data.get("api_key") if isinstance(data, dict) else None
+    if not owner_key:
+        raise RuntimeError(
+            "key exchange response has no api_key (is this device's serial enrolled in MDM?)"
+        )
+    return owner_key
+
+
+def resolve_discovery_key(api_key: str, backend_url: str) -> str:
+    """The device owner's key for the discovery scan. Raises RuntimeError if
+    the serial can't be read or the exchange fails. Deliberately never falls
+    back to the admin key: the backend would attribute the device to the admin."""
+    serial = get_device_serial()
+    if not serial:
+        raise RuntimeError("could not read this device's hardware serial number")
+    owner_key = fetch_owner_key(api_key, backend_url, serial)
+    print(f"[Discovery] scanning with the device owner's key (serial {serial})")
+    return owner_key
+
+
+def run_discovery_step(explicit_key, api_key: str, backend_url: str) -> bool:
+    """Explicit --discovery-key wins; otherwise resolve the owner's key from
+    the admin key + serial. On resolution failure the step is reported failed
+    and the scan is skipped."""
+    key = explicit_key
+    if not key:
+        try:
+            key = resolve_discovery_key(api_key, backend_url)
+        except RuntimeError as e:
+            print(
+                f"❌ [Discovery] cannot resolve the device owner's key: {e}. "
+                "Skipping the scan rather than attributing this device to the admin key.",
+                file=sys.stderr,
+            )
+            return False
+    return run_discovery(key, backend_url)
+
+
 def parse_args(argv: list) -> tuple:
     """Splits argv into (discovery_key, mdm_args, backend_url, is_clear,
     skip_managed_settings).
@@ -341,6 +493,15 @@ def parse_args(argv: list) -> tuple:
     return discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings
 
 
+def _flag_value(args: list, flag: str):
+    """Value following `flag` in args, or None if absent or given no value."""
+    try:
+        i = args.index(flag)
+    except ValueError:
+        return None
+    return args[i + 1] if i + 1 < len(args) else None
+
+
 def main() -> int:
     args = sys.argv[1:]
 
@@ -351,14 +512,14 @@ def main() -> int:
     discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings = parse_args(args)
 
     # Validate flags. --clear short-circuits the key checks: nothing to
-    # authenticate, just remove the configuration.
+    # authenticate, just remove the configuration. --discovery-key is optional:
+    # the dashboard-generated command no longer includes it, and the scan's key
+    # is resolved from the admin key + serial in run_discovery_step.
+    api_key = None
     if not is_clear:
-        if "--api-key" not in mdm_args:
+        api_key = _flag_value(mdm_args, "--api-key")
+        if not api_key:
             print("Error: --api-key is required (the MDM admin key).\n", file=sys.stderr)
-            print(USAGE, file=sys.stderr)
-            return 1
-        if not discovery_key:
-            print("Error: --discovery-key is required (separate from --api-key).\n", file=sys.stderr)
             print(USAGE, file=sys.stderr)
             return 1
 
@@ -388,7 +549,7 @@ def main() -> int:
     # Discovery is a one-shot scan — skip it on --clear (nothing to remove).
     if not is_clear:
         print(f"\n{'=' * 60}\n[Discovery] coding-tool scan\n{'=' * 60}\n")
-        if not run_discovery(discovery_key, backend_url or DEFAULT_BACKEND_URL):
+        if not run_discovery_step(discovery_key, api_key, backend_url or DEFAULT_BACKEND_URL):
             failures.append("Discovery")
 
     print(f"\n{'=' * 60}")

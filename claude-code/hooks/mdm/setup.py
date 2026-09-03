@@ -1718,7 +1718,7 @@ def _is_reparse_point(path: Path) -> bool:
 
 
 def _claude_desktop_support_dirs(home: Path) -> List[Path]:
-    """Claude Desktop app support dir(s) for a home. Team/SSO desktop sessions
+    r"""Claude Desktop app support dir(s) for a home. Team/SSO desktop sessions
     cache the active account's oauthAccount under local-agent-mode-sessions/ here.
 
     Taken from unbound.py, keyed off `home` instead of Path.home()/APPDATA: MDM
