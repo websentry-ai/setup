@@ -8,7 +8,7 @@ Runs all five MDM setup steps for an admin device enrollment in one shot:
 4. **GitHub Copilot** MDM setup
 5. **Coding-discovery** scan (separate repo)
 
-All steps use `--api-key` (the admin MDM key). The backend accepts the admin key for discovery uploads, so a separate discovery key is no longer needed. `--discovery-key` / `-DiscoveryKey` is still accepted for back-compat (deprecated) and, when given, is used for the discovery scan in place of the admin key.
+Steps 1–4 use `--api-key` (the admin MDM key). The discovery scan runs with the **device owner's** key, which onboard.py resolves by exchanging the admin key + hardware serial via `/api/v1/automations/mdm/get_application_api_key/` (the same exchange the per-tool MDM scripts do), so the scan is attributed to the owner rather than the admin. If that exchange fails the Discovery step is reported failed; it never falls back to the admin key. `--discovery-key` / `-DiscoveryKey` is still accepted (deprecated) and, when given, skips the exchange and scans with that key.
 
 Each step runs in its own subprocess; a failure in one does not abort the others. A summary at the end lists which steps succeeded and which failed.
 

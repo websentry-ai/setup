@@ -26,8 +26,8 @@
     The MDM admin API key (required unless -Clear is specified)
 
 .PARAMETER DiscoveryKey
-    Deprecated, optional: a separate key for the coding-discovery scan. Defaults to
-    ApiKey — the backend accepts the admin key for discovery uploads.
+    Deprecated, optional: scan with this key instead of the device owner's key that
+    onboard.py resolves from ApiKey + the hardware serial.
 
 .PARAMETER BackendUrl
     Backend URL override for tenant deployments (default: https://backend.getunbound.ai)
@@ -171,15 +171,12 @@ function Main {
         } else {
             $pythonArgs += "--api-key"
             $pythonArgs += $ApiKey
-            # -DiscoveryKey is deprecated: the backend accepts the admin key for
-            # discovery uploads, so it defaults to ApiKey. Passed explicitly so
-            # the fallback holds whichever onboard.py revision is fetched.
-            $discoveryKeyArg = $DiscoveryKey
-            if ([string]::IsNullOrWhiteSpace($discoveryKeyArg)) {
-                $discoveryKeyArg = $ApiKey
+            # -DiscoveryKey is deprecated and only forwarded when given. Otherwise
+            # onboard.py resolves the device owner's key from ApiKey + the serial.
+            if (-not [string]::IsNullOrWhiteSpace($DiscoveryKey)) {
+                $pythonArgs += "--discovery-key"
+                $pythonArgs += $DiscoveryKey
             }
-            $pythonArgs += "--discovery-key"
-            $pythonArgs += $discoveryKeyArg
         }
 
         # URL overrides apply to both normal and clear modes
