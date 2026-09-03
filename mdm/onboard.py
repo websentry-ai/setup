@@ -548,11 +548,16 @@ def main() -> int:
             failures.append(name)
 
     # Discovery is a one-shot scan — skip it on --clear (nothing to remove).
+    discovery_skipped = False
     if not is_clear:
         print(f"\n{'=' * 60}\n[Discovery] coding-tool scan\n{'=' * 60}\n")
         discovery_backend = backend_url or DEFAULT_BACKEND_URL
         scan_key = fetch_device_owner_key(api_key, discovery_backend)
-        if not scan_key or not run_discovery(scan_key, discovery_backend):
+        if not scan_key:
+            # No owner, no scan — but the tool installs above are done and
+            # sound. Skipped, not failed, matching `unbound-hook setup`.
+            discovery_skipped = True
+        elif not run_discovery(scan_key, discovery_backend):
             failures.append("Discovery")
 
     print(f"\n{'=' * 60}")
@@ -560,7 +565,9 @@ def main() -> int:
         print(f"❌ MDM onboarding finished with {len(failures)} failure(s): {', '.join(failures)}")
         print("Re-run the failed step's individual command to retry.")
         return 1
-    steps = [name for name, *_ in TOOLS] + ([] if is_clear else ["Discovery"])
+    steps = [name for name, *_ in TOOLS]
+    if not is_clear:
+        steps.append("Discovery (skipped)" if discovery_skipped else "Discovery")
     print(f"✅ MDM onboarding complete: {', '.join(steps)}")
     return 0
 

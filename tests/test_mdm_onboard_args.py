@@ -43,3 +43,30 @@ def test_device_identity_matches_the_per_tool_mdm_scripts():
     must resolve the same one or the backend mints a second owner for one machine."""
     per_tool = load_module("claude-code/hooks/mdm/setup.py")
     assert onboard.get_device_identifier() == per_tool.get_device_identifier()
+
+
+def test_unresolvable_owner_skips_discovery_without_failing_the_enrollment(monkeypatch, capsys):
+    """Five clean tool installs must not be reported as a failed enrollment just
+    because the owner key could not be resolved. `unbound-hook setup` returns
+    ("skipped", ...) here; this path has to agree."""
+    monkeypatch.setattr(onboard, "check_admin_privileges", lambda: True)
+    monkeypatch.setattr(onboard, "run_tool", lambda name, url, args: True)
+    monkeypatch.setattr(onboard, "fetch_device_owner_key", lambda key, url: None)
+    monkeypatch.setattr(onboard, "run_discovery", lambda *a: pytest.fail("no key, no scan"))
+    monkeypatch.setattr(onboard.sys, "argv", ["onboard.py", "--api-key", "K"])
+
+    assert onboard.main() == 0
+    out = capsys.readouterr().out
+    assert "Discovery (skipped)" in out
+    assert "MDM onboarding complete" in out
+
+
+def test_a_scan_that_actually_fails_is_still_a_failure(monkeypatch, capsys):
+    monkeypatch.setattr(onboard, "check_admin_privileges", lambda: True)
+    monkeypatch.setattr(onboard, "run_tool", lambda name, url, args: True)
+    monkeypatch.setattr(onboard, "fetch_device_owner_key", lambda key, url: "owner-key")
+    monkeypatch.setattr(onboard, "run_discovery", lambda *a: False)
+    monkeypatch.setattr(onboard.sys, "argv", ["onboard.py", "--api-key", "K"])
+
+    assert onboard.main() == 1
+    assert "failure(s): Discovery" in capsys.readouterr().out
