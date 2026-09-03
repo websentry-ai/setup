@@ -418,8 +418,9 @@ def set_env_var_system_wide(var_name: str, value: str) -> Tuple[bool, bool]:
         return False, False
 
 
-def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str) -> Optional[str]:
-    params = f"serial_number={device_id}&app_type=copilot"
+def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, device_id: str,
+                           app_type: str = "copilot") -> Optional[str]:
+    params = f"serial_number={device_id}&app_type={app_type}"
     if app_name:
         params = f"app_name={app_name}&{params}"
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"

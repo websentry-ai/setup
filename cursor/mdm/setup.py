@@ -981,9 +981,10 @@ def clear_setup() -> bool:
     return not teardown_failed
 
 
-def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, serial_number: str) -> str:
+def fetch_api_key_from_mdm(base_url: str, app_name: str, auth_api_key: str, serial_number: str,
+                           app_type: str = "cursor") -> str:
     """Fetch API key from MDM endpoint."""
-    params = f"serial_number={serial_number}&app_type=cursor"
+    params = f"serial_number={serial_number}&app_type={app_type}"
     if app_name:
         params = f"app_name={app_name}&{params}"
     url = f"{base_url.rstrip('/')}/api/v1/automations/mdm/get_application_api_key/?{params}"

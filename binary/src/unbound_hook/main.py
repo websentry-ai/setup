@@ -50,7 +50,7 @@ Usage:
   unbound-hook hook <tool> [<event>]      tools: claude-code|cursor|copilot|codex|augment
   unbound-hook mcp-diagnostic <tool>      internal: detached null-fp diagnostic (env-driven)
   unbound-hook sync-skills <tool>         internal: detached injected-skill reconcile
-  unbound-hook setup --api-key <key> [--discovery-key <key>] [options]
+  unbound-hook setup --api-key <key> [options]
   unbound-hook backfill (--all | --user <name>) [--dry-run] [options]
   unbound-hook clear
   unbound-hook --version
