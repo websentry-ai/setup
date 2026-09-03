@@ -676,17 +676,44 @@ def test_skip_managed_settings_prints_every_remote_policy_command(env, capsys):
 
 
 def test_skip_managed_settings_install_state_never_tampered(env):
-    """With no config of ours, a stripped file must not read as tampered."""
+    """With no config of ours, a stripped file reads as unknown, not as a state.
+    Reporting one would make every run look like the managed config was cleared."""
     m = env["modules"]["claude-code"]
     managed = m.get_managed_settings_dir()
     managed.mkdir(parents=True, exist_ok=True)
     settings_path = managed / "managed-settings.json"
     settings_path.write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
-    assert setup_cmd._detect_state(settings_path, skip_settings=True) == "fresh"
+    assert setup_cmd._detect_state(settings_path, skip_settings=True) is None
     assert setup_cmd._detect_state(settings_path) == "tampered"
     settings_path.write_text(json.dumps({"hooks": {"Stop": [
         {"hooks": [{"type": "command", "command": _cmd("claude-code", "Stop")}]}]}}))
     assert setup_cmd._detect_state(settings_path, skip_settings=True) == "persisted"
+
+
+def test_skip_managed_settings_absent_file_is_unknown_not_fresh(env):
+    """The repeat-run case: skip mode writes no config, so an absent file is the
+    steady state. Reporting 'fresh' counted a tamper on every run after the first."""
+    m = env["modules"]["claude-code"]
+    settings_path = m.get_managed_settings_dir() / "managed-settings.json"
+    assert not settings_path.exists()
+    assert setup_cmd._detect_state(settings_path, skip_settings=True) is None
+    assert setup_cmd._detect_state(settings_path) == "fresh"
+
+
+def test_binary_and_python_agree_on_a_hook_hash(env):
+    """The binary reports the hash through the same vendored module the python path
+    uses, so both must return the identical digest for identical bytes."""
+    from unbound_hook._resources import hook_source_path
+    for tool in ("claude-code", "cursor", "copilot", "codex", "augment"):
+        source = hook_source_path(tool)
+        digest = env["modules"][tool].hook_script_hash(source)
+        assert len(digest) == 64 and digest == digest.lower()
+        copy = source.parent / ("copy-" + source.name)
+        try:
+            copy.write_bytes(source.read_bytes())
+            assert env["modules"][tool].hook_script_hash(copy) == digest
+        finally:
+            copy.unlink(missing_ok=True)
 
 
 def test_skip_managed_settings_flag_is_accepted_by_the_parser(env):
