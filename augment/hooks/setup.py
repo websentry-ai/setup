@@ -402,7 +402,10 @@ def write_unbound_config(api_key: str, urls: dict = None) -> bool:
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
     try:
-        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chmod(config_dir, 0o700)
         config = {}
         if config_file.exists():

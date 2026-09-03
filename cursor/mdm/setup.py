@@ -392,7 +392,10 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str, u
     _repair_user_ownership(username, [config_dir, config_file])
 
     def _write():
-        config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         config = {}
         if config_file.exists():
             try:
@@ -1189,6 +1192,11 @@ def main():
         print(f"❌ Failed to set environment variable: {message}")
         return False
     print(f"✅ Environment variable set ({message})")
+
+    url_ok, _, url_message = set_env_var("UNBOUND_BACKEND_URL", base_url)
+    if not url_ok:
+        print(f"❌ Failed to set UNBOUND_BACKEND_URL: {url_message}")
+        return False
 
     # Write API key to ~/.unbound/config.json for each user and remove user-level hooks
     print("\n📝 Writing config for all users...")
