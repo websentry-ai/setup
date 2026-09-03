@@ -114,14 +114,15 @@ def _detect_state(settings_path: Path, skip_settings: bool = False):
     those as 'tampered' would flood the backend with false tamper signals on
     rollout day); 'tampered' = settings present referencing neither. With
     skip_settings we own no config file, so a file we already stripped is
-    indistinguishable from a tampered one: report 'fresh' instead."""
+    indistinguishable from one that was never there: report None (unknown), which
+    leaves the backend's tamper state untouched rather than counting every run."""
     try:
         if not settings_path.exists():
-            return "fresh"
+            return None if skip_settings else "fresh"
         text = settings_path.read_text(encoding="utf-8")
         if str(HOOK_BINARY) in text or "unbound.py" in text:
             return "persisted"
-        return "fresh" if skip_settings else "tampered"
+        return None if skip_settings else "tampered"
     except Exception as e:
         # None = "unknown" — notify_setup_complete omits the field entirely,
         # which is more honest than guessing 'fresh' over an unreadable but
@@ -596,7 +597,9 @@ def _setup_claude_code(opts):
         _remove_stale_managed_script(m.get_managed_settings_dir())
 
     m.notify_setup_complete(api_key, "claude-code", backend_url=base,
-                            install_state=state, serial_number=device_id)
+                            install_state=state, serial_number=device_id,
+                            hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
+                            install_mode="binary-skip" if skip_settings else "binary")
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
@@ -646,7 +649,9 @@ def _setup_augment(opts):
         m.remove_user_level_hooks_for_user(username, home_dir)
 
     m.notify_setup_complete(api_key, "augment_code", backend_url=base,
-                            install_state=state, serial_number=device_id)
+                            install_state=state, serial_number=device_id,
+                            hook_hash=m.hook_script_hash(hook_source_path("augment")),
+                            install_mode="binary")
     return ("configured", None)
 
 
@@ -687,7 +692,9 @@ def _setup_codex(opts):
         return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "codex", backend_url=base,
-                            install_state=state, serial_number=device_id)
+                            install_state=state, serial_number=device_id,
+                            hook_hash=m.hook_script_hash(hook_source_path("codex")),
+                            install_mode="binary")
     if opts["backfill"]:
         m.run_backfill(api_key, base, m.get_all_user_homes())
     return ("configured", None)
@@ -748,7 +755,9 @@ def _setup_cursor(opts):
     _remove_stale_managed_script(m.get_enterprise_hooks_dir())
 
     m.notify_setup_complete(api_key, "cursor", backend_url=base,
-                            install_state=state, serial_number=device_id)
+                            install_state=state, serial_number=device_id,
+                            hook_hash=m.hook_script_hash(hook_source_path("cursor")),
+                            install_mode="binary")
     if env_changed or hooks_changed:
         m.restart_cursor()
     return ("configured", None)
@@ -807,7 +816,9 @@ def _setup_copilot(opts):
         return ("deferred", "hook install failed for all users")
 
     m.notify_setup_complete(api_key, "copilot", backend_url=base,
-                            install_state=state, serial_number=device_id)
+                            install_state=state, serial_number=device_id,
+                            hook_hash=m.hook_script_hash(hook_source_path("copilot")),
+                            install_mode="binary")
     if opts["backfill"]:
         hook_source = hook_source_path("copilot").read_text(encoding="utf-8")
         m.run_backfill(api_key, base, user_homes, hook_source)

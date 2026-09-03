@@ -5,6 +5,7 @@ every branch of one tool, so a new tool cannot ship without the basics. Deeper
 per-tool behaviour lives beside the tool it belongs to.
 """
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -215,3 +216,56 @@ class TestCollectorShapeMatchesEveryUnpacker:
         assert targets, f"{path}: no `<tuple> = result` unpack found — did it get renamed?"
         for t in targets:
             assert len(t.elts) == 3, f"{path}: unpacks {len(t.elts)}, collectors return 3"
+
+
+# Installers that ship an unbound.py, and so can report which version is deployed.
+# Gateway-mode and openclaw write no hook script and are deliberately excluded.
+HOOK_NOTIFIERS = sorted(s for s in SETUPS if _has(s, "hook_script_hash"))
+NOTIFIERS = sorted(s for s in SETUPS if _has(s, "notify_setup_complete"))
+
+
+def _notify_body(relpath, **kwargs):
+    """The JSON body an installer would POST, captured at the curl boundary."""
+    module = load_module(relpath)
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured["body"] = json.loads(kw["input"].decode())
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(module.subprocess, "run", fake_run)
+        module.notify_setup_complete("k", "claude-code", backend_url="https://b", **kwargs)
+    return captured["body"]
+
+
+def test_the_hook_notifier_inventory_is_the_five_tools_twice():
+    """Five tools, each with a user-level and an MDM installer. A drop here means
+    a tool silently stopped reporting its hook version."""
+    assert len(HOOK_NOTIFIERS) == 10, HOOK_NOTIFIERS
+
+
+@pytest.mark.parametrize("relpath", NOTIFIERS)
+def test_notify_body_is_unchanged_when_the_new_fields_are_absent(relpath):
+    # A caller passing neither field must send the exact body it always sent, so
+    # old installers keep working against the new backend and vice versa.
+    body = _notify_body(relpath)
+    assert "hook_hash" not in body
+    assert "install_mode" not in body
+
+
+@pytest.mark.parametrize("relpath", HOOK_NOTIFIERS)
+def test_every_hook_installer_forwards_hash_and_mode(relpath):
+    body = _notify_body(relpath, hook_hash="d" * 64, install_mode="mdm")
+    assert body["hook_hash"] == "d" * 64
+    assert body["install_mode"] == "mdm"
+
+
+@pytest.mark.parametrize("relpath", HOOK_NOTIFIERS)
+def test_hook_script_hash_is_sha256_and_survives_a_missing_file(relpath, tmp_path):
+    module = load_module(relpath)
+    script = tmp_path / "unbound.py"
+    script.write_bytes(b"print('hook')\n")
+    assert module.hook_script_hash(script) == hashlib.sha256(b"print('hook')\n").hexdigest()
+    # A hash is never worth failing an install over.
+    assert module.hook_script_hash(tmp_path / "gone.py") is None
+    assert module.hook_script_hash(None) is None
