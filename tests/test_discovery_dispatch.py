@@ -330,3 +330,20 @@ def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, 
     hook._dispatch_discovery()
 
     assert calls == []
+
+
+def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkeypatch):
+    """A leftover per-user env var from a prior personal install must not
+    outrank a freshly-written, readable config.json (e.g. after MDM enrolls
+    a device that previously had a subscription install)."""
+    hook, calls, _install_ps1 = windows_hook
+    tool = request.node.callspec.params["windows_hook"]
+
+    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "stale-personal-install-key")
+    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://stale.example")
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "test-key"
+    assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"

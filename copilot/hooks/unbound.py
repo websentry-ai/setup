@@ -4608,7 +4608,7 @@ def _dispatch_discovery() -> None:
                 pass
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = os.getenv('UNBOUND_COPILOT_API_KEY') or unbound_config.get("api_key")
+            api_key = unbound_config.get("api_key") or os.getenv('UNBOUND_COPILOT_API_KEY')
             backend_url = unbound_config.get("base_url") or os.getenv('UNBOUND_BACKEND_URL')
             if not api_key:
                 log_error("discovery gate: no api_key in env or config", 'discovery_gate')
@@ -4685,7 +4685,7 @@ def _dispatch_mcp_server_scan(server_name, server_config):
             pass
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = os.getenv('UNBOUND_COPILOT_API_KEY') or unbound_config.get("api_key")
+        api_key = unbound_config.get("api_key") or os.getenv('UNBOUND_COPILOT_API_KEY')
         backend_url = unbound_config.get("base_url") or os.getenv('UNBOUND_BACKEND_URL')
         if not api_key or not backend_url:
             return
