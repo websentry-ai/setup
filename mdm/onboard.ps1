@@ -203,9 +203,19 @@ function Main {
             $pythonArgs += "--skip-managed-settings"
         }
 
-        # Execute the Python script and capture exit code
-        & $pythonCmd @pythonArgs
-        $exitCode = $LASTEXITCODE
+        # Execute the Python script and capture exit code.
+        # Windows PowerShell 5.1 turns each stderr line of a native command into a
+        # NativeCommandError when the output is redirected into a pipeline, which is
+        # terminating under the Stop preference set above. onboard.py logs to stderr,
+        # so the first log line would abort onboarding for any caller that pipes us.
+        $prevEap = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            & $pythonCmd @pythonArgs
+            $exitCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prevEap
+        }
 
     } finally {
         # Clean up temporary files
