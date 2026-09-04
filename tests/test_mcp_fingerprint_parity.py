@@ -77,7 +77,43 @@ class TestMcpFingerprintParity(unittest.TestCase):
             with self.subTest(hook=hook.__file__):
                 self.assertEqual(
                     hook.compute_mcp_cache_key('alias', 'npx', None, args),
-                    'smithery:@vendor/server',
+                    'smithery:vendor/server',
+                )
+
+    def test_smithery_supported_package_and_command_forms(self):
+        vectors = [
+            ('npx', ['-y', 'smithery@latest', 'mcp', 'run', 'vendor/server']),
+            ('smithery.cmd', ['--verbose', 'run', '@vendor/server']),
+            ('npm', ['exec', '--', '@smithery/cli', 'run', 'vendor/server']),
+            ('bunx', ['--bun', '@smithery/cli', 'run', 'vendor/server']),
+            ('bun', ['x', '--bun', '@smithery/cli', 'run', 'vendor/server']),
+            (
+                'npx',
+                [
+                    '-y', '@smithery/cli', 'run', '--config', '{}',
+                    '@vendor/server',
+                ],
+            ),
+            (
+                'cmd.exe',
+                ['/d', '/c', 'npx', '-y', 'smithery', 'run', 'vendor/server'],
+            ),
+        ]
+        for hook in HOOKS:
+            for command, args in vectors:
+                with self.subTest(hook=hook.__file__, command=command, args=args):
+                    self.assertEqual(
+                        hook.compute_mcp_cache_key('alias', command, None, args),
+                        'smithery:vendor/server',
+                    )
+
+    def test_invalid_standalone_smithery_command_fails_closed(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertIsNone(
+                    hook.compute_mcp_cache_key(
+                        'alias', 'smithery', None, ['list', 'vendor/server']
+                    )
                 )
 
     def test_smithery_argument_does_not_override_another_launcher(self):
@@ -91,15 +127,17 @@ class TestMcpFingerprintParity(unittest.TestCase):
 
     def test_smithery_rejects_execution_changing_inputs(self):
         vectors = [
-            ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server'],
-            ['-y', '@smithery/cli@npm:evil', 'run', '@vendor/server'],
-            ['-y', '@smithery/cli', 'run', '@vendor/server@npm:evil'],
+            ('npx', ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server']),
+            ('npx', ['-y', '@smithery/cli@npm:evil', 'run', '@vendor/server']),
+            ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server@npm:evil']),
+            ('npm', ['exec', '@smithery/cli', 'run', '@vendor/server']),
+            ('cmd', ['/c', 'npx', '@smithery/cli', 'run', '@vendor/server', '&', 'evil']),
         ]
         for hook in HOOKS:
-            for args in vectors:
-                with self.subTest(hook=hook.__file__, args=args):
+            for command, args in vectors:
+                with self.subTest(hook=hook.__file__, command=command, args=args):
                     self.assertIsNone(
-                        hook.compute_mcp_cache_key('alias', 'npx', None, args)
+                        hook.compute_mcp_cache_key('alias', command, None, args)
                     )
 
     def test_runtime_argument_does_not_claim_smithery_identity(self):
@@ -148,6 +186,24 @@ class TestMcpFingerprintParity(unittest.TestCase):
             ),
             (
                 'dotnet',
+                [
+                    'dnx', '--arch', 'x64', '--verbosity', 'diag',
+                    '--disable-parallel', '--no-cache', '--no-http-cache',
+                    '--source', 'https://api.nuget.org/v3/index.json',
+                    'Example.Server@2.0.0',
+                ],
+                'nuget:example.server',
+            ),
+            (
+                'dotnet',
+                [
+                    'tool', 'exec', 'Example.Server@2.0.0', '--source',
+                    'https://api.nuget.org/v3/index.json', '--', '--listen',
+                ],
+                'nuget:example.server',
+            ),
+            (
+                'dotnet',
                 ['tool', 'exec', 'Example.Server@2.0.0'],
                 None,
             ),
@@ -188,3 +244,25 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     hook.compute_mcp_cache_key('alias', 'dnx', None, args),
                     'nuget:example.server',
                 )
+
+    def test_nuget_restore_options_after_package_fail_closed(self):
+        vectors = [
+            '--add-source:https://packages.example/v3/index.json',
+            '--configfile:NuGet.Config',
+            '--unknown-option',
+        ]
+        for hook in HOOKS:
+            for extra in vectors:
+                with self.subTest(hook=hook.__file__, extra=extra):
+                    self.assertNotEqual(
+                        hook.compute_mcp_cache_key(
+                            'alias', 'dotnet', None,
+                            [
+                                'tool', 'exec', 'Example.Server@2.0.0',
+                                '--source',
+                                'https://api.nuget.org/v3/index.json',
+                                extra,
+                            ],
+                        ),
+                        'nuget:example.server',
+                    )

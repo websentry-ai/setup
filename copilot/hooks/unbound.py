@@ -7,7 +7,9 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import json
 import os
+import ntpath
 import platform
+import posixpath
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
@@ -1863,8 +1865,9 @@ def _vscode_workspace_scope_matches(
         return True
     if skip_filesystem_probe:
         path_type = PureWindowsPath if platform.system() == 'Windows' else Path
-        workspace = path_type(scope)
-        current = path_type(cwd)
+        path_module = ntpath if platform.system() == 'Windows' else posixpath
+        workspace = path_type(path_module.normpath(scope))
+        current = path_type(path_module.normpath(cwd))
     else:
         try:
             workspace = Path(scope).resolve()
@@ -1892,15 +1895,26 @@ def _vscode_cached_launch_fields(launch, skip_command_probe=False):
         cwd = launch.get('cwd')
         if isinstance(cwd, str) and cwd:
             fields['cwd'] = cwd
+        expanded_command = os.path.expandvars(os.path.expanduser(command))
+        expanded_cwd = (
+            os.path.expandvars(os.path.expanduser(cwd))
+            if isinstance(cwd, str)
+            else ''
+        )
+        if platform.system() == 'Windows' and any(
+            value.replace('/', '\\').startswith('\\\\')
+            for value in (expanded_command, expanded_cwd)
+        ):
+            return None
         if not skip_command_probe:
-            expanded = Path(os.path.expandvars(os.path.expanduser(command)))
+            expanded = Path(expanded_command)
             if expanded.is_absolute():
                 if not expanded.is_file():
                     return None
             elif cwd:
-                expanded_cwd = Path(os.path.expandvars(os.path.expanduser(cwd)))
+                expanded_cwd_path = Path(expanded_cwd)
                 if (
-                    not (expanded_cwd / expanded).is_file()
+                    not (expanded_cwd_path / expanded).is_file()
                     and shutil.which(str(expanded)) is None
                 ):
                     return None
@@ -2042,6 +2056,8 @@ CLAUDEAI_ALLOWED_ADDITIONAL_DATA = ({}, {'scope': 'claudeai'})
 
 # npm-package runners: the first positional arg is the package to run.
 NPM_RUNNERS = frozenset({'npx', 'npm', 'bunx'})
+SMITHERY_CLI_PACKAGES = frozenset({'@smithery/cli', 'smithery'})
+SMITHERY_GLOBAL_FLAGS = frozenset({'--verbose', '--debug', '--json', '--table'})
 # Sub-runners under npx/bunx that are not the package themselves (the real
 # target -- usually a local script -- follows).
 NPX_LOCAL_RUNNERS = frozenset({'tsx', 'ts-node'})
@@ -2205,12 +2221,61 @@ def _registry_npm_package(spec: str) -> Optional[str]:
     return package.lower()
 
 
+def _smithery_server_identity(value: str) -> Optional[str]:
+    target = _unquote(value).strip()
+    if target.startswith('@'):
+        target = target[1:]
+    pattern = r'[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?'
+    return target.lower() if re.fullmatch(pattern, target, re.IGNORECASE) else None
+
+
+def _smithery_command_target(tokens: List[str]) -> Optional[str]:
+    while tokens and str(tokens[0]).lower() in SMITHERY_GLOBAL_FLAGS:
+        tokens = tokens[1:]
+    if tokens and str(tokens[0]).lower() == 'mcp':
+        tokens = tokens[1:]
+        while tokens and str(tokens[0]).lower() in SMITHERY_GLOBAL_FLAGS:
+            tokens = tokens[1:]
+    if not tokens or str(tokens[0]).lower() != 'run':
+        return None
+
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if not isinstance(token, str):
+            return None
+        lower = token.lower()
+        if lower == '--config':
+            if index + 1 >= len(tokens):
+                return None
+            index += 2
+            continue
+        if lower.startswith('--config='):
+            index += 1
+            continue
+        if token.startswith('-'):
+            return None
+        return _smithery_server_identity(token)
+    return None
+
+
 def _smithery_run_target(
     args: List[str],
     command_base: Optional[str] = None,
 ) -> Optional[str]:
+    if command_base == 'smithery':
+        return _smithery_command_target(args)
+    if command_base == 'cmd' and any(
+        isinstance(arg, str) and re.search(r'[&|<>^\r\n]', arg)
+        for arg in args
+    ):
+        return None
+
     for index, arg in enumerate(args):
-        if not isinstance(arg, str) or _registry_npm_package(arg) != '@smithery/cli':
+        if (
+            not isinstance(arg, str)
+            or _registry_npm_package(arg) not in SMITHERY_CLI_PACKAGES
+        ):
             continue
         prefix_tokens = []
         for prefix_arg in args[:index]:
@@ -2220,20 +2285,29 @@ def _smithery_run_target(
 
         def valid_runner_prefix(runner, tokens):
             safe_flags = {'-y', '--yes'}
+            if runner in {'bunx', 'bun'}:
+                safe_flags.update({'--bun', '--no-install', '--verbose', '--silent'})
+            if runner == 'npm':
+                safe_flags.add('--')
             if any(token.startswith('-') and token not in safe_flags for token in tokens):
                 return False
             positional = [token for token in tokens if token not in safe_flags]
             if runner == 'npm':
-                return positional in (['exec'], ['x'])
+                return tokens[-1:] == ['--'] and positional in (['exec'], ['x'])
+            if runner == 'bun':
+                return positional == ['x']
             return not positional
 
         if command_base in NPM_RUNNERS:
             if not valid_runner_prefix(command_base, prefix_tokens):
                 return None
+        elif command_base == 'bun':
+            if not valid_runner_prefix(command_base, prefix_tokens):
+                return None
         elif command_base == 'cmd':
             runner_positions = [
                 offset for offset, token in enumerate(prefix_tokens)
-                if token in NPM_RUNNERS
+                if token in NPM_RUNNERS or token == 'bun'
             ]
             if len(runner_positions) != 1:
                 return None
@@ -2250,20 +2324,15 @@ def _smithery_run_target(
                 return None
         else:
             return None
-        if index + 2 >= len(args) or str(args[index + 1]).lower() != 'run':
-            return None
-        target = _unquote(args[index + 2])
-        if (not target or target.startswith('-')
-                or target.startswith(('http://', 'https://', 'git+'))
-                or _looks_like_local_path(target)):
-            return None
-        return _registry_npm_package(target)
+        return _smithery_command_target(args[index + 1:])
     return None
 
 
 def _nuget_package(base: str, args: List[str]) -> Optional[str]:
     if base == 'dnx':
         tokens = args
+    elif base == 'dotnet' and args and str(args[0]).lower() == 'dnx':
+        tokens = args[1:]
     elif (
         base == 'dotnet'
         and len(args) >= 2
@@ -2279,8 +2348,10 @@ def _nuget_package(base: str, args: List[str]) -> Optional[str]:
         and (
             arg.lower() == '--configfile'
             or arg.lower().startswith('--configfile=')
+            or arg.lower().startswith('--configfile:')
             or arg.lower() == '--add-source'
             or arg.lower().startswith('--add-source=')
+            or arg.lower().startswith('--add-source:')
         )
         for arg in tokens
     ):
@@ -2312,17 +2383,23 @@ def _nuget_package(base: str, args: List[str]) -> Optional[str]:
         return None
 
     value_options = {
-        '--version', '--framework', '--configfile', '--source', '-s',
+        '--version', '--framework', '--arch', '-a', '--verbosity', '-v',
+        '--configfile', '--source', '-s',
     }
     flag_options = {
         '--prerelease', '--allow-roll-forward', '--ignore-failed-sources',
-        '--interactive', '--yes', '-y',
+        '--interactive', '--yes', '-y', '--disable-parallel', '--no-cache',
+        '--no-http-cache',
     }
     candidate = None
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if not isinstance(token, str) or token == '--':
+        if token == '--':
+            if candidate is None:
+                return None
+            break
+        if not isinstance(token, str):
             return None
         lower = token.lower()
         option = lower.split('=', 1)[0]
@@ -2334,8 +2411,10 @@ def _nuget_package(base: str, args: List[str]) -> Optional[str]:
             continue
         if token.startswith('-'):
             return None
+        if candidate is not None:
+            return None
         candidate = token
-        break
+        index += 1
     if not isinstance(candidate, str):
         return None
     package = _unquote(candidate).split('@', 1)[0].lower()
@@ -2581,10 +2660,24 @@ def compute_fingerprint(
     smithery_target = _smithery_run_target(safe_args, base)
     if smithery_target:
         return f'smithery:{smithery_target}'
+    if base == 'smithery':
+        return None
     first_scoped_package = _npm_package_from_args(safe_args)
-    if first_scoped_package in {None, '@smithery/cli'} and any(
-        isinstance(arg, str) and _registry_npm_package(arg) == '@smithery/cli'
-        for arg in safe_args
+    smithery_index = next((
+        index for index, arg in enumerate(safe_args)
+        if isinstance(arg, str)
+        and _registry_npm_package(arg) in SMITHERY_CLI_PACKAGES
+    ), None)
+    first_scoped_index = next((
+        index for index, arg in enumerate(safe_args)
+        if isinstance(arg, str) and arg.startswith('@')
+    ), None)
+    if (
+        smithery_index is not None
+        and (
+            first_scoped_index is None
+            or first_scoped_index >= smithery_index
+        )
     ):
         return None
 

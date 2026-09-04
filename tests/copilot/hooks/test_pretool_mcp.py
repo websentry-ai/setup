@@ -1006,7 +1006,7 @@ class TestVscodeProviderCache(unittest.TestCase):
             'cwd': '/extension',
         })
 
-    def test_elevated_cache_does_not_probe_cached_command_or_cwd(self):
+    def test_unc_cached_command_is_rejected_without_a_probe(self):
         launch = {
             'type': 1,
             'command': r'\\attacker\share\server.exe',
@@ -1015,7 +1015,9 @@ class TestVscodeProviderCache(unittest.TestCase):
             'cwd': r'\\attacker\share',
         }
 
-        with patch.object(unbound.Path, 'is_file') as is_file, patch.object(
+        with patch.object(
+            unbound.platform, 'system', return_value='Windows'
+        ), patch.object(unbound.Path, 'is_file') as is_file, patch.object(
             unbound.shutil, 'which'
         ) as which:
             fields = unbound._vscode_cached_launch_fields(
@@ -1025,8 +1027,7 @@ class TestVscodeProviderCache(unittest.TestCase):
 
         is_file.assert_not_called()
         which.assert_not_called()
-        self.assertEqual(fields['command'], launch['command'])
-        self.assertEqual(fields['cwd'], launch['cwd'])
+        self.assertIsNone(fields)
 
     def test_elevated_workspace_match_is_lexical(self):
         cache_path = Path('/code/User/workspaceStorage/cache/state.vscdb')
@@ -1040,6 +1041,20 @@ class TestVscodeProviderCache(unittest.TestCase):
 
         resolve.assert_not_called()
         self.assertTrue(matched)
+
+    def test_elevated_workspace_match_normalizes_parent_segments(self):
+        cache_path = Path('/code/User/workspaceStorage/cache/state.vscdb')
+
+        with patch.object(unbound.Path, 'resolve') as resolve:
+            matched = unbound._vscode_workspace_scope_matches(
+                cache_path,
+                '/workspace',
+                '/workspace/../other/project',
+                skip_filesystem_probe=True,
+            )
+
+        resolve.assert_not_called()
+        self.assertFalse(matched)
 
     def test_http_provider_uri_is_resolved(self):
         fields = unbound._vscode_cached_launch_fields({
