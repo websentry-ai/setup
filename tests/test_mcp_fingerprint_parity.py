@@ -86,6 +86,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
             ('npm', ['exec', '--', '@smithery/cli', 'run', 'vendor/server']),
             ('bunx', ['--bun', '@smithery/cli', 'run', 'vendor/server']),
             ('bun', ['x', '--bun', '@smithery/cli', 'run', 'vendor/server']),
+            ('cmd', ['/c', 'npx.cmd', '-y', '@smithery/cli', 'run', 'vendor/server']),
             (
                 'npx',
                 [
@@ -133,6 +134,27 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'npm:wrapper-mcp',
                 )
 
+    def test_smithery_argument_preserves_wrapped_npm_launchers(self):
+        vectors = [
+            ('bun', ['x', 'wrapper-mcp', '@smithery/cli', 'run', '@vendor/server']),
+            ('cmd', ['/d', '/c', 'npx', 'wrapper-mcp', '@smithery/cli', 'run', '@vendor/server']),
+        ]
+        for hook in HOOKS:
+            for command, args in vectors:
+                with self.subTest(hook=hook.__file__, command=command):
+                    self.assertEqual(
+                        hook.compute_mcp_cache_key('alias', command, None, args),
+                        'npm:wrapper-mcp',
+                    )
+
+    def test_smithery_argument_does_not_turn_bun_script_into_package(self):
+        args = ['wrapper-mcp', '@smithery/cli', 'run', '@vendor/server']
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertIsNone(
+                    hook.compute_mcp_cache_key('alias', 'bun', None, args)
+                )
+
     def test_smithery_rejects_execution_changing_inputs(self):
         vectors = [
             ('npx', ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server']),
@@ -146,6 +168,8 @@ class TestMcpFingerprintParity(unittest.TestCase):
             ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server', '--package=evil']),
             ('npm', ['exec', '--', '@smithery/cli', 'run', '@vendor/server', '--call=evil']),
             ('cmd', ['/c', 'npx', '@smithery/cli', 'run', '@vendor/server', '&', 'evil']),
+            ('npx', ['--workspace', 'decoy', '@smithery/cli', 'run', '@vendor/server']),
+            ('bunx', ['--cwd', 'decoy', '@smithery/cli', 'run', '@vendor/server']),
         ]
         for hook in HOOKS:
             for command, args in vectors:
@@ -177,12 +201,13 @@ class TestMcpFingerprintParity(unittest.TestCase):
                 )
 
     def test_nested_npm_runner_does_not_claim_smithery_identity(self):
-        args = ['npm', '@smithery/cli', 'run', '@vendor/server']
         for hook in HOOKS:
-            with self.subTest(hook=hook.__file__):
-                self.assertIsNone(
-                    hook.compute_mcp_cache_key('alias', 'npx', None, args)
-                )
+            for nested_runner in ['npm', 'npx.cmd', 'bun']:
+                with self.subTest(hook=hook.__file__, nested_runner=nested_runner):
+                    args = [nested_runner, '@smithery/cli', 'run', '@vendor/server']
+                    self.assertIsNone(
+                        hook.compute_mcp_cache_key('alias', 'npx', None, args)
+                    )
 
     def test_smithery_argument_does_not_erase_non_npm_launcher(self):
         vectors = [
