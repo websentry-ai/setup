@@ -184,6 +184,20 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     hook.compute_mcp_cache_key('alias', 'npx', None, args)
                 )
 
+    def test_smithery_argument_does_not_erase_non_npm_launcher(self):
+        vectors = [
+            ('uvx', ['real-package', '@smithery/cli'], 'pypi:real-package'),
+            ('docker', ['run', 'vendor/image', '@smithery/cli'], 'docker:vendor/image'),
+            ('custom-server', ['@smithery/cli'], 'bin:custom-server'),
+        ]
+        for hook in HOOKS:
+            for command, args, expected in vectors:
+                with self.subTest(hook=hook.__file__, command=command):
+                    self.assertEqual(
+                        hook.compute_mcp_cache_key('alias', command, None, args),
+                        expected,
+                    )
+
     def test_nuget_launchers_use_package_identity(self):
         vectors = [
             ('dnx', ['Vendor.Server@1.2.3', 'serve'], None),
