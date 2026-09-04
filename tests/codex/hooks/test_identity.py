@@ -311,7 +311,9 @@ class TestBuildAccountIdentity(unittest.TestCase):
     def test_keys_limited_to_identity_fields(self):
         result = unbound.build_account_identity()
         self.assertEqual(
-            set(result.keys()), {"org_id", "plan", "auth_mode", "email_domain"}
+            set(result.keys()),
+            {"org_id", "plan", "auth_mode", "email_domain",
+             "user_email", "device_serial"},
         )
 
 
