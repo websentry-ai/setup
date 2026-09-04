@@ -305,6 +305,18 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'nuget:example.server',
                 )
 
+    def test_colon_attached_nuget_source(self):
+        args = [
+            'tool', 'exec', 'Example.Server@2.0.0',
+            '--source:https://api.nuget.org/v3/index.json',
+        ]
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key('alias', 'dotnet', None, args),
+                    'nuget:example.server',
+                )
+
     def test_nuget_restore_options_after_package_fail_closed(self):
         vectors = [
             '--add-source:https://packages.example/v3/index.json',
