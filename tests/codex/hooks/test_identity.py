@@ -309,10 +309,16 @@ class TestBuildAccountIdentity(unittest.TestCase):
         self.assertEqual(result["plan"], "pro")
 
     def test_keys_limited_to_identity_fields(self):
-        result = unbound.build_account_identity()
-        self.assertEqual(
-            set(result.keys()), {"org_id", "plan", "auth_mode", "email_domain"}
-        )
+        """device_serial is the one optional key: a host with no readable serial
+        and a cold cache omits it, so pin both shapes rather than the host's."""
+        always = {"org_id", "plan", "auth_mode", "email_domain", "user_email"}
+        with patch.object(unbound, "_device_serial", return_value=None):
+            self.assertEqual(set(unbound.build_account_identity().keys()), always)
+        with patch.object(unbound, "_device_serial", return_value="SERIAL1"):
+            self.assertEqual(
+                set(unbound.build_account_identity().keys()),
+                always | {"device_serial"},
+            )
 
 
 if __name__ == "__main__":

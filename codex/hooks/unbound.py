@@ -14,6 +14,7 @@ import re
 import tempfile
 import shutil
 import base64
+import platform
 import urllib.request
 from urllib.parse import unquote, urlparse
 
@@ -22,6 +23,8 @@ UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
 CODEX_AUTH_PATH = Path.home() / ".codex" / "auth.json"
+# Shared with the cursor and claude-code hooks, so one probe serves all three.
+IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 CODEX_CONFIG_PATH = Path.home() / ".codex" / "config.toml"
 AUDIT_LOG = Path.home() / ".codex" / "hooks" / "agent-audit.log"
 ERROR_LOG = Path.home() / ".codex" / "hooks" / "error.log"
@@ -2322,6 +2325,7 @@ def read_account_identity() -> Dict:
     org_id = None
     plan = None
     auth_mode = None
+    email = None
     email_domain = None
     try:
         auth = json.loads(CODEX_AUTH_PATH.read_text(encoding='utf-8'))
@@ -2340,19 +2344,131 @@ def read_account_identity() -> Dict:
             if isinstance(auth_claim, dict):
                 org_id = _codex_org_id(auth_claim)
                 plan = auth_claim.get('chatgpt_plan_type') or None
-            email_domain = _email_domain(claims.get('email'))
+            email = claims.get('email') or None
+            email_domain = _email_domain(email)
     except Exception:
         pass
     return {
         'org_id': org_id,
         'plan': plan,
         'auth_mode': auth_mode,
+        'user_email': email,
         'email_domain': email_domain,
     }
 
 
-def build_account_identity() -> Dict:
-    return read_account_identity()
+# DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
+# shared sentinel string (with a zero exit code), which would map many machines
+# onto one fake serial. Treat these as "no serial" and fall through.
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
+    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+    'to be filled by oem', 'system serial number', 'serial number',
+    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
+    'invalid', '123456789', 'xxxxxxxx',
+}
+
+
+def _valid_serial(value):
+    return bool(value) and value.strip().lower() not in _PLACEHOLDER_SERIALS
+
+
+def _get_device_serial():
+    """Best-effort hardware serial, mirroring the MDM setup scripts. Filters known
+    OEM/VM placeholder values so two machines never collide on the same fake serial,
+    falling through to a stable per-install id (machine-id / MachineGuid) instead."""
+    try:
+        system = platform.system().lower()
+        if system == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPHardwareDataType'],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                for line in out.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ', 1)
+                        if len(parts) >= 2 and _valid_serial(parts[1]):
+                            return parts[1].strip()
+        elif system == 'linux':
+            try:
+                out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                try:
+                    value = Path(path).read_text(encoding='utf-8').strip()
+                    if _valid_serial(value):
+                        return value
+                except Exception:
+                    continue
+        elif system == 'windows':
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _device_serial(probe=True):
+    """Hardware serial, computed once and cached. Never raises and never blocks the
+    hook. On the latency-critical pre-tool path callers pass probe=False to read the
+    cache only (no subprocess); sessionStart and the end-of-turn exchange probe and
+    persist. A missing / corrupt / unreadable cache falls back to a fresh probe (when
+    allowed), an unwritable cache is ignored (the probed value is still returned), and
+    an unavailable serial returns None so the caller proceeds without it. The cache is
+    shared with the claude-code hook, so we merge and write atomically (no torn file)."""
+    data = {}
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+            cached = data.get('device_serial')
+            if isinstance(cached, str) and cached.strip():
+                return cached.strip()
+    except Exception:
+        data = {}
+    if not probe:
+        return None
+    try:
+        serial = _get_device_serial()
+    except Exception:
+        serial = None
+    if serial:
+        try:
+            data['device_serial'] = serial
+            IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+        except Exception:
+            pass
+    return serial
+
+def build_account_identity(probe: bool = True) -> Dict:
+    identity = read_account_identity()
+    try:
+        serial = _device_serial(probe=probe)
+        if serial:
+            identity['device_serial'] = serial
+    except Exception:
+        pass
+    return identity
 
 
 def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
@@ -2424,7 +2540,8 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
             'tool_name': tool_name,
             'metadata': metadata
         },
-        'account_identity': build_account_identity(),
+        # The pre-tool path reads the serial cache only; the prompt event probes.
+        'account_identity': build_account_identity(probe=False),
         **_build_user_prompt_payload(recent_user_prompts),
     }
 
