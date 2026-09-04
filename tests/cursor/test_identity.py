@@ -130,12 +130,13 @@ class TestReadCursorItemTable(unittest.TestCase):
         result = unbound._read_cursor_item_table(self.db_path, ["nonexistent/key"])
         self.assertNotIn("nonexistent/key", result)
 
-    def test_missing_file_returns_empty_dict(self):
+    def test_missing_file_reports_unreadable(self):
+        """None means "could not read"; {} would mean "read fine, signed out"."""
         result = unbound._read_cursor_item_table(
             self.tmp / "does_not_exist.vscdb",
             ["cursorAuth/cachedEmail"],
         )
-        self.assertEqual(result, {})
+        self.assertIsNone(result)
 
     def test_missing_file_does_not_raise(self):
         try:
@@ -173,17 +174,47 @@ class TestUnreadableStateDb(unittest.TestCase):
 
     def test_an_unreadable_database_falls_back_to_the_last_account(self):
         unbound.read_account_identity()
-        with patch.object(unbound, "_read_cursor_item_table", return_value={}):
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None):
             result = unbound.read_account_identity()
         self.assertEqual(result["user_email"], "user@acme.io")
         self.assertEqual(result["email_domain"], "acme.io")
         self.assertEqual(result["plan"], "pro")
 
-    def test_no_cache_and_no_database_reports_nothing(self):
+    def test_a_signed_out_account_is_not_restored_from_the_cache(self):
+        """A database that reads fine and holds no account means signed out.
+        Reusing the last account there hands the previous approval to whoever
+        signs in next."""
+        unbound.read_account_identity()
         with patch.object(unbound, "_read_cursor_item_table", return_value={}):
             result = unbound.read_account_identity()
         self.assertIsNone(result["user_email"])
         self.assertIsNone(result["email_domain"])
+        self.assertNotIn("cursor_account", json.loads(self.cache.read_text()))
+
+    def test_a_stale_cache_is_not_used(self):
+        unbound.read_account_identity()
+        data = json.loads(self.cache.read_text(encoding="utf-8"))
+        data["cursor_account"]["seen_at"] -= unbound.ACCOUNT_CACHE_MAX_AGE_SECONDS + 60
+        self.cache.write_text(json.dumps(data), encoding="utf-8")
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None):
+            result = unbound.read_account_identity()
+        self.assertIsNone(result["user_email"])
+
+    def test_no_cache_and_no_database_reports_nothing(self):
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None):
+            result = unbound.read_account_identity()
+        self.assertIsNone(result["user_email"])
+        self.assertIsNone(result["email_domain"])
+
+    def test_the_event_email_replaces_a_cached_domain(self):
+        """The gate matches on email_domain, so a domain left over from another
+        account would evaluate an outside address as approved."""
+        unbound.read_account_identity()
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity({"user_email": "attacker@gmail.com"})
+        self.assertEqual(identity["user_email"], "attacker@gmail.com")
+        self.assertEqual(identity["email_domain"], "gmail.com")
 
     def test_a_write_ahead_log_value_is_visible(self):
         """The old immutable open ignored the -wal, so a value Cursor had not yet

@@ -44,6 +44,10 @@ DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 CURSOR_DB_TIMEOUT_SECONDS = 2
+# The cached account only covers a database we could not read, so it is bounded:
+# stale beyond this and the hook reports no account instead.
+ACCOUNT_CACHE_MAX_AGE_SECONDS = 12 * 3600
+ACCOUNT_CACHE_REFRESH_SECONDS = 15 * 60
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -1037,11 +1041,13 @@ def _read_cursor_item_table(db_path, keys):
     # mode=ro first: an immutable open ignores the -wal file, so a value Cursor
     # wrote but has not checkpointed reads back as missing, and the account then
     # looks unidentified. immutable stays as the fallback for a db with no -shm.
+    readable = False
     for uri in (f"file:{quoted}?mode=ro", f"file:{quoted}?mode=ro&immutable=1"):
         conn = None
         try:
             conn = sqlite3.connect(uri, uri=True, timeout=CURSOR_DB_TIMEOUT_SECONDS)
             values = {key: value for key, value in conn.execute(sql, keys).fetchall()}
+            readable = True
             if values:
                 return values
         except Exception:
@@ -1052,41 +1058,52 @@ def _read_cursor_item_table(db_path, keys):
                     conn.close()
                 except Exception:
                     pass
-    return {}
+    # None means "could not read", {} means "read fine, no such rows". A signed
+    # out user is the second, and must not be given the previous account.
+    return {} if readable else None
 
 
 def read_account_identity():
     plan = None
     email = None
+    unreadable = False
     try:
         db_path = _cursor_state_db_path()
         if db_path and db_path.exists():
             values = _read_cursor_item_table(
                 db_path, ['cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType']
             )
-            email = (values.get('cursorAuth/cachedEmail') or '').strip() or None
-            plan = values.get('cursorAuth/stripeMembershipType') or None
+            if values is None:
+                unreadable = True
+            else:
+                email = (values.get('cursorAuth/cachedEmail') or '').strip() or None
+                plan = values.get('cursorAuth/stripeMembershipType') or None
     except Exception:
-        pass
-    # A read that comes back empty means the database was busy or the account is
-    # only in the -wal, not that the user is signed out. Reporting nothing there
-    # makes an approved account look unidentified, and an account-access policy
-    # then refuses it.
-    if not email:
-        email, plan = _cached_account(plan)
-    elif plan:
+        unreadable = True
+    if email:
         _remember_account(email, plan)
+    elif unreadable:
+        # Only when the read itself failed. A database that reads fine and holds
+        # no account means signed out, and reusing the last account there would
+        # hand a signed-out or switched user the previous approval.
+        email, plan = _cached_account(plan)
+    else:
+        _forget_account()
     return {
         'org_id': None,
         'plan': plan,
         'auth_mode': None,
         'user_email': email,
+        # Always derived from the email actually reported: a domain kept from a
+        # different account is the one field the gate matches on.
         'email_domain': _email_domain(email),
     }
 
 
 def _cached_account(plan):
-    """Last account this hook read successfully. Never raises."""
+    """Last account this hook read successfully, if it is still fresh. The age
+    bound keeps a machine that stops reporting from carrying an approval forever.
+    Never raises."""
     try:
         loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
     except Exception:
@@ -1096,9 +1113,32 @@ def _cached_account(plan):
     account = loaded.get('cursor_account')
     if not isinstance(account, dict):
         return None, plan
+    seen_at = account.get('seen_at')
+    if not isinstance(seen_at, (int, float)):
+        return None, plan
+    if (time.time() - seen_at) > ACCOUNT_CACHE_MAX_AGE_SECONDS:
+        return None, plan
     email = account.get('user_email')
     email = email.strip() if isinstance(email, str) else None
     return (email or None), (plan or account.get('plan'))
+
+
+def _forget_account():
+    """Drop the cached account on a clean read with nobody signed in."""
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return
+    if not isinstance(loaded, dict) or 'cursor_account' not in loaded:
+        return
+    try:
+        del loaded['cursor_account']
+        IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps(loaded), encoding='utf-8')
+        os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+    except Exception:
+        pass
 
 
 def _remember_account(email, plan):
@@ -1111,9 +1151,15 @@ def _remember_account(email, plan):
                 data = loaded
         except Exception:
             data = {}
-        if data.get('cursor_account') == {'user_email': email, 'plan': plan}:
+        current = data.get('cursor_account')
+        if (isinstance(current, dict) and current.get('user_email') == email
+                and current.get('plan') == plan
+                and isinstance(current.get('seen_at'), (int, float))
+                and (time.time() - current['seen_at']) < ACCOUNT_CACHE_REFRESH_SECONDS):
             return
-        data['cursor_account'] = {'user_email': email, 'plan': plan}
+        data['cursor_account'] = {
+            'user_email': email, 'plan': plan, 'seen_at': int(time.time()),
+        }
         IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
         tmp.write_text(json.dumps(data), encoding='utf-8')
@@ -1241,9 +1287,10 @@ def build_account_identity(event=None, probe=False):
         if isinstance(event, dict):
             email = (event.get('user_email') or '').strip() or None
             if email:
+                # Recompute, never keep: a domain left over from another account
+                # is the field the gate matches on.
                 identity['user_email'] = email
-                if not identity.get('email_domain'):
-                    identity['email_domain'] = _email_domain(email)
+                identity['email_domain'] = _email_domain(email)
         serial = _device_serial(probe=probe)
         if serial:
             identity['device_serial'] = serial
