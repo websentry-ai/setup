@@ -27,22 +27,20 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'bin:gk',
                 )
 
-    def test_bare_vscode_provider_uses_provider_identity(self):
+    def test_bare_vscode_provider_is_not_a_fingerprint(self):
         additional_data = {
             'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
             'providerServerId': 'eamodio.gitlens/GitKraken',
         }
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
-                self.assertEqual(
+                self.assertIsNone(
                     hook.compute_mcp_cache_key(
                         'GitKraken', None, None, [], additional_data,
-                    ),
-                    'vscode-provider:eamodio.gitlens/gitlens.gkmcpprovider:'
-                    'eamodio.gitlens/gitkraken',
+                    )
                 )
 
-    def test_cached_vscode_provider_uses_provider_identity(self):
+    def test_cached_vscode_provider_keeps_launch_identity(self):
         additional_data = {
             'scope': 'vscode-provider-cache',
             'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
@@ -54,22 +52,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     hook.compute_mcp_cache_key(
                         'GitKraken', 'gk', None, ['mcp'], additional_data,
                     ),
-                    'vscode-provider:eamodio.gitlens/gitlens.gkmcpprovider:'
-                    'eamodio.gitlens/gitkraken',
-                )
-
-    def test_vscode_provider_identity_respects_fingerprint_column_limit(self):
-        provider_id = f"{'a' * 128}/{'b' * 128}"
-        additional_data = {
-            'providerId': provider_id,
-            'providerServerId': provider_id,
-        }
-        for hook in HOOKS:
-            with self.subTest(hook=hook.__file__):
-                self.assertIsNone(
-                    hook.compute_mcp_cache_key(
-                        'provider', 'node', None, [], additional_data,
-                    )
+                    'bin:gk',
                 )
 
     def test_http_provider_keeps_url_bound_identity(self):
