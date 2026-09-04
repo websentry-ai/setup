@@ -138,6 +138,8 @@ class TestMcpFingerprintParity(unittest.TestCase):
             ('npx', ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server']),
             ('npx', ['-y', '@smithery/cli@npm:evil', 'run', '@vendor/server']),
             ('npx', ['-y', '@smithery/cli@.', 'run', '@vendor/server']),
+            ('npx', ['-y', '@smithery/cli@...', 'run', '@vendor/server']),
+            ('npx', ['-y', '@smithery/cli@.hidden', 'run', '@vendor/server']),
             ('npx', ['-y', 'smithery@..', 'mcp', 'run', 'vendor/server']),
             ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server@npm:evil']),
             ('npm', ['exec', '@smithery/cli', 'run', '@vendor/server']),
@@ -148,6 +150,20 @@ class TestMcpFingerprintParity(unittest.TestCase):
         for hook in HOOKS:
             for command, args in vectors:
                 with self.subTest(hook=hook.__file__, command=command, args=args):
+                    self.assertIsNone(
+                        hook.compute_mcp_cache_key('alias', command, None, args)
+                    )
+
+    def test_smithery_rejects_path_qualified_launchers(self):
+        vectors = [
+            ('./smithery', ['run', '@vendor/server']),
+            ('/tmp/evil/smithery', ['run', '@vendor/server']),
+            (r'C:\evil\smithery.exe', ['run', '@vendor/server']),
+            ('./npx', ['-y', '@smithery/cli', 'run', '@vendor/server']),
+        ]
+        for hook in HOOKS:
+            for command, args in vectors:
+                with self.subTest(hook=hook.__file__, command=command):
                     self.assertIsNone(
                         hook.compute_mcp_cache_key('alias', command, None, args)
                     )
@@ -195,6 +211,24 @@ class TestMcpFingerprintParity(unittest.TestCase):
                 ['tool', 'exec', '--source',
                  'https://api.nuget.org/v3/index.json', 'Example.Server@2.0.0'],
                 'nuget:example.server',
+            ),
+            (
+                'dotnet',
+                ['tool', 'exec', '--version', '2.0.0', '--source',
+                 'https://api.nuget.org/v3/index.json', 'Example.Server'],
+                'nuget:example.server',
+            ),
+            (
+                'dotnet',
+                ['tool', 'exec', '--source',
+                 'https://api.nuget.org/v3/index.json', 'Example.Server'],
+                'url-arg:api.nuget.org/v3/index.json',
+            ),
+            (
+                '/tmp/dotnet',
+                ['tool', 'exec', 'Example.Server@2.0.0', '--source',
+                 'https://api.nuget.org/v3/index.json'],
+                'url-arg:api.nuget.org/v3/index.json',
             ),
             (
                 'dotnet',
