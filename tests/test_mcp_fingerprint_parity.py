@@ -125,12 +125,23 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'npm:@vendor/wrapper',
                 )
 
+    def test_smithery_argument_preserves_bare_launcher(self):
+        args = ['wrapper-mcp', '@smithery/cli', 'run', '@vendor/server']
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key('alias', 'npx', None, args),
+                    'npm:wrapper-mcp',
+                )
+
     def test_smithery_rejects_execution_changing_inputs(self):
         vectors = [
             ('npx', ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server']),
             ('npx', ['-y', '@smithery/cli@npm:evil', 'run', '@vendor/server']),
             ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server@npm:evil']),
             ('npm', ['exec', '@smithery/cli', 'run', '@vendor/server']),
+            ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server', '--package=evil']),
+            ('npm', ['exec', '--', '@smithery/cli', 'run', '@vendor/server', '--call=evil']),
             ('cmd', ['/c', 'npx', '@smithery/cli', 'run', '@vendor/server', '&', 'evil']),
         ]
         for hook in HOOKS:
