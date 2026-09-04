@@ -7,7 +7,9 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import json
 import os
+import ntpath
 import platform
+import posixpath
 import stat
 import subprocess
 from pathlib import Path, PureWindowsPath
@@ -20,8 +22,9 @@ import sqlite3
 import shutil
 import urllib.request
 import uuid
-from typing import Any, Dict, List, Optional
-from urllib.parse import unquote, urlparse
+from contextlib import closing
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import unquote, urlparse, urlunsplit
 
 
 def _copilot_home():
@@ -1670,13 +1673,346 @@ def _extract_mcp_server_fields(server):
         return None
     result = {
         key: server[key]
-        for key in ('url', 'command', 'args', 'type')
+        for key in ('url', 'command', 'args', 'type', 'cwd')
         if server.get(key)
     }
     return result or None
 
 
+def _mcp_launch_identity(server):
+    if not isinstance(server, dict):
+        return None
+    args = server.get('args')
+    return (
+        server.get('command'),
+        server.get('url'),
+        tuple(args) if isinstance(args, list) else (),
+        server.get('cwd'),
+    )
+
+
+def _mcp_provider_identity(server):
+    if not isinstance(server, dict):
+        return None
+    additional_data = server.get('additional_data')
+    if not isinstance(additional_data, dict):
+        return None
+    provider_id = additional_data.get('providerId')
+    server_id = additional_data.get('providerServerId')
+    if not isinstance(provider_id, str) or not isinstance(server_id, str):
+        return None
+    return provider_id, server_id
+
+
 _MCP_CONFIG_MAX_BYTES = 1_000_000
+_VSCODE_MCP_PROVIDER_CACHE_KEY = 'mcp.extCachedServers'
+_VSCODE_MCP_PROVIDER_CACHE_MAX_BYTES = 5 * 1024 * 1024
+_VSCODE_MCP_STATE_DATABASE_MAX_COUNT = 100
+_VSCODE_MCP_PROVIDER_MAX_COUNT = 200
+_VSCODE_MCP_SERVERS_PER_PROVIDER_MAX_COUNT = 100
+_VSCODE_MCP_SERVER_MAX_COUNT = 500
+_VSCODE_WORKSPACE_METADATA_MAX_BYTES = 64 * 1024
+
+
+def _vscode_mcp_state_databases():
+    paths = []
+    patterns = (
+        'globalStorage/state.vscdb',
+        'workspaceStorage/*/state.vscdb',
+        'profiles/*/globalStorage/state.vscdb',
+        'profiles/*/workspaceStorage/*/state.vscdb',
+    )
+    for user_dir in _vscode_user_dirs():
+        for pattern in patterns:
+            try:
+                paths.extend(path for path in user_dir.glob(pattern) if path.is_file())
+            except OSError:
+                continue
+
+    def modified_at(path):
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    ordered = sorted(set(paths), key=lambda path: (-modified_at(path), str(path)))
+    return ordered[:_VSCODE_MCP_STATE_DATABASE_MAX_COUNT]
+
+
+def _read_vscode_mcp_provider_cache(path):
+    try:
+        database_uri = f'{path.resolve().as_uri()}?mode=ro'
+        with closing(sqlite3.connect(database_uri, uri=True, timeout=1.0)) as connection:
+            size_row = connection.execute(
+                'SELECT length(CAST(value AS BLOB)) FROM ItemTable WHERE key = ? LIMIT 1',
+                (_VSCODE_MCP_PROVIDER_CACHE_KEY,),
+            ).fetchone()
+            if not size_row or not isinstance(size_row[0], int):
+                return None
+            if size_row[0] > _VSCODE_MCP_PROVIDER_CACHE_MAX_BYTES:
+                return None
+            value_row = connection.execute(
+                'SELECT value FROM ItemTable WHERE key = ? LIMIT 1',
+                (_VSCODE_MCP_PROVIDER_CACHE_KEY,),
+            ).fetchone()
+    except (OSError, sqlite3.Error) as error:
+        log_error(f'copilot mcp provider cache read failed path={path} err={error}', 'mcp_config')
+        return None
+
+    if not value_row:
+        return None
+    value = value_row[0]
+    if isinstance(value, bytes):
+        try:
+            value = value.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    try:
+        cache = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return cache if isinstance(cache, dict) else None
+
+
+def _vscode_workspace_uri_path(uri):
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != 'file':
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', '')) or None
+
+    path = unquote(parsed.path)
+    if platform.system() == 'Windows':
+        windows_path = path.replace('/', '\\')
+        if parsed.netloc:
+            return f'\\\\{parsed.netloc}{windows_path}'
+        if re.match(r'^/[A-Za-z]:', path):
+            windows_path = windows_path[1:]
+        return windows_path or None
+    if parsed.netloc:
+        return f'//{parsed.netloc}{path}'
+    return path or None
+
+
+def _vscode_cache_scope(path):
+    for user_dir in _vscode_user_dirs():
+        try:
+            relative_parts = path.relative_to(user_dir).parts
+        except ValueError:
+            continue
+
+        if 'workspaceStorage' in relative_parts:
+            metadata_path = path.parent / 'workspace.json'
+            try:
+                with metadata_path.open('rb') as metadata_file:
+                    raw_metadata = metadata_file.read(
+                        _VSCODE_WORKSPACE_METADATA_MAX_BYTES + 1
+                    )
+                if len(raw_metadata) > _VSCODE_WORKSPACE_METADATA_MAX_BYTES:
+                    return None
+                metadata = json.loads(raw_metadata.decode('utf-8'))
+            except (OSError, UnicodeDecodeError, ValueError):
+                return None
+            if not isinstance(metadata, dict):
+                return None
+            workspace_uri = metadata.get('folder') or metadata.get('workspace')
+            if not isinstance(workspace_uri, str) or not workspace_uri:
+                return None
+            return _vscode_workspace_uri_path(workspace_uri)
+
+        if len(relative_parts) >= 3 and relative_parts[0] == 'profiles':
+            return str(user_dir / 'profiles' / relative_parts[1])
+        if relative_parts == ('globalStorage', 'state.vscdb'):
+            return str(user_dir)
+    return None
+
+
+def _vscode_cache_profile(path):
+    for user_dir in _vscode_user_dirs():
+        try:
+            relative_parts = path.relative_to(user_dir).parts
+        except ValueError:
+            continue
+        if len(relative_parts) >= 2 and relative_parts[0] == 'profiles':
+            return relative_parts[1]
+    return None
+
+
+def _running_with_elevated_privileges():
+    if platform.system() == 'Windows':
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return True
+    try:
+        return os.geteuid() == 0 or os.geteuid() != os.getuid()
+    except (AttributeError, OSError):
+        return True
+
+
+def _vscode_workspace_scope_matches(
+    path,
+    scope,
+    cwd,
+    skip_filesystem_probe=False,
+):
+    if not cwd or 'workspaceStorage' not in path.parts:
+        return True
+    if '://' in scope or scope.lower().endswith('.code-workspace'):
+        return True
+    if skip_filesystem_probe:
+        path_type = PureWindowsPath if platform.system() == 'Windows' else Path
+        path_module = ntpath if platform.system() == 'Windows' else posixpath
+        workspace = path_type(path_module.normpath(scope))
+        current = path_type(path_module.normpath(cwd))
+    else:
+        try:
+            workspace = Path(scope).resolve()
+            current = Path(cwd).resolve()
+        except OSError:
+            workspace = Path(scope)
+            current = Path(cwd)
+    return current == workspace or workspace in current.parents
+
+
+def _vscode_cached_launch_fields(launch, skip_command_probe=False):
+    if not isinstance(launch, dict):
+        return None
+    transport_type = launch.get('type')
+    command = launch.get('command')
+    if transport_type == 1 and isinstance(command, str) and command:
+        args = launch.get('args')
+        env = launch.get('env')
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            return None
+        if not isinstance(env, dict):
+            return None
+        fields = {'type': 'stdio', 'command': command}
+        fields['args'] = args
+        cwd = launch.get('cwd')
+        if isinstance(cwd, str) and cwd:
+            fields['cwd'] = cwd
+        expanded_command = os.path.expandvars(os.path.expanduser(command))
+        expanded_cwd = (
+            os.path.expandvars(os.path.expanduser(cwd))
+            if isinstance(cwd, str)
+            else ''
+        )
+        if platform.system() == 'Windows' and any(
+            value.replace('/', '\\').startswith('\\\\')
+            for value in (expanded_command, expanded_cwd)
+        ):
+            return None
+        if not skip_command_probe:
+            expanded = Path(expanded_command)
+            if expanded.is_absolute():
+                if not expanded.is_file():
+                    return None
+            elif cwd:
+                expanded_cwd_path = Path(expanded_cwd)
+                if (
+                    not (expanded_cwd_path / expanded).is_file()
+                    and shutil.which(str(expanded)) is None
+                ):
+                    return None
+            elif shutil.which(str(expanded)) is None:
+                return None
+        return fields
+    if transport_type == 2:
+        uri = launch.get('uri')
+        if not isinstance(uri, dict):
+            return None
+        scheme = uri.get('scheme')
+        authority = uri.get('authority')
+        path = uri.get('path', '')
+        if (
+            not isinstance(scheme, str)
+            or scheme.lower() not in ('http', 'https')
+            or not isinstance(authority, str)
+            or not authority
+            or not isinstance(path, str)
+        ):
+            return None
+        parsed = urlparse(urlunsplit((scheme, authority, path, '', '')))
+        hostname = parsed.hostname or ''
+        if not hostname:
+            return None
+        if ':' in hostname and not hostname.startswith('['):
+            hostname = f'[{hostname}]'
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        netloc = f'{hostname}:{port}' if port is not None else hostname
+        return {
+            'type': 'http',
+            'url': urlunsplit((scheme.lower(), netloc, path, '', '')),
+        }
+    return None
+
+
+def _vscode_cached_mcp_servers(cwd=None):
+    servers = []
+    seen = set()
+    skip_filesystem_probe = _running_with_elevated_privileges()
+    for path in _vscode_mcp_state_databases():
+        scope = _vscode_cache_scope(path)
+        profile_id = _vscode_cache_profile(path)
+        if scope is None or not _vscode_workspace_scope_matches(
+            path,
+            scope,
+            cwd,
+            skip_filesystem_probe,
+        ):
+            continue
+        cache = _read_vscode_mcp_provider_cache(path)
+        if not cache:
+            continue
+        for provider_index, (provider_id, provider) in enumerate(cache.items()):
+            if provider_index >= _VSCODE_MCP_PROVIDER_MAX_COUNT:
+                break
+            if not isinstance(provider_id, str) or not isinstance(provider, dict):
+                continue
+            cached_servers = provider.get('servers')
+            if not isinstance(cached_servers, list):
+                continue
+            for cached_server in cached_servers[:_VSCODE_MCP_SERVERS_PER_PROVIDER_MAX_COUNT]:
+                if len(servers) >= _VSCODE_MCP_SERVER_MAX_COUNT:
+                    return servers
+                if not isinstance(cached_server, dict):
+                    continue
+                fields = _vscode_cached_launch_fields(
+                    cached_server.get('launch'),
+                    skip_filesystem_probe,
+                )
+                if fields is None:
+                    continue
+                server_id = cached_server.get('id')
+                if not isinstance(server_id, str) or not server_id:
+                    continue
+                label = cached_server.get('label')
+                if not isinstance(label, str) or not label:
+                    label = server_id
+                identity = (scope, profile_id, provider_id, server_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                fields['additional_data'] = {
+                    'scope': VSCODE_PROVIDER_CACHE_SCOPE,
+                    'providerId': provider_id,
+                    'providerServerId': server_id,
+                    **(
+                        {'providerProfileId': profile_id}
+                        if profile_id is not None
+                        else {}
+                    ),
+                }
+                servers.append((label, fields))
+    return servers
 
 # KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
 # Fingerprints key the local tool-hash cache; Redis tool scores are separately
@@ -1694,6 +2030,7 @@ _UNBOUND_CODING_TOOL = 'GitHub Copilot CLI'
 CLAUDE_BUILTIN_PREFIX = 'claude-builtin:'
 
 CLAUDE_CONNECTOR_SCOPE = 'claude-connector'
+VSCODE_PROVIDER_CACHE_SCOPE = 'vscode-provider-cache'
 
 # Claude Code sanitizes display names into runtime names (non-alphanumerics -> '_'), so one
 # server arrives under several spellings. chrome/browser/preview stay separate: different tools.
@@ -1722,6 +2059,8 @@ CLAUDEAI_ALLOWED_ADDITIONAL_DATA = ({}, {'scope': 'claudeai'})
 
 # npm-package runners: the first positional arg is the package to run.
 NPM_RUNNERS = frozenset({'npx', 'npm', 'bunx'})
+SMITHERY_CLI_PACKAGES = frozenset({'@smithery/cli', 'smithery'})
+SMITHERY_GLOBAL_FLAGS = frozenset({'--verbose', '--debug', '--json', '--table'})
 # Sub-runners under npx/bunx that are not the package themselves (the real
 # target -- usually a local script -- follows).
 NPX_LOCAL_RUNNERS = frozenset({'tsx', 'ts-node'})
@@ -1730,6 +2069,7 @@ NPM_SUBCOMMANDS = frozenset({'exec', 'run', 'run-script', 'x', 'create', 'init',
 # Python-package runners and the sub-commands that precede the package.
 PYPI_RUNNERS = frozenset({'uvx', 'uv', 'pipx'})
 PYPI_SUBCOMMANDS = frozenset({'run', 'tool', 'tool-run'})
+NUGET_RUNNERS = frozenset({'dnx', 'dotnet'})
 
 # Prompt Security's MCP proxy wraps the real server command after this token.
 PROMPT_SECURITY_BASENAME = 'prompt_security_mcp'
@@ -1746,7 +2086,7 @@ RUNTIMES = frozenset({
 # Commands that have their own rule (or are runtimes) -- excluded from the
 # catch-all `bin:` tier so they don't double-resolve.
 BIN_SKIP_COMMANDS = (
-    RUNTIMES | NPM_RUNNERS | PYPI_RUNNERS
+    RUNTIMES | NPM_RUNNERS | PYPI_RUNNERS | NUGET_RUNNERS
     | frozenset({'docker', 'builtin', PROMPT_SECURITY_BASENAME})
 )
 
@@ -1837,6 +2177,13 @@ def _command_base(command: Optional[str]) -> str:
     return _EXE_SUFFIX_RE.sub('', base.lower())
 
 
+def _trusted_launcher_base(command: Optional[str]) -> str:
+    token = _unquote(command).strip() if command else ''
+    if '/' in token or '\\' in token:
+        return ''
+    return _command_base(token)
+
+
 def _unquote(value: str) -> str:
     """Strip surrounding quotes some clients leave in arg values."""
     return value.strip('"\'')
@@ -1859,22 +2206,280 @@ def _looks_like_local_path(value: str) -> bool:
 
 
 def _npm_package_from_args(args: List[str]) -> Optional[str]:
-    """Find the first @scoped npm package in args, stripped of any @version suffix."""
     for arg in args:
         if not isinstance(arg, str) or not arg.startswith('@'):
             continue
-        second_at = arg.find('@', 1)
-        return arg[:second_at] if second_at != -1 else arg
+        return _registry_npm_package(arg)
     return None
 
 
-def _normalize_npm(pkg: str) -> str:
-    """@scope/name@ver -> @scope/name ; name@ver -> name"""
-    p = _unquote(pkg)
-    if p.startswith('@'):
-        i = p.find('@', 1)
-        return p[:i] if i != -1 else p
-    return p.split('@')[0]
+def _registry_npm_package(spec: str) -> Optional[str]:
+    token = _unquote(spec).strip()
+    if token.startswith('@'):
+        version_at = token.find('@', 1)
+        package = token if version_at == -1 else token[:version_at]
+        selector = None if version_at == -1 else token[version_at + 1:]
+        package_pattern = r'@[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]*'
+    else:
+        package, separator, selector = token.partition('@')
+        selector = selector if separator else None
+        package_pattern = r'[a-z0-9][a-z0-9._-]*'
+    if not re.fullmatch(package_pattern, package, re.IGNORECASE):
+        return None
+    if selector is not None and (
+        selector.startswith('.')
+        or not re.fullmatch(r'[a-z0-9*^~<>=.+_-]+', selector, re.IGNORECASE)
+    ):
+        return None
+    return package.lower()
+
+
+def _smithery_server_identity(value: str) -> Optional[str]:
+    target = _unquote(value).strip()
+    if target.startswith('@'):
+        target = target[1:]
+    pattern = r'[a-z0-9][a-z0-9._-]*(?:/[a-z0-9][a-z0-9._-]*)?'
+    return target.lower() if re.fullmatch(pattern, target, re.IGNORECASE) else None
+
+
+def _is_registry_resolved_smithery_cli(value: str) -> bool:
+    return _unquote(value).strip().lower() in {
+        '@smithery/cli@latest',
+        'smithery@latest',
+    }
+
+
+def _smithery_command_target(tokens: List[str]) -> Optional[str]:
+    while tokens and str(tokens[0]).lower() in SMITHERY_GLOBAL_FLAGS:
+        tokens = tokens[1:]
+    if tokens and str(tokens[0]).lower() == 'mcp':
+        tokens = tokens[1:]
+        while tokens and str(tokens[0]).lower() in SMITHERY_GLOBAL_FLAGS:
+            tokens = tokens[1:]
+    if not tokens or str(tokens[0]).lower() != 'run':
+        return None
+
+    target = None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if not isinstance(token, str):
+            return None
+        lower = token.lower()
+        if lower in {'--config', '--key'}:
+            if (
+                index + 1 >= len(tokens)
+                or not isinstance(tokens[index + 1], str)
+                or tokens[index + 1].startswith('-')
+            ):
+                return None
+            index += 2
+            continue
+        if any(lower.startswith(f'{flag}=') for flag in ('--config', '--key')):
+            if not token.partition('=')[2]:
+                return None
+            index += 1
+            continue
+        if token.startswith('-') or target is not None:
+            return None
+        target = _smithery_server_identity(token)
+        if target is None:
+            return None
+        index += 1
+    return target
+
+
+def _smithery_run_target(
+    args: List[str],
+    command_base: str,
+    launcher_trusted: bool,
+) -> Optional[Tuple[str, bool]]:
+    if command_base == 'smithery':
+        target = _smithery_command_target(args)
+        return (target, False) if target else None
+    if command_base == 'cmd' and any(
+        isinstance(arg, str) and re.search(r'[&|<>^\r\n]', arg)
+        for arg in args
+    ):
+        return None
+
+    for index, arg in enumerate(args):
+        if (
+            not isinstance(arg, str)
+            or _registry_npm_package(arg) not in SMITHERY_CLI_PACKAGES
+        ):
+            continue
+        prefix_tokens = []
+        for prefix_arg in args[:index]:
+            if not isinstance(prefix_arg, str):
+                return None
+            prefix_tokens.append(_unquote(prefix_arg).lower())
+
+        def valid_runner_prefix(runner, tokens):
+            safe_flags = {'-y', '--yes'}
+            if runner in {'bunx', 'bun'}:
+                safe_flags.update({'--bun', '--no-install', '--verbose', '--silent'})
+            if runner == 'npm':
+                safe_flags.add('--')
+            if any(token.startswith('-') and token not in safe_flags for token in tokens):
+                return False
+            positional = [token for token in tokens if token not in safe_flags]
+            if runner == 'npm':
+                return tokens[-1:] == ['--'] and positional in (['exec'], ['x'])
+            if runner == 'bun':
+                return positional == ['x']
+            return not positional
+
+        if command_base in NPM_RUNNERS:
+            if not valid_runner_prefix(command_base, prefix_tokens):
+                return None
+        elif command_base == 'bun':
+            if not valid_runner_prefix(command_base, prefix_tokens):
+                return None
+        elif command_base == 'cmd':
+            runner_positions = [
+                offset for offset, token in enumerate(prefix_tokens)
+                if _trusted_launcher_base(token) in NPM_RUNNERS | {'bun'}
+            ]
+            if len(runner_positions) != 1:
+                return None
+            runner_index = runner_positions[0]
+            shell_prefix = prefix_tokens[:runner_index]
+            if '/c' not in shell_prefix or any(
+                token not in {'/c', '/d', '/s'} for token in shell_prefix
+            ):
+                return None
+            if not valid_runner_prefix(
+                _trusted_launcher_base(prefix_tokens[runner_index]),
+                prefix_tokens[runner_index + 1:],
+            ):
+                return None
+        else:
+            return None
+        target = _smithery_command_target(args[index + 1:])
+        if target is None:
+            return None
+        registry_resolved = (
+            launcher_trusted
+            and command_base in {'npx', 'npm'}
+            and _is_registry_resolved_smithery_cli(arg)
+        )
+        return target, registry_resolved
+    return None
+
+
+def _nuget_package(base: str, args: List[str]) -> Optional[str]:
+    if base == 'dnx':
+        tokens = args
+    elif base == 'dotnet' and args and str(args[0]).lower() == 'dnx':
+        tokens = args[1:]
+    elif (
+        base == 'dotnet'
+        and len(args) >= 2
+        and str(args[0]).lower() == 'tool'
+        and str(args[1]).lower() in {'exec', 'execute'}
+    ):
+        tokens = args[2:]
+    else:
+        return None
+
+    if any(
+        isinstance(arg, str)
+        and (
+            arg.lower() == '--configfile'
+            or arg.lower().startswith('--configfile=')
+            or arg.lower().startswith('--configfile:')
+            or arg.lower() == '--add-source'
+            or arg.lower().startswith('--add-source=')
+            or arg.lower().startswith('--add-source:')
+        )
+        for arg in tokens
+    ):
+        return None
+
+    source_flags = {'--source', '-s'}
+    source_seen = False
+    for index, arg in enumerate(tokens):
+        if not isinstance(arg, str):
+            continue
+        if arg == '--':
+            break
+        value = None
+        if arg.lower() in source_flags:
+            value = tokens[index + 1] if index + 1 < len(tokens) else None
+        elif any(
+            arg.lower().startswith((f'{flag}=', f'{flag}:'))
+            for flag in source_flags
+        ):
+            value = re.split(r'[=:]', arg, maxsplit=1)[1]
+        if value is None:
+            continue
+        source_seen = True
+        if not isinstance(value, str):
+            return None
+        parsed = urlparse(_unquote(value))
+        if parsed.scheme not in {'http', 'https'} or parsed.hostname not in {
+            'api.nuget.org', 'nuget.org', 'www.nuget.org',
+        }:
+            return None
+    if not source_seen:
+        return None
+
+    value_options = {
+        '--version', '--framework', '--arch', '-a', '--verbosity', '-v',
+        '--configfile', '--source', '-s',
+    }
+    flag_options = {
+        '--prerelease', '--allow-roll-forward', '--ignore-failed-sources',
+        '--interactive', '--yes', '-y', '--disable-parallel', '--no-cache',
+        '--no-http-cache',
+    }
+    candidate = None
+    version = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == '--':
+            if candidate is None:
+                return None
+            break
+        if not isinstance(token, str):
+            return None
+        lower = token.lower()
+        option = re.split(r'[=:]', lower, maxsplit=1)[0]
+        has_attached_value = len(option) < len(token)
+        if option in value_options:
+            if option == '--version':
+                value = token[len(option) + 1:] if has_attached_value else (
+                    tokens[index + 1] if index + 1 < len(tokens) else None
+                )
+                if not isinstance(value, str) or version is not None:
+                    return None
+                version = _unquote(value)
+            index += 1 if has_attached_value else 2
+            continue
+        if lower in flag_options:
+            index += 1
+            continue
+        if token.startswith('-'):
+            return None
+        if candidate is not None:
+            return None
+        candidate = token
+        index += 1
+    if not isinstance(candidate, str):
+        return None
+    package, separator, inline_version = _unquote(candidate).partition('@')
+    if separator:
+        if version is not None:
+            return None
+        version = inline_version
+    if not version or not re.fullmatch(
+        r'(?:\*|[0-9][a-z0-9*.+_-]*)', version, re.IGNORECASE,
+    ):
+        return None
+    package = package.lower()
+    return package if re.fullmatch(r'[a-z0-9][a-z0-9._-]*', package) else None
 
 
 def _normalize_pypi(pkg: str) -> str:
@@ -1929,6 +2534,72 @@ def _package_from_runner_args(args: List[str], skip: frozenset) -> Optional[str]
             return None
         return t
     return None
+
+
+def _npm_runner_invocation(
+    command_base: str,
+    args: List[str],
+) -> Optional[Tuple[str, List[str]]]:
+    if command_base in NPM_RUNNERS:
+        return command_base, args
+    if command_base == 'bun':
+        if args and isinstance(args[0], str) and _unquote(args[0]).lower() == 'x':
+            return command_base, args[1:]
+        return None
+    if command_base != 'cmd' or any(
+        not isinstance(arg, str) or re.search(r'[&|<>^\r\n]', arg)
+        for arg in args
+    ):
+        return None
+    runner_positions = [
+        index for index, arg in enumerate(args)
+        if _trusted_launcher_base(arg) in NPM_RUNNERS | {'bun'}
+    ]
+    if len(runner_positions) != 1:
+        return None
+    runner_index = runner_positions[0]
+    shell_prefix = [_unquote(arg).lower() for arg in args[:runner_index]]
+    if '/c' not in shell_prefix or any(
+        token not in {'/c', '/d', '/s'} for token in shell_prefix
+    ):
+        return None
+    runner = _trusted_launcher_base(args[runner_index])
+    nested_args = args[runner_index + 1:]
+    if runner == 'bun':
+        if not nested_args or _unquote(nested_args[0]).lower() != 'x':
+            return None
+        nested_args = nested_args[1:]
+    return runner, nested_args
+
+
+def _npm_package_before_smithery(runner: str, args: List[str]) -> Optional[str]:
+    safe_flags = {'-y', '--yes', '--'}
+    if runner in {'bun', 'bunx'}:
+        safe_flags.update({'--bun', '--no-install', '--verbose', '--silent'})
+    npm_command_seen = runner != 'npm'
+    candidate = None
+    for arg in args:
+        if not isinstance(arg, str):
+            return None
+        if _registry_npm_package(arg) in SMITHERY_CLI_PACKAGES:
+            break
+        token = _unquote(arg)
+        lower = token.lower()
+        if token.startswith('-'):
+            if lower not in safe_flags:
+                return None
+            continue
+        if not npm_command_seen:
+            if lower not in {'exec', 'x'}:
+                return None
+            npm_command_seen = True
+            continue
+        if _trusted_launcher_base(token) in NPM_RUNNERS | {'bun'}:
+            return None
+        if candidate is not None or _looks_like_local_path(token):
+            return None
+        candidate = token
+    return candidate if npm_command_seen else None
 
 
 # `docker run` BOOLEAN flags — the closed, stable set that consumes NO value.
@@ -2042,6 +2713,7 @@ def compute_fingerprint(
     safe_args = args or []
     safe_additional_data = additional_data or {}
     base = _command_base(command)
+    launcher_base = _trusted_launcher_base(command)
 
     # 0. Prompt Security proxy: the real server command follows `__args__`.
     #    Unwrap and fingerprint the inner command instead of the wrapper.
@@ -2086,6 +2758,59 @@ def compute_fingerprint(
         if identity:
             return f'url:{identity}'
 
+    nuget_package = _nuget_package(launcher_base, safe_args)
+    if nuget_package:
+        return f'nuget:{nuget_package}'
+
+    smithery_match = _smithery_run_target(
+        safe_args,
+        base,
+        launcher_trusted=bool(launcher_base),
+    )
+    if smithery_match:
+        smithery_target, registry_resolved = smithery_match
+        prefix = 'smithery' if registry_resolved else 'smithery-unverified'
+        return f'{prefix}:{smithery_target}'
+    if base == 'smithery':
+        return None
+    first_scoped_package = _npm_package_from_args(safe_args)
+    runner_package = None
+    runner_invocation = _npm_runner_invocation(launcher_base, safe_args)
+    if runner_invocation is not None:
+        runner, runner_args = runner_invocation
+        if any(
+            isinstance(arg, str)
+            and _registry_npm_package(arg) in SMITHERY_CLI_PACKAGES
+            for arg in runner_args
+        ):
+            candidate = _npm_package_before_smithery(runner, runner_args)
+        else:
+            candidate = _package_from_runner_args(
+                runner_args,
+                NPX_LOCAL_RUNNERS | NPM_SUBCOMMANDS | NPM_RUNNERS | RUNTIMES,
+            )
+        runner_package = _registry_npm_package(candidate) if candidate else None
+    smithery_index = next((
+        index for index, arg in enumerate(safe_args)
+        if isinstance(arg, str)
+        and _registry_npm_package(arg) in SMITHERY_CLI_PACKAGES
+    ), None)
+    first_scoped_index = next((
+        index for index, arg in enumerate(safe_args)
+        if isinstance(arg, str) and arg.startswith('@')
+    ), None)
+    if (
+        smithery_index is not None
+        and (
+            first_scoped_index is None
+            or first_scoped_index >= smithery_index
+        )
+    ):
+        if launcher_base in NPM_RUNNERS | {'bun', 'cmd'}:
+            if not runner_package or runner_package in SMITHERY_CLI_PACKAGES:
+                return None
+        first_scoped_package = None
+
     # 2. URLs inside args -> url-arg:<identity> (only if all URLs resolve to a single identity)
     url_args = _urls_in_args(safe_args)
     if url_args:
@@ -2102,15 +2827,12 @@ def compute_fingerprint(
         return f'git:{git}'
 
     # 4. @scoped npm package anywhere in args (command-agnostic, original rule)
-    scoped_npm = _npm_package_from_args(safe_args)
-    if scoped_npm:
-        return f'npm:{scoped_npm}'
+    if first_scoped_package:
+        return f'npm:{first_scoped_package}'
 
     # 5. npm package run via npx / npm / bunx (bare or quoted-scoped)
-    if base in NPM_RUNNERS:
-        pkg = _package_from_runner_args(safe_args, NPX_LOCAL_RUNNERS | NPM_SUBCOMMANDS | RUNTIMES)
-        if pkg:
-            return f'npm:{_normalize_npm(pkg)}'
+    if runner_package:
+        return f'npm:{runner_package}'
 
     # 6. Python package run via uvx / uv / pipx
     if base in PYPI_RUNNERS:
@@ -2369,6 +3091,28 @@ def read_copilot_mcp_servers(cwd=None):
             # a genuine read failure, so it's worth surfacing for diagnosis.
             log_error(f"copilot mcp config read failed path={config_path} err={e}", 'mcp_config')
             continue
+    for name, fields in _vscode_cached_mcp_servers(cwd):
+        if name in ambiguous_names:
+            continue
+        if name in server_sources:
+            existing = servers.get(name)
+            existing_provider = _mcp_provider_identity(existing)
+            incoming_provider = _mcp_provider_identity(fields)
+            if (
+                _mcp_launch_identity(existing) != _mcp_launch_identity(fields)
+                or (
+                    existing_provider is not None
+                    and incoming_provider is not None
+                    and existing_provider != incoming_provider
+                )
+            ):
+                servers[name] = None
+                ambiguous_names.add(name)
+                continue
+            servers[name] = {**fields, **existing}
+        else:
+            servers[name] = fields
+            server_sources[name] = 'provider'
     return servers
 
 
