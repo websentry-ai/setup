@@ -81,30 +81,34 @@ class TestMcpFingerprintParity(unittest.TestCase):
 
     def test_smithery_supported_package_and_command_forms(self):
         vectors = [
-            ('npx', ['-y', 'smithery@latest', 'mcp', 'run', 'vendor/server']),
-            ('smithery.cmd', ['--verbose', 'run', '@vendor/server']),
-            ('npm', ['exec', '--', '@smithery/cli', 'run', 'vendor/server']),
-            ('bunx', ['--bun', '@smithery/cli', 'run', 'vendor/server']),
-            ('bun', ['x', '--bun', '@smithery/cli', 'run', 'vendor/server']),
-            ('cmd', ['/c', 'npx.cmd', '-y', '@smithery/cli', 'run', 'vendor/server']),
+            ('npx', ['-y', 'smithery@latest', 'mcp', 'run', 'vendor/server'], 'smithery:vendor/server'),
+            ('smithery.cmd', ['--verbose', 'run', '@vendor/server'], 'smithery-unverified:vendor/server'),
+            ('npm', ['exec', '--', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery:vendor/server'),
+            ('bunx', ['--bun', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery-unverified:vendor/server'),
+            ('bun', ['x', '--bun', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery-unverified:vendor/server'),
+            ('cmd', ['/c', 'npx.cmd', '-y', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery-unverified:vendor/server'),
             (
                 'npx',
                 [
-                    '-y', '@smithery/cli', 'run', '--config', '{}',
+                    '-y', '@smithery/cli@latest', 'run', '--config', '{}',
                     '@vendor/server',
                 ],
+                'smithery:vendor/server',
             ),
             (
                 'cmd.exe',
-                ['/d', '/c', 'npx', '-y', 'smithery', 'run', 'vendor/server'],
+                ['/d', '/c', 'npx', '-y', 'smithery@latest', 'run', 'vendor/server'],
+                'smithery-unverified:vendor/server',
             ),
+            ('npx', ['-y', '@smithery/cli', 'run', 'vendor/server'], 'smithery-unverified:vendor/server'),
+            ('bunx', ['--no-install', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery-unverified:vendor/server'),
         ]
         for hook in HOOKS:
-            for command, args in vectors:
+            for command, args, expected in vectors:
                 with self.subTest(hook=hook.__file__, command=command, args=args):
                     self.assertEqual(
                         hook.compute_mcp_cache_key('alias', command, None, args),
-                        'smithery:vendor/server',
+                        expected,
                     )
 
     def test_invalid_standalone_smithery_command_fails_closed(self):
@@ -178,7 +182,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
                         hook.compute_mcp_cache_key('alias', command, None, args)
                     )
 
-    def test_smithery_rejects_path_qualified_launchers(self):
+    def test_smithery_path_qualified_launchers_are_unverified(self):
         vectors = [
             ('./smithery', ['run', '@vendor/server']),
             ('/tmp/evil/smithery', ['run', '@vendor/server']),
@@ -188,8 +192,9 @@ class TestMcpFingerprintParity(unittest.TestCase):
         for hook in HOOKS:
             for command, args in vectors:
                 with self.subTest(hook=hook.__file__, command=command):
-                    self.assertIsNone(
-                        hook.compute_mcp_cache_key('alias', command, None, args)
+                    self.assertEqual(
+                        hook.compute_mcp_cache_key('alias', command, None, args),
+                        'smithery-unverified:vendor/server',
                     )
 
     def test_runtime_argument_does_not_claim_smithery_identity(self):
