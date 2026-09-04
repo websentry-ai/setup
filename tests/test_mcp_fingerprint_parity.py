@@ -154,6 +154,8 @@ class TestMcpFingerprintParity(unittest.TestCase):
         vectors = [
             ('npx', ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server']),
             ('npx', ['-y', '@smithery/cli@npm:evil', 'run', '@vendor/server']),
+            ('npx', ['-y', '@smithery/cli@.', 'run', '@vendor/server']),
+            ('npx', ['-y', 'smithery@..', 'mcp', 'run', 'vendor/server']),
             ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server@npm:evil']),
             ('npm', ['exec', '@smithery/cli', 'run', '@vendor/server']),
             ('npx', ['-y', '@smithery/cli', 'run', '@vendor/server', '--package=evil']),

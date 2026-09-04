@@ -9,6 +9,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -655,7 +656,9 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
     def _run(self, write_user_gdrive=None):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)), patch.object(
+            unbound.platform, "system", return_value="Darwin"
+        ):
             user_dir = unbound._vscode_user_dirs()[0]
             user_dir.mkdir(parents=True, exist_ok=True)
             plugin_dir = (
@@ -689,14 +692,18 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
     def test_no_plugins_is_noop(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)), patch.object(
+            unbound.platform, "system", return_value="Darwin"
+        ):
             unbound._vscode_user_dirs()[0].mkdir(parents=True, exist_ok=True)
             self.assertEqual(unbound.read_copilot_mcp_servers(None), {})
 
     def test_bare_package_config_reaches_the_gateway(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)), patch.object(
+            unbound.platform, "system", return_value="Darwin"
+        ):
             user_dir = unbound._vscode_user_dirs()[0]
             user_dir.mkdir(parents=True, exist_ok=True)
             (user_dir / "mcp.json").write_text(json.dumps({"servers": {
@@ -757,7 +764,9 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
     def test_plugin_relative_command_is_forwarded_without_hook_fingerprint(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)):
+        with patch.object(unbound.Path, "home", return_value=Path(tmp.name)), patch.object(
+            unbound.platform, "system", return_value="Darwin"
+        ):
             user_dir = unbound._vscode_user_dirs()[0]
             user_dir.mkdir(parents=True, exist_ok=True)
             plugin_dir = (
@@ -775,6 +784,17 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
 
 
 class TestVscodeProviderCache(unittest.TestCase):
+    @staticmethod
+    @contextmanager
+    def _isolated_vscode_home(home):
+        with patch.object(unbound.Path, 'home', return_value=home), patch.dict(
+            os.environ,
+            {'APPDATA': str(home / 'AppData' / 'Roaming')},
+        ), patch.object(
+            unbound, '_running_with_elevated_privileges', return_value=False
+        ):
+            yield unbound._vscode_user_dirs()[0]
+
     @staticmethod
     def _write_cache(
         user_dir,
@@ -808,27 +828,24 @@ class TestVscodeProviderCache(unittest.TestCase):
                 }],
             },
         }
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             connection.execute('CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)')
             connection.execute(
                 'INSERT INTO ItemTable (key, value) VALUES (?, ?)',
                 ('mcp.extCachedServers', json.dumps(cache)),
             )
+            connection.commit()
         os.utime(path, (modified_at, modified_at))
         return path
 
     def test_dynamic_provider_resolves_without_hardcoded_server_name(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            command = user_dir / 'globalStorage' / 'eamodio.gitlens' / 'gk'
-            command.parent.mkdir(parents=True)
-            command.touch()
-            self._write_cache(user_dir, 'workspace-a', command, 1)
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                command = user_dir / 'globalStorage' / 'eamodio.gitlens' / 'gk'
+                command.parent.mkdir(parents=True)
+                command.touch()
+                self._write_cache(user_dir, 'workspace-a', command, 1)
                 servers = unbound.read_copilot_mcp_servers(None)
 
         self.assertEqual(
@@ -854,17 +871,13 @@ class TestVscodeProviderCache(unittest.TestCase):
     def test_provider_definitions_in_different_workspaces_are_not_collapsed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            old_command = home / 'old-gk'
-            new_command = home / 'new-gk'
-            old_command.touch()
-            new_command.touch()
-            self._write_cache(user_dir, 'old-workspace', old_command, 1)
-            self._write_cache(user_dir, 'new-workspace', new_command, 2)
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                old_command = home / 'old-gk'
+                new_command = home / 'new-gk'
+                old_command.touch()
+                new_command.touch()
+                self._write_cache(user_dir, 'old-workspace', old_command, 1)
+                self._write_cache(user_dir, 'new-workspace', new_command, 2)
                 servers = unbound.read_copilot_mcp_servers(None)
 
         self.assertIsNone(servers['GitKraken'])
@@ -872,34 +885,30 @@ class TestVscodeProviderCache(unittest.TestCase):
     def test_current_workspace_provider_definition_is_selected(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            workspace_a = home / 'workspace-a'
-            workspace_b = home / 'workspace-b'
-            current = workspace_a / 'packages' / 'app'
-            current.mkdir(parents=True)
-            workspace_b.mkdir()
-            command_a = home / 'gk-a'
-            command_b = home / 'gk-b'
-            command_a.touch()
-            command_b.touch()
-            self._write_cache(
-                user_dir,
-                'cache-a',
-                command_a,
-                1,
-                workspace_uri=workspace_a.as_uri(),
-            )
-            self._write_cache(
-                user_dir,
-                'cache-b',
-                command_b,
-                2,
-                workspace_uri=workspace_b.as_uri(),
-            )
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                workspace_a = home / 'workspace-a'
+                workspace_b = home / 'workspace-b'
+                current = workspace_a / 'packages' / 'app'
+                current.mkdir(parents=True)
+                workspace_b.mkdir()
+                command_a = home / 'gk-a'
+                command_b = home / 'gk-b'
+                command_a.touch()
+                command_b.touch()
+                self._write_cache(
+                    user_dir,
+                    'cache-a',
+                    command_a,
+                    1,
+                    workspace_uri=workspace_a.as_uri(),
+                )
+                self._write_cache(
+                    user_dir,
+                    'cache-b',
+                    command_b,
+                    2,
+                    workspace_uri=workspace_b.as_uri(),
+                )
                 servers = unbound.read_copilot_mcp_servers(str(current))
 
         self.assertEqual(servers['GitKraken']['command'], str(command_a))
@@ -907,22 +916,18 @@ class TestVscodeProviderCache(unittest.TestCase):
     def test_newest_provider_definition_wins_within_one_workspace(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            old_command = home / 'old-gk'
-            new_command = home / 'new-gk'
-            old_command.touch()
-            new_command.touch()
-            workspace_uri = (home / 'shared-workspace').as_uri()
-            self._write_cache(
-                user_dir, 'old-cache', old_command, 1, workspace_uri=workspace_uri
-            )
-            self._write_cache(
-                user_dir, 'new-cache', new_command, 2, workspace_uri=workspace_uri
-            )
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                old_command = home / 'old-gk'
+                new_command = home / 'new-gk'
+                old_command.touch()
+                new_command.touch()
+                workspace_uri = (home / 'shared-workspace').as_uri()
+                self._write_cache(
+                    user_dir, 'old-cache', old_command, 1, workspace_uri=workspace_uri
+                )
+                self._write_cache(
+                    user_dir, 'new-cache', new_command, 2, workspace_uri=workspace_uri
+                )
                 servers = unbound.read_copilot_mcp_servers(None)
 
         self.assertEqual(servers['GitKraken']['command'], str(new_command))
@@ -930,25 +935,21 @@ class TestVscodeProviderCache(unittest.TestCase):
     def test_provider_definitions_in_different_profiles_are_not_collapsed(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            workspace = home / 'shared-workspace'
-            workspace.mkdir()
-            command_a = home / 'gk-a'
-            command_b = home / 'gk-b'
-            command_a.touch()
-            command_b.touch()
-            self._write_cache(
-                user_dir, 'cache-a', command_a, 1,
-                workspace_uri=workspace.as_uri(), profile='profile-a',
-            )
-            self._write_cache(
-                user_dir, 'cache-b', command_b, 2,
-                workspace_uri=workspace.as_uri(), profile='profile-b',
-            )
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                workspace = home / 'shared-workspace'
+                workspace.mkdir()
+                command_a = home / 'gk-a'
+                command_b = home / 'gk-b'
+                command_a.touch()
+                command_b.touch()
+                self._write_cache(
+                    user_dir, 'cache-a', command_a, 1,
+                    workspace_uri=workspace.as_uri(), profile='profile-a',
+                )
+                self._write_cache(
+                    user_dir, 'cache-b', command_b, 2,
+                    workspace_uri=workspace.as_uri(), profile='profile-b',
+                )
                 servers = unbound.read_copilot_mcp_servers(str(workspace))
 
         self.assertIsNone(servers['GitKraken'])
@@ -956,15 +957,11 @@ class TestVscodeProviderCache(unittest.TestCase):
     def test_workspace_cache_without_scope_metadata_is_ignored(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            command = home / 'gk'
-            command.touch()
-            path = self._write_cache(user_dir, 'workspace-a', command, 1)
-            (path.parent / 'workspace.json').unlink()
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                command = home / 'gk'
+                command.touch()
+                path = self._write_cache(user_dir, 'workspace-a', command, 1)
+                (path.parent / 'workspace.json').unlink()
                 servers = unbound.read_copilot_mcp_servers(None)
 
         self.assertNotIn('GitKraken', servers)
@@ -980,12 +977,8 @@ class TestVscodeProviderCache(unittest.TestCase):
     def test_missing_absolute_command_is_ignored_as_stale(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
-            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
-            self._write_cache(user_dir, 'workspace-a', home / 'missing-gk', 1)
-
-            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
-                unbound.platform, 'system', return_value='Darwin'
-            ):
+            with self._isolated_vscode_home(home) as user_dir:
+                self._write_cache(user_dir, 'workspace-a', home / 'missing-gk', 1)
                 servers = unbound.read_copilot_mcp_servers(None)
 
         self.assertNotIn('GitKraken', servers)

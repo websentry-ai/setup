@@ -22,6 +22,7 @@ import sqlite3
 import shutil
 import urllib.request
 import uuid
+from contextlib import closing
 from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse, urlunsplit
 
@@ -1741,7 +1742,7 @@ def _vscode_mcp_state_databases():
 def _read_vscode_mcp_provider_cache(path):
     try:
         database_uri = f'{path.resolve().as_uri()}?mode=ro'
-        with sqlite3.connect(database_uri, uri=True, timeout=1.0) as connection:
+        with closing(sqlite3.connect(database_uri, uri=True, timeout=1.0)) as connection:
             size_row = connection.execute(
                 'SELECT length(CAST(value AS BLOB)) FROM ItemTable WHERE key = ? LIMIT 1',
                 (_VSCODE_MCP_PROVIDER_CACHE_KEY,),
@@ -2218,7 +2219,10 @@ def _registry_npm_package(spec: str) -> Optional[str]:
         package_pattern = r'[a-z0-9][a-z0-9._-]*'
     if not re.fullmatch(package_pattern, package, re.IGNORECASE):
         return None
-    if selector is not None and not re.fullmatch(r'[a-z0-9*^~<>=.+_-]+', selector, re.IGNORECASE):
+    if selector is not None and (
+        selector in {'.', '..'}
+        or not re.fullmatch(r'[a-z0-9*^~<>=.+_-]+', selector, re.IGNORECASE)
+    ):
         return None
     return package.lower()
 
