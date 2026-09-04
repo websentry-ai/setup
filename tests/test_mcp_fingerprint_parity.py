@@ -13,7 +13,7 @@ HOOKS = [
 
 
 class TestMcpFingerprintParity(unittest.TestCase):
-    def test_vscode_provider_identity_wins_over_launch_details(self):
+    def test_vscode_provider_identity_does_not_override_launch_details(self):
         additional_data = {
             'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
             'providerServerId': 'eamodio.gitlens/GitKraken',
@@ -22,7 +22,21 @@ class TestMcpFingerprintParity(unittest.TestCase):
             with self.subTest(hook=hook.__file__):
                 self.assertEqual(
                     hook.compute_mcp_cache_key(
-                        'GitKraken', 'node', None, ['extension.js'], additional_data,
+                        'GitKraken', 'gk', None, ['mcp'], additional_data,
+                    ),
+                    'bin:gk',
+                )
+
+    def test_bare_vscode_provider_uses_provider_identity(self):
+        additional_data = {
+            'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
+            'providerServerId': 'eamodio.gitlens/GitKraken',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'GitKraken', None, None, [], additional_data,
                     ),
                     'vscode-provider:eamodio.gitlens/gitlens.gkmcpprovider:'
                     'eamodio.gitlens/gitkraken',
@@ -75,30 +89,44 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'npm:@vendor/wrapper',
                 )
 
+    def test_smithery_rejects_execution_changing_inputs(self):
+        vectors = [
+            ['--registry=https://packages.example', '@smithery/cli', 'run', '@vendor/server'],
+            ['-y', '@smithery/cli@npm:evil', 'run', '@vendor/server'],
+            ['-y', '@smithery/cli', 'run', '@vendor/server@npm:evil'],
+        ]
+        for hook in HOOKS:
+            for args in vectors:
+                with self.subTest(hook=hook.__file__, args=args):
+                    self.assertIsNone(
+                        hook.compute_mcp_cache_key('alias', 'npx', None, args)
+                    )
+
     def test_runtime_argument_does_not_claim_smithery_identity(self):
         args = ['-c', 'npx', '@smithery/cli', 'run', '@vendor/server']
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
-                self.assertEqual(
-                    hook.compute_mcp_cache_key('alias', 'python', None, args),
-                    'npm:@smithery/cli',
+                self.assertIsNone(
+                    hook.compute_mcp_cache_key('alias', 'python', None, args)
                 )
 
     def test_nested_npm_runner_does_not_claim_smithery_identity(self):
         args = ['npm', '@smithery/cli', 'run', '@vendor/server']
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
-                self.assertEqual(
-                    hook.compute_mcp_cache_key('alias', 'npx', None, args),
-                    'npm:@smithery/cli',
+                self.assertIsNone(
+                    hook.compute_mcp_cache_key('alias', 'npx', None, args)
                 )
 
     def test_nuget_launchers_use_package_identity(self):
         vectors = [
-            ('dnx', ['Vendor.Server@1.2.3', 'serve'], 'nuget:vendor.server'),
+            ('dnx', ['Vendor.Server@1.2.3', 'serve'], None),
             (
                 'dnx',
-                ['--framework', 'net10.0', '-y', 'Example.Server@2.0.0'],
+                [
+                    '--framework', 'net10.0', '-y', 'Example.Server@2.0.0',
+                    '--source', 'https://api.nuget.org/v3/index.json',
+                ],
                 'nuget:example.server',
             ),
             (
@@ -121,7 +149,13 @@ class TestMcpFingerprintParity(unittest.TestCase):
             (
                 'dotnet',
                 ['tool', 'exec', 'Example.Server@2.0.0'],
-                'nuget:example.server',
+                None,
+            ),
+            (
+                'dnx',
+                ['Example.Server@2.0.0', '--add-source',
+                 'https://api.nuget.org/v3/index.json'],
+                'url-arg:api.nuget.org/v3/index.json',
             ),
             (
                 'dotnet',
@@ -142,3 +176,15 @@ class TestMcpFingerprintParity(unittest.TestCase):
                         hook.compute_mcp_cache_key('alias', command, None, args),
                         expected,
                     )
+
+    def test_attached_nuget_source_cannot_hide_the_real_host(self):
+        args = [
+            'Example.Server@2.0.0',
+            '--source=https://api.nuget.org=@evil.com/v3/index.json',
+        ]
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertNotEqual(
+                    hook.compute_mcp_cache_key('alias', 'dnx', None, args),
+                    'nuget:example.server',
+                )
