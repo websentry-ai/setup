@@ -4379,7 +4379,12 @@ def send_to_api(exchange, api_key):
 
 
 def get_api_key():
-    """Read API key from ~/.unbound/config.json (freshest), falling back to env."""
+    """Windows: the HKLM value is admin-only, so it wins -- a managed user must
+    not be able to override it via their writable ~/.unbound/config.json.
+    Elsewhere there is no admin-only env scope, so the file (freshest) wins."""
+    machine_key = _machine_env('UNBOUND_COPILOT_API_KEY')
+    if _is_windows() and machine_key:
+        return machine_key
     try:
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
@@ -4390,7 +4395,7 @@ def get_api_key():
         pass
     except Exception as e:
         log_error(f"Failed to read config file: {e}", 'config')
-    return _machine_env('UNBOUND_COPILOT_API_KEY')
+    return machine_key
 
 
 def _is_windows() -> bool:
