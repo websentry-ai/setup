@@ -843,6 +843,7 @@ class TestVscodeProviderCache(unittest.TestCase):
                     'command': str(command),
                     'args': ['mcp', '--host=vscode'],
                     'additional_data': {
+                        'scope': 'vscode-provider-cache',
                         'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
                         'providerServerId': 'eamodio.gitlens/GitKraken',
                     },

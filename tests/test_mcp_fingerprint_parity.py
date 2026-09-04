@@ -42,6 +42,22 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'eamodio.gitlens/gitkraken',
                 )
 
+    def test_cached_vscode_provider_uses_provider_identity(self):
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
+            'providerServerId': 'eamodio.gitlens/GitKraken',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'GitKraken', 'gk', None, ['mcp'], additional_data,
+                    ),
+                    'vscode-provider:eamodio.gitlens/gitlens.gkmcpprovider:'
+                    'eamodio.gitlens/gitkraken',
+                )
+
     def test_vscode_provider_identity_respects_fingerprint_column_limit(self):
         provider_id = f"{'a' * 128}/{'b' * 128}"
         additional_data = {
