@@ -150,6 +150,60 @@ class TestReadCursorItemTable(unittest.TestCase):
         self.assertEqual(result, {})
 
 
+class TestUnreadableStateDb(unittest.TestCase):
+    """A busy or checkpoint-pending database used to read back empty, which made
+    an approved account look unidentified and got it refused by the gate."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.db_path = _make_state_db(self.tmp)
+        self.cache = self.tmp / "identity.json"
+        self._c = patch.object(unbound, "IDENTITY_CACHE_PATH", self.cache)
+        self._c.start()
+        self.addCleanup(self._c.stop)
+        self._p = patch.object(unbound, "_cursor_state_db_path", return_value=self.db_path)
+        self._p.start()
+        self.addCleanup(self._p.stop)
+
+    def test_a_successful_read_is_remembered(self):
+        unbound.read_account_identity()
+        stored = json.loads(self.cache.read_text(encoding="utf-8"))["cursor_account"]
+        self.assertEqual(stored["user_email"], "user@acme.io")
+        self.assertEqual(stored["plan"], "pro")
+
+    def test_an_unreadable_database_falls_back_to_the_last_account(self):
+        unbound.read_account_identity()
+        with patch.object(unbound, "_read_cursor_item_table", return_value={}):
+            result = unbound.read_account_identity()
+        self.assertEqual(result["user_email"], "user@acme.io")
+        self.assertEqual(result["email_domain"], "acme.io")
+        self.assertEqual(result["plan"], "pro")
+
+    def test_no_cache_and_no_database_reports_nothing(self):
+        with patch.object(unbound, "_read_cursor_item_table", return_value={}):
+            result = unbound.read_account_identity()
+        self.assertIsNone(result["user_email"])
+        self.assertIsNone(result["email_domain"])
+
+    def test_a_write_ahead_log_value_is_visible(self):
+        """The old immutable open ignored the -wal, so a value Cursor had not yet
+        checkpointed read back as missing."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute(
+            "UPDATE ItemTable SET value = ? WHERE key = ?",
+            ("later@acme.io", "cursorAuth/cachedEmail"),
+        )
+        conn.commit()
+        try:
+            result = unbound._read_cursor_item_table(
+                self.db_path, ["cursorAuth/cachedEmail"]
+            )
+            self.assertEqual(result["cursorAuth/cachedEmail"], "later@acme.io")
+        finally:
+            conn.close()
+
+
 # ---------------------------------------------------------------------------
 # build_account_identity
 # ---------------------------------------------------------------------------

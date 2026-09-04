@@ -43,6 +43,7 @@ DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/codi
 DISCOVERY_INSTALL_SH_TTL_SECONDS = 24 * 3600
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
+CURSOR_DB_TIMEOUT_SECONDS = 2
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -1030,26 +1031,28 @@ def _cursor_state_db_path():
 def _read_cursor_item_table(db_path, keys):
     if not keys:
         return {}
-    values = {}
-    conn = None
-    try:
-        uri = f"file:{quote(str(db_path))}?mode=ro&immutable=1"
-        conn = sqlite3.connect(uri, uri=True)
-        placeholders = ','.join('?' for _ in keys)
-        cursor = conn.execute(
-            f"SELECT key, value FROM ItemTable WHERE key IN ({placeholders})", keys
-        )
-        for key, value in cursor.fetchall():
-            values[key] = value
-    except Exception:
-        pass
-    finally:
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
-    return values
+    placeholders = ','.join('?' for _ in keys)
+    sql = f"SELECT key, value FROM ItemTable WHERE key IN ({placeholders})"
+    quoted = quote(str(db_path))
+    # mode=ro first: an immutable open ignores the -wal file, so a value Cursor
+    # wrote but has not checkpointed reads back as missing, and the account then
+    # looks unidentified. immutable stays as the fallback for a db with no -shm.
+    for uri in (f"file:{quoted}?mode=ro", f"file:{quoted}?mode=ro&immutable=1"):
+        conn = None
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=CURSOR_DB_TIMEOUT_SECONDS)
+            values = {key: value for key, value in conn.execute(sql, keys).fetchall()}
+            if values:
+                return values
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return {}
 
 
 def read_account_identity():
@@ -1065,6 +1068,14 @@ def read_account_identity():
             plan = values.get('cursorAuth/stripeMembershipType') or None
     except Exception:
         pass
+    # A read that comes back empty means the database was busy or the account is
+    # only in the -wal, not that the user is signed out. Reporting nothing there
+    # makes an approved account look unidentified, and an account-access policy
+    # then refuses it.
+    if not email:
+        email, plan = _cached_account(plan)
+    elif plan:
+        _remember_account(email, plan)
     return {
         'org_id': None,
         'plan': plan,
@@ -1072,6 +1083,43 @@ def read_account_identity():
         'user_email': email,
         'email_domain': _email_domain(email),
     }
+
+
+def _cached_account(plan):
+    """Last account this hook read successfully. Never raises."""
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+    except Exception:
+        return None, plan
+    if not isinstance(loaded, dict):
+        return None, plan
+    account = loaded.get('cursor_account')
+    if not isinstance(account, dict):
+        return None, plan
+    email = account.get('user_email')
+    email = email.strip() if isinstance(email, str) else None
+    return (email or None), (plan or account.get('plan'))
+
+
+def _remember_account(email, plan):
+    """Merge into the cache the device serial already shares. Never raises."""
+    try:
+        data = {}
+        try:
+            loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+        if data.get('cursor_account') == {'user_email': email, 'plan': plan}:
+            return
+        data['cursor_account'] = {'user_email': email, 'plan': plan}
+        IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps(data), encoding='utf-8')
+        os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+    except Exception:
+        pass
 
 
 # DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
