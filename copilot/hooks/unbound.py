@@ -21,7 +21,7 @@ import shutil
 import urllib.request
 import uuid
 from typing import Any, Dict, List, Optional
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, urlunsplit
 
 
 def _copilot_home():
@@ -1670,13 +1670,333 @@ def _extract_mcp_server_fields(server):
         return None
     result = {
         key: server[key]
-        for key in ('url', 'command', 'args', 'type')
+        for key in ('url', 'command', 'args', 'type', 'cwd')
         if server.get(key)
     }
     return result or None
 
 
+def _mcp_launch_identity(server):
+    if not isinstance(server, dict):
+        return None
+    args = server.get('args')
+    return (
+        server.get('command'),
+        server.get('url'),
+        tuple(args) if isinstance(args, list) else (),
+        server.get('cwd'),
+    )
+
+
+def _mcp_provider_identity(server):
+    if not isinstance(server, dict):
+        return None
+    additional_data = server.get('additional_data')
+    if not isinstance(additional_data, dict):
+        return None
+    provider_id = additional_data.get('providerId')
+    server_id = additional_data.get('providerServerId')
+    if not isinstance(provider_id, str) or not isinstance(server_id, str):
+        return None
+    return provider_id, server_id
+
+
 _MCP_CONFIG_MAX_BYTES = 1_000_000
+_VSCODE_MCP_PROVIDER_CACHE_KEY = 'mcp.extCachedServers'
+_VSCODE_MCP_PROVIDER_CACHE_MAX_BYTES = 5 * 1024 * 1024
+_VSCODE_MCP_STATE_DATABASE_MAX_COUNT = 100
+_VSCODE_MCP_PROVIDER_MAX_COUNT = 200
+_VSCODE_MCP_SERVERS_PER_PROVIDER_MAX_COUNT = 100
+_VSCODE_MCP_SERVER_MAX_COUNT = 500
+_VSCODE_WORKSPACE_METADATA_MAX_BYTES = 64 * 1024
+
+
+def _vscode_mcp_state_databases():
+    paths = []
+    patterns = (
+        'globalStorage/state.vscdb',
+        'workspaceStorage/*/state.vscdb',
+        'profiles/*/globalStorage/state.vscdb',
+        'profiles/*/workspaceStorage/*/state.vscdb',
+    )
+    for user_dir in _vscode_user_dirs():
+        for pattern in patterns:
+            try:
+                paths.extend(path for path in user_dir.glob(pattern) if path.is_file())
+            except OSError:
+                continue
+
+    def modified_at(path):
+        try:
+            return path.stat().st_mtime_ns
+        except OSError:
+            return -1
+
+    ordered = sorted(set(paths), key=lambda path: (-modified_at(path), str(path)))
+    return ordered[:_VSCODE_MCP_STATE_DATABASE_MAX_COUNT]
+
+
+def _read_vscode_mcp_provider_cache(path):
+    try:
+        database_uri = f'{path.resolve().as_uri()}?mode=ro'
+        with sqlite3.connect(database_uri, uri=True, timeout=1.0) as connection:
+            size_row = connection.execute(
+                'SELECT length(CAST(value AS BLOB)) FROM ItemTable WHERE key = ? LIMIT 1',
+                (_VSCODE_MCP_PROVIDER_CACHE_KEY,),
+            ).fetchone()
+            if not size_row or not isinstance(size_row[0], int):
+                return None
+            if size_row[0] > _VSCODE_MCP_PROVIDER_CACHE_MAX_BYTES:
+                return None
+            value_row = connection.execute(
+                'SELECT value FROM ItemTable WHERE key = ? LIMIT 1',
+                (_VSCODE_MCP_PROVIDER_CACHE_KEY,),
+            ).fetchone()
+    except (OSError, sqlite3.Error) as error:
+        log_error(f'copilot mcp provider cache read failed path={path} err={error}', 'mcp_config')
+        return None
+
+    if not value_row:
+        return None
+    value = value_row[0]
+    if isinstance(value, bytes):
+        try:
+            value = value.decode('utf-8')
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(value, str):
+        return None
+    try:
+        cache = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return cache if isinstance(cache, dict) else None
+
+
+def _vscode_workspace_uri_path(uri):
+    try:
+        parsed = urlparse(uri)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() != 'file':
+        return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, '', '')) or None
+
+    path = unquote(parsed.path)
+    if platform.system() == 'Windows':
+        windows_path = path.replace('/', '\\')
+        if parsed.netloc:
+            return f'\\\\{parsed.netloc}{windows_path}'
+        if re.match(r'^/[A-Za-z]:', path):
+            windows_path = windows_path[1:]
+        return windows_path or None
+    if parsed.netloc:
+        return f'//{parsed.netloc}{path}'
+    return path or None
+
+
+def _vscode_cache_scope(path):
+    for user_dir in _vscode_user_dirs():
+        try:
+            relative_parts = path.relative_to(user_dir).parts
+        except ValueError:
+            continue
+
+        if 'workspaceStorage' in relative_parts:
+            metadata_path = path.parent / 'workspace.json'
+            try:
+                with metadata_path.open('rb') as metadata_file:
+                    raw_metadata = metadata_file.read(
+                        _VSCODE_WORKSPACE_METADATA_MAX_BYTES + 1
+                    )
+                if len(raw_metadata) > _VSCODE_WORKSPACE_METADATA_MAX_BYTES:
+                    return None
+                metadata = json.loads(raw_metadata.decode('utf-8'))
+            except (OSError, UnicodeDecodeError, ValueError):
+                return None
+            if not isinstance(metadata, dict):
+                return None
+            workspace_uri = metadata.get('folder') or metadata.get('workspace')
+            if not isinstance(workspace_uri, str) or not workspace_uri:
+                return None
+            return _vscode_workspace_uri_path(workspace_uri)
+
+        if len(relative_parts) >= 3 and relative_parts[0] == 'profiles':
+            return str(user_dir / 'profiles' / relative_parts[1])
+        if relative_parts == ('globalStorage', 'state.vscdb'):
+            return str(user_dir)
+    return None
+
+
+def _vscode_cache_profile(path):
+    for user_dir in _vscode_user_dirs():
+        try:
+            relative_parts = path.relative_to(user_dir).parts
+        except ValueError:
+            continue
+        if len(relative_parts) >= 2 and relative_parts[0] == 'profiles':
+            return relative_parts[1]
+    return None
+
+
+def _running_with_elevated_privileges():
+    if platform.system() == 'Windows':
+        try:
+            import ctypes
+            return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        except Exception:
+            return True
+    try:
+        return os.geteuid() == 0 or os.geteuid() != os.getuid()
+    except (AttributeError, OSError):
+        return True
+
+
+def _vscode_workspace_scope_matches(
+    path,
+    scope,
+    cwd,
+    skip_filesystem_probe=False,
+):
+    if not cwd or 'workspaceStorage' not in path.parts:
+        return True
+    if '://' in scope or scope.lower().endswith('.code-workspace'):
+        return True
+    if skip_filesystem_probe:
+        path_type = PureWindowsPath if platform.system() == 'Windows' else Path
+        workspace = path_type(scope)
+        current = path_type(cwd)
+    else:
+        try:
+            workspace = Path(scope).resolve()
+            current = Path(cwd).resolve()
+        except OSError:
+            workspace = Path(scope)
+            current = Path(cwd)
+    return current == workspace or workspace in current.parents
+
+
+def _vscode_cached_launch_fields(launch, skip_command_probe=False):
+    if not isinstance(launch, dict):
+        return None
+    transport_type = launch.get('type')
+    command = launch.get('command')
+    if transport_type == 1 and isinstance(command, str) and command:
+        args = launch.get('args')
+        env = launch.get('env')
+        if not isinstance(args, list) or not all(isinstance(arg, str) for arg in args):
+            return None
+        if not isinstance(env, dict):
+            return None
+        fields = {'type': 'stdio', 'command': command}
+        fields['args'] = args
+        cwd = launch.get('cwd')
+        if isinstance(cwd, str) and cwd:
+            fields['cwd'] = cwd
+        if not skip_command_probe:
+            expanded = Path(os.path.expandvars(os.path.expanduser(command)))
+            if expanded.is_absolute():
+                if not expanded.is_file():
+                    return None
+            elif cwd:
+                expanded_cwd = Path(os.path.expandvars(os.path.expanduser(cwd)))
+                if (
+                    not (expanded_cwd / expanded).is_file()
+                    and shutil.which(str(expanded)) is None
+                ):
+                    return None
+            elif shutil.which(str(expanded)) is None:
+                return None
+        return fields
+    if transport_type == 2:
+        uri = launch.get('uri')
+        if not isinstance(uri, dict):
+            return None
+        scheme = uri.get('scheme')
+        authority = uri.get('authority')
+        path = uri.get('path', '')
+        if (
+            not isinstance(scheme, str)
+            or scheme.lower() not in ('http', 'https')
+            or not isinstance(authority, str)
+            or not authority
+            or not isinstance(path, str)
+        ):
+            return None
+        parsed = urlparse(urlunsplit((scheme, authority, path, '', '')))
+        hostname = parsed.hostname or ''
+        if not hostname:
+            return None
+        if ':' in hostname and not hostname.startswith('['):
+            hostname = f'[{hostname}]'
+        try:
+            port = parsed.port
+        except ValueError:
+            return None
+        netloc = f'{hostname}:{port}' if port is not None else hostname
+        return {
+            'type': 'http',
+            'url': urlunsplit((scheme.lower(), netloc, path, '', '')),
+        }
+    return None
+
+
+def _vscode_cached_mcp_servers(cwd=None):
+    servers = []
+    seen = set()
+    skip_filesystem_probe = _running_with_elevated_privileges()
+    for path in _vscode_mcp_state_databases():
+        scope = _vscode_cache_scope(path)
+        profile_id = _vscode_cache_profile(path)
+        if scope is None or not _vscode_workspace_scope_matches(
+            path,
+            scope,
+            cwd,
+            skip_filesystem_probe,
+        ):
+            continue
+        cache = _read_vscode_mcp_provider_cache(path)
+        if not cache:
+            continue
+        for provider_index, (provider_id, provider) in enumerate(cache.items()):
+            if provider_index >= _VSCODE_MCP_PROVIDER_MAX_COUNT:
+                break
+            if not isinstance(provider_id, str) or not isinstance(provider, dict):
+                continue
+            cached_servers = provider.get('servers')
+            if not isinstance(cached_servers, list):
+                continue
+            for cached_server in cached_servers[:_VSCODE_MCP_SERVERS_PER_PROVIDER_MAX_COUNT]:
+                if len(servers) >= _VSCODE_MCP_SERVER_MAX_COUNT:
+                    return servers
+                if not isinstance(cached_server, dict):
+                    continue
+                fields = _vscode_cached_launch_fields(
+                    cached_server.get('launch'),
+                    skip_filesystem_probe,
+                )
+                if fields is None:
+                    continue
+                server_id = cached_server.get('id')
+                if not isinstance(server_id, str) or not server_id:
+                    continue
+                label = cached_server.get('label')
+                if not isinstance(label, str) or not label:
+                    label = server_id
+                identity = (scope, profile_id, provider_id, server_id)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                fields['additional_data'] = {
+                    'providerId': provider_id,
+                    'providerServerId': server_id,
+                    **(
+                        {'providerProfileId': profile_id}
+                        if profile_id is not None
+                        else {}
+                    ),
+                }
+                servers.append((label, fields))
+    return servers
 
 # KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
 # Fingerprints key the local tool-hash cache; Redis tool scores are separately
@@ -1878,10 +2198,51 @@ def _normalize_npm(pkg: str) -> str:
     return p.split('@')[0]
 
 
-def _smithery_run_target(args: List[str]) -> Optional[str]:
+def _smithery_run_target(
+    args: List[str],
+    command_base: Optional[str] = None,
+) -> Optional[str]:
     for index, arg in enumerate(args):
         if not isinstance(arg, str) or _normalize_npm(arg).lower() != '@smithery/cli':
             continue
+        prefix_tokens = []
+        for prefix_arg in args[:index]:
+            if not isinstance(prefix_arg, str):
+                return None
+            prefix_tokens.append(_unquote(prefix_arg).lower())
+
+        def valid_runner_prefix(runner, tokens):
+            positional = [
+                token for token in tokens
+                if token != '--' and not token.startswith('-')
+            ]
+            if runner == 'npm':
+                return positional in (['exec'], ['x'])
+            return not positional
+
+        if command_base in NPM_RUNNERS:
+            if not valid_runner_prefix(command_base, prefix_tokens):
+                return None
+        elif command_base == 'cmd':
+            runner_positions = [
+                offset for offset, token in enumerate(prefix_tokens)
+                if token in NPM_RUNNERS
+            ]
+            if len(runner_positions) != 1:
+                return None
+            runner_index = runner_positions[0]
+            shell_prefix = prefix_tokens[:runner_index]
+            if '/c' not in shell_prefix or any(
+                token not in {'/c', '/d', '/s'} for token in shell_prefix
+            ):
+                return None
+            if not valid_runner_prefix(
+                prefix_tokens[runner_index],
+                prefix_tokens[runner_index + 1:],
+            ):
+                return None
+        else:
+            return None
         if index + 2 >= len(args) or str(args[index + 1]).lower() != 'run':
             return None
         target = _unquote(args[index + 2])
@@ -1894,11 +2255,74 @@ def _smithery_run_target(args: List[str]) -> Optional[str]:
 
 
 def _nuget_package(base: str, args: List[str]) -> Optional[str]:
-    candidate = None
     if base == 'dnx':
-        candidate = next((arg for arg in args if isinstance(arg, str) and not arg.startswith('-')), None)
-    elif base == 'dotnet' and len(args) >= 3 and [str(arg).lower() for arg in args[:2]] == ['tool', 'execute']:
-        candidate = args[2]
+        tokens = args
+    elif (
+        base == 'dotnet'
+        and len(args) >= 2
+        and str(args[0]).lower() == 'tool'
+        and str(args[1]).lower() in {'exec', 'execute'}
+    ):
+        tokens = args[2:]
+    else:
+        return None
+
+    if any(
+        isinstance(arg, str)
+        and (
+            arg.lower() == '--configfile'
+            or arg.lower().startswith('--configfile=')
+        )
+        for arg in tokens
+    ):
+        return None
+
+    source_flags = {'--source', '--add-source', '-s'}
+    for index, arg in enumerate(tokens):
+        if not isinstance(arg, str):
+            continue
+        if arg == '--':
+            break
+        value = None
+        if arg.lower() in source_flags:
+            value = tokens[index + 1] if index + 1 < len(tokens) else None
+        elif any(arg.lower().startswith(f'{flag}=') for flag in source_flags):
+            value = arg.split('=', 1)[1]
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            return None
+        parsed = urlparse(_unquote(value))
+        if parsed.scheme not in {'http', 'https'} or parsed.hostname not in {
+            'api.nuget.org', 'nuget.org', 'www.nuget.org',
+        }:
+            return None
+
+    value_options = {
+        '--version', '--framework', '--configfile', '--source', '--add-source', '-s',
+    }
+    flag_options = {
+        '--prerelease', '--allow-roll-forward', '--ignore-failed-sources',
+        '--interactive', '--yes', '-y',
+    }
+    candidate = None
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if not isinstance(token, str) or token == '--':
+            return None
+        lower = token.lower()
+        option = lower.split('=', 1)[0]
+        if option in value_options:
+            index += 1 if '=' in token else 2
+            continue
+        if lower in flag_options:
+            index += 1
+            continue
+        if token.startswith('-'):
+            return None
+        candidate = token
+        break
     if not isinstance(candidate, str):
         return None
     package = _unquote(candidate).split('@', 1)[0].lower()
@@ -2050,6 +2474,25 @@ def _normalize_bin(command: str) -> Optional[str]:
     return b
 
 
+def _vscode_provider_identity(additional_data) -> Optional[str]:
+    if not isinstance(additional_data, dict):
+        return None
+    provider_id = additional_data.get('providerId')
+    server_id = additional_data.get('providerServerId')
+    pattern = re.compile(
+        r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}/[A-Za-z0-9][A-Za-z0-9._-]{0,127}'
+    )
+    if (
+        not isinstance(provider_id, str)
+        or not isinstance(server_id, str)
+        or not pattern.fullmatch(provider_id)
+        or not pattern.fullmatch(server_id)
+    ):
+        return None
+    identity = f'{provider_id.lower()}:{server_id.lower()}'
+    return identity if len('vscode-provider:') + len(identity) <= 500 else None
+
+
 def compute_fingerprint(
     name: Optional[str],
     command: Optional[str],
@@ -2114,11 +2557,15 @@ def compute_fingerprint(
         if identity:
             return f'url:{identity}'
 
+    provider_identity = _vscode_provider_identity(safe_additional_data)
+    if provider_identity:
+        return f'vscode-provider:{provider_identity}'
+
     nuget_package = _nuget_package(base, safe_args)
     if nuget_package:
         return f'nuget:{nuget_package}'
 
-    smithery_target = _smithery_run_target(safe_args)
+    smithery_target = _smithery_run_target(safe_args, base)
     if smithery_target:
         return f'smithery:{smithery_target}'
 
@@ -2405,6 +2852,28 @@ def read_copilot_mcp_servers(cwd=None):
             # a genuine read failure, so it's worth surfacing for diagnosis.
             log_error(f"copilot mcp config read failed path={config_path} err={e}", 'mcp_config')
             continue
+    for name, fields in _vscode_cached_mcp_servers(cwd):
+        if name in ambiguous_names:
+            continue
+        if name in server_sources:
+            existing = servers.get(name)
+            existing_provider = _mcp_provider_identity(existing)
+            incoming_provider = _mcp_provider_identity(fields)
+            if (
+                _mcp_launch_identity(existing) != _mcp_launch_identity(fields)
+                or (
+                    existing_provider is not None
+                    and incoming_provider is not None
+                    and existing_provider != incoming_provider
+                )
+            ):
+                servers[name] = None
+                ambiguous_names.add(name)
+                continue
+            servers[name] = {**fields, **existing}
+        else:
+            servers[name] = fields
+            server_sources[name] = 'provider'
     return servers
 
 

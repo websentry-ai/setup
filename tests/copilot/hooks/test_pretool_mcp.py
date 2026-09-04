@@ -6,6 +6,7 @@ server keys mirror a real VS Code mcp.json.
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -771,6 +772,354 @@ class TestAgentPluginConfigPaths(unittest.TestCase):
             servers = unbound.read_copilot_mcp_servers(str(user_dir.parent))
         self.assertIn("local", servers)
         self.assertEqual(servers["local"], {"command": "./server.py"})
+
+
+class TestVscodeProviderCache(unittest.TestCase):
+    @staticmethod
+    def _write_cache(
+        user_dir,
+        workspace,
+        command,
+        modified_at,
+        workspace_uri=None,
+        profile=None,
+    ):
+        storage_root = user_dir
+        if profile is not None:
+            storage_root = storage_root / 'profiles' / profile
+        path = storage_root / 'workspaceStorage' / workspace / 'state.vscdb'
+        path.parent.mkdir(parents=True)
+        if workspace_uri is None:
+            workspace_uri = (path.parent / 'project').as_uri()
+        (path.parent / 'workspace.json').write_text(json.dumps({
+            'folder': workspace_uri,
+        }))
+        cache = {
+            'eamodio.gitlens/gitlens.gkMcpProvider': {
+                'servers': [{
+                    'id': 'eamodio.gitlens/GitKraken',
+                    'label': 'GitKraken',
+                    'launch': {
+                        'type': 1,
+                        'command': str(command),
+                        'args': ['mcp', '--host=vscode'],
+                        'env': {'TOKEN': 'secret'},
+                    },
+                }],
+            },
+        }
+        with sqlite3.connect(path) as connection:
+            connection.execute('CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value BLOB)')
+            connection.execute(
+                'INSERT INTO ItemTable (key, value) VALUES (?, ?)',
+                ('mcp.extCachedServers', json.dumps(cache)),
+            )
+        os.utime(path, (modified_at, modified_at))
+        return path
+
+    def test_dynamic_provider_resolves_without_hardcoded_server_name(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            command = user_dir / 'globalStorage' / 'eamodio.gitlens' / 'gk'
+            command.parent.mkdir(parents=True)
+            command.touch()
+            self._write_cache(user_dir, 'workspace-a', command, 1)
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertEqual(
+            unbound.resolve_copilot_mcp(
+                'mcp_gitkraken_pull_request_get_detail', servers
+            ),
+            (
+                'GitKraken',
+                'pull_request_get_detail',
+                {
+                    'type': 'stdio',
+                    'command': str(command),
+                    'args': ['mcp', '--host=vscode'],
+                    'additional_data': {
+                        'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
+                        'providerServerId': 'eamodio.gitlens/GitKraken',
+                    },
+                },
+            ),
+        )
+
+    def test_provider_definitions_in_different_workspaces_are_not_collapsed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            old_command = home / 'old-gk'
+            new_command = home / 'new-gk'
+            old_command.touch()
+            new_command.touch()
+            self._write_cache(user_dir, 'old-workspace', old_command, 1)
+            self._write_cache(user_dir, 'new-workspace', new_command, 2)
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertIsNone(servers['GitKraken'])
+
+    def test_current_workspace_provider_definition_is_selected(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            workspace_a = home / 'workspace-a'
+            workspace_b = home / 'workspace-b'
+            current = workspace_a / 'packages' / 'app'
+            current.mkdir(parents=True)
+            workspace_b.mkdir()
+            command_a = home / 'gk-a'
+            command_b = home / 'gk-b'
+            command_a.touch()
+            command_b.touch()
+            self._write_cache(
+                user_dir,
+                'cache-a',
+                command_a,
+                1,
+                workspace_uri=workspace_a.as_uri(),
+            )
+            self._write_cache(
+                user_dir,
+                'cache-b',
+                command_b,
+                2,
+                workspace_uri=workspace_b.as_uri(),
+            )
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(str(current))
+
+        self.assertEqual(servers['GitKraken']['command'], str(command_a))
+
+    def test_newest_provider_definition_wins_within_one_workspace(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            old_command = home / 'old-gk'
+            new_command = home / 'new-gk'
+            old_command.touch()
+            new_command.touch()
+            workspace_uri = (home / 'shared-workspace').as_uri()
+            self._write_cache(
+                user_dir, 'old-cache', old_command, 1, workspace_uri=workspace_uri
+            )
+            self._write_cache(
+                user_dir, 'new-cache', new_command, 2, workspace_uri=workspace_uri
+            )
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertEqual(servers['GitKraken']['command'], str(new_command))
+
+    def test_provider_definitions_in_different_profiles_are_not_collapsed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            workspace = home / 'shared-workspace'
+            workspace.mkdir()
+            command_a = home / 'gk-a'
+            command_b = home / 'gk-b'
+            command_a.touch()
+            command_b.touch()
+            self._write_cache(
+                user_dir, 'cache-a', command_a, 1,
+                workspace_uri=workspace.as_uri(), profile='profile-a',
+            )
+            self._write_cache(
+                user_dir, 'cache-b', command_b, 2,
+                workspace_uri=workspace.as_uri(), profile='profile-b',
+            )
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(str(workspace))
+
+        self.assertIsNone(servers['GitKraken'])
+
+    def test_workspace_cache_without_scope_metadata_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            command = home / 'gk'
+            command.touch()
+            path = self._write_cache(user_dir, 'workspace-a', command, 1)
+            (path.parent / 'workspace.json').unlink()
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertNotIn('GitKraken', servers)
+
+    def test_windows_workspace_uri_decodes_to_local_path(self):
+        with patch.object(unbound.platform, 'system', return_value='Windows'):
+            scope = unbound._vscode_workspace_uri_path(
+                'file:///C%3A/Users/test/My%20Project'
+            )
+
+        self.assertEqual(scope, r'C:\Users\test\My Project')
+
+    def test_missing_absolute_command_is_ignored_as_stale(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            user_dir = home / 'Library' / 'Application Support' / 'Code' / 'User'
+            self._write_cache(user_dir, 'workspace-a', home / 'missing-gk', 1)
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound.platform, 'system', return_value='Darwin'
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertNotIn('GitKraken', servers)
+
+    def test_relative_command_is_resolved_from_provider_cwd(self):
+        with patch.object(unbound.Path, 'is_file', return_value=True):
+            fields = unbound._vscode_cached_launch_fields({
+                'type': 1,
+                'command': 'bin/gk',
+                'args': [],
+                'env': {},
+                'cwd': '/extension',
+            })
+
+        self.assertEqual(fields, {
+            'type': 'stdio',
+            'command': 'bin/gk',
+            'args': [],
+            'cwd': '/extension',
+        })
+
+    def test_elevated_cache_does_not_probe_cached_command_or_cwd(self):
+        launch = {
+            'type': 1,
+            'command': r'\\attacker\share\server.exe',
+            'args': [],
+            'env': {},
+            'cwd': r'\\attacker\share',
+        }
+
+        with patch.object(unbound.Path, 'is_file') as is_file, patch.object(
+            unbound.shutil, 'which'
+        ) as which:
+            fields = unbound._vscode_cached_launch_fields(
+                launch,
+                skip_command_probe=True,
+            )
+
+        is_file.assert_not_called()
+        which.assert_not_called()
+        self.assertEqual(fields['command'], launch['command'])
+        self.assertEqual(fields['cwd'], launch['cwd'])
+
+    def test_elevated_workspace_match_is_lexical(self):
+        cache_path = Path('/code/User/workspaceStorage/cache/state.vscdb')
+        with patch.object(unbound.Path, 'resolve') as resolve:
+            matched = unbound._vscode_workspace_scope_matches(
+                cache_path,
+                '/workspace',
+                '/workspace/project',
+                skip_filesystem_probe=True,
+            )
+
+        resolve.assert_not_called()
+        self.assertTrue(matched)
+
+    def test_http_provider_uri_is_resolved(self):
+        fields = unbound._vscode_cached_launch_fields({
+            'type': 2,
+            'uri': {
+                'scheme': 'https',
+                'authority': 'user:secret@mcp.example.com:8443',
+                'path': '/api/mcp',
+                'query': 'mode=minimal',
+                'fragment': 'secret-fragment',
+            },
+            'headers': [['Authorization', 'Bearer secret']],
+        })
+
+        self.assertEqual(fields, {
+            'type': 'http',
+            'url': 'https://mcp.example.com:8443/api/mcp',
+        })
+
+    def test_matching_file_config_and_provider_cache_merge_provenance(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            config = home / '.copilot' / 'mcp-config.json'
+            config.parent.mkdir()
+            config.write_text(json.dumps({
+                'mcpServers': {
+                    'GitKraken': {
+                        'command': 'gk',
+                        'args': ['mcp'],
+                    },
+                },
+            }))
+            provider = {
+                'type': 'stdio',
+                'command': 'gk',
+                'args': ['mcp'],
+                'additional_data': {
+                    'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
+                    'providerServerId': 'eamodio.gitlens/GitKraken',
+                },
+            }
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound, '_vscode_cached_mcp_servers', return_value=[('GitKraken', provider)]
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertEqual(servers['GitKraken'], provider)
+
+    def test_provider_cwd_must_match_file_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            home = Path(tmpdir)
+            config = home / '.copilot' / 'mcp-config.json'
+            config.parent.mkdir()
+            config.write_text(json.dumps({
+                'mcpServers': {
+                    'GitKraken': {
+                        'command': 'gk',
+                        'args': ['mcp'],
+                        'cwd': '/workspace-a',
+                    },
+                },
+            }))
+            provider = {
+                'type': 'stdio',
+                'command': 'gk',
+                'args': ['mcp'],
+                'cwd': '/workspace-b',
+                'additional_data': {
+                    'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
+                    'providerServerId': 'eamodio.gitlens/GitKraken',
+                },
+            }
+
+            with patch.object(unbound.Path, 'home', return_value=home), patch.object(
+                unbound, '_vscode_cached_mcp_servers', return_value=[('GitKraken', provider)]
+            ):
+                servers = unbound.read_copilot_mcp_servers(None)
+
+        self.assertIsNone(servers['GitKraken'])
 
 
 class TestCopilotProjectConfigPaths(unittest.TestCase):
