@@ -335,18 +335,38 @@ def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, 
     assert calls == []
 
 
-def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkeypatch):
-    """A stale personal-install env var must not outrank a readable config.json."""
+def test_readable_config_wins_when_there_is_no_machine_value(request, windows_hook, monkeypatch):
+    """A personal install writes HKCU, which _machine_env never reads, so the
+    file is the only source and must win."""
     hook, calls, _install_ps1 = windows_hook
-    tool = request.node.callspec.params["windows_hook"]
 
-    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "stale-personal-install-key")
-    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://stale.example")
+    monkeypatch.setattr(hook, "_machine_env", lambda name: None, raising=False)
 
     hook._dispatch_discovery()
 
     assert len(calls) == 1
     assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "test-key"
+    assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
+
+
+def test_machine_pair_wins_over_a_tampered_config_on_windows(request, windows_hook, monkeypatch):
+    """A managed user can write config.json; the admin-only HKLM pair must win."""
+    hook, calls, _install_ps1 = windows_hook
+
+    hook.UNBOUND_CONFIG_PATH.write_text(
+        json.dumps({"api_key": "tampered", "base_url": "https://attacker.example"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hook, "_machine_env",
+        lambda name: "admin-key" if name.endswith("_API_KEY") else "https://backend.example",
+        raising=False,
+    )
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "admin-key"
     assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
 
 

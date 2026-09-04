@@ -3258,6 +3258,23 @@ def _machine_env(name: str) -> Optional[str]:
         return None
 
 
+def _resolve_credentials(unbound_config, key_var, category):
+    """Windows: the admin-only HKLM pair wins over a user-writable config.json.
+    Elsewhere the file (freshest) wins. Always resolved as a unit, never mixed."""
+    machine_key = _machine_env(key_var)
+    machine_url = _machine_env('UNBOUND_BACKEND_URL')
+    if machine_url and not machine_url.startswith("https://"):
+        log_error("env base_url is not https, ignoring", category)
+        machine_key = machine_url = None
+    if _is_windows() and machine_key and machine_url:
+        return machine_key, machine_url
+    api_key = unbound_config.get("api_key")
+    backend_url = unbound_config.get("base_url")
+    if api_key and backend_url:
+        return api_key, backend_url
+    return machine_key, machine_url
+
+
 def _discovery_installer():
     if _is_windows():
         return DISCOVERY_INSTALL_PS1, DISCOVERY_INSTALL_PS1_URL
@@ -3310,14 +3327,7 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict) -> None:
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key")
-        backend_url = unbound_config.get("base_url")
-        if not (api_key and backend_url):
-            api_key = _machine_env('UNBOUND_AUGMENT_API_KEY')
-            backend_url = _machine_env('UNBOUND_BACKEND_URL')
-            if backend_url and not backend_url.startswith("https://"):
-                log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
-                backend_url = None
+        api_key, backend_url = _resolve_credentials(unbound_config, 'UNBOUND_AUGMENT_API_KEY', 'mcp_server')
         if not api_key or not backend_url:
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
@@ -3508,15 +3518,7 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("api_key")
-            backend_url = unbound_config.get("base_url")
-            if not (api_key and backend_url):
-                # Resolve as a unit -- never pair a config field with an env field.
-                api_key = _machine_env('UNBOUND_AUGMENT_API_KEY')
-                backend_url = _machine_env('UNBOUND_BACKEND_URL')
-                if backend_url and not backend_url.startswith("https://"):
-                    log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')
-                    backend_url = None
+            api_key, backend_url = _resolve_credentials(unbound_config, 'UNBOUND_AUGMENT_API_KEY', 'discovery_gate')
             if not api_key:
                 log_error("discovery gate: no api_key in env or config", 'discovery_gate')
                 return
