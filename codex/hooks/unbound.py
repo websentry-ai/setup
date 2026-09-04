@@ -3932,12 +3932,23 @@ def _dispatch_discovery() -> None:
 
 
 def get_api_key():
+    """Read API key from ~/.unbound/config.json (freshest), falling back to env."""
+    try:
+        config_file = Path.home() / ".unbound" / "config.json"
+        with open(config_file, 'r', encoding='utf-8') as f:
+            key = json.loads(f.read()).get('api_key')
+        if key:
+            return key
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log_error(f"Failed to read config file: {e}", 'config')
     return _machine_env('UNBOUND_CODEX_API_KEY')
 
 
 def main():
     global _cached_api_key
-    api_key = _machine_env('UNBOUND_CODEX_API_KEY')
+    api_key = get_api_key()
     _cached_api_key = api_key
 
     if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
