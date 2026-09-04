@@ -3476,19 +3476,23 @@ def process_stop_event(generation_id, api_key=None):
 
 
 def get_api_key():
-    """Get API key from env var or ~/.unbound/config.json."""
-    key = os.getenv('UNBOUND_CURSOR_API_KEY')
-    if key:
-        return key
+    """Windows: the HKLM value is admin-only, so it wins -- a managed user must
+    not be able to override it via their writable ~/.unbound/config.json.
+    Elsewhere there is no admin-only env scope, so the file (freshest) wins."""
+    machine_key = _machine_env('UNBOUND_CURSOR_API_KEY')
+    if _is_windows() and machine_key:
+        return machine_key
     try:
         config_file = Path.home() / ".unbound" / "config.json"
         with open(config_file, 'r', encoding='utf-8') as f:
-            return json.loads(f.read()).get('api_key')
+            key = json.loads(f.read()).get('api_key')
+        if key:
+            return key
     except FileNotFoundError:
-        return None
+        pass
     except Exception as e:
         log_error(f"Failed to read config file: {e}", 'config')
-        return None
+    return machine_key
 
 
 def _is_windows() -> bool:
@@ -3512,6 +3516,23 @@ def _machine_env(name: str) -> Optional[str]:
             return value
     except OSError:
         return None
+
+
+def _resolve_credentials(unbound_config, key_var, category):
+    """Windows: the admin-only HKLM pair wins over a user-writable config.json.
+    Elsewhere the file (freshest) wins. Always resolved as a unit, never mixed."""
+    machine_key = _machine_env(key_var)
+    machine_url = _machine_env('UNBOUND_BACKEND_URL')
+    if machine_url and not machine_url.startswith("https://"):
+        log_error("env base_url is not https, ignoring", category)
+        machine_key = machine_url = None
+    if _is_windows() and machine_key and machine_url:
+        return machine_key, machine_url
+    api_key = unbound_config.get("api_key")
+    backend_url = unbound_config.get("base_url")
+    if api_key and backend_url:
+        return api_key, backend_url
+    return machine_key, machine_url
 
 
 def _discovery_installer():
@@ -3566,14 +3587,7 @@ def _dispatch_mcp_server_scan(server_name, server_config):
                       % (type(e).__name__, getattr(e, "errno", None)), 'mcp_server')
         if not isinstance(unbound_config, dict):
             unbound_config = {}
-        api_key = unbound_config.get("api_key")
-        backend_url = unbound_config.get("base_url")
-        if not (api_key and backend_url):
-            api_key = _machine_env('UNBOUND_CURSOR_API_KEY')
-            backend_url = _machine_env('UNBOUND_BACKEND_URL')
-            if backend_url and not backend_url.startswith("https://"):
-                log_error("mcp scan dispatch: env base_url is not https, ignoring", 'mcp_server')
-                backend_url = None
+        api_key, backend_url = _resolve_credentials(unbound_config, 'UNBOUND_CURSOR_API_KEY', 'mcp_server')
         if not api_key or not backend_url:
             log_error("mcp scan dispatch: api_key/base_url missing in config", 'mcp_server')
             return
@@ -3763,15 +3777,7 @@ def _dispatch_discovery() -> None:
                           % (type(e).__name__, getattr(e, "errno", None)), 'discovery_gate')
             if not isinstance(unbound_config, dict):
                 unbound_config = {}
-            api_key = unbound_config.get("api_key")
-            backend_url = unbound_config.get("base_url")
-            if not (api_key and backend_url):
-                # Resolve as a unit -- never pair a config field with an env field.
-                api_key = _machine_env('UNBOUND_CURSOR_API_KEY')
-                backend_url = _machine_env('UNBOUND_BACKEND_URL')
-                if backend_url and not backend_url.startswith("https://"):
-                    log_error("discovery gate: env base_url is not https, ignoring", 'discovery_gate')
-                    backend_url = None
+            api_key, backend_url = _resolve_credentials(unbound_config, 'UNBOUND_CURSOR_API_KEY', 'discovery_gate')
             if not api_key:
                 log_error("discovery gate: no api_key in env or config", 'discovery_gate')
                 return
