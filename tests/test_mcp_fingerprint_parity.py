@@ -82,10 +82,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
     def test_smithery_supported_package_and_command_forms(self):
         vectors = [
             ('npx', ['-y', 'smithery@latest', 'mcp', 'run', 'vendor/server'], 'smithery:vendor/server'),
-            ('smithery.cmd', ['--verbose', 'run', '@vendor/server'], 'smithery:vendor/server'),
             ('npm', ['exec', '--', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery:vendor/server'),
-            ('bunx', ['--bun', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery:vendor/server'),
-            ('bun', ['x', '--bun', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery:vendor/server'),
             ('cmd', ['/c', 'npx.cmd', '-y', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery:vendor/server'),
             (
                 'npx',
@@ -100,8 +97,6 @@ class TestMcpFingerprintParity(unittest.TestCase):
                 ['/d', '/c', 'npx', '-y', 'smithery@latest', 'run', 'vendor/server'],
                 'smithery:vendor/server',
             ),
-            ('npx', ['-y', '@smithery/cli', 'run', 'vendor/server'], 'smithery:vendor/server'),
-            ('bunx', ['--no-install', '@smithery/cli@latest', 'run', 'vendor/server'], 'smithery:vendor/server'),
         ]
         for hook in HOOKS:
             for command, args, expected in vectors:
@@ -182,19 +177,23 @@ class TestMcpFingerprintParity(unittest.TestCase):
                         hook.compute_mcp_cache_key('alias', command, None, args)
                     )
 
-    def test_smithery_path_qualified_launchers_use_run_target(self):
+    def test_unverified_smithery_launchers_fail_closed(self):
         vectors = [
+            ('smithery', ['run', '@vendor/server']),
+            ('smithery.cmd', ['--verbose', 'run', '@vendor/server']),
+            ('bunx', ['--bun', '@smithery/cli@latest', 'run', 'vendor/server']),
+            ('bun', ['x', '--bun', '@smithery/cli@latest', 'run', 'vendor/server']),
+            ('npx', ['-y', '@smithery/cli', 'run', 'vendor/server']),
             ('./smithery', ['run', '@vendor/server']),
             ('/tmp/evil/smithery', ['run', '@vendor/server']),
             (r'C:\evil\smithery.exe', ['run', '@vendor/server']),
-            ('./npx', ['-y', '@smithery/cli', 'run', '@vendor/server']),
+            ('./npx', ['-y', '@smithery/cli@latest', 'run', '@vendor/server']),
         ]
         for hook in HOOKS:
             for command, args in vectors:
                 with self.subTest(hook=hook.__file__, command=command):
-                    self.assertEqual(
-                        hook.compute_mcp_cache_key('alias', command, None, args),
-                        'smithery:vendor/server',
+                    self.assertIsNone(
+                        hook.compute_mcp_cache_key('alias', command, None, args)
                     )
 
     def test_runtime_argument_does_not_claim_smithery_identity(self):
