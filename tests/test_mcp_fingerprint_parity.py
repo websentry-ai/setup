@@ -13,6 +13,13 @@ HOOKS = [
 
 
 class TestMcpFingerprintParity(unittest.TestCase):
+    def test_redaction_placeholder_is_not_a_binary_identity(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertIsNone(
+                    hook.compute_mcp_cache_key('redacted', '***', None, [])
+                )
+
     def test_vscode_provider_identity_does_not_override_launch_details(self):
         additional_data = {
             'providerId': 'eamodio.gitlens/gitlens.gkMcpProvider',
