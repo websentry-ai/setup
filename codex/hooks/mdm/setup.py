@@ -1443,36 +1443,49 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
 # A FIFO would hang provisioning and an oversized file would exhaust memory, so the read
 # is capped and restricted to a regular file.
 _HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
+# The hook script is a few hundred KB; past this it is not the file we wrote.
+_HOOK_SCRIPT_MAX_BYTES = 8 * 1024 * 1024
 
 
 def _load_hooks_json(hooks_path):
-    """('absent'|'unreadable'|'ok', config). Opened without following symlinks and
-    size-capped, because these are user-owned paths read by a root/SYSTEM process."""
+    """('absent'|'refused'|'unusable'|'ok', config). Opened without following
+    symlinks and size-capped, because these are user-owned paths read by a
+    root/SYSTEM process.
+
+    'refused' is our own restriction — a symlink or an unreadable mode — and says
+    nothing about the file. 'unusable' means the content is there and codex cannot
+    load hooks out of it either, which is a fact about the install, not about us.
+    """
     try:
         fd = os.open(str(hooks_path),
                      os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
     except FileNotFoundError:
         return 'absent', None
     except OSError:
-        return 'unreadable', None  # includes a symlink refused by O_NOFOLLOW
+        return 'refused', None  # includes a symlink refused by O_NOFOLLOW
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOKS_JSON_MAX_BYTES:
+        if not stat.S_ISREG(info.st_mode):
             os.close(fd)
-            return 'unreadable', None
+            return 'unusable', None
+        if info.st_size > _HOOKS_JSON_MAX_BYTES:
+            os.close(fd)
+            return 'unusable', None
     except OSError:
         os.close(fd)
-        return 'unreadable', None
+        return 'refused', None
     try:
         handle = os.fdopen(fd, 'r', encoding='utf-8')
     except OSError:
         os.close(fd)
-        return 'unreadable', None
+        return 'refused', None
     try:
         with handle as f:
             return 'ok', json.load(f)
-    except (OSError, ValueError):
-        return 'unreadable', None
+    except ValueError:
+        return 'unusable', None
+    except OSError:
+        return 'refused', None
 
 
 def _hooks_still_registered(hooks_path):
@@ -1498,10 +1511,12 @@ def _hooks_still_registered(hooks_path):
 
 def _unbound_hook_registered(hooks_path, script_path):
     """True when OUR hook is registered for this user, False when it is not, None
-    when the file cannot be read. Ownership uses the same rule the uninstall
-    strips by, so registration and removal cannot disagree about what is ours."""
+    only when we declined to read the file. Ownership uses the same rule the
+    uninstall strips by, so registration and removal cannot disagree about what is
+    ours. Content codex cannot load hooks from counts as not registered, because
+    that is exactly what it means for codex."""
     status, config = _load_hooks_json(hooks_path)
-    if status == 'absent':
+    if status in ('absent', 'unusable'):
         return False
     if status != 'ok':
         return None
@@ -2091,12 +2106,21 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
+def _is_our_hook_file(path) -> bool:
+    """A real file at exactly this path. lstat, not exists: these live in
+    user-writable homes, and a symlink there is not something we installed."""
+    try:
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
 def _installed_hook_script() -> Optional[Path]:
     """The per-user hook script, from the first home that has one. Codex installs
     the same file for every user, so any one of them identifies the install."""
     for _username, home_dir in get_all_user_homes():
         candidate = home_dir / ".codex" / "hooks" / "unbound.py"
-        if candidate.exists():
+        if _is_our_hook_file(candidate):
             return candidate
     return None
 
@@ -2110,23 +2134,30 @@ def detect_install_state() -> Optional[str]:
     'fresh' (no profile has either), 'persisted' (at least one has both),
     'tampered' (any profile has one without the other), None on any error.
     Tampered wins, matching the copilot detector.
-    An unreadable hooks.json is mirrored from the script rather than counted as a
-    mismatch, so a file we cannot open never manufactures a tamper report."""
+    A hooks.json we declined to read leaves the answer undetermined rather than
+    assumed: None omits install_state from the report, so the stored state is left
+    alone instead of being guessed healthy or guessed tampered."""
     try:
         any_complete = False
+        indeterminate = False
         for _username, home_dir in get_all_user_homes():
             script_path = home_dir / ".codex" / "hooks" / "unbound.py"
-            script = script_path.exists()
+            script = _is_our_hook_file(script_path)
             registered = _unbound_hook_registered(
                 home_dir / ".codex" / "hooks.json", script_path)
             if registered is None:
-                registered = script
+                # We declined to read it, so this profile is evidence of nothing.
+                # Never let the script stand in for the registration.
+                indeterminate = True
+                continue
             if not script and not registered:
                 continue
             if script and registered:
                 any_complete = True
             else:
                 return 'tampered'
+        if indeterminate:
+            return None
         return 'persisted' if any_complete else 'fresh'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
@@ -2135,11 +2166,34 @@ def detect_install_state() -> Optional[str]:
 
 def hook_script_hash(script_path) -> Optional[str]:
     """sha256 of the hook script this run installed, so the backend can tell which
-    hook version a device is running. None when absent or unreadable."""
-    try:
-        return hashlib.sha256(Path(script_path).read_bytes()).hexdigest()
-    except Exception:
+    hook version a device is running. None when absent or unreadable.
+
+    Codex installs per user, so this path sits in a user-writable home and is read
+    here by a root/SYSTEM process. Symlinks are refused and the size is capped, so
+    the path cannot be swapped between install and report to make setup hash a file
+    it should not read, or block on something that never ends."""
+    if script_path is None:
         return None
+    try:
+        fd = os.open(str(script_path),
+                     os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOK_SCRIPT_MAX_BYTES:
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
