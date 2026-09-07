@@ -2172,11 +2172,16 @@ def detect_install_state(skip_settings: bool = False) -> Optional[str]:
     With skip_settings no config is written, so the hook script is the marker."""
     try:
         managed_dir = get_managed_settings_dir()
-        config_path = managed_dir / "managed-settings.json"
         script_path = managed_dir / "hooks" / "unbound.py"
         if skip_settings:
             return 'persisted' if script_path.exists() else 'fresh'
-        if not config_path.exists():
+        # The install prefers the drop-in and only falls back to the flat file,
+        # so checking one of them reports every drop-in install as 'fresh'.
+        config_present = (
+            (managed_dir / "managed-settings.d" / "unbound.json").exists()
+            or (managed_dir / "managed-settings.json").exists()
+        )
+        if not config_present:
             return 'fresh'
         return 'persisted' if script_path.exists() else 'tampered'
     except Exception as e:

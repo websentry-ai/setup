@@ -2058,19 +2058,27 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
+def _installed_hook_script() -> Optional[Path]:
+    """The per-user hook script, from the first home that has one. Codex installs
+    the same file for every user, so any one of them identifies the install."""
+    for _username, home_dir in get_all_user_homes():
+        candidate = home_dir / ".codex" / "hooks" / "unbound.py"
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def detect_install_state() -> Optional[str]:
-    """Inspect the managed hooks.json target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error."""
+    """Inspect the install target BEFORE this run reasserts it.
+    Codex discovers hooks from the user layer, so the install writes nothing to
+    the managed dir and the per-user hook script is the only marker there is.
+    'persisted' when any user home still has it, 'fresh' otherwise, None on any
+    error. A removed script reports 'fresh', which the backend already reads as
+    tampering against an existing record.
+    Existence-based: these files change across versions, so content checks are
+    unreliable — only file existence is trustworthy."""
     try:
-        managed_dir = get_managed_settings_dir()
-        config_path = managed_dir / "hooks.json"
-        script_path = managed_dir / "hooks" / "unbound.py"
-        if not config_path.exists():
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        return 'persisted' if _installed_hook_script() else 'fresh'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None
@@ -2239,7 +2247,7 @@ def main():
 
     if success:
         notify_setup_complete(api_key, "codex", backend_url=base_url, install_state=state, serial_number=device_id,
-                              hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"), install_mode="mdm")
+                              hook_hash=hook_script_hash(_installed_hook_script()), install_mode="mdm")
 
     if success and backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())
