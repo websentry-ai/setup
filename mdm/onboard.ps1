@@ -12,7 +12,7 @@
       4. GitHub Copilot MDM setup
       5. Coding-discovery scan
 
-    Use -Backfill to seed historical transcripts for Claude Code and Codex.
+    Use -Backfill to seed historical transcripts for Claude Code, Codex and GitHub Copilot.
 
     This PowerShell wrapper:
     - Checks for Python availability (py, python3, python)
@@ -40,7 +40,7 @@
     each user's ~/.unbound/config.json so unbound-cli works without further setup.
 
 .PARAMETER Backfill
-    Enable backfill of historical transcripts for Claude Code and Codex (opt-in, disabled by default)
+    Enable backfill of historical transcripts for Claude Code, Codex and GitHub Copilot (opt-in, disabled by default)
 
 .PARAMETER SkipManagedSettings
     Claude Code only: install the hook script but leave managed-settings.json alone,
