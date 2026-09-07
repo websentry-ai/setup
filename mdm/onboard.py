@@ -5,7 +5,7 @@ Unbound MDM onboarding — runs all six steps in one shot:
   1. Claude Code MDM setup (with --backfill of historical transcripts)
   2. Cursor MDM setup
   3. Codex MDM setup (with --backfill of historical transcripts)
-  4. GitHub Copilot MDM setup
+  4. GitHub Copilot MDM setup (with --backfill of historical transcripts)
   5. Augment MDM setup
   6. Coding-discovery scan
 
@@ -15,11 +15,11 @@ separate discovery key is needed. --discovery-key is still accepted so existing
 MDM policies keep working, but it is ignored.
 
 Backfill must be explicitly enabled via --backfill flag (typically passed from
-PowerShell's -Backfill parameter). When enabled, it seeds Claude Code and Codex
-historical transcripts into analytics so the dashboard isn't empty until live
-activity accumulates. Backfill is idempotent (Task-row gate + deterministic
-uuid5 per record prevents duplication), so re-runs are safe. Cursor, GitHub
-Copilot, and Augment have no historical transcript store to backfill.
+PowerShell's -Backfill parameter). When enabled, it seeds Claude Code, Codex and
+GitHub Copilot historical transcripts into analytics so the dashboard isn't empty
+until live activity accumulates. Backfill is idempotent (Task-row gate +
+deterministic uuid5 per record prevents duplication), so re-runs are safe. Cursor
+and Augment have no historical transcript store to backfill.
 
 Usage:
 
@@ -91,7 +91,7 @@ DISCOVERY_KILL_GRACE_SECONDS = 120
 
 # (display_name, url, supports_backfill, supports_skip_managed_settings). Only
 # tools whose hook scripts accept `--backfill` get the flag appended; Cursor and
-# GitHub Copilot have no historical transcript store and would just print "not
+# Augment have no historical transcript store and would just print "not
 # supported" and continue. `--skip-managed-settings` is Claude Code's alone.
 TOOLS = [
     ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True,  True),
