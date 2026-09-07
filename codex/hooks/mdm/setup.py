@@ -1443,6 +1443,49 @@ def enable_codex_hooks_feature_for_user(username: str, home_dir: Path) -> None:
 # A FIFO would hang provisioning and an oversized file would exhaust memory, so the read
 # is capped and restricted to a regular file.
 _HOOKS_JSON_MAX_BYTES = 4 * 1024 * 1024
+# The hook script is a few hundred KB; past this it is not the file we wrote.
+_HOOK_SCRIPT_MAX_BYTES = 8 * 1024 * 1024
+
+
+def _load_hooks_json(hooks_path):
+    """('absent'|'refused'|'unusable'|'ok', config). Opened without following
+    symlinks and size-capped, because these are user-owned paths read by a
+    root/SYSTEM process.
+
+    'refused' is our own restriction — a symlink or an unreadable mode — and says
+    nothing about the file. 'unusable' means the content is there and codex cannot
+    load hooks out of it either, which is a fact about the install, not about us.
+    """
+    try:
+        fd = os.open(str(hooks_path),
+                     os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except FileNotFoundError:
+        return 'absent', None
+    except OSError:
+        return 'refused', None  # includes a symlink refused by O_NOFOLLOW
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            return 'unusable', None
+        if info.st_size > _HOOKS_JSON_MAX_BYTES:
+            os.close(fd)
+            return 'unusable', None
+    except OSError:
+        os.close(fd)
+        return 'refused', None
+    try:
+        handle = os.fdopen(fd, 'r', encoding='utf-8')
+    except OSError:
+        os.close(fd)
+        return 'refused', None
+    try:
+        with handle as f:
+            return 'ok', json.load(f)
+    except ValueError:
+        return 'unusable', None
+    except OSError:
+        return 'refused', None
 
 
 def _hooks_still_registered(hooks_path):
@@ -1451,30 +1494,10 @@ def _hooks_still_registered(hooks_path):
     clearing it while somebody else's entry remains turns their tooling off; None keeps the
     flag and marks the uninstall incomplete rather than guessing either way. Call this only
     after our own entries have been stripped."""
-    try:
-        fd = os.open(str(hooks_path),
-                     os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
-    except FileNotFoundError:
+    status, config = _load_hooks_json(hooks_path)
+    if status == 'absent':
         return False
-    except OSError:
-        return None  # includes a symlink refused by O_NOFOLLOW
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOKS_JSON_MAX_BYTES:
-            os.close(fd)
-            return None
-    except OSError:
-        os.close(fd)
-        return None
-    try:
-        handle = os.fdopen(fd, 'r', encoding='utf-8')
-    except OSError:
-        os.close(fd)
-        return None
-    try:
-        with handle as f:
-            config = json.load(f)
-    except (OSError, ValueError):
+    if status != 'ok':
         return None
     events = config.get('hooks')
     if not isinstance(events, dict):
@@ -1483,6 +1506,31 @@ def _hooks_still_registered(hooks_path):
         for item in entries if isinstance(entries, list) else []:
             if isinstance(item, dict) and item.get('hooks'):
                 return True
+    return False
+
+
+def _unbound_hook_registered(hooks_path, script_path):
+    """True when OUR hook is registered for this user, False when it is not, None
+    only when we declined to read the file. Ownership uses the same rule the
+    uninstall strips by, so registration and removal cannot disagree about what is
+    ours. Content codex cannot load hooks from counts as not registered, because
+    that is exactly what it means for codex."""
+    status, config = _load_hooks_json(hooks_path)
+    if status in ('absent', 'unusable'):
+        return False
+    if status != 'ok':
+        return None
+    events = config.get('hooks') if isinstance(config, dict) else None
+    if not isinstance(events, dict):
+        return False
+    for entries in events.values():
+        for item in entries if isinstance(entries, list) else []:
+            if not isinstance(item, dict):
+                continue
+            for hook in item.get('hooks') or []:
+                if isinstance(hook, dict) and _is_unbound_hook_command(
+                        hook.get('command', ''), script_path):
+                    return True
     return False
 
 
@@ -2058,19 +2106,59 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 
 
-def detect_install_state() -> Optional[str]:
-    """Inspect the managed hooks.json target BEFORE it gets overwritten.
-    Existence-based: these files change across versions, so content checks
-    are unreliable — only file existence is trustworthy.
-    'fresh' (config absent), 'persisted' (config + unbound.py both present),
-    'tampered' (config present but hook script missing), or None on any error."""
+def _is_our_hook_file(path) -> bool:
+    """A real file at exactly this path. lstat, not exists: these live in
+    user-writable homes, and a symlink there is not something we installed."""
     try:
-        managed_dir = get_managed_settings_dir()
-        config_path = managed_dir / "hooks.json"
-        script_path = managed_dir / "hooks" / "unbound.py"
-        if not config_path.exists():
-            return 'fresh'
-        return 'persisted' if script_path.exists() else 'tampered'
+        return stat.S_ISREG(path.lstat().st_mode)
+    except OSError:
+        return False
+
+
+def _installed_hook_script() -> Optional[Path]:
+    """The per-user hook script, from the first home that has one. Codex installs
+    the same file for every user, so any one of them identifies the install."""
+    for _username, home_dir in get_all_user_homes():
+        candidate = home_dir / ".codex" / "hooks" / "unbound.py"
+        if _is_our_hook_file(candidate):
+            return candidate
+    return None
+
+
+def detect_install_state() -> Optional[str]:
+    """Inspect the install target BEFORE this run reasserts it.
+    Codex discovers hooks from the user layer, so the install writes nothing to
+    the managed dir. Setup installs for every profile it finds, so the state is
+    per profile: the pair is the hook script and our entry in that user's
+    hooks.json, and either one alone leaves Codex unenforced for them.
+    'fresh' (no profile has either), 'persisted' (at least one has both),
+    'tampered' (any profile has one without the other), None on any error.
+    Tampered wins, matching the copilot detector.
+    A hooks.json we declined to read leaves the answer undetermined rather than
+    assumed: None omits install_state from the report, so the stored state is left
+    alone instead of being guessed healthy or guessed tampered."""
+    try:
+        any_complete = False
+        indeterminate = False
+        for _username, home_dir in get_all_user_homes():
+            script_path = home_dir / ".codex" / "hooks" / "unbound.py"
+            script = _is_our_hook_file(script_path)
+            registered = _unbound_hook_registered(
+                home_dir / ".codex" / "hooks.json", script_path)
+            if registered is None:
+                # We declined to read it, so this profile is evidence of nothing.
+                # Never let the script stand in for the registration.
+                indeterminate = True
+                continue
+            if not script and not registered:
+                continue
+            if script and registered:
+                any_complete = True
+            else:
+                return 'tampered'
+        if indeterminate:
+            return None
+        return 'persisted' if any_complete else 'fresh'
     except Exception as e:
         debug_print(f"detect_install_state failed: {e}")
         return None
@@ -2078,11 +2166,34 @@ def detect_install_state() -> Optional[str]:
 
 def hook_script_hash(script_path) -> Optional[str]:
     """sha256 of the hook script this run installed, so the backend can tell which
-    hook version a device is running. None when absent or unreadable."""
-    try:
-        return hashlib.sha256(Path(script_path).read_bytes()).hexdigest()
-    except Exception:
+    hook version a device is running. None when absent or unreadable.
+
+    Codex installs per user, so this path sits in a user-writable home and is read
+    here by a root/SYSTEM process. Symlinks are refused and the size is capped, so
+    the path cannot be swapped between install and report to make setup hash a file
+    it should not read, or block on something that never ends."""
+    if script_path is None:
         return None
+    try:
+        fd = os.open(str(script_path),
+                     os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > _HOOK_SCRIPT_MAX_BYTES:
+            return None
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "https://backend.getunbound.ai", install_state: Optional[str] = None, serial_number: Optional[str] = None,
@@ -2239,7 +2350,7 @@ def main():
 
     if success:
         notify_setup_complete(api_key, "codex", backend_url=base_url, install_state=state, serial_number=device_id,
-                              hook_hash=hook_script_hash(get_managed_settings_dir() / "hooks" / "unbound.py"), install_mode="mdm")
+                              hook_hash=hook_script_hash(_installed_hook_script()), install_mode="mdm")
 
     if success and backfill_mode:
         run_backfill(api_key, base_url, get_all_user_homes())
