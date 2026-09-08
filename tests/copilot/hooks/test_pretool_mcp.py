@@ -428,6 +428,33 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
 
         dispatch.assert_not_called()
 
+    def test_provider_scope_without_inventory_origin_dispatches_scan(self):
+        config = {
+            "url": "http://localhost:51983/stream",
+            "additional_data": {"scope": "vscode-provider-cache"},
+        }
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_pylance_mcp_s_read_code",
+            "tool_input": {},
+            "cwd": self.cwd,
+            "session_id": "s",
+        }
+        gateway = unittest.mock.Mock(return_value={
+            "decision": "allow",
+            "unknown_mcp_server": True,
+        })
+        with patch.object(
+            unbound,
+            "read_copilot_mcp_servers",
+            return_value={"pylance mcp server": config},
+        ), patch.object(unbound, "send_to_hook_api", gateway), patch.object(
+            unbound, "_dispatch_mcp_server_scan"
+        ) as dispatch:
+            unbound.process_pre_tool_use(event, "K")
+
+        dispatch.assert_called_once_with("pylance mcp server", config)
+
     def test_denied_unknown_server_does_not_dispatch_targeted_scan(self):
         event = {
             "hook_event_name": "PreToolUse",

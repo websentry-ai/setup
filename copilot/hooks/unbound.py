@@ -3752,10 +3752,15 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                 if isinstance(mcp_server_config, dict)
                 else None
             )
-            if config_scope not in {
-                'copilot-builtin',
-                VSCODE_PROVIDER_CACHE_SCOPE,
-            }:
+            is_vscode_provider_inventory = (
+                config_scope == VSCODE_PROVIDER_CACHE_SCOPE
+                and mcp_server_config.get('provider_cache_origin')
+                == VSCODE_PROVIDER_CACHE_ORIGIN
+            )
+            if (
+                config_scope != 'copilot-builtin'
+                and not is_vscode_provider_inventory
+            ):
                 scan_config = mcp_server_config
             log_error(
                 f"copilot mcp detected session={session_id} tool={raw_tool} "
