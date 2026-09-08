@@ -1907,6 +1907,16 @@ _UNBOUND_CODING_TOOL = 'Claude Code'
 CLAUDE_BUILTIN_PREFIX = 'claude-builtin:'
 
 CLAUDE_CONNECTOR_SCOPE = 'claude-connector'
+VSCODE_PROVIDER_CACHE_SCOPE = 'vscode-provider-cache'
+VSCODE_PROVIDER_PREFIX = 'vscode-provider:'
+DYNAMIC_LOCAL_PORT_MIN = 1024
+_EXTENSION_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+_PROVIDER_CONTRIBUTION_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+_PROVIDER_SERVER_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._ -]{0,127}')
+DYNAMIC_LOCAL_STREAM_PROVIDERS = frozenset({
+    'ms-python.vscode-pylance/pylancemcp:'
+    'ms-python.vscode-pylance/pylance mcp server',
+})
 
 # Claude Code sanitizes display names into runtime names (non-alphanumerics -> '_'), so one
 # server arrives under several spellings. chrome/browser/preview stay separate: different tools.
@@ -2538,6 +2548,66 @@ def _normalize_bin(command: str) -> Optional[str]:
     return b
 
 
+def _vscode_provider_local_stream_identity(
+    command: Optional[str],
+    url_value: Optional[str],
+    args: List[str],
+    additional_data: Dict[str, Any],
+) -> Optional[str]:
+    if (
+        command
+        or args
+        or additional_data.get('scope') != VSCODE_PROVIDER_CACHE_SCOPE
+        or not isinstance(url_value, str)
+    ):
+        return None
+    raw_url = url_value.strip()
+    raw_path_match = re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://[^/?#]*(/[^?#]*)?', raw_url)
+    raw_path = raw_path_match.group(1) if raw_path_match else ''
+    if '\\' in raw_url or any(
+        re.fullmatch(r'(?:(?:\.|%2e)){1,2}', segment, flags=re.IGNORECASE)
+        for segment in raw_path.split('/')
+    ):
+        return None
+    try:
+        parsed = urlparse(raw_url)
+        port = parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme.lower() not in {'http', 'https'}
+        or (parsed.hostname or '').lower() != 'localhost'
+        or port is None
+        or port < DYNAMIC_LOCAL_PORT_MIN
+        or port > 65535
+        or (parsed.path or '').rstrip('/') != '/stream'
+    ):
+        return None
+    provider_id = additional_data.get('providerId')
+    provider_server_id = additional_data.get('providerServerId')
+    if not isinstance(provider_id, str) or not isinstance(provider_server_id, str):
+        return None
+    provider_parts = provider_id.strip().split('/')
+    server_parts = provider_server_id.strip().split('/')
+    if (
+        len(provider_parts) != 2
+        or len(server_parts) != 2
+        or not _EXTENSION_ID_RE.fullmatch(provider_parts[0])
+        or not _PROVIDER_CONTRIBUTION_RE.fullmatch(provider_parts[1])
+        or not _EXTENSION_ID_RE.fullmatch(server_parts[0])
+        or not _PROVIDER_SERVER_NAME_RE.fullmatch(server_parts[1])
+        or provider_parts[0].lower() != server_parts[0].lower()
+    ):
+        return None
+    identity = f'{provider_id.strip().lower()}:{provider_server_id.strip().lower()}'
+    if (
+        identity not in DYNAMIC_LOCAL_STREAM_PROVIDERS
+        or len(VSCODE_PROVIDER_PREFIX) + len(identity) > 500
+    ):
+        return None
+    return identity
+
+
 def compute_fingerprint(
     name: Optional[str],
     command: Optional[str],
@@ -2596,6 +2666,12 @@ def compute_fingerprint(
         builtin = claude_builtin_identity(safe_name)
         if builtin:
             return f'{CLAUDE_BUILTIN_PREFIX}{builtin}'
+
+    vscode_provider = _vscode_provider_local_stream_identity(
+        command, url, safe_args, safe_additional_data,
+    )
+    if vscode_provider:
+        return f'{VSCODE_PROVIDER_PREFIX}{vscode_provider}'
 
     # 1. url field -> url:<host[:port]/path>
     if url:

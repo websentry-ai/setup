@@ -650,6 +650,227 @@ _PLUGIN_TOOLCHAIN_URL = (
 )
 
 
+class TestProviderCacheHydration(unittest.TestCase):
+    PROVIDER_FINGERPRINT = (
+        "vscode-provider:ms-python.vscode-pylance/pylancemcp:"
+        "ms-python.vscode-pylance/pylance mcp server"
+    )
+    PROVIDER_DATA = {
+        "scope": "vscode-provider-cache",
+        "providerId": "ms-python.vscode-pylance/pylanceMcp",
+        "providerServerId": (
+            "ms-python.vscode-pylance/pylance mcp server"
+        ),
+    }
+
+    def _observation(self, port, name="pylance mcp server", **additional):
+        return {
+            "name": name,
+            "url": f"http://localhost:{port}/stream",
+            "additional_data": {**self.PROVIDER_DATA, **additional},
+        }
+
+    def _cache(self, observations):
+        return {
+            "provider_servers": {
+                "GitHub Copilot (VS Code)": {
+                    "alice": {self.PROVIDER_FINGERPRINT: observations},
+                },
+            },
+            "tools": {
+                "GitHub Copilot (VS Code)": {
+                    "alice": {
+                        self.PROVIDER_FINGERPRINT: {"read_code": "a" * 64},
+                    },
+                },
+            },
+        }
+
+    def _read(self, cache, config_paths=None):
+        home = Path(self._tmp.name) / "alice"
+        home.mkdir(exist_ok=True)
+        with patch.object(unbound.Path, "home", return_value=home), \
+                patch.object(unbound, "_read_mcp_tools_cache", return_value=cache), \
+                patch.object(unbound, "_plugin_mcp_config_paths", return_value=[]), \
+                patch.object(
+                    unbound,
+                    "_copilot_mcp_config_paths",
+                    return_value=config_paths or [],
+                ), \
+                patch.object(unbound, "_workspace_mcp_config_paths", return_value=[]):
+            servers = unbound.read_copilot_mcp_servers(None)
+            config = servers.get("pylance mcp server")
+            content_hash = unbound._lookup_tool_content_hash(
+                "pylance mcp server", "read_code", config
+            )
+        return servers, content_hash
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_hydrates_one_validated_config_and_collapses_port_observations(self):
+        cache = self._cache([
+            self._observation(61244),
+            self._observation(51983, token="must-not-be-forwarded"),
+        ])
+
+        servers, content_hash = self._read(cache)
+
+        self.assertEqual(servers["pylance mcp server"], {
+            "url": "http://localhost:51983/stream",
+            "additional_data": self.PROVIDER_DATA,
+            "provider_cache_origin": "vscode-inventory",
+        })
+        server, tool, config = unbound.resolve_copilot_mcp(
+            "mcp_pylance_mcp_s_read_code", servers
+        )
+        self.assertEqual((server, tool), ("pylance mcp server", "read_code"))
+        self.assertEqual(config, servers["pylance mcp server"])
+        self.assertEqual(content_hash, "a" * 64)
+
+    def test_rejects_provider_observations_from_other_copilot_clients(self):
+        for tool_name in (
+            "GitHub Copilot",
+            "GitHub Copilot CLI",
+            "GitHub Copilot (JetBrains)",
+        ):
+            with self.subTest(tool_name=tool_name):
+                cache = self._cache([self._observation(51983)])
+                provider_data = cache["provider_servers"].pop(
+                    "GitHub Copilot (VS Code)"
+                )
+                cache["provider_servers"][tool_name] = provider_data
+
+                servers, _content_hash = self._read(cache)
+
+                self.assertNotIn("pylance mcp server", servers)
+
+    def test_canonicalizes_provider_url_before_forwarding_it(self):
+        observation = self._observation(51983)
+        observation["url"] = (
+            "http://alice:secret@localhost:51983/stream?token=private#fragment"
+        )
+
+        servers, content_hash = self._read(self._cache([observation]))
+
+        self.assertEqual(servers["pylance mcp server"]["url"], (
+            "http://localhost:51983/stream"
+        ))
+        self.assertEqual(content_hash, "a" * 64)
+
+    def test_provider_cache_reaches_complete_pretool_request(self):
+        cache = self._cache([self._observation(51983)])
+        home = Path(self._tmp.name) / "alice"
+        home.mkdir(exist_ok=True)
+        captured = {}
+
+        def capturing_gateway(request_body, api_key):
+            captured["request"] = request_body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_pylance_mcp_s_read_code",
+            "tool_input": {"path": "example.py"},
+            "cwd": self._tmp.name,
+            "session_id": "provider-session",
+        }
+        with patch.object(unbound.Path, "home", return_value=home), \
+                patch.object(unbound, "_read_mcp_tools_cache", return_value=cache), \
+                patch.object(unbound, "_plugin_mcp_config_paths", return_value=[]), \
+                patch.object(unbound, "_copilot_mcp_config_paths", return_value=[]), \
+                patch.object(unbound, "_workspace_mcp_config_paths", return_value=[]), \
+                patch.object(unbound, "load_policy_cache", return_value=None), \
+                patch.object(
+                    unbound, "get_recent_user_prompts_for_session", return_value=[]
+                ), \
+                patch.object(unbound, "get_session_start_model", return_value="auto"), \
+                patch.object(unbound, "_is_approval_retry", return_value=False), \
+                patch.object(unbound, "send_to_hook_api", side_effect=capturing_gateway), \
+                patch.object(unbound, "report_error_to_gateway", return_value=None):
+            result = unbound.process_pre_tool_use(event, "API_KEY")
+
+        self.assertEqual(result, {})
+        pretool = captured["request"]["pre_tool_use_data"]
+        self.assertEqual(
+            pretool["tool_name"], "mcp__pylance mcp server__read_code"
+        )
+        self.assertEqual(pretool["metadata"]["mcp_server"], "pylance mcp server")
+        self.assertEqual(pretool["metadata"]["mcp_tool"], "read_code")
+        self.assertEqual(pretool["metadata"]["mcp_server_config"], {
+            "url": "http://localhost:51983/stream",
+            "additional_data": self.PROVIDER_DATA,
+            "provider_cache_origin": "vscode-inventory",
+            "tool_content_hash": "a" * 64,
+        })
+
+    def test_unknown_provider_identity_does_not_dispatch_reactive_scan(self):
+        cache = self._cache([self._observation(51983)])
+        home = Path(self._tmp.name) / "alice"
+        home.mkdir(exist_ok=True)
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_pylance_mcp_s_read_code",
+            "tool_input": {"path": "example.py"},
+            "cwd": self._tmp.name,
+            "session_id": "provider-session",
+        }
+        with patch.object(unbound.Path, "home", return_value=home), \
+                patch.object(unbound, "_read_mcp_tools_cache", return_value=cache), \
+                patch.object(unbound, "_plugin_mcp_config_paths", return_value=[]), \
+                patch.object(unbound, "_copilot_mcp_config_paths", return_value=[]), \
+                patch.object(unbound, "_workspace_mcp_config_paths", return_value=[]), \
+                patch.object(unbound, "load_policy_cache", return_value=None), \
+                patch.object(
+                    unbound, "get_recent_user_prompts_for_session", return_value=[]
+                ), \
+                patch.object(unbound, "get_session_start_model", return_value="auto"), \
+                patch.object(unbound, "_is_approval_retry", return_value=False), \
+                patch.object(
+                    unbound,
+                    "send_to_hook_api",
+                    return_value={
+                        "decision": "allow",
+                        "unknown_mcp_server": True,
+                    },
+                ), \
+                patch.object(unbound, "_dispatch_mcp_server_scan") as dispatch, \
+                patch.object(unbound, "report_error_to_gateway", return_value=None):
+            result = unbound.process_pre_tool_use(event, "API_KEY")
+
+        self.assertEqual(result, {})
+        dispatch.assert_not_called()
+
+    def test_rejects_observation_that_does_not_recompute_to_enclosing_key(self):
+        observation = self._observation(51983)
+        observation["url"] = "http://127.0.0.1:51983/stream"
+
+        servers, content_hash = self._read(self._cache([observation]))
+
+        self.assertNotIn("pylance mcp server", servers)
+        self.assertIsNone(content_hash)
+
+    def test_static_config_with_same_name_is_ambiguous(self):
+        config_path = Path(self._tmp.name) / "mcp.json"
+        config_path.write_text(json.dumps({
+            "servers": {
+                "pylance mcp server": {
+                    "url": "http://localhost:51983/mcp",
+                },
+            },
+        }))
+
+        servers, content_hash = self._read(
+            self._cache([self._observation(51983)]),
+            [config_path],
+        )
+
+        self.assertIn("pylance mcp server", servers)
+        self.assertIsNone(servers["pylance mcp server"])
+        self.assertIsNone(content_hash)
+
+
 class TestAgentPluginConfigPaths(unittest.TestCase):
     """Exercise the real agentPlugins glob (no mocking) against a temp HOME."""
 

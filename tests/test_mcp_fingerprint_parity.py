@@ -62,6 +62,41 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'bin:gk',
                 )
 
+    def test_pylance_local_stream_has_one_provider_fingerprint(self):
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'ms-python.vscode-pylance/pylanceMcp',
+            'providerServerId': (
+                'ms-python.vscode-pylance/pylance mcp server'
+            ),
+        }
+        expected = (
+            'vscode-provider:ms-python.vscode-pylance/pylancemcp:'
+            'ms-python.vscode-pylance/pylance mcp server'
+        )
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'pylance mcp server',
+                        None,
+                        'http://localhost:51983/stream',
+                        [],
+                        additional_data,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'pylance mcp server',
+                        None,
+                        'http://127.0.0.1:51983/stream',
+                        [],
+                        additional_data,
+                    ),
+                    'url:127.0.0.1:51983/stream',
+                )
+
     def test_http_provider_keeps_url_bound_identity(self):
         additional_data = {
             'providerId': 'publisher.extension/provider',
