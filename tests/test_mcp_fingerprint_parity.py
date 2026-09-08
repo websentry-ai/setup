@@ -97,19 +97,47 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'url:127.0.0.1:51983/stream',
                 )
 
-    def test_prompt_security_wrapper_does_not_inherit_provider_identity(self):
+    def test_provider_identity_is_not_extension_allowlisted(self):
         additional_data = {
             'scope': 'vscode-provider-cache',
-            'providerId': 'ms-python.vscode-pylance/pylanceMcp',
-            'providerServerId': (
-                'ms-python.vscode-pylance/pylance mcp server'
-            ),
+            'providerId': 'publisher.extension/provider',
+            'providerServerId': 'publisher.extension/server',
         }
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
                 self.assertEqual(
                     hook.compute_mcp_cache_key(
-                        'pylance mcp server',
+                        'server',
+                        None,
+                        'http://localhost:51983/stream',
+                        [],
+                        additional_data,
+                    ),
+                    'vscode-provider:publisher.extension/provider:'
+                    'publisher.extension/server',
+                )
+
+    def test_provider_identity_only_applies_to_direct_literal_stream_urls(self):
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'publisher.extension/provider',
+            'providerServerId': 'publisher.extension/server',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
+                        None,
+                        'http://localhost:51983/foo/../stream',
+                        [],
+                        additional_data,
+                    ),
+                    'url:localhost:51983/foo/../stream',
+                )
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
                         'prompt_security_mcp',
                         None,
                         ['__args__', 'http://localhost:51983/stream'],

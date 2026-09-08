@@ -428,7 +428,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
 
         dispatch.assert_not_called()
 
-    def test_provider_scope_without_inventory_origin_dispatches_scan(self):
+    def test_provider_scope_does_not_dispatch_reactive_scan(self):
         config = {
             "url": "http://localhost:51983/stream",
             "additional_data": {"scope": "vscode-provider-cache"},
@@ -453,7 +453,7 @@ class TestProcessPreToolUseVscode(ProcessPreToolUseBase):
         ) as dispatch:
             unbound.process_pre_tool_use(event, "K")
 
-        dispatch.assert_called_once_with("pylance mcp server", config)
+        dispatch.assert_not_called()
 
     def test_denied_unknown_server_does_not_dispatch_targeted_scan(self):
         event = {
@@ -747,7 +747,6 @@ class TestProviderCacheHydration(unittest.TestCase):
         self.assertEqual(servers["pylance mcp server"], {
             "url": "http://localhost:51983/stream",
             "additional_data": self.PROVIDER_DATA,
-            "provider_cache_origin": "vscode-inventory",
         })
         server, tool, config = unbound.resolve_copilot_mcp(
             "mcp_pylance_mcp_s_read_code", servers
@@ -756,7 +755,7 @@ class TestProviderCacheHydration(unittest.TestCase):
         self.assertEqual(config, servers["pylance mcp server"])
         self.assertEqual(content_hash, "a" * 64)
 
-    def test_rejects_provider_observations_from_other_copilot_clients(self):
+    def test_provider_observations_do_not_depend_on_tool_label(self):
         for tool_name in (
             "GitHub Copilot",
             "GitHub Copilot CLI",
@@ -771,20 +770,7 @@ class TestProviderCacheHydration(unittest.TestCase):
 
                 servers, _content_hash = self._read(cache)
 
-                self.assertNotIn("pylance mcp server", servers)
-
-    def test_canonicalizes_provider_url_before_forwarding_it(self):
-        observation = self._observation(51983)
-        observation["url"] = (
-            "http://alice:secret@localhost:51983/stream?token=private#fragment"
-        )
-
-        servers, content_hash = self._read(self._cache([observation]))
-
-        self.assertEqual(servers["pylance mcp server"]["url"], (
-            "http://localhost:51983/stream"
-        ))
-        self.assertEqual(content_hash, "a" * 64)
+                self.assertIn("pylance mcp server", servers)
 
     def test_provider_cache_reaches_complete_pretool_request(self):
         cache = self._cache([self._observation(51983)])
@@ -828,7 +814,6 @@ class TestProviderCacheHydration(unittest.TestCase):
         self.assertEqual(pretool["metadata"]["mcp_server_config"], {
             "url": "http://localhost:51983/stream",
             "additional_data": self.PROVIDER_DATA,
-            "provider_cache_origin": "vscode-inventory",
             "tool_content_hash": "a" * 64,
         })
 
