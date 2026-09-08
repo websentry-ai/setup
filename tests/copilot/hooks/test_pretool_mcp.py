@@ -878,6 +878,13 @@ class TestProviderCacheHydration(unittest.TestCase):
         self.assertNotIn("pylance mcp server", servers)
         self.assertIsNone(content_hash)
 
+    def test_rejects_observation_name_that_does_not_match_provider_server(self):
+        observation = self._observation(51983, name="github")
+
+        servers, _content_hash = self._read(self._cache([observation]))
+
+        self.assertNotIn("github", servers)
+
     def test_static_config_with_same_name_is_ambiguous(self):
         config_path = Path(self._tmp.name) / "mcp.json"
         config_path.write_text(json.dumps({

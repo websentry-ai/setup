@@ -2304,6 +2304,8 @@ def compute_fingerprint(
     args: Optional[List[str]],
     additional_data: Optional[Dict[str, Any]],
     script_hash: Optional[str] = None,
+    *,
+    _allow_vscode_provider_identity: bool = True,
 ) -> Optional[str]:
     """
     Derive a stable fingerprint for an MCP server.
@@ -2334,6 +2336,7 @@ def compute_fingerprint(
                 args=inner[1:],
                 additional_data=safe_additional_data,
                 script_hash=script_hash,
+                _allow_vscode_provider_identity=False,
             )
 
     # Claude desktop OAuth remote connector. Named by a per-registration UUID at
@@ -2356,8 +2359,12 @@ def compute_fingerprint(
         if builtin:
             return f'{CLAUDE_BUILTIN_PREFIX}{builtin}'
 
-    vscode_provider = _vscode_provider_local_stream_identity(
-        command, url, safe_args, safe_additional_data,
+    vscode_provider = (
+        _vscode_provider_local_stream_identity(
+            command, url, safe_args, safe_additional_data,
+        )
+        if _allow_vscode_provider_identity
+        else None
     )
     if vscode_provider:
         return f'{VSCODE_PROVIDER_PREFIX}{vscode_provider}'
