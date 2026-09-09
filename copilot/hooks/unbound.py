@@ -2031,6 +2031,17 @@ CLAUDE_BUILTIN_PREFIX = 'claude-builtin:'
 
 CLAUDE_CONNECTOR_SCOPE = 'claude-connector'
 VSCODE_PROVIDER_CACHE_SCOPE = 'vscode-provider-cache'
+VSCODE_PROVIDER_PREFIX = 'vscode-provider:'
+# A loopback address is a throwaway: the port changes on every extension
+# restart, so it names nothing. A real host does, and it is what makes the same
+# remote server group across every tool, so those keep the url: identity.
+_VSCODE_PROVIDER_LOOPBACK_URL_RE = re.compile(
+    r'https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::([0-9]{1,5}))?(?:[/?#].*)?',
+    re.IGNORECASE,
+)
+_EXTENSION_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+_PROVIDER_CONTRIBUTION_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+_PROVIDER_SERVER_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._ -]{0,127}')
 
 # Claude Code sanitizes display names into runtime names (non-alphanumerics -> '_'), so one
 # server arrives under several spellings. chrome/browser/preview stay separate: different tools.
@@ -2662,6 +2673,47 @@ def _normalize_bin(command: str) -> Optional[str]:
     return b
 
 
+def _vscode_provider_loopback_identity(
+    command: Optional[str],
+    url_value: Optional[str],
+    args: List[str],
+    additional_data: Dict[str, Any],
+) -> Optional[str]:
+    if (
+        command
+        or args
+        or additional_data.get('scope') != VSCODE_PROVIDER_CACHE_SCOPE
+        or not isinstance(url_value, str)
+    ):
+        return None
+    url_match = _VSCODE_PROVIDER_LOOPBACK_URL_RE.fullmatch(url_value.strip())
+    if not url_match:
+        return None
+    # Five digits can still exceed a port; urlparse().port raises on those.
+    if url_match.group(1) and int(url_match.group(1)) > 65535:
+        return None
+    provider_id = additional_data.get('providerId')
+    provider_server_id = additional_data.get('providerServerId')
+    if not isinstance(provider_id, str) or not isinstance(provider_server_id, str):
+        return None
+    provider_parts = provider_id.strip().split('/')
+    server_parts = provider_server_id.strip().split('/')
+    if (
+        len(provider_parts) != 2
+        or len(server_parts) != 2
+        or not _EXTENSION_ID_RE.fullmatch(provider_parts[0])
+        or not _PROVIDER_CONTRIBUTION_RE.fullmatch(provider_parts[1])
+        or not _EXTENSION_ID_RE.fullmatch(server_parts[0])
+        or not _PROVIDER_SERVER_NAME_RE.fullmatch(server_parts[1])
+        or provider_parts[0].lower() != server_parts[0].lower()
+    ):
+        return None
+    identity = f'{provider_id.strip().lower()}:{provider_server_id.strip().lower()}'
+    if len(VSCODE_PROVIDER_PREFIX) + len(identity) > 500:
+        return None
+    return identity
+
+
 def compute_fingerprint(
     name: Optional[str],
     command: Optional[str],
@@ -2697,7 +2749,12 @@ def compute_fingerprint(
                 command=None if inner_url else inner_cmd,
                 url=inner_url,
                 args=inner[1:],
-                additional_data=safe_additional_data,
+                additional_data=(
+                    {}
+                    if safe_additional_data.get('scope')
+                    == VSCODE_PROVIDER_CACHE_SCOPE
+                    else safe_additional_data
+                ),
                 script_hash=script_hash,
             )
 
@@ -2720,6 +2777,12 @@ def compute_fingerprint(
         builtin = claude_builtin_identity(safe_name)
         if builtin:
             return f'{CLAUDE_BUILTIN_PREFIX}{builtin}'
+
+    vscode_provider = _vscode_provider_loopback_identity(
+        command, url, safe_args, safe_additional_data,
+    )
+    if vscode_provider:
+        return f'{VSCODE_PROVIDER_PREFIX}{vscode_provider}'
 
     # 1. url field -> url:<host[:port]/path>
     if url:
@@ -2932,6 +2995,133 @@ def _mcp_cache_entries_for_user(tools):
     return entries
 
 
+def _provider_cache_entries_for_user(provider_servers):
+    username = Path.home().name
+    entries = []
+    for by_user in provider_servers.values():
+        if not isinstance(by_user, dict):
+            continue
+        entry = by_user.get(username)
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def _validated_provider_cache_observation(stable_fingerprint, observation):
+    if not isinstance(observation, dict):
+        return None
+    name = observation.get('name')
+    url = observation.get('url')
+    raw_additional_data = observation.get('additional_data')
+    if (
+        not isinstance(name, str)
+        or not name
+        or len(name) > 255
+        or not isinstance(url, str)
+        or not isinstance(raw_additional_data, dict)
+    ):
+        return None
+
+    additional_data = {
+        'scope': raw_additional_data.get('scope'),
+        'providerId': raw_additional_data.get('providerId'),
+        'providerServerId': raw_additional_data.get('providerServerId'),
+    }
+    recomputed = compute_mcp_cache_key(
+        name=name,
+        command=None,
+        url=url,
+        args=None,
+        additional_data=additional_data,
+    )
+    if recomputed != stable_fingerprint:
+        return None
+    provider_server_id = additional_data['providerServerId']
+    expected_name = provider_server_id.split('/', 1)[1]
+    if name.strip().casefold() != expected_name.strip().casefold():
+        return None
+
+    try:
+        parsed_url = urlparse(url)
+        _ = parsed_url.port
+    except ValueError:
+        return None
+    host = parsed_url.hostname or ''
+    # urlparse strips the brackets off an IPv6 host; without them the rebuilt
+    # URL is unparseable and stops recomputing to the enclosing fingerprint.
+    host = f'[{host}]' if ':' in host else host
+    try:
+        parsed_port = parsed_url.port
+    except ValueError:
+        return None
+    port = f':{parsed_port}' if parsed_port else ''
+    canonical_url = (
+        f'{parsed_url.scheme.lower()}://{host}{port}'
+        f'{parsed_url.path}'
+    )
+    return name, {
+        'url': canonical_url,
+        'additional_data': additional_data,
+    }
+
+
+def _copilot_provider_servers_from_cache(cache):
+    provider_servers = cache.get('provider_servers') if isinstance(cache, dict) else None
+    if not isinstance(provider_servers, dict):
+        return {}
+
+    candidates = {}
+    for by_fingerprint in _provider_cache_entries_for_user(
+        provider_servers
+    ):
+        for stable_fingerprint, observations in by_fingerprint.items():
+            if (
+                not isinstance(stable_fingerprint, str)
+                or not stable_fingerprint.startswith(VSCODE_PROVIDER_PREFIX)
+                or not isinstance(observations, list)
+            ):
+                continue
+            for observation in observations:
+                validated = _validated_provider_cache_observation(
+                    stable_fingerprint,
+                    observation,
+                )
+                if validated is None:
+                    continue
+                name, config = validated
+                normalized_name = name.casefold()
+                candidates.setdefault(normalized_name, []).append(
+                    (stable_fingerprint, name, config)
+                )
+
+    resolved = {}
+    for same_name in candidates.values():
+        fingerprints = {candidate[0] for candidate in same_name}
+        # One runtime name claiming multiple validated provider identities is
+        # ambiguous. Keep the name present with a null config so the existing
+        # resolver cannot silently borrow either identity.
+        if len(fingerprints) != 1:
+            chosen_name = min(candidate[1] for candidate in same_name)
+            resolved[chosen_name] = None
+            continue
+
+        # Multiple ports for one stable provider are expected. Pick one config
+        # deterministically; the fingerprint is port-independent, while every
+        # observation remains intact in the cache file.
+        _fingerprint, chosen_name, chosen_config = min(
+            same_name,
+            key=lambda candidate: (
+                candidate[1].casefold(),
+                candidate[1],
+                candidate[2]['url'],
+                candidate[2]['additional_data']['providerId'],
+                candidate[2]['additional_data']['providerServerId'],
+            ),
+        )
+        resolved[chosen_name] = chosen_config
+    return resolved
+
+
 _CONTENT_HASH_RE = re.compile(r'^[a-f0-9]{64}$', re.IGNORECASE)
 
 
@@ -3054,8 +3244,38 @@ def read_copilot_mcp_servers(cwd=None):
             # a genuine read failure, so it's worth surfacing for diagnosis.
             log_error(f"copilot mcp config read failed path={config_path} err={e}", 'mcp_config')
             continue
+    cached_providers = _copilot_provider_servers_from_cache(_read_mcp_tools_cache())
+    cached_by_name = {
+        name.casefold(): (name, config)
+        for name, config in cached_providers.items()
+    }
+    existing_names = {name.casefold(): name for name in servers}
+    for provider_name, provider_config in cached_providers.items():
+        normalized_name = provider_name.casefold()
+        existing_name = existing_names.get(normalized_name)
+        if existing_name is None:
+            servers[provider_name] = provider_config
+            server_sources[provider_name] = 'validated-provider'
+            existing_names[normalized_name] = provider_name
+            continue
+        if servers.get(existing_name) != provider_config:
+            servers[existing_name] = None
+            ambiguous_names.add(existing_name)
+
     for name, fields in _vscode_cached_mcp_servers(cwd):
-        if name in ambiguous_names:
+        normalized_name = name.casefold()
+        validated_provider = cached_by_name.get(normalized_name)
+        existing_name = existing_names.get(normalized_name, name)
+        if existing_name in ambiguous_names:
+            continue
+        if validated_provider is not None:
+            _provider_name, provider_config = validated_provider
+            if (
+                _mcp_provider_identity(fields)
+                != _mcp_provider_identity(provider_config)
+            ):
+                servers[existing_name] = None
+                ambiguous_names.add(existing_name)
             continue
         if name in server_sources:
             existing = servers.get(name)
@@ -3525,12 +3745,15 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         else:
             is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
-            if isinstance(mcp_server_config, dict) and (
+            config_scope = (
                 (mcp_server_config.get('additional_data') or {}).get('scope')
-                != 'copilot-builtin'
+                if isinstance(mcp_server_config, dict)
+                else None
+            )
+            if (
+                config_scope != 'copilot-builtin'
+                and config_scope != VSCODE_PROVIDER_CACHE_SCOPE
             ):
-                # A builtin has nothing on disk; its targeted scan can only
-                # ever report unknown_config_shape.
                 scan_config = mcp_server_config
             log_error(
                 f"copilot mcp detected session={session_id} tool={raw_tool} "
