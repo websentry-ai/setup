@@ -447,6 +447,33 @@ def _get_session_model(session_id: str) -> Optional[str]:
         return None
 
 
+_TRANSCRIPT_MODEL_TAIL_BYTES = 1024 * 1024
+
+
+def _transcript_model(transcript_path: Optional[str]) -> Optional[str]:
+    """Model of the newest assistant entry in the transcript. Only SessionStart
+    carries a model in the hook input, so this is the only per-turn source."""
+    if not transcript_path or transcript_path == 'undefined':
+        return None
+    try:
+        with open(transcript_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - _TRANSCRIPT_MODEL_TAIL_BYTES))
+            lines = f.read().split(b'\n')
+    except Exception:
+        return None  # fail open: an unreadable transcript must not skip the policy check
+    for line in reversed(lines):
+        if not line.strip():
+            continue
+        try:
+            message = json.loads(line).get('message')
+        except (ValueError, AttributeError):
+            continue  # a tail cut mid-line, or an entry that is not an object
+        if isinstance(message, dict) and message.get('model'):
+            return message['model']
+    return None
+
+
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
@@ -3511,7 +3538,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     """Run the gateway policy check for a PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
-    model = event.get('model') or _get_session_model(session_id) or 'auto'
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
 
@@ -3613,6 +3639,10 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     # Raw CLAUDE_CODE_ENTRYPOINT, forwarded so the gateway can tell a headless
     # session (sdk-cli/sdk-ts/sdk-py) apart from an interactive one.
     client_entrypoint = os.environ.get('CLAUDE_CODE_ENTRYPOINT', 'cli')
+
+    # Past the early returns: the tail read is wasted on a call the gateway never sees.
+    model = (event.get('model') or _transcript_model(transcript_path)
+             or _get_session_model(session_id) or 'auto')
 
     request_body = {
         'conversation_id': session_id,
@@ -4377,7 +4407,8 @@ def _apply_prompt_skill_actions(event: Dict, api_response, api_key: str) -> None
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
-    model = event.get('model') or _get_session_model(session_id) or 'auto'
+    model = (event.get('model') or _transcript_model(event.get('transcript_path'))
+             or _get_session_model(session_id) or 'auto')
     prompt = event.get('prompt', '')
 
     cache = load_policy_cache()
