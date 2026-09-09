@@ -59,15 +59,34 @@ class TestTranscriptModel(unittest.TestCase):
         self.assertEqual(unbound._transcript_model(str(self.path)), "claude-sonnet-4-6")
 
     def test_newest_wins_across_a_large_intervening_entry(self):
-        head = _user("x" * unbound._TRANSCRIPT_MODEL_TAIL_BYTES)
-        path = self._write([_assistant("claude-opus-4-1"), head,
+        path = self._write([_assistant("claude-opus-4-1"), _user("x" * 4096),
                             _assistant("claude-sonnet-4-6")])
-        self.assertEqual(unbound._transcript_model(path), "claude-sonnet-4-6")
+        with patch.object(unbound, "_TRANSCRIPT_MODEL_WINDOWS", (1024, 65536)):
+            self.assertEqual(unbound._transcript_model(path), "claude-sonnet-4-6")
 
-    def test_model_older_than_the_tail_window_is_not_found(self):
-        path = self._write([_assistant("claude-opus-4-1"),
-                            _user("x" * (unbound._TRANSCRIPT_MODEL_TAIL_BYTES + 1))])
-        self.assertIsNone(unbound._transcript_model(path))
+    def test_record_larger_than_the_first_window_is_found_by_the_second(self):
+        # A single tool-result record can fill the first window on its own.
+        path = self._write([_assistant("claude-sonnet-4-6"), _user("x" * 4096)])
+        with patch.object(unbound, "_TRANSCRIPT_MODEL_WINDOWS", (1024, 65536)):
+            self.assertEqual(unbound._transcript_model(path), "claude-sonnet-4-6")
+
+    def test_model_bearing_record_exceeding_the_first_window(self):
+        path = self._write([_assistant("claude-sonnet-4-6", "y" * 4096)])
+        with patch.object(unbound, "_TRANSCRIPT_MODEL_WINDOWS", (1024, 65536)):
+            self.assertEqual(unbound._transcript_model(path), "claude-sonnet-4-6")
+
+    def test_beyond_every_window_is_none(self):
+        path = self._write([_assistant("claude-opus-4-1"), _user("x" * 4096)])
+        with patch.object(unbound, "_TRANSCRIPT_MODEL_WINDOWS", (256, 1024)):
+            self.assertIsNone(unbound._transcript_model(path))
+
+    def test_short_file_is_read_once_not_per_window(self):
+        path = self._write([_assistant("claude-sonnet-4-6")])
+        opened = []
+        real_open = unbound.open if hasattr(unbound, "open") else open
+        with patch("builtins.open", side_effect=lambda *a, **k: opened.append(a[0]) or real_open(*a, **k)):
+            self.assertEqual(unbound._transcript_model(path), "claude-sonnet-4-6")
+        self.assertEqual(len(opened), 1)
 
 
 class TestPreToolUseReportsTranscriptModel(ProcessPreToolUseBase):

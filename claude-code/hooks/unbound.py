@@ -447,7 +447,9 @@ def _get_session_model(session_id: str) -> Optional[str]:
         return None
 
 
-_TRANSCRIPT_MODEL_TAIL_BYTES = 1024 * 1024
+# A single tool-result record can approach a megabyte on its own, so a miss in the
+# first window retries wider before giving up.
+_TRANSCRIPT_MODEL_WINDOWS = (1024 * 1024, 16 * 1024 * 1024)
 
 
 def _transcript_model(transcript_path: Optional[str]) -> Optional[str]:
@@ -455,22 +457,25 @@ def _transcript_model(transcript_path: Optional[str]) -> Optional[str]:
     carries a model in the hook input, so this is the only per-turn source."""
     if not transcript_path or transcript_path == 'undefined':
         return None
-    try:
-        with open(transcript_path, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - _TRANSCRIPT_MODEL_TAIL_BYTES))
-            lines = f.read().split(b'\n')
-    except Exception:
-        return None  # fail open: an unreadable transcript must not skip the policy check
-    for line in reversed(lines):
-        if not line.strip():
-            continue
+    for window in _TRANSCRIPT_MODEL_WINDOWS:
         try:
-            message = json.loads(line).get('message')
-        except (ValueError, AttributeError):
-            continue  # a tail cut mid-line, or an entry that is not an object
-        if isinstance(message, dict) and message.get('model'):
-            return message['model']
+            with open(transcript_path, 'rb') as f:
+                size = f.seek(0, os.SEEK_END)
+                f.seek(max(0, size - window))
+                lines = f.read().split(b'\n')
+        except Exception:
+            return None  # fail open: an unreadable transcript must not skip the policy check
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line).get('message')
+            except (ValueError, AttributeError):
+                continue  # a tail cut mid-line, or an entry that is not an object
+            if isinstance(message, dict) and message.get('model'):
+                return message['model']
+        if window >= size:
+            break  # the whole file was read; a wider window cannot reach further
     return None
 
 
@@ -3641,6 +3646,8 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     client_entrypoint = os.environ.get('CLAUDE_CODE_ENTRYPOINT', 'cli')
 
     # Past the early returns: the tail read is wasted on a call the gateway never sees.
+    # Transcript first: it names the model that ran the turn, and a tool call is always
+    # preceded by the assistant message that requested it, so it is never empty here.
     model = (event.get('model') or _transcript_model(transcript_path)
              or _get_session_model(session_id) or 'auto')
 
