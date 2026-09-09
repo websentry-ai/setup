@@ -2036,7 +2036,7 @@ VSCODE_PROVIDER_PREFIX = 'vscode-provider:'
 # restart, so it names nothing. A real host does, and it is what makes the same
 # remote server group across every tool, so those keep the url: identity.
 _VSCODE_PROVIDER_LOOPBACK_URL_RE = re.compile(
-    r'https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::[0-9]{1,5})?(?:[/?#].*)?',
+    r'https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::([0-9]{1,5}))?(?:[/?#].*)?',
     re.IGNORECASE,
 )
 _EXTENSION_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
@@ -2686,7 +2686,11 @@ def _vscode_provider_loopback_identity(
         or not isinstance(url_value, str)
     ):
         return None
-    if not _VSCODE_PROVIDER_LOOPBACK_URL_RE.fullmatch(url_value.strip()):
+    url_match = _VSCODE_PROVIDER_LOOPBACK_URL_RE.fullmatch(url_value.strip())
+    if not url_match:
+        return None
+    # Five digits can still exceed a port; urlparse().port raises on those.
+    if url_match.group(1) and int(url_match.group(1)) > 65535:
         return None
     provider_id = additional_data.get('providerId')
     provider_server_id = additional_data.get('providerServerId')
@@ -3037,7 +3041,11 @@ def _validated_provider_cache_observation(stable_fingerprint, observation):
     if name.strip().casefold() != expected_name.strip().casefold():
         return None
 
-    parsed_url = urlparse(url)
+    try:
+        parsed_url = urlparse(url)
+        _ = parsed_url.port
+    except ValueError:
+        return None
     host = parsed_url.hostname or ''
     # urlparse strips the brackets off an IPv6 host; without them the rebuilt
     # URL is unparseable and stops recomputing to the enclosing fingerprint.

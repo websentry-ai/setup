@@ -117,6 +117,26 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'publisher.extension/server',
                 )
 
+    def test_port_above_65535_is_not_a_provider_url(self):
+        """urlparse().port raises on these, so they must not reach the rebuild."""
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'publisher.extension/provider',
+            'providerServerId': 'publisher.extension/server',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
+                        None,
+                        'http://localhost:99999/mcp',
+                        [],
+                        additional_data,
+                    ),
+                    None,
+                )
+
     def test_provider_identity_only_applies_to_loopback_urls(self):
         additional_data = {
             'scope': 'vscode-provider-cache',
