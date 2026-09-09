@@ -702,6 +702,7 @@ def _backfill_mcp_tool_provenance(entries: List[Dict]) -> Dict[str, Dict[str, An
                     tool_name, arguments, "", mcp_servers=mcp_servers,
                     mcp_server_name=request.get("mcpServerName"),
                     mcp_tool_name=request.get("mcpToolName"),
+                    cwd=cwd,
                 )
                 if not isinstance(mapped, dict) or mapped.get("type") != "afterMCPExecution":
                     continue

@@ -7,6 +7,8 @@ neither has a config-file `mcpServers` entry, so the hook must rebuild a config
 to give the gateway a non-null fingerprint.
 """
 
+import base64
+import hashlib
 import json
 import os
 import tempfile
@@ -1207,6 +1209,96 @@ class TestProcessPreToolUseSuffixFallback(ProcessPreToolUseBase):
             unbound.process_pre_tool_use(event, "API_KEY")
         self.assertFalse([m for m, _ in logged
                           if m.startswith("unknown mcp server with no resolvable config")])
+
+
+class TestLocalScriptFingerprint(ProcessPreToolUseBase):
+    """A stdio MCP server's script is fingerprinted for the policy call and its
+    body uploaded by the out-of-band scan; both must describe the same bytes and
+    neither may reach a file the runtime would not execute."""
+
+    def setUp(self):
+        self._real_dispatch_scan = unbound._dispatch_mcp_server_scan
+        super().setUp()
+        unbound._HOOK_SCRIPT_SNAPSHOT.clear()
+        self.script = self.root / "build" / "index.js"
+        self.script.parent.mkdir(parents=True, exist_ok=True)
+        self.body = b"console.log('ctx')\n"
+        self.script.write_bytes(self.body)
+        self.sha = hashlib.sha256(self.body).hexdigest()
+
+    def _forwarded_config(self, server_config):
+        _write_json(self.claude_json, {"mcpServers": {"ctx": server_config}})
+        return self.run_capture("mcp__ctx__query").get("mcp_server_config", {})
+
+    def _scan_payload(self, server_config):
+        config_path = self.root / "unbound.json"
+        _write_json(config_path, {"api_key": "secret-api-key",
+                                  "base_url": "https://backend.example.com"})
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), \
+             patch.object(unbound, "RUNNING_FROZEN", True), \
+             patch.object(unbound, "FROZEN_DISCOVERY_BIN", str(self.script)), \
+             patch.object(unbound.subprocess, "Popen") as popen:
+            self._real_dispatch_scan("ctx", server_config, cwd=self.cwd)
+        return json.loads(popen.call_args.kwargs["env"]["UNBOUND_MCP_SERVER_JSON"])
+
+    def test_plain_script_argument_is_hashed(self):
+        cfg = self._forwarded_config({"command": "node", "args": [str(self.script)]})
+        self.assertEqual(cfg.get("scriptHash"), self.sha)
+
+    def test_scan_body_matches_the_hash_reported_at_policy_time(self):
+        # The backend re-hashes the uploaded body, so an edit landing between the
+        # PreToolUse policy call and the out-of-band scan must not split the two.
+        server = {"command": "node", "args": [str(self.script)]}
+        reported = self._forwarded_config(server)["scriptHash"]
+        self.script.write_bytes(b"console.log('edited after the policy call')\n")
+
+        sent = self._scan_payload(server)
+        self.assertEqual(reported, self.sha)
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(),
+            reported)
+
+    def test_scan_without_a_cached_snapshot_still_agrees(self):
+        unbound._HOOK_SCRIPT_SNAPSHOT.clear()
+        sent = self._scan_payload({"command": "node", "args": [str(self.script)]})
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(),
+            self.sha)
+
+    def test_module_run_never_reads_an_unrelated_file(self):
+        notes = self.root / "notes.py"
+        notes.write_bytes(b"# private\n")
+        server = {"command": "python", "args": ["-m", "package", str(notes)]}
+        self.assertNotIn("scriptHash", self._forwarded_config(server))
+        self.assertNotIn("script_content", self._scan_payload(server))
+
+    def test_windows_module_run_never_reads_a_trailing_path(self):
+        server = {"command": "python",
+                  "args": ["-m", "package", r"C:\private\notes.py"]}
+        self.assertNotIn("scriptHash", self._forwarded_config(server))
+        self.assertNotIn("script_content", self._scan_payload(server))
+
+    def test_preload_flag_makes_the_entrypoint_ambiguous(self):
+        preload = self.root / "build" / "preload.js"
+        preload.write_bytes(b"// preload\n")
+        cfg = self._forwarded_config({
+            "command": "node", "args": ["-r", str(preload), str(self.script)]})
+        self.assertNotIn("scriptHash", cfg)
+
+    def test_script_symlink_to_a_non_script_is_neither_hashed_nor_uploaded(self):
+        secret = self.root / "credentials"
+        secret.write_bytes(b"aws_secret_access_key = 1\n")
+        link = self.root / "server.py"
+        link.symlink_to(secret)
+        server = {"command": "python3", "args": [str(link)]}
+        self.assertNotIn("scriptHash", self._forwarded_config(server))
+        self.assertNotIn("script_content", self._scan_payload(server))
+
+    def test_script_symlink_to_a_real_script_is_hashed(self):
+        link = self.root / "server.js"
+        link.symlink_to(self.script)
+        cfg = self._forwarded_config({"command": "node", "args": [str(link)]})
+        self.assertEqual(cfg.get("scriptHash"), self.sha)
 
 
 if __name__ == "__main__":

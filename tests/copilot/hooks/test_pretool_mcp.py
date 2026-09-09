@@ -1281,6 +1281,7 @@ class TestLocalScriptFingerprint(ProcessPreToolUseBase):
 
     def setUp(self):
         super().setUp()
+        unbound._HOOK_SCRIPT_SNAPSHOT.clear()
         self.script = Path(self.cwd) / "build" / "index.js"
         self.script.parent.mkdir(parents=True, exist_ok=True)
         self.script.write_bytes(b"console.log('ctx')\n")
@@ -1353,6 +1354,56 @@ class TestLocalScriptFingerprint(ProcessPreToolUseBase):
         self.assertEqual(self._forwarded_config(), {
             "command": "npx", "args": ["@upstash/context7-mcp"],
         })
+
+    def _scan_payload(self, server_config):
+        config_path = Path(self.cwd) / "unbound.json"
+        config_path.write_text(json.dumps({
+            "api_key": "secret-api-key",
+            "base_url": "https://backend.example.com",
+        }))
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
+            unbound, "RUNNING_FROZEN", True
+        ), patch.object(
+            unbound, "FROZEN_DISCOVERY_BIN", str(self.script)
+        ), patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_mcp_server_scan("context", server_config, cwd=self.cwd)
+        return json.loads(popen.call_args.kwargs["env"]["UNBOUND_MCP_SERVER_JSON"])
+
+    def test_scan_body_matches_the_hash_reported_at_policy_time(self):
+        # The backend re-hashes the uploaded body, so an edit landing between the
+        # PreToolUse policy call and the out-of-band scan must not split the two.
+        reported = self._forwarded_config()["scriptHash"]
+        self.script.write_bytes(b"console.log('edited after the policy call')\n")
+
+        sent = self._scan_payload({"command": "node", "args": [str(self.script)]})
+        self.assertEqual(reported, self.sha)
+        self.assertEqual(sent["scriptHash"], reported)
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(),
+            reported,
+        )
+
+    def test_scan_without_a_cached_snapshot_still_agrees(self):
+        unbound._HOOK_SCRIPT_SNAPSHOT.clear()
+        sent = self._scan_payload({"command": "node", "args": [str(self.script)]})
+        self.assertEqual(sent["scriptHash"], self.sha)
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(),
+            self.sha,
+        )
+
+    def test_module_run_never_uploads_an_unrelated_file(self):
+        notes = Path(self.cwd) / "notes.py"
+        notes.write_bytes(b"# private\n")
+        (Path(self.cwd) / ".vscode" / "mcp.json").write_text(json.dumps({
+            "servers": {"context": {
+                "command": "python", "args": ["-m", "package", str(notes)],
+            }},
+        }))
+        self.assertNotIn("scriptHash", self._forwarded_config())
+        sent = self._scan_payload(
+            {"command": "python", "args": ["-m", "package", str(notes)]})
+        self.assertNotIn("script_content", sent)
 
 
 if __name__ == "__main__":

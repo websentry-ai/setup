@@ -1,16 +1,20 @@
 import base64
 import hashlib
+import json
+import os
 import tempfile
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest.mock import patch
 
 from tests.conftest import load_module
 
 
+COPILOT = load_module('copilot/hooks/unbound.py')
 HOOKS = [
     load_module('claude-code/hooks/unbound.py'),
     load_module('codex/hooks/unbound.py'),
-    load_module('copilot/hooks/unbound.py'),
+    COPILOT,
     load_module('augment/hooks/unbound.py'),
     load_module('cursor/unbound.py'),
 ]
@@ -421,7 +425,7 @@ class TestScriptHashParity(unittest.TestCase):
     def test_runner_subtoken_is_skipped(self):
         ts = self.dir / 'server.ts'
         ts.write_bytes(self.body)
-        self._assert_all(self.sha, 'node', ['--loader', 'tsx', str(ts)])
+        self._assert_all(self.sha, 'bun', ['run', str(ts)])
 
     def test_non_script_extension_is_never_read(self):
         # Security control: a '/'-only match let a crafted config point a runtime
@@ -482,3 +486,235 @@ class TestScriptHashParity(unittest.TestCase):
                         hashlib.sha256(base64.b64decode(body)).hexdigest(),
                         hook._compute_script_hash('node', [str(script)], None),
                     )
+
+
+class TestMcpScanDispatchCommand(unittest.TestCase):
+    """The targeted scan has to launch natively on Windows: a stock box has neither
+    bash nor install.sh, which is what `[WinError 2]` on the dispatch was."""
+
+    DOMAIN = 'https://backend.example.com'
+    API_KEY = 'secret-api-key'
+    SERVER = {'command': 'npx', 'args': ['-y', 'pg-mcp']}
+    SYSTEM_ROOT = r'C:\Windows'
+
+    def _dispatch(self, hook, windows):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'unbound.json'
+            config.write_text(json.dumps(
+                {'api_key': self.API_KEY, 'base_url': self.DOMAIN}))
+            with patch.object(hook, 'UNBOUND_CONFIG_PATH', config), \
+                    patch.object(hook, 'RUNNING_FROZEN', False), \
+                    patch.object(hook, '_is_windows', return_value=windows), \
+                    patch.object(hook, '_ensure_discovery_installer', return_value=True), \
+                    patch.dict(os.environ, {'SystemRoot': self.SYSTEM_ROOT}), \
+                    patch.object(hook.subprocess, 'Popen') as popen:
+                hook._dispatch_mcp_server_scan('ctx', dict(self.SERVER))
+        self.assertEqual(popen.call_count, 1, hook.__file__)
+        return popen.call_args
+
+    def test_windows_scan_runs_the_powershell_installer(self):
+        powershell = str(PureWindowsPath(self.SYSTEM_ROOT).joinpath(
+            'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'))
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(self._dispatch(hook, windows=True).args[0], [
+                    powershell,
+                    '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+                    '-File', str(hook.DISCOVERY_INSTALL_PS1),
+                    '-McpScan', '-McpServerName', 'ctx', '-Domain', self.DOMAIN,
+                ])
+
+    def test_unix_scan_keeps_its_bash_invocation(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                argv = self._dispatch(hook, windows=False).args[0]
+                if hook is COPILOT:
+                    self.assertEqual(argv, [
+                        'bash', str(hook.DISCOVERY_INSTALL_SH), 'mcp-scan',
+                        '--name', 'ctx', '--domain', self.DOMAIN,
+                    ])
+                    continue
+                self.assertEqual(argv[:2], ['bash', '-c'])
+                self.assertIn(hook.DISCOVERY_INSTALL_SH.as_posix(), argv[2])
+                self.assertIn(hook.DISCOVERY_INSTALL_URL, argv[2])
+                self.assertIn(
+                    'exec bash "$SH" mcp-scan --name "$UNBOUND_MCP_SERVER_NAME"'
+                    ' --domain "$UNBOUND_MCP_DOMAIN"', argv[2])
+
+    def test_neither_path_puts_the_api_key_in_argv(self):
+        for hook in HOOKS:
+            for windows in (True, False):
+                with self.subTest(hook=hook.__file__, windows=windows):
+                    call = self._dispatch(hook, windows=windows)
+                    self.assertNotIn(self.API_KEY, ' '.join(call.args[0]))
+                    self.assertEqual(
+                        call.kwargs['env']['UNBOUND_API_KEY'], self.API_KEY)
+                    self.assertEqual(
+                        json.loads(call.kwargs['env']['UNBOUND_MCP_SERVER_JSON']),
+                        self.SERVER)
+
+
+class TestScriptEntrypointSelection(unittest.TestCase):
+    """A crafted MCP config must not be able to name a file the runtime would never
+    execute: `python -m package C:\\private\\notes.py` runs a module, not notes.py."""
+
+    def _candidates(self, command, args):
+        return {h.__file__: h._hook_candidate_script(command, args)
+                for h in HOOKS}
+
+    def _assert_all(self, expected, command, args):
+        for path, got in self._candidates(command, args).items():
+            self.assertEqual(got, expected, path)
+
+    def test_module_flag_leaves_a_trailing_path_alone(self):
+        self._assert_all(None, 'python', ['-m', 'package', r'C:\private\notes.py'])
+
+    def test_inline_code_flags_have_no_entrypoint(self):
+        for command, args in (
+            ('python3', ['-c', 'import runpy']),
+            ('python3', ['-uc', 'import runpy']),      # bundled short options
+            ('node', ['-e', 'require("./server.js")']),
+            ('node', ['--eval', 'x']),
+            ('node', ['-p', './server.js']),
+            ('bun', ['--eval', './server.ts']),
+            ('deno', ['eval', './server.ts']),
+            ('ruby', ['-e', 'load "./server.rb"']),
+            ('perl', ['-ne', 'print', './server.py']),  # bundled -n -e
+            ('php', ['-r', 'include "x.php";', './server.php']),
+            ('rscript', ['-e', 'source("x.sh")']),
+        ):
+            with self.subTest(command=command, args=args):
+                self._assert_all(None, command, args)
+
+    def test_any_flag_before_the_entrypoint_yields_nothing(self):
+        # Deliberately conservative: without per-runtime flag tables we cannot tell
+        # an entrypoint from a module name or a value a flag consumes, so we read
+        # nothing rather than risk reading the wrong file.
+        for command, args in (
+            ('node', ['-r', './preload.js', 'server.js']),
+            ('node', ['--require', './preload.js', 'server.js']),
+            ('node', ['--require=./preload.js', 'server.js']),
+            ('node', ['--experimental-loader', './loader.mjs', 'server.js']),
+            ('node', ['--loader', 'tsx', 'server.ts']),
+            ('bun', ['--preload', './preload.js', 'server.js']),
+            ('deno', ['run', '--allow-net', 'server.ts']),
+            ('python3', ['-X', 'importtime', 'app.py']),
+            ('python3', ['-uX', 'importtime', 'app.py']),
+            ('ruby', ['-I', './lib', 'main.rb']),
+            ('ruby', ['-Ilib', 'main.rb']),
+            ('php', ['-f', 'server.php']),
+        ):
+            with self.subTest(command=command, args=args):
+                self._assert_all(None, command, args)
+
+    def test_only_the_first_positional_can_be_the_entrypoint(self):
+        self._assert_all('server.js', 'node', ['server.js', './notes.py'])
+
+    def test_runner_subtokens_still_resolve(self):
+        self._assert_all('server.ts', 'bun', ['run', 'server.ts'])
+        self._assert_all('server.ts', 'deno', ['run', 'server.ts'])
+        self._assert_all('server.ts', 'dart', ['run', 'server.ts'])
+
+    def test_run_is_not_skipped_for_other_runtimes(self):
+        for runtime in ('node', 'python3', 'ruby'):
+            with self.subTest(runtime=runtime):
+                self._assert_all(None, runtime, ['run', 'private.py'])
+
+    def test_command_that_is_itself_a_script_still_resolves(self):
+        self._assert_all('./server.py', './server.py', [])
+
+    def test_non_string_args_are_not_parsed(self):
+        self._assert_all(None, 'node', [{'path': 'server.js'}, 'server.js'])
+
+
+class TestScriptSymlinkResolution(unittest.TestCase):
+    """The extension gate has to hold for the bytes actually read, so a `.py`
+    symlink pointing at a secret is rejected rather than followed."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.body = b"print('hi')\n"
+        for hook in HOOKS:
+            if hasattr(hook, '_HOOK_SCRIPT_SNAPSHOT'):
+                hook._HOOK_SCRIPT_SNAPSHOT.clear()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _assert_all(self, expected, command, args, cwd=None):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(hook._compute_script_hash(command, args, cwd), expected)
+
+    def test_script_symlink_to_a_non_script_is_rejected(self):
+        secret = self.dir / 'credentials'
+        secret.write_bytes(b'aws_secret_access_key = 1\n')
+        link = self.dir / 'server.py'
+        link.symlink_to(secret)
+        self._assert_all(None, 'python3', [str(link)])
+
+    def test_symlink_to_a_real_script_still_resolves(self):
+        target = self.dir / 'real.py'
+        target.write_bytes(self.body)
+        link = self.dir / 'server.py'
+        link.symlink_to(target)
+        self._assert_all(hashlib.sha256(self.body).hexdigest(), 'python3', [str(link)])
+
+    def test_directory_named_like_a_script_is_not_read(self):
+        (self.dir / 'server.py').mkdir()
+        self._assert_all(None, 'python3', [str(self.dir / 'server.py')])
+
+    def test_fifo_named_like_a_script_is_not_read(self):
+        fifo = self.dir / 'server.sh'
+        os.mkfifo(fifo)
+        self._assert_all(None, 'bash', [str(fifo)])
+        self._assert_all(None, str(fifo), [])
+
+
+class TestScriptFailureDiagnostics(unittest.TestCase):
+    """A script we resolve but cannot use has to leave a breadcrumb; a silent
+    `except Exception: return None` is indistinguishable from 'not a local script'."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        for hook in HOOKS:
+            if hasattr(hook, '_HOOK_SCRIPT_SNAPSHOT'):
+                hook._HOOK_SCRIPT_SNAPSHOT.clear()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _logged(self, hook, command, args):
+        with patch.object(hook, 'log_error') as log_error:
+            self.assertIsNone(hook._compute_script_hash(command, args, None))
+        self.assertTrue(log_error.called, hook.__file__)
+        message, category = log_error.call_args.args[:2]
+        self.assertEqual(category, 'mcp_config', hook.__file__)
+        return message
+
+    def test_non_script_symlink_target_is_logged(self):
+        secret = self.dir / 'credentials'
+        secret.write_bytes(b'aws_secret_access_key = 1\n')
+        link = self.dir / 'server.py'
+        link.symlink_to(secret)
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                message = self._logged(hook, 'python3', [str(link)])
+                self.assertIn(str(link), message)
+                self.assertNotIn('aws_secret_access_key', message)
+
+    def test_unreadable_script_is_logged(self):
+        script = self.dir / 'server.py'
+        script.write_bytes(b"print('secret-body')\n")
+        script.chmod(0o000)
+        try:
+            for hook in HOOKS:
+                with self.subTest(hook=hook.__file__):
+                    message = self._logged(hook, 'python3', [str(script)])
+                    self.assertIn(str(script), message)
+                    self.assertIn('PermissionError', message)
+                    self.assertNotIn('secret-body', message)
+        finally:
+            script.chmod(0o600)

@@ -450,6 +450,31 @@ class TestLocalScriptFingerprint(_HomeTmp):
             "command": "npx", "args": ["@upstash/context7-mcp"],
         })
 
+    def test_module_run_never_hashes_an_unrelated_file(self):
+        notes = self.home / "notes.py"
+        notes.write_bytes(b"# private\n")
+        self._write_cli_settings(
+            self.home,
+            {"command": "python", "args": ["-m", "package", str(notes)]})
+        self.assertNotIn("scriptHash", self._forwarded_config())
+
+    def test_preload_flag_makes_the_entrypoint_ambiguous(self):
+        preload = self.home / "build" / "preload.js"
+        preload.write_bytes(b"// preload\n")
+        self._write_cli_settings(self.home, {
+            "command": "node",
+            "args": ["-r", str(preload), str(self.script)],
+        })
+        self.assertNotIn("scriptHash", self._forwarded_config())
+
+    def test_script_symlink_to_a_non_script_is_not_hashed(self):
+        secret = self.home / "credentials"
+        secret.write_bytes(b"aws_secret_access_key = 1\n")
+        link = self.home / "server.py"
+        link.symlink_to(secret)
+        self._write_cli_settings(self.home, {"command": "python3", "args": [str(link)]})
+        self.assertNotIn("scriptHash", self._forwarded_config())
+
 
 # --------------------------------------------------------------------------- #
 # Stop audit exchange                                                         #
