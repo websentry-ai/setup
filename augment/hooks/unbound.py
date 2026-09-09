@@ -946,6 +946,79 @@ def _mangle_mcp_token(s: Optional[str]) -> str:
     return re.sub(r'[^A-Za-z0-9_-]', '_', s or '')
 
 
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _hook_command_basename(command: str) -> str:
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value: str) -> bool:
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    # Require a script extension: matching any path-shaped arg would let a
+    # crafted runtime config (e.g. `python3 /etc/passwd`) read arbitrary files.
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_candidate_script(command: Optional[str], args: Optional[List]) -> Optional[str]:
+    """The local script this config runs: the file arg under a runtime, or the
+    command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        for a in (args or []):
+            if not isinstance(a, str) or a.startswith('-'):
+                continue
+            t = a.strip().strip('"\'')
+            if t in _HOOK_RUNNER_SUBTOKENS:
+                continue
+            if _hook_looks_like_path(t):
+                return t
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+def _compute_script_hash(command: Optional[str], args: Optional[List],
+                         cwd: Optional[str]) -> Optional[str]:
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    try:
+        cand = _hook_candidate_script(command, args)
+        if not cand:
+            return None
+        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+        if '${' in path:  # an env var we couldn't expand -> can't resolve
+            return None
+        if not os.path.isabs(path) and cwd:
+            path = os.path.join(cwd, path)
+        if not os.path.isfile(path):
+            return None
+        h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
+        with open(path, 'rb') as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 # KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
 # Fingerprints key the local tool-hash cache; Redis tool scores are separately
 # keyed by tool content hash. Keep fingerprint output aligned with data/gateway.
@@ -2021,7 +2094,8 @@ def _redact_args(args):
     return kept
 
 
-def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None) -> Optional[Dict]:
+def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None,
+                         cwd: Optional[str] = None) -> Optional[Dict]:
     """Normalize a config entry from any surface to {command, args, url, type}
     (fingerprint-relevant fields only, secrets redacted). Handles VS Code's single
     command string. env/headers are intentionally never read or forwarded."""
@@ -2051,6 +2125,10 @@ def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None) -> Optional[Di
     if 'args' not in out and isinstance(extra, str) and extra.strip():
         args = extra.split()
         out['args'] = _redact_args(args)
+    script_hash = _compute_script_hash(
+        out.get('command'), args if isinstance(args, list) else None, cwd)
+    if script_hash:
+        out['scriptHash'] = script_hash
     fingerprint = compute_mcp_cache_key(
         name=name,
         command=out.get('command'),
@@ -2068,6 +2146,7 @@ def read_augment_mcp_servers(event: Dict) -> Dict:
     """Aggregate MCP servers across all Augment surfaces into {name -> config}.
     First definition of a name wins; never raises (fail-open)."""
     servers = {}
+    cwd = event.get('cwd')
     for path, fmt in _augment_mcp_config_sources(event):
         try:
             if not path.exists() or path.stat().st_size > _MCP_CONFIG_MAX_BYTES:
@@ -2080,7 +2159,8 @@ def read_augment_mcp_servers(event: Dict) -> Dict:
                 entries = list(data['mcpServers'].items())
             for name, entry in entries:
                 if name:
-                    servers.setdefault(name, _normalize_mcp_entry(entry, name=name) or {})
+                    servers.setdefault(
+                        name, _normalize_mcp_entry(entry, name=name, cwd=cwd) or {})
         except Exception as exc:
             log_error(f"augment mcp config read failed {path}: {exc}", 'mcp_config')
             continue

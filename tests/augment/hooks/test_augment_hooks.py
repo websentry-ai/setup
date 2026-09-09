@@ -11,6 +11,7 @@ Gateway/network is mocked at the curl boundary (send_to_hook_api / send_to_api /
 notify_setup_complete) so no real HTTP is made.
 """
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -380,6 +381,74 @@ class TestMcpFingerprinting(unittest.TestCase):
         )
         self.assertEqual(cfg["args"], [])
         self.assertEqual(cfg["_unbound_fingerprint"], "pypi:markitdown-mcp")
+
+
+class TestLocalScriptFingerprint(_HomeTmp):
+    """`node <path>/index.js` has no package or binary identity, so without a
+    client-computed scriptHash the server reaches the gateway with a null
+    fingerprint."""
+
+    def setUp(self):
+        super().setUp()
+        self.script = self.home / "build" / "index.js"
+        self.script.parent.mkdir(parents=True, exist_ok=True)
+        self.script.write_bytes(b"console.log('ctx')\n")
+        self.sha = hashlib.sha256(self.script.read_bytes()).hexdigest()
+
+    def _write_cli_settings(self, root, entry):
+        settings = root / ".augment" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({"mcpServers": {"context": entry}}))
+
+    def _forwarded_config(self, event_extra=None):
+        captured = {}
+
+        def _capture(body, key):
+            captured["body"] = body
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse", "session_id": "c",
+            "tool_name": "get_docs_context", "tool_input": {},
+            "is_mcp_tool": True,
+            "mcp_metadata": {
+                "mcpExecutedToolServerName": "context",
+                "mcpExecutedToolName": "get_docs",
+            },
+        }
+        event.update(event_extra or {})
+        with patch.object(unbound, "send_to_hook_api", side_effect=_capture):
+            unbound.process_pre_tool_use(event, "sk-test")
+        return captured["body"]["pre_tool_use_data"]["metadata"]["mcp_server_config"]
+
+    def test_pretool_forwards_script_hash(self):
+        self._write_cli_settings(
+            self.home, {"command": "node", "args": [str(self.script)]})
+        self.assertEqual(self._forwarded_config().get("scriptHash"), self.sha)
+
+    def test_relative_script_resolves_against_the_event_cwd(self):
+        workspace = self.home / "repo"
+        (workspace / "build").mkdir(parents=True, exist_ok=True)
+        (workspace / "build" / "index.js").write_bytes(self.script.read_bytes())
+        self._write_cli_settings(
+            workspace, {"command": "node", "args": ["build/index.js"]})
+        config = self._forwarded_config({"cwd": str(workspace)})
+        self.assertEqual(config.get("scriptHash"), self.sha)
+
+    def test_script_hash_drives_the_cache_key(self):
+        cfg = unbound._normalize_mcp_entry(
+            {"command": "node", "args": [str(self.script)]},
+            name="context",
+        )
+        self.assertEqual(cfg["scriptHash"], self.sha)
+        self.assertEqual(cfg["_unbound_fingerprint"], "script:%s" % self.sha)
+
+    def test_package_server_gets_no_script_hash(self):
+        self._write_cli_settings(
+            self.home, {"command": "npx", "args": ["@upstash/context7-mcp"]})
+        self.assertEqual(self._forwarded_config(), {
+            "command": "npx", "args": ["@upstash/context7-mcp"],
+        })
 
 
 # --------------------------------------------------------------------------- #
