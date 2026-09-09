@@ -1,4 +1,8 @@
+import base64
+import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
 from tests.conftest import load_module
 
@@ -10,6 +14,10 @@ HOOKS = [
     load_module('augment/hooks/unbound.py'),
     load_module('cursor/unbound.py'),
 ]
+
+# Only the hooks whose targeted MCP scan uploads the script body for the backend
+# to re-hash; the rest carry the hash alone.
+BODY_HOOKS = [h for h in HOOKS if hasattr(h, '_read_script_body_b64')]
 
 
 class TestMcpFingerprintParity(unittest.TestCase):
@@ -373,4 +381,104 @@ class TestMcpFingerprintParity(unittest.TestCase):
                             ],
                         ),
                         'nuget:example.server',
+                    )
+
+
+class TestScriptHashParity(unittest.TestCase):
+    """Every hook must derive the same `script:<hash>` identity from the same
+    local script, and the same non-answer from the same non-script config."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.body = b"console.log('hi')\n"
+        self.script = self.dir / 'index.js'
+        self.script.write_bytes(self.body)
+        self.sha = hashlib.sha256(self.body).hexdigest()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _hashes(self, command, args, cwd=None):
+        return {h.__file__: h._compute_script_hash(command, args, cwd) for h in HOOKS}
+
+    def _assert_all(self, expected, command, args, cwd=None):
+        for path, got in self._hashes(command, args, cwd).items():
+            self.assertEqual(got, expected, path)
+
+    def test_runtime_with_absolute_script_hashes_the_file(self):
+        self._assert_all(self.sha, 'node', [str(self.script)])
+
+    def test_command_is_the_script(self):
+        sh = self.dir / 'server.sh'
+        sh.write_bytes(self.body)
+        self._assert_all(self.sha, str(sh), [])
+
+    def test_relative_script_needs_cwd(self):
+        self._assert_all(None, 'node', ['index.js'])
+        self._assert_all(self.sha, 'node', ['index.js'], str(self.dir))
+
+    def test_runner_subtoken_is_skipped(self):
+        ts = self.dir / 'server.ts'
+        ts.write_bytes(self.body)
+        self._assert_all(self.sha, 'node', ['--loader', 'tsx', str(ts)])
+
+    def test_non_script_extension_is_never_read(self):
+        # Security control: a '/'-only match let a crafted config point a runtime
+        # at any readable file. The extension check is what stops it.
+        secret = self.dir / 'passwd'
+        secret.write_bytes(b'root:x:0:0\n')
+        self._assert_all(None, 'python3', [str(secret)])
+
+    def test_unexpanded_env_var_is_not_resolved(self):
+        self._assert_all(None, 'node', ['${WORKSPACE}/index.js'], str(self.dir))
+
+    def test_missing_file_and_package_configs_yield_no_hash(self):
+        self._assert_all(None, 'node', [str(self.dir / 'absent.js')])
+        self._assert_all(None, 'npx', ['-y', 'pg-mcp'])
+        self._assert_all(None, 'uvx', ['markitdown-mcp@latest'])
+
+    def test_url_and_package_args_are_not_paths(self):
+        for hook in HOOKS:
+            for value in ('https://example.com/index.js', '@vendor/server.js',
+                          'git+https://example.com/repo.js'):
+                with self.subTest(hook=hook.__file__, value=value):
+                    self.assertFalse(hook._hook_looks_like_path(value))
+
+    def test_hash_is_capped_at_the_shared_byte_limit(self):
+        cap = HOOKS[0]._HOOK_MAX_SCRIPT_BYTES
+        for hook in HOOKS:
+            self.assertEqual(hook._HOOK_MAX_SCRIPT_BYTES, cap, hook.__file__)
+        big = self.dir / 'big.js'
+        big.write_bytes(b'a' * (cap + 1024))
+        expected = hashlib.sha256(b'a' * cap).hexdigest()
+        self._assert_all(expected, 'node', [str(big)])
+
+    def test_script_hash_drives_the_fingerprint(self):
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertIsNone(
+                    hook.compute_mcp_cache_key('local', 'node', None, [str(self.script)])
+                )
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'local', 'node', None, [str(self.script)],
+                        script_hash=hook._compute_script_hash('node', [str(self.script)], None),
+                    ),
+                    'script:%s' % self.sha,
+                )
+
+    def test_uploaded_body_re_hashes_to_the_reported_hash(self):
+        # The backend recomputes sha256 over the decoded body, so a hook that
+        # sends both must send bytes that agree.
+        self.assertTrue(BODY_HOOKS)
+        big = self.dir / 'big.js'
+        big.write_bytes(b'a' * (HOOKS[0]._HOOK_MAX_SCRIPT_BYTES + 1024))
+        for hook in BODY_HOOKS:
+            for script in (self.script, big):
+                with self.subTest(hook=hook.__file__, script=script.name):
+                    body = hook._read_script_body_b64('node', [str(script)], None)
+                    self.assertEqual(
+                        hashlib.sha256(base64.b64decode(body)).hexdigest(),
+                        hook._compute_script_hash('node', [str(script)], None),
                     )
