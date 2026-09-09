@@ -5,6 +5,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 """
 
 import sys
+import base64
 import json
 import os
 import ntpath
@@ -2014,6 +2015,113 @@ def _vscode_cached_mcp_servers(cwd=None):
                 servers.append((label, fields))
     return servers
 
+
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
+
+
+def _hook_command_basename(command):
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value):
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    # Require a script extension: matching any path-shaped arg would let a
+    # crafted runtime config (e.g. `python3 /etc/passwd`) read arbitrary files.
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_candidate_script(command, args):
+    """The local script this config runs: the file arg under a runtime, or the
+    command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        for a in (args or []):
+            if not isinstance(a, str) or a.startswith('-'):
+                continue
+            t = a.strip().strip('"\'')
+            if t in _HOOK_RUNNER_SUBTOKENS:
+                continue
+            if _hook_looks_like_path(t):
+                return t
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _hook_script_path(command, args, cwd):
+    cand = _hook_candidate_script(command, args)
+    if not cand:
+        return None
+    path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+    if '${' in path:  # an env var we couldn't expand -> can't resolve
+        return None
+    if not os.path.isabs(path) and cwd:
+        path = os.path.join(cwd, path)
+    if not os.path.isfile(path):
+        return None
+    return path
+
+
+def _compute_script_hash(command, args, cwd):
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    try:
+        path = _hook_script_path(command, args, cwd)
+        if not path:
+            return None
+        h = hashlib.sha256()
+        remaining = _HOOK_MAX_SCRIPT_BYTES
+        with open(path, 'rb') as f:
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                h.update(chunk)
+                remaining -= len(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _augment_script_hash(result, cwd):
+    """Add scriptHash to an MCP server config when it runs a local script, so the
+    gateway can fingerprint it as `script:<hash>`."""
+    if result and result.get('command'):
+        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
+        if script_hash:
+            result['scriptHash'] = script_hash
+    return result
+
+
+def _read_script_body_b64(command, args, cwd):
+    """base64 of the local script's first _HOOK_MAX_SCRIPT_BYTES bytes (the scan
+    body), or None. The backend re-hashes these exact bytes, so this must read the
+    same prefix _compute_script_hash hashed."""
+    try:
+        path = _hook_script_path(command, args, cwd)
+        if not path:
+            return None
+        with open(path, 'rb') as f:
+            data = f.read(_HOOK_MAX_SCRIPT_BYTES)
+        return base64.b64encode(data).decode('ascii')
+    except Exception:
+        return None
+
+
 # KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
 # Fingerprints key the local tool-hash cache; Redis tool scores are separately
 # keyed by tool content hash. Keep fingerprint output aligned with data/gateway.
@@ -3568,7 +3676,8 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         metadata['mcp_server'] = mcp_server
         metadata['mcp_tool'] = mcp_tool
         if mcp_server_config:
-            metadata['mcp_server_config'] = mcp_server_config
+            metadata['mcp_server_config'] = _augment_script_hash(
+                mcp_server_config, metadata.get('cwd'))
         _attach_tool_content_hash(metadata)
 
     approval_key = f"{canonical}:{command}"
@@ -3660,7 +3769,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         and api_response.get('unknown_mcp_server')
         and scan_config
     ):
-        _dispatch_mcp_server_scan(mcp_server, scan_config)
+        _dispatch_mcp_server_scan(mcp_server, scan_config, cwd=event.get('cwd'))
 
     if (
         api_response.get('decision') == 'deny'
@@ -4287,7 +4396,7 @@ def _extract_patch_target_path(args):
 
 
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
-                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None):
+                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal and unsupported native tools.
@@ -4370,7 +4479,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             metadata = {
                 'mcp_server': mcp_server,
                 'mcp_tool': mcp_tool,
-                'mcp_server_config': mcp_server_config,
+                'mcp_server_config': _augment_script_hash(mcp_server_config, cwd),
             }
             _attach_tool_content_hash(metadata)
             if metadata.get('mcp_server_config'):
@@ -4990,7 +5099,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                                   shell_state=shell_state, root_projects=root_projects,
                                   mcp_servers=mcp_servers,
                                   mcp_server_name=call['mcp_server_name'],
-                                  mcp_tool_name=call['mcp_tool_name'])
+                                  mcp_tool_name=call['mcp_tool_name'],
+                                  cwd=cwd)
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.
@@ -5404,9 +5514,16 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
-def _dispatch_mcp_server_scan(server_name, server_config):
+def _dispatch_mcp_server_scan(server_name, server_config, cwd=None):
     if not server_name or not isinstance(server_config, dict):
         return
+    try:
+        if server_config.get('command') and not server_config.get('script_content'):
+            body = _read_script_body_b64(server_config.get('command'), server_config.get('args'), cwd)
+            if body:
+                server_config = {**server_config, 'script_content': body}
+    except Exception:
+        pass
     try:
         unbound_config = {}
         try:
