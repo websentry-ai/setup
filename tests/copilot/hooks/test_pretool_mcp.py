@@ -854,6 +854,23 @@ class TestProviderCacheHydration(unittest.TestCase):
         self.assertEqual(result, {})
         dispatch.assert_not_called()
 
+    def test_hydrates_every_loopback_shape(self):
+        for url in (
+            "http://localhost:51983/mcp",
+            "http://127.0.0.1:51983/mcp",
+            "http://[::1]:51983/mcp",
+            "http://localhost/mcp",
+        ):
+            with self.subTest(url=url):
+                observation = self._observation(51983)
+                observation["url"] = url
+
+                servers, content_hash = self._read(self._cache([observation]))
+
+                self.assertIn("pylance mcp server", servers)
+                self.assertEqual(servers["pylance mcp server"]["url"], url)
+                self.assertIsNotNone(content_hash)
+
     def test_rejects_observation_that_does_not_recompute_to_enclosing_key(self):
         observation = self._observation(51983)
         observation["url"] = "https://api.githubcopilot.com/mcp/"

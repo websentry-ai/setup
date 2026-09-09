@@ -3038,9 +3038,13 @@ def _validated_provider_cache_observation(stable_fingerprint, observation):
         return None
 
     parsed_url = urlparse(url)
+    host = parsed_url.hostname or ''
+    # urlparse strips the brackets off an IPv6 host; without them the rebuilt
+    # URL is unparseable and stops recomputing to the enclosing fingerprint.
+    host = f'[{host}]' if ':' in host else host
     port = f':{parsed_url.port}' if parsed_url.port else ''
     canonical_url = (
-        f'{parsed_url.scheme.lower()}://{parsed_url.hostname}{port}'
+        f'{parsed_url.scheme.lower()}://{host}{port}'
         f'{parsed_url.path}'
     )
     return name, {
