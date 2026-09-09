@@ -856,7 +856,7 @@ class TestProviderCacheHydration(unittest.TestCase):
 
     def test_rejects_observation_that_does_not_recompute_to_enclosing_key(self):
         observation = self._observation(51983)
-        observation["url"] = "http://127.0.0.1:51983/stream"
+        observation["url"] = "https://api.githubcopilot.com/mcp/"
 
         servers, content_hash = self._read(self._cache([observation]))
 

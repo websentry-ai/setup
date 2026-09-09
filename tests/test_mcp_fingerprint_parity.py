@@ -62,7 +62,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'bin:gk',
                 )
 
-    def test_pylance_local_stream_has_one_provider_fingerprint(self):
+    def test_pylance_loopback_has_one_provider_fingerprint(self):
         additional_data = {
             'scope': 'vscode-provider-cache',
             'providerId': 'ms-python.vscode-pylance/pylanceMcp',
@@ -94,7 +94,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
                         [],
                         additional_data,
                     ),
-                    'url:127.0.0.1:51983/stream',
+                    expected,
                 )
 
     def test_provider_identity_is_not_extension_allowlisted(self):
@@ -117,7 +117,7 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'publisher.extension/server',
                 )
 
-    def test_provider_identity_only_applies_to_direct_literal_stream_urls(self):
+    def test_provider_identity_only_applies_to_loopback_urls(self):
         additional_data = {
             'scope': 'vscode-provider-cache',
             'providerId': 'publisher.extension/provider',
@@ -129,11 +129,11 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     hook.compute_mcp_cache_key(
                         'server',
                         None,
-                        'http://localhost:51983/foo/../stream',
+                        'https://api.githubcopilot.com/mcp/',
                         [],
                         additional_data,
                     ),
-                    'url:localhost:51983/foo/../stream',
+                    'url:api.githubcopilot.com/mcp',
                 )
                 self.assertEqual(
                     hook.compute_mcp_cache_key(
