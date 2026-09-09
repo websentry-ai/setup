@@ -880,6 +880,15 @@ class TestProviderCacheHydration(unittest.TestCase):
         self.assertNotIn("pylance mcp server", servers)
         self.assertIsNone(content_hash)
 
+    def test_rejects_observation_with_invalid_port(self):
+        observation = self._observation(51983)
+        observation["url"] = "http://localhost:99999/mcp"
+
+        servers, content_hash = self._read(self._cache([observation]))
+
+        self.assertNotIn("pylance mcp server", servers)
+        self.assertIsNone(content_hash)
+
     def test_rejects_observation_name_that_does_not_match_provider_server(self):
         observation = self._observation(51983, name="github")
 
