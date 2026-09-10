@@ -4971,7 +4971,7 @@ def _ensure_discovery_installer(installer_path: Path, installer_url: str,
     )
     if r.returncode == 0:
         if not _is_windows():
-            os.chmod(tmp, 0o755)
+            os.chmod(tmp, 0o700)
         os.replace(tmp, installer_path)
         return True
     tmp.unlink(missing_ok=True)

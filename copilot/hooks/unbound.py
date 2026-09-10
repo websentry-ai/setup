@@ -5326,7 +5326,7 @@ def _ensure_discovery_installer(
             )
             return False
         if installer_path == DISCOVERY_INSTALL_SH:
-            os.chmod(temporary_path, 0o755)
+            os.chmod(temporary_path, 0o700)
         os.replace(temporary_path, installer_path)
         return True
     finally:
