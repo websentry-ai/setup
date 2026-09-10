@@ -647,6 +647,10 @@ def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
         backup = settings_path.with_suffix(".json.unbound-bak")
         if backup.is_symlink():
             backup.unlink()
+        # An older build refreshed this every run, so an upgraded machine can hold a
+        # previous key here; age is no guarantee of being clean.
+        if backup.is_file():
+            _sanitise_backup(backup)
         # Taken once, from the file as it was before we ever wrote to it. Refreshing it
         # on every run would capture the previous API key on a rotation and leave it on
         # disk. clear_otel_export removes it, so a later install takes a fresh one.
@@ -708,6 +712,45 @@ def _parse_jsonc_or_none(text: str):
         return None
 
 
+SYNC_IGNORE_KEY = "settingsSync.ignoredSettings"
+OTEL_HEADERS_KEY = "github.copilot.chat.otel.headers"
+
+
+def _sync_ignore_list(settings_path: Path, add: bool):
+    """settingsSync.ignoredSettings with our header entry added or removed.
+
+    Settings Sync uploads user settings by default, so without this the key leaves the
+    machine and a local 0600 stops meaning anything. Merged with whatever the user
+    already ignores; None when nothing is left, which is how VS Code clears it.
+    """
+    text = _read_settings_text(settings_path) if settings_path.exists() else None
+    current = _parse_jsonc_or_none(text) if text else None
+    existing = current.get(SYNC_IGNORE_KEY) if isinstance(current, dict) else None
+    items = [i for i in existing if isinstance(i, str)] if isinstance(existing, list) else []
+    if add:
+        return items if OTEL_HEADERS_KEY in items else items + [OTEL_HEADERS_KEY]
+    remaining = [i for i in items if i != OTEL_HEADERS_KEY]
+    return remaining or None
+
+
+def _sanitise_backup(backup: Path) -> None:
+    """Strip our keys from a backup an older build wrote after a key had already landed."""
+    text = _read_settings_text(backup)
+    if text is None or not any(key in text for key in OTEL_SETTING_KEYS):
+        return
+    cleaned = _merge_settings_text(text, {key: None for key in OTEL_SETTING_KEYS})
+    try:
+        if cleaned is not None and _parse_jsonc_or_none(cleaned) is not None:
+            backup.write_text(cleaned, encoding="utf-8")
+            if os.name == "posix":
+                os.chmod(backup, 0o600)
+        else:
+            # Unsanitisable, so removing the credential beats keeping the recovery point.
+            backup.unlink()
+    except OSError:
+        pass
+
+
 def _is_secure_endpoint(url: str) -> bool:
     """https, or a loopback collector, which is how a local OTLP setup is tested."""
     parsed = urllib.parse.urlparse(url)
@@ -741,9 +784,15 @@ def configure_otel_export(api_key: str, gateway_url: str = DEFAULT_GATEWAY_URL,
     if not dirs:
         debug_print("No VS Code user directory found; skipping OTLP settings")
         return True
+    results = []
+    for directory in dirs:
+        settings_path = directory / "settings.json"
+        # Per file: each editor keeps its own ignore list and ours merges into it.
+        results.append(_write_settings(settings_path, dict(
+            updates, **{SYNC_IGNORE_KEY: _sync_ignore_list(settings_path, add=True)})))
     # Listed, not a generator: all() short-circuits, and one unparsable
     # settings file would leave every remaining editor unconfigured.
-    return all([_write_settings(d / "settings.json", updates) for d in dirs])
+    return all(results)
 
 
 def clear_otel_export(home: Optional[Path] = None) -> str:
@@ -751,7 +800,6 @@ def clear_otel_export(home: Optional[Path] = None) -> str:
 
     Returns "cleared", "not_found" or "failed", matching _clear_path, so a device
     that never had these settings does not report having cleared them."""
-    updates = {key: None for key in OTEL_SETTING_KEYS}
     found = failed = False
     for directory in vscode_user_dirs(home):
         settings_path = directory / "settings.json"
@@ -759,8 +807,15 @@ def clear_otel_export(home: Optional[Path] = None) -> str:
         if text is None:
             continue
         current = _parse_jsonc_or_none(text)
-        if not isinstance(current, dict) or not any(k in current for k in OTEL_SETTING_KEYS):
+        if not isinstance(current, dict):
             continue
+        ignored = current.get(SYNC_IGNORE_KEY)
+        ours_ignored = isinstance(ignored, list) and OTEL_HEADERS_KEY in ignored
+        if not any(k in current for k in OTEL_SETTING_KEYS) and not ours_ignored:
+            continue
+        updates = {key: None for key in OTEL_SETTING_KEYS}
+        # Only our entry leaves the ignore list; the user's own entries stay.
+        updates[SYNC_IGNORE_KEY] = _sync_ignore_list(settings_path, add=False)
         found = True
         if not _write_settings(settings_path, updates):
             failed = True

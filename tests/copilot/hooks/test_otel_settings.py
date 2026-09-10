@@ -150,7 +150,8 @@ class OtelSettingsTests(_OtelHelpers, unittest.TestCase):
             self._configure(mod, name, "sk-old", home)
             self._configure(mod, name, "sk-new", home)
             text = path.read_text()
-            self.assertEqual(text.count('"github.copilot.chat.otel.headers"'), 1)
+            # As a setting key, not as the string inside settingsSync.ignoredSettings.
+            self.assertEqual(text.count('"github.copilot.chat.otel.headers":'), 1)
             self.assertEqual(
                 mod._parse_jsonc_or_none(text)["github.copilot.chat.otel.headers"],
                 {"x-api-key": "sk-new"})
@@ -429,3 +430,58 @@ class OtelSettingsEndpointAndBackupTests(_OtelHelpers, unittest.TestCase):
             parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
             self.assertEqual(parsed["github.copilot.chat.otel.otlpEndpoint"],
                              "http://localhost:4318/otel")
+
+
+class OtelSettingsSyncAndLegacyBackupTests(_OtelHelpers, unittest.TestCase):
+    def test_a_legacy_backup_holding_a_key_is_stripped_on_the_next_run(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
+            backup = settings.with_suffix(".json.unbound-bak")
+            backup.write_text(
+                '{"editor.fontSize": 12,'
+                ' "github.copilot.chat.otel.headers": {"x-api-key": "LEGACYKEY"}}',
+                encoding="utf-8")
+            self._configure(mod, name, "NEWKEY", home)
+            text = backup.read_text(encoding="utf-8")
+            self.assertNotIn("LEGACYKEY", text)
+            self.assertIn("editor.fontSize", text)
+            if platform.system() != "Windows":
+                self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
+
+    def test_the_header_is_excluded_from_settings_sync(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
+            self._configure(mod, name, "KEY", home)
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertIn("github.copilot.chat.otel.headers",
+                          parsed["settingsSync.ignoredSettings"])
+
+    def test_the_users_own_ignored_settings_are_kept(self):
+        original = '{"settingsSync.ignoredSettings": ["editor.fontSize"]}'
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, original)
+            self._configure(mod, name, "KEY", home)
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["settingsSync.ignoredSettings"],
+                             ["editor.fontSize", "github.copilot.chat.otel.headers"])
+            self.assertEqual(self._clear(mod, name, home), "cleared")
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["settingsSync.ignoredSettings"], ["editor.fontSize"])
+
+    def test_the_ignore_list_is_removed_when_only_our_entry_was_in_it(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
+            self._configure(mod, name, "KEY", home)
+            self.assertEqual(self._clear(mod, name, home), "cleared")
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertNotIn("settingsSync.ignoredSettings", parsed)
+            self.assertEqual(parsed["editor.fontSize"], 12)
+
+    def test_running_setup_twice_still_leaves_one_ignore_entry(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
+            self._configure(mod, name, "KEY", home)
+            self._configure(mod, name, "KEY", home)
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["settingsSync.ignoredSettings"].count(
+                "github.copilot.chat.otel.headers"), 1)
