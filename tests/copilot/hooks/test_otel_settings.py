@@ -520,3 +520,22 @@ class OtelSettingsHostileFileTypeTests(_OtelHelpers, unittest.TestCase):
             settings.write_bytes(b"\xff\xfe{\x00}\x00")
             # not_found would tell the caller the device is clean while the key is on disk
             self.assertEqual(self._clear(mod, name, home), "failed")
+
+
+class OtelSettingsWriteBindingTests(_OtelHelpers, unittest.TestCase):
+    def test_a_directory_swapped_after_discovery_is_refused_at_the_write(self):
+        if platform.system() == "Windows":
+            self.skipTest("POSIX symlink stands in for a junction")
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"a": 1}')
+            user_dir = settings.parent
+            outside = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+            # Accepted at discovery, then swapped before the write lands.
+            self.assertEqual(mod.vscode_user_dirs(home), [user_dir])
+            shutil.rmtree(user_dir)
+            user_dir.symlink_to(outside)
+            self.assertFalse(mod._write_settings(
+                user_dir / "settings.json", {"github.copilot.chat.otel.enabled": True}, home))
+            self.assertFalse((outside / "settings.json").exists())
+            self.assertEqual(list(outside.glob(".unbound-*")), [])

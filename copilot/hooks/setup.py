@@ -515,6 +515,14 @@ def _strip_jsonc(text: str) -> str:
         lambda m: m.group(0) if m.group(0).startswith('"') else '', "".join(out))
 
 
+def _within_home(directory: Path, home: Path) -> bool:
+    """True when `directory` still resolves inside `home`, junctions followed."""
+    try:
+        return home.resolve(strict=False) in directory.resolve(strict=False).parents
+    except OSError:
+        return False
+
+
 def vscode_user_dirs(home: Optional[Path] = None) -> List[Path]:
     """Existing VS Code user-settings directories for `home`.
 
@@ -529,27 +537,19 @@ def vscode_user_dirs(home: Optional[Path] = None) -> List[Path]:
         base = home / "Library" / "Application Support"
     else:
         base = home / ".config"
-    kept = []
-    for directory in (base / "Code" / "User", base / "Code - Insiders" / "User"):
-        if not directory.is_dir():
-            continue
-        try:
-            # Resolved: a junction or symlink on the directory itself satisfies is_dir(),
-            # and the MDM path writes these elevated on Windows, where the privilege drop
-            # in _run_as_user does not apply.
-            if home.resolve(strict=False) in directory.resolve(strict=False).parents:
-                kept.append(directory)
-        except OSError:
-            continue
-    return kept
+    # Checked here and again immediately before the rename: a junction or symlink on the
+    # directory satisfies is_dir(), and on Windows the elevated MDM run has no privilege
+    # drop, so discovery alone cannot bind the write that happens later.
+    return [d for d in (base / "Code" / "User", base / "Code - Insiders" / "User")
+            if d.is_dir() and _within_home(d, home)]
 
 
-def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
+def _write_settings(settings_path: Path, updates: Dict[str, Any], home: Path) -> bool:
     """Apply `updates` to one settings.json. A value of None removes the key.
 
     Rewritten from the parsed document, so comments and layout in the file do not
-    survive. Deliberate: parsing to a dict makes a duplicate or nested copy of one of
-    these keys impossible to confuse for the top-level setting we mean.
+    survive. Accepted: this is config the installer owns, and a dict also makes a
+    duplicate or nested copy of one of these keys impossible to confuse for ours.
     """
     if settings_path.is_symlink():
         # Never write through a link: the MDM and binary paths reach every user's
@@ -578,8 +578,6 @@ def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
     merged = json.dumps(current, indent=2)
 
     try:
-        # Windows keeps a check-to-write gap: no privilege drop applies there, so a local
-        # session swapping this directory for a junction mid-run gets a privileged write.
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         # Staged beside the target and renamed over it: a direct write truncates first,
         # so an interrupted one would leave the user with no settings at all.
@@ -591,6 +589,10 @@ def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
             if os.name == "posix":
                 # Owner-only whether or not the file existed: it now carries the API key.
                 os.chmod(staged, 0o600)
+            # Rechecked against the moment of the write, not of discovery: on Windows
+            # nothing drops privileges, so the directory could have become a junction.
+            if not _within_home(settings_path.parent, home):
+                raise OSError(f"{settings_path.parent} no longer resolves inside the home")
             os.replace(staged, settings_path)
         except BaseException:
             try:
@@ -706,6 +708,7 @@ def configure_otel_export(api_key: str, gateway_url: str = DEFAULT_GATEWAY_URL,
         "github.copilot.chat.otel.headers": {"x-api-key": api_key},
         "github.copilot.chat.otel.captureContent": False,
     }
+    home = home or Path.home()
     dirs = vscode_user_dirs(home)
     if not dirs:
         debug_print("No VS Code user directory found; skipping OTLP settings")
@@ -715,7 +718,7 @@ def configure_otel_export(api_key: str, gateway_url: str = DEFAULT_GATEWAY_URL,
         settings_path = directory / "settings.json"
         # Per file: each editor keeps its own ignore list and ours merges into it.
         results.append(_write_settings(settings_path, dict(
-            updates, **{SYNC_IGNORE_KEY: _sync_ignore_list(settings_path, add=True)})))
+            updates, **{SYNC_IGNORE_KEY: _sync_ignore_list(settings_path, add=True)}), home))
     # Listed, not a generator: all() short-circuits, and one unparsable
     # settings file would leave every remaining editor unconfigured.
     return all(results)
@@ -726,6 +729,7 @@ def clear_otel_export(home: Optional[Path] = None) -> str:
 
     Returns "cleared", "not_found" or "failed", matching _clear_path, so a device
     that never had these settings does not report having cleared them."""
+    home = home or Path.home()
     found = failed = False
     for directory in vscode_user_dirs(home):
         settings_path = directory / "settings.json"
@@ -747,7 +751,7 @@ def clear_otel_export(home: Optional[Path] = None) -> str:
         # Only our entry leaves the ignore list; the user's own entries stay.
         updates[SYNC_IGNORE_KEY] = _sync_ignore_list(settings_path, add=False)
         found = True
-        if not _write_settings(settings_path, updates):
+        if not _write_settings(settings_path, updates, home):
             failed = True
     if failed:
         return "failed"
