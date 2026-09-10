@@ -806,7 +806,8 @@ class TestScriptFailureDiagnostics(unittest.TestCase):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
                 message = self._logged(hook, 'python3', [str(link)])
-                self.assertIn(str(link), message)
+                self.assertIn('server.py', message)
+                self.assertNotIn(str(self.dir), message)
                 self.assertNotIn('aws_secret_access_key', message)
 
     def test_unreadable_script_is_logged(self):
@@ -817,7 +818,8 @@ class TestScriptFailureDiagnostics(unittest.TestCase):
             for hook in HOOKS:
                 with self.subTest(hook=hook.__file__):
                     message = self._logged(hook, 'python3', [str(script)])
-                    self.assertIn(str(script), message)
+                    self.assertIn('server.py', message)
+                    self.assertNotIn(str(self.dir), message)
                     self.assertIn('PermissionError', message)
                     self.assertNotIn('secret-body', message)
         finally:

@@ -1565,11 +1565,11 @@ def _hook_script_path(command, args, cwd):
         resolved = os.path.realpath(path)
     except OSError as exc:
         log_error("mcp script fingerprint: cannot resolve %s: %s"
-                  % (path, type(exc).__name__), 'mcp_config')
+                  % (os.path.basename(path), type(exc).__name__), 'mcp_config')
         return None
     if not _HOOK_SCRIPT_EXT_RE.search(resolved):
         log_error("mcp script fingerprint: %s resolves to a non-script target"
-                  % path, 'mcp_config')
+                  % os.path.basename(path), 'mcp_config')
         return None
     if not os.path.isfile(resolved):
         return None
@@ -1598,10 +1598,10 @@ def _compute_script_hash(command, args, cwd):
         data = _hook_read_script_bytes(path)
     except OSError as exc:
         log_error("mcp script fingerprint: cannot read %s: %s"
-                  % (path, type(exc).__name__), 'mcp_config')
+                  % (os.path.basename(path), type(exc).__name__), 'mcp_config')
         return None
     if data is None:
-        log_error("mcp script fingerprint: %s is not a regular file" % path, 'mcp_config')
+        log_error("mcp script fingerprint: %s is not a regular file" % os.path.basename(path), 'mcp_config')
         return None
     return hashlib.sha256(data).hexdigest()
 
