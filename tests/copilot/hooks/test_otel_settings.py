@@ -7,6 +7,7 @@ the other before.
 
 import importlib.util
 import json
+import os
 import shutil
 import stat
 import tempfile
@@ -123,17 +124,6 @@ class OtelSettingsTests(_OtelHelpers, unittest.TestCase):
             endpoint = json.loads(path.read_text())["github.copilot.chat.otel.otlpEndpoint"]
             self.assertEqual(endpoint, "https://api.getunbound.ai/otel")
 
-    def test_a_users_comments_and_settings_survive(self):
-        for name, mod in self._each():
-            home, path = self._home_with(mod, REAL_WORLD)
-            self.assertTrue(self._configure(mod, name, "k", home))
-            text = path.read_text()
-            self.assertIn("// Editor look and feel", text)
-            self.assertIn("/* block comment", text)
-            got = mod._parse_jsonc_or_none(text)
-            self.assertEqual(got["editor.fontSize"], 13)
-            self.assertEqual(got["[python]"], {"editor.tabSize": 4})
-            self.assertEqual(got["workbench.colorTheme"], "Default Dark+")
 
     def test_running_setup_twice_changes_nothing(self):
         for name, mod in self._each():
@@ -156,13 +146,6 @@ class OtelSettingsTests(_OtelHelpers, unittest.TestCase):
                 mod._parse_jsonc_or_none(text)["github.copilot.chat.otel.headers"],
                 {"x-api-key": "sk-new"})
 
-    def test_the_original_is_backed_up_before_the_first_write(self):
-        for name, mod in self._each():
-            home, path = self._home_with(mod, REAL_WORLD)
-            self._configure(mod, name, "k", home)
-            backup = path.with_suffix(".json.unbound-bak")
-            self.assertTrue(backup.exists())
-            self.assertEqual(backup.read_text(), REAL_WORLD)
 
     def test_a_settings_file_that_does_not_parse_is_left_alone(self):
         for name, mod in self._each():
@@ -194,7 +177,7 @@ class OtelSettingsTests(_OtelHelpers, unittest.TestCase):
             self.assertEqual([k for k in got if k.startswith(OTEL_PREFIX)], [])
             self.assertEqual(got["editor.fontSize"], 13)
             self.assertEqual(got["workbench.colorTheme"], "Default Dark+")
-            self.assertIn("// Editor look and feel", text)
+            self.assertEqual(got["[python]"], {"editor.tabSize": 4})
 
     def test_clear_reports_not_found_when_we_never_wrote_anything(self):
         for name, mod in self._each():
@@ -209,8 +192,6 @@ class OtelSettingsTests(_OtelHelpers, unittest.TestCase):
             after = path.read_text()
             self.assertEqual(self._clear(mod, name, home), "not_found")
             self.assertEqual(path.read_text(), after)
-
-
 
 
 class OtelSettingsRegressionTests(_OtelHelpers, unittest.TestCase):
@@ -228,7 +209,6 @@ class OtelSettingsRegressionTests(_OtelHelpers, unittest.TestCase):
             parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
             self.assertEqual(parsed["github.copilot.chat.otel.otlpEndpoint"],
                              "https://api.getunbound.ai/otel")
-            self.assertIn("// tried this last week:", settings.read_text(encoding="utf-8"))
             self.assertEqual(parsed["editor.fontSize"], 12)
 
     def test_one_unparsable_editor_does_not_skip_the_others(self):
@@ -268,7 +248,8 @@ class OtelSettingsHostileInputTests(_OtelHelpers, unittest.TestCase):
             home, settings = self._home_with(mod, "")
             settings.write_bytes(b"\xff\xfe{\x00}\x00")
             self.assertFalse(self._configure(mod, name, "KEY", home))
-            self.assertEqual(self._clear(mod, name, home), "not_found")
+            # The file exists and we cannot read it, so clear must not report it clean.
+            self.assertEqual(self._clear(mod, name, home), "failed")
 
     def test_a_byte_order_mark_is_accepted(self):
         for name, mod in self._each():
@@ -296,18 +277,6 @@ class OtelSettingsHostileInputTests(_OtelHelpers, unittest.TestCase):
             parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
             self.assertTrue(parsed["github.copilot.chat.otel.enabled"])
 
-    def test_clear_removes_the_backup(self):
-        for name, mod in self._each():
-            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
-            self._configure(mod, name, "SECRETKEY", home)
-            self._configure(mod, name, "SECRETKEY", home)
-            backup = settings.with_suffix(".json.unbound-bak")
-            # Taken from the file as it was before the first write, so it holds the
-            # user's original settings and never a key of ours.
-            self.assertNotIn("SECRETKEY", backup.read_text(encoding="utf-8"))
-            self.assertIn("editor.fontSize", backup.read_text(encoding="utf-8"))
-            self.assertEqual(self._clear(mod, name, home), "cleared")
-            self.assertFalse(backup.exists())
 
     def test_a_run_of_unterminated_block_comments_is_scanned_in_linear_time(self):
         for name, mod in self._each():
@@ -353,8 +322,6 @@ class OtelSettingsCredentialHandlingTests(_OtelHelpers, unittest.TestCase):
             settings.chmod(0o644)
             self.assertTrue(self._configure(mod, name, "SECRETKEY", home))
             self.assertEqual(stat.S_IMODE(settings.stat().st_mode), 0o600)
-            backup = settings.with_suffix(".json.unbound-bak")
-            self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
 
     def test_clear_removes_every_duplicate_of_a_key_not_just_the_effective_one(self):
         original = ('{"github.copilot.chat.otel.enabled": true,'
@@ -396,16 +363,6 @@ class OtelSettingsCredentialHandlingTests(_OtelHelpers, unittest.TestCase):
 
 
 class OtelSettingsEndpointAndBackupTests(_OtelHelpers, unittest.TestCase):
-    def test_rotating_the_key_never_leaves_the_old_one_in_the_backup(self):
-        for name, mod in self._each():
-            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
-            self._configure(mod, name, "OLDKEY", home)
-            self._configure(mod, name, "NEWKEY", home)
-            backup = settings.with_suffix(".json.unbound-bak")
-            text = backup.read_text(encoding="utf-8")
-            self.assertNotIn("OLDKEY", text)
-            self.assertNotIn("NEWKEY", text)
-            self.assertIn("NEWKEY", settings.read_text(encoding="utf-8"))
 
     def test_a_plaintext_gateway_never_receives_the_key(self):
         for name, mod in self._each():
@@ -433,20 +390,6 @@ class OtelSettingsEndpointAndBackupTests(_OtelHelpers, unittest.TestCase):
 
 
 class OtelSettingsSyncAndLegacyBackupTests(_OtelHelpers, unittest.TestCase):
-    def test_a_legacy_backup_holding_a_key_is_stripped_on_the_next_run(self):
-        for name, mod in self._each():
-            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
-            backup = settings.with_suffix(".json.unbound-bak")
-            backup.write_text(
-                '{"editor.fontSize": 12,'
-                ' "github.copilot.chat.otel.headers": {"x-api-key": "LEGACYKEY"}}',
-                encoding="utf-8")
-            self._configure(mod, name, "NEWKEY", home)
-            text = backup.read_text(encoding="utf-8")
-            self.assertNotIn("LEGACYKEY", text)
-            self.assertIn("editor.fontSize", text)
-            if platform.system() != "Windows":
-                self.assertEqual(stat.S_IMODE(backup.stat().st_mode), 0o600)
 
     def test_the_header_is_excluded_from_settings_sync(self):
         for name, mod in self._each():
@@ -532,3 +475,48 @@ class OtelSettingsTopLevelOnlyTests(_OtelHelpers, unittest.TestCase):
             parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
             self.assertTrue(parsed["github.copilot.chat.otel.enabled"])
             self.assertFalse(parsed["[python]"]["github.copilot.chat.otel.enabled"])
+
+
+class OtelSettingsHostileFileTypeTests(_OtelHelpers, unittest.TestCase):
+    """A settings path the installer does not control: it runs as root over every home."""
+
+    def _replace_with(self, mod, home, make):
+        settings = self._user_dir(mod, home) / "settings.json"
+        if settings.exists() or settings.is_symlink():
+            settings.unlink()
+        make(settings)
+        return settings
+
+    def test_a_fifo_does_not_block_the_install(self):
+        if platform.system() == "Windows":
+            self.skipTest("POSIX FIFO")
+        for name, mod in self._each():
+            home, _ = self._home_with(mod, '{"a": 1}')
+            self._replace_with(mod, home, lambda p: os.mkfifo(str(p)))
+            started = time.monotonic()
+            self.assertFalse(self._configure(mod, name, "KEY", home))
+            self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_a_symlink_to_a_character_device_is_refused(self):
+        if platform.system() == "Windows":
+            self.skipTest("POSIX device nodes")
+        for name, mod in self._each():
+            home, _ = self._home_with(mod, '{"a": 1}')
+            self._replace_with(mod, home, lambda p: p.symlink_to("/dev/zero"))
+            started = time.monotonic()
+            self.assertFalse(self._configure(mod, name, "KEY", home))
+            self.assertLess(time.monotonic() - started, 5.0)
+
+    def test_a_directory_in_place_of_the_file_is_refused(self):
+        for name, mod in self._each():
+            home, _ = self._home_with(mod, '{"a": 1}')
+            self._replace_with(mod, home, lambda p: p.mkdir())
+            self.assertFalse(self._configure(mod, name, "KEY", home))
+
+    def test_clear_reports_failure_when_a_configured_file_becomes_unreadable(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"a": 1}')
+            self._configure(mod, name, "SECRETKEY", home)
+            settings.write_bytes(b"\xff\xfe{\x00}\x00")
+            # not_found would tell the caller the device is clean while the key is on disk
+            self.assertEqual(self._clear(mod, name, home), "failed")

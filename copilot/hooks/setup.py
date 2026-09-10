@@ -5,6 +5,7 @@ import sys
 import platform
 import re
 import shutil
+import stat
 import tempfile
 import subprocess
 import urllib.parse
@@ -425,7 +426,6 @@ def configure_copilot_hooks() -> bool:
         return False
 
 
-
 def _clear_path(path: Path, label: str) -> str:
     if not path.exists():
         return "not_found"
@@ -515,47 +515,6 @@ def _strip_jsonc(text: str) -> str:
         lambda m: m.group(0) if m.group(0).startswith('"') else '', "".join(out))
 
 
-def _mask_to_top_level(text: str) -> str:
-    """`text` with comments and every nested level blanked, same length.
-
-    Only the root object's own keys survive the mask, so neither a commented-out copy
-    nor one nested inside another setting's value can absorb a write meant for the
-    top level. Offsets are preserved, so a match indexes straight back into `text`.
-    """
-    chars = list(text)
-    spans = {start: (end, is_comment) for start, end, is_comment in _jsonc_spans(text)}
-
-    # NUL, not a space: the key pattern ends in `\\s*`, which would otherwise run past a
-    # blanked value and land the match end after it instead of on it.
-    def blank(start, end):
-        for k in range(start, end):
-            if chars[k] not in '\n\r':
-                chars[k] = '\x00'
-
-    depth = index = 0
-    while index < len(text):
-        if index in spans:
-            end, is_comment = spans[index]
-            if is_comment or depth != 1:
-                blank(index, end)
-            index = end
-            continue
-        char = text[index]
-        if char in '{[':
-            depth += 1
-            if depth != 1:
-                blank(index, index + 1)
-        elif char in '}]':
-            if depth != 1:
-                blank(index, index + 1)
-            depth -= 1
-        elif depth != 1:
-            blank(index, index + 1)
-        index += 1
-    return "".join(chars)
-
-
-
 def vscode_user_dirs(home: Optional[Path] = None) -> List[Path]:
     """Existing VS Code user-settings directories for `home`.
 
@@ -585,108 +544,43 @@ def vscode_user_dirs(home: Optional[Path] = None) -> List[Path]:
     return kept
 
 
-def _merge_settings_text(text: str, updates: Dict[str, Any]) -> Optional[str]:
-    """Apply `updates` to a settings document, preserving comments and layout.
-
-    A value of None removes the key. Edits the text rather than round-tripping
-    through json.dump, which would silently delete every comment in a developer's
-    own settings file. Value extents come from raw_decode, so a nested value like
-    the headers map is replaced exactly.
-    """
-    decoder = json.JSONDecoder()
-    result = text
-    missing = {}
-    for key, value in updates.items():
-        pattern = r'"' + re.escape(key) + r'"\s*:\s*'
-        while True:
-            # Masked copy, equal length: a commented-out copy of one of these keys
-            # would otherwise absorb the write and leave the real setting unset.
-            # These setting names are application-scoped, so they only ever appear at
-            # the top level; no nested block in a settings file declares them.
-            found = list(re.finditer(pattern, _mask_to_top_level(result)))
-            if not found:
-                if value is not None:
-                    missing[key] = value
-                break
-            # Last occurrence: a duplicated key resolves last-wins in every JSON parser,
-            # so editing the first one leaves the effective value untouched.
-            match = found[-1]
-            try:
-                _, end = decoder.raw_decode(result, match.end())
-            except ValueError:
-                return None
-            if value is None:
-                tail = result[end:]
-                gap = len(tail) - len(tail.lstrip())
-                if tail[gap:gap + 1] == ',':
-                    end += gap + 1
-                result = result[:match.start()] + result[end:]
-                # Keep going: a duplicate left behind becomes the effective value again,
-                # so a file reported as cleared could still hold the key.
-                continue
-            result = result[:match.end()] + json.dumps(value) + result[end:]
-            break
-
-    if not missing:
-        return result
-    # Masked for the same reason as the key search above: a leading block comment
-    # containing a brace would otherwise put the entries, and the key, inside it.
-    brace = _mask_to_top_level(result).find('{')
-    if brace < 0:
-        return None
-    entries = ",\n".join(
-        f'  {json.dumps(k)}: {json.dumps(v)}' for k, v in missing.items())
-    # Stripped first: a comment can sit between the brace and the first key, and
-    # testing the raw text there reads it as an empty object and drops the comma.
-    remainder = _strip_jsonc(result[brace + 1:]).lstrip()
-    separator = "," if remainder.startswith('"') else ""
-    return result[:brace + 1] + "\n" + entries + separator + result[brace + 1:]
-
-
 def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
-    """Merge `updates` into one settings.json. Backs the file up before writing."""
+    """Apply `updates` to one settings.json. A value of None removes the key.
+
+    Rewritten from the parsed document, so comments and layout in the file do not
+    survive. Deliberate: parsing to a dict makes a duplicate or nested copy of one of
+    these keys impossible to confuse for the top-level setting we mean.
+    """
     if settings_path.is_symlink():
         # Never write through a link: the MDM and binary paths reach every user's
         # home, and Windows grants no privilege drop to make that safe.
         print(f"⚠️  {settings_path} is a symlink; leaving it alone")
         return False
+
+    current: Dict[str, Any] = {}
     if settings_path.exists():
-        original = _read_settings_text(settings_path)
-        if original is None:
+        text = _read_settings_text(settings_path)
+        if text is None:
             print(f"⚠️  Could not read {settings_path}; leaving it alone")
             return False
-    else:
-        original = ""
+        if text.strip():
+            parsed = _parse_jsonc_or_none(text)
+            if not isinstance(parsed, dict):
+                print(f"⚠️  {settings_path} is not a JSON object; leaving it alone")
+                return False
+            current = parsed
 
-    if not original.strip():
-        merged = json.dumps({k: v for k, v in updates.items() if v is not None}, indent=2)
-    else:
-        if _parse_jsonc_or_none(original) is None:
-            print(f"⚠️  {settings_path} is not valid JSON; leaving it alone")
-            return False
-        merged = _merge_settings_text(original, updates)
-        if merged is None or _parse_jsonc_or_none(merged) is None:
-            print(f"⚠️  Could not merge settings into {settings_path}; leaving it alone")
-            return False
+    for key, value in updates.items():
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = value
+    merged = json.dumps(current, indent=2)
 
     try:
         # Windows keeps a check-to-write gap: no privilege drop applies there, so a local
         # session swapping this directory for a junction mid-run gets a privileged write.
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        backup = settings_path.with_suffix(".json.unbound-bak")
-        if backup.is_symlink():
-            backup.unlink()
-        # An older build refreshed this every run, so an upgraded machine can hold a
-        # previous key here; age is no guarantee of being clean.
-        if backup.is_file():
-            _sanitise_backup(backup)
-        # Taken once, from the file as it was before we ever wrote to it. Refreshing it
-        # on every run would capture the previous API key on a rotation and leave it on
-        # disk. clear_otel_export removes it, so a later install takes a fresh one.
-        if original and not backup.exists():
-            shutil.copy2(settings_path, backup)
-            if os.name == "posix":
-                os.chmod(backup, 0o600)
         # Staged beside the target and renamed over it: a direct write truncates first,
         # so an interrupted one would leave the user with no settings at all.
         handle_fd, staged = tempfile.mkstemp(dir=str(settings_path.parent),
@@ -718,16 +612,37 @@ MAX_SETTINGS_BYTES = 1024 * 1024
 def _read_settings_text(path: Path) -> Optional[str]:
     """Settings text, or None if it cannot be read as text.
 
-    utf-8-sig because VS Code accepts a BOM, and UnicodeDecodeError is a ValueError,
-    so an OSError-only guard would let a UTF-16 file abort the whole install.
+    Opened by descriptor, not by path: a FIFO reports size 0, so a stat-first cap never
+    fires and the read blocks the install for every later profile. O_NOFOLLOW keeps a
+    symlinked leaf from redirecting the read, and utf-8-sig accepts the BOM VS Code
+    writes, while UnicodeDecodeError is a ValueError an OSError-only guard would miss.
     """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     try:
-        if path.stat().st_size > MAX_SETTINGS_BYTES:
+        handle_fd = os.open(str(path), flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(handle_fd).st_mode):
+            print(f"⚠️  {path} is not a regular file; leaving it alone")
+            return None
+        chunks = []
+        remaining = MAX_SETTINGS_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(handle_fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_SETTINGS_BYTES:
             print(f"⚠️  {path} is too large to merge; leaving it alone")
             return None
-        return path.read_text(encoding="utf-8-sig")
+        return data.decode("utf-8-sig")
     except (OSError, UnicodeDecodeError, ValueError):
         return None
+    finally:
+        os.close(handle_fd)
 
 
 def _parse_jsonc_or_none(text: str):
@@ -760,24 +675,6 @@ def _sync_ignore_list(settings_path: Path, add: bool):
         return items if OTEL_HEADERS_KEY in items else items + [OTEL_HEADERS_KEY]
     remaining = [i for i in items if i != OTEL_HEADERS_KEY]
     return remaining or None
-
-
-def _sanitise_backup(backup: Path) -> None:
-    """Strip our keys from a backup an older build wrote after a key had already landed."""
-    text = _read_settings_text(backup)
-    if text is None or not any(key in text for key in OTEL_SETTING_KEYS):
-        return
-    cleaned = _merge_settings_text(text, {key: None for key in OTEL_SETTING_KEYS})
-    try:
-        if cleaned is not None and _parse_jsonc_or_none(cleaned) is not None:
-            backup.write_text(cleaned, encoding="utf-8")
-            if os.name == "posix":
-                os.chmod(backup, 0o600)
-        else:
-            # Unsanitisable, so removing the credential beats keeping the recovery point.
-            backup.unlink()
-    except OSError:
-        pass
 
 
 def _is_secure_endpoint(url: str) -> bool:
@@ -834,6 +731,10 @@ def clear_otel_export(home: Optional[Path] = None) -> str:
         settings_path = directory / "settings.json"
         text = _read_settings_text(settings_path)
         if text is None:
+            # Present but unreadable may still hold the key, so that is a failure
+            # to clear rather than an absence.
+            if settings_path.is_symlink() or settings_path.exists():
+                failed = True
             continue
         current = _parse_jsonc_or_none(text)
         if not isinstance(current, dict):
@@ -848,14 +749,6 @@ def clear_otel_export(home: Optional[Path] = None) -> str:
         found = True
         if not _write_settings(settings_path, updates):
             failed = True
-        else:
-            # The backup is a verbatim copy and holds the key we just removed.
-            backup = settings_path.with_suffix(".json.unbound-bak")
-            try:
-                if backup.is_file() and not backup.is_symlink():
-                    backup.unlink()
-            except OSError:
-                pass
     if failed:
         return "failed"
     return "cleared" if found else "not_found"
