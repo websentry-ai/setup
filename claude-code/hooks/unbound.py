@@ -447,6 +447,38 @@ def _get_session_model(session_id: str) -> Optional[str]:
         return None
 
 
+# A single tool-result record can approach a megabyte on its own, so a miss in the
+# first window retries wider before giving up.
+_TRANSCRIPT_MODEL_WINDOWS = (1024 * 1024, 16 * 1024 * 1024)
+
+
+def _transcript_model(transcript_path: Optional[str]) -> Optional[str]:
+    """Model of the newest assistant entry in the transcript. Only SessionStart
+    carries a model in the hook input, so this is the only per-turn source."""
+    if not transcript_path or transcript_path == 'undefined':
+        return None
+    for window in _TRANSCRIPT_MODEL_WINDOWS:
+        try:
+            with open(transcript_path, 'rb') as f:
+                size = f.seek(0, os.SEEK_END)
+                f.seek(max(0, size - window))
+                lines = f.read().split(b'\n')
+        except Exception:
+            return None  # fail open: an unreadable transcript must not skip the policy check
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                message = json.loads(line).get('message')
+            except (ValueError, AttributeError):
+                continue  # a tail cut mid-line, or an entry that is not an object
+            if isinstance(message, dict) and message.get('model'):
+                return message['model']
+        if window >= size:
+            break  # the whole file was read; a wider window cannot reach further
+    return None
+
+
 _USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens')
 
 
@@ -1947,6 +1979,18 @@ _UNBOUND_CODING_TOOL = 'Claude Code'
 CLAUDE_BUILTIN_PREFIX = 'claude-builtin:'
 
 CLAUDE_CONNECTOR_SCOPE = 'claude-connector'
+VSCODE_PROVIDER_CACHE_SCOPE = 'vscode-provider-cache'
+VSCODE_PROVIDER_PREFIX = 'vscode-provider:'
+# A loopback address is a throwaway: the port changes on every extension
+# restart, so it names nothing. A real host does, and it is what makes the same
+# remote server group across every tool, so those keep the url: identity.
+_VSCODE_PROVIDER_LOOPBACK_URL_RE = re.compile(
+    r'https?://(?:localhost|127\.0\.0\.1|\[::1\])(?::([0-9]{1,5}))?(?:[/?#].*)?',
+    re.IGNORECASE,
+)
+_EXTENSION_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+_PROVIDER_CONTRIBUTION_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}')
+_PROVIDER_SERVER_NAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._ -]{0,127}')
 
 # Claude Code sanitizes display names into runtime names (non-alphanumerics -> '_'), so one
 # server arrives under several spellings. chrome/browser/preview stay separate: different tools.
@@ -2578,6 +2622,47 @@ def _normalize_bin(command: str) -> Optional[str]:
     return b
 
 
+def _vscode_provider_loopback_identity(
+    command: Optional[str],
+    url_value: Optional[str],
+    args: List[str],
+    additional_data: Dict[str, Any],
+) -> Optional[str]:
+    if (
+        command
+        or args
+        or additional_data.get('scope') != VSCODE_PROVIDER_CACHE_SCOPE
+        or not isinstance(url_value, str)
+    ):
+        return None
+    url_match = _VSCODE_PROVIDER_LOOPBACK_URL_RE.fullmatch(url_value.strip())
+    if not url_match:
+        return None
+    # Five digits can still exceed a port; urlparse().port raises on those.
+    if url_match.group(1) and int(url_match.group(1)) > 65535:
+        return None
+    provider_id = additional_data.get('providerId')
+    provider_server_id = additional_data.get('providerServerId')
+    if not isinstance(provider_id, str) or not isinstance(provider_server_id, str):
+        return None
+    provider_parts = provider_id.strip().split('/')
+    server_parts = provider_server_id.strip().split('/')
+    if (
+        len(provider_parts) != 2
+        or len(server_parts) != 2
+        or not _EXTENSION_ID_RE.fullmatch(provider_parts[0])
+        or not _PROVIDER_CONTRIBUTION_RE.fullmatch(provider_parts[1])
+        or not _EXTENSION_ID_RE.fullmatch(server_parts[0])
+        or not _PROVIDER_SERVER_NAME_RE.fullmatch(server_parts[1])
+        or provider_parts[0].lower() != server_parts[0].lower()
+    ):
+        return None
+    identity = f'{provider_id.strip().lower()}:{provider_server_id.strip().lower()}'
+    if len(VSCODE_PROVIDER_PREFIX) + len(identity) > 500:
+        return None
+    return identity
+
+
 def compute_fingerprint(
     name: Optional[str],
     command: Optional[str],
@@ -2613,7 +2698,12 @@ def compute_fingerprint(
                 command=None if inner_url else inner_cmd,
                 url=inner_url,
                 args=inner[1:],
-                additional_data=safe_additional_data,
+                additional_data=(
+                    {}
+                    if safe_additional_data.get('scope')
+                    == VSCODE_PROVIDER_CACHE_SCOPE
+                    else safe_additional_data
+                ),
                 script_hash=script_hash,
             )
 
@@ -2636,6 +2726,12 @@ def compute_fingerprint(
         builtin = claude_builtin_identity(safe_name)
         if builtin:
             return f'{CLAUDE_BUILTIN_PREFIX}{builtin}'
+
+    vscode_provider = _vscode_provider_loopback_identity(
+        command, url, safe_args, safe_additional_data,
+    )
+    if vscode_provider:
+        return f'{VSCODE_PROVIDER_PREFIX}{vscode_provider}'
 
     # 1. url field -> url:<host[:port]/path>
     if url:
@@ -3551,7 +3647,6 @@ def process_pre_tool_use(event: Dict, api_key: str) -> Dict:
 def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     """Run the gateway policy check for a PreToolUse event - DO NOT LOG."""
     session_id = event.get('session_id')
-    model = event.get('model') or _get_session_model(session_id) or 'auto'
     transcript_path = event.get('transcript_path')
     tool_name = event.get('tool_name', '')
 
@@ -3653,6 +3748,12 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
     # Raw CLAUDE_CODE_ENTRYPOINT, forwarded so the gateway can tell a headless
     # session (sdk-cli/sdk-ts/sdk-py) apart from an interactive one.
     client_entrypoint = os.environ.get('CLAUDE_CODE_ENTRYPOINT', 'cli')
+
+    # Past the early returns: the tail read is wasted on a call the gateway never sees.
+    # Transcript first: it names the model that ran the turn, and a tool call is always
+    # preceded by the assistant message that requested it, so it is never empty here.
+    model = (event.get('model') or _transcript_model(transcript_path)
+             or _get_session_model(session_id) or 'auto')
 
     request_body = {
         'conversation_id': session_id,
@@ -4417,7 +4518,8 @@ def _apply_prompt_skill_actions(event: Dict, api_response, api_key: str) -> None
 def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
     """Process UserPromptSubmit event for policy checking. Also refreshes the policy cache, which is what makes the session's FIRST gated tool call enforceable: the gate never calls the network."""
     session_id = event.get('session_id')
-    model = event.get('model') or _get_session_model(session_id) or 'auto'
+    model = (event.get('model') or _transcript_model(event.get('transcript_path'))
+             or _get_session_model(session_id) or 'auto')
     prompt = event.get('prompt', '')
 
     cache = load_policy_cache()

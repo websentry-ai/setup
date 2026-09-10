@@ -74,6 +74,110 @@ class TestMcpFingerprintParity(unittest.TestCase):
                     'bin:gk',
                 )
 
+    def test_pylance_loopback_has_one_provider_fingerprint(self):
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'ms-python.vscode-pylance/pylanceMcp',
+            'providerServerId': (
+                'ms-python.vscode-pylance/pylance mcp server'
+            ),
+        }
+        expected = (
+            'vscode-provider:ms-python.vscode-pylance/pylancemcp:'
+            'ms-python.vscode-pylance/pylance mcp server'
+        )
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'pylance mcp server',
+                        None,
+                        'http://localhost:51983/stream',
+                        [],
+                        additional_data,
+                    ),
+                    expected,
+                )
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'pylance mcp server',
+                        None,
+                        'http://127.0.0.1:51983/stream',
+                        [],
+                        additional_data,
+                    ),
+                    expected,
+                )
+
+    def test_provider_identity_is_not_extension_allowlisted(self):
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'publisher.extension/provider',
+            'providerServerId': 'publisher.extension/server',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
+                        None,
+                        'http://localhost:51983/stream',
+                        [],
+                        additional_data,
+                    ),
+                    'vscode-provider:publisher.extension/provider:'
+                    'publisher.extension/server',
+                )
+
+    def test_port_above_65535_is_not_a_provider_url(self):
+        """urlparse().port raises on these, so they must not reach the rebuild."""
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'publisher.extension/provider',
+            'providerServerId': 'publisher.extension/server',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
+                        None,
+                        'http://localhost:99999/mcp',
+                        [],
+                        additional_data,
+                    ),
+                    None,
+                )
+
+    def test_provider_identity_only_applies_to_loopback_urls(self):
+        additional_data = {
+            'scope': 'vscode-provider-cache',
+            'providerId': 'publisher.extension/provider',
+            'providerServerId': 'publisher.extension/server',
+        }
+        for hook in HOOKS:
+            with self.subTest(hook=hook.__file__):
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
+                        None,
+                        'https://api.githubcopilot.com/mcp/',
+                        [],
+                        additional_data,
+                    ),
+                    'url:api.githubcopilot.com/mcp',
+                )
+                self.assertEqual(
+                    hook.compute_mcp_cache_key(
+                        'server',
+                        'prompt_security_mcp',
+                        None,
+                        ['__args__', 'http://localhost:51983/stream'],
+                        additional_data,
+                    ),
+                    'url:localhost:51983/stream',
+                )
+
     def test_http_provider_keeps_url_bound_identity(self):
         additional_data = {
             'providerId': 'publisher.extension/provider',
