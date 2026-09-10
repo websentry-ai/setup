@@ -107,23 +107,21 @@ def _normalized_urls(m, opts):
     return base, gateway
 
 
-def _detect_state(settings_path: Path, skip_settings: bool = False):
+def _detect_state(settings_path: Path):
     """Binary-era analog of the python detect_install_state(): the python
     version checked managed unbound.py existence, which no longer exists.
     'persisted' = settings present and pointing at this binary OR at the
     python-era unbound.py (a legitimate install being migrated — reporting
     those as 'tampered' would flood the backend with false tamper signals on
-    rollout day); 'tampered' = settings present referencing neither. With
-    skip_settings we own no config file, so a file we already stripped is
-    indistinguishable from one that was never there: report None (unknown), which
-    leaves the backend's tamper state untouched rather than counting every run."""
+    rollout day); 'tampered' = settings present referencing neither. Callers that
+    do not own the settings file must not call this at all."""
     try:
         if not settings_path.exists():
-            return None if skip_settings else "fresh"
+            return "fresh"
         text = settings_path.read_text(encoding="utf-8")
         if str(HOOK_BINARY) in text or "unbound.py" in text:
             return "persisted"
-        return None if skip_settings else "tampered"
+        return "tampered"
     except Exception as e:
         # None = "unknown" — notify_setup_complete omits the field entirely,
         # which is more honest than guessing 'fresh' over an unreadable but
@@ -158,7 +156,10 @@ def _remove_stale_managed_script(managed_dir: Path) -> None:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     """tmp + os.replace so a crash mid-write never leaves the editor reading
-    a truncated managed-settings file."""
+    a truncated managed-settings file. A link is refused, not resolved: this runs as
+    root, so following one writes wherever it points."""
+    if path.is_symlink():
+        raise OSError(f"{path} is a link; refusing to write through it as root")
     tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)
@@ -278,25 +279,15 @@ def _print_remote_policy_hooks() -> None:
 def _write_claude_managed_settings(m, skip_settings: bool = False) -> bool:
     """Binary variant of claude-code setup_managed_hooks(): same settings
     file, same gateway-leftover cleanup, no script download. With
-    skip_settings it writes no hook config and strips ours instead."""
+    skip_settings it writes no hook config and leaves the file alone entirely."""
     try:
         managed_dir = m.get_managed_settings_dir()
         managed_dir.mkdir(parents=True, exist_ok=True)
         settings_path = managed_dir / "managed-settings.json"
 
-        # No hook config of our own: the remote policy owns it. Strips through
-        # the vendored module so this path and the python one cannot drift.
+        # No hook config of our own: the remote policy owns it. managed-settings.json
+        # belongs to the admin in this mode and is neither read nor written.
         if skip_settings:
-            stripped, strip_error = m._strip_unbound_hooks_from_settings(
-                managed_dir, managed_dir / "hooks" / "unbound.py",
-                delete_when_empty=False)
-            if stripped:
-                print("Removed Unbound hooks left behind in the local managed settings")
-            # A failed strip leaves local hooks live next to the remote policy,
-            # so the tool defers instead of reporting itself configured.
-            if strip_error:
-                print(f"Failed to strip existing Unbound hooks from {managed_dir}")
-                return False
             if platform.system().lower() in ("darwin", "linux"):
                 os.chmod(managed_dir, 0o755)
             return True
@@ -586,8 +577,10 @@ def _setup_claude_code(opts):
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
 
     skip_settings = opts["skip_managed_settings"]
-    state = _detect_state(m.get_managed_settings_dir() / "managed-settings.json",
-                          skip_settings=skip_settings)
+    # None (unknown) without looking: in skip mode managed-settings.json is the
+    # admin's file, and unknown leaves the backend's tamper state untouched.
+    state = None if skip_settings else _detect_state(
+        m.get_managed_settings_dir() / "managed-settings.json")
     if not _write_claude_managed_settings(m, skip_settings=skip_settings):
         return ("deferred", "managed settings update failed")
     if skip_settings:
