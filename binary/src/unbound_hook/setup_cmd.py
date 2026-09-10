@@ -156,11 +156,10 @@ def _remove_stale_managed_script(managed_dir: Path) -> None:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     """tmp + os.replace so a crash mid-write never leaves the editor reading
-    a truncated managed-settings file. A link is written through instead, matching
-    the python writer: replacing it would strand the target the admin maintains."""
+    a truncated managed-settings file. A link is refused, not resolved: this runs as
+    root, so following one writes wherever it points."""
     if path.is_symlink():
-        path.write_text(text, encoding="utf-8")
-        return
+        raise OSError(f"{path} is a link; refusing to write through it as root")
     tmp = path.parent / f"{path.name}.{os.getpid()}.tmp"
     tmp.write_text(text, encoding="utf-8")
     os.replace(tmp, path)

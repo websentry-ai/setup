@@ -688,16 +688,37 @@ def test_skip_managed_settings_prints_every_remote_policy_command(env, capsys):
         assert _cmd("claude-code", event) in out, f"{event} command not printed"
 
 
-def test_atomic_write_preserves_a_symlinked_settings_file(tmp_path):
-    """os.replace renames onto the path, swapping an admin-maintained link for a
-    regular file and stranding its target. The python writer follows the link."""
+def test_non_skip_install_defers_on_a_symlinked_config(env, capsys):
+    """End to end: root must neither replace the admin's link nor write through it,
+    so the step defers loudly instead of reporting itself configured."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    target = managed.parent / "org-managed-settings.json"
+    target.write_text('{"forceLoginOrgUUID": "org-uuid"}')
+    (managed / "managed-settings.json").symlink_to(target)
+
+    setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code"])
+
+    assert (managed / "managed-settings.json").is_symlink()
+    assert json.loads(target.read_text()) == {"forceLoginOrgUUID": "org-uuid"}
+    out = capsys.readouterr().out
+    assert "deferred" in out
+
+
+def test_atomic_write_refuses_a_symlinked_settings_file(tmp_path):
+    """Replacing the link strands the admin's target; following it writes wherever
+    it points, as root. Refused, leaving both the link and its target alone."""
     target = tmp_path / "org.json"
     target.write_text('{"owner":"org"}')
     link = tmp_path / "managed-settings.json"
     link.symlink_to(target)
-    setup_cmd._atomic_write_text(link, '{"owner":"unbound"}')
+
+    with pytest.raises(OSError):
+        setup_cmd._atomic_write_text(link, '{"owner":"unbound"}')
+
     assert link.is_symlink()
-    assert json.loads(target.read_text()) == {"owner": "unbound"}
+    assert json.loads(target.read_text()) == {"owner": "org"}
 
 
 def test_skip_managed_settings_reports_no_install_state(env):

@@ -1282,6 +1282,10 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
         }
 
         settings["hooks"] = hooks_config
+        # Refused, not resolved: write_text and the chmod below both follow a link,
+        # and this runs as root, so following one writes wherever it points.
+        if _is_reparse_point(settings_path):
+            raise OSError(f"{settings_path} is a link; refusing to write through it as root")
         settings_path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
         debug_print(f"Created managed settings: {settings_path}")
 

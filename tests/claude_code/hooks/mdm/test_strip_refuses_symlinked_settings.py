@@ -1,8 +1,9 @@
-"""--clear must not replace a symlinked managed-settings.json.
+"""managed-settings.json is never written through a link.
 
-os.replace renames onto the path, so it swaps an admin-maintained link for a
-regular file and strands the target, which is where their edits keep going.
-Skip mode never reads or writes this file at all; binary/tests covers that.
+Replacing it swaps an admin-maintained link for a regular file and strands the
+target, which is where their edits keep going. Following it writes wherever the
+link points, as root. Both writers refuse. Skip mode never touches the file at
+all; binary/tests covers that.
 """
 import importlib.util
 import json
