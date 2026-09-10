@@ -1149,19 +1149,13 @@ def setup_managed_hooks(gateway_url: str = DEFAULT_GATEWAY_URL, skip_settings: b
             os.chmod(script_path, 0o755)
             debug_print("Set script as executable")
 
-        # No hook config of our own: the remote policy owns it, and stale local
-        # hooks would let the device enforce from two places at once.
+        # No hook config of our own: the remote policy owns it. managed-settings.json
+        # belongs to the admin in this mode and is neither read nor written.
         if skip_settings:
-            stripped, strip_error = _strip_unbound_hooks_from_settings(
-                managed_dir, script_path, delete_when_empty=False)
-            if stripped:
-                print("Removed Unbound hooks left behind in the local managed settings")
-            if strip_error:
-                print(f"Warning: could not strip existing Unbound hooks from {managed_dir}; check it by hand")
             if system in ["darwin", "linux"]:
                 os.chmod(managed_dir, 0o755)
                 os.chmod(hooks_dir, 0o755)
-            debug_print("Installed hook script only; wrote no managed settings")
+            debug_print("Installed hook script only; left managed settings untouched")
             return True
 
         # Read existing settings or create new
@@ -1391,6 +1385,13 @@ def _strip_unbound_hooks_from_settings(managed_dir: Path, script_path: Path,
                 if not hooks_block:
                     del settings["hooks"]
             if modified:
+                # unlink drops the link and os.replace swaps it for a regular file;
+                # either way the admin's target is stranded, so a link is reported.
+                if _is_reparse_point(settings_path):
+                    print(f"Warning: {settings_path} is a link; left it alone. "
+                          f"Remove the Unbound hook entries from its target by hand.")
+                    had_error = True
+                    continue
                 # Delete the file only when nothing foreign remains (our
                 # drop-in, or a managed-settings.json that held only our
                 # hooks); otherwise rewrite in place so org policy survives.

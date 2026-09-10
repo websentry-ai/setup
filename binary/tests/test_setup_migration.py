@@ -8,6 +8,7 @@ against sandboxed paths.
 import getpass
 import io
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -602,45 +603,57 @@ def test_skip_managed_settings_writes_no_hook_config(env):
     assert not (m.get_managed_settings_dir() / "managed-settings.json").exists()
 
 
-def test_skip_managed_settings_strips_ours_keeps_foreign(env):
-    """Our binary-form and python-era entries go; org policy and foreign hooks stay."""
+def test_skip_managed_settings_touches_no_managed_settings_path(env, monkeypatch):
+    """The contract is stronger than "does not edit it": in skip mode the file is
+    the admin's and nothing may stat, open or read it. Asserted by instrumenting the
+    filesystem calls for the whole run, so a new caller anywhere trips this."""
     m = env["modules"]["claude-code"]
     managed = m.get_managed_settings_dir()
     managed.mkdir(parents=True, exist_ok=True)
-    settings_path = managed / "managed-settings.json"
-    foreign_cmd = "/usr/local/bin/org-audit-hook"
-    python_era = f'"{managed / "hooks" / "unbound.py"}"'
-    settings_path.write_text(json.dumps({
-        "permissions": {"deny": ["Bash(rm:*)"]},
-        "hooks": {
-            "PreToolUse": [{"matcher": "*", "hooks": [
-                {"type": "command", "command": _cmd("claude-code", "PreToolUse")},
-                {"type": "command", "command": foreign_cmd},
-            ]}],
-            "Stop": [{"hooks": [{"type": "command", "command": python_era}]}],
-        },
+    (managed / "managed-settings.json").write_text(json.dumps({"forceLoginOrgUUID": "org"}))
+
+    touches = []
+
+    def record(kind, path):
+        if "managed-settings" in str(path) and str(path).endswith(".json"):
+            touches.append(f"{kind}({path})")
+
+    real_open, real_stat, real_read = io.open, os.stat, Path.read_text
+    monkeypatch.setattr(io, "open", lambda f, *a, **k: (record("open", f), real_open(f, *a, **k))[1])
+    monkeypatch.setattr(os, "stat", lambda f, *a, **k: (record("stat", f), real_stat(f, *a, **k))[1])
+    monkeypatch.setattr(Path, "read_text",
+                        lambda self, *a, **k: (record("read_text", self), real_read(self, *a, **k))[1])
+
+    rc = setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                        "--skip-managed-settings"])
+    monkeypatch.undo()
+    assert rc == 0
+    assert touches == [], f"skip mode touched the admin's file: {touches}"
+
+
+def test_skip_managed_settings_preserves_a_symlinked_config(env):
+    """The reported failure: a daily Jamf run turned the admin's symlink into a
+    root-owned regular file and dropped the hook entries from the live config."""
+    m = env["modules"]["claude-code"]
+    managed = m.get_managed_settings_dir()
+    managed.mkdir(parents=True, exist_ok=True)
+    target = managed.parent / "org-managed-settings.json"
+    target.write_text(json.dumps({
+        "forceLoginOrgUUID": "org-uuid",
+        "hooks": {"PreToolUse": [{"matcher": "*", "hooks": [
+            {"type": "command", "command": _cmd("claude-code", "PreToolUse")}]}]},
     }, indent=2))
-    assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
-                          "--skip-managed-settings"]) == 0
-    result = json.loads(settings_path.read_text())
-    assert result["permissions"] == {"deny": ["Bash(rm:*)"]}
-    assert "unbound" not in json.dumps(result["hooks"]).lower()
-    cmds = [h["command"] for grp in result["hooks"]["PreToolUse"] for h in grp["hooks"]]
-    assert cmds == [foreign_cmd]
-
-
-def test_skip_managed_settings_keeps_the_file_when_emptied(env):
-    """A file holding only our hooks is left in place as {} — their MDM may own it."""
-    m = env["modules"]["claude-code"]
-    managed = m.get_managed_settings_dir()
-    managed.mkdir(parents=True, exist_ok=True)
     settings_path = managed / "managed-settings.json"
-    settings_path.write_text(json.dumps({"hooks": {"Stop": [
-        {"hooks": [{"type": "command", "command": _cmd("claude-code", "Stop")}]}]}}))
+    settings_path.symlink_to(target)
+    before = target.read_bytes()
+
     assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
                           "--skip-managed-settings"]) == 0
-    assert settings_path.exists(), "the file must survive; only our lines go"
-    assert json.loads(settings_path.read_text()) == {}
+
+    assert settings_path.is_symlink(), "the admin's link must survive the run"
+    assert target.read_bytes() == before
+    live = json.loads(settings_path.read_text())
+    assert "PreToolUse" in live["hooks"], "the live config must keep enforcing"
 
 
 def test_skip_managed_settings_keeps_python_era_script(env):
@@ -675,29 +688,35 @@ def test_skip_managed_settings_prints_every_remote_policy_command(env, capsys):
         assert _cmd("claude-code", event) in out, f"{event} command not printed"
 
 
-def test_skip_managed_settings_install_state_never_tampered(env):
-    """With no config of ours, a stripped file reads as unknown, not as a state.
-    Reporting one would make every run look like the managed config was cleared."""
+def test_atomic_write_preserves_a_symlinked_settings_file(tmp_path):
+    """os.replace renames onto the path, swapping an admin-maintained link for a
+    regular file and stranding its target. The python writer follows the link."""
+    target = tmp_path / "org.json"
+    target.write_text('{"owner":"org"}')
+    link = tmp_path / "managed-settings.json"
+    link.symlink_to(target)
+    setup_cmd._atomic_write_text(link, '{"owner":"unbound"}')
+    assert link.is_symlink()
+    assert json.loads(target.read_text()) == {"owner": "unbound"}
+
+
+def test_skip_managed_settings_reports_no_install_state(env):
+    """install_state is derived from a settings file we do not own in this mode, so
+    it is reported as unknown. notify_setup_complete omits the field entirely, which
+    leaves the backend's tamper state untouched instead of counting every run."""
     m = env["modules"]["claude-code"]
     managed = m.get_managed_settings_dir()
     managed.mkdir(parents=True, exist_ok=True)
-    settings_path = managed / "managed-settings.json"
-    settings_path.write_text(json.dumps({"permissions": {"deny": ["Bash"]}}))
-    assert setup_cmd._detect_state(settings_path, skip_settings=True) is None
-    assert setup_cmd._detect_state(settings_path) == "tampered"
-    settings_path.write_text(json.dumps({"hooks": {"Stop": [
-        {"hooks": [{"type": "command", "command": _cmd("claude-code", "Stop")}]}]}}))
-    assert setup_cmd._detect_state(settings_path, skip_settings=True) == "persisted"
+    # A file that would read as 'tampered' if anyone looked at it.
+    (managed / "managed-settings.json").write_text(
+        json.dumps({"permissions": {"deny": ["Bash"]}}))
 
+    assert setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
+                          "--skip-managed-settings"]) == 0
 
-def test_skip_managed_settings_absent_file_is_unknown_not_fresh(env):
-    """The repeat-run case: skip mode writes no config, so an absent file is the
-    steady state. Reporting 'fresh' counted a tamper on every run after the first."""
-    m = env["modules"]["claude-code"]
-    settings_path = m.get_managed_settings_dir() / "managed-settings.json"
-    assert not settings_path.exists()
-    assert setup_cmd._detect_state(settings_path, skip_settings=True) is None
-    assert setup_cmd._detect_state(settings_path) == "fresh"
+    reports = [k for _, k in env["notified"] if k.get("install_mode") == "binary-skip"]
+    assert len(reports) == 1
+    assert reports[0]["install_state"] is None
 
 
 def test_binary_and_python_agree_on_a_hook_hash(env):
@@ -721,23 +740,6 @@ def test_skip_managed_settings_flag_is_accepted_by_the_parser(env):
     opts = setup_cmd._parse_args(["--api-key", "k", "--skip-managed-settings"])
     assert opts is not None and opts["skip_managed_settings"] is True
     assert setup_cmd._parse_args(["--api-key", "k"])["skip_managed_settings"] is False
-
-
-def test_skip_managed_settings_defers_when_the_strip_fails(env, capsys):
-    """An unstrippable file leaves local hooks live, so claude-code must defer
-    rather than report configured with duplicate enforcement in place."""
-    m = env["modules"]["claude-code"]
-    managed = m.get_managed_settings_dir()
-    managed.mkdir(parents=True, exist_ok=True)
-    settings_path = managed / "managed-settings.json"
-    settings_path.write_text("{ not json ")
-    rc = setup_cmd.run(["--api-key", "admin-key", "--tools", "claude-code",
-                        "--skip-managed-settings"])
-    assert rc == 1, "a strip failure must surface in the exit code"
-    out = capsys.readouterr().out
-    assert "deferred (managed settings update failed)" in out
-    assert "Failed to strip existing Unbound hooks" in out
-    assert settings_path.read_text() == "{ not json ", "must not clobber what it cannot parse"
 
 
 # The discovery key is retired. Legacy Jamf policies still pass it to the binary,
