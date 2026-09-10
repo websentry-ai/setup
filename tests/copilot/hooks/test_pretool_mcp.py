@@ -4,6 +4,8 @@ copilot/hooks/unbound.py. Tool names are real ones from VS Code chat transcripts
 server keys mirror a real VS Code mcp.json.
 """
 
+import base64
+import hashlib
 import json
 import os
 import sqlite3
@@ -1536,6 +1538,139 @@ class TestCopilotProjectConfigPaths(unittest.TestCase):
 
         self.assertIn("shared", servers)
         self.assertIsNone(servers["shared"])
+
+
+class TestLocalScriptFingerprint(ProcessPreToolUseBase):
+    """`node <path>/index.js` has no package or binary identity, so without a
+    client-computed scriptHash the server reaches the gateway with a null
+    fingerprint."""
+
+    def setUp(self):
+        super().setUp()
+        unbound._HOOK_SCRIPT_SNAPSHOT.clear()
+        self.script = Path(self.cwd) / "build" / "index.js"
+        self.script.parent.mkdir(parents=True, exist_ok=True)
+        self.script.write_bytes(b"console.log('ctx')\n")
+        self.sha = hashlib.sha256(self.script.read_bytes()).hexdigest()
+        (Path(self.cwd) / ".vscode" / "mcp.json").write_text(json.dumps({
+            "servers": {"context": {"command": "node", "args": [str(self.script)]}},
+        }))
+
+    def _forwarded_config(self):
+        captured = {}
+
+        def capturing_gw(request_body, api_key):
+            captured["md"] = request_body["pre_tool_use_data"]["metadata"]
+            return {"decision": "allow"}
+
+        event = {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "mcp_context_get_docs",
+            "tool_input": {}, "cwd": self.cwd, "session_id": "s",
+        }
+        with patch.object(unbound, "send_to_hook_api", capturing_gw):
+            unbound.process_pre_tool_use(event, "K")
+        return captured["md"]["mcp_server_config"]
+
+    def test_pretool_forwards_script_hash(self):
+        self.assertEqual(self._forwarded_config().get("scriptHash"), self.sha)
+
+    def test_forwarded_config_fingerprints_to_the_script_tier(self):
+        config = self._forwarded_config()
+        self.assertIsNone(unbound.compute_mcp_cache_key(
+            "context", config["command"], None, config["args"]))
+        self.assertEqual(
+            unbound.compute_mcp_cache_key(
+                "context", config["command"], None, config["args"],
+                script_hash=config["scriptHash"]),
+            "script:%s" % self.sha,
+        )
+
+    def test_session_tool_use_entry_carries_script_hash(self):
+        mapped = unbound.map_copilot_tool(
+            "mcp_context_get_docs", {}, "ok",
+            mcp_servers={"context": {"command": "node", "args": [str(self.script)]}},
+            cwd=self.cwd,
+        )
+        self.assertEqual(mapped["mcp_server_config"]["scriptHash"], self.sha)
+
+    def test_targeted_scan_uploads_the_hashed_script_body(self):
+        config_path = Path(self.cwd) / "unbound.json"
+        config_path.write_text(json.dumps({
+            "api_key": "secret-api-key",
+            "base_url": "https://backend.example.com",
+        }))
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
+            unbound, "RUNNING_FROZEN", True
+        ), patch.object(
+            unbound, "FROZEN_DISCOVERY_BIN", str(self.script)
+        ), patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_mcp_server_scan(
+                "context", {"command": "node", "args": [str(self.script)]}, cwd=self.cwd,
+            )
+
+        sent = json.loads(popen.call_args.kwargs["env"]["UNBOUND_MCP_SERVER_JSON"])
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(), self.sha)
+
+    def test_package_server_gets_no_script_fields(self):
+        (Path(self.cwd) / ".vscode" / "mcp.json").write_text(json.dumps({
+            "servers": {"context": {"command": "npx", "args": ["@upstash/context7-mcp"]}},
+        }))
+        self.assertEqual(self._forwarded_config(), {
+            "command": "npx", "args": ["@upstash/context7-mcp"],
+        })
+
+    def _scan_payload(self, server_config):
+        config_path = Path(self.cwd) / "unbound.json"
+        config_path.write_text(json.dumps({
+            "api_key": "secret-api-key",
+            "base_url": "https://backend.example.com",
+        }))
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", config_path), patch.object(
+            unbound, "RUNNING_FROZEN", True
+        ), patch.object(
+            unbound, "FROZEN_DISCOVERY_BIN", str(self.script)
+        ), patch.object(unbound.subprocess, "Popen") as popen:
+            unbound._dispatch_mcp_server_scan("context", server_config, cwd=self.cwd)
+        return json.loads(popen.call_args.kwargs["env"]["UNBOUND_MCP_SERVER_JSON"])
+
+    def test_scan_body_matches_the_hash_reported_at_policy_time(self):
+        # The backend re-hashes the uploaded body, so an edit landing between the
+        # PreToolUse policy call and the out-of-band scan must not split the two.
+        reported = self._forwarded_config()["scriptHash"]
+        self.script.write_bytes(b"console.log('edited after the policy call')\n")
+
+        sent = self._scan_payload({"command": "node", "args": [str(self.script)]})
+        self.assertEqual(reported, self.sha)
+        self.assertEqual(sent["scriptHash"], reported)
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(),
+            reported,
+        )
+
+    def test_scan_without_a_cached_snapshot_still_agrees(self):
+        unbound._HOOK_SCRIPT_SNAPSHOT.clear()
+        sent = self._scan_payload({"command": "node", "args": [str(self.script)]})
+        self.assertEqual(sent["scriptHash"], self.sha)
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(sent["script_content"])).hexdigest(),
+            self.sha,
+        )
+
+    def test_module_run_never_uploads_an_unrelated_file(self):
+        notes = Path(self.cwd) / "notes.py"
+        notes.write_bytes(b"# private\n")
+        (Path(self.cwd) / ".vscode" / "mcp.json").write_text(json.dumps({
+            "servers": {"context": {
+                "command": "python", "args": ["-m", "package", str(notes)],
+            }},
+        }))
+        self.assertNotIn("scriptHash", self._forwarded_config())
+        sent = self._scan_payload(
+            {"command": "python", "args": ["-m", "package", str(notes)]})
+        self.assertNotIn("script_content", sent)
+
 
 if __name__ == "__main__":
     unittest.main()

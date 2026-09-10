@@ -1518,8 +1518,6 @@ _HOOK_SCRIPT_RUNTIMES = {
     'ruby', 'dart', 'php', 'perl', 'rscript',
 }
 _HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
-_HOOK_RUNNER_SUBTOKENS = {'run', 'tsx', 'ts-node'}
-
 
 def _hook_command_basename(command: str) -> str:
     base = re.split(r'[\\/]', (command or '').strip())[-1]
@@ -1536,54 +1534,111 @@ def _hook_looks_like_path(value: str) -> bool:
     return bool(_HOOK_SCRIPT_EXT_RE.search(v))
 
 
+def _hook_runtime_entrypoint(runtime: str, args: List) -> Optional[str]:
+    """The runtime's script entrypoint: the first positional argument. A flag
+    before it means we cannot tell an entrypoint from a module name or a value
+    the flag consumes (`python -m pkg app.py`), so nothing is read."""
+    for index, raw in enumerate(args):
+        if not isinstance(raw, str):
+            return None
+        token = raw.strip().strip('"\'')
+        if index == 0 and runtime in ('bun', 'deno', 'dart') and token == 'run':
+            continue
+        if token.startswith('-'):
+            return None
+        return token
+    return None
+
+
 def _hook_candidate_script(command: Optional[str], args: Optional[List]) -> Optional[str]:
-    """The local script this config runs: the file arg under a runtime, or the
-    command itself when it's a script file. None for packages/urls/binaries."""
+    """The local script this config runs: the entrypoint argument under a runtime,
+    or the command itself when it's a script file. None for packages/urls/binaries."""
     base = _hook_command_basename(command or '')
     if base in _HOOK_SCRIPT_RUNTIMES:
-        for a in (args or []):
-            if not isinstance(a, str) or a.startswith('-'):
-                continue
-            t = a.strip().strip('"\'')
-            if t in _HOOK_RUNNER_SUBTOKENS:
-                continue
-            if _hook_looks_like_path(t):
-                return t
+        candidate = _hook_runtime_entrypoint(base, args or [])
+        if candidate and _hook_looks_like_path(candidate):
+            return candidate
         return None
     if command and _HOOK_SCRIPT_EXT_RE.search(base):
         return command
     return None
 
 
+def _hook_script_path(command: Optional[str], args: Optional[List],
+                      cwd: Optional[str]) -> Optional[str]:
+    """Absolute, symlink-resolved path of the local script, or None. The extension
+    gate is re-applied to the resolved target so a `server.py` link pointing at a
+    secret can't smuggle a non-script through it."""
+    cand = _hook_candidate_script(command, args)
+    if not cand:
+        return None
+    path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+    if '${' in path:  # an env var we couldn't expand -> can't resolve
+        return None
+    if not os.path.isabs(path) and cwd:
+        path = os.path.join(cwd, path)
+    try:
+        resolved = os.path.realpath(path)
+    except OSError as exc:
+        log_error("mcp script fingerprint: cannot resolve %s: %s"
+                  % (os.path.basename(path), type(exc).__name__), 'mcp_config')
+        return None
+    if not _HOOK_SCRIPT_EXT_RE.search(resolved):
+        log_error("mcp script fingerprint: %s resolves to a non-script target"
+                  % os.path.basename(path), 'mcp_config')
+        return None
+    if not os.path.isfile(resolved):
+        return None
+    return resolved
+
+
+def _hook_read_script_bytes(path: str) -> Optional[bytes]:
+    """First _HOOK_MAX_SCRIPT_BYTES bytes of a regular file, else None."""
+    flags = (os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+             | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+    with os.fdopen(os.open(path, flags), 'rb') as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None
+        return f.read(_HOOK_MAX_SCRIPT_BYTES)
+
+
+_HOOK_SCRIPT_SNAPSHOT = {}
+
+
+def _hook_script_snapshot(command: Optional[str], args: Optional[List],
+                          cwd: Optional[str]) -> Optional[Tuple[str, str]]:
+    """(sha256, base64 body) derived from one read, so the hash reported on the
+    policy call and the body the scan uploads can never describe different bytes.
+    Holds a single entry: the body is capped, but it is not free."""
+    path = _hook_script_path(command, args, cwd)
+    if not path:
+        return None
+    cached = _HOOK_SCRIPT_SNAPSHOT.get(path)
+    if cached:
+        return cached
+    try:
+        data = _hook_read_script_bytes(path)
+    except OSError as exc:
+        log_error("mcp script fingerprint: cannot read %s: %s"
+                  % (os.path.basename(path), type(exc).__name__), 'mcp_config')
+        return None
+    if data is None:
+        log_error("mcp script fingerprint: %s is not a regular file" % os.path.basename(path), 'mcp_config')
+        return None
+    snapshot = (hashlib.sha256(data).hexdigest(),
+                base64.b64encode(data).decode('ascii'))
+    _HOOK_SCRIPT_SNAPSHOT.clear()
+    _HOOK_SCRIPT_SNAPSHOT[path] = snapshot
+    return snapshot
+
+
 def _compute_script_hash(command: Optional[str], args: Optional[List], cwd: Optional[str]) -> Optional[str]:
     """sha256 of the local script's contents, or None when it isn't a resolvable
     local script. Matches what the backend recomputes from the uploaded body, so
-    the gateway's `script:<hash>` lookup lines up with the stored fingerprint."""
-    try:
-        cand = _hook_candidate_script(command, args)
-        if not cand:
-            return None
-        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
-        if '${' in path:  # an env var we couldn't expand -> can't resolve
-            return None
-        if not os.path.isabs(path) and cwd:
-            path = os.path.join(cwd, path)
-        if not os.path.isfile(path):
-            return None
-        # Hash at most _HOOK_MAX_SCRIPT_BYTES so the gateway's scriptHash matches
-        # the bytes the backend re-hashes from the (same-capped) uploaded body.
-        h = hashlib.sha256()
-        remaining = _HOOK_MAX_SCRIPT_BYTES
-        with open(path, 'rb') as f:
-            while remaining > 0:
-                chunk = f.read(min(65536, remaining))
-                if not chunk:
-                    break
-                h.update(chunk)
-                remaining -= len(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    snapshot = _hook_script_snapshot(command, args, cwd)
+    return snapshot[0] if snapshot else None
 
 
 def _session_file_created_at(path) -> float:
@@ -1650,24 +1705,9 @@ _HOOK_MAX_SCRIPT_BYTES = 256 * 1024
 def _read_script_body_b64(command, args, cwd):
     """base64 of the local script's first _HOOK_MAX_SCRIPT_BYTES bytes (the scan
     body), or None. The backend re-hashes these exact bytes, so this must read the
-    same prefix _compute_script_hash hashed. Capped (and truncated, not skipped)
-    so the body stays consistent with the hash and the payload stays small."""
-    try:
-        cand = _hook_candidate_script(command, args)
-        if not cand:
-            return None
-        path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
-        if '${' in path:
-            return None
-        if not os.path.isabs(path) and cwd:
-            path = os.path.join(cwd, path)
-        if not os.path.isfile(path):
-            return None
-        with open(path, 'rb') as f:
-            data = f.read(_HOOK_MAX_SCRIPT_BYTES)
-        return base64.b64encode(data).decode('ascii')
-    except Exception:
-        return None
+    same prefix _compute_script_hash hashed."""
+    snapshot = _hook_script_snapshot(command, args, cwd)
+    return snapshot[1] if snapshot else None
 
 
 def _macos_proc_argv(pid: int) -> Optional[List[str]]:
@@ -5017,6 +5057,33 @@ def _discovery_installer_is_stale(installer_path: Path) -> bool:
         return True
 
 
+def _ensure_discovery_installer(installer_path: Path, installer_url: str,
+                                category: str = 'discovery_gate') -> bool:
+    """Download or TTL-refresh the installer. False only when nothing usable is on disk."""
+    DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
+    if not _discovery_installer_is_stale(installer_path):
+        return True
+    fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
+    os.close(fd)
+    tmp = Path(_tmp)
+    curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
+    r = subprocess.run(
+        [curl, "-fsSL", "-o", str(tmp), installer_url],
+        capture_output=True, timeout=30,
+    )
+    if r.returncode == 0:
+        if not _is_windows():
+            os.chmod(tmp, 0o700)
+        os.replace(tmp, installer_path)
+        return True
+    tmp.unlink(missing_ok=True)
+    if not installer_path.exists():
+        log_error(f"discovery {installer_path.name} download failed: {r.stderr.decode(errors='replace')[:200]}", category)
+        return False
+    log_error(f"discovery {installer_path.name} refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", category)
+    return True
+
+
 def _dispatch_mcp_server_scan(server_name: str, server_config: Dict, cwd: Optional[str] = None) -> None:
     """Report ONE unknown MCP server out-of-band.
 
@@ -5064,6 +5131,18 @@ def _dispatch_mcp_server_scan(server_name: str, server_config: Dict, cwd: Option
                 return
             scan_cmd = [FROZEN_DISCOVERY_BIN, "mcp-scan",
                         "--name", server_name, "--domain", backend_url]
+        elif _is_windows():
+            # No bash and no install.sh on a stock Windows box, so the scan runs
+            # through the PowerShell installer instead.
+            installer_path, installer_url = _discovery_installer()
+            if not _ensure_discovery_installer(installer_path, installer_url, 'mcp_server'):
+                return
+            scan_cmd = [
+                _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+                "-NoProfile", "-NonInteractive",
+                "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+                "-McpScan", "-McpServerName", server_name, "-Domain", backend_url,
+            ]
         else:
             DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
             bootstrap = (
@@ -6142,26 +6221,8 @@ def _dispatch_discovery() -> None:
                 discovery_cmd = [FROZEN_DISCOVERY_BIN, "--domain", backend_url]
             else:
                 installer_path, installer_url = _discovery_installer()
-                DISCOVERY_INSTALL_DIR.mkdir(parents=True, exist_ok=True)
-                if _discovery_installer_is_stale(installer_path):
-                    fd, _tmp = tempfile.mkstemp(dir=DISCOVERY_INSTALL_DIR, prefix="install.", suffix=".tmp")
-                    os.close(fd)
-                    tmp = Path(_tmp)
-                    curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
-                    r = subprocess.run(
-                        [curl, "-fsSL", "-o", str(tmp), installer_url],
-                        capture_output=True, timeout=30,
-                    )
-                    if r.returncode == 0:
-                        if not _is_windows():
-                            os.chmod(tmp, 0o755)
-                        os.replace(tmp, installer_path)
-                    else:
-                        tmp.unlink(missing_ok=True)
-                        if not installer_path.exists():
-                            log_error(f"discovery {installer_path.name} download failed: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
-                            return
-                        log_error(f"discovery {installer_path.name} refresh failed; using cached copy: {r.stderr.decode(errors='replace')[:200]}", 'discovery_gate')
+                if not _ensure_discovery_installer(installer_path, installer_url):
+                    return
                 discovery_cmd = _discovery_command(installer_path, backend_url)
 
             # api_key goes via env so it never appears in argv / /proc/<pid>/cmdline.

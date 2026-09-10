@@ -6,6 +6,7 @@ transcript's own path rather than from Path.home(). The reader block itself is s
 with the user-level installer and must not drift.
 """
 
+import hashlib
 import json
 import sqlite3
 import tempfile
@@ -95,11 +96,15 @@ class TestMdmBackfillUsage(unittest.TestCase):
             sessions = []
             for root, server in ((first, "alpha"), (second, "beta")):
                 home = Path(root)
+                script_body = (server + "\n").encode()
+                (home / "server.py").write_bytes(script_body)
                 hook_dir = home / ".copilot" / "hooks"
                 hook_dir.mkdir(parents=True)
                 (hook_dir / "unbound.py").write_text(source_hook.read_text(encoding="utf-8"), encoding="utf-8")
                 (home / ".copilot" / "mcp-config.json").write_text(json.dumps({
-                    "mcpServers": {server: {"command": "npx", "args": [server]}},
+                    "mcpServers": {
+                        server: {"command": "python", "args": ["server.py"]},
+                    },
                 }), encoding="utf-8")
                 transcript = home / ".copilot" / "session-state" / server / "events.jsonl"
                 transcript.parent.mkdir(parents=True)
@@ -122,13 +127,21 @@ class TestMdmBackfillUsage(unittest.TestCase):
                     "tool_name": "alpha-get_issue",
                     "server_name": "alpha",
                     "mcp_tool_name": "get_issue",
-                    "mcp_server_config": {"command": "npx", "args": ["alpha"]},
+                    "mcp_server_config": {
+                        "command": "python",
+                        "args": ["server.py"],
+                        "scriptHash": hashlib.sha256(b"alpha\n").hexdigest(),
+                    },
                 }},
                 {"beta": {
                     "tool_name": "beta-get_issue",
                     "server_name": "beta",
                     "mcp_tool_name": "get_issue",
-                    "mcp_server_config": {"command": "npx", "args": ["beta"]},
+                    "mcp_server_config": {
+                        "command": "python",
+                        "args": ["server.py"],
+                        "scriptHash": hashlib.sha256(b"beta\n").hexdigest(),
+                    },
                 }},
             ],
         )

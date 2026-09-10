@@ -5,6 +5,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 """
 
 import sys
+import base64
 import json
 import os
 import ntpath
@@ -2014,6 +2015,153 @@ def _vscode_cached_mcp_servers(cwd=None):
                 servers.append((label, fields))
     return servers
 
+
+_HOOK_SCRIPT_RUNTIMES = {
+    'node', 'nodejs', 'bun', 'deno', 'python', 'python2', 'python3', 'py',
+    'ruby', 'dart', 'php', 'perl', 'rscript',
+}
+_HOOK_SCRIPT_EXT_RE = re.compile(r'\.(sh|py|js|cjs|mjs|ts|tsx|rb|php|dart)$', re.IGNORECASE)
+
+def _hook_command_basename(command):
+    base = re.split(r'[\\/]', (command or '').strip())[-1]
+    return re.sub(r'\.(exe|cmd|bat|com)$', '', base.lower())
+
+
+def _hook_looks_like_path(value):
+    v = (value or '').strip().strip('"\'')
+    if v.startswith(('http://', 'https://', '@', 'git+')):
+        return False
+    # Require a script extension: matching any path-shaped arg would let a
+    # crafted runtime config (e.g. `python3 /etc/passwd`) read arbitrary files.
+    return bool(_HOOK_SCRIPT_EXT_RE.search(v))
+
+
+def _hook_runtime_entrypoint(runtime, args):
+    """The runtime's script entrypoint: the first positional argument. A flag
+    before it means we cannot tell an entrypoint from a module name or a value
+    the flag consumes (`python -m pkg app.py`), so nothing is read."""
+    for index, raw in enumerate(args):
+        if not isinstance(raw, str):
+            return None
+        token = raw.strip().strip('"\'')
+        if index == 0 and runtime in ('bun', 'deno', 'dart') and token == 'run':
+            continue
+        if token.startswith('-'):
+            return None
+        return token
+    return None
+
+
+def _hook_candidate_script(command, args):
+    """The local script this config runs: the entrypoint argument under a runtime,
+    or the command itself when it's a script file. None for packages/urls/binaries."""
+    base = _hook_command_basename(command or '')
+    if base in _HOOK_SCRIPT_RUNTIMES:
+        candidate = _hook_runtime_entrypoint(base, args or [])
+        if candidate and _hook_looks_like_path(candidate):
+            return candidate
+        return None
+    if command and _HOOK_SCRIPT_EXT_RE.search(base):
+        return command
+    return None
+
+
+_HOOK_MAX_SCRIPT_BYTES = 256 * 1024
+
+
+def _hook_script_path(command, args, cwd):
+    """Absolute, symlink-resolved path of the local script, or None. The extension
+    gate is re-applied to the resolved target so a `server.py` link pointing at a
+    secret can't smuggle a non-script through it."""
+    cand = _hook_candidate_script(command, args)
+    if not cand:
+        return None
+    path = os.path.expanduser(os.path.expandvars(cand.strip().strip('"\'')))
+    if '${' in path:  # an env var we couldn't expand -> can't resolve
+        return None
+    if not os.path.isabs(path) and cwd:
+        path = os.path.join(cwd, path)
+    try:
+        resolved = os.path.realpath(path)
+    except OSError as exc:
+        log_error("mcp script fingerprint: cannot resolve %s: %s"
+                  % (os.path.basename(path), type(exc).__name__), 'mcp_config')
+        return None
+    if not _HOOK_SCRIPT_EXT_RE.search(resolved):
+        log_error("mcp script fingerprint: %s resolves to a non-script target"
+                  % os.path.basename(path), 'mcp_config')
+        return None
+    if not os.path.isfile(resolved):
+        return None
+    return resolved
+
+
+def _hook_read_script_bytes(path):
+    """First _HOOK_MAX_SCRIPT_BYTES bytes of a regular file, else None."""
+    flags = (os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0)
+             | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+    with os.fdopen(os.open(path, flags), 'rb') as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            return None
+        return f.read(_HOOK_MAX_SCRIPT_BYTES)
+
+
+_HOOK_SCRIPT_SNAPSHOT = {}
+
+
+def _hook_script_snapshot(command, args, cwd):
+    """(sha256, base64 body) derived from one read, so the hash reported on the
+    policy call and the body the scan uploads can never describe different bytes.
+    Holds a single entry: the body is capped, but it is not free."""
+    path = _hook_script_path(command, args, cwd)
+    if not path:
+        return None
+    cached = _HOOK_SCRIPT_SNAPSHOT.get(path)
+    if cached:
+        return cached
+    try:
+        data = _hook_read_script_bytes(path)
+    except OSError as exc:
+        log_error("mcp script fingerprint: cannot read %s: %s"
+                  % (os.path.basename(path), type(exc).__name__), 'mcp_config')
+        return None
+    if data is None:
+        log_error("mcp script fingerprint: %s is not a regular file" % os.path.basename(path), 'mcp_config')
+        return None
+    snapshot = (hashlib.sha256(data).hexdigest(),
+                base64.b64encode(data).decode('ascii'))
+    _HOOK_SCRIPT_SNAPSHOT.clear()
+    _HOOK_SCRIPT_SNAPSHOT[path] = snapshot
+    return snapshot
+
+
+def _compute_script_hash(command, args, cwd):
+    """sha256 of the local script's contents, or None when it isn't a resolvable
+    local script. Matches what the backend recomputes from the uploaded body, so
+    the gateway's `script:<hash>` lookup lines up with the stored fingerprint.
+    Capped so all clients agree on the hash for large scripts."""
+    snapshot = _hook_script_snapshot(command, args, cwd)
+    return snapshot[0] if snapshot else None
+
+
+def _augment_script_hash(result, cwd):
+    """Add scriptHash to an MCP server config when it runs a local script, so the
+    gateway can fingerprint it as `script:<hash>`."""
+    if result and result.get('command'):
+        script_hash = _compute_script_hash(result.get('command'), result.get('args'), cwd)
+        if script_hash:
+            result['scriptHash'] = script_hash
+    return result
+
+
+def _read_script_body_b64(command, args, cwd):
+    """base64 of the local script's first _HOOK_MAX_SCRIPT_BYTES bytes (the scan
+    body), or None. The backend re-hashes these exact bytes, so this must read the
+    same prefix _compute_script_hash hashed."""
+    snapshot = _hook_script_snapshot(command, args, cwd)
+    return snapshot[1] if snapshot else None
+
+
 # KEEP IN SYNC: coding-discovery-tool mcp_tools_cache.py + all 5 hook copies — byte-identical, do not diverge.
 # Fingerprints key the local tool-hash cache; Redis tool scores are separately
 # keyed by tool content hash. Keep fingerprint output aligned with data/gateway.
@@ -3791,7 +3939,8 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         metadata['mcp_server'] = mcp_server
         metadata['mcp_tool'] = mcp_tool
         if mcp_server_config:
-            metadata['mcp_server_config'] = mcp_server_config
+            metadata['mcp_server_config'] = _augment_script_hash(
+                mcp_server_config, metadata.get('cwd'))
         _attach_tool_content_hash(metadata)
 
     approval_key = f"{canonical}:{command}"
@@ -3883,7 +4032,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         and api_response.get('unknown_mcp_server')
         and scan_config
     ):
-        _dispatch_mcp_server_scan(mcp_server, scan_config)
+        _dispatch_mcp_server_scan(mcp_server, scan_config, cwd=event.get('cwd'))
 
     if (
         api_response.get('decision') == 'deny'
@@ -4510,7 +4659,7 @@ def _extract_patch_target_path(args):
 
 
 def map_copilot_tool(name, args, result_content, shell_state=None, root_projects=None,
-                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None):
+                     mcp_servers=None, mcp_server_name=None, mcp_tool_name=None, cwd=None):
     """Map a Copilot tool call to a cursor-style tool_use entry.
 
     Returns None for internal and unsupported native tools.
@@ -4593,7 +4742,7 @@ def map_copilot_tool(name, args, result_content, shell_state=None, root_projects
             metadata = {
                 'mcp_server': mcp_server,
                 'mcp_tool': mcp_tool,
-                'mcp_server_config': mcp_server_config,
+                'mcp_server_config': _augment_script_hash(mcp_server_config, cwd),
             }
             _attach_tool_content_hash(metadata)
             if metadata.get('mcp_server_config'):
@@ -5213,7 +5362,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                                   shell_state=shell_state, root_projects=root_projects,
                                   mcp_servers=mcp_servers,
                                   mcp_server_name=call['mcp_server_name'],
-                                  mcp_tool_name=call['mcp_tool_name'])
+                                  mcp_tool_name=call['mcp_tool_name'],
+                                  cwd=cwd)
         # Advance the watermark for EVERY handled call, mapped or not: an internal tool
         # maps to None (nothing to send) but must still be recorded, else a turn of only
         # internal tools is reparsed on every later Stop and never records progress.
@@ -5399,7 +5549,7 @@ def _ensure_discovery_installer(
             )
             return False
         if installer_path == DISCOVERY_INSTALL_SH:
-            os.chmod(temporary_path, 0o755)
+            os.chmod(temporary_path, 0o700)
         os.replace(temporary_path, installer_path)
         return True
     finally:
@@ -5627,9 +5777,33 @@ def _dispatch_discovery() -> None:
         log_error(f"discovery gate failed: {e}", 'discovery_gate')
 
 
-def _dispatch_mcp_server_scan(server_name, server_config):
+def _mcp_scan_command(installer_path, server_name, backend_url):
+    if _is_windows():
+        return [
+            _windows_system32_path("WindowsPowerShell", "v1.0", "powershell.exe"),
+            "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(installer_path),
+            "-McpScan", "-McpServerName", server_name, "-Domain", backend_url,
+        ]
+    return ["bash", str(installer_path), "mcp-scan", "--name", server_name,
+            "--domain", backend_url]
+
+
+def _dispatch_mcp_server_scan(server_name, server_config, cwd=None):
     if not server_name or not isinstance(server_config, dict):
         return
+    try:
+        if server_config.get('command') and not server_config.get('script_content'):
+            # Hash and body from one snapshot: the backend re-hashes the body, so
+            # a file edited since the policy call must not split the two apart.
+            snapshot = _hook_script_snapshot(
+                server_config.get('command'), server_config.get('args'), cwd)
+            if snapshot:
+                server_config = {**server_config, 'scriptHash': snapshot[0],
+                                 'script_content': snapshot[1]}
+    except Exception as exc:
+        log_error("mcp scan dispatch: no script body for %s: %s"
+                  % (server_name, type(exc).__name__), 'mcp_server')
     try:
         unbound_config = {}
         try:
@@ -5657,12 +5831,10 @@ def _dispatch_mcp_server_scan(server_name, server_config):
             scan_cmd = [FROZEN_DISCOVERY_BIN, "mcp-scan", "--name", server_name,
                         "--domain", backend_url]
         else:
-            if not _ensure_discovery_installer():
+            installer_path, installer_url = _discovery_installer()
+            if not _ensure_discovery_installer(installer_path, installer_url):
                 return
-            scan_cmd = [
-                "bash", str(DISCOVERY_INSTALL_SH), "mcp-scan", "--name", server_name,
-                "--domain", backend_url,
-            ]
+            scan_cmd = _mcp_scan_command(installer_path, server_name, backend_url)
 
         popen_kwargs = {
             "stdout": subprocess.DEVNULL,
