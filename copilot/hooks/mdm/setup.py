@@ -1900,16 +1900,43 @@ def _strip_jsonc(text: str) -> str:
         lambda m: m.group(0) if m.group(0).startswith('"') else '', "".join(out))
 
 
-def _mask_jsonc_comments(text: str) -> str:
-    """`text` with comment bodies blanked, same length, so offsets still line up."""
-    if '/' not in text:
-        return text
+def _mask_to_top_level(text: str) -> str:
+    """`text` with comments and every nested level blanked, same length.
+
+    Only the root object's own keys survive the mask, so neither a commented-out copy
+    nor one nested inside another setting's value can absorb a write meant for the
+    top level. Offsets are preserved, so a match indexes straight back into `text`.
+    """
     chars = list(text)
-    for start, end, is_comment in _jsonc_spans(text):
-        if is_comment:
-            for k in range(start, end):
-                if chars[k] not in '\n\r':
-                    chars[k] = ' '
+    spans = {start: (end, is_comment) for start, end, is_comment in _jsonc_spans(text)}
+
+    # NUL, not a space: the key pattern ends in `\\s*`, which would otherwise run past a
+    # blanked value and land the match end after it instead of on it.
+    def blank(start, end):
+        for k in range(start, end):
+            if chars[k] not in '\n\r':
+                chars[k] = '\x00'
+
+    depth = index = 0
+    while index < len(text):
+        if index in spans:
+            end, is_comment = spans[index]
+            if is_comment or depth != 1:
+                blank(index, end)
+            index = end
+            continue
+        char = text[index]
+        if char in '{[':
+            depth += 1
+            if depth != 1:
+                blank(index, index + 1)
+        elif char in '}]':
+            if depth != 1:
+                blank(index, index + 1)
+            depth -= 1
+        elif depth != 1:
+            blank(index, index + 1)
+        index += 1
     return "".join(chars)
 
 
@@ -1961,7 +1988,7 @@ def _merge_settings_text(text: str, updates: Dict[str, Any]) -> Optional[str]:
             # would otherwise absorb the write and leave the real setting unset.
             # These setting names are application-scoped, so they only ever appear at
             # the top level; no nested block in a settings file declares them.
-            found = list(re.finditer(pattern, _mask_jsonc_comments(result)))
+            found = list(re.finditer(pattern, _mask_to_top_level(result)))
             if not found:
                 if value is not None:
                     missing[key] = value
@@ -1989,7 +2016,7 @@ def _merge_settings_text(text: str, updates: Dict[str, Any]) -> Optional[str]:
         return result
     # Masked for the same reason as the key search above: a leading block comment
     # containing a brace would otherwise put the entries, and the key, inside it.
-    brace = _mask_jsonc_comments(result).find('{')
+    brace = _mask_to_top_level(result).find('{')
     if brace < 0:
         return None
     entries = ",\n".join(
@@ -2028,6 +2055,8 @@ def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
             return False
 
     try:
+        # Windows keeps a check-to-write gap: no privilege drop applies there, so a local
+        # session swapping this directory for a junction mid-run gets a privileged write.
         settings_path.parent.mkdir(parents=True, exist_ok=True)
         backup = settings_path.with_suffix(".json.unbound-bak")
         if backup.is_symlink():

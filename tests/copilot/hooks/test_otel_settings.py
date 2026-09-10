@@ -485,3 +485,50 @@ class OtelSettingsSyncAndLegacyBackupTests(_OtelHelpers, unittest.TestCase):
             parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
             self.assertEqual(parsed["settingsSync.ignoredSettings"].count(
                 "github.copilot.chat.otel.headers"), 1)
+
+
+class OtelSettingsTopLevelOnlyTests(_OtelHelpers, unittest.TestCase):
+    NESTED = ('{"unbound.backup": {"github.copilot.chat.otel.headers": {"x-api-key": "OLDKEY"}},'
+              ' "editor.fontSize": 12}')
+
+    def test_a_nested_copy_of_a_key_does_not_absorb_the_write(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, self.NESTED)
+            self.assertTrue(self._configure(mod, name, "NEWKEY", home))
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["github.copilot.chat.otel.headers"], {"x-api-key": "NEWKEY"})
+            self.assertEqual(parsed["github.copilot.chat.otel.otlpEndpoint"],
+                             "https://api.getunbound.ai/otel")
+            self.assertEqual(parsed["unbound.backup"],
+                             {"github.copilot.chat.otel.headers": {"x-api-key": "OLDKEY"}})
+
+    def test_clear_leaves_a_nested_copy_alone(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, self.NESTED)
+            self._configure(mod, name, "NEWKEY", home)
+            self.assertEqual(self._clear(mod, name, home), "cleared")
+            text = settings.read_text(encoding="utf-8")
+            self.assertNotIn("NEWKEY", text)
+            parsed = mod._parse_jsonc_or_none(text)
+            self.assertEqual(parsed["unbound.backup"],
+                             {"github.copilot.chat.otel.headers": {"x-api-key": "OLDKEY"}})
+            self.assertEqual(parsed["editor.fontSize"], 12)
+
+    def test_a_string_value_naming_one_of_our_keys_is_left_alone(self):
+        original = json.dumps({"note": 'see "github.copilot.chat.otel.headers": x', "a": 1})
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, original)
+            self.assertTrue(self._configure(mod, name, "KEY", home))
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["note"], 'see "github.copilot.chat.otel.headers": x')
+            self.assertEqual(parsed["github.copilot.chat.otel.headers"], {"x-api-key": "KEY"})
+
+    def test_a_key_inside_a_language_block_is_not_touched(self):
+        original = ('{"[python]": {"github.copilot.chat.otel.enabled": false},'
+                    ' "editor.fontSize": 12}')
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, original)
+            self._configure(mod, name, "KEY", home)
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertTrue(parsed["github.copilot.chat.otel.enabled"])
+            self.assertFalse(parsed["[python]"]["github.copilot.chat.otel.enabled"])
