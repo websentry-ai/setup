@@ -8,6 +8,7 @@ stores Copilot keeps them in and ships one usage dict per exchange. Covers:
   - _backfill_collect_session / _backfill_slice_session (payload + boundary-aligned slicing)
 """
 
+import hashlib
 import json
 from datetime import datetime, timezone
 import os
@@ -321,6 +322,11 @@ class TestBackfillPayload(unittest.TestCase):
         ]
         with tempfile.TemporaryDirectory() as tmpdir:
             home = Path(tmpdir)
+            workspace = home / "workspace"
+            workspace.mkdir()
+            script_body = b"print('mcp')\n"
+            (workspace / "server.py").write_bytes(script_body)
+            entries[0]["cwd"] = str(workspace)
             hook_dir = home / ".copilot" / "hooks"
             hook_dir.mkdir(parents=True)
             source_hook = Path(__file__).resolve().parents[3] / "copilot" / "hooks" / "unbound.py"
@@ -329,7 +335,7 @@ class TestBackfillPayload(unittest.TestCase):
             )
             (home / ".copilot" / "mcp-config.json").write_text(json.dumps({
                 "mcpServers": {
-                    "github": {"command": "npx", "args": ["github-mcp-server"]},
+                    "github": {"command": "python", "args": ["server.py"]},
                 },
             }), encoding="utf-8")
             transcript = home / ".copilot" / "session-state" / SESSION / "events.jsonl"
@@ -346,8 +352,9 @@ class TestBackfillPayload(unittest.TestCase):
                 "server_name": "github",
                 "mcp_tool_name": "get_issue",
                 "mcp_server_config": {
-                    "command": "npx",
-                    "args": ["github-mcp-server"],
+                    "command": "python",
+                    "args": ["server.py"],
+                    "scriptHash": hashlib.sha256(script_body).hexdigest(),
                 },
             },
         })
