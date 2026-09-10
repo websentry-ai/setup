@@ -295,13 +295,16 @@ class OtelSettingsHostileInputTests(_OtelHelpers, unittest.TestCase):
             parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
             self.assertTrue(parsed["github.copilot.chat.otel.enabled"])
 
-    def test_clear_removes_the_backup_that_holds_the_key(self):
+    def test_clear_removes_the_backup(self):
         for name, mod in self._each():
             home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
             self._configure(mod, name, "SECRETKEY", home)
             self._configure(mod, name, "SECRETKEY", home)
             backup = settings.with_suffix(".json.unbound-bak")
-            self.assertIn("SECRETKEY", backup.read_text(encoding="utf-8"))
+            # Taken from the file as it was before the first write, so it holds the
+            # user's original settings and never a key of ours.
+            self.assertNotIn("SECRETKEY", backup.read_text(encoding="utf-8"))
+            self.assertIn("editor.fontSize", backup.read_text(encoding="utf-8"))
             self.assertEqual(self._clear(mod, name, home), "cleared")
             self.assertFalse(backup.exists())
 
@@ -389,3 +392,40 @@ class OtelSettingsCredentialHandlingTests(_OtelHelpers, unittest.TestCase):
             self.assertEqual(mod.vscode_user_dirs(home), [])
             self._configure(mod, name, "SECRETKEY", home)
             self.assertFalse((outside / "User" / "settings.json").exists())
+
+
+class OtelSettingsEndpointAndBackupTests(_OtelHelpers, unittest.TestCase):
+    def test_rotating_the_key_never_leaves_the_old_one_in_the_backup(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod, '{"editor.fontSize": 12}')
+            self._configure(mod, name, "OLDKEY", home)
+            self._configure(mod, name, "NEWKEY", home)
+            backup = settings.with_suffix(".json.unbound-bak")
+            text = backup.read_text(encoding="utf-8")
+            self.assertNotIn("OLDKEY", text)
+            self.assertNotIn("NEWKEY", text)
+            self.assertIn("NEWKEY", settings.read_text(encoding="utf-8"))
+
+    def test_a_plaintext_gateway_never_receives_the_key(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod)
+            self.assertFalse(
+                self._configure(mod, name, "SECRETKEY", home, gateway="http://internal-gw.local"))
+            self.assertFalse(settings.exists())
+
+    def test_a_bare_host_is_treated_as_https_and_still_configured(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod)
+            self.assertTrue(self._configure(mod, name, "KEY", home, gateway="internal-gw.local"))
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["github.copilot.chat.otel.otlpEndpoint"],
+                             "https://internal-gw.local/otel")
+
+    def test_a_loopback_collector_is_allowed_for_local_testing(self):
+        for name, mod in self._each():
+            home, settings = self._home_with(mod)
+            self.assertTrue(
+                self._configure(mod, name, "KEY", home, gateway="http://localhost:4318"))
+            parsed = mod._parse_jsonc_or_none(settings.read_text(encoding="utf-8"))
+            self.assertEqual(parsed["github.copilot.chat.otel.otlpEndpoint"],
+                             "http://localhost:4318/otel")

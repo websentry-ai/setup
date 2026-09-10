@@ -644,10 +644,13 @@ def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
 
     try:
         settings_path.parent.mkdir(parents=True, exist_ok=True)
-        if original:
-            backup = settings_path.with_suffix(".json.unbound-bak")
-            if backup.is_symlink():
-                backup.unlink()
+        backup = settings_path.with_suffix(".json.unbound-bak")
+        if backup.is_symlink():
+            backup.unlink()
+        # Taken once, from the file as it was before we ever wrote to it. Refreshing it
+        # on every run would capture the previous API key on a rotation and leave it on
+        # disk. clear_otel_export removes it, so a later install takes a fresh one.
+        if original and not backup.exists():
             shutil.copy2(settings_path, backup)
             if os.name == "posix":
                 os.chmod(backup, 0o600)
@@ -705,6 +708,15 @@ def _parse_jsonc_or_none(text: str):
         return None
 
 
+def _is_secure_endpoint(url: str) -> bool:
+    """https, or a loopback collector, which is how a local OTLP setup is tested."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and (parsed.hostname or "").lower() in (
+        "localhost", "127.0.0.1", "::1")
+
+
 def configure_otel_export(api_key: str, gateway_url: str = DEFAULT_GATEWAY_URL,
                           home: Optional[Path] = None) -> bool:
     """Point Copilot Chat's OTLP exporter at the gateway.
@@ -712,10 +724,16 @@ def configure_otel_export(api_key: str, gateway_url: str = DEFAULT_GATEWAY_URL,
     The endpoint is a base: the exporter appends /v1/traces itself. A window
     reload is required, since these are read once at extension activation.
     """
+    endpoint = f"{normalize_url(gateway_url).rstrip('/')}/otel"
+    if not _is_secure_endpoint(endpoint):
+        # The key travels on every turn as a header; a plaintext endpoint would put it
+        # on the wire each time.
+        print(f"⚠️  Gateway URL is not https ({endpoint}); skipping Copilot telemetry export")
+        return False
     updates = {
         "github.copilot.chat.otel.enabled": True,
         "github.copilot.chat.otel.exporterType": "otlp-http",
-        "github.copilot.chat.otel.otlpEndpoint": f"{normalize_url(gateway_url).rstrip('/')}/otel",
+        "github.copilot.chat.otel.otlpEndpoint": endpoint,
         "github.copilot.chat.otel.headers": {"x-api-key": api_key},
         "github.copilot.chat.otel.captureContent": False,
     }
