@@ -467,6 +467,32 @@ class TestLocalScriptFingerprint(_HomeTmp):
         })
         self.assertNotIn("scriptHash", self._forwarded_config())
 
+    def test_only_the_called_server_has_its_script_read(self):
+        other = self.home / "other" / "server.py"
+        other.parent.mkdir(parents=True, exist_ok=True)
+        other.write_bytes(b"# unrelated\n")
+        settings = self.home / ".augment" / "settings.json"
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({"mcpServers": {
+            "context": {"command": "node", "args": [str(self.script)]},
+            "other": {"command": "python3", "args": [str(other)]},
+        }}))
+        real = unbound._compute_script_hash
+        with patch.object(unbound, "_compute_script_hash", side_effect=real) as spy:
+            config = self._forwarded_config()
+        self.assertEqual(config.get("scriptHash"), self.sha)
+        read = [c.args[1] for c in spy.call_args_list]
+        self.assertEqual(read, [[str(self.script)]])
+
+    def test_reading_the_config_list_reads_no_scripts(self):
+        self._write_cli_settings(
+            self.home, {"command": "node", "args": [str(self.script)]})
+        with patch.object(unbound, "_compute_script_hash") as spy:
+            servers = unbound.read_augment_mcp_servers({})
+        self.assertIn("context", servers)
+        self.assertNotIn("scriptHash", servers["context"])
+        spy.assert_not_called()
+
     def test_script_symlink_to_a_non_script_is_not_hashed(self):
         secret = self.home / "credentials"
         secret.write_bytes(b"aws_secret_access_key = 1\n")

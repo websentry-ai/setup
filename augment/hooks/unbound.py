@@ -2132,7 +2132,8 @@ def _redact_args(args):
 
 
 def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None,
-                         cwd: Optional[str] = None) -> Optional[Dict]:
+                         cwd: Optional[str] = None,
+                         hash_script: bool = True) -> Optional[Dict]:
     """Normalize a config entry from any surface to {command, args, url, type}
     (fingerprint-relevant fields only, secrets redacted). Handles VS Code's single
     command string. env/headers are intentionally never read or forwarded."""
@@ -2162,10 +2163,11 @@ def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None,
     if 'args' not in out and isinstance(extra, str) and extra.strip():
         args = extra.split()
         out['args'] = _redact_args(args)
-    script_hash = _compute_script_hash(
-        out.get('command'), args if isinstance(args, list) else None, cwd)
-    if script_hash:
-        out['scriptHash'] = script_hash
+    if hash_script:
+        script_hash = _compute_script_hash(
+            out.get('command'), args if isinstance(args, list) else None, cwd)
+        if script_hash:
+            out['scriptHash'] = script_hash
     fingerprint = compute_mcp_cache_key(
         name=name,
         command=out.get('command'),
@@ -2179,9 +2181,10 @@ def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None,
     return out or None
 
 
-def read_augment_mcp_servers(event: Dict) -> Dict:
+def read_augment_mcp_servers(event: Dict, script_server: Optional[str] = None) -> Dict:
     """Aggregate MCP servers across all Augment surfaces into {name -> config}.
-    First definition of a name wins; never raises (fail-open)."""
+    First definition of a name wins; never raises (fail-open). Only
+    `script_server` has its local script read and hashed."""
     servers = {}
     cwd = event.get('cwd')
     for path, fmt in _augment_mcp_config_sources(event):
@@ -2197,7 +2200,9 @@ def read_augment_mcp_servers(event: Dict) -> Dict:
             for name, entry in entries:
                 if name:
                     servers.setdefault(
-                        name, _normalize_mcp_entry(entry, name=name, cwd=cwd) or {})
+                        name, _normalize_mcp_entry(
+                            entry, name=name, cwd=cwd,
+                            hash_script=(name == script_server)) or {})
         except Exception as exc:
             log_error(f"augment mcp config read failed {path}: {exc}", 'mcp_config')
             continue
@@ -2612,19 +2617,20 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
         # surface populates it (the VS Code extension sends null). Prefer it; else
         # recover the real server + tool by matching the raw tool_name's server
         # suffix against Augment's own MCP config across CLI/VS Code.
-        servers = read_augment_mcp_servers(event)
         mcp_server_name = mcp_tool_name = ''
         mcp_cfg = None
         mcp_metadata = event.get('mcp_metadata')
         if isinstance(mcp_metadata, dict):
             mcp_server_name = (mcp_metadata.get('mcpExecutedToolServerName') or '').strip()
             mcp_tool_name = (mcp_metadata.get('mcpExecutedToolName') or '').strip()
-        if mcp_server_name:
-            mcp_cfg = servers.get(mcp_server_name)
-        else:
-            r_server, r_tool, mcp_cfg = resolve_augment_mcp(tool_name, servers)
+        if not mcp_server_name:
+            r_server, r_tool, _ = resolve_augment_mcp(
+                tool_name, read_augment_mcp_servers(event))
             if r_server:
                 mcp_server_name, mcp_tool_name = r_server, r_tool
+        if mcp_server_name:
+            mcp_cfg = read_augment_mcp_servers(
+                event, script_server=mcp_server_name).get(mcp_server_name)
         if mcp_server_name:
             metadata['mcp_server'] = mcp_server_name
             metadata['mcp_tool'] = mcp_tool_name
@@ -3773,7 +3779,7 @@ def _ensure_discovery_installer(installer_path: Path, installer_url: str,
     )
     if r.returncode == 0:
         if not _is_windows():
-            os.chmod(tmp, 0o755)
+            os.chmod(tmp, 0o700)
         os.replace(tmp, installer_path)
         return True
     tmp.unlink(missing_ok=True)
