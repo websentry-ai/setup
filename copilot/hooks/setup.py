@@ -5,6 +5,7 @@ import sys
 import platform
 import re
 import shutil
+import tempfile
 import subprocess
 import urllib.parse
 import time
@@ -542,8 +543,19 @@ def vscode_user_dirs(home: Optional[Path] = None) -> List[Path]:
         base = home / "Library" / "Application Support"
     else:
         base = home / ".config"
-    dirs = [base / "Code" / "User", base / "Code - Insiders" / "User"]
-    return [d for d in dirs if d.is_dir()]
+    kept = []
+    for directory in (base / "Code" / "User", base / "Code - Insiders" / "User"):
+        if not directory.is_dir():
+            continue
+        try:
+            # Resolved: a junction or symlink on the directory itself satisfies is_dir(),
+            # and the MDM path writes these elevated on Windows, where the privilege drop
+            # in _run_as_user does not apply.
+            if home.resolve(strict=False) in directory.resolve(strict=False).parents:
+                kept.append(directory)
+        except OSError:
+            continue
+    return kept
 
 
 def _merge_settings_text(text: str, updates: Dict[str, Any]) -> Optional[str]:
@@ -558,31 +570,35 @@ def _merge_settings_text(text: str, updates: Dict[str, Any]) -> Optional[str]:
     result = text
     missing = {}
     for key, value in updates.items():
-        # Masked copy, equal length: a commented-out copy of one of these keys
-        # would otherwise absorb the write and leave the real setting unset.
-        scan = _mask_jsonc_comments(result)
-        # These setting names are application-scoped, so they only ever appear at
-        # the top level; no nested block in a settings file declares them.
-        # Last occurrence: a duplicated key resolves last-wins in every JSON parser,
-        # so editing the first one leaves the effective value untouched.
-        found = list(re.finditer(r'"' + re.escape(key) + r'"\s*:\s*', scan))
-        match = found[-1] if found else None
-        if not match:
-            if value is not None:
-                missing[key] = value
-            continue
-        try:
-            _, end = decoder.raw_decode(result, match.end())
-        except ValueError:
-            return None
-        if value is None:
-            tail = result[end:]
-            gap = len(tail) - len(tail.lstrip())
-            if tail[gap:gap + 1] == ',':
-                end += gap + 1
-            result = result[:match.start()] + result[end:]
-        else:
+        pattern = r'"' + re.escape(key) + r'"\s*:\s*'
+        while True:
+            # Masked copy, equal length: a commented-out copy of one of these keys
+            # would otherwise absorb the write and leave the real setting unset.
+            # These setting names are application-scoped, so they only ever appear at
+            # the top level; no nested block in a settings file declares them.
+            found = list(re.finditer(pattern, _mask_jsonc_comments(result)))
+            if not found:
+                if value is not None:
+                    missing[key] = value
+                break
+            # Last occurrence: a duplicated key resolves last-wins in every JSON parser,
+            # so editing the first one leaves the effective value untouched.
+            match = found[-1]
+            try:
+                _, end = decoder.raw_decode(result, match.end())
+            except ValueError:
+                return None
+            if value is None:
+                tail = result[end:]
+                gap = len(tail) - len(tail.lstrip())
+                if tail[gap:gap + 1] == ',':
+                    end += gap + 1
+                result = result[:match.start()] + result[end:]
+                # Keep going: a duplicate left behind becomes the effective value again,
+                # so a file reported as cleared could still hold the key.
+                continue
             result = result[:match.end()] + json.dumps(value) + result[end:]
+            break
 
     if not missing:
         return result
@@ -627,18 +643,31 @@ def _write_settings(settings_path: Path, updates: Dict[str, Any]) -> bool:
             return False
 
     try:
-        existed = settings_path.exists()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
         if original:
             backup = settings_path.with_suffix(".json.unbound-bak")
             if backup.is_symlink():
                 backup.unlink()
             shutil.copy2(settings_path, backup)
-        settings_path.parent.mkdir(parents=True, exist_ok=True)
-        settings_path.write_text(merged, encoding="utf-8")
-        if not existed and os.name == "posix":
-            # This file carries the API key, so a file we created is owner-only; one
-            # the editor created keeps whatever mode the editor chose.
-            os.chmod(settings_path, 0o600)
+            if os.name == "posix":
+                os.chmod(backup, 0o600)
+        # Staged beside the target and renamed over it: a direct write truncates first,
+        # so an interrupted one would leave the user with no settings at all.
+        handle_fd, staged = tempfile.mkstemp(dir=str(settings_path.parent),
+                                             prefix=".unbound-", suffix=".json")
+        try:
+            with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+                handle.write(merged)
+            if os.name == "posix":
+                # Owner-only whether or not the file existed: it now carries the API key.
+                os.chmod(staged, 0o600)
+            os.replace(staged, settings_path)
+        except BaseException:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+            raise
         return True
     except OSError as e:
         print(f"⚠️  Could not write {settings_path}: {e}")
