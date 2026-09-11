@@ -3,7 +3,10 @@
 import os
 import sys
 import platform
+import re
 import shutil
+import stat
+import tempfile
 import subprocess
 import urllib.parse
 import time
@@ -423,7 +426,6 @@ def configure_copilot_hooks() -> bool:
         return False
 
 
-
 def _clear_path(path: Path, label: str) -> str:
     if not path.exists():
         return "not_found"
@@ -434,6 +436,326 @@ def _clear_path(path: Path, label: str) -> str:
     except Exception as e:
         print(f"Failed to clear {label}: {e}")
         return "failed"
+
+
+# ── Copilot OTLP export ──────────────────────────────────────────────────────
+# Copilot Chat reports each turn's model and token counts over OpenTelemetry.
+# Pointing its exporter at the gateway is what makes Copilot cost and usage
+# accurate; without it we only have what the hook can read off disk after the
+# turn, which the tool writes seconds late.
+
+# `headers` is the only way this surface can carry a credential: the extension
+# applies it directly to the exporter rather than through the environment, and
+# OTEL_EXPORTER_OTLP_HEADERS is both generic to every exporter on the machine
+# and invisible to an editor launched from the Dock.
+OTEL_SETTING_KEYS = (
+    "github.copilot.chat.otel.enabled",
+    "github.copilot.chat.otel.exporterType",
+    "github.copilot.chat.otel.otlpEndpoint",
+    "github.copilot.chat.otel.headers",
+    "github.copilot.chat.otel.captureContent",
+)
+
+_JSONC_TRAILING_COMMA_RE = re.compile(
+    r'"(?:\\.|[^"\\])*"'   # string literal (preserved)
+    r'|,(?=\s*[}\]])',     # trailing comma (dropped; brace left via lookahead)
+    re.DOTALL,
+)
+
+
+def _jsonc_spans(text: str):
+    """(start, end, is_comment) for every string literal and comment, in order.
+
+    Scanned rather than matched: a regex for block comments backtracks badly on a
+    run of unterminated `/*`, which is reachable from any user's settings file.
+    """
+    spans = []
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == '\\':
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            else:
+                j = n
+            spans.append((i, min(j, n), False))
+            i = min(j, n)
+        elif c == '/' and i + 1 < n and text[i + 1] == '/':
+            j = i + 2
+            while j < n and text[j] not in '\n\r':
+                j += 1
+            spans.append((i, j, True))
+            i = j
+        elif c == '/' and i + 1 < n and text[i + 1] == '*':
+            j = text.find('*/', i + 2)
+            j = n if j < 0 else j + 2
+            spans.append((i, j, True))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def _strip_jsonc(text: str) -> str:
+    """VS Code settings are JSONC: comments and trailing commas are legal there."""
+    out, prev = [], 0
+    for start, end, is_comment in _jsonc_spans(text):
+        if is_comment:
+            out.append(text[prev:start])
+            prev = end
+    out.append(text[prev:])
+    return _JSONC_TRAILING_COMMA_RE.sub(
+        lambda m: m.group(0) if m.group(0).startswith('"') else '', "".join(out))
+
+
+def _within_home(directory: Path, home: Path) -> bool:
+    """True when `directory` still resolves inside `home`, junctions followed."""
+    try:
+        return home.resolve(strict=False) in directory.resolve(strict=False).parents
+    except OSError:
+        return False
+
+
+def vscode_user_dirs(home: Optional[Path] = None) -> List[Path]:
+    """Existing VS Code user-settings directories for `home`.
+
+    Only ones that exist: these settings are application-scoped, so creating a
+    directory for an editor that is not installed just leaves dead config behind.
+    """
+    home = home or Path.home()
+    system = platform.system()
+    if system == "Windows":
+        base = home / "AppData" / "Roaming"
+    elif system == "Darwin":
+        base = home / "Library" / "Application Support"
+    else:
+        base = home / ".config"
+    # Checked here and again immediately before the rename: a junction or symlink on the
+    # directory satisfies is_dir(), and on Windows the elevated MDM run has no privilege
+    # drop, so discovery alone cannot bind the write that happens later.
+    return [d for d in (base / "Code" / "User", base / "Code - Insiders" / "User")
+            if d.is_dir() and _within_home(d, home)]
+
+
+def _write_settings(settings_path: Path, updates: Dict[str, Any], home: Path) -> bool:
+    """Apply `updates` to one settings.json. A value of None removes the key.
+
+    Rewritten from the parsed document, so comments and layout in the file do not
+    survive. Accepted: this is config the installer owns, and a dict also makes a
+    duplicate or nested copy of one of these keys impossible to confuse for ours.
+    """
+    if settings_path.is_symlink():
+        # Never write through a link: the MDM and binary paths reach every user's
+        # home, and Windows grants no privilege drop to make that safe.
+        print(f"⚠️  {settings_path} is a symlink; leaving it alone")
+        return False
+
+    current: Dict[str, Any] = {}
+    if settings_path.exists():
+        text = _read_settings_text(settings_path)
+        if text is None:
+            print(f"⚠️  Could not read {settings_path}; leaving it alone")
+            return False
+        if text.strip():
+            parsed = _parse_jsonc_or_none(text)
+            if not isinstance(parsed, dict):
+                print(f"⚠️  {settings_path} is not a JSON object; leaving it alone")
+                return False
+            current = parsed
+
+    for key, value in updates.items():
+        if value is None:
+            current.pop(key, None)
+        else:
+            current[key] = value
+    merged = json.dumps(current, indent=2)
+
+    try:
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        # Staged beside the target and renamed over it: a direct write truncates first,
+        # so an interrupted one would leave the user with no settings at all.
+        handle_fd, staged = tempfile.mkstemp(dir=str(settings_path.parent),
+                                             prefix=".unbound-", suffix=".json")
+        try:
+            with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+                handle.write(merged)
+            if os.name == "posix":
+                # Owner-only whether or not the file existed: it now carries the API key.
+                os.chmod(staged, 0o600)
+            # Rechecked against the moment of the write, not of discovery: on Windows
+            # nothing drops privileges, so the directory could have become a junction.
+            if not _within_home(settings_path.parent, home):
+                raise OSError(f"{settings_path.parent} no longer resolves inside the home")
+            os.replace(staged, settings_path)
+        except BaseException:
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+            raise
+        return True
+    except OSError as e:
+        print(f"⚠️  Could not write {settings_path}: {e}")
+        return False
+
+
+# VS Code settings are a few KB; anything this large is not a settings file, and
+# the comment scanners should not be handed unbounded input from a user's home.
+MAX_SETTINGS_BYTES = 1024 * 1024
+
+
+def _read_settings_text(path: Path) -> Optional[str]:
+    """Settings text, or None if it cannot be read as text.
+
+    Opened by descriptor, not by path: a FIFO reports size 0, so a stat-first cap never
+    fires and the read blocks the install for every later profile. O_NOFOLLOW keeps a
+    symlinked leaf from redirecting the read, and utf-8-sig accepts the BOM VS Code
+    writes, while UnicodeDecodeError is a ValueError an OSError-only guard would miss.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        handle_fd = os.open(str(path), flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(handle_fd).st_mode):
+            print(f"⚠️  {path} is not a regular file; leaving it alone")
+            return None
+        chunks = []
+        remaining = MAX_SETTINGS_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(handle_fd, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        data = b"".join(chunks)
+        if len(data) > MAX_SETTINGS_BYTES:
+            print(f"⚠️  {path} is too large to merge; leaving it alone")
+            return None
+        return data.decode("utf-8-sig")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    finally:
+        os.close(handle_fd)
+
+
+def _parse_jsonc_or_none(text: str):
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    try:
+        return json.loads(_strip_jsonc(text))
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+SYNC_IGNORE_KEY = "settingsSync.ignoredSettings"
+OTEL_HEADERS_KEY = "github.copilot.chat.otel.headers"
+
+
+def _sync_ignore_list(settings_path: Path, add: bool):
+    """settingsSync.ignoredSettings with our header entry added or removed.
+
+    Settings Sync uploads user settings by default, so without this the key leaves the
+    machine and a local 0600 stops meaning anything. Merged with whatever the user
+    already ignores; None when nothing is left, which is how VS Code clears it.
+    """
+    text = _read_settings_text(settings_path) if settings_path.exists() else None
+    current = _parse_jsonc_or_none(text) if text else None
+    existing = current.get(SYNC_IGNORE_KEY) if isinstance(current, dict) else None
+    items = [i for i in existing if isinstance(i, str)] if isinstance(existing, list) else []
+    if add:
+        return items if OTEL_HEADERS_KEY in items else items + [OTEL_HEADERS_KEY]
+    remaining = [i for i in items if i != OTEL_HEADERS_KEY]
+    return remaining or None
+
+
+def _is_secure_endpoint(url: str) -> bool:
+    """https, or a loopback collector, which is how a local OTLP setup is tested."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and (parsed.hostname or "").lower() in (
+        "localhost", "127.0.0.1", "::1")
+
+
+def configure_otel_export(api_key: str, gateway_url: str = DEFAULT_GATEWAY_URL,
+                          home: Optional[Path] = None) -> bool:
+    """Point Copilot Chat's OTLP exporter at the gateway.
+
+    The endpoint is a base: the exporter appends /v1/traces itself. A window
+    reload is required, since these are read once at extension activation.
+    """
+    endpoint = f"{normalize_url(gateway_url).rstrip('/')}/otel"
+    if not _is_secure_endpoint(endpoint):
+        # The key travels on every turn as a header; a plaintext endpoint would put it
+        # on the wire each time.
+        print(f"⚠️  Gateway URL is not https ({endpoint}); skipping Copilot telemetry export")
+        return False
+    updates = {
+        "github.copilot.chat.otel.enabled": True,
+        "github.copilot.chat.otel.exporterType": "otlp-http",
+        "github.copilot.chat.otel.otlpEndpoint": endpoint,
+        "github.copilot.chat.otel.headers": {"x-api-key": api_key},
+        "github.copilot.chat.otel.captureContent": False,
+    }
+    home = home or Path.home()
+    dirs = vscode_user_dirs(home)
+    if not dirs:
+        debug_print("No VS Code user directory found; skipping OTLP settings")
+        return True
+    results = []
+    for directory in dirs:
+        settings_path = directory / "settings.json"
+        # Per file: each editor keeps its own ignore list and ours merges into it.
+        results.append(_write_settings(settings_path, dict(
+            updates, **{SYNC_IGNORE_KEY: _sync_ignore_list(settings_path, add=True)}), home))
+    # Listed, not a generator: all() short-circuits, and one unparsable
+    # settings file would leave every remaining editor unconfigured.
+    return all(results)
+
+
+def clear_otel_export(home: Optional[Path] = None) -> str:
+    """Remove only the keys configure_otel_export writes.
+
+    Returns "cleared", "not_found" or "failed", matching _clear_path, so a device
+    that never had these settings does not report having cleared them."""
+    home = home or Path.home()
+    found = failed = False
+    for directory in vscode_user_dirs(home):
+        settings_path = directory / "settings.json"
+        text = _read_settings_text(settings_path)
+        if text is None:
+            # Present but unreadable may still hold the key, so that is a failure
+            # to clear rather than an absence.
+            if settings_path.is_symlink() or settings_path.exists():
+                failed = True
+            continue
+        current = _parse_jsonc_or_none(text)
+        if not isinstance(current, dict):
+            continue
+        ignored = current.get(SYNC_IGNORE_KEY)
+        ours_ignored = isinstance(ignored, list) and OTEL_HEADERS_KEY in ignored
+        if not any(k in current for k in OTEL_SETTING_KEYS) and not ours_ignored:
+            continue
+        updates = {key: None for key in OTEL_SETTING_KEYS}
+        # Only our entry leaves the ignore list; the user's own entries stay.
+        updates[SYNC_IGNORE_KEY] = _sync_ignore_list(settings_path, add=False)
+        found = True
+        if not _write_settings(settings_path, updates, home):
+            failed = True
+    if failed:
+        return "failed"
+    return "cleared" if found else "not_found"
 
 
 def clear_setup() -> bool:
@@ -461,6 +783,13 @@ def clear_setup() -> bool:
     if _r == "cleared":
         any_cleared = True
     elif _r == "failed":
+        any_failed = True
+
+    _r = clear_otel_export()
+    if _r == "cleared":
+        any_cleared = True
+    elif _r == "failed":
+        print("Failed to clear Copilot telemetry settings")
         any_failed = True
 
     if any_cleared:
@@ -1617,6 +1946,14 @@ def main():
         print("\n❌ Failed to configure Copilot hooks")
         return False
     debug_print("Copilot hooks configured")
+
+    # Never fatal: the hooks are the enforcement plane and must not be rolled back
+    # because an editor's settings file could not be merged.
+    debug_print("Configuring Copilot OTLP export...")
+    if configure_otel_export(api_key, gateway_url=gateway_url):
+        print("✅ Copilot telemetry export configured (reload VS Code to apply)")
+    else:
+        print("⚠️  Could not configure Copilot telemetry export; hooks still active")
 
     print("\n" + "=" * 60)
     print("Setup Complete!")
