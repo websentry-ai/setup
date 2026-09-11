@@ -1409,8 +1409,6 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'messages': [{'role': 'user', 'content': user_prompt},
                      {'role': 'assistant', 'content': assistant_prompt}],
         'turn_request_id': pending['turn_request_id'],
-        # Absent on a slot written before this keying; the server falls back to content.
-        'turn_id': pending.get('turn_id'),
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
     }
@@ -5163,7 +5161,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     already_forwarded = already_forwarded or set()
     already_prompted = already_prompted or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        return None, set(), None, set()
+        return None, set(), None, set(), None
 
     entries = []
     try:
@@ -5177,7 +5175,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 except json.JSONDecodeError:
                     continue
     except Exception:
-        return None, set(), None, set()
+        return None, set(), None, set(), None
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
     # VS Code at .../transcripts/<sessionId>.jsonl. Recover the id from the path
@@ -5223,7 +5221,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             turn_prompt_ids.add(message_id)
 
     if turn_start_index < 0:
-        return None, set(), None, set()
+        return None, set(), None, set(), None
 
     # One message, not one per prompt: the backend keeps only the last user message.
     user_prompt = '\n\n'.join(turn_prompts) or None
@@ -5382,7 +5380,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
-        return None, set(), None, set()
+        return None, set(), None, set(), None
 
     return {
         'conversation_id': conversation_id,
@@ -5392,9 +5390,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-        # What the request id is built from, sent so the server can recompute it.
-        'turn_id': turn_id,
-    }, forwarded_now, text_sig, turn_prompt_ids
+    }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
 def send_to_api(exchange, api_key):
@@ -5910,7 +5906,7 @@ def main():
             # consistent even when the Stop payload omits session_id.
             wm_key = stop_session_key(event)
             already_forwarded, last_text_sig, already_prompted, usage_index = get_forwarded_state(wm_key)
-            exchange, forwarded_now, text_sig, prompts_now = build_exchange_from_transcript(
+            exchange, forwarded_now, text_sig, prompts_now, turn_id = build_exchange_from_transcript(
                 event.get('transcript_path'), session_id,
                 session_start_model=get_session_start_model(session_id),
                 cwd=event.get('cwd'),
@@ -5965,7 +5961,7 @@ def main():
 
                 # The transcript's own id for the turn, so re-sending once the tokens
                 # land addresses the row the first send created.
-                turn_request_id = build_turn_request_id(session_id, exchange['turn_id'])
+                turn_request_id = build_turn_request_id(session_id, turn_id)
                 exchange['turn_request_id'] = turn_request_id
 
                 # Record only after the send succeeds, so a failed send retries next Stop
@@ -5986,7 +5982,6 @@ def main():
                     if incomplete and anchor:
                         pending_turns.append({
                             'turn_request_id': turn_request_id,
-                            'turn_id': exchange['turn_id'],
                             'conversation_id': exchange.get('conversation_id'),
                             'prompt_id': anchor,
                             'since': previous_stop,

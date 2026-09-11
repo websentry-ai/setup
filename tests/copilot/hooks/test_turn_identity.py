@@ -60,10 +60,9 @@ class TestTurnIdComesFromTheTranscript(unittest.TestCase):
 
     def _turn_id(self, entries, already_prompted=None):
         with tempfile.TemporaryDirectory() as tmpdir:
-            exchange = unbound.build_exchange_from_transcript(
+            return unbound.build_exchange_from_transcript(
                 str(_transcript(tmpdir, entries)), SESSION,
-                already_prompted=already_prompted)[0]
-        return exchange["turn_id"]
+                already_prompted=already_prompted)[4]
 
     def test_it_is_the_user_messages_own_id(self):
         self.assertEqual(self._turn_id([_user("hi", "u-42"), _assistant("hello")]), "u-42")
