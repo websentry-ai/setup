@@ -605,10 +605,10 @@ class TestReplayStopHasNothingToAttachUsageTo(unittest.TestCase):
     def test_a_replayed_stop_builds_no_exchange(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             transcript = self._transcript(tmpdir)
-            first, tools, sig, prompts = unbound.build_exchange_from_transcript(
+            first, tools, sig, prompts, _turn_id = unbound.build_exchange_from_transcript(
                 transcript, SESSION, cwd=tmpdir)
             self.assertIsNotNone(first)
-            replay, new_tools, _sig, _prompts = unbound.build_exchange_from_transcript(
+            replay, new_tools, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
                 transcript, SESSION, cwd=tmpdir,
                 already_forwarded=tools, already_prompted=prompts)
         # nothing new means nothing to send, so deferred usage cannot fabricate a row

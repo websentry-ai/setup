@@ -70,3 +70,26 @@ def test_a_scan_that_actually_fails_is_still_a_failure(monkeypatch, capsys):
 
     assert onboard.main() == 1
     assert "failure(s): Discovery" in capsys.readouterr().out
+
+
+def test_a_tool_that_does_not_declare_backfill_never_receives_the_flag():
+    """The flag was declared per tool and then never consulted, so --backfill reached
+    every installer including the ones that reject it."""
+    asked = ["--api-key", "K", "--backfill"]
+    assert onboard.tool_arguments(asked, True, False, False) == asked
+    assert onboard.tool_arguments(asked, False, False, False) == ["--api-key", "K"]
+
+
+def test_the_tool_table_holds_back_copilot_and_keeps_the_others():
+    supports = {name: flag for name, _url, flag, _skip in onboard.TOOLS}
+    assert supports["GitHub Copilot"] is False
+    assert supports["Claude Code"] is True
+    assert supports["Codex"] is True
+
+
+def test_skip_managed_settings_is_still_appended_only_where_declared():
+    """Same builder now decides both flags, so the other one has to keep working."""
+    base = ["--api-key", "K"]
+    assert onboard.tool_arguments(base, False, True, True) == base + ["--skip-managed-settings"]
+    assert onboard.tool_arguments(base, False, False, True) == base
+    assert onboard.tool_arguments(base, False, True, False) == base

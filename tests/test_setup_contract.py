@@ -290,3 +290,12 @@ def test_hook_script_hash_is_sha256_and_survives_a_missing_file(relpath, tmp_pat
     # A hash is never worth failing an install over.
     assert module.hook_script_hash(tmp_path / "gone.py") is None
     assert module.hook_script_hash(None) is None
+
+
+@pytest.mark.parametrize("relpath", [s for s in BACKFILLERS if "copilot" in s])
+def test_copilot_backfill_ships_disabled(relpath):
+    """Held back while a Copilot turn's request id moves from a hash of its text to the
+    transcript's own id: the two derive different ids, so a run would insert a second row
+    for every turn the installed hook already reported. Read from source, because the
+    loader turns it on for the tests that cover the machinery."""
+    assert "BACKFILL_ENABLED = False" in (REPO / relpath).read_text(), relpath
