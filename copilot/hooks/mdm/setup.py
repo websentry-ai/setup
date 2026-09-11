@@ -35,6 +35,11 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+# Off while a turn's request id moves from a hash of its text to the transcript's own id
+# for it. The two derive different ids for the same turn, so a run now inserts a second
+# row for every turn the installed hook already reported. Flip back to True once the
+# fleet is on the new hook.
+BACKFILL_ENABLED = False
 
 
 def normalize_url(value: str) -> str:
@@ -1689,6 +1694,9 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     MDM /get_application_api_key/ returns one per-device key and attribution is
     by device, so all profiles' history is seeded under that single key — the
     same model as install, which configures every user profile."""
+    if not BACKFILL_ENABLED:
+        debug_print("backfill is disabled for this tool — skipping")
+        return
     if os.environ.get('UNBOUND_BACKFILL_DISABLED') == '1':
         debug_print("UNBOUND_BACKFILL_DISABLED=1 — skipping backfill")
         return

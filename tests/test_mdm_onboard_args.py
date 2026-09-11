@@ -70,3 +70,14 @@ def test_a_scan_that_actually_fails_is_still_a_failure(monkeypatch, capsys):
 
     assert onboard.main() == 1
     assert "failure(s): Discovery" in capsys.readouterr().out
+
+
+def test_a_tool_that_does_not_declare_backfill_never_receives_the_flag():
+    """The per-tool flag was declared and then never consulted, so --backfill reached
+    every installer including the ones that do not want it."""
+    import inspect
+
+    supports = {name: flag for name, _url, flag, _skip in onboard.TOOLS}
+    assert supports["GitHub Copilot"] is False
+    assert supports["Claude Code"] is True
+    assert 'arg != "--backfill"' in inspect.getsource(onboard.main)

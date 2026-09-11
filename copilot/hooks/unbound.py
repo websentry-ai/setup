@@ -1206,7 +1206,7 @@ def get_forwarded_state(session_id):
 
 
 def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=None, usage_index=None,
-                             turn_digests=None, pending_turns=_UNSET):
+                             pending_turns=_UNSET):
     """Persist the forwarded toolCallIds + the last-sent text signature for this session as
     a SINGLE consolidated marker, rewritten (re-appended last) on each Stop. Keeping one
     cumulative marker -- rather than one append per Stop -- means it survives
@@ -1232,8 +1232,6 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
                 text_sig = ev.get('text_sig')  # carry forward the last known text sig
             if usage_index is None:
                 usage_index = ev.get('usage_request_index')
-            if turn_digests is None:
-                turn_digests = ev.get('turn_digests')
             if pending_turns is _UNSET:
                 pending_turns = ev.get('pending_turns')
             continue  # drop the old marker; a fresh consolidated one is appended below
@@ -1247,9 +1245,6 @@ def record_forwarded_tool_ids(session_id, tool_ids, text_sig=None, prompt_ids=No
             'forwarded_prompt_ids': sorted(merged_prompts),
             'text_sig': text_sig,
             'usage_request_index': usage_index if isinstance(usage_index, int) else 0,
-            # Digests of turns already sent, so a repeated prompt-and-reply gets its own
-            # occurrence rather than colliding with the earlier one.
-            'turn_digests': turn_digests if isinstance(turn_digests, list) else [],
             # Turns sent whose tokens or model had not landed yet. Each holds an id and
             # a window, never prompt text: the turn is rebuilt from the transcript.
             'pending_turns': (pending_turns if pending_turns is not _UNSET else []) or [],
@@ -1336,40 +1331,14 @@ def _transcript_path_for_session(event):
     return None
 
 
-def turn_content_digest(user_prompt, assistant_prompt):
-    """Digest of what both this hook and the server-side transcript parser can see of one
-    turn. NUL-joined so a prompt ending where the reply begins cannot forge another
-    turn's digest. KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service."""
-    return hashlib.sha256(
-        (user_prompt or '').encode('utf-8') + b'\x00' + (assistant_prompt or '').encode('utf-8')
-    ).hexdigest()
+def build_turn_request_id(session_id, turn_id):
+    """Stable id for one turn, keyed on the transcript's own id for its user message.
 
-
-def build_turn_request_id(session_id, digest, occurrence):
-    """Stable id for one turn, keyed on content rather than position.
-
-    Position is not usable: a turn that never reached the gateway is in the transcript
-    and not in our history, so counting turns would map one turn's tokens onto its
-    neighbour. Content is the same on both sides by construction. `occurrence` separates
-    turns whose prompt AND reply are byte-identical inside one session."""
+    Unique per request by construction, which a hash of the turn's text is not: a session
+    can hold two turns whose prompt AND reply are byte-identical.
+    KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service."""
     return str(uuid.uuid5(
-        uuid.NAMESPACE_OID,
-        'turn:copilot:%s:%s:%d' % (session_id, digest, occurrence),
-    ))
-
-
-def exchange_turn_content(exchange):
-    """(user prompt, assistant text) of an exchange, in the shape the digest is taken over."""
-    user_prompt = ''
-    assistant_prompt = ''
-    for message in (exchange or {}).get('messages') or []:
-        if not isinstance(message, dict):
-            continue
-        if message.get('role') == 'user':
-            user_prompt = message.get('content') or ''
-        elif message.get('role') == 'assistant':
-            assistant_prompt = message.get('content') or ''
-    return user_prompt, assistant_prompt
+        uuid.NAMESPACE_OID, 'turn:copilot:%s:%s' % (session_id, turn_id)))
 
 
 def get_session_marker(session_key):
@@ -1440,6 +1409,8 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'messages': [{'role': 'user', 'content': user_prompt},
                      {'role': 'assistant', 'content': assistant_prompt}],
         'turn_request_id': pending['turn_request_id'],
+        # Absent on a slot written before this keying; the server falls back to content.
+        'turn_id': pending.get('turn_id'),
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
     }
@@ -5421,6 +5392,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
+        # What the request id is built from, sent so the server can recompute it.
+        'turn_id': turn_id,
     }, forwarded_now, text_sig, turn_prompt_ids
 
 
@@ -5990,14 +5963,9 @@ def main():
                 if usage:
                     exchange['usage'] = usage
 
-                # Content, not position: the id has to survive being sent again once the
-                # tokens land, and a turn that never reached the gateway would shift every
-                # position after it.
-                marker = get_session_marker(wm_key)
-                digests = marker.get('turn_digests') or []
-                user_prompt, assistant_prompt = exchange_turn_content(exchange)
-                digest = turn_content_digest(user_prompt, assistant_prompt)
-                turn_request_id = build_turn_request_id(session_id, digest, digests.count(digest))
+                # The transcript's own id for the turn, so re-sending once the tokens
+                # land addresses the row the first send created.
+                turn_request_id = build_turn_request_id(session_id, exchange['turn_id'])
                 exchange['turn_request_id'] = turn_request_id
 
                 # Record only after the send succeeds, so a failed send retries next Stop
@@ -6018,18 +5986,17 @@ def main():
                     if incomplete and anchor:
                         pending_turns.append({
                             'turn_request_id': turn_request_id,
+                            'turn_id': exchange['turn_id'],
                             'conversation_id': exchange.get('conversation_id'),
                             'prompt_id': anchor,
                             'since': previous_stop,
                             'until': timestamp,
                         })
                     record_forwarded_tool_ids(wm_key, forwarded_now, text_sig, prompts_now,
-                                              usage_index, digests + [digest],
-                                              pending_turns[-MAX_PENDING_TURNS:])
+                                              usage_index, pending_turns[-MAX_PENDING_TURNS:])
             elif still_pending != was_pending:
                 # Nothing new this Stop, but some turns settled; drop just those.
-                record_forwarded_tool_ids(wm_key, set(), None, None, None, None,
-                                          still_pending)
+                record_forwarded_tool_ids(wm_key, set(), None, None, None, still_pending)
             cleanup_old_logs()
 
         # Output required by Copilot hooks

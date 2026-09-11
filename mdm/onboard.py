@@ -89,15 +89,15 @@ SUBPROCESS_TIMEOUT_SECONDS = 600
 DISCOVERY_TIMEOUT_SECONDS = 12000   # 200 min; kept in sync with the discovery --timeout
 DISCOVERY_KILL_GRACE_SECONDS = 120
 
-# (display_name, url, supports_backfill, supports_skip_managed_settings). Only
-# tools whose hook scripts accept `--backfill` get the flag appended; Cursor and
-# Augment have no historical transcript store and would just print "not
-# supported" and continue. `--skip-managed-settings` is Claude Code's alone.
+# (display_name, url, supports_backfill, supports_skip_managed_settings). Only tools
+# whose flag is True get `--backfill` appended. Cursor and Augment have no historical
+# transcript store; Copilot's is held back in its own installer's BACKFILL_ENABLED.
+# `--skip-managed-settings` is Claude Code's alone.
 TOOLS = [
     ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True,  True),
     ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False, False),
     ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True,  False),
-    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True,  False),
+    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     False, False),
     ("Augment",        f"{_RAW_SETUP}/augment/hooks/mdm/setup.py",     False, False),
 ]
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
@@ -548,9 +548,11 @@ def main() -> int:
 
     for name, url, supports_backfill, supports_skip_settings in TOOLS:
         print(f"\n{'=' * 60}\n[{name}] MDM setup\n{'=' * 60}\n")
-        # Pass through mdm_args as-is. Backfill is only enabled when the user
-        # explicitly passes --backfill (typically via PowerShell's -Backfill flag).
+        # Backfill only reaches a tool that both declares it and was asked for it: the
+        # operator passes --backfill (typically via PowerShell's -Backfill flag).
         tool_args = list(mdm_args)
+        if not supports_backfill:
+            tool_args = [arg for arg in tool_args if arg != "--backfill"]
         if skip_managed_settings and supports_skip_settings:
             tool_args.append("--skip-managed-settings")
         if not run_tool(name, url, tool_args):
