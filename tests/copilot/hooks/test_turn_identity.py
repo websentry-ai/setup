@@ -37,37 +37,52 @@ def _assistant(content):
 
 
 class TestTurnRequestId(unittest.TestCase):
-    def _id(self, user, assistant, occurrence=0, session=SESSION):
-        digest = unbound.turn_content_digest(user, assistant)
-        return unbound.build_turn_request_id(session, digest, occurrence)
+    def _id(self, turn_id, session=SESSION):
+        return unbound.build_turn_request_id(session, turn_id)
 
     def test_same_turn_gets_the_same_id(self):
         # The whole point: re-sending a turn once its tokens land must address the row
         # the first send created.
-        self.assertEqual(self._id("hi", "hello"), self._id("hi", "hello"))
-
-    def test_usage_is_not_part_of_the_id(self):
-        # The id is built from content alone, so tokens arriving later cannot change it.
-        first = self._id("hi", "hello")
-        self.assertEqual(first, self._id("hi", "hello"))
+        self.assertEqual(self._id("u1"), self._id("u1"))
 
     def test_different_turns_get_different_ids(self):
-        self.assertNotEqual(self._id("hi", "hello"), self._id("bye", "hello"))
-        self.assertNotEqual(self._id("hi", "hello"), self._id("hi", "goodbye"))
-
-    def test_a_repeated_turn_is_separated_by_occurrence(self):
-        self.assertNotEqual(self._id("hi", "hello", 0), self._id("hi", "hello", 1))
+        self.assertNotEqual(self._id("u1"), self._id("u2"))
 
     def test_sessions_do_not_collide(self):
-        self.assertNotEqual(self._id("hi", "hello"), self._id("hi", "hello", session="other"))
-
-    def test_a_prompt_cannot_forge_the_next_turns_digest(self):
-        # NUL-joined, so "ab" + "" and "a" + "b" stay distinct.
-        self.assertNotEqual(unbound.turn_content_digest("ab", ""),
-                            unbound.turn_content_digest("a", "b"))
+        self.assertNotEqual(self._id("u1"), self._id("u1", session="other"))
 
     def test_the_id_fits_the_request_id_column(self):
-        self.assertEqual(len(self._id("hi", "hello")), 36)
+        self.assertEqual(len(self._id("u1")), 36)
+
+
+class TestTurnIdComesFromTheTranscript(unittest.TestCase):
+    """Unique per request, and unchanged while the turn's reply is still growing."""
+
+    def _turn_id(self, entries, already_prompted=None):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            return unbound.build_exchange_from_transcript(
+                str(_transcript(tmpdir, entries)), SESSION,
+                already_prompted=already_prompted)[4]
+
+    def test_it_is_the_user_messages_own_id(self):
+        self.assertEqual(self._turn_id([_user("hi", "u-42"), _assistant("hello")]), "u-42")
+
+    def test_it_does_not_change_as_the_reply_grows(self):
+        # Usage and the served model land after the turn is reported, and the re-send has
+        # to carry the same id or it writes a second row.
+        first = self._turn_id([_user("hi", "u-42"), _assistant("one")])
+        self.assertEqual(first, self._turn_id(
+            [_user("hi", "u-42"), _assistant("one"), _assistant("two")]))
+
+    def test_two_turns_with_identical_text_do_not_collide(self):
+        # What a hash of the turn's content could not do.
+        entries = [_user("hi", "u-1"), _assistant("hello"),
+                   _user("hi", "u-2"), _assistant("hello")]
+        self.assertNotEqual(self._turn_id(entries),
+                            self._turn_id(entries, already_prompted={"u-1"}))
+
+    def test_an_entry_without_an_envelope_id_still_yields_one(self):
+        self.assertTrue(self._turn_id([_user("hi"), _assistant("hello")]))
 
 
 class TestRebuildTurnContent(unittest.TestCase):
