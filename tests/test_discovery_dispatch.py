@@ -335,18 +335,38 @@ def test_unreadable_config_without_env_does_not_dispatch(request, windows_hook, 
     assert calls == []
 
 
-def test_readable_config_wins_over_a_stale_env_var(request, windows_hook, monkeypatch):
-    """A stale personal-install env var must not outrank a readable config.json."""
+def test_readable_config_wins_when_there_is_no_machine_value(request, windows_hook, monkeypatch):
+    """A personal install writes HKCU, which _machine_env never reads, so the
+    file is the only source and must win."""
     hook, calls, _install_ps1 = windows_hook
-    tool = request.node.callspec.params["windows_hook"]
 
-    monkeypatch.setenv(TOOL_API_KEY_ENV[tool], "stale-personal-install-key")
-    monkeypatch.setenv("UNBOUND_BACKEND_URL", "https://stale.example")
+    monkeypatch.setattr(hook, "_machine_env", lambda name: None, raising=False)
 
     hook._dispatch_discovery()
 
     assert len(calls) == 1
     assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "test-key"
+    assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
+
+
+def test_machine_pair_wins_over_a_tampered_config_on_windows(request, windows_hook, monkeypatch):
+    """A managed user can write config.json; the admin-only HKLM pair must win."""
+    hook, calls, _install_ps1 = windows_hook
+
+    hook.UNBOUND_CONFIG_PATH.write_text(
+        json.dumps({"api_key": "tampered", "base_url": "https://attacker.example"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        hook, "_machine_env",
+        lambda name: "admin-key" if name.endswith("_API_KEY") else "https://backend.example",
+        raising=False,
+    )
+
+    hook._dispatch_discovery()
+
+    assert len(calls) == 1
+    assert calls[0][1]["env"]["UNBOUND_API_KEY"] == "admin-key"
     assert calls[0][1]["env"]["UNBOUND_DOMAIN"] == "https://backend.example"
 
 
@@ -419,3 +439,55 @@ def test_machine_env_uses_os_environ_on_posix(tool, monkeypatch):
     monkeypatch.setenv("UNBOUND_TEST_VAR", "posix-value")
 
     assert hook._machine_env("UNBOUND_TEST_VAR") == "posix-value"
+
+
+def _load(tool, tag):
+    spec = importlib.util.spec_from_file_location(
+        "%s_%s" % (tag, tool.replace("-", "_")), HOOKS[tool]
+    )
+    hook = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hook)
+    return hook
+
+
+def _write_config(tmp_path, key):
+    (tmp_path / ".unbound").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".unbound" / "config.json").write_text(
+        json.dumps({"api_key": key}), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_get_api_key_machine_value_beats_a_tampered_config_on_windows(tool, monkeypatch, tmp_path):
+    """A managed user can write ~/.unbound/config.json; HKLM must still win."""
+    hook = _load(tool, "getkey_win")
+    _write_config(tmp_path, "tampered-by-user")
+    monkeypatch.setattr(hook.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setattr(hook, "_machine_env", lambda name: "admin-provisioned", raising=False)
+
+    assert hook.get_api_key() == "admin-provisioned"
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_get_api_key_falls_back_to_config_when_no_machine_value(tool, monkeypatch, tmp_path):
+    """Personal Windows installs write HKCU + config.json, so HKLM is empty."""
+    hook = _load(tool, "getkey_personal")
+    _write_config(tmp_path, "personal-install-key")
+    monkeypatch.setattr(hook.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(hook, "_is_windows", lambda: True, raising=False)
+    monkeypatch.setattr(hook, "_machine_env", lambda name: None, raising=False)
+
+    assert hook.get_api_key() == "personal-install-key"
+
+
+@pytest.mark.parametrize("tool", sorted(HOOKS))
+def test_get_api_key_prefers_config_over_env_on_posix(tool, monkeypatch, tmp_path):
+    """No admin-only env scope on POSIX, so the freshest source (file) wins."""
+    hook = _load(tool, "getkey_posix")
+    _write_config(tmp_path, "file-key")
+    monkeypatch.setattr(hook.Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(hook, "_is_windows", lambda: False, raising=False)
+    monkeypatch.setattr(hook, "_machine_env", lambda name: "env-key", raising=False)
+
+    assert hook.get_api_key() == "file-key"
