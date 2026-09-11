@@ -508,6 +508,16 @@ def parse_args(argv: list) -> tuple:
     return api_key, discovery_key, mdm_args, backend_url, is_clear, skip_managed_settings
 
 
+def tool_arguments(mdm_args, supports_backfill, supports_skip_settings,
+                   skip_managed_settings):
+    """The arguments one tool's installer is called with. A tool that does not declare
+    backfill never receives the flag, whoever asked for it."""
+    args = [arg for arg in mdm_args if supports_backfill or arg != "--backfill"]
+    if skip_managed_settings and supports_skip_settings:
+        args.append("--skip-managed-settings")
+    return args
+
+
 def main() -> int:
     args = sys.argv[1:]
 
@@ -548,13 +558,8 @@ def main() -> int:
 
     for name, url, supports_backfill, supports_skip_settings in TOOLS:
         print(f"\n{'=' * 60}\n[{name}] MDM setup\n{'=' * 60}\n")
-        # Backfill only reaches a tool that both declares it and was asked for it: the
-        # operator passes --backfill (typically via PowerShell's -Backfill flag).
-        tool_args = list(mdm_args)
-        if not supports_backfill:
-            tool_args = [arg for arg in tool_args if arg != "--backfill"]
-        if skip_managed_settings and supports_skip_settings:
-            tool_args.append("--skip-managed-settings")
+        tool_args = tool_arguments(mdm_args, supports_backfill, supports_skip_settings,
+                                   skip_managed_settings)
         if not run_tool(name, url, tool_args):
             failures.append(name)
 

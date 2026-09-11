@@ -1336,7 +1336,8 @@ def build_turn_request_id(session_id, turn_id):
 
     Unique per request by construction, which a hash of the turn's text is not: a session
     can hold two turns whose prompt AND reply are byte-identical.
-    KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service."""
+    KEEP IN SYNC: ai-gateway-data coding_tools_backfill_service, which derives the same
+    id and must accept this keying before a device running it reports a turn."""
     return str(uuid.uuid5(
         uuid.NAMESPACE_OID, 'turn:copilot:%s:%s' % (session_id, turn_id)))
 
