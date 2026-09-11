@@ -64,6 +64,13 @@ AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
+MCP_DIAG_STAMP_DIR = LOG_DIR / "mcp-diag"
+MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
+MCP_DIAG_VERSION = "copilot-v1"
+MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
+# ~/.claude.json carries per-project history and can run to megabytes.
+MCP_DIAG_MAX_CONFIG_BYTES = 20 * 1024 * 1024
+
 # Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
 # binary must make ZERO network calls other than the backend/gateway APIs:
 # discovery runs from the locally installed binary instead of a GitHub-fetched
@@ -3337,6 +3344,10 @@ def _mcp_servers_from_config(config, allow_bare=False):
 
 
 def read_copilot_mcp_servers(cwd=None):
+    return _read_copilot_mcp_servers_with_sources(cwd)[0]
+
+
+def _read_copilot_mcp_servers_with_sources(cwd=None):
     servers = {}
     server_sources = {}
     ambiguous_names = set()
@@ -3444,7 +3455,7 @@ def read_copilot_mcp_servers(cwd=None):
         else:
             servers[name] = fields
             server_sources[name] = 'provider'
-    return servers
+    return servers, server_sources, ambiguous_names
 
 
 # Mirror Copilot's server-name sanitization for tool-name prefixes.
@@ -3890,6 +3901,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                     f"copilot mcp unresolved session={session_id} tool={raw_tool}",
                     'mcp_match',
                 )
+                _dispatch_mcp_diagnostic(raw_tool, event.get('cwd'), api_key)
         else:
             is_mcp = True
             canonical = f"mcp__{mcp_server}__{mcp_tool}"
@@ -5859,6 +5871,507 @@ def _dispatch_mcp_server_scan(server_name, server_config, cwd=None):
         log_error(f"mcp scan dispatch failed for {server_name}: {exc}", 'mcp_server')
 
 
+# ---------------------------------------------------------------------------
+# Unresolved-MCP diagnostic: when a VS Code `mcp_<server>_<tool>` call matches no
+# configured server, a detached child inventories every MCP config on disk (the
+# ones this hook reads AND the ones it doesn't) and uploads a text report to
+# /v1/hooks/mcp-diagnostics, which stores it and pings Slack on first sight.
+# ---------------------------------------------------------------------------
+
+def _mcp_diag_server_hint(raw_tool):
+    """Server token of `mcp_<server>_<tool>` up to the first '_' (VS Code keeps '-')."""
+    body = raw_tool[len('mcp_'):] if raw_tool.lower().startswith('mcp_') else raw_tool
+    return (body.split('_', 1)[0] or raw_tool)[:255]
+
+
+def _mcp_diag_summarize(entry):
+    """Compact, secret-free summary of one server config: no args, env or headers."""
+    if not isinstance(entry, dict):
+        return '<no config>'
+    bits = []
+    if entry.get('type'):
+        bits.append(str(entry['type'])[:20])
+    url = entry.get('url') or entry.get('serverUrl')
+    if isinstance(url, str) and url:
+        parsed = urlparse(url)
+        bits.append(('%s://%s%s' % (parsed.scheme, parsed.hostname or '', parsed.path))[:120])
+    command = entry.get('command')
+    if isinstance(command, str) and command:
+        bits.append('cmd=%s' % os.path.basename(command)[:60])
+    if isinstance(entry.get('args'), list) and entry['args']:
+        bits.append('args=%d' % len(entry['args']))
+    return ', '.join(bits) or '<empty>'
+
+
+def _mcp_diag_read_json(path):
+    """(status, parsed) for one JSON/JSONC file; never raises."""
+    try:
+        if not path.is_file():
+            return 'missing', None
+        if path.stat().st_size > MCP_DIAG_MAX_CONFIG_BYTES:
+            return 'too large', None
+        return 'ok', _parse_jsonc(path.read_text(encoding='utf-8'))
+    except Exception as exc:
+        return 'unreadable (%s)' % type(exc).__name__, None
+
+
+def _mcp_diag_config_servers(path, allow_bare=False):
+    status, config = _mcp_diag_read_json(path)
+    if status != 'ok':
+        return status, {}
+    raw = _mcp_servers_from_config(config, allow_bare=allow_bare) if isinstance(config, dict) else None
+    if not raw:
+        return 'no servers', {}
+    return 'ok', {str(name): _mcp_diag_summarize(entry) for name, entry in raw.items()}
+
+
+def _mcp_diag_hook_sources(cwd):
+    """Every source read_copilot_mcp_servers consults, file by file."""
+    rows = []
+    plugin_list = _plugin_mcp_config_paths()
+    plugin_paths = set(plugin_list)
+    workspace_paths = set(_workspace_mcp_config_paths(cwd))
+    for path in _copilot_mcp_config_paths(cwd, plugin_list):
+        allow_bare = path.name == '.mcp.json' or (
+            path.name == 'mcp.json' and path.parent.name == '.github'
+        )
+        kind = 'plugin' if path in plugin_paths else (
+            'workspace' if path in workspace_paths else 'user'
+        )
+        status, servers = _mcp_diag_config_servers(path, allow_bare)
+        rows.append({'source': kind, 'file': str(path), 'status': status, 'servers': servers})
+    try:
+        providers = _copilot_provider_servers_from_cache(_read_mcp_tools_cache())
+        rows.append({'source': 'validated-provider', 'file': 'mcp-tools-cache.json', 'status': 'ok',
+                     'servers': {n: _mcp_diag_summarize(c) for n, c in providers.items()}})
+    except Exception as exc:
+        rows.append({'source': 'validated-provider', 'file': 'mcp-tools-cache.json',
+                     'status': 'failed (%s)' % type(exc).__name__, 'servers': {}})
+    try:
+        cached = {n: _mcp_diag_summarize(f) for n, f in _vscode_cached_mcp_servers(cwd)}
+        rows.append({'source': 'provider', 'file': 'VS Code state.vscdb', 'status': 'ok', 'servers': cached})
+    except Exception as exc:
+        rows.append({'source': 'provider', 'file': 'VS Code state.vscdb',
+                     'status': 'failed (%s)' % type(exc).__name__, 'servers': {}})
+    return rows
+
+
+def _mcp_diag_claude_plugin_dirs(claude_dir):
+    dirs = {}
+    root = claude_dir / 'plugins'
+    _status, installed = _mcp_diag_read_json(root / 'installed_plugins.json')
+    if isinstance(installed, dict):
+        for full_name, entries in (installed.get('plugins') or {}).items():
+            for entry in (entries or []):
+                if isinstance(entry, dict) and entry.get('installPath'):
+                    dirs[Path(entry['installPath'])] = full_name
+    if dirs:
+        # The cache also keeps every superseded version; only the installed one is live.
+        return dirs
+    try:
+        for marketplace in (m for m in (root / 'cache').iterdir() if m.is_dir()):
+            for plugin in (p for p in marketplace.iterdir() if p.is_dir()):
+                for version in (v for v in plugin.iterdir() if v.is_dir()):
+                    dirs.setdefault(version, '%s@%s' % (plugin.name, marketplace.name))
+    except OSError:
+        pass
+    return dirs
+
+
+def _mcp_diag_unread_sources(cwd):
+    """MCP configs this hook never reads but VS Code may still load: other apps'
+    configs (VS Code can import them), Claude Code config + plugins, and
+    `.vscode/mcp.json` above the cwd."""
+    home = Path.home()
+    system = platform.system()
+    if system == 'Windows':
+        app_support = Path(os.environ.get('APPDATA') or home)
+    elif system == 'Darwin':
+        app_support = home / 'Library' / 'Application Support'
+    else:
+        app_support = home / '.config'
+    rows = []
+
+    def add(source, path, allow_bare=False):
+        status, servers = _mcp_diag_config_servers(path, allow_bare)
+        if status not in ('missing', 'no servers'):
+            rows.append({'source': source, 'file': str(path), 'status': status, 'servers': servers})
+
+    add('Claude Desktop', app_support / 'Claude' / 'claude_desktop_config.json')
+    add('Cursor', home / '.cursor' / 'mcp.json')
+    add('Windsurf', home / '.codeium' / 'windsurf' / 'mcp_config.json')
+    for editor in ('VSCodium', 'Code - OSS'):
+        add('%s user' % editor, app_support / editor / 'User' / 'mcp.json')
+
+    claude_dir = Path(os.environ.get('CLAUDE_CONFIG_DIR') or home / '.claude')
+    claude_json = home / '.claude.json'
+    status, data = _mcp_diag_read_json(claude_json)
+    if isinstance(data, dict):
+        top = data.get('mcpServers')
+        if isinstance(top, dict) and top:
+            rows.append({'source': 'Claude Code user', 'file': str(claude_json), 'status': 'ok',
+                         'servers': {n: _mcp_diag_summarize(e) for n, e in top.items()}})
+        for project, entry in (data.get('projects') or {}).items():
+            servers = entry.get('mcpServers') if isinstance(entry, dict) else None
+            if isinstance(servers, dict) and servers:
+                rows.append({'source': 'Claude Code project %s' % project, 'file': str(claude_json),
+                             'status': 'ok',
+                             'servers': {n: _mcp_diag_summarize(e) for n, e in servers.items()}})
+    elif status != 'missing':
+        rows.append({'source': 'Claude Code user', 'file': str(claude_json), 'status': status, 'servers': {}})
+
+    for plugin_dir, plugin_name in _mcp_diag_claude_plugin_dirs(claude_dir).items():
+        add('Claude Code plugin %s' % plugin_name, plugin_dir / '.mcp.json', allow_bare=True)
+        add('Claude Code plugin %s' % plugin_name, plugin_dir / '.claude-plugin' / 'plugin.json')
+
+    if cwd:
+        try:
+            start = Path(cwd).resolve()
+            for directory in start.parents:
+                add('.vscode above cwd', directory / '.vscode' / 'mcp.json')
+            for directory in [start] + list(start.parents):
+                add('Cursor workspace', directory / '.cursor' / 'mcp.json')
+        except OSError:
+            pass
+    return rows
+
+
+def _mcp_diag_matches(raw_tool, groups):
+    """Server names whose VS Code tool prefix (full or 13-char truncated) produces
+    raw_tool, and looser near-misses on the parsed server token."""
+    body = _vscode_sanitize(raw_tool[len('mcp_'):])
+    hint = _vscode_sanitize(_mcp_diag_server_hint(raw_tool))
+    exact, near = [], []
+    for group in groups:
+        for name, summary in (group.get('servers') or {}).items():
+            aliases = _vscode_server_aliases(name)
+            prefixes = aliases | {a[:_VSCODE_TRUNCATED_SERVER_LENGTH] for a in aliases}
+            row = {'name': name, 'source': group['source'], 'file': group['file'], 'cfg': summary}
+            if any(body.startswith(p + '_') for p in prefixes):
+                exact.append(row)
+            elif len(hint) >= 3 and any(hint in a or (len(a) >= 3 and a in hint) for a in aliases):
+                near.append(row)
+    return {'exact': exact, 'near': near}
+
+
+def _mcp_diag_vscode_server_logs(hint):
+    """VS Code's own record of the servers it started: one
+    `mcpServer.<collection>.<server>.log` per server per window, where the
+    collection says where the definition came from (e.g. mcp.config.usrlocal =
+    user mcp.json). Newest two log sessions per VS Code flavour; names only."""
+    rows = []
+    for user_dir in _vscode_user_dirs():
+        logs_root = user_dir.parent / 'logs'
+        try:
+            sessions = sorted((d for d in logs_root.iterdir() if d.is_dir()), key=lambda d: d.name)[-2:]
+        except OSError:
+            continue
+        for session in sessions:
+            try:
+                files = sorted(session.glob('window*/mcpServer.*.log'))
+            except OSError:
+                continue
+            for log_file in files:
+                name = log_file.name[len('mcpServer.'):-len('.log')]
+                mark = hint and hint in _vscode_sanitize(name)
+                rows.append('%s/%s/%s%s' % (
+                    user_dir.parent.name, session.name, name, '   <-- matches tool' if mark else ''))
+    return rows[-60:]
+
+
+def _mcp_diag_extension_providers():
+    """Installed VS Code extensions that contribute MCP servers (no config file:
+    VS Code asks the extension at runtime), plus the Copilot Chat version."""
+    rows = []
+    for ext_root in (Path.home() / '.vscode' / 'extensions',
+                     Path.home() / '.vscode-insiders' / 'extensions'):
+        try:
+            ext_dirs = sorted(d for d in ext_root.iterdir() if d.is_dir())
+        except OSError:
+            continue
+        for ext_dir in ext_dirs:
+            if ext_dir.name.startswith('github.copilot-chat-'):
+                rows.append('%s (Copilot Chat)' % ext_dir.name)
+            _status, manifest = _mcp_diag_read_json(ext_dir / 'package.json')
+            contributes = manifest.get('contributes') if isinstance(manifest, dict) else None
+            providers = contributes.get('mcpServerDefinitionProviders') if isinstance(contributes, dict) else None
+            if not isinstance(providers, list):
+                continue
+            labels = ', '.join(
+                '%s (%s)' % (p.get('label'), p.get('id')) for p in providers if isinstance(p, dict))
+            rows.append('%s: %s' % (ext_dir.name, labels))
+    return rows
+
+
+def _mcp_diag_copilot_cli_list():
+    """`copilot mcp list --json`: the Copilot CLI's own resolved view (user,
+    workspace, plugin, builtin), summarized without args/env/headers."""
+    binary = shutil.which('copilot')
+    if not binary:
+        return {'status': 'copilot CLI not on PATH', 'servers': {}}
+    try:
+        proc = subprocess.run([binary, 'mcp', 'list', '--json'], capture_output=True,
+                              text=True, timeout=30, stdin=subprocess.DEVNULL)
+        data = json.loads(proc.stdout or '{}')
+    except Exception as exc:
+        return {'status': 'failed (%s)' % type(exc).__name__, 'servers': {}}
+    servers = data.get('mcpServers') if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return {'status': 'unexpected output (exit %s)' % proc.returncode, 'servers': {}}
+    return {'status': 'ok', 'servers': {
+        name: '%s, source=%s%s' % (_mcp_diag_summarize(entry), entry.get('source'),
+                                  '' if entry.get('enabled', True) else ', DISABLED')
+        for name, entry in servers.items() if isinstance(entry, dict)
+    }}
+
+
+def _mcp_diag_vscode_settings():
+    """chat.mcp.* settings (e.g. discovery of other apps' servers) per VS Code user dir."""
+    out = {}
+    for user_dir in _vscode_user_dirs():
+        _status, settings = _mcp_diag_read_json(user_dir / 'settings.json')
+        if not isinstance(settings, dict):
+            continue
+        for key, value in settings.items():
+            if key.startswith('chat.mcp') and isinstance(value, (bool, int, str)):
+                out['%s: %s' % (user_dir.parent.name, key)] = str(value)[:80]
+            elif key.startswith('chat.mcp') and isinstance(value, dict):
+                out['%s: %s' % (user_dir.parent.name, key)] = json.dumps(value)[:200]
+    return out
+
+
+def _mcp_diag_error_log_tail():
+    try:
+        lines = ERROR_LOG.read_text(encoding='utf-8', errors='replace').splitlines()
+    except Exception:
+        return []
+    return [line[:300] for line in lines if 'mcp' in line.lower()][-15:]
+
+
+def _build_mcp_diagnostic(raw_tool, cwd):
+    servers, server_sources, ambiguous = _read_copilot_mcp_servers_with_sources(cwd)
+    resolved = resolve_copilot_mcp(raw_tool, servers)
+    hook_sources = _mcp_diag_hook_sources(cwd)
+    unread_sources = _mcp_diag_unread_sources(cwd)
+    copilot_cli = _mcp_diag_copilot_cli_list()
+    cli_group = {'source': 'copilot mcp list', 'file': 'copilot CLI', 'servers': copilot_cli['servers']}
+    hook_path = sys.executable if RUNNING_FROZEN else os.path.abspath(__file__)
+    hook_sha = ''
+    if not RUNNING_FROZEN:
+        try:
+            hook_sha = hashlib.sha256(Path(hook_path).read_bytes()).hexdigest()[:16]
+        except Exception:
+            pass
+    return {
+        'version': MCP_DIAG_VERSION,
+        'tool': raw_tool,
+        'server_hint': _mcp_diag_server_hint(raw_tool),
+        'cwd': cwd,
+        'home': str(Path.home()),
+        'platform': '%s %s' % (platform.system(), platform.release()),
+        'python': sys.version.split()[0],
+        'hook': '%s  (frozen=%s sha256 %s)' % (hook_path, RUNNING_FROZEN, hook_sha),
+        'term_program': os.environ.get('TERM_PROGRAM') or '',
+        'resolved': {
+            'server': resolved[0], 'tool': resolved[1],
+            'config': _mcp_diag_summarize(resolved[2]) if resolved[0] else None,
+        },
+        'known_servers': {
+            name: '%s%s' % (server_sources.get(name, '?'),
+                            ', AMBIGUOUS (config dropped)' if name in ambiguous else '')
+            for name in servers
+        },
+        'hook_sources': hook_sources,
+        'unread_sources': unread_sources,
+        'matches': _mcp_diag_matches(raw_tool, hook_sources + unread_sources + [cli_group]),
+        'vscode_server_logs': _mcp_diag_vscode_server_logs(
+            _vscode_sanitize(_mcp_diag_server_hint(raw_tool))),
+        'extension_providers': _mcp_diag_extension_providers(),
+        'copilot_cli': copilot_cli,
+        'vscode_settings': _mcp_diag_vscode_settings(),
+        'error_log_tail': _mcp_diag_error_log_tail(),
+    }
+
+
+def _render_mcp_diagnostic(d):
+    L = []
+
+    def head(title):
+        L.append('\n=== %s ===' % title)
+
+    def kv(key, value):
+        L.append('%-14s: %s' % (key, value))
+
+    def sources(rows):
+        for row in rows:
+            if row['status'] == 'missing':
+                L.append('  [missing] %s   (%s)' % (row['file'], row['source']))
+                continue
+            L.append('  %s   (%s, %s)' % (row['file'], row['source'], row['status']))
+            for name, summary in row['servers'].items():
+                L.append('      %-40s %s' % (name, summary))
+
+    L.append('unbound-mcp-diag %s   tool=%s   server_hint=%s' % (
+        d.get('version'), d.get('tool'), d.get('server_hint')))
+    head('environment')
+    for key in ('cwd', 'home', 'platform', 'python', 'hook', 'term_program'):
+        kv(key, d.get(key))
+
+    head('resolution replay')
+    kv('resolved', json.dumps(d.get('resolved')))
+    for name, source in (d.get('known_servers') or {}).items():
+        L.append('  %-40s %s' % (name, source))
+
+    head('servers VS Code actually started (logs/<session>/window*/mcpServer.<collection>.<server>.log)')
+    for row in d.get('vscode_server_logs') or ['<no VS Code MCP server logs>']:
+        L.append('  %s' % row)
+
+    head('where a server matching the tool appears')
+    matches = d.get('matches') or {}
+    for kind in ('exact', 'near'):
+        for row in matches.get(kind) or []:
+            L.append('  %-5s %s   in %s (%s)   [%s]' % (
+                kind, row['name'], row['source'], row['file'], row['cfg']))
+    if not matches.get('exact') and not matches.get('near'):
+        L.append('  <no matching server name in any source on disk>')
+
+    head('sources the hook reads')
+    sources(d.get('hook_sources') or [])
+
+    head('sources the hook does NOT read')
+    sources(d.get('unread_sources') or [])
+    if not d.get('unread_sources'):
+        L.append('  <none found>')
+
+    head('VS Code extensions providing MCP servers')
+    for row in d.get('extension_providers') or ['<none>']:
+        L.append('  %s' % row)
+
+    head('copilot mcp list --json')
+    cli = d.get('copilot_cli') or {}
+    kv('status', cli.get('status'))
+    for name, summary in (cli.get('servers') or {}).items():
+        L.append('  %-40s %s' % (name, summary))
+
+    head('VS Code chat.mcp settings')
+    for key, value in (d.get('vscode_settings') or {}).items():
+        kv(key, value)
+
+    head('hook error.log (mcp-related)')
+    for line in d.get('error_log_tail') or []:
+        L.append('  %s' % line)
+    return '\n'.join(str(x) for x in L)
+
+
+def _upload_mcp_diagnostic(payload, api_key):
+    try:
+        body = json.dumps({'diagnostic': payload, 'hook_source': 'copilot'})
+    except Exception as exc:
+        log_error('mcp diagnostic serialize failed: %s' % exc, 'mcp_server')
+        return
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ['curl', '-fsSL', '--max-time', '30', '-X', 'POST',
+             '-H', 'Authorization: Bearer %s' % api_key,
+             '-H', 'Content-Type: application/json',
+             '--data-binary', '@-',
+             '%s/v1/hooks/mcp-diagnostics' % UNBOUND_GATEWAY_URL],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc.communicate(body.encode(), timeout=35)
+        if proc.returncode:
+            log_error('mcp diagnostic upload: curl exit %s' % proc.returncode, 'mcp_server')
+    except Exception as exc:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+                proc.communicate()
+            except Exception:
+                pass
+        log_error('mcp diagnostic upload failed: %s' % exc, 'mcp_server')
+
+
+def _run_mcp_diagnostic_cli():
+    raw_tool = os.environ.get('UNBOUND_DIAG_TOOL') or ''
+    cwd = os.environ.get('UNBOUND_DIAG_CWD') or None
+    api_key = os.environ.get('UNBOUND_DIAG_API_KEY') or get_api_key()
+    if not raw_tool or not api_key:
+        return
+    try:
+        report = _render_mcp_diagnostic(_build_mcp_diagnostic(raw_tool, cwd))
+    except Exception as exc:
+        log_error('mcp diagnostic build failed: %s' % exc, 'mcp_server')
+        return
+    if len(report) > MCP_DIAG_MAX_REPORT_CHARS:
+        report = report[:MCP_DIAG_MAX_REPORT_CHARS] + '\n… [report truncated]'
+    _upload_mcp_diagnostic({
+        'report': report,
+        'server': _mcp_diag_server_hint(raw_tool),
+        'cwd': cwd or '',
+        'tool': raw_tool,
+        'hook_source': 'copilot',
+    }, api_key)
+
+
+def _mcp_diag_stamp_path(server_hint, cwd):
+    key = hashlib.sha256(('%s\x00%s' % (server_hint, cwd or '')).encode('utf-8', 'replace')).hexdigest()[:16]
+    return MCP_DIAG_STAMP_DIR / key
+
+
+def _mcp_diag_on_cooldown(server_hint, cwd):
+    try:
+        stamp = _mcp_diag_stamp_path(server_hint, cwd)
+        return stamp.exists() and (time.time() - stamp.stat().st_mtime) < MCP_DIAG_COOLDOWN_SECONDS
+    except Exception:
+        return False
+
+
+def _mcp_diag_mark_dispatched(server_hint, cwd):
+    try:
+        MCP_DIAG_STAMP_DIR.mkdir(parents=True, exist_ok=True)
+        _mcp_diag_stamp_path(server_hint, cwd).write_text(str(int(time.time())), encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _dispatch_mcp_diagnostic(raw_tool, cwd, api_key):
+    """Build + upload the diagnostic in a detached child so the config sweep stays
+    off the blocking PreToolUse path. One per (server, cwd) per cooldown window."""
+    if not raw_tool or not api_key:
+        return
+    server_hint = _mcp_diag_server_hint(raw_tool)
+    if _mcp_diag_on_cooldown(server_hint, cwd):
+        return
+    if RUNNING_FROZEN:
+        cmd = [sys.executable, 'mcp-diagnostic', os.environ.get('UNBOUND_HOOK_TOOL') or 'copilot']
+    else:
+        try:
+            script = os.path.abspath(__file__)
+        except Exception:
+            return
+        if not os.path.isfile(script):
+            return
+        cmd = [sys.executable, script, '--mcp-diagnostic']
+    child_env = {'UNBOUND_DIAG_TOOL': raw_tool,
+                 'UNBOUND_DIAG_CWD': cwd or '',
+                 'UNBOUND_DIAG_API_KEY': api_key}
+    try:
+        popen_kwargs = {
+            'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL,
+            'stdin': subprocess.DEVNULL, 'close_fds': True,
+            'env': {**os.environ, **child_env},
+        }
+        if os.name == 'nt':
+            popen_kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            popen_kwargs['start_new_session'] = True
+        subprocess.Popen(cmd, **popen_kwargs)
+        # Stamp only after a successful spawn, so a failed dispatch doesn't mute 6h.
+        _mcp_diag_mark_dispatched(server_hint, cwd)
+    except Exception as exc:
+        log_error('mcp diagnostic dispatch failed for %s: %s' % (raw_tool, exc), 'mcp_server')
+
+
 def main():
     """Main entry point - read from stdin and process events."""
     global _cached_api_key
@@ -5867,6 +6380,10 @@ def main():
 
     if len(sys.argv) > 1 and sys.argv[1] == '--sync-skills':
         _sync_skills_once(api_key)
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == '--mcp-diagnostic':
+        _run_mcp_diagnostic_cli()
         return
 
     try:
