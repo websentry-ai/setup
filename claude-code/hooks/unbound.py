@@ -140,7 +140,7 @@ def redact_secrets(text, key=None):
     return text
 
 
-def report_error_to_gateway(message, category='general', api_key=None):
+def report_error_to_gateway(message, category='general', api_key=None, extra=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
     if _reporting_error or not api_key or not _should_report():
@@ -148,8 +148,11 @@ def report_error_to_gateway(message, category='general', api_key=None):
     _reporting_error = True
     message = redact_secrets(message, api_key)
     try:
+        entry = {'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}
+        if isinstance(extra, dict):
+            entry.update(extra)
         payload = json.dumps({
-            'errors': [{'message': message, 'timestamp': datetime.utcnow().isoformat() + 'Z', 'category': category}],
+            'errors': [entry],
             'hook_source': 'claude-code',
         })
         proc = subprocess.Popen(
@@ -169,7 +172,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
         _reporting_error = False
 
 
-def log_error(message: str, category: str = 'general'):
+def log_error(message: str, category: str = 'general', extra: Optional[Dict] = None):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     if _suppress_error_logging:
         return
@@ -193,7 +196,7 @@ def log_error(message: str, category: str = 'general'):
         pass
 
     # Report to gateway (fire-and-forget)
-    report_error_to_gateway(message, category, _cached_api_key)
+    report_error_to_gateway(message, category, _cached_api_key, extra)
 
 
 def _read_policy_cache_raw() -> Optional[Dict]:
@@ -4806,7 +4809,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
         return False
     
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/claude"
-    data = json.dumps(exchange)
+    data = json.dumps(exchange).encode()
 
     for attempt in range(3):
         try:
@@ -4815,7 +4818,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
-                input=data.encode(),
+                input=data,
                 capture_output=True,
                 timeout=10
             )
@@ -4823,7 +4826,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
             if result.returncode == 0:
                 return True
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
-            log_error(f"API request failed: {error_msg}", 'api_call')
+            log_error(f"API request failed: {error_msg}", 'api_call', {'payload_size_bytes': len(data)})
         except Exception as e:
             log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
 
