@@ -5165,6 +5165,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     already_forwarded = already_forwarded or set()
     already_prompted = already_prompted or set()
     if not transcript_path or not os.path.exists(transcript_path):
+        log_error(
+            f"transcript missing: {os.path.basename(transcript_path) if transcript_path else '<none>'}",
+            'transcript',
+        )
         return None, set(), None, set(), None
 
     entries = []
@@ -5178,7 +5182,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except Exception as e:
+        log_error(f"transcript unreadable: {type(e).__name__}", 'transcript')
         return None, set(), None, set(), None
 
     # CLI stores transcripts at ~/.copilot/session-state/<conversation_id>/events.jsonl;
@@ -5225,6 +5230,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             turn_prompt_ids.add(message_id)
 
     if turn_start_index < 0:
+        log_error(f"transcript turn start not found in {len(entries)} entries", 'transcript')
         return None, set(), None, set(), None
 
     # One message, not one per prompt: the backend keeps only the last user message.
@@ -5384,6 +5390,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     messages.append(assistant_msg)
 
     if not messages:
+        log_error("transcript produced no messages", 'transcript')
         return None, set(), None, set(), None
 
     return {
