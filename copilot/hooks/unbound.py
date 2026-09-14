@@ -5165,7 +5165,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     already_forwarded = already_forwarded or set()
     already_prompted = already_prompted or set()
     if not transcript_path or not os.path.exists(transcript_path):
-        log_error(f"transcript missing: {transcript_path}", 'transcript')
+        log_error(
+            f"transcript missing: {os.path.basename(transcript_path) if transcript_path else '<none>'}",
+            'transcript',
+        )
         return None, set(), None, set(), None
 
     entries = []
@@ -5179,7 +5182,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    except (OSError, UnicodeDecodeError) as e:
+    except Exception as e:
         log_error(f"transcript unreadable: {type(e).__name__}", 'transcript')
         return None, set(), None, set(), None
 
