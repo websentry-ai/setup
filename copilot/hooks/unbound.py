@@ -5865,6 +5865,10 @@ def _mcp_diag_server_hint(raw_tool):
     return (body.split('_', 1)[0] or raw_tool)[:255]
 
 
+_MCP_DIAG_SECRETISH = re.compile(
+    r'(?i)(authorization|bearer|api[_-]?key|apikey|token|secret|password|passwd|credential)')
+
+
 def _mcp_diag_host_of(url):
     # scheme://hostname[:port] only: URL paths, queries and userinfo can carry credentials.
     try:
@@ -6131,6 +6135,15 @@ def _mcp_diag_copilot_cli_list():
     }}
 
 
+def _mcp_diag_scrub_value(value):
+    """Drop a credential-bearing value whole, the boundary the Claude Code
+    diagnostic applies to the free text it collects."""
+    text = str(value)
+    if _MCP_DIAG_SECRETISH.search(text):
+        return '<redacted>'
+    return text[:200]
+
+
 def _mcp_diag_vscode_settings():
     """chat.mcp.* settings (e.g. discovery of other apps' servers) per VS Code user dir."""
     out = {}
@@ -6139,10 +6152,12 @@ def _mcp_diag_vscode_settings():
         if not isinstance(settings, dict):
             continue
         for key, value in settings.items():
-            if key.startswith('chat.mcp') and isinstance(value, (bool, int, str)):
-                out['%s: %s' % (user_dir.parent.name, key)] = str(value)[:80]
-            elif key.startswith('chat.mcp') and isinstance(value, dict):
-                out['%s: %s' % (user_dir.parent.name, key)] = json.dumps(value)[:200]
+            if not key.startswith('chat.mcp'):
+                continue
+            if isinstance(value, (bool, int, str)):
+                out['%s: %s' % (user_dir.parent.name, key)] = _mcp_diag_scrub_value(value)
+            elif isinstance(value, dict):
+                out['%s: %s' % (user_dir.parent.name, key)] = _mcp_diag_scrub_value(json.dumps(value))
     return out
 
 
@@ -6151,7 +6166,18 @@ def _mcp_diag_error_log_tail():
         lines = ERROR_LOG.read_text(encoding='utf-8', errors='replace').splitlines()
     except Exception:
         return []
-    return [line[:300] for line in lines if 'mcp' in line.lower()][-15:]
+    kept, dropped = [], 0
+    for line in lines:
+        if 'mcp' not in line.lower():
+            continue
+        if _MCP_DIAG_SECRETISH.search(line):
+            dropped += 1
+            continue
+        kept.append(line[:300])
+    kept = kept[-15:]
+    if dropped:
+        kept.append('[%d credential-bearing line(s) suppressed]' % dropped)
+    return kept
 
 
 def _build_mcp_diagnostic(raw_tool, cwd):
