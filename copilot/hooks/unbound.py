@@ -6113,12 +6113,27 @@ def _mcp_diag_extension_providers():
     return rows
 
 
+def _mcp_diag_path_binary(name):
+    """shutil.which() searches the working directory before PATH on Windows, and
+    the child inherits the editor's workspace as its cwd — so a repo could ship
+    its own copilot.exe. Take the binary from PATH only."""
+    found = shutil.which(name, path=os.environ.get('PATH'))
+    if not found:
+        return None
+    try:
+        if Path(found).resolve().parent == Path.cwd().resolve():
+            return None
+    except OSError:
+        return None
+    return found
+
+
 def _mcp_diag_copilot_cli_list():
     """`copilot mcp list --json`: the Copilot CLI's own resolved view (user,
     workspace, plugin, builtin), summarized without args/env/headers."""
-    binary = shutil.which('copilot')
+    binary = _mcp_diag_path_binary('copilot')
     if not binary:
-        return {'status': 'copilot CLI not on PATH', 'servers': {}}
+        return {'status': 'copilot CLI not resolved from PATH', 'servers': {}}
     try:
         proc = subprocess.run([binary, 'mcp', 'list', '--json'], capture_output=True,
                               text=True, timeout=30, stdin=subprocess.DEVNULL)
@@ -6281,8 +6296,10 @@ def _upload_mcp_diagnostic(payload, api_key):
         return
     proc = None
     try:
+        # Pin curl.exe on Windows, like the discovery download path does.
+        curl = _windows_system32_path('curl.exe') if _is_windows() else 'curl'
         proc = subprocess.Popen(
-            ['curl', '-fsSL', '--max-time', '30', '-X', 'POST',
+            [curl, '-fsSL', '--max-time', '30', '-X', 'POST',
              '-H', 'Authorization: Bearer %s' % api_key,
              '-H', 'Content-Type: application/json',
              '--data-binary', '@-',
@@ -6304,7 +6321,8 @@ def _upload_mcp_diagnostic(payload, api_key):
 def _run_mcp_diagnostic_cli():
     raw_tool = os.environ.get('UNBOUND_DIAG_TOOL') or ''
     cwd = os.environ.get('UNBOUND_DIAG_CWD') or None
-    api_key = os.environ.get('UNBOUND_DIAG_API_KEY') or get_api_key()
+    # pop, so `copilot mcp list` and curl don't inherit the key.
+    api_key = os.environ.pop('UNBOUND_DIAG_API_KEY', None) or get_api_key()
     if not raw_tool or not api_key:
         return
     try:
