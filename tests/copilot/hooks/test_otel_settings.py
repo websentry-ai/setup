@@ -672,3 +672,31 @@ class ManagedTelemetrySettingsTests(unittest.TestCase):
         self._configure(gateway="https://gw.customer.example")
         self.assertEqual(self.mod.clear_managed_telemetry(path=self.path), "cleared")
         self.assertFalse(self.path.exists())
+
+    def test_a_planted_symlink_on_the_staging_path_is_not_written_through(self):
+        # A fixed staging name let a local account point it at any file and have root
+        # write JSON through it. mkstemp opens O_EXCL under a random name instead.
+        self.path.parent.mkdir(parents=True)
+        victim = self.root / "victim"
+        victim.write_text("untouched", encoding="utf-8")
+        (self.path.parent / "managed-settings.json.unbound.tmp").symlink_to(victim)
+
+        self.assertTrue(self._configure())
+
+        self.assertEqual(victim.read_text(encoding="utf-8"), "untouched")
+        self.assertEqual(self._read()["telemetry"]["headers"], {"x-api-key": "sk-live-abc"})
+
+    @unittest.skipIf(os.name != "posix", "POSIX modes")
+    def test_a_world_writable_directory_is_refused(self):
+        # Anyone who can write the directory can redirect the write, so it is not a
+        # place to install from.
+        self.path.parent.mkdir(parents=True)
+        os.chmod(self.path.parent, 0o777)
+        self.assertFalse(self._configure())
+        self.assertFalse(self.path.exists())
+
+    def test_a_failed_write_leaves_no_staging_file_behind(self):
+        self.path.parent.mkdir(parents=True)
+        with patch.object(self.mod.json, "dumps", side_effect=ValueError("boom")):
+            self.assertFalse(self._configure())
+        self.assertEqual(list(self.path.parent.iterdir()), [])

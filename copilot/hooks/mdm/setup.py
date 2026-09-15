@@ -2115,19 +2115,46 @@ def _read_managed_settings(target: Path):
     return current
 
 
+def _managed_dir_is_trustworthy(parent: Path) -> bool:
+    """Whether a write into this directory can be trusted not to be redirected.
+
+    Owned by whoever is writing, which is root at install time, and writable by nobody
+    else. A directory anyone else can write to lets them plant a symlink for root to
+    write through, so the install refuses rather than tries to harden it."""
+    if os.name != "posix":
+        return True
+    try:
+        info = parent.stat()
+    except OSError:
+        return False
+    return (info.st_uid == os.geteuid()
+            and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH))
+
+
 def _write_managed_settings(target: Path, data) -> None:
     """Replace the file in one step, so Copilot never reads a half-written one."""
     target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = target.with_name(target.name + ".unbound.tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    # World-readable on purpose, and it has to be: Copilot runs as the signed-in user
-    # and there is no per-user managed path. 0644 also satisfies the
-    # not-group-or-world-writable rule the loader enforces. The key this exposes is the
-    # device's own application key, which every Copilot user on the device already held
-    # a copy of in their own settings file, so what widens is reach to local accounts
-    # that never had Copilot configured.
-    os.chmod(str(tmp), 0o644)
-    os.replace(str(tmp), str(target))
+    if not _managed_dir_is_trustworthy(target.parent):
+        raise OSError(f"{target.parent} is owned or writable by another account")
+    # mkstemp, not a fixed name: it opens O_EXCL with a random name, so a symlink
+    # planted at a predictable staging path cannot be written through as root.
+    handle_fd, staged = tempfile.mkstemp(dir=str(target.parent),
+                                         prefix=".unbound-", suffix=".json")
+    try:
+        with os.fdopen(handle_fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(data, indent=2) + "\n")
+        # Readable by the signed-in user because that is who Copilot runs as, and not
+        # group- or world-writable, which is what the loader enforces. See the docstring
+        # for why the key it carries is acceptable at this mode.
+        os.chmod(staged, 0o644)
+        os.replace(staged, str(target))
+    except Exception:
+        # Never leave a half-written staging file beside the settings Copilot reads.
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+        raise
 
 
 def configure_managed_telemetry(api_key: str,
@@ -2137,6 +2164,12 @@ def configure_managed_telemetry(api_key: str,
 
     Only the telemetry block is ours: anything else in the file is an administrator's
     and is preserved.
+
+    The file carries the device's API key at 0644, which is deliberate and reviewed.
+    Copilot runs as the signed-in user and has no per-user managed path, so a mode it
+    cannot read means no telemetry at all. These are single-user devices, so there is
+    no second local account to read it, and the key is per device rather than per user:
+    every Copilot user on the machine already held the same value in their own settings.
     """
     endpoint = f"{normalize_url(gateway_url).rstrip('/')}/otel"
     if not _is_secure_endpoint(endpoint):
