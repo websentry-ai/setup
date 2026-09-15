@@ -6101,18 +6101,22 @@ def _mcp_diag_extension_providers():
 
 
 def _mcp_diag_path_binary(name):
-    """shutil.which() searches the working directory before PATH on Windows, and
-    the child inherits the editor's workspace as its cwd — so a repo could ship
-    its own copilot.exe. Take the binary from PATH only."""
-    found = shutil.which(name, path=os.environ.get('PATH'))
+    """The child inherits the editor's workspace as its cwd, and Windows searches
+    that directory before PATH, so a repo could ship its own copilot.exe. Resolve
+    from absolute PATH entries only — a relative entry like `bin` resolves inside
+    the workspace too — and refuse anything that still lands under the cwd."""
+    entries = [e for e in (os.environ.get('PATH') or '').split(os.pathsep) if os.path.isabs(e)]
+    found = shutil.which(name, path=os.pathsep.join(entries))
     if not found:
         return None
     try:
-        if Path(found).resolve().parent == Path.cwd().resolve():
-            return None
-    except OSError:
+        resolved = str(Path(found).resolve())
+        cwd = str(Path.cwd().resolve())
+    except (OSError, ValueError):
         return None
-    return found
+    if resolved == cwd or resolved.startswith(cwd + os.sep):
+        return None
+    return resolved
 
 
 def _mcp_diag_copilot_cli_list():
