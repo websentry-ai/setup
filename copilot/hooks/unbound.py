@@ -5404,6 +5404,15 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
+_RETRYABLE_4XX = ('408', '429')
+
+
+def _permanent_failure(stdout):
+    """A 4xx that is not transient: the same body will be rejected again, so stop retrying."""
+    status = (stdout or b'').decode('utf-8', errors='ignore').strip()[-3:]
+    return status.isdigit() and status[0] == '4' and status not in _RETRYABLE_4XX
+
+
 def send_to_api(exchange, api_key):
     """Send exchange data to Unbound API."""
     if not api_key:
@@ -5419,6 +5428,7 @@ def send_to_api(exchange, api_key):
                 ["curl", "-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
+                 "-w", "%{http_code}",
                  "--data-binary", "@-", url],
                 input=data,
                 capture_output=True,
@@ -5429,6 +5439,8 @@ def send_to_api(exchange, api_key):
                 return True
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
             log_error(f"API request failed: {error_msg}", 'api_call', {'payload_size_bytes': len(data)})
+            if _permanent_failure(result.stdout):
+                return False
         except Exception as e:
             log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
 
