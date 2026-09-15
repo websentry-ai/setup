@@ -5884,6 +5884,17 @@ def _mcp_diag_server_hint(raw_tool):
     return (body.split('_', 1)[0] or raw_tool)[:255]
 
 
+def _mcp_diag_host_of(url):
+    # scheme://hostname[:port] only: URL paths, queries and userinfo can carry credentials.
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme and parsed.hostname:
+            return '%s://%s%s' % (parsed.scheme, parsed.hostname, ':%d' % parsed.port if parsed.port else '')
+    except Exception:
+        pass
+    return '<unparseable-url>'
+
+
 def _mcp_diag_summarize(entry):
     """Compact, secret-free summary of one server config: no args, env or headers."""
     if not isinstance(entry, dict):
@@ -5893,8 +5904,7 @@ def _mcp_diag_summarize(entry):
         bits.append(str(entry['type'])[:20])
     url = entry.get('url') or entry.get('serverUrl')
     if isinstance(url, str) and url:
-        parsed = urlparse(url)
-        bits.append(('%s://%s%s' % (parsed.scheme, parsed.hostname or '', parsed.path))[:120])
+        bits.append(_mcp_diag_host_of(url))
     command = entry.get('command')
     if isinstance(command, str) and command:
         bits.append('cmd=%s' % os.path.basename(command)[:60])
