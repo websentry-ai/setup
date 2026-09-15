@@ -68,6 +68,7 @@ MCP_DIAG_STAMP_DIR = LOG_DIR / "mcp-diag"
 MCP_DIAG_COOLDOWN_SECONDS = 6 * 3600
 MCP_DIAG_VERSION = "copilot-v1"
 MCP_DIAG_MAX_REPORT_CHARS = 200 * 1024  # stay well under the gateway's 256KB cap
+MCP_DIAG_UPLOAD_TIMEOUT_SECONDS = 30
 # ~/.claude.json carries per-project history and can run to megabytes.
 MCP_DIAG_MAX_CONFIG_BYTES = 20 * 1024 * 1024
 
@@ -6274,28 +6275,23 @@ def _upload_mcp_diagnostic(payload, api_key):
     except Exception as exc:
         log_error('mcp diagnostic serialize failed: %s' % exc, 'mcp_server')
         return
-    proc = None
+    # In-process POST like _request_skill_sync: an argv carrying the key is
+    # readable by any local process for as long as the upload runs.
+    request = urllib.request.Request(
+        '%s/v1/hooks/mcp-diagnostics' % UNBOUND_GATEWAY_URL,
+        data=body.encode('utf-8'),
+        headers={
+            'Authorization': 'Bearer %s' % api_key,
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    opener = urllib.request.build_opener(_SkillSyncNoRedirects())
     try:
-        # Pin curl.exe on Windows, like the discovery download path does.
-        curl = _windows_system32_path('curl.exe') if _is_windows() else 'curl'
-        proc = subprocess.Popen(
-            [curl, '-fsSL', '--max-time', '30', '-X', 'POST',
-             '-H', 'Authorization: Bearer %s' % api_key,
-             '-H', 'Content-Type: application/json',
-             '--data-binary', '@-',
-             '%s/v1/hooks/mcp-diagnostics' % UNBOUND_GATEWAY_URL],
-            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        proc.communicate(body.encode(), timeout=35)
-        if proc.returncode:
-            log_error('mcp diagnostic upload: curl exit %s' % proc.returncode, 'mcp_server')
+        with opener.open(request, timeout=MCP_DIAG_UPLOAD_TIMEOUT_SECONDS) as response:
+            response.read(64 * 1024)
     except Exception as exc:
-        if proc is not None and proc.poll() is None:
-            try:
-                proc.kill()
-                proc.communicate()
-            except Exception:
-                pass
-        log_error('mcp diagnostic upload failed: %s' % exc, 'mcp_server')
+        log_error('mcp diagnostic upload failed: %s' % type(exc).__name__, 'mcp_server')
 
 
 def _run_mcp_diagnostic_cli():
