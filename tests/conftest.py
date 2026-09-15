@@ -29,6 +29,11 @@ def load_module(relpath: str):
     # Registered before exec so a module that imports itself by name still resolves.
     sys.modules[alias] = module
     spec.loader.exec_module(module)
+    # Backfill is gated off in the shipped installers while a tool's request id changes.
+    # Its machinery still has to stay covered, so tests run with it on; the shipped value
+    # is asserted from source in test_setup_contract.
+    if hasattr(module, "BACKFILL_ENABLED"):
+        module.BACKFILL_ENABLED = True
     _CACHE[key] = module
     return module
 

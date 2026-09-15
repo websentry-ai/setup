@@ -58,7 +58,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         tool_use = exchange["messages"][1]["tool_use"]
@@ -77,7 +77,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         self.assertNotIn("tool_use", exchange["messages"][1])
@@ -92,7 +92,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         self.assertNotIn("tool_use", exchange["messages"][1])
@@ -117,7 +117,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         self.assertNotIn("tool_use", exchange["messages"][1])
@@ -132,7 +132,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         self.assertNotIn("tool_use", exchange["messages"][1])
@@ -179,7 +179,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         self.assertNotIn("tool_use", exchange["messages"][1])
@@ -200,7 +200,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             "read_copilot_mcp_servers",
             return_value={"github-mcp-server": config},
         ):
-            exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
                 path, SESSION, cwd="/workspace")
 
         tool_use = exchange["messages"][1]["tool_use"]
@@ -263,7 +263,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             "read_copilot_mcp_servers",
             return_value={"docs_alias": config},
         ):
-            exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+            exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
                 path, SESSION, cwd="/workspace")
 
         tool_use = exchange["messages"][1]["tool_use"]
@@ -298,7 +298,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
 
         tool_use = exchange["messages"][1]["tool_use"]
@@ -325,7 +325,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="done"),
         ])
 
-        exchange, _forwarded, _sig, _prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, _prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION
         )
 
@@ -342,7 +342,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="the answer"),
             _entry("assistant.turn_end"),
         ])
-        exchange, forwarded, _sig, prompts = unbound.build_exchange_from_transcript(
+        exchange, forwarded, _sig, prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
         self.assertEqual(_user_text(exchange), ["first question\n\nsecond question"])
         self.assertEqual(forwarded, {"call-a", "call-b"})
@@ -360,7 +360,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("assistant.message", content="the answer"),
             _entry("assistant.turn_end"),
         ])
-        exchange, _forwarded, _sig, prompts = unbound.build_exchange_from_transcript(
+        exchange, _forwarded, _sig, prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
         self.assertEqual(_user_text(exchange), ["first question\n\nsecond question"])
         self.assertEqual(prompts, {"u1", "u2"})
@@ -374,7 +374,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             *_tool("call-b"),
             _entry("assistant.message", content="the second answer"),
         ])
-        exchange, forwarded, _sig, prompts = unbound.build_exchange_from_transcript(
+        exchange, forwarded, _sig, prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION, already_forwarded={"call-a"}, already_prompted={"u1"})
         self.assertEqual(_user_text(exchange), ["second question"])
         self.assertEqual(forwarded, {"call-b"})
@@ -385,7 +385,7 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("user.message", _id="u1", content="first question"),
             _entry("assistant.message", content="the answer"),
         ])
-        exchange, forwarded, sig, prompts = unbound.build_exchange_from_transcript(
+        exchange, forwarded, sig, prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION, already_prompted={"u1"})
         self.assertIsNone(exchange)
         self.assertEqual((forwarded, sig, prompts), (set(), None, set()))
@@ -396,10 +396,10 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("user.message", content="no envelope id"),
             _entry("assistant.message", content="the answer"),
         ])
-        exchange, _f, _s, prompts = unbound.build_exchange_from_transcript(path, SESSION)
+        exchange, _f, _s, prompts, _turn_id = unbound.build_exchange_from_transcript(path, SESSION)
         self.assertEqual(_user_text(exchange), ["no envelope id"])
         self.assertEqual(len(prompts), 1)
-        again, _f2, _s2, _p2 = unbound.build_exchange_from_transcript(
+        again, _f2, _s2, _p2, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION, already_prompted=prompts)
         self.assertIsNone(again)
 
@@ -409,12 +409,12 @@ class TestTurnIsTheUnreportedPrompts(unittest.TestCase):
             _entry("user.message", content="second"),
             _entry("assistant.message", content="the answer"),
         ])
-        _ex, _f, _s, prompts = unbound.build_exchange_from_transcript(path, SESSION)
+        _ex, _f, _s, prompts, _turn_id = unbound.build_exchange_from_transcript(path, SESSION)
         self.assertEqual(len(prompts), 2)
 
     def test_a_transcript_with_no_prompt_yields_nothing(self):
         path = _transcript([_entry("session.start", sessionId=SESSION)])
-        exchange, forwarded, sig, prompts = unbound.build_exchange_from_transcript(
+        exchange, forwarded, sig, prompts, _turn_id = unbound.build_exchange_from_transcript(
             path, SESSION)
         self.assertIsNone(exchange)
         self.assertEqual((forwarded, sig, prompts), (set(), None, set()))
@@ -462,14 +462,14 @@ class TestReportedPromptWatermark(unittest.TestCase):
             _entry("user.message", _id="u1", content="first question"),
             _entry("assistant.message", content="the first answer"),
         ])
-        _ex, _fwd, _sig, reported = unbound.build_exchange_from_transcript(first, SESSION)
+        _ex, _fwd, _sig, reported, _turn_id = unbound.build_exchange_from_transcript(first, SESSION)
         second = _transcript([
             _entry("user.message", _id="u1", content="first question"),
             _entry("assistant.message", content="the first answer"),
             _entry("user.message", _id="u2", content="second question"),
             _entry("assistant.message", content="the second answer"),
         ])
-        exchange, _f, _s, _p = unbound.build_exchange_from_transcript(
+        exchange, _f, _s, _p, _turn_id = unbound.build_exchange_from_transcript(
             second, SESSION, already_prompted=reported)
         self.assertEqual(_user_text(exchange), ["second question"])
 
