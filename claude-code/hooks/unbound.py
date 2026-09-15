@@ -4802,6 +4802,12 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     return exchange
 
 
+def _permanent_failure(stdout):
+    """4xx other than 401/429: the same body will be rejected again, so stop retrying."""
+    status = (stdout or b'').decode('utf-8', errors='ignore').strip()[-3:]
+    return status.isdigit() and status[0] == '4' and status not in ('401', '429')
+
+
 def send_to_api(exchange: Dict, api_key: str) -> bool:
     """Send exchange data to Unbound API."""
     if not api_key:
@@ -4817,6 +4823,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
                 ["curl", "-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
+                 "-w", "%{http_code}",
                  "--data-binary", "@-", url],
                 input=data,
                 capture_output=True,
@@ -4827,6 +4834,8 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
                 return True
             error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
             log_error(f"API request failed: {error_msg}", 'api_call', {'payload_size_bytes': len(data)})
+            if _permanent_failure(result.stdout):
+                return False
         except Exception as e:
             log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
 
