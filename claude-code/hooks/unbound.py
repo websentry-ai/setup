@@ -4802,10 +4802,13 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
     return exchange
 
 
+_RETRYABLE_4XX = ('401', '408', '429')
+
+
 def _permanent_failure(stdout):
-    """4xx other than 401/429: the same body will be rejected again, so stop retrying."""
+    """A 4xx that is not transient: the same body will be rejected again, so stop retrying."""
     status = (stdout or b'').decode('utf-8', errors='ignore').strip()[-3:]
-    return status.isdigit() and status[0] == '4' and status not in ('401', '429')
+    return status.isdigit() and status[0] == '4' and status not in _RETRYABLE_4XX
 
 
 def send_to_api(exchange: Dict, api_key: str) -> bool:
