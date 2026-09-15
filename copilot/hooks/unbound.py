@@ -6034,7 +6034,9 @@ def _mcp_diag_unread_sources(cwd):
 def _mcp_diag_matches(raw_tool, groups):
     """Server names whose VS Code tool prefix (full or 13-char truncated) produces
     raw_tool, and looser near-misses on the parsed server token."""
-    body = _vscode_sanitize(raw_tool[len('mcp_'):])
+    # Match against the name with and without the mcp_ prefix: VS Code strips it to
+    # build the tool name, but a server can also be called `mcp_<something>` itself.
+    bodies = (_vscode_sanitize(raw_tool[len('mcp_'):]), _vscode_sanitize(raw_tool))
     hint = _vscode_sanitize(_mcp_diag_server_hint(raw_tool))
     exact, near = [], []
     for group in groups:
@@ -6042,7 +6044,7 @@ def _mcp_diag_matches(raw_tool, groups):
             aliases = _vscode_server_aliases(name)
             prefixes = aliases | {a[:_VSCODE_TRUNCATED_SERVER_LENGTH] for a in aliases}
             row = {'name': name, 'source': group['source'], 'file': group['file'], 'cfg': summary}
-            if any(body.startswith(p + '_') for p in prefixes):
+            if any(body.startswith(p + '_') for p in prefixes for body in bodies):
                 exact.append(row)
             elif len(hint) >= 3 and any(hint in a or (len(a) >= 3 and a in hint) for a in aliases):
                 near.append(row)
@@ -6320,6 +6322,15 @@ def _upload_mcp_diagnostic(payload, api_key):
         log_error('mcp diagnostic upload failed: %s' % type(exc).__name__, 'mcp_server')
 
 
+def _mcp_diag_reported_server(diagnostic, raw_tool):
+    """The name to file the diagnostic under. One unambiguous on-disk match names the
+    real server; otherwise fall back to the token parsed out of the tool name."""
+    names = {row['name'] for row in ((diagnostic.get('matches') or {}).get('exact') or [])}
+    if len(names) == 1:
+        return names.pop()[:255]
+    return _mcp_diag_server_hint(raw_tool)
+
+
 def _run_mcp_diagnostic_cli():
     raw_tool = os.environ.get('UNBOUND_DIAG_TOOL') or ''
     cwd = os.environ.get('UNBOUND_DIAG_CWD') or None
@@ -6328,7 +6339,8 @@ def _run_mcp_diagnostic_cli():
     if not raw_tool or not api_key:
         return
     try:
-        report = _render_mcp_diagnostic(_build_mcp_diagnostic(raw_tool, cwd))
+        diagnostic = _build_mcp_diagnostic(raw_tool, cwd)
+        report = _render_mcp_diagnostic(diagnostic)
     except Exception as exc:
         log_error('mcp diagnostic build failed: %s' % exc, 'mcp_server')
         return
@@ -6336,7 +6348,7 @@ def _run_mcp_diagnostic_cli():
         report = report[:MCP_DIAG_MAX_REPORT_CHARS] + '\n… [report truncated]'
     _upload_mcp_diagnostic({
         'report': report,
-        'server': _mcp_diag_server_hint(raw_tool),
+        'server': _mcp_diag_reported_server(diagnostic, raw_tool),
         'cwd': cwd or '',
         'tool': raw_tool,
         'hook_source': 'copilot',
