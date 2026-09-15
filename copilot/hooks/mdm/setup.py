@@ -2120,8 +2120,12 @@ def _write_managed_settings(target: Path, data) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(target.name + ".unbound.tmp")
     tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    # World-readable on purpose: Copilot runs as the signed-in user and has to read
-    # this. 0644 also satisfies the not-group-or-world-writable rule it enforces.
+    # World-readable on purpose, and it has to be: Copilot runs as the signed-in user
+    # and there is no per-user managed path. 0644 also satisfies the
+    # not-group-or-world-writable rule the loader enforces. The key this exposes is the
+    # device's own application key, which every Copilot user on the device already held
+    # a copy of in their own settings file, so what widens is reach to local accounts
+    # that never had Copilot configured.
     os.chmod(str(tmp), 0o644)
     os.replace(str(tmp), str(target))
 
@@ -2171,6 +2175,19 @@ def configure_managed_telemetry(api_key: str,
         return False
 
 
+def _is_our_telemetry(block) -> bool:
+    """Whether this telemetry block is one configure_managed_telemetry wrote.
+
+    Both marks hold for everything we write and are unlikely together in a block an
+    administrator set up themselves, so teardown leaves theirs alone."""
+    if not isinstance(block, dict):
+        return False
+    endpoint = block.get("endpoint")
+    headers = block.get("headers")
+    return (isinstance(endpoint, str) and endpoint.rstrip("/").endswith("/otel")
+            and isinstance(headers, dict) and "x-api-key" in headers)
+
+
 def clear_managed_telemetry(path: Optional[Path] = None) -> str:
     """Drop our telemetry block, and the file too when nothing else is left in it."""
     target = path or managed_settings_path()
@@ -2180,7 +2197,8 @@ def clear_managed_telemetry(path: Optional[Path] = None) -> str:
         current = _read_managed_settings(target)
         if current is None:
             return "failed"
-        if "telemetry" not in current:
+        if not _is_our_telemetry(current.get("telemetry")):
+            # Either absent, or replaced by an administrator after we installed.
             return "not_found"
         del current["telemetry"]
         if current:

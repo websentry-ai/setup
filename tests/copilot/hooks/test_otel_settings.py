@@ -648,3 +648,27 @@ class ManagedTelemetrySettingsTests(unittest.TestCase):
         self.path.write_text(json.dumps({"sandbox": {"enabled": True}}), encoding="utf-8")
         self.assertEqual(self.mod.clear_managed_telemetry(path=self.path), "not_found")
         self.assertEqual(self._read(), {"sandbox": {"enabled": True}})
+
+    def test_clear_leaves_a_block_an_administrator_replaced(self):
+        # Ours is recognised by its endpoint and header. A block someone else put there
+        # after us is theirs, and teardown must not take it.
+        self._configure()
+        theirs = {"endpoint": "https://collector.corp.internal/v1/traces",
+                  "enabled": True}
+        self.path.write_text(json.dumps({"telemetry": theirs}), encoding="utf-8")
+        self.assertEqual(self.mod.clear_managed_telemetry(path=self.path), "not_found")
+        self.assertEqual(self._read()["telemetry"], theirs)
+
+    def test_clear_still_removes_a_block_we_wrote(self):
+        # The guard above must not be so tight that our own key survives teardown.
+        self._configure()
+        self.assertTrue(self.mod._is_our_telemetry(self._read()["telemetry"]))
+        self.assertEqual(self.mod.clear_managed_telemetry(path=self.path), "cleared")
+        self.assertFalse(self.path.exists())
+
+    def test_clear_removes_what_we_wrote_against_any_gateway(self):
+        # Self-hosted tenants get a different host; the mark is the /otel path and the
+        # header, not the domain, so their teardown works too.
+        self._configure(gateway="https://gw.customer.example")
+        self.assertEqual(self.mod.clear_managed_telemetry(path=self.path), "cleared")
+        self.assertFalse(self.path.exists())
