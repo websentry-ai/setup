@@ -803,12 +803,18 @@ def _setup_copilot(opts):
         m.write_unbound_config_for_user(
             username, home_dir, api_key,
             urls={"base_url": base, "gateway_url": gateway, "frontend_url": opts["frontend_url"]})
-        # Called explicitly: the vendored module ships inside this binary, but this
-        # command drives its named functions rather than its main(), so a writer
-        # added there is dead code here until it is invoked.
-        m.configure_otel_export_for_user(username, home_dir, api_key, gateway_url=gateway)
+        # Earlier versions configured the exporter here, per user, in VS Code
+        # settings. The managed file written below outranks those, so they are only
+        # taken back out.
+        if home_dir is not None:
+            m.clear_otel_export_for_user(username, home_dir)
         if _install_copilot_hooks_for_user(m, username, home_dir):
             installed += 1
+
+    # Machine-wide, so once for the device rather than once per user. Called
+    # explicitly: this command drives the vendored module's named functions rather
+    # than its main(), so a writer added there is dead code here until it is invoked.
+    m.configure_managed_telemetry(api_key, gateway_url=gateway)
 
     if user_homes and installed == 0:
         return ("deferred", "hook install failed for all users")

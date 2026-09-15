@@ -1836,11 +1836,10 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
 # Pointing its exporter at the gateway is what makes Copilot cost and usage
 # accurate; without it we only have what the hook can read off disk after the
 # turn, which the tool writes seconds late.
-
-# `headers` is the only way this surface can carry a credential: the extension
-# applies it directly to the exporter rather than through the environment, and
-# OTEL_EXPORTER_OTLP_HEADERS is both generic to every exporter on the machine
-# and invisible to an editor launched from the Dock.
+#
+# Configured through Copilot's managed settings now (configure_managed_telemetry).
+# The keys below are what earlier versions wrote into each user's VS Code settings;
+# the managed file outranks them, so they are only ever cleared.
 OTEL_SETTING_KEYS = (
     "github.copilot.chat.otel.enabled",
     "github.copilot.chat.otel.exporterType",
@@ -2055,21 +2054,19 @@ SYNC_IGNORE_KEY = "settingsSync.ignoredSettings"
 OTEL_HEADERS_KEY = "github.copilot.chat.otel.headers"
 
 
-def _sync_ignore_list(settings_path: Path, add: bool):
-    """settingsSync.ignoredSettings with our header entry added or removed.
+def _sync_ignore_list(settings_path: Path):
+    """settingsSync.ignoredSettings with our header entry removed.
 
-    Settings Sync uploads user settings by default, so without this the key leaves the
-    machine and a local 0600 stops meaning anything. Merged with whatever the user
-    already ignores; None when nothing is left, which is how VS Code clears it.
+    Earlier versions added it, because Settings Sync uploads user settings by default
+    and would have carried the key off the machine. The exporter is configured through
+    managed settings now, so this only takes our entry back out. The user's own entries
+    stay, and None is how VS Code clears the list once nothing is left.
     """
     text = _read_settings_text(settings_path) if settings_path.exists() else None
     current = _parse_jsonc_or_none(text) if text else None
     existing = current.get(SYNC_IGNORE_KEY) if isinstance(current, dict) else None
     items = [i for i in existing if isinstance(i, str)] if isinstance(existing, list) else []
-    if add:
-        return items if OTEL_HEADERS_KEY in items else items + [OTEL_HEADERS_KEY]
-    remaining = [i for i in items if i != OTEL_HEADERS_KEY]
-    return remaining or None
+    return [i for i in items if i != OTEL_HEADERS_KEY] or None
 
 
 def _is_secure_endpoint(url: str) -> bool:
@@ -2081,14 +2078,61 @@ def _is_secure_endpoint(url: str) -> bool:
         "localhost", "127.0.0.1", "::1")
 
 
-def configure_otel_export_for_user(username: str, home: Path, api_key: str,
-                                   gateway_url: str = DEFAULT_GATEWAY_URL) -> bool:
-    """Point one user's Copilot Chat OTLP exporter at the gateway.
+# Copilot reads managed settings from here, and this is a root-owned system path,
+# which is why only the MDM installer configures the exporter. Precedence runs
+# MDM > server-managed > file-based > user settings, so this outranks anything a
+# developer sets in their own editor.
+def managed_settings_path() -> Optional[Path]:
+    """Where this OS reads Copilot's managed settings, or None if unsupported."""
+    system = platform.system().lower()
+    if system == "darwin":
+        parent = Path("/Library/Application Support/GitHubCopilot")
+    elif system == "linux":
+        parent = Path("/etc/github-copilot")
+    elif system == "windows":
+        parent = Path(os.environ.get("ProgramFiles") or r"C:\Program Files") / "GitHubCopilot"
+    else:
+        return None
+    return parent / "managed-settings.json"
 
-    Writes as the target user, so a symlink in their home cannot redirect a root
-    write and the file stays writable by the editor that owns it. The endpoint is
-    a base: the exporter appends /v1/traces itself. A window reload is required,
-    since these are read once at extension activation.
+
+def _read_managed_settings(target: Path):
+    """The file's current contents, {} when absent, or None when unusable.
+
+    None means leave it alone: overwriting a file we cannot parse would drop an
+    administrator's settings we never got to see.
+    """
+    if not target.exists():
+        return {}
+    try:
+        current = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (json.JSONDecodeError, OSError, ValueError) as e:
+        print(f"⚠️  Could not read {target}: {e}")
+        return None
+    if not isinstance(current, dict):
+        print(f"⚠️  {target} is not a JSON object")
+        return None
+    return current
+
+
+def _write_managed_settings(target: Path, data) -> None:
+    """Replace the file in one step, so Copilot never reads a half-written one."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(target.name + ".unbound.tmp")
+    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    # World-readable on purpose: Copilot runs as the signed-in user and has to read
+    # this. 0644 also satisfies the not-group-or-world-writable rule it enforces.
+    os.chmod(str(tmp), 0o644)
+    os.replace(str(tmp), str(target))
+
+
+def configure_managed_telemetry(api_key: str,
+                                gateway_url: str = DEFAULT_GATEWAY_URL,
+                                path: Optional[Path] = None) -> bool:
+    """Point Copilot's OTLP exporter at the gateway for every user on the device.
+
+    Only the telemetry block is ours: anything else in the file is an administrator's
+    and is preserved.
     """
     endpoint = f"{normalize_url(gateway_url).rstrip('/')}/otel"
     if not _is_secure_endpoint(endpoint):
@@ -2096,33 +2140,61 @@ def configure_otel_export_for_user(username: str, home: Path, api_key: str,
         # on the wire each time.
         print(f"⚠️  Gateway URL is not https ({endpoint}); skipping Copilot telemetry export")
         return False
-    updates = {
-        "github.copilot.chat.otel.enabled": True,
-        "github.copilot.chat.otel.exporterType": "otlp-http",
-        "github.copilot.chat.otel.otlpEndpoint": endpoint,
-        "github.copilot.chat.otel.headers": {"x-api-key": api_key},
-        "github.copilot.chat.otel.captureContent": False,
-    }
-    def _configure():
-        dirs = vscode_user_dirs(home)
-        if not dirs:
-            debug_print("No VS Code user directory found; skipping OTLP settings")
-            return True
-        results = []
-        for directory in dirs:
-            settings_path = directory / "settings.json"
-            # Per file: each editor keeps its own ignore list and ours merges into it.
-            results.append(_write_settings(settings_path, dict(
-                updates, **{SYNC_IGNORE_KEY: _sync_ignore_list(settings_path, add=True)}), home))
-        # Listed, not a generator: all() short-circuits, and one unparsable
-        # settings file would leave every remaining editor unconfigured.
-        return all(results)
 
-    return bool(_run_as_user(username, _configure))
+    target = path or managed_settings_path()
+    if target is None:
+        debug_print("No managed settings path for this OS; skipping OTLP settings")
+        return True
+    # Copilot rejects a symlinked managed settings file outright, so writing one would
+    # configure nothing.
+    if target.is_symlink():
+        print(f"⚠️  {target} is a symlink; skipping Copilot telemetry export")
+        return False
+
+    try:
+        current = _read_managed_settings(target)
+        if current is None:
+            return False
+        current["telemetry"] = {
+            "enabled": True,
+            "endpoint": endpoint,
+            # Our collector parses OTLP/JSON only; the OTel default is protobuf, which
+            # it would reject with nothing surfaced to the device.
+            "protocol": "http/json",
+            "captureContent": False,
+            "headers": {"x-api-key": api_key},
+        }
+        _write_managed_settings(target, current)
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not write {target}: {e}")
+        return False
+
+
+def clear_managed_telemetry(path: Optional[Path] = None) -> str:
+    """Drop our telemetry block, and the file too when nothing else is left in it."""
+    target = path or managed_settings_path()
+    if target is None or target.is_symlink() or not target.exists():
+        return "not_found"
+    try:
+        current = _read_managed_settings(target)
+        if current is None:
+            return "failed"
+        if "telemetry" not in current:
+            return "not_found"
+        del current["telemetry"]
+        if current:
+            _write_managed_settings(target, current)
+        else:
+            target.unlink()
+        return "cleared"
+    except Exception as e:
+        debug_print(f"could not clear {target}: {e}")
+        return "failed"
 
 
 def clear_otel_export_for_user(username: str, home: Path) -> str:
-    """Remove only the keys configure_otel_export writes, as the target user.
+    """Remove the OTLP keys earlier versions wrote, as the target user.
 
     Returns "cleared", "not_found" or "failed", matching _clear_path, so a device
     that never had these settings does not report having cleared them."""
@@ -2146,7 +2218,7 @@ def clear_otel_export_for_user(username: str, home: Path) -> str:
                 continue
             updates = {key: None for key in OTEL_SETTING_KEYS}
             # Only our entry leaves the ignore list; the user's own entries stay.
-            updates[SYNC_IGNORE_KEY] = _sync_ignore_list(settings_path, add=False)
+            updates[SYNC_IGNORE_KEY] = _sync_ignore_list(settings_path)
             found = True
             if not _write_settings(settings_path, updates, home):
                 failed = True
@@ -2218,6 +2290,15 @@ def clear_setup() -> bool:
         if hooks_failed:
             teardown_failed = True
             print(f"Failed to clear Copilot hooks for {hooks_failed} user(s)")
+
+    # Machine-wide, so outside the per-user loop and attempted even when no user
+    # home was found.
+    managed = clear_managed_telemetry()
+    if managed == "cleared":
+        print("Cleared Copilot telemetry settings")
+    elif managed == "failed":
+        teardown_failed = True
+        print("Failed to clear Copilot telemetry settings")
 
     print("\n" + "=" * 60)
     print("Clear Complete!")
@@ -2330,10 +2411,20 @@ def main():
         write_unbound_config_for_user(username, home_dir, api_key, urls={"base_url": base_url, "gateway_url": gateway_url, "frontend_url": frontend_url})
         # Never fatal: the hooks are the enforcement plane and must not be rolled
         # back because an editor's settings file could not be merged.
+        # Earlier versions configured the exporter here, per user, in VS Code settings.
+        # The managed file below outranks those, so they are only taken back out.
         if home_dir is not None:
-            configure_otel_export_for_user(username, home_dir, api_key, gateway_url=gateway_url)
+            clear_otel_export_for_user(username, home_dir)
         if install_hooks_for_user(username, home_dir, script_text):
             installed_count += 1
+
+    # Machine-wide, so once for the device rather than once per user. Never fatal:
+    # the hooks are the enforcement plane and must not be rolled back because a
+    # settings file could not be written.
+    if configure_managed_telemetry(api_key, gateway_url=gateway_url):
+        print("✅ Copilot telemetry export configured (reload editors to apply)")
+    else:
+        print("⚠️  Could not configure Copilot telemetry export; hooks still active")
 
     success = bool(user_homes) and installed_count == len(user_homes)
     if not user_homes:

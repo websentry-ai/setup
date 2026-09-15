@@ -778,3 +778,36 @@ def test_setup_parses_and_ignores_a_stale_discovery_key(argv):
     assert opts is not None, "a stale --discovery-key must never be an unknown argument"
     assert opts["api_key"] == "K"
     assert "discovery_key" not in opts
+
+
+def test_every_vendored_function_setup_cmd_calls_actually_exists():
+    """setup_cmd drives the vendored modules by name, so a function renamed or
+    removed on one of them is an AttributeError at install time and nothing here
+    fails first. Reads the call sites out of the source rather than listing them,
+    or the list drifts out of date exactly when it matters.
+    """
+    import ast
+
+    source = Path(setup_cmd.__file__).with_suffix(".py").read_text(encoding="utf-8")
+    called = {
+        node.func.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "m"
+    }
+    assert called, "found no vendored calls; the extraction is broken, not the code"
+
+    modules = []
+    for tool in ("claude-code", "codex", "copilot", "cursor", "augment"):
+        try:
+            modules.append(load_mdm_setup_module(tool))
+        except Exception:
+            continue
+    assert modules, "no vendored module loaded; the harness is broken, not the code"
+
+    # A name is fine if any vendored module defines it, since setup_cmd reaches a
+    # different module per tool. One that no module defines cannot be reached at all.
+    orphans = sorted(n for n in called if not any(hasattr(m, n) for m in modules))
+    assert not orphans, f"setup_cmd calls functions no vendored module defines: {orphans}"
