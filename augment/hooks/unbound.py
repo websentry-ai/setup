@@ -3637,7 +3637,7 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     }
 
 
-_RETRYABLE_4XX = ('401', '408', '429')
+_RETRYABLE_4XX = ('408', '429')
 
 
 def _permanent_failure(stdout):

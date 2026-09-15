@@ -2933,7 +2933,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
 
 
 
-_RETRYABLE_4XX = ('401', '408', '429')
+_RETRYABLE_4XX = ('408', '429')
 
 
 def _permanent_failure(stdout):

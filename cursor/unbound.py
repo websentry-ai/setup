@@ -3880,7 +3880,7 @@ def build_llm_exchange(events, api_key=None):
     return exchange
 
 
-_RETRYABLE_4XX = ('401', '408', '429')
+_RETRYABLE_4XX = ('408', '429')
 
 
 def _permanent_failure(stdout):

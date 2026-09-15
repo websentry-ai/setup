@@ -5404,7 +5404,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
-_RETRYABLE_4XX = ('401', '408', '429')
+_RETRYABLE_4XX = ('408', '429')
 
 
 def _permanent_failure(stdout):
