@@ -14,7 +14,7 @@ template), WEB-4792 (pkg payload).
 | `discovery.lock` | KEY=VALUE source config, canonical from WEB-4787 (`SOURCE_REF` is checked out into `./discovery-src`, tracking `main` by default; `PYTHON_VERSION`/`PYINSTALLER_VERSION` are asserted against the installed toolchain) |
 | `unbound-discovery.spec` + `unbound_discovery_entry.py` + `build-discovery.sh` | **Canonical** discovery bundle build (WEB-4787); CI invokes the spec with `UNBOUND_DISCOVERY_SRC=./discovery-src` |
 | `../binary/unbound-hook.spec` | **Canonical** hook bundle build (WEB-4786, Stream A): vendored hook/MDM sources + hidden imports; CI builds this spec directly. Bundle names, onedir COLLECT layout, and `target_arch='universal2'` are the pipeline contract |
-| `specs/unbound-discovery.spec` + `placeholder/unbound_discovery_main.py` | Dry-run-only discovery fallback for tokenless `workflow_dispatch` runs (the hook side has no placeholder anymore — it always builds from `binary/`) |
+| `specs/unbound-discovery.spec` + `placeholder/unbound_discovery_main.py` | Placeholder discovery for local builds without `UNBOUND_DISCOVERY_SRC`; CI always builds from the checkout (the hook side has no placeholder anymore — it always builds from `binary/`) |
 | `requirements-nuitka-build.txt` + `nuitka/` + `scripts/build-nuitka.sh` + `scripts/lipo-merge.sh` | **Alternative Nuitka builder** (WEB-4804 EDR bake-off, `workflow_dispatch` `builder=nuitka` only — tag releases always use PyInstaller). Nuitka pinned to 2.8.x, the last Apache-2.0 series. `--standalone` only, never `--onefile` (onefile's self-extract-to-temp is the EDR "packer" pattern the bake-off exists to avoid). Nuitka 2.8 cannot emit universal binaries, so the script builds arm64 + x86_64 from the same universal2 CPython and `lipo -create`-merges them; output layout is contract-identical (`dist/<name>/<name>`), so the lipo gate, per-Mach-O signing, smoke test, and pkg stages run unchanged. `unbound-hook` builds the real `binary/src` package — vendored data files and hidden imports are parsed from `binary/unbound-hook.spec` so the two builders cannot drift; `nuitka/unbound_hook_entry.py` is a build-only shim supplying the `sys.frozen`/`sys._MEIPASS` contract PyInstaller's bootloader provides |
 | `scripts/` | Build steps factored out of the workflow so they're shellcheckable and runnable locally |
 | `pkg/postinstall` | Pre-warms both binaries (Gatekeeper first-exec) **before** flipping `current`, bootstraps the LaunchDaemon, sets up `/var/log/unbound` + newsyslog, keep-2 version GC |
@@ -58,7 +58,6 @@ lights up independently:
 | Mach-O signing | `APPLE_CERT_APPLICATION_P12` + `APPLE_APP_SIGNING_IDENTITY` (+ password) |
 | pkg productsign | above + `APPLE_CERT_INSTALLER_P12` + `APPLE_INSTALLER_SIGNING_IDENTITY` + `APPLE_TEAM_ID` (installer signing without a Team ID is refused — the onboard.sh assert must never be empty in a signed release) |
 | notarytool + staple + spctl | above + `APPLE_NOTARY_KEY_P8/_KEY_ID/_ISSUER_ID` |
-| pinned discovery checkout (canonical spec) | `DISCOVERY_CHECKOUT_TOKEN` |
 | S3 upload | `ARTIFACTS_AWS_ACCESS_KEY_ID` + `ARTIFACTS_AWS_SECRET_ACCESS_KEY` |
 
 Artifacts publish to

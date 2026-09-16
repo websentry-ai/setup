@@ -15,7 +15,6 @@
 #   APPLE_INSTALLER_SIGNING_IDENTITY "Developer ID Installer: ... (TEAMID)"
 #   APPLE_TEAM_ID
 #   APPLE_NOTARY_KEY_P8 / APPLE_NOTARY_KEY_ID / APPLE_NOTARY_ISSUER_ID
-#   DISCOVERY_CHECKOUT_TOKEN        read access to coding-discovery-tool
 #   ARTIFACTS_AWS_ACCESS_KEY_ID / ARTIFACTS_AWS_SECRET_ACCESS_KEY
 #       write access to the release-artifacts bucket below
 #
@@ -83,7 +82,6 @@ jobs:
           HAS_INSTALLER_CERT: ${{ secrets.APPLE_CERT_INSTALLER_P12 != '' && secrets.APPLE_INSTALLER_SIGNING_IDENTITY != '' }}
           HAS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
           HAS_NOTARY: ${{ secrets.APPLE_NOTARY_KEY_P8 != '' && secrets.APPLE_NOTARY_KEY_ID != '' && secrets.APPLE_NOTARY_ISSUER_ID != '' }}
-          HAS_DISCOVERY_TOKEN: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN != '' }}
           HAS_S3: ${{ secrets.ARTIFACTS_AWS_ACCESS_KEY_ID != '' && secrets.ARTIFACTS_AWS_SECRET_ACCESS_KEY != '' }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_BUILDER: ${{ inputs.builder }}
@@ -170,13 +168,6 @@ jobs:
             echo "::error::tag release requires ARTIFACTS_AWS_ACCESS_KEY_ID/ARTIFACTS_AWS_SECRET_ACCESS_KEY in the release environment. Dry-run via workflow_dispatch instead."
             exit 1
           fi
-          # A tag release must build the REAL discovery binary from the
-          # pinned checkout — the placeholder fallback is dry-run only (and
-          # the install-test version assert would reject it anyway).
-          if [[ "$publish" == "true" && "$HAS_DISCOVERY_TOKEN" != "true" ]]; then
-            echo "::error::tag release requires DISCOVERY_CHECKOUT_TOKEN (coding-discovery-tool checkout). Dry-run via workflow_dispatch instead."
-            exit 1
-          fi
 
           artifact_base="https://$ARTIFACTS_BUCKET.s3.$ARTIFACTS_REGION.amazonaws.com/macos/$version"
 
@@ -200,7 +191,6 @@ jobs:
             echo "pkg_sign=$pkg_sign"
             echo "notarize=$notarize"
             echo "s3=$HAS_S3"
-            echo "discovery_token=$HAS_DISCOVERY_TOKEN"
             echo "pkg_name=unbound-runtime-$version$builder_suffix.pkg"
             echo "tar_name=unbound-runtime-$version$builder_suffix.tar.gz"
             echo "artifact_name=unbound-runtime-$version$builder_suffix"
@@ -215,16 +205,13 @@ jobs:
       # source repo's main. A release is therefore recorded rather than
       # reproducible from this repo alone, and the next step is what records it:
       # this workflow drives PyInstaller directly and never runs
-      # build-discovery.sh. Put a SHA in SOURCE_REF to freeze a release. Gated:
-      # the placeholder build doesn't read the checkout yet; Stream B's spec
-      # will, at which point DISCOVERY_CHECKOUT_TOKEN becomes mandatory.
+      # build-discovery.sh. Put a SHA in SOURCE_REF to freeze a release.
+      # The source repo is public, so no token: an expired one fails the fetch.
       - name: Checkout coding-discovery-tool at SOURCE_REF
-        if: steps.cfg.outputs.discovery_token == 'true'
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           repository: websentry-ai/coding-discovery-tool
           ref: ${{ steps.cfg.outputs.discovery_ref }}
-          token: ${{ secrets.DISCOVERY_CHECKOUT_TOKEN }}
           path: discovery-src
 
       # Recorded in three places because each answers a different question:
@@ -232,7 +219,6 @@ jobs:
       # dist/unbound-discovery/SOURCE so a deployed device answers offline.
       - name: Record resolved discovery commit
         id: discovery
-        if: steps.cfg.outputs.discovery_token == 'true'
         env:
           DISCOVERY_REF: ${{ steps.cfg.outputs.discovery_ref }}
         run: |
@@ -241,10 +227,6 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "discovery source: $DISCOVERY_REF -> $sha"
           echo "discovery source: \`$DISCOVERY_REF\` @ \`$sha\`" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Note skipped discovery checkout
-        if: steps.cfg.outputs.discovery_token != 'true'
-        run: echo "::warning::DISCOVERY_CHECKOUT_TOKEN not configured — skipping discovery checkout (placeholder build only)"
 
       # Pinned python.org universal2 CPython — deliberately NOT
       # actions/setup-python (thin, non-relocatable build; cannot produce
@@ -336,26 +318,15 @@ jobs:
       - name: Build bundles with Nuitka (per-arch + lipo merge)
         if: steps.cfg.outputs.builder == 'nuitka'
         env:
-          HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
           NUITKA_CACHE_DIR: ${{ github.workspace }}/.nuitka-cache
         run: |
           set -euo pipefail
-          # Same source-selection contract as the PyInstaller step below:
-          # pinned checkout when the token is configured, placeholder
-          # discovery only on tokenless dry-runs (tag releases hard-require
-          # the token in cfg — and can never reach this step anyway).
-          if [[ "$HAS_DISCOVERY_SRC" == "true" ]]; then
-            export UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src"
-          else
-            echo "::warning::building PLACEHOLDER unbound-discovery (no DISCOVERY_CHECKOUT_TOKEN) — dry-run only"
-          fi
+          UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src" \
           NUITKA_PYTHON=./.build-venv-nuitka/bin/python \
             ./packaging/scripts/build-nuitka.sh dist
 
       - name: Build bundles from committed .spec files
         if: steps.cfg.outputs.builder == 'pyinstaller'
-        env:
-          HAS_DISCOVERY_SRC: ${{ steps.cfg.outputs.discovery_token }}
         run: |
           set -euo pipefail
           # Real Stream A spec (WEB-4786): vendored hook/MDM sources + hidden
@@ -364,19 +335,10 @@ jobs:
           # resolve from binary/, so invoking from the repo root is fine.
           ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
             binary/unbound-hook.spec
-          # Canonical discovery spec (WEB-4787) builds from the pinned
-          # checkout; the placeholder spec exists ONLY for tokenless
-          # workflow_dispatch dry-runs (tag releases hard-require the token
-          # in cfg, and the install-test version assert rejects placeholders).
-          if [[ "$HAS_DISCOVERY_SRC" == "true" ]]; then
-            UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src" \
-              ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
-              packaging/unbound-discovery.spec
-          else
-            echo "::warning::building PLACEHOLDER unbound-discovery (no DISCOVERY_CHECKOUT_TOKEN) — dry-run only"
+          # Canonical discovery spec (WEB-4787) builds from the pinned checkout.
+          UNBOUND_DISCOVERY_SRC="$GITHUB_WORKSPACE/discovery-src" \
             ./.build-venv/bin/pyinstaller --noconfirm --distpath dist --workpath build \
-              packaging/specs/unbound-discovery.spec
-          fi
+            packaging/unbound-discovery.spec
 
       - name: Lipo gate (every Mach-O universal2)
         run: ./packaging/scripts/lipo-gate.sh dist/unbound-hook dist/unbound-discovery
