@@ -335,23 +335,33 @@ def test_stdout_cannot_raise_out_of_an_mdm_install(relpath):
 
 @pytest.mark.parametrize("relpath", MDM_ENTRY_POINTS)
 def test_the_guard_survives_a_stream_that_cannot_encode(relpath):
-    """Run the real guard against a cp1252 stream, which is what Windows hands MDM."""
+    """Run the real guard against cp1252 streams, which is what Windows hands MDM.
+
+    stdout and stderr get their own wrapper: aliased to one object, a guard that
+    stopped reconfiguring either stream would still pass."""
     import io as _io
 
+    def narrow():
+        raw = _io.BytesIO()
+        return raw, _io.TextIOWrapper(raw, encoding="cp1252", newline="")
+
     module = load_module(relpath)
-    raw = _io.BytesIO()
-    narrow = _io.TextIOWrapper(raw, encoding="cp1252", newline="")
     line = "status \u2705 and dash \u2014\n"
-    with pytest.raises(UnicodeEncodeError):
-        narrow.write(line)
-        narrow.flush()
+    out_raw, out = narrow()
+    err_raw, err = narrow()
+    for stream in (out, err):
+        with pytest.raises(UnicodeEncodeError):
+            stream.write(line)
+            stream.flush()
 
     real_out, real_err = sys.stdout, sys.stderr
     try:
-        sys.stdout = sys.stderr = narrow
+        sys.stdout, sys.stderr = out, err
         module._stdout_never_raises()
     finally:
         sys.stdout, sys.stderr = real_out, real_err
-    narrow.write(line)
-    narrow.flush()
-    assert raw.getvalue().endswith(line.encode("utf-8"))
+
+    for stream, raw in ((out, out_raw), (err, err_raw)):
+        stream.write(line)
+        stream.flush()
+        assert raw.getvalue().endswith(line.encode("utf-8"))
