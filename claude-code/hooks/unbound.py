@@ -3058,19 +3058,12 @@ _COWORK_SESSIONS_DIRNAME = 'local-agent-mode-sessions'
 
 
 def _desktop_session_dir(event: Optional[Dict]) -> Optional[Path]:
-    """The Cowork sandbox session directory this hook run belongs to, resolved
-    from the paths Claude Code hands the hook.
-
-    Layout is
-    <support>/local-agent-mode-sessions/<accountUuid>/<organizationUuid>/local_<id>/,
-    so the path names the signed-in account's organization on its own. Only a
-    path under the real Claude Desktop support dir is accepted, so a tree
-    planted elsewhere is not read as a session. Best effort — never raises."""
+    """This run's Cowork session dir, from the paths Claude Code hands the hook.
+    Layout: <support>/local-agent-mode-sessions/<account>/<org>/local_<id>/. Only
+    a path under the real support dir is accepted. Never raises."""
     if not isinstance(event, dict):
         return None
-    # Every Claude Code run takes this path too, so settle it with a substring
-    # test before touching the disk: only a Cowork path can match, and resolve()
-    # below is the first syscall either way.
+    # Claude Code runs reach here too; settle them before touching the disk.
     paths = [
         event.get(field)
         for field in ('transcript_path', 'cwd')
@@ -3094,35 +3087,22 @@ def _desktop_session_dir(event: Optional[Dict]) -> Optional[Path]:
                 rel = candidate.relative_to(root).parts
             except Exception:
                 continue
-            # <accountUuid>/<organizationUuid>/local_<id>, plus whatever the
-            # path pointed at inside the session.
             if len(rel) >= 3 and rel[2].startswith('local_'):
                 return root / rel[0] / rel[1] / rel[2]
     return None
 
 
 def _desktop_session_identity(event: Optional[Dict]) -> Dict:
-    """Account identity for the Cowork session this run belongs to.
-
-    Claude Desktop does not hydrate oauthAccount into ~/.claude.json
-    (anthropics/claude-code#57026), so a Cowork run otherwise reports no
-    organization at all and an account-access policy keyed on organization
-    refuses every one of them, whoever is signed in.
-
-    Only the organization is taken, and only from the session path. The
-    session's own .claude.json sits inside the sandbox and the agent running
-    there can rewrite it; an email or plan read from it would be an attacker-
-    chosen value handed to a gate that accepts an organization, a domain or a
-    plan match alone. The path is written by Claude Desktop outside the
-    sandbox's subtree, so it is the one field worth reporting. Never raises."""
+    """Cowork identity. Claude Desktop omits oauthAccount from ~/.claude.json
+    (anthropics/claude-code#57026), so without this a Cowork run reports no org
+    and an org-keyed policy refuses everyone. Only the org is taken, and only
+    from the path: the session's own config is sandbox-writable. Never raises."""
     session = _desktop_session_dir(event)
     if session is None:
         return {}
     org_id = session.parent.name or None
     if not org_id:
         return {}
-    # A session directory exists only for a signed-in Desktop account, so the
-    # sign-in method follows from the path rather than from the config.
     return {'org_id': org_id, 'auth_mode': 'subscription'}
 
 
@@ -3206,9 +3186,7 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
             auth_mode = 'api_key'
     except Exception:
         pass
-    # A Cowork run is a sandbox session of its own account, which ~/.claude.json
-    # either does not describe at all or describes with the CLI's separate
-    # account. The session it actually belongs to wins.
+    # ~/.claude.json describes the CLI's account, not this session's.
     try:
         session = _desktop_session_identity(event)
     except Exception:
@@ -3216,17 +3194,12 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
     if session.get('org_id'):
         org_id = session['org_id']
         auth_mode = session.get('auth_mode') or auth_mode
-        # ~/.claude.json describes the CLI's separate account. Keeping its email
-        # or plan here would pair this session's organization with another
-        # account's domain, and the gate admits a request that matches either.
+        # Its email beside this org would offer the gate an approved domain.
         plan = None
         email = None
     elif not email:
-        # Only a non-Cowork run reaches the scan. It reads the same per-session
-        # configs the sandbox can write, and its all-sessions-agree rule is
-        # vacuous on a machine holding one session, so a Cowork run must not
-        # take an email from it either: a forged address would offer the gate an
-        # approved domain beside an organization it would otherwise refuse.
+        # Cowork skips the scan: it reads the same sandbox-writable configs, and
+        # its agree rule is vacuous on a machine holding one session.
         try:
             email = _desktop_session_email()
         except Exception:
@@ -3345,11 +3318,9 @@ def _device_serial(probe: bool = True) -> Optional[str]:
 
 
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
-    """read_account_identity pulls the full identity from the event's Cowork session
-    or ~/.claude.json; just add the device serial. probe defaults False so the
-    latency-critical pre-tool path only reads the cache; the end-of-turn exchange
-    passes probe=True. Never raises — on any failure the hook proceeds with
-    whatever identity it has (possibly none)."""
+    """read_account_identity reads the event's Cowork session or ~/.claude.json;
+    just add the device serial. probe defaults False so the latency-critical
+    pre-tool path only reads the cache. Never raises."""
     try:
         identity = read_account_identity(event)
         if not isinstance(identity, dict):
