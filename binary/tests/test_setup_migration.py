@@ -778,3 +778,71 @@ def test_setup_parses_and_ignores_a_stale_discovery_key(argv):
     assert opts is not None, "a stale --discovery-key must never be an unknown argument"
     assert opts["api_key"] == "K"
     assert "discovery_key" not in opts
+
+
+def test_every_vendored_function_setup_cmd_calls_actually_exists():
+    """setup_cmd drives the vendored modules by name, so a function renamed or
+    removed on one of them is an AttributeError at install time and nothing here
+    fails first. Reads the call sites out of the source rather than listing them,
+    or the list drifts out of date exactly when it matters.
+
+    Checked against the module each call site actually reaches where that is knowable:
+    a function that does `m = _module("copilot")` is checked against copilot alone, so
+    a name another tool happens to define cannot cover for it. Helpers that receive `m`
+    as a parameter name no tool, and fall back to the union.
+    """
+    import ast
+
+    source = Path(setup_cmd.__file__).with_suffix(".py").read_text(encoding="utf-8")
+
+    def called_in(node):
+        return {
+            n.func.attr
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+            and isinstance(n.func.value, ast.Name) and n.func.value.id == "m"
+        }
+
+    def tool_of(node):
+        """The tool a function pins itself to via _module("<tool>"), if it does."""
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                    and n.func.id == "_module" and n.args
+                    and isinstance(n.args[0], ast.Constant)
+                    and isinstance(n.args[0].value, str)):
+                return n.args[0].value
+        return None
+
+    tree = ast.parse(source)
+    modules = {}
+    for tool in ("claude-code", "codex", "copilot", "cursor", "augment"):
+        try:
+            modules[tool] = load_mdm_setup_module(tool)
+        except Exception:
+            continue
+    assert modules, "no vendored module loaded; the harness is broken, not the code"
+
+    pinned, unpinned = {}, set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef):
+            continue
+        names = called_in(node)
+        if not names:
+            continue
+        tool = tool_of(node)
+        if tool in modules:
+            pinned.setdefault(tool, set()).update(names)
+        else:
+            unpinned |= names
+    assert pinned, "no call site could be pinned to a tool; the extraction is broken"
+
+    problems = []
+    for tool, names in sorted(pinned.items()):
+        missing = sorted(n for n in names if not hasattr(modules[tool], n))
+        if missing:
+            problems.append(f"{tool}: {missing}")
+    # A helper takes `m` as a parameter and names no tool, so the union is all we know.
+    orphans = sorted(n for n in unpinned if not any(hasattr(mod, n) for mod in modules.values()))
+    if orphans:
+        problems.append(f"defined by no vendored module: {orphans}")
+    assert not problems, "setup_cmd calls functions its module does not define -> " + "; ".join(problems)
