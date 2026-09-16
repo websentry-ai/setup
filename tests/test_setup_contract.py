@@ -299,3 +299,59 @@ def test_copilot_backfill_ships_disabled(relpath):
     for every turn the installed hook already reported. Read from source, because the
     loader turns it on for the tests that cover the machinery."""
     assert "BACKFILL_ENABLED = False" in (REPO / relpath).read_text(), relpath
+
+
+# Installers MDM runs with stdout redirected. On Windows that pipe encodes as cp1252,
+# where one non-ASCII character in a status line takes down the whole run.
+MDM_ENTRY_POINTS = [s for s in SETUPS if "/mdm/" in s] + ["mdm/onboard.py"]
+
+
+def test_the_mdm_entry_point_inventory_is_not_empty():
+    """Derived by reading paths, so a move would quietly empty this and pass."""
+    assert len(MDM_ENTRY_POINTS) >= 5, MDM_ENTRY_POINTS
+
+
+@pytest.mark.parametrize("relpath", MDM_ENTRY_POINTS)
+def test_stdout_cannot_raise_out_of_an_mdm_install(relpath):
+    """The guard has to be main's first statement: anything printed before it runs is
+    printed unprotected, and the first status line is exactly where this bites."""
+    import ast
+
+    tree = ast.parse((REPO / relpath).read_text(encoding="utf-8"))
+    main = next((n for n in tree.body
+                 if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
+    assert main is not None, f"{relpath} has no module-level main()"
+
+    body = main.body
+    first = body[1] if (isinstance(body[0], ast.Expr)
+                        and isinstance(body[0].value, ast.Constant)
+                        and isinstance(body[0].value.value, str)
+                        and len(body) > 1) else body[0]
+    assert (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+            and isinstance(first.value.func, ast.Name)
+            and first.value.func.id == "_stdout_never_raises"), (
+        f"{relpath}: main() must call _stdout_never_raises() first")
+
+
+@pytest.mark.parametrize("relpath", MDM_ENTRY_POINTS)
+def test_the_guard_survives_a_stream_that_cannot_encode(relpath):
+    """Run the real guard against a cp1252 stream, which is what Windows hands MDM."""
+    import io as _io
+
+    module = load_module(relpath)
+    raw = _io.BytesIO()
+    narrow = _io.TextIOWrapper(raw, encoding="cp1252", newline="")
+    line = "status \u2705 and dash \u2014\n"
+    with pytest.raises(UnicodeEncodeError):
+        narrow.write(line)
+        narrow.flush()
+
+    real_out, real_err = sys.stdout, sys.stderr
+    try:
+        sys.stdout = sys.stderr = narrow
+        module._stdout_never_raises()
+    finally:
+        sys.stdout, sys.stderr = real_out, real_err
+    narrow.write(line)
+    narrow.flush()
+    assert raw.getvalue().endswith(line.encode("utf-8"))

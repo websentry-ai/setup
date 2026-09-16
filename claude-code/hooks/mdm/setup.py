@@ -2232,7 +2232,18 @@ def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = "http
         debug_print(f"Could not notify backend: {e}")
 
 
+def _stdout_never_raises() -> None:
+    """MDM gives this a non-console pipe, which on Windows defaults to cp1252 and
+    raises UnicodeEncodeError on the first non-ASCII status line."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main():
+    _stdout_never_raises()
     global DEBUG
 
     clear_mode = "--clear" in sys.argv
