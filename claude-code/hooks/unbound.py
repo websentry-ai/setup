@@ -3054,6 +3054,57 @@ def _claude_desktop_support_dirs() -> List[Path]:
 
 _DESKTOP_SESSION_MAX_BYTES = 512 * 1024
 
+_COWORK_SESSIONS_DIRNAME = 'local-agent-mode-sessions'
+
+
+def _desktop_session_dir(event: Optional[Dict]) -> Optional[Path]:
+    """This run's Cowork session dir, from the paths Claude Code hands the hook.
+    Layout: <support>/local-agent-mode-sessions/<account>/<org>/local_<id>/. Only
+    a path under the real support dir is accepted. Never raises."""
+    if not isinstance(event, dict):
+        return None
+    # Claude Code runs reach here too; settle them before touching the disk.
+    paths = [
+        event.get(field)
+        for field in ('transcript_path', 'cwd')
+        if isinstance(event.get(field), str)
+        and _COWORK_SESSIONS_DIRNAME in event[field]
+    ]
+    if not paths:
+        return None
+    try:
+        bases = [base.resolve() for base in _claude_desktop_support_dirs()]
+    except Exception:
+        return None
+    for raw in paths:
+        try:
+            candidate = Path(raw).resolve()
+        except Exception:
+            continue
+        for base in bases:
+            root = base / _COWORK_SESSIONS_DIRNAME
+            try:
+                rel = candidate.relative_to(root).parts
+            except Exception:
+                continue
+            if len(rel) >= 3 and rel[2].startswith('local_'):
+                return root / rel[0] / rel[1] / rel[2]
+    return None
+
+
+def _desktop_session_identity(event: Optional[Dict]) -> Dict:
+    """Cowork identity. Claude Desktop omits oauthAccount from ~/.claude.json
+    (anthropics/claude-code#57026), so without this a Cowork run reports no org
+    and an org-keyed policy refuses everyone. Only the org is taken, and only
+    from the path: the session's own config is sandbox-writable. Never raises."""
+    session = _desktop_session_dir(event)
+    if session is None:
+        return {}
+    org_id = session.parent.name or None
+    if not org_id:
+        return {}
+    return {'org_id': org_id, 'auth_mode': 'subscription'}
+
 
 def _desktop_session_email() -> Optional[str]:
     """Fallback for Team/SSO Claude Desktop, where the desktop app doesn't hydrate
@@ -3114,7 +3165,7 @@ def _desktop_session_email() -> Optional[str]:
     return found
 
 
-def read_account_identity() -> Dict:
+def read_account_identity(event: Optional[Dict] = None) -> Dict:
     org_id = None
     plan = None
     auth_mode = None
@@ -3135,7 +3186,20 @@ def read_account_identity() -> Dict:
             auth_mode = 'api_key'
     except Exception:
         pass
-    if not email:
+    # ~/.claude.json describes the CLI's account, not this session's.
+    try:
+        session = _desktop_session_identity(event)
+    except Exception:
+        session = {}
+    if session.get('org_id'):
+        org_id = session['org_id']
+        auth_mode = session.get('auth_mode') or auth_mode
+        # Its email beside this org would offer the gate an approved domain.
+        plan = None
+        email = None
+    elif not email:
+        # Cowork skips the scan: it reads the same sandbox-writable configs, and
+        # its agree rule is vacuous on a machine holding one session.
         try:
             email = _desktop_session_email()
         except Exception:
@@ -3253,13 +3317,12 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
-def build_account_identity(probe: bool = False) -> Dict:
-    """read_account_identity pulls the full user_email from ~/.claude.json; just add
-    the device serial. probe defaults False so the latency-critical pre-tool path only
-    reads the cache; the end-of-turn exchange passes probe=True. Never raises — on any
-    failure the hook proceeds with whatever identity it has (possibly none)."""
+def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
+    """read_account_identity reads the event's Cowork session or ~/.claude.json;
+    just add the device serial. probe defaults False so the latency-critical
+    pre-tool path only reads the cache. Never raises."""
     try:
-        identity = read_account_identity()
+        identity = read_account_identity(event)
         if not isinstance(identity, dict):
             identity = {}
     except Exception:
@@ -3768,7 +3831,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
             'tool_name': tool_name,
             'metadata': metadata
         },
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(event),
         'client_entrypoint': client_entrypoint,
         **_build_user_prompt_payload(recent_user_prompts),
     }
@@ -4533,7 +4596,7 @@ def process_user_prompt_submit(event: Dict, api_key: str) -> Dict:
         'unbound_app_label': _unbound_app_label(event),
         'model': model,
         'event_name': 'user_prompt',
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(event),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
         'pre_tool_use_data': {
             'tool_name': '',
@@ -4788,7 +4851,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-        'account_identity': build_account_identity(probe=True),
+        'account_identity': build_account_identity({'cwd': cwd}, probe=True),
     }
 
     if usage:

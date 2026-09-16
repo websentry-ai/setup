@@ -3,7 +3,7 @@ Tests for account-identity helpers in claude-code/hooks/unbound.py.
 
 Covers:
   - _email_domain
-  - read_account_identity  (CLAUDE_MCP_CONFIG_PATH variants)
+  - read_account_identity  (CLAUDE_MCP_CONFIG_PATH and Cowork session variants)
 """
 
 import json
@@ -421,6 +421,205 @@ class TestDesktopSessionEmail(unittest.TestCase):
         with patch.object(unbound, "_claude_desktop_support_dirs",
                           return_value=[_BadBase(), self.tmp]):
             self.assertEqual(unbound._desktop_session_email(), "ok@corp.com")
+
+
+class TestDesktopSessionIdentity(unittest.TestCase):
+    """_desktop_session_dir / _desktop_session_identity: a Cowork run reports the
+    organization of the session it belongs to, taken from the session path."""
+
+    ACCT = "cde7482a-446f-43c9-91b3-f480675a45c4"
+    ORG = "3e9f466f-645a-44fe-af6f-4f8259823234"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self._patcher = patch.object(
+            unbound, "_claude_desktop_support_dirs", return_value=[self.tmp]
+        )
+        self._patcher.start()
+        self.addCleanup(self._patcher.stop)
+        # resolve(): on macOS the temp dir is a /var -> /private/var symlink and
+        # the helper resolves before comparing.
+        self.session = (self.tmp / "local-agent-mode-sessions" / self.ACCT
+                        / self.ORG / "local_abc").resolve()
+
+    def _config(self, oauth, session=None):
+        p = (session or self.session) / ".claude" / ".claude.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({"oauthAccount": oauth}), encoding="utf-8")
+        return p
+
+    def _oauth(self, **over):
+        payload = {
+            "accountUuid": self.ACCT,
+            "organizationUuid": self.ORG,
+            "emailAddress": "user@corp.com",
+            "organizationType": "claude_enterprise",
+        }
+        payload.update(over)
+        return payload
+
+    def test_session_dir_from_cwd(self):
+        event = {"cwd": str(self.session / "outputs")}
+        self.assertEqual(unbound._desktop_session_dir(event), self.session)
+
+    def test_session_dir_from_transcript_path(self):
+        event = {"transcript_path": str(self.session / ".claude" / "projects" / "p" / "t.jsonl")}
+        self.assertEqual(unbound._desktop_session_dir(event), self.session)
+
+    def test_session_dir_from_the_session_root_itself(self):
+        self.assertEqual(unbound._desktop_session_dir({"cwd": str(self.session)}), self.session)
+
+    def test_session_dir_none_for_a_plain_repo_cwd(self):
+        self.assertIsNone(unbound._desktop_session_dir({"cwd": "/Users/dev/repo"}))
+
+    def test_session_dir_none_for_a_tree_outside_the_support_dir(self):
+        # A planted tree elsewhere on disk is not this user's Claude Desktop.
+        outside = Path(tempfile.mkdtemp()) / "local-agent-mode-sessions" / "a" / "b" / "local_c"
+        self.assertIsNone(unbound._desktop_session_dir({"cwd": str(outside)}))
+
+    def test_session_dir_none_without_a_local_session_segment(self):
+        stray = self.tmp / "local-agent-mode-sessions" / self.ACCT / self.ORG / "cowork_plugins"
+        self.assertIsNone(unbound._desktop_session_dir({"cwd": str(stray)}))
+
+    def test_session_dir_none_for_a_non_dict_event(self):
+        self.assertIsNone(unbound._desktop_session_dir("not-a-dict"))
+        self.assertIsNone(unbound._desktop_session_dir(None))
+
+    def test_identity_is_the_path_organization_only(self):
+        # The config is never read: it lives inside the sandbox, so an agent
+        # running there could name any email or plan it liked.
+        self._config(self._oauth())
+        self.assertEqual(
+            unbound._desktop_session_identity({"cwd": str(self.session)}),
+            {"org_id": self.ORG, "auth_mode": "subscription"},
+        )
+
+    def test_org_id_survives_a_missing_config(self):
+        self.assertEqual(
+            unbound._desktop_session_identity({"cwd": str(self.session)}),
+            {"org_id": self.ORG, "auth_mode": "subscription"},
+        )
+
+    def test_a_rewritten_config_cannot_change_the_reported_identity(self):
+        # The sandbox-writable config claims an approved-looking domain and a
+        # different plan; neither reaches the gate.
+        self._config(self._oauth(emailAddress="ceo@approved-corp.com",
+                                 organizationType="claude_enterprise"))
+        identity = unbound._desktop_session_identity({"cwd": str(self.session)})
+        self.assertEqual(identity, {"org_id": self.ORG, "auth_mode": "subscription"})
+        self.assertNotIn("user_email", identity)
+        self.assertNotIn("plan", identity)
+
+    def test_malformed_config_keeps_the_path_org(self):
+        p = self.session / ".claude" / ".claude.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("{not json", encoding="utf-8")
+        self.assertEqual(
+            unbound._desktop_session_identity({"cwd": str(self.session)}),
+            {"org_id": self.ORG, "auth_mode": "subscription"},
+        )
+
+    def test_no_session_returns_empty(self):
+        self.assertEqual(unbound._desktop_session_identity({"cwd": "/tmp"}), {})
+
+    def test_never_raises(self):
+        for event in (None, "x", {}, {"cwd": None}, {"cwd": 5}, {"transcript_path": []}):
+            try:
+                unbound._desktop_session_identity(event)
+            except Exception as exc:
+                self.fail(f"_desktop_session_identity raised {exc!r} for {event!r}")
+
+
+class TestReadAccountIdentityForCowork(unittest.TestCase):
+    """read_account_identity(event): the Cowork session wins over ~/.claude.json,
+    which describes the CLI's account and not the session's."""
+
+    ORG = "7b274105-463a-431c-b894-cc97cf580b2b"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.session = (self.tmp / "local-agent-mode-sessions" / "acct"
+                        / self.ORG / "local_abc")
+        cfg = self.session / ".claude" / ".claude.json"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(json.dumps({"oauthAccount": {
+            "organizationUuid": self.ORG,
+            "emailAddress": "dev@corp.com",
+            "organizationType": "claude_enterprise",
+        }}), encoding="utf-8")
+        p = patch.object(unbound, "_claude_desktop_support_dirs", return_value=[self.tmp])
+        p.start()
+        self.addCleanup(p.stop)
+        self.event = {"cwd": str(self.session / "outputs")}
+
+    def _home_config(self, payload):
+        p = self.tmp / "home.claude.json"
+        p.write_text(json.dumps(payload), encoding="utf-8")
+        return patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", p)
+
+    def test_cowork_reports_its_own_org(self):
+        # The Desktop-only case: ~/.claude.json never gets oauthAccount, so this
+        # is the whole of WEB-5650's false ORG_NOT_APPROVED refusals. The email
+        # comes from the all-sessions-agree scan, not from this session's own
+        # config, and the plan is not reported at all.
+        with self._home_config({}):
+            self.assertEqual(unbound.read_account_identity(self.event), {
+                "org_id": self.ORG, "plan": None,
+                "auth_mode": "subscription", "user_email": None,
+                "email_domain": None,
+            })
+
+    def test_cowork_session_wins_over_a_different_cli_account(self):
+        with self._home_config({"oauthAccount": {
+            "organizationUuid": "personal-org", "emailAddress": "me@gmail.com",
+            "organizationType": "claude_max",
+        }}):
+            result = unbound.read_account_identity(self.event)
+        self.assertEqual(result["org_id"], self.ORG)
+        self.assertIsNone(result["plan"])
+        self.assertIsNone(result["user_email"])
+
+    def test_cowork_never_takes_an_email_from_the_agree_scan(self):
+        # The scan reads the same sandbox-writable session configs, and a machine
+        # with one session agrees with itself, so a rewritten address would pass
+        # the agreement rule unchallenged.
+        with self._home_config({}):
+            self.assertIsNone(unbound.read_account_identity(self.event)["user_email"])
+
+    def test_cli_email_never_pairs_with_a_cowork_organization(self):
+        # The gate admits a request on an organization OR a domain match, so
+        # carrying the CLI account's approved domain beside this session's
+        # unapproved organization would let the session through.
+        import shutil
+        shutil.rmtree(self.session / ".claude")
+        with self._home_config({"oauthAccount": {
+            "organizationUuid": "personal-org",
+            "emailAddress": "ceo@approved-corp.com",
+            "organizationType": "claude_enterprise",
+        }}):
+            result = unbound.read_account_identity(self.event)
+        self.assertEqual(result["org_id"], self.ORG)
+        self.assertIsNone(result["user_email"])
+        self.assertIsNone(result["email_domain"])
+        self.assertIsNone(result["plan"])
+
+    def test_claude_code_run_is_unaffected(self):
+        with self._home_config({"oauthAccount": {
+            "organizationUuid": "personal-org", "emailAddress": "me@gmail.com",
+            "organizationType": "claude_max",
+        }}):
+            self.assertEqual(unbound.read_account_identity({"cwd": "/Users/dev/repo"}), {
+                "org_id": "personal-org", "plan": "claude_max",
+                "auth_mode": "subscription", "user_email": "me@gmail.com",
+                "email_domain": "gmail.com",
+            })
+
+    def test_no_event_is_unaffected(self):
+        with self._home_config({"oauthAccount": {
+            "organizationUuid": "personal-org", "emailAddress": "me@gmail.com",
+        }}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "personal-org")
+
 
 
 if __name__ == "__main__":
