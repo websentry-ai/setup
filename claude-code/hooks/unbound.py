@@ -3221,7 +3221,12 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
         # account's domain, and the gate admits a request that matches either.
         plan = None
         email = None
-    if not email:
+    elif not email:
+        # Only a non-Cowork run reaches the scan. It reads the same per-session
+        # configs the sandbox can write, and its all-sessions-agree rule is
+        # vacuous on a machine holding one session, so a Cowork run must not
+        # take an email from it either: a forged address would offer the gate an
+        # approved domain beside an organization it would otherwise refuse.
         try:
             email = _desktop_session_email()
         except Exception:

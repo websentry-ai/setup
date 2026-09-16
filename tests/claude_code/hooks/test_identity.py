@@ -565,8 +565,8 @@ class TestReadAccountIdentityForCowork(unittest.TestCase):
         with self._home_config({}):
             self.assertEqual(unbound.read_account_identity(self.event), {
                 "org_id": self.ORG, "plan": None,
-                "auth_mode": "subscription", "user_email": "dev@corp.com",
-                "email_domain": "corp.com",
+                "auth_mode": "subscription", "user_email": None,
+                "email_domain": None,
             })
 
     def test_cowork_session_wins_over_a_different_cli_account(self):
@@ -577,7 +577,14 @@ class TestReadAccountIdentityForCowork(unittest.TestCase):
             result = unbound.read_account_identity(self.event)
         self.assertEqual(result["org_id"], self.ORG)
         self.assertIsNone(result["plan"])
-        self.assertNotEqual(result["user_email"], "me@gmail.com")
+        self.assertIsNone(result["user_email"])
+
+    def test_cowork_never_takes_an_email_from_the_agree_scan(self):
+        # The scan reads the same sandbox-writable session configs, and a machine
+        # with one session agrees with itself, so a rewritten address would pass
+        # the agreement rule unchallenged.
+        with self._home_config({}):
+            self.assertIsNone(unbound.read_account_identity(self.event)["user_email"])
 
     def test_cli_email_never_pairs_with_a_cowork_organization(self):
         # The gate admits a request on an organization OR a domain match, so
