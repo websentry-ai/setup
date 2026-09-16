@@ -485,27 +485,30 @@ class TestDesktopSessionIdentity(unittest.TestCase):
         self.assertIsNone(unbound._desktop_session_dir("not-a-dict"))
         self.assertIsNone(unbound._desktop_session_dir(None))
 
-    def test_identity_from_session_path_and_config(self):
+    def test_identity_is_the_path_organization_only(self):
+        # The config is never read: it lives inside the sandbox, so an agent
+        # running there could name any email or plan it liked.
         self._config(self._oauth())
         self.assertEqual(
             unbound._desktop_session_identity({"cwd": str(self.session)}),
-            {"org_id": self.ORG, "user_email": "user@corp.com",
-             "plan": "claude_enterprise", "auth_mode": "subscription"},
+            {"org_id": self.ORG, "auth_mode": "subscription"},
         )
 
     def test_org_id_survives_a_missing_config(self):
-        # The path names the organization even when the sandbox wrote no config.
         self.assertEqual(
             unbound._desktop_session_identity({"cwd": str(self.session)}),
-            {"org_id": self.ORG},
+            {"org_id": self.ORG, "auth_mode": "subscription"},
         )
 
-    def test_config_claiming_another_org_contributes_nothing(self):
-        self._config(self._oauth(organizationUuid="99999999-0000-0000-0000-000000000000"))
-        self.assertEqual(
-            unbound._desktop_session_identity({"cwd": str(self.session)}),
-            {"org_id": self.ORG},
-        )
+    def test_a_rewritten_config_cannot_change_the_reported_identity(self):
+        # The sandbox-writable config claims an approved-looking domain and a
+        # different plan; neither reaches the gate.
+        self._config(self._oauth(emailAddress="ceo@approved-corp.com",
+                                 organizationType="claude_enterprise"))
+        identity = unbound._desktop_session_identity({"cwd": str(self.session)})
+        self.assertEqual(identity, {"org_id": self.ORG, "auth_mode": "subscription"})
+        self.assertNotIn("user_email", identity)
+        self.assertNotIn("plan", identity)
 
     def test_malformed_config_keeps_the_path_org(self):
         p = self.session / ".claude" / ".claude.json"
@@ -513,25 +516,8 @@ class TestDesktopSessionIdentity(unittest.TestCase):
         p.write_text("{not json", encoding="utf-8")
         self.assertEqual(
             unbound._desktop_session_identity({"cwd": str(self.session)}),
-            {"org_id": self.ORG},
+            {"org_id": self.ORG, "auth_mode": "subscription"},
         )
-
-    def test_oversized_config_keeps_the_path_org(self):
-        p = self.session / ".claude" / ".claude.json"
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text("x" * (unbound._DESKTOP_SESSION_MAX_BYTES + 10), encoding="utf-8")
-        self.assertEqual(
-            unbound._desktop_session_identity({"cwd": str(self.session)}),
-            {"org_id": self.ORG},
-        )
-
-    def test_blank_email_is_dropped_not_reported(self):
-        self._config(self._oauth(emailAddress="   "))
-        self.assertIsNone(unbound._desktop_session_identity({"cwd": str(self.session)})["user_email"])
-
-    def test_missing_plan_is_none(self):
-        self._config(self._oauth(organizationType=None))
-        self.assertIsNone(unbound._desktop_session_identity({"cwd": str(self.session)})["plan"])
 
     def test_no_session_returns_empty(self):
         self.assertEqual(unbound._desktop_session_identity({"cwd": "/tmp"}), {})
@@ -571,12 +557,14 @@ class TestReadAccountIdentityForCowork(unittest.TestCase):
         p.write_text(json.dumps(payload), encoding="utf-8")
         return patch.object(unbound, "CLAUDE_MCP_CONFIG_PATH", p)
 
-    def test_cowork_reports_its_own_org_when_home_config_has_none(self):
+    def test_cowork_reports_its_own_org(self):
         # The Desktop-only case: ~/.claude.json never gets oauthAccount, so this
-        # is the whole of WEB-5650's false ORG_NOT_APPROVED refusals.
+        # is the whole of WEB-5650's false ORG_NOT_APPROVED refusals. The email
+        # comes from the all-sessions-agree scan, not from this session's own
+        # config, and the plan is not reported at all.
         with self._home_config({}):
             self.assertEqual(unbound.read_account_identity(self.event), {
-                "org_id": self.ORG, "plan": "claude_enterprise",
+                "org_id": self.ORG, "plan": None,
                 "auth_mode": "subscription", "user_email": "dev@corp.com",
                 "email_domain": "corp.com",
             })
@@ -588,8 +576,25 @@ class TestReadAccountIdentityForCowork(unittest.TestCase):
         }}):
             result = unbound.read_account_identity(self.event)
         self.assertEqual(result["org_id"], self.ORG)
-        self.assertEqual(result["plan"], "claude_enterprise")
-        self.assertEqual(result["user_email"], "dev@corp.com")
+        self.assertIsNone(result["plan"])
+        self.assertNotEqual(result["user_email"], "me@gmail.com")
+
+    def test_cli_email_never_pairs_with_a_cowork_organization(self):
+        # The gate admits a request on an organization OR a domain match, so
+        # carrying the CLI account's approved domain beside this session's
+        # unapproved organization would let the session through.
+        import shutil
+        shutil.rmtree(self.session / ".claude")
+        with self._home_config({"oauthAccount": {
+            "organizationUuid": "personal-org",
+            "emailAddress": "ceo@approved-corp.com",
+            "organizationType": "claude_enterprise",
+        }}):
+            result = unbound.read_account_identity(self.event)
+        self.assertEqual(result["org_id"], self.ORG)
+        self.assertIsNone(result["user_email"])
+        self.assertIsNone(result["email_domain"])
+        self.assertIsNone(result["plan"])
 
     def test_claude_code_run_is_unaffected(self):
         with self._home_config({"oauthAccount": {

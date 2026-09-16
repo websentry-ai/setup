@@ -3107,31 +3107,23 @@ def _desktop_session_identity(event: Optional[Dict]) -> Dict:
     Claude Desktop does not hydrate oauthAccount into ~/.claude.json
     (anthropics/claude-code#57026), so a Cowork run otherwise reports no
     organization at all and an account-access policy keyed on organization
-    refuses every one of them, whoever is signed in. The organization uuid is a
-    segment of the session path; the email and plan come from the session's own
-    config, and only when that config agrees with the path about which
-    organization it is, so a rewritten config cannot rename the session's
-    account. Returns only the fields it could establish. Never raises."""
+    refuses every one of them, whoever is signed in.
+
+    Only the organization is taken, and only from the session path. The
+    session's own .claude.json sits inside the sandbox and the agent running
+    there can rewrite it; an email or plan read from it would be an attacker-
+    chosen value handed to a gate that accepts an organization, a domain or a
+    plan match alone. The path is written by Claude Desktop outside the
+    sandbox's subtree, so it is the one field worth reporting. Never raises."""
     session = _desktop_session_dir(event)
     if session is None:
         return {}
-    identity = {'org_id': session.parent.name or None}
-    try:
-        path = session / '.claude' / '.claude.json'
-        with open(path, 'rb') as f:
-            data = f.read(_DESKTOP_SESSION_MAX_BYTES + 1)
-        if len(data) > _DESKTOP_SESSION_MAX_BYTES:
-            return identity
-        oauth = json.loads(data.decode('utf-8')).get('oauthAccount')
-    except Exception:
-        return identity
-    if not isinstance(oauth, dict) or oauth.get('organizationUuid') != identity['org_id']:
-        return identity
-    email = oauth.get('emailAddress')
-    identity['user_email'] = email.strip() or None if isinstance(email, str) else None
-    identity['plan'] = oauth.get('organizationType') or None
-    identity['auth_mode'] = 'subscription'
-    return identity
+    org_id = session.parent.name or None
+    if not org_id:
+        return {}
+    # A session directory exists only for a signed-in Desktop account, so the
+    # sign-in method follows from the path rather than from the config.
+    return {'org_id': org_id, 'auth_mode': 'subscription'}
 
 
 def _desktop_session_email() -> Optional[str]:
@@ -3223,9 +3215,12 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
         session = {}
     if session.get('org_id'):
         org_id = session['org_id']
-        plan = session.get('plan')
         auth_mode = session.get('auth_mode') or auth_mode
-        email = session.get('user_email') or email
+        # ~/.claude.json describes the CLI's separate account. Keeping its email
+        # or plan here would pair this session's organization with another
+        # account's domain, and the gate admits a request that matches either.
+        plan = None
+        email = None
     if not email:
         try:
             email = _desktop_session_email()
