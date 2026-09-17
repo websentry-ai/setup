@@ -2727,45 +2727,6 @@ def _attach_connection_identity(metadata, tool_name):
         log_error('mcp-identity stamp failed: %s' % type(exc).__name__, 'mcp_identity')
 
 
-# Claude-only: kept outside the synced section above because the other agents
-# have no `projects` worktree-union semantics to read.
-def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
-                                           cwd: Optional[str] = None) -> Optional[Dict]:
-    """Claude unions local-scope servers across all linked worktrees of cwd's
-    repo, so a sibling checkout's project entry can be live here too."""
-    try:
-        if not cwd or not config_path.exists():
-            return None
-        roots = _git_worktree_roots(cwd)
-        if not roots:
-            return None
-        with open(config_path, 'r', encoding='utf-8') as f:
-            projects = (json.loads(f.read()) or {}).get('projects')
-        if not isinstance(projects, dict):
-            return None
-        for root in roots:
-            proj_data = projects.get(root.replace('\\', '/').rstrip('/'))
-            if not isinstance(proj_data, dict):
-                continue
-            proj_servers = proj_data.get('mcpServers', {})
-            if isinstance(proj_servers, dict) and server_name in proj_servers:
-                result = _extract_mcp_server_fields(proj_servers[server_name])
-                if result:
-                    return _augment_script_hash(result, cwd)
-        return None
-    except Exception:
-        return None
-
-
-def _email_domain(email: Optional[str]) -> Optional[str]:
-    try:
-        if email and '@' in email:
-            domain = email.rsplit('@', 1)[1].strip().lower()
-            return domain or None
-    except Exception:
-        pass
-
-
 def _read_mcp_server_config(server_name, config_path):
     """
     Read an MCP server's config (url, command, args, type) from the codex
