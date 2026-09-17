@@ -15,9 +15,10 @@ from tests.conftest import load_module
 REPO = Path(__file__).resolve().parent.parent
 COPIES = ['claude-code/hooks/unbound.py', 'codex/hooks/unbound.py']
 SYNCED_FUNCS = [
-    '_connection_server_key', '_normalize_account_email', '_gmail_messages',
-    '_account_from_gmail_message', '_extract_connection_account', '_mcp_identity_dir',
-    '_cache_connection_identity', '_read_connection_identity', '_attach_connection_identity',
+    '_looks_like_gmail_connection', '_connection_cache_key', '_normalize_account_email',
+    '_gmail_messages', '_account_from_gmail_message', '_extract_connection_account',
+    '_mcp_identity_dir', '_cache_connection_identity', '_read_connection_identity',
+    '_attach_connection_identity',
 ]
 HOOKS = [load_module(c) for c in COPIES]
 
@@ -44,13 +45,13 @@ class TestConnectionIdentityParity(unittest.TestCase):
                 self.assertEqual(acct['email'], 'sumit@unboundsecurity.ai')
                 self.assertEqual(acct['confidence'], 'high')
 
-    def test_each_copy_derives_the_server_key(self):
+    def test_each_copy_derives_the_cache_key(self):
         for hook in HOOKS:
             with self.subTest(hook=hook.__file__):
-                self.assertEqual(
-                    hook._connection_server_key('mcp__claude_ai_Gmail__search_threads'),
-                    'claude_ai_Gmail')
-                self.assertIsNone(hook._connection_server_key('Bash'))
+                key = hook._connection_cache_key('mcp__claude_ai_Gmail__search_threads', '/p')
+                self.assertTrue(key.startswith('claude_ai_Gmail__'))
+                self.assertIsNone(hook._connection_cache_key('mcp__slack__post', '/p'))
+                self.assertIsNone(hook._connection_cache_key('Bash', '/p'))
 
 
 if __name__ == '__main__':

@@ -2507,16 +2507,32 @@ _MCP_IDENTITY_EMAIL_RE = re.compile(
 _MCP_IDENTITY_MAX_EMAIL_LEN = 254
 
 
-def _connection_server_key(tool_name):
-    """Filesystem-safe cache key for one MCP connection, from the tool name's server segment
-    (mcp__<server>__<tool> → <server>). None for non-MCP or unusable names. Uses the literal
-    'mcp__' (not a module constant) so this synced block stays self-contained across copies."""
+def _looks_like_gmail_connection(server):
+    """v0 gate: only Gmail-named MCP connectors get an identity stamp. This keeps the feature
+    scoped to Gmail AND narrows the forge surface — a non-Gmail server returning a Gmail-shaped
+    response (labelIds/sender) is ignored rather than mis-attributed. (Full integrity against a
+    malicious/compromised connector is the brokered-connector end-state; a malicious server can
+    already exfil directly, so it gains nothing by forging its own identity stamp.)"""
+    return bool(server) and 'gmail' in server.lower()
+
+
+def _connection_cache_key(tool_name, cwd):
+    """Filesystem-safe, project-scoped cache key for one MCP connection: the tool name's server
+    segment (mcp__<server>__<tool> → <server>) PLUS a hash of the project cwd, so the same server
+    name resolved from different project configs (different Gmail connections) never share a cache
+    file. None for non-MCP names, non-Gmail servers, or unusable input. Uses the literal 'mcp__'
+    (not a module constant) so this synced block stays self-contained across copies."""
     prefix = 'mcp__'
     if not isinstance(tool_name, str) or not tool_name.startswith(prefix):
         return None
-    server = tool_name[len(prefix):].split('__', 1)[0]
-    key = re.sub(r'[^A-Za-z0-9._-]', '_', server.strip())[:128]
-    return key or None
+    server = tool_name[len(prefix):].split('__', 1)[0].strip()
+    if not server or not _looks_like_gmail_connection(server):
+        return None
+    server_key = re.sub(r'[^A-Za-z0-9._-]', '_', server)[:96]
+    if not server_key:
+        return None
+    scope = hashlib.sha256((cwd or '').encode('utf-8')).hexdigest()[:12]
+    return '%s__%s' % (server_key, scope)
 
 
 def _normalize_account_email(value):
@@ -2625,11 +2641,12 @@ def _mcp_identity_dir():
 
 
 def _cache_connection_identity(event):
-    """PostToolUse: if this was an MCP tool call whose response reveals the connected account,
-    cache it under ~/.unbound/mcp-identity/<server>.json (atomic replace). Never raises."""
+    """PostToolUse: if this was a Gmail MCP tool call whose response reveals the connected
+    account, cache it under ~/.unbound/mcp-identity/<key>.json (atomic replace). Never raises;
+    a write failure is logged (not silently dropped) so a broken cache is diagnosable."""
     try:
-        server_key = _connection_server_key(event.get('tool_name') or '')
-        if not server_key:
+        cache_key = _connection_cache_key(event.get('tool_name') or '', event.get('cwd'))
+        if not cache_key:
             return
         account = _extract_connection_account(event.get('tool_response'))
         if not account:
@@ -2641,37 +2658,52 @@ def _cache_connection_identity(event):
         }
         cache_dir = _mcp_identity_dir()
         cache_dir.mkdir(parents=True, exist_ok=True)
-        target = cache_dir / (server_key + '.json')
-        tmp = cache_dir / ('.%s.%d.tmp' % (server_key, os.getpid()))
+        target = cache_dir / (cache_key + '.json')
+        tmp = cache_dir / ('.%s.%d.tmp' % (cache_key, os.getpid()))
         tmp.write_text(json.dumps(record), encoding='utf-8')
         os.replace(str(tmp), str(target))
-    except Exception:
-        pass
+    except Exception as exc:
+        log_error('mcp-identity cache write failed: %s' % type(exc).__name__, 'mcp_identity')
 
 
-def _read_connection_identity(server_key):
-    """The cached account record for one connection, or None (missing/expired/corrupt/oversize).
-    Fail-open."""
+def _read_connection_identity(cache_key):
+    """The cached account record for one connection, or None (missing/expired/corrupt/oversize/
+    symlinked). Fail-open. Anomalies (symlink, oversize, corrupt) are logged so an operator can
+    tell them apart from a normal miss; a plain missing file and a normal expiry are silent."""
     try:
-        if not server_key:
+        if not cache_key:
             return None
-        target = _mcp_identity_dir() / (server_key + '.json')
+        target = _mcp_identity_dir() / (cache_key + '.json')
         if not target.is_file():
             return None
-        raw = target.read_text(encoding='utf-8')
-        if len(raw) > _MCP_IDENTITY_MAX_BYTES:
+        if target.is_symlink():  # never follow a symlinked cache entry (arbitrary-path/large IO)
+            log_error('mcp-identity cache entry is a symlink, ignoring: %s' % cache_key,
+                      'mcp_identity')
             return None
-        record = json.loads(raw)
+        # Read at most the cap + 1 byte so a corrupt/huge entry can't force unbounded IO here.
+        with open(str(target), 'r', encoding='utf-8') as fh:
+            raw = fh.read(_MCP_IDENTITY_MAX_BYTES + 1)
+        if len(raw) > _MCP_IDENTITY_MAX_BYTES:
+            log_error('mcp-identity cache entry over size cap, ignoring: %s' % cache_key,
+                      'mcp_identity')
+            return None
+        try:
+            record = json.loads(raw)
+        except Exception:
+            log_error('mcp-identity cache entry is corrupt JSON, ignoring: %s' % cache_key,
+                      'mcp_identity')
+            return None
         if not isinstance(record, dict):
             return None
         ts = record.get('ts')
         if not isinstance(ts, (int, float)) or (time.time() - ts) > _MCP_IDENTITY_TTL_SECONDS:
-            return None
+            return None  # normal expiry — silent
         account = record.get('account')
         if not isinstance(account, dict) or not account.get('email'):
             return None
         return record
-    except Exception:
+    except Exception as exc:
+        log_error('mcp-identity cache read failed: %s' % type(exc).__name__, 'mcp_identity')
         return None
 
 
@@ -2680,7 +2712,8 @@ def _attach_connection_identity(metadata, tool_name):
     connection so the gateway attributes/enforces on the real mailbox. Fail-open — a missing
     stamp is treated as 'unknown' (probe) server-side, never a silent allow."""
     try:
-        record = _read_connection_identity(_connection_server_key(tool_name))
+        record = _read_connection_identity(
+            _connection_cache_key(tool_name, metadata.get('cwd')))
         if not record:
             return
         account = record['account']
@@ -2690,6 +2723,45 @@ def _attach_connection_identity(metadata, tool_name):
             'confidence': record.get('confidence'),
             'source': 'endpoint_hook_cache',
         }
+    except Exception as exc:
+        log_error('mcp-identity stamp failed: %s' % type(exc).__name__, 'mcp_identity')
+
+
+# Claude-only: kept outside the synced section above because the other agents
+# have no `projects` worktree-union semantics to read.
+def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
+                                           cwd: Optional[str] = None) -> Optional[Dict]:
+    """Claude unions local-scope servers across all linked worktrees of cwd's
+    repo, so a sibling checkout's project entry can be live here too."""
+    try:
+        if not cwd or not config_path.exists():
+            return None
+        roots = _git_worktree_roots(cwd)
+        if not roots:
+            return None
+        with open(config_path, 'r', encoding='utf-8') as f:
+            projects = (json.loads(f.read()) or {}).get('projects')
+        if not isinstance(projects, dict):
+            return None
+        for root in roots:
+            proj_data = projects.get(root.replace('\\', '/').rstrip('/'))
+            if not isinstance(proj_data, dict):
+                continue
+            proj_servers = proj_data.get('mcpServers', {})
+            if isinstance(proj_servers, dict) and server_name in proj_servers:
+                result = _extract_mcp_server_fields(proj_servers[server_name])
+                if result:
+                    return _augment_script_hash(result, cwd)
+        return None
+    except Exception:
+        return None
+
+
+def _email_domain(email: Optional[str]) -> Optional[str]:
+    try:
+        if email and '@' in email:
+            domain = email.rsplit('@', 1)[1].strip().lower()
+            return domain or None
     except Exception:
         pass
 

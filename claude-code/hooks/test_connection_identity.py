@@ -5,6 +5,7 @@ Mirrors the ai-gateway-data mcp_identity_service extraction rules (SENT→sender
 INBOX→deliveredTo|single toRecipients) so the endpoint stamp agrees with the control-plane
 observe attribution.
 """
+import hashlib
 import json
 import time
 import tempfile
@@ -77,8 +78,6 @@ class ExtractAccountTests(unittest.TestCase):
             self.assertIsNone(unbound._extract_connection_account(bad))
 
     def test_most_frequent_mailbox_wins_across_messages(self):
-        # A thread seen from one mailbox: it is the sender of its SENT msg and the recipient of
-        # the received ones — all the same account; a stray counterparty must not win.
         out = {'threads': [{'messages': [
             {'labelIds': ['SENT'], 'sender': 'me@corp.com', 'toRecipients': ['peer@x.com']},
             {'labelIds': ['INBOX'], 'sender': 'peer@x.com', 'deliveredTo': 'me@corp.com'},
@@ -86,23 +85,31 @@ class ExtractAccountTests(unittest.TestCase):
         self.assertEqual(unbound._extract_connection_account(out)['email'], 'me@corp.com')
 
 
-# ── server-key derivation ─────────────────────────────────────────────────────
+# ── cache-key derivation (Gmail-gated + project-scoped) ───────────────────────
 
-class ServerKeyTests(unittest.TestCase):
-    def test_parses_and_sanitizes(self):
-        self.assertEqual(
-            unbound._connection_server_key('mcp__claude_ai_Gmail__search_threads'),
-            'claude_ai_Gmail')
+class CacheKeyTests(unittest.TestCase):
+    def test_gmail_server_is_scoped_by_cwd(self):
+        key = unbound._connection_cache_key('mcp__claude_ai_Gmail__search_threads', '/proj/a')
+        scope = hashlib.sha256(b'/proj/a').hexdigest()[:12]
+        self.assertEqual(key, 'claude_ai_Gmail__' + scope)
+
+    def test_same_server_different_projects_get_different_keys(self):
+        a = unbound._connection_cache_key('mcp__claude_ai_Gmail__x', '/proj/a')
+        b = unbound._connection_cache_key('mcp__claude_ai_Gmail__x', '/proj/b')
+        self.assertNotEqual(a, b)
+
+    def test_non_gmail_server_is_gated_out(self):
+        self.assertIsNone(unbound._connection_cache_key('mcp__slack__post_message', '/p'))
+        self.assertIsNone(unbound._connection_cache_key('mcp__asana__create_task', '/p'))
 
     def test_non_mcp_is_none(self):
-        self.assertIsNone(unbound._connection_server_key('Bash'))
-        self.assertIsNone(unbound._connection_server_key(''))
-        self.assertIsNone(unbound._connection_server_key(None))
+        self.assertIsNone(unbound._connection_cache_key('Bash', '/p'))
+        self.assertIsNone(unbound._connection_cache_key('', '/p'))
+        self.assertIsNone(unbound._connection_cache_key(None, '/p'))
 
     def test_path_traversal_chars_are_stripped(self):
-        key = unbound._connection_server_key('mcp__../../etc/passwd__x')
+        key = unbound._connection_cache_key('mcp__gmail/../../etc__x', '/p')
         self.assertNotIn('/', key)
-        self.assertNotIn('..', key.replace('.', ''))  # dots kept but no slash escape
 
 
 # ── cache round-trip + stamp ──────────────────────────────────────────────────
@@ -117,16 +124,17 @@ class CacheAndStampTests(unittest.TestCase):
         self.addCleanup(p.stop)
         self.addCleanup(self._tmp.cleanup)
 
-    def _sent_event(self, tool='mcp__claude_ai_Gmail__search_threads'):
+    def _sent_event(self, tool='mcp__claude_ai_Gmail__search_threads', cwd='/proj/a'):
         return {
             'tool_name': tool,
+            'cwd': cwd,
             'tool_response': {'threads': [{'messages': [
                 {'labelIds': ['SENT'], 'sender': 'sumit@unboundsecurity.ai'}]}]},
         }
 
     def test_cache_then_stamp_round_trip(self):
         unbound._cache_connection_identity(self._sent_event())
-        meta = {'mcp_server': 'Gmail'}  # display name differs from the raw key — keyed by tool_name
+        meta = {'mcp_server': 'Gmail', 'cwd': '/proj/a'}  # same project → hit
         unbound._attach_connection_identity(meta, 'mcp__claude_ai_Gmail__send_message')
         ci = meta['connection_identity']
         self.assertEqual(ci['status'], 'resolved')
@@ -134,26 +142,40 @@ class CacheAndStampTests(unittest.TestCase):
         self.assertEqual(ci['account']['domain'], 'unboundsecurity.ai')
         self.assertEqual(ci['source'], 'endpoint_hook_cache')
 
-    def test_no_account_no_cache_no_stamp(self):
-        unbound._cache_connection_identity(
-            {'tool_name': 'mcp__claude_ai_Gmail__search_threads',
-             'tool_response': {'files': [{'owner': 'x@y.com'}]}})
-        meta = {}
+    def test_stamp_is_isolated_across_projects(self):
+        unbound._cache_connection_identity(self._sent_event(cwd='/proj/a'))
+        meta = {'cwd': '/proj/b'}  # different project → no cross-contamination
         unbound._attach_connection_identity(meta, 'mcp__claude_ai_Gmail__send_message')
         self.assertNotIn('connection_identity', meta)
 
+    def test_no_account_no_cache_no_stamp(self):
+        unbound._cache_connection_identity(
+            {'tool_name': 'mcp__claude_ai_Gmail__search_threads', 'cwd': '/p',
+             'tool_response': {'files': [{'owner': 'x@y.com'}]}})
+        meta = {'cwd': '/p'}
+        unbound._attach_connection_identity(meta, 'mcp__claude_ai_Gmail__send_message')
+        self.assertNotIn('connection_identity', meta)
+
+    def test_non_gmail_mcp_call_is_not_cached(self):
+        unbound._cache_connection_identity(
+            {'tool_name': 'mcp__slack__post', 'cwd': '/p',
+             'tool_response': {'labelIds': ['SENT'], 'sender': 'a@b.com'}})
+        self.assertEqual(list(self.state_dir.glob('**/*.json')), [])
+
     def test_non_mcp_event_is_ignored(self):
         unbound._cache_connection_identity(
-            {'tool_name': 'Bash', 'tool_response': {'labelIds': ['SENT'], 'sender': 'a@b.com'}})
+            {'tool_name': 'Bash', 'cwd': '/p',
+             'tool_response': {'labelIds': ['SENT'], 'sender': 'a@b.com'}})
         self.assertEqual(list(self.state_dir.glob('**/*.json')), [])
 
     def test_expired_entry_is_not_stamped(self):
         unbound._cache_connection_identity(self._sent_event())
-        cache = self.state_dir / unbound._MCP_IDENTITY_DIRNAME / 'claude_ai_Gmail.json'
+        key = unbound._connection_cache_key('mcp__claude_ai_Gmail__x', '/proj/a')
+        cache = self.state_dir / unbound._MCP_IDENTITY_DIRNAME / (key + '.json')
         rec = json.loads(cache.read_text())
         rec['ts'] = int(time.time()) - unbound._MCP_IDENTITY_TTL_SECONDS - 10
         cache.write_text(json.dumps(rec))
-        meta = {}
+        meta = {'cwd': '/proj/a'}
         unbound._attach_connection_identity(meta, 'mcp__claude_ai_Gmail__send_message')
         self.assertNotIn('connection_identity', meta)
 
@@ -167,12 +189,21 @@ class CacheAndStampTests(unittest.TestCase):
                         'pad': 'z' * (unbound._MCP_IDENTITY_MAX_BYTES + 10)}))
         self.assertIsNone(unbound._read_connection_identity('b'))
 
+    def test_read_is_capped_before_full_load(self):
+        # A pathologically large entry must not be read whole: the capped read returns cap+1
+        # bytes at most, which then trips the size guard.
+        cache_dir = self.state_dir / unbound._MCP_IDENTITY_DIRNAME
+        cache_dir.mkdir(parents=True)
+        big = cache_dir / 'big.json'
+        big.write_text('x' * (unbound._MCP_IDENTITY_MAX_BYTES * 4))
+        self.assertIsNone(unbound._read_connection_identity('big'))
+
     def test_missing_entry_is_none(self):
         self.assertIsNone(unbound._read_connection_identity('nope'))
         self.assertIsNone(unbound._read_connection_identity(None))
 
     def test_stamp_is_absent_for_non_mcp_tool(self):
-        meta = {}
+        meta = {'cwd': '/p'}
         unbound._attach_connection_identity(meta, 'Bash')
         self.assertNotIn('connection_identity', meta)
 
