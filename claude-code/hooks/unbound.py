@@ -3000,6 +3000,217 @@ def _attach_tool_content_hash(metadata):
 # ───────────────────────── end MCP tool risk-scoring section ─────────────────
 
 
+# KEEP IN SYNC across the mcp__-tool-name hook copies (claude-code/codex) — byte-identical, do
+# not diverge. (cursor has no MCP path; copilot reconstructs MCP names / has a custom PostToolUse
+# path, and augment resolves MCP servers from config rather than an mcp__server__tool name — both
+# need their own key derivation, tracked as follow-ups.)
+# Connection-identity account stamp:
+# on an MCP tool RESPONSE we extract WHICH account the connection is bound to (v0: Gmail — the
+# mailbox behind the connector) and cache it under ~/.unbound/mcp-identity/<server>.json; on the
+# next PreToolUse we stamp metadata['connection_identity'] from that cache so the gateway can
+# attribute/enforce on the real mailbox. Mirrors ai-gateway-data mcp_identity_service extraction
+# (SENT→sender / INBOX→deliveredTo|single toRecipients + strict email normalisation). Fail-open
+# throughout: any error leaves the request unstamped (the gateway then treats it as 'unknown'),
+# never blocks the tool call.
+
+_MCP_IDENTITY_DIRNAME = 'mcp-identity'
+_MCP_IDENTITY_MAX_BYTES = 64 * 1024
+_MCP_IDENTITY_TTL_SECONDS = 30 * 24 * 3600  # a mailbox↔connection binding is stable for weeks
+# Strict single-address shape (mirrors ai-gateway-data _ACCOUNT_EMAIL_RE): local@domain.tld with
+# no spaces/control chars/angle brackets/quotes/commas. MCP output is attacker-controlled, so a
+# display name or a garbage token like `gmail.com>` must never be stored (it would misclassify).
+_MCP_IDENTITY_EMAIL_RE = re.compile(
+    r'^[^\x00-\x20@<>",]+@[^\x00-\x20@<>",]+\.[^\x00-\x20@<>",]{2,}$')
+_MCP_IDENTITY_MAX_EMAIL_LEN = 254
+
+
+def _connection_server_key(tool_name):
+    """Filesystem-safe cache key for one MCP connection, from the tool name's server segment
+    (mcp__<server>__<tool> → <server>). None for non-MCP or unusable names. Uses the literal
+    'mcp__' (not a module constant) so this synced block stays self-contained across copies."""
+    prefix = 'mcp__'
+    if not isinstance(tool_name, str) or not tool_name.startswith(prefix):
+        return None
+    server = tool_name[len(prefix):].split('__', 1)[0]
+    key = re.sub(r'[^A-Za-z0-9._-]', '_', server.strip())[:128]
+    return key or None
+
+
+def _normalize_account_email(value):
+    """Canonicalise one address, or None if it isn't a plausible single mailbox. Mirrors the
+    control-plane _normalize_email: unwrap "Name <addr>", lowercase, cap at 254, strict shape."""
+    if not isinstance(value, (str, int, float)):
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if '<' in s and '>' in s:  # "Display Name <addr@x>" → the bracketed address is the mailbox
+        inner = s[s.rfind('<') + 1:s.rfind('>')].strip()
+        if inner:
+            s = inner
+    s = s.lower()
+    if len(s) > _MCP_IDENTITY_MAX_EMAIL_LEN:
+        return None
+    return s if _MCP_IDENTITY_EMAIL_RE.match(s) else None
+
+
+def _gmail_messages(response):
+    """Yield message dicts from the known Gmail response shapes: search_threads →
+    threads[*].messages[*]; get_thread → messages[*]; get_message → the whole object."""
+    if not isinstance(response, dict):
+        return
+    threads = response.get('threads')
+    if isinstance(threads, list):
+        for thread in threads:
+            if isinstance(thread, dict):
+                for message in thread.get('messages') or []:
+                    if isinstance(message, dict):
+                        yield message
+        return
+    messages = response.get('messages')
+    if isinstance(messages, list):
+        for message in messages:
+            if isinstance(message, dict):
+                yield message
+        return
+    yield response  # flat: the response is a single message
+
+
+def _account_from_gmail_message(message):
+    """The connected mailbox for one Gmail message as (email, confidence), or None. SENT → the
+    sender (high). INBOX & not SENT → deliveredTo else a SINGLE toRecipients (medium); an
+    ambiguous multi-recipient received mail attributes nothing rather than guess."""
+    labels = {
+        str(x).upper() for x in (message.get('labelIds') or [])
+        if isinstance(x, (str, int, float))
+    }
+    if 'SENT' in labels:
+        email = _normalize_account_email(message.get('sender'))
+        return (email, 'high') if email else None
+    if 'INBOX' in labels and 'SENT' not in labels:
+        delivered = message.get('deliveredTo')
+        if isinstance(delivered, str) and delivered.strip():
+            candidates = [delivered]
+        else:
+            recipients = message.get('toRecipients')
+            if isinstance(recipients, list):
+                vals = [r for r in recipients if isinstance(r, str) and r.strip()]
+                candidates = vals if len(vals) == 1 else []  # single_only: no guessing
+            elif isinstance(recipients, str) and recipients.strip():
+                candidates = [recipients]
+            else:
+                candidates = []
+        if len(candidates) == 1:
+            email = _normalize_account_email(candidates[0])
+            return (email, 'medium') if email else None
+    return None
+
+
+def _extract_connection_account(response):
+    """The single account a connection is bound to, from an MCP tool response, as
+    {email, domain, confidence}, or None. v0: Gmail only (other shapes yield nothing). When
+    messages disagree the most frequent mailbox wins (a thread is one mailbox's view), ties
+    broken by confidence."""
+    if isinstance(response, str):
+        try:
+            response = json.loads(response)
+        except Exception:
+            return None
+    tally = {}  # email -> [count, best_confidence_rank]
+    for message in _gmail_messages(response):
+        found = _account_from_gmail_message(message)
+        if not found:
+            continue
+        email, confidence = found
+        entry = tally.setdefault(email, [0, 0])
+        entry[0] += 1
+        entry[1] = max(entry[1], 2 if confidence == 'high' else 1)
+    if not tally:
+        return None
+    email = max(tally, key=lambda e: (tally[e][0], tally[e][1]))
+    return {
+        'email': email,
+        'domain': email.split('@', 1)[1],
+        'confidence': 'high' if tally[email][1] == 2 else 'medium',
+    }
+
+
+def _mcp_identity_dir():
+    """The identity-cache directory (created lazily on write). Uses the primary ~/.unbound state
+    dir from the shared resolver so it stays aligned with the other on-disk caches."""
+    return _unbound_state_dir_candidates()[0] / _MCP_IDENTITY_DIRNAME
+
+
+def _cache_connection_identity(event):
+    """PostToolUse: if this was an MCP tool call whose response reveals the connected account,
+    cache it under ~/.unbound/mcp-identity/<server>.json (atomic replace). Never raises."""
+    try:
+        server_key = _connection_server_key(event.get('tool_name') or '')
+        if not server_key:
+            return
+        account = _extract_connection_account(event.get('tool_response'))
+        if not account:
+            return
+        record = {
+            'account': {'email': account['email'], 'domain': account['domain']},
+            'confidence': account['confidence'],
+            'ts': int(time.time()),
+        }
+        cache_dir = _mcp_identity_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / (server_key + '.json')
+        tmp = cache_dir / ('.%s.%d.tmp' % (server_key, os.getpid()))
+        tmp.write_text(json.dumps(record), encoding='utf-8')
+        os.replace(str(tmp), str(target))
+    except Exception:
+        pass
+
+
+def _read_connection_identity(server_key):
+    """The cached account record for one connection, or None (missing/expired/corrupt/oversize).
+    Fail-open."""
+    try:
+        if not server_key:
+            return None
+        target = _mcp_identity_dir() / (server_key + '.json')
+        if not target.is_file():
+            return None
+        raw = target.read_text(encoding='utf-8')
+        if len(raw) > _MCP_IDENTITY_MAX_BYTES:
+            return None
+        record = json.loads(raw)
+        if not isinstance(record, dict):
+            return None
+        ts = record.get('ts')
+        if not isinstance(ts, (int, float)) or (time.time() - ts) > _MCP_IDENTITY_TTL_SECONDS:
+            return None
+        account = record.get('account')
+        if not isinstance(account, dict) or not account.get('email'):
+            return None
+        return record
+    except Exception:
+        return None
+
+
+def _attach_connection_identity(metadata, tool_name):
+    """PreToolUse: stamp metadata['connection_identity'] from the cached account for this MCP
+    connection so the gateway attributes/enforces on the real mailbox. Fail-open — a missing
+    stamp is treated as 'unknown' (probe) server-side, never a silent allow."""
+    try:
+        record = _read_connection_identity(_connection_server_key(tool_name))
+        if not record:
+            return
+        account = record['account']
+        metadata['connection_identity'] = {
+            'status': 'resolved',
+            'account': {'email': account.get('email'), 'domain': account.get('domain')},
+            'confidence': record.get('confidence'),
+            'source': 'endpoint_hook_cache',
+        }
+    except Exception:
+        pass
+
+
 # Claude-only: kept outside the synced section above because the other agents
 # have no `projects` worktree-union semantics to read.
 def _read_mcp_server_config_worktree_union(server_name: str, config_path: Path,
@@ -3807,6 +4018,7 @@ def _evaluate_pre_tool_use_policies(event: Dict, api_key: str) -> Dict:
                     metadata['mcp_server_config'] = union_cfg
 
             _attach_tool_content_hash(metadata)
+            _attach_connection_identity(metadata, tool_name)
 
     approval_key = f"{tool_name}:{command}"
     is_retry = _is_approval_retry(approval_key)
@@ -6419,6 +6631,9 @@ def main():
         }
 
         append_to_audit_log(log_entry)
+
+        if hook_event_name == 'PostToolUse':
+            _cache_connection_identity(event)
 
         if hook_event_name == 'Stop' and session_id:
             process_stop_event(event, api_key)
