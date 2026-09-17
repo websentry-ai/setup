@@ -1369,14 +1369,16 @@ def is_autopilot_continuation(data):
     """True for the user.message autopilot writes to nudge itself on, which nobody typed.
 
     It carries no content -- the instruction sits in transformedContent -- so treating it
-    as a prompt starts a turn the user never began. VS Code emits no such entry."""
+    as a prompt starts a turn the user never began. VS Code emits no such entry.
+
+    Empty content is required whichever marker matched, so text a user actually typed is
+    reported however the entry around it is labelled."""
     if not isinstance(data, dict):
         return False
-    if data.get('isAutopilotContinuation'):
-        return True
     content = data.get('content')
-    return data.get('source') == 'system' and not (
-        content.strip() if isinstance(content, str) else content)
+    empty = not (content.strip() if isinstance(content, str) else content)
+    return empty and bool(data.get('isAutopilotContinuation')
+                          or data.get('source') == 'system')
 
 
 def turn_prompt_id(entry, conversation_id, index, content):

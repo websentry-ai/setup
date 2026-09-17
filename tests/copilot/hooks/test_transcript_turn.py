@@ -477,9 +477,6 @@ class TestReportedPromptWatermark(unittest.TestCase):
         self.assertEqual(unbound.get_forwarded_state(None), (set(), None, set(), 0))
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 def _continuation():
     """The user.message autopilot writes to push itself on. Field-for-field what the CLI
@@ -493,7 +490,13 @@ class AutopilotContinuationTests(unittest.TestCase):
     """A turn autopilot continues is one turn, so it is one row keyed on its own prompt."""
 
     def test_a_continuation_is_not_a_prompt(self):
-        self.assertTrue(unbound.is_autopilot_continuation(_continuation()["data"]))
+        for data in (_continuation()["data"],
+                     # The markerless form: system-authored, no content.
+                     {"content": "", "source": "system"},
+                     {"content": "   ", "source": "system"},
+                     {"source": "system"},
+                     {"content": "", "isAutopilotContinuation": True}):
+            self.assertTrue(unbound.is_autopilot_continuation(data), data)
 
     def test_a_typed_prompt_is_never_mistaken_for_one(self):
         for data in ({"content": "hi"},
@@ -502,6 +505,25 @@ class AutopilotContinuationTests(unittest.TestCase):
                      {"content": ""},
                      {}):
             self.assertFalse(unbound.is_autopilot_continuation(data), data)
+
+    def test_text_is_reported_however_the_entry_is_labelled(self):
+        """Content decides, not the marker. A transcript is a local file, so a flag on an
+        entry that carries real text must not take that text out of the audit log."""
+        for data in ({"content": "hi", "isAutopilotContinuation": True},
+                     {"content": "hi", "source": "system"},
+                     {"content": "hi", "source": "system",
+                      "isAutopilotContinuation": True}):
+            self.assertFalse(unbound.is_autopilot_continuation(data), data)
+
+    def test_a_flagged_entry_carrying_text_still_opens_a_turn(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="a real prompt",
+                   source="system", isAutopilotContinuation=True),
+            _entry("assistant.message", content="answer"),
+        ])
+        exchange, _, _, _, turn_id = unbound.build_exchange_from_transcript(path, SESSION)
+        self.assertEqual(_user_text(exchange), ["a real prompt"])
+        self.assertEqual(turn_id, "p1")
 
     def test_it_does_not_open_a_turn_of_its_own(self):
         path = _transcript([
@@ -616,3 +638,5 @@ class RebuildSpansTheContinuationTests(unittest.TestCase):
     def test_a_real_prompt_still_closes_the_turn(self):
         _user, assistant = unbound.rebuild_turn_content(self._path(), SESSION, "p1")
         self.assertNotIn("other turn", assistant)
+if __name__ == "__main__":
+    unittest.main()
