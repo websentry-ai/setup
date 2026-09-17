@@ -1365,6 +1365,22 @@ def get_session_marker(session_key):
     return {}
 
 
+def is_autopilot_continuation(data):
+    """True for the user.message autopilot writes to nudge itself on, which nobody typed.
+
+    It carries no content -- the instruction sits in transformedContent -- so treating it
+    as a prompt starts a turn the user never began. VS Code emits no such entry.
+
+    Empty content is required whichever marker matched, so text a user actually typed is
+    reported however the entry around it is labelled."""
+    if not isinstance(data, dict):
+        return False
+    content = data.get('content')
+    empty = not (content.strip() if isinstance(content, str) else content)
+    return empty and bool(data.get('isAutopilotContinuation')
+                          or data.get('source') == 'system')
+
+
 def turn_prompt_id(entry, conversation_id, index, content):
     """Stable id for a user prompt entry. An entry without an envelope id still has to be
     watermarked, or every later Stop re-selects it and re-uploads its text with the
@@ -1465,6 +1481,10 @@ def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
         entry_type = entry.get('type')
         data = entry.get('data') or {}
         if entry_type == 'user.message':
+            # Autopilot's nudge is not the next prompt, so it does not close the turn.
+            # Matches the turn this rebuild is completing, which spans it too.
+            if is_autopilot_continuation(data):
+                continue
             if user_prompt is not None:
                 break  # the next prompt closes the turn
             content = data.get('content')
@@ -5230,6 +5250,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 model = new_model
         elif entry_type == 'user.message':
             content = data.get('content')
+            if is_autopilot_continuation(data):
+                # Never a turn boundary: this is the turn already open being pushed on,
+                # and its output belongs to the prompt that started it.
+                continue
             # An entry without an envelope id still has to be watermarked, or every later
             # Stop re-selects it and re-uploads its text with the current turn. Keyed the
             # same way turn_id is when its id is missing.
