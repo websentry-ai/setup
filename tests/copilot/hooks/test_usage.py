@@ -781,3 +781,4 @@ class TestStorePathsMustBeRegularFiles(unittest.TestCase):
             os.mkfifo(str(store))
             with patch.object(unbound, "_COPILOT_STORE", store):
                 self.assertIsNone(unbound._cli_turn_usage(SESSION, None, float("inf")))
+

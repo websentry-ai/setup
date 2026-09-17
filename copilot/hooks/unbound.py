@@ -1365,6 +1365,20 @@ def get_session_marker(session_key):
     return {}
 
 
+def is_autopilot_continuation(data):
+    """True for the user.message autopilot writes to nudge itself on, which nobody typed.
+
+    It carries no content -- the instruction sits in transformedContent -- so treating it
+    as a prompt starts a turn the user never began. VS Code emits no such entry."""
+    if not isinstance(data, dict):
+        return False
+    if data.get('isAutopilotContinuation'):
+        return True
+    content = data.get('content')
+    return data.get('source') == 'system' and not (
+        content.strip() if isinstance(content, str) else content)
+
+
 def turn_prompt_id(entry, conversation_id, index, content):
     """Stable id for a user prompt entry. An entry without an envelope id still has to be
     watermarked, or every later Stop re-selects it and re-uploads its text with the
@@ -5230,6 +5244,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 model = new_model
         elif entry_type == 'user.message':
             content = data.get('content')
+            if is_autopilot_continuation(data):
+                # Never a turn boundary: this is the turn already open being pushed on,
+                # and its output belongs to the prompt that started it.
+                continue
             # An entry without an envelope id still has to be watermarked, or every later
             # Stop re-selects it and re-uploads its text with the current turn. Keyed the
             # same way turn_id is when its id is missing.
