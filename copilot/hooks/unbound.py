@@ -1479,6 +1479,10 @@ def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
         entry_type = entry.get('type')
         data = entry.get('data') or {}
         if entry_type == 'user.message':
+            # Autopilot's nudge is not the next prompt, so it does not close the turn.
+            # Matches the turn this rebuild is completing, which spans it too.
+            if is_autopilot_continuation(data):
+                continue
             if user_prompt is not None:
                 break  # the next prompt closes the turn
             content = data.get('content')

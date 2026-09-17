@@ -589,3 +589,30 @@ class VSCodeTranscriptUnaffectedTests(unittest.TestCase):
             path, SESSION, already_prompted={"p1"})
         self.assertEqual(_user_text(exchange), ["second"])
         self.assertEqual(turn_id, "p2")
+
+
+class RebuildSpansTheContinuationTests(unittest.TestCase):
+    """rebuild_turn_content backfills a turn's text when its tokens land late. It must
+    span the same turn build_exchange_from_transcript does, or the two disagree about
+    where the turn ends."""
+
+    def _path(self):
+        return _transcript([
+            _entry("user.message", _id="p1", content="do the thing"),
+            _entry("assistant.message", content="first half"),
+            _continuation(),
+            _entry("assistant.message", content="second half"),
+            _entry("session.task_complete"),
+            _entry("user.message", _id="p2", content="next turn"),
+            _entry("assistant.message", content="other turn"),
+        ])
+
+    def test_the_rebuild_covers_the_whole_turn(self):
+        user, assistant = unbound.rebuild_turn_content(self._path(), SESSION, "p1")
+        self.assertEqual(user, "do the thing")
+        self.assertIn("first half", assistant)
+        self.assertIn("second half", assistant)
+
+    def test_a_real_prompt_still_closes_the_turn(self):
+        _user, assistant = unbound.rebuild_turn_content(self._path(), SESSION, "p1")
+        self.assertNotIn("other turn", assistant)
