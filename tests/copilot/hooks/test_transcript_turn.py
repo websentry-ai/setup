@@ -477,5 +477,243 @@ class TestReportedPromptWatermark(unittest.TestCase):
         self.assertEqual(unbound.get_forwarded_state(None), (set(), None, set(), 0))
 
 
+
+def _continuation():
+    """The user.message autopilot writes to push itself on. Field-for-field what the CLI
+    records: empty content, the instruction parked in transformedContent."""
+    return _entry("user.message", _id="cont-1", content="", source="system",
+                  isAutopilotContinuation=True, agentMode="autopilot", delivery="idle",
+                  transformedContent="You have not yet marked the task as complete ...")
+
+
+class AutopilotContinuationTests(unittest.TestCase):
+    """A turn autopilot continues is one turn, so it is one row keyed on its own prompt."""
+
+    def test_a_continuation_is_not_a_prompt(self):
+        for data in (_continuation()["data"],
+                     # The markerless form: system-authored, no content.
+                     {"content": "", "source": "system"},
+                     {"content": "   ", "source": "system"},
+                     {"source": "system"},
+                     {"content": "", "isAutopilotContinuation": True}):
+            self.assertTrue(unbound.is_autopilot_continuation(data), data)
+
+    def test_a_typed_prompt_is_never_mistaken_for_one(self):
+        for data in ({"content": "hi"},
+                     {"content": "hi", "source": "user"},
+                     # Empty from a real user still is not autopilot's.
+                     {"content": ""},
+                     {}):
+            self.assertFalse(unbound.is_autopilot_continuation(data), data)
+
+    def test_text_is_reported_however_the_entry_is_labelled(self):
+        """Content decides, not the marker. A transcript is a local file, so a flag on an
+        entry that carries real text must not take that text out of the audit log."""
+        for data in ({"content": "hi", "isAutopilotContinuation": True},
+                     {"content": "hi", "source": "system"},
+                     {"content": "hi", "source": "system",
+                      "isAutopilotContinuation": True}):
+            self.assertFalse(unbound.is_autopilot_continuation(data), data)
+
+    def test_a_flagged_entry_carrying_text_still_opens_a_turn(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="a real prompt",
+                   source="system", isAutopilotContinuation=True),
+            _entry("assistant.message", content="answer"),
+        ])
+        exchange, _, _, _, turn_id = unbound.build_exchange_from_transcript(path, SESSION)
+        self.assertEqual(_user_text(exchange), ["a real prompt"])
+        self.assertEqual(turn_id, "p1")
+
+    def test_it_does_not_open_a_turn_of_its_own(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="do the thing"),
+            _entry("assistant.message", content="working"),
+            _continuation(),
+            _entry("assistant.message", content="still working"),
+            _entry("session.task_complete"),
+        ])
+        exchange, _, _, prompts, turn_id = unbound.build_exchange_from_transcript(
+            path, SESSION)
+        self.assertEqual(_user_text(exchange), ["do the thing"])
+        # Keyed on the prompt's id, not the continuation's, so the row the first Stop
+        # created is the row this addresses.
+        self.assertEqual(turn_id, "p1")
+        self.assertNotIn("cont-1", prompts)
+
+    def test_a_reported_turn_that_only_continued_produces_nothing(self):
+        """The bug: the continuation became a turn with no prompt and its own request id."""
+        path = _transcript([
+            _entry("user.message", _id="p1", content="do the thing"),
+            _entry("assistant.message", content="working"),
+            _continuation(),
+            _entry("assistant.message", content="still working"),
+            _entry("session.task_complete"),
+        ])
+        exchange, _, _, _, _ = unbound.build_exchange_from_transcript(
+            path, SESSION, already_prompted={"p1"})
+        self.assertIsNone(exchange)
+
+    def test_the_whole_turn_rides_the_one_row(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="do the thing"),
+            _entry("assistant.message", content="first half")]
+            + _tool("call-a") + [
+            _continuation(),
+            _entry("assistant.message", content="second half")]
+            + _tool("call-b") + [
+            _entry("session.task_complete"),
+        ])
+        exchange, forwarded, _, _, _ = unbound.build_exchange_from_transcript(
+            path, SESSION)
+        assistant = exchange["messages"][-1]["content"]
+        self.assertIn("first half", assistant)
+        self.assertIn("second half", assistant)
+        self.assertEqual(forwarded, {"call-a", "call-b"})
+
+    def test_a_later_prompt_still_starts_its_own_turn(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="first"),
+            _continuation(),
+            _entry("session.task_complete"),
+            _entry("user.message", _id="p2", content="second"),
+            _entry("assistant.message", content="answer"),
+            _entry("session.task_complete"),
+        ])
+        exchange, _, _, _, turn_id = unbound.build_exchange_from_transcript(
+            path, SESSION, already_prompted={"p1"})
+        self.assertEqual(_user_text(exchange), ["second"])
+        self.assertEqual(turn_id, "p2")
+
+
+class VSCodeTranscriptUnaffectedTests(unittest.TestCase):
+    """VS Code emits no continuation and no task_complete, so none of this may reach it."""
+
+    def _vscode(self):
+        return [
+            _entry("user.message", _id="p1", content="first"),
+            _entry("assistant.message", content="answer one"),
+            _entry("user.message", _id="p2", content="second"),
+            _entry("assistant.message", content="answer two"),
+        ]
+
+    def test_turn_selection_is_unchanged(self):
+        path = _transcript(self._vscode())
+        exchange, _, _, prompts, turn_id = unbound.build_exchange_from_transcript(
+            path, SESSION)
+        self.assertEqual(_user_text(exchange), ["first\n\nsecond"])
+        self.assertEqual(turn_id, "p1")
+        self.assertEqual(prompts, {"p1", "p2"})
+
+    def test_an_unreported_prompt_is_always_selected(self):
+        path = _transcript(self._vscode())
+        exchange, _, _, _, turn_id = unbound.build_exchange_from_transcript(
+            path, SESSION, already_prompted={"p1"})
+        self.assertEqual(_user_text(exchange), ["second"])
+        self.assertEqual(turn_id, "p2")
+
+
+class RebuildSpansTheContinuationTests(unittest.TestCase):
+    """rebuild_turn_content backfills a turn's text when its tokens land late. It must
+    span the same turn build_exchange_from_transcript does, or the two disagree about
+    where the turn ends."""
+
+    def _path(self):
+        return _transcript([
+            _entry("user.message", _id="p1", content="do the thing"),
+            _entry("assistant.message", content="first half"),
+            _continuation(),
+            _entry("assistant.message", content="second half"),
+            _entry("session.task_complete"),
+            _entry("user.message", _id="p2", content="next turn"),
+            _entry("assistant.message", content="other turn"),
+        ])
+
+    def test_the_rebuild_covers_the_whole_turn(self):
+        user, assistant = unbound.rebuild_turn_content(self._path(), SESSION, "p1")
+        self.assertEqual(user, "do the thing")
+        self.assertIn("first half", assistant)
+        self.assertIn("second half", assistant)
+
+    def test_a_real_prompt_still_closes_the_turn(self):
+        _user, assistant = unbound.rebuild_turn_content(self._path(), SESSION, "p1")
+        self.assertNotIn("other turn", assistant)
+
+class ServedModelTests(unittest.TestCase):
+    """A CLI turn names the model that served it. The transcript says so per assistant
+    message; without reading it every such row reads 'auto'."""
+
+    def _path(self, *models):
+        entries = [_entry("user.message", _id="p1", content="go")]
+        for m in models:
+            entries.append(_entry("assistant.message", content="text", model=m))
+        return _transcript(entries)
+
+    def _model(self, path, **kw):
+        exchange, _, _, _, _ = unbound.build_exchange_from_transcript(path, SESSION, **kw)
+        return exchange["model"]
+
+    def test_it_reports_the_model_that_served_the_turn(self):
+        self.assertEqual(self._model(self._path("claude-haiku-4.5")), "claude-haiku-4.5")
+
+    def test_it_outranks_the_auto_the_session_started_with(self):
+        """The session-start value is the picker's selection; 'auto' is not a model."""
+        self.assertEqual(
+            self._model(self._path("gpt-5.4-mini"), session_start_model="auto"),
+            "gpt-5.4-mini")
+
+    def test_the_message_that_finished_the_turn_decides(self):
+        self.assertEqual(
+            self._model(self._path("gpt-5.4-mini", "claude-haiku-4.5")),
+            "claude-haiku-4.5")
+
+    def test_a_turn_with_no_model_keeps_the_old_answer(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="go"),
+            _entry("assistant.message", content="text"),
+        ])
+        self.assertEqual(self._model(path, session_start_model="gpt-4.1"), "gpt-4.1")
+        self.assertEqual(self._model(path), "auto")
+
+    def test_an_unusable_model_is_ignored_rather_than_sent(self):
+        for bad in (None, "", "   ", 42, {"name": "x"}, []):
+            path = _transcript([
+                _entry("user.message", _id="p1", content="go"),
+                _entry("assistant.message", content="text", model=bad),
+            ])
+            self.assertEqual(
+                self._model(path, session_start_model="gpt-4.1"), "gpt-4.1", bad)
+
+    def test_an_absurd_model_name_is_bounded(self):
+        """The transcript is a local file and this name reaches the shared model catalog."""
+        self.assertEqual(len(self._model(self._path("x" * 5000))), 255)
+
+    def test_a_continuations_own_messages_still_count(self):
+        """Autopilot continues a turn with the same model, and those messages are the ones
+        that finish it."""
+        path = _transcript([
+            _entry("user.message", _id="p1", content="go"),
+            _entry("assistant.message", content="first", model="claude-haiku-4.5"),
+            _continuation(),
+            _entry("assistant.message", content="second", model="claude-haiku-4.5"),
+        ])
+        self.assertEqual(self._model(path, session_start_model="auto"), "claude-haiku-4.5")
+
+
+class VSCodeModelUnaffectedTests(unittest.TestCase):
+    """VS Code writes no model on assistant.message; it is resolved from its own journal
+    by the caller, which runs after this and overrides. Measured: 0 of 208 entries across
+    40 real VS Code transcripts carry one."""
+
+    def test_a_vscode_shaped_turn_is_untouched(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="go"),
+            _entry("assistant.message", content="answer"),
+        ])
+        exchange, _, _, _, _ = unbound.build_exchange_from_transcript(
+            path, SESSION, session_start_model="gpt-5.6-terra")
+        self.assertEqual(exchange["model"], "gpt-5.6-terra")
+
+
 if __name__ == "__main__":
     unittest.main()

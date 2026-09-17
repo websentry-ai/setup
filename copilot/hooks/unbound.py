@@ -72,6 +72,10 @@ MCP_DIAG_UPLOAD_TIMEOUT_SECONDS = 30
 # ~/.claude.json carries per-project history and can run to megabytes.
 MCP_DIAG_MAX_CONFIG_BYTES = 20 * 1024 * 1024
 
+# Matches the backend's model-name column, which truncates to the same length before the
+# name reaches the catalog every tenant reads.
+MAX_MODEL_NAME_CHARS = 255
+
 # Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
 # binary must make ZERO network calls other than the backend/gateway APIs:
 # discovery runs from the locally installed binary instead of a GitHub-fetched
@@ -1365,6 +1369,22 @@ def get_session_marker(session_key):
     return {}
 
 
+def is_autopilot_continuation(data):
+    """True for the user.message autopilot writes to nudge itself on, which nobody typed.
+
+    It carries no content -- the instruction sits in transformedContent -- so treating it
+    as a prompt starts a turn the user never began. VS Code emits no such entry.
+
+    Empty content is required whichever marker matched, so text a user actually typed is
+    reported however the entry around it is labelled."""
+    if not isinstance(data, dict):
+        return False
+    content = data.get('content')
+    empty = not (content.strip() if isinstance(content, str) else content)
+    return empty and bool(data.get('isAutopilotContinuation')
+                          or data.get('source') == 'system')
+
+
 def turn_prompt_id(entry, conversation_id, index, content):
     """Stable id for a user prompt entry. An entry without an envelope id still has to be
     watermarked, or every later Stop re-selects it and re-uploads its text with the
@@ -1465,6 +1485,10 @@ def rebuild_turn_content(transcript_path, conversation_id, prompt_id):
         entry_type = entry.get('type')
         data = entry.get('data') or {}
         if entry_type == 'user.message':
+            # Autopilot's nudge is not the next prompt, so it does not close the turn.
+            # Matches the turn this rebuild is completing, which spans it too.
+            if is_autopilot_continuation(data):
+                continue
             if user_prompt is not None:
                 break  # the next prompt closes the turn
             content = data.get('content')
@@ -5230,6 +5254,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
                 model = new_model
         elif entry_type == 'user.message':
             content = data.get('content')
+            if is_autopilot_continuation(data):
+                # Never a turn boundary: this is the turn already open being pushed on,
+                # and its output belongs to the prompt that started it.
+                continue
             # An entry without an envelope id still has to be watermarked, or every later
             # Stop re-selects it and re-uploads its text with the current turn. Keyed the
             # same way turn_id is when its id is missing.
@@ -5263,6 +5291,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
              ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
+    # The model that actually served this turn, which names the real one behind an 'auto'
+    # pick. The CLI records it per assistant message; VS Code records none here and is
+    # resolved from its own journal by the caller instead.
+    served_model = None
     tool_calls = []          # ordered list of call ids
     tool_data = {}           # call_id -> {name, arguments, result, success}
     skill_events = []        # raw `skill.invoked` payloads seen this turn
@@ -5290,6 +5322,11 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             content = data.get('content')
             if content:
                 text_parts.append(content)
+            # Last one wins: one model serves a turn, and the message that finished it is
+            # the one that says which. Bounded because a transcript is a local file.
+            entry_model = data.get('model')
+            if isinstance(entry_model, str) and entry_model.strip():
+                served_model = entry_model.strip()[:MAX_MODEL_NAME_CHARS]
             for req in data.get('toolRequests') or []:
                 if not isinstance(req, dict):
                     continue
@@ -5408,7 +5445,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     return {
         'conversation_id': conversation_id,
-        'model': model or session_start_model or 'auto',
+        'model': served_model or model or session_start_model or 'auto',
         'messages': messages,
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user
