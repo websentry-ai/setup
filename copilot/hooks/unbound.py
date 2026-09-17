@@ -72,6 +72,10 @@ MCP_DIAG_UPLOAD_TIMEOUT_SECONDS = 30
 # ~/.claude.json carries per-project history and can run to megabytes.
 MCP_DIAG_MAX_CONFIG_BYTES = 20 * 1024 * 1024
 
+# Matches the backend's model-name column, which truncates to the same length before the
+# name reaches the catalog every tenant reads.
+MAX_MODEL_NAME_CHARS = 255
+
 # Frozen-binary mode (the PyInstaller-packaged `unbound-hook` CLI). The frozen
 # binary must make ZERO network calls other than the backend/gateway APIs:
 # discovery runs from the locally installed binary instead of a GitHub-fetched
@@ -5287,6 +5291,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
              ).encode('utf-8', 'replace')).hexdigest()[:24]
 
     text_parts = []
+    # The model that actually served this turn, which names the real one behind an 'auto'
+    # pick. The CLI records it per assistant message; VS Code records none here and is
+    # resolved from its own journal by the caller instead.
+    served_model = None
     tool_calls = []          # ordered list of call ids
     tool_data = {}           # call_id -> {name, arguments, result, success}
     skill_events = []        # raw `skill.invoked` payloads seen this turn
@@ -5314,6 +5322,11 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
             content = data.get('content')
             if content:
                 text_parts.append(content)
+            # Last one wins: one model serves a turn, and the message that finished it is
+            # the one that says which. Bounded because a transcript is a local file.
+            entry_model = data.get('model')
+            if isinstance(entry_model, str) and entry_model.strip():
+                served_model = entry_model.strip()[:MAX_MODEL_NAME_CHARS]
             for req in data.get('toolRequests') or []:
                 if not isinstance(req, dict):
                     continue
@@ -5432,7 +5445,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
 
     return {
         'conversation_id': conversation_id,
-        'model': model or session_start_model or 'auto',
+        'model': served_model or model or session_start_model or 'auto',
         'messages': messages,
         'cwd': cwd,
         # Turn-level fallback: rows without a per-call project (the user

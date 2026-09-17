@@ -638,5 +638,82 @@ class RebuildSpansTheContinuationTests(unittest.TestCase):
     def test_a_real_prompt_still_closes_the_turn(self):
         _user, assistant = unbound.rebuild_turn_content(self._path(), SESSION, "p1")
         self.assertNotIn("other turn", assistant)
+
+class ServedModelTests(unittest.TestCase):
+    """A CLI turn names the model that served it. The transcript says so per assistant
+    message; without reading it every such row reads 'auto'."""
+
+    def _path(self, *models):
+        entries = [_entry("user.message", _id="p1", content="go")]
+        for m in models:
+            entries.append(_entry("assistant.message", content="text", model=m))
+        return _transcript(entries)
+
+    def _model(self, path, **kw):
+        exchange, _, _, _, _ = unbound.build_exchange_from_transcript(path, SESSION, **kw)
+        return exchange["model"]
+
+    def test_it_reports_the_model_that_served_the_turn(self):
+        self.assertEqual(self._model(self._path("claude-haiku-4.5")), "claude-haiku-4.5")
+
+    def test_it_outranks_the_auto_the_session_started_with(self):
+        """The session-start value is the picker's selection; 'auto' is not a model."""
+        self.assertEqual(
+            self._model(self._path("gpt-5.4-mini"), session_start_model="auto"),
+            "gpt-5.4-mini")
+
+    def test_the_message_that_finished_the_turn_decides(self):
+        self.assertEqual(
+            self._model(self._path("gpt-5.4-mini", "claude-haiku-4.5")),
+            "claude-haiku-4.5")
+
+    def test_a_turn_with_no_model_keeps_the_old_answer(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="go"),
+            _entry("assistant.message", content="text"),
+        ])
+        self.assertEqual(self._model(path, session_start_model="gpt-4.1"), "gpt-4.1")
+        self.assertEqual(self._model(path), "auto")
+
+    def test_an_unusable_model_is_ignored_rather_than_sent(self):
+        for bad in (None, "", "   ", 42, {"name": "x"}, []):
+            path = _transcript([
+                _entry("user.message", _id="p1", content="go"),
+                _entry("assistant.message", content="text", model=bad),
+            ])
+            self.assertEqual(
+                self._model(path, session_start_model="gpt-4.1"), "gpt-4.1", bad)
+
+    def test_an_absurd_model_name_is_bounded(self):
+        """The transcript is a local file and this name reaches the shared model catalog."""
+        self.assertEqual(len(self._model(self._path("x" * 5000))), 255)
+
+    def test_a_continuations_own_messages_still_count(self):
+        """Autopilot continues a turn with the same model, and those messages are the ones
+        that finish it."""
+        path = _transcript([
+            _entry("user.message", _id="p1", content="go"),
+            _entry("assistant.message", content="first", model="claude-haiku-4.5"),
+            _continuation(),
+            _entry("assistant.message", content="second", model="claude-haiku-4.5"),
+        ])
+        self.assertEqual(self._model(path, session_start_model="auto"), "claude-haiku-4.5")
+
+
+class VSCodeModelUnaffectedTests(unittest.TestCase):
+    """VS Code writes no model on assistant.message; it is resolved from its own journal
+    by the caller, which runs after this and overrides. Measured: 0 of 208 entries across
+    40 real VS Code transcripts carry one."""
+
+    def test_a_vscode_shaped_turn_is_untouched(self):
+        path = _transcript([
+            _entry("user.message", _id="p1", content="go"),
+            _entry("assistant.message", content="answer"),
+        ])
+        exchange, _, _, _, _ = unbound.build_exchange_from_transcript(
+            path, SESSION, session_start_model="gpt-5.6-terra")
+        self.assertEqual(exchange["model"], "gpt-5.6-terra")
+
+
 if __name__ == "__main__":
     unittest.main()
