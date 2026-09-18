@@ -1063,21 +1063,36 @@ def _read_cursor_item_table(db_path, keys):
     return {} if readable else None
 
 
+def _cursor_team_id(raw):
+    """The Cursor team's id, from the cached team record. None for a personal
+    account, which belongs to no team. Never raises."""
+    try:
+        team = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        team_id = team.get('teamId') if isinstance(team, dict) else None
+        return str(team_id) if team_id not in (None, '') else None
+    except Exception:
+        return None
+
+
 def read_account_identity():
     plan = None
     email = None
+    org_id = None
     unreadable = False
     try:
         db_path = _cursor_state_db_path()
         if db_path and db_path.exists():
             values = _read_cursor_item_table(
-                db_path, ['cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType']
+                db_path,
+                ['cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType',
+                 'cursorAuth/cachedTeam'],
             )
             if values is None:
                 unreadable = True
             else:
                 email = (values.get('cursorAuth/cachedEmail') or '').strip() or None
                 plan = values.get('cursorAuth/stripeMembershipType') or None
+                org_id = _cursor_team_id(values.get('cursorAuth/cachedTeam'))
     except Exception:
         unreadable = True
     if email:
@@ -1087,10 +1102,13 @@ def read_account_identity():
         # no account means signed out, and reusing the last account there would
         # hand a signed-out or switched user the previous approval.
         email, plan = _cached_account(plan)
+        # The cache carries no team, and a team kept from a different account
+        # would name the wrong tenant.
+        org_id = None
     else:
         _forget_account()
     return {
-        'org_id': None,
+        'org_id': org_id,
         'plan': plan,
         'auth_mode': None,
         'user_email': email,

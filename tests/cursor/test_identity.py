@@ -263,5 +263,31 @@ class TestBuildAccountIdentity(unittest.TestCase):
         )
 
 
+class TestCursorTeamId(unittest.TestCase):
+    """org_id was hardcoded None, so every Cursor account looked tenant-less.
+    Cursor caches the team in its own state db; read it."""
+
+    def test_reads_the_team_id(self):
+        self.assertEqual(
+            unbound._cursor_team_id('{"teamId":22471406,"name":"Unbound"}'), "22471406")
+
+    def test_returns_a_string_the_char_column_can_hold(self):
+        self.assertIsInstance(unbound._cursor_team_id('{"teamId":1}'), str)
+
+    def test_a_personal_account_has_no_team(self):
+        self.assertIsNone(unbound._cursor_team_id(None))
+        self.assertIsNone(unbound._cursor_team_id("{}"))
+        self.assertIsNone(unbound._cursor_team_id('{"name":"Unbound"}'))
+
+    def test_a_zero_id_is_still_an_id(self):
+        self.assertEqual(unbound._cursor_team_id('{"teamId":0}'), "0")
+
+    def test_corrupt_json_is_failsafe_none(self):
+        self.assertIsNone(unbound._cursor_team_id("{not json"))
+
+    def test_bytes_are_accepted(self):
+        self.assertEqual(unbound._cursor_team_id(b'{"teamId":7}'), "7")
+
+
 if __name__ == "__main__":
     unittest.main()
