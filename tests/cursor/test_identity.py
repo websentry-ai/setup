@@ -285,6 +285,19 @@ class TestCursorTeamId(unittest.TestCase):
     def test_corrupt_json_is_failsafe_none(self):
         self.assertIsNone(unbound._cursor_team_id("{not json"))
 
+    def test_an_unreadable_record_is_logged(self):
+        """A personal account and a corrupt record both yield None, so the one
+        that is a failure has to say so."""
+        with patch.object(unbound, "log_error") as logged:
+            unbound._cursor_team_id("{not json")
+        self.assertEqual(logged.call_count, 1)
+
+    def test_a_personal_account_is_not_logged_as_a_failure(self):
+        with patch.object(unbound, "log_error") as logged:
+            unbound._cursor_team_id(None)
+            unbound._cursor_team_id("{}")
+        self.assertEqual(logged.call_count, 0)
+
     def test_bytes_are_accepted(self):
         self.assertEqual(unbound._cursor_team_id(b'{"teamId":7}'), "7")
 

@@ -1065,13 +1065,22 @@ def _read_cursor_item_table(db_path, keys):
 
 def _cursor_team_id(raw):
     """The Cursor team's id, from the cached team record. None for a personal
-    account, which belongs to no team. Never raises."""
+    account, which belongs to no team. Never raises.
+
+    A record that is present but unreadable is logged: it reads as a personal
+    account otherwise, and that is the one case worth telling apart."""
+    if raw in (None, ''):
+        return None
     try:
         team = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
-        team_id = team.get('teamId') if isinstance(team, dict) else None
-        return str(team_id) if team_id not in (None, '') else None
-    except Exception:
+    except Exception as e:
+        log_error("cursor team record unparsable: %s" % type(e).__name__, 'config')
         return None
+    if not isinstance(team, dict):
+        log_error("cursor team record is %s, expected object" % type(team).__name__, 'config')
+        return None
+    team_id = team.get('teamId')
+    return str(team_id) if team_id not in (None, '') else None
 
 
 def read_account_identity():
