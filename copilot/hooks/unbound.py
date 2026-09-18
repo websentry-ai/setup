@@ -50,6 +50,8 @@ DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+# Shared with the claude-code/cursor/codex/augment hooks, so the serial is probed once.
+IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -1385,6 +1387,167 @@ def is_autopilot_continuation(data):
                           or data.get('source') == 'system')
 
 
+def _email_domain(email: Optional[str]) -> Optional[str]:
+    try:
+        if email and '@' in email:
+            domain = email.rsplit('@', 1)[1].strip().lower()
+            return domain or None
+    except Exception:
+        pass
+    return None
+
+
+def _config_email() -> Optional[str]:
+    """The signed-in user's email from ~/.unbound/config.json, which the installer
+    writes. Fully fail-safe: any read/parse error -> None, never raises."""
+    try:
+        with open(UNBOUND_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            cfg = json.loads(f.read())
+        if isinstance(cfg, dict):
+            return (cfg.get('email') or '').strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def read_account_identity(event: Optional[Dict] = None) -> Dict:
+    """Resolve the signed-in user's email.
+
+    The Copilot CLI keeps no readable account file of its own, so the email comes
+    from ~/.unbound/config.json, which the installer writes. org/plan/auth_mode are
+    always None (the gateway resolves the org from the API key). Fail-safe: any read
+    error -> None, never raises."""
+    email = _config_email()
+    return {
+        'org_id': None,
+        'plan': None,
+        'auth_mode': None,
+        'user_email': email,
+        'email_domain': _email_domain(email),
+    }
+
+
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
+    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+    'to be filled by oem', 'system serial number', 'serial number',
+    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
+    'invalid', '123456789', 'xxxxxxxx',
+}
+
+
+def _valid_serial(value: Optional[str]) -> bool:
+    return bool(value) and value.strip().lower() not in _PLACEHOLDER_SERIALS
+
+
+def _get_device_serial() -> Optional[str]:
+    """Best-effort hardware serial, mirroring the MDM setup scripts. Filters known
+    OEM/VM placeholder values so two machines never collide on the same fake serial,
+    falling through to a stable per-install id (machine-id / MachineGuid) instead."""
+    try:
+        system = platform.system().lower()
+        if system == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPHardwareDataType'],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                for line in out.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ', 1)
+                        if len(parts) >= 2 and _valid_serial(parts[1]):
+                            return parts[1].strip()
+        elif system == 'linux':
+            try:
+                out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                try:
+                    value = Path(path).read_text(encoding='utf-8').strip()
+                    if _valid_serial(value):
+                        return value
+                except Exception:
+                    continue
+        elif system == 'windows':
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _device_serial(probe: bool = True) -> Optional[str]:
+    """Hardware serial, computed once and cached. Never raises and never blocks the
+    hook. On the latency-critical pre-tool path callers pass probe=False to read the
+    cache only (no subprocess); SessionStart and the end-of-turn exchange probe and
+    persist. A missing / corrupt / unreadable cache falls back to a fresh probe (when
+    allowed), an unwritable cache is ignored (the probed value is still returned), and
+    an unavailable serial returns None so the caller proceeds without it. The cache is
+    shared with the claude-code/cursor hooks, so we merge and write atomically."""
+    data = {}
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+            cached = data.get('device_serial')
+            if isinstance(cached, str) and cached.strip():
+                return cached.strip()
+    except Exception:
+        data = {}
+    if not probe:
+        return None
+    try:
+        serial = _get_device_serial()
+    except Exception:
+        serial = None
+    if serial:
+        try:
+            data['device_serial'] = serial
+            IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+        except Exception:
+            pass
+    return serial
+
+
+def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
+    """read_account_identity reads context.userEmail off the event; just add the
+    device serial. probe defaults False so the latency-critical pre-tool path only
+    reads the cache; the end-of-turn exchange passes probe=True. Never raises — on
+    any failure the hook proceeds with whatever identity it has (possibly none)."""
+    try:
+        identity = read_account_identity(event)
+        if not isinstance(identity, dict):
+            identity = {}
+    except Exception:
+        identity = {}
+    try:
+        serial = _device_serial(probe=probe)
+        if serial:
+            identity['device_serial'] = serial
+    except Exception:
+        pass
+    return identity
+
+
 def turn_prompt_id(entry, conversation_id, index, content):
     """Stable id for a user prompt entry. An entry without an envelope id still has to be
     watermarked, or every later Stop re-selects it and re-uploads its text with the
@@ -1443,6 +1606,9 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'turn_request_id': pending['turn_request_id'],
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
+        # This path fills the same turn row, so it carries the account too:
+        # a session settled only through here still lands in the inventory.
+        'account_identity': build_account_identity(probe=True),
     }
     if usage:
         exchange['usage'] = usage
@@ -5451,6 +5617,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
+        # The account this tool is signed in with. The turn row is what the
+        # account inventory is built from, so it has to carry it.
+        'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
