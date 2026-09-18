@@ -1064,11 +1064,8 @@ def _read_cursor_item_table(db_path, keys):
 
 
 def _cursor_team_id(raw):
-    """The Cursor team's id, from the cached team record. None for a personal
-    account, which belongs to no team. Never raises.
-
-    A record that is present but unreadable is logged: it reads as a personal
-    account otherwise, and that is the one case worth telling apart."""
+    """The team id from Cursor's cached team record; None for a personal account.
+    An unreadable record is logged, since it reads as personal otherwise."""
     if raw in (None, ''):
         return None
     try:
@@ -1111,8 +1108,8 @@ def read_account_identity():
         # no account means signed out, and reusing the last account there would
         # hand a signed-out or switched user the previous approval.
         email, plan = _cached_account(plan)
-        # The cache carries no team, and a team kept from a different account
-        # would name the wrong tenant.
+        # The cache carries no team, and one kept from another account would
+        # name the wrong tenant.
         org_id = None
     else:
         _forget_account()

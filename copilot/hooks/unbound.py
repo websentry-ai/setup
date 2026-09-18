@@ -1397,8 +1397,7 @@ def _email_domain(email: Optional[str]) -> Optional[str]:
 
 
 def _config_email() -> Optional[str]:
-    """The signed-in user's email from ~/.unbound/config.json, which the installer
-    writes. Fully fail-safe: any read/parse error -> None, never raises."""
+    """The email the installer wrote to ~/.unbound/config.json. Never raises."""
     try:
         with open(UNBOUND_CONFIG_PATH, 'r', encoding='utf-8') as f:
             cfg = json.loads(f.read())
@@ -1410,12 +1409,8 @@ def _config_email() -> Optional[str]:
 
 
 def read_account_identity(event: Optional[Dict] = None) -> Dict:
-    """Resolve the signed-in user's email.
-
-    The Copilot CLI keeps no readable account file of its own, so the email comes
-    from ~/.unbound/config.json, which the installer writes. org/plan/auth_mode are
-    always None (the gateway resolves the org from the API key). Fail-safe: any read
-    error -> None, never raises."""
+    """The signed-in account. Copilot exposes no account file, so only the email is
+    known; the gateway resolves the org from the API key."""
     email = _config_email()
     return {
         'org_id': None,
@@ -1440,9 +1435,8 @@ def _valid_serial(value: Optional[str]) -> bool:
 
 
 def _get_device_serial() -> Optional[str]:
-    """Best-effort hardware serial, mirroring the MDM setup scripts. Filters known
-    OEM/VM placeholder values so two machines never collide on the same fake serial,
-    falling through to a stable per-install id (machine-id / MachineGuid) instead."""
+    """Hardware serial, falling back to a per-install id. Placeholder values are
+    rejected so two machines never collide on the same fake serial."""
     try:
         system = platform.system().lower()
         if system == 'darwin':
@@ -1492,13 +1486,8 @@ def _get_device_serial() -> Optional[str]:
 
 
 def _device_serial(probe: bool = True) -> Optional[str]:
-    """Hardware serial, computed once and cached. Never raises and never blocks the
-    hook. On the latency-critical pre-tool path callers pass probe=False to read the
-    cache only (no subprocess); SessionStart and the end-of-turn exchange probe and
-    persist. A missing / corrupt / unreadable cache falls back to a fresh probe (when
-    allowed), an unwritable cache is ignored (the probed value is still returned), and
-    an unavailable serial returns None so the caller proceeds without it. The cache is
-    shared with the claude-code/cursor hooks, so we merge and write atomically."""
+    """Hardware serial, probed once and cached. probe=False reads the cache only, so
+    the latency-critical paths never run a subprocess. Never raises."""
     data = {}
     try:
         loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
@@ -1528,10 +1517,7 @@ def _device_serial(probe: bool = True) -> Optional[str]:
 
 
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
-    """read_account_identity reads the email from ~/.unbound/config.json, ignoring
-    the event; just add the device serial. probe defaults False so the latency-critical
-    pre-tool path only reads the cache; the end-of-turn exchange passes probe=True.
-    Never raises — on any failure the hook proceeds with whatever identity it has."""
+    """The account plus the device serial. The event is unused here. Never raises."""
     try:
         identity = read_account_identity(event)
         if not isinstance(identity, dict):
@@ -1605,9 +1591,8 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'turn_request_id': pending['turn_request_id'],
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
-        # Fills the same turn row, so a session settled only here still lands.
-        # Cache-only: complete_pending_turns calls this once per waiting turn, and a
-        # serial that never resolves would cost a 10s probe on each of them.
+        # Cache-only: called once per waiting turn, so probing here would cost a
+        # 10s command on each of them.
         'account_identity': build_account_identity(),
     }
     if usage:
