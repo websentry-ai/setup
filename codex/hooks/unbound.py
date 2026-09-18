@@ -4114,9 +4114,6 @@ def process_stop_event(event: Dict, api_key: str):
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-        # The account this tool is signed in with. The pre-tool path already
-        # sends it, but only a policy reads that; the turn row is what the
-        # account inventory is built from, so it has to carry it too.
         'account_identity': build_account_identity(probe=True),
     }
 

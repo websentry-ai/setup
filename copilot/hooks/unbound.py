@@ -50,7 +50,6 @@ DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
-# Shared with the claude-code/cursor/codex/augment hooks, so the serial is probed once.
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 APPROVAL_POLL_PHASES = (
@@ -1606,8 +1605,7 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'turn_request_id': pending['turn_request_id'],
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
-        # This path fills the same turn row, so it carries the account too:
-        # a session settled only through here still lands in the inventory.
+        # Fills the same turn row, so a session settled only here still lands.
         'account_identity': build_account_identity(probe=True),
     }
     if usage:
@@ -5617,8 +5615,6 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-        # The account this tool is signed in with. The turn row is what the
-        # account inventory is built from, so it has to carry it.
         'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
