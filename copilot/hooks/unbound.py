@@ -1528,10 +1528,10 @@ def _device_serial(probe: bool = True) -> Optional[str]:
 
 
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
-    """read_account_identity reads context.userEmail off the event; just add the
-    device serial. probe defaults False so the latency-critical pre-tool path only
-    reads the cache; the end-of-turn exchange passes probe=True. Never raises — on
-    any failure the hook proceeds with whatever identity it has (possibly none)."""
+    """read_account_identity reads the email from ~/.unbound/config.json, ignoring
+    the event; just add the device serial. probe defaults False so the latency-critical
+    pre-tool path only reads the cache; the end-of-turn exchange passes probe=True.
+    Never raises — on any failure the hook proceeds with whatever identity it has."""
     try:
         identity = read_account_identity(event)
         if not isinstance(identity, dict):
@@ -1606,7 +1606,9 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
         # Fills the same turn row, so a session settled only here still lands.
-        'account_identity': build_account_identity(probe=True),
+        # Cache-only: complete_pending_turns calls this once per waiting turn, and a
+        # serial that never resolves would cost a 10s probe on each of them.
+        'account_identity': build_account_identity(),
     }
     if usage:
         exchange['usage'] = usage
