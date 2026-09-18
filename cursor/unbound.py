@@ -1063,21 +1063,42 @@ def _read_cursor_item_table(db_path, keys):
     return {} if readable else None
 
 
+def _cursor_team_id(raw):
+    """The team id from Cursor's cached team record; None for a personal account.
+    An unreadable record is logged, since it reads as personal otherwise."""
+    if raw in (None, ''):
+        return None
+    try:
+        team = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+    except Exception as e:
+        log_error("cursor team record unparsable: %s" % type(e).__name__, 'config')
+        return None
+    if not isinstance(team, dict):
+        log_error("cursor team record is %s, expected object" % type(team).__name__, 'config')
+        return None
+    team_id = team.get('teamId')
+    return str(team_id) if team_id not in (None, '') else None
+
+
 def read_account_identity():
     plan = None
     email = None
+    org_id = None
     unreadable = False
     try:
         db_path = _cursor_state_db_path()
         if db_path and db_path.exists():
             values = _read_cursor_item_table(
-                db_path, ['cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType']
+                db_path,
+                ['cursorAuth/cachedEmail', 'cursorAuth/stripeMembershipType',
+                 'cursorAuth/cachedTeam'],
             )
             if values is None:
                 unreadable = True
             else:
                 email = (values.get('cursorAuth/cachedEmail') or '').strip() or None
                 plan = values.get('cursorAuth/stripeMembershipType') or None
+                org_id = _cursor_team_id(values.get('cursorAuth/cachedTeam'))
     except Exception:
         unreadable = True
     if email:
@@ -1087,10 +1108,13 @@ def read_account_identity():
         # no account means signed out, and reusing the last account there would
         # hand a signed-out or switched user the previous approval.
         email, plan = _cached_account(plan)
+        # The cache carries no team, and one kept from another account would
+        # name the wrong tenant.
+        org_id = None
     else:
         _forget_account()
     return {
-        'org_id': None,
+        'org_id': org_id,
         'plan': plan,
         'auth_mode': None,
         'user_email': email,

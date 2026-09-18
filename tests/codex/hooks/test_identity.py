@@ -321,5 +321,23 @@ class TestBuildAccountIdentity(unittest.TestCase):
             )
 
 
+class TestStopExchangeCarriesTheAccount(unittest.TestCase):
+    """The turn row is what the account inventory is built from. Codex built the
+    identity correctly but never attached it here, so its accounts never appeared
+    and nothing failed to say so. Pin the call site."""
+
+    def test_the_stop_payload_asks_for_the_account(self):
+        import inspect
+        body = inspect.getsource(unbound.process_stop_event)
+        self.assertIn("'account_identity': build_account_identity(", body)
+
+    def test_it_probes_rather_than_reading_a_cold_cache(self):
+        # The stop path is not latency-critical, and a device serial that was never
+        # probed would otherwise stay missing for the whole session.
+        import inspect
+        body = inspect.getsource(unbound.process_stop_event)
+        self.assertIn("build_account_identity(probe=True)", body)
+
+
 if __name__ == "__main__":
     unittest.main()
