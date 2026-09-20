@@ -18,14 +18,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from augment.hooks import unbound  # noqa: E402
 
 
-def _write_mcp(home: Path, editor: str, server: str, url: str):
-    """Seed Augment's VS Code-side MCP config under one editor's data dir."""
-    if sys.platform == 'darwin':
-        base = home / 'Library' / 'Application Support'
-    elif sys.platform == 'win32':
-        base = home / 'AppData' / 'Roaming'
-    else:
-        base = home / '.config'
+def _write_mcp(editor: str, server: str, url: str):
+    """Seed Augment's VS Code-side MCP config under one editor's data dir.
+
+    The base comes from the hook itself -- restating its platform rules here is
+    how this missed that CI sets XDG_CONFIG_HOME and the paths diverged.
+    """
+    base = unbound._vscode_user_dirs()[0].parent.parent
     path = (base / editor / 'User' / 'globalStorage' / 'augment.vscode-augment'
             / 'augment-global-state' / 'mcpServers.json')
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,20 +42,20 @@ class AugmentInsideDevin(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_a_server_configured_in_devin_is_found(self):
-        _write_mcp(self.home, 'Devin', 'gdrive', 'https://example.test/gdrive')
+        _write_mcp('Devin', 'gdrive', 'https://example.test/gdrive')
         servers = unbound.read_augment_mcp_servers({})
         self.assertIn('gdrive', servers)
         self.assertEqual('https://example.test/gdrive', servers['gdrive']['url'])
 
     def test_the_pre_rebrand_directory_still_works(self):
-        _write_mcp(self.home, 'Windsurf', 'gdrive', 'https://example.test/old')
+        _write_mcp('Windsurf', 'gdrive', 'https://example.test/old')
         servers = unbound.read_augment_mcp_servers({})
         self.assertEqual('https://example.test/old', servers['gdrive']['url'])
 
     def test_a_migrated_machine_uses_the_live_directory(self):
         """Both survive the upgrade; the editor reads the renamed one."""
-        _write_mcp(self.home, 'Windsurf', 'gdrive', 'https://example.test/old')
-        _write_mcp(self.home, 'Devin', 'gdrive', 'https://example.test/new')
+        _write_mcp('Windsurf', 'gdrive', 'https://example.test/old')
+        _write_mcp('Devin', 'gdrive', 'https://example.test/new')
         servers = unbound.read_augment_mcp_servers({})
         self.assertEqual('https://example.test/new', servers['gdrive']['url'])
 
