@@ -17,6 +17,7 @@ import sys
 
 from ._resources import TOOLS
 from ._loader import load_hook_module
+from ._tenant import apply_tenant_gateway
 
 
 def run(args) -> int:
@@ -28,6 +29,8 @@ def run(args) -> int:
     # So the hook's detached diagnostic can re-invoke this binary's
     # `mcp-diagnostic <tool>` subcommand for the right tool.
     os.environ["UNBOUND_HOOK_TOOL"] = tool
+    # Before the import: the module fixes its gateway at import time.
+    apply_tenant_gateway()
     try:
         module = load_hook_module(tool)
         module.main()
@@ -46,6 +49,7 @@ def run_skills_sync(args) -> int:
     the hook's SessionStart)."""
     if not args or args[0] not in TOOLS:
         return 0
+    apply_tenant_gateway()
     try:
         module = load_hook_module(args[0])
         sync = getattr(module, "_sync_skills_once", None)
@@ -65,6 +69,7 @@ def run_mcp_diagnostic(args) -> int:
     Fail-open: never raises. Only tools whose module defines the entry run it."""
     if not args or args[0] not in TOOLS:
         return 0
+    apply_tenant_gateway()
     try:
         module = load_hook_module(args[0])
         run_fn = getattr(module, "_run_mcp_diagnostic_cli", None)
