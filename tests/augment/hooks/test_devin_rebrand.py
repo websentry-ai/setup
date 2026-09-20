@@ -40,6 +40,15 @@ class AugmentInsideDevin(unittest.TestCase):
         patcher = patch.object(unbound.Path, 'home', return_value=self.home)
         patcher.start()
         self.addCleanup(patcher.stop)
+        # The hook prefers these over the home directory when they are set, and on
+        # a developer machine or CI they are -- without this the fixtures land
+        # outside the temp home, where the tests leak into each other.
+        env = patch.dict('os.environ', {
+            'APPDATA': str(self.home / 'AppData' / 'Roaming'),
+            'XDG_CONFIG_HOME': str(self.home / '.config'),
+        })
+        env.start()
+        self.addCleanup(env.stop)
 
     def test_a_server_configured_in_devin_is_found(self):
         _write_mcp('Devin', 'gdrive', 'https://example.test/gdrive')
