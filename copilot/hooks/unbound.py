@@ -32,6 +32,10 @@ def _copilot_home():
     return Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
 
 
+# Copilot cloud agent sandbox: ephemeral disk, no device, no signed-in user, no approver.
+RUNNING_CLOUD = bool(os.environ.get('COPILOT_AGENT_SESSION_ID'))
+
+
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
@@ -60,7 +64,7 @@ APPROVAL_POLL_PHASES = (
 )
 
 # Use user's home directory for logs
-LOG_DIR = _copilot_home() / "hooks"
+LOG_DIR = Path('/tmp/unbound-copilot') if RUNNING_CLOUD else _copilot_home() / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
@@ -1514,6 +1518,32 @@ def _device_serial(probe: bool = True) -> Optional[str]:
         except Exception:
             pass
     return serial
+
+
+def _github_actor() -> Optional[str]:
+    """The human who triggered the session. Sandbox env names only the bot, but the
+    agent co-authors its commits with the requester."""
+    try:
+        out = subprocess.run(['git', 'log', '-20', '--format=%B'],
+                             capture_output=True, timeout=5)
+        match = re.search(r'^Co-authored-by:\s*([^<\n]+)<',
+                          out.stdout.decode('utf-8', 'replace'), re.M | re.I)
+        return match.group(1).strip() or None if match else None
+    except Exception:
+        return None
+
+
+def build_github_context() -> Optional[Dict]:
+    """Cloud-agent provenance. None on a laptop, where the device identity applies."""
+    if not RUNNING_CLOUD:
+        return None
+    context = {
+        'actor': _github_actor(),
+        'repo': os.environ.get('GITHUB_REPOSITORY'),
+        'session': os.environ.get('COPILOT_AGENT_SESSION_ID'),
+        'event': os.environ.get('COPILOT_JOB_EVENT_TYPE'),
+    }
+    return {key: value for key, value in context.items() if value} or None
 
 
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
@@ -4169,6 +4199,16 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
+        # No approver exists in a sandbox, and the retry path would block on a poll
+        # until the hook is killed — a killed preToolUse fails open, so an unapproved
+        # action would run. Deny outright instead.
+        if RUNNING_CLOUD:
+            return transform_response_for_copilot({
+                'decision': 'deny',
+                'reason': 'Blocked by organization policy. This action requires approval, which a cloud agent cannot obtain.',
+                'additionalContext': 'This action requires human approval and a cloud agent session has no approver. Do not retry and do not work around it. Stop and say so in the pull request.',
+            })
+
         approval_check = api_response.get('approvalCheck', {})
         policy_ids = approval_check.get('policyIds', [])
         application_id = approval_check.get('applicationId', '')
@@ -5603,6 +5643,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
         'account_identity': build_account_identity(probe=True),
+        'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
@@ -6639,10 +6680,14 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
-            _cleanup_skill_policy_state()
-            _snapshot_copilot_skill_inventory(event)
-            _dispatch_discovery()
-            _dispatch_skills_sync(api_key)
+            # None of this survives an ephemeral sandbox: the debounce cache is always
+            # empty so discovery would reinstall every session, and synced skills would
+            # land in an agent workspace that is destroyed minutes later.
+            if not RUNNING_CLOUD:
+                _cleanup_skill_policy_state()
+                _snapshot_copilot_skill_inventory(event)
+                _dispatch_discovery()
+                _dispatch_skills_sync(api_key)
             print("{}")
             return
 

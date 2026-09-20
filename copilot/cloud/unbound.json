@@ -1,0 +1,23 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      { "bash": "bash .github/hooks/unbound.sh", "timeoutSec": 60 }
+    ],
+    "userPromptSubmitted": [
+      { "bash": "bash .github/hooks/unbound.sh", "timeoutSec": 60 }
+    ],
+    "preToolUse": [
+      { "bash": "bash .github/hooks/unbound.sh", "timeoutSec": 60 }
+    ],
+    "postToolUse": [
+      { "bash": "bash .github/hooks/unbound.sh", "timeoutSec": 60 }
+    ],
+    "agentStop": [
+      { "bash": "bash .github/hooks/unbound.sh", "timeoutSec": 60 }
+    ],
+    "sessionEnd": [
+      { "bash": "bash .github/hooks/unbound.sh", "timeoutSec": 60 }
+    ]
+  }
+}
