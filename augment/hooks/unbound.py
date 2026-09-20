@@ -2113,7 +2113,11 @@ def _vscode_user_dirs() -> List[Path]:
     else:
         cfg = os.environ.get('XDG_CONFIG_HOME')
         base = Path(cfg) if cfg else home / '.config'
-    return [base / n / 'User' for n in ('Code', 'Code - Insiders', 'VSCodium', 'Cursor', 'Windsurf')]
+    # Windsurf ships as Devin since the rebrand and a migrated machine keeps both
+    # directories; the renamed one is listed first so the live config wins the
+    # first-definition-wins merge below.
+    return [base / n / 'User' for n in
+            ('Code', 'Code - Insiders', 'VSCodium', 'Cursor', 'Devin', 'Windsurf')]
 
 
 def _augment_workspace_roots(event: Dict) -> List[Path]:
