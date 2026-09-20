@@ -40,6 +40,12 @@ def _clean_gateway_url(value):
     parsed = urlparse(value)
     if parsed.scheme != "https" or not parsed.hostname:
         return None
+    # The modules append "/v1/hooks/..." to this string, so it must be a bare
+    # base URL: no credentials, query or fragment, and a port that parses
+    # (`.port` raises ValueError otherwise — caught by the caller).
+    if parsed.username or parsed.password or "?" in value or "#" in value:
+        return None
+    parsed.port
     return value
 
 

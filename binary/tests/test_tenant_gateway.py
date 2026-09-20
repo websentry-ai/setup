@@ -126,6 +126,13 @@ def test_trailing_slash_is_stripped(sandbox_home, curl_shim):
     _assert_routed_to(urls, TENANT_GATEWAY)
 
 
+def test_port_and_path_prefix_are_kept(sandbox_home, curl_shim):
+    gateway = "https://tenant-api.example.com:8443/edge"
+    _write_config(sandbox_home, json.dumps({"api_key": "test-key", "gateway_url": gateway}))
+    _, urls = _run_hook("claude-code", sandbox_home, curl_shim)
+    _assert_routed_to(urls, gateway)
+
+
 @pytest.mark.parametrize("tool", list(PRETOOL_EVENT))
 def test_env_var_wins_over_config(tool, sandbox_home, curl_shim):
     _write_config(sandbox_home, json.dumps(
@@ -151,6 +158,11 @@ DEFAULT_GATEWAY_CONFIGS = {
     "gateway_no_host": json.dumps({"api_key": "test-key", "gateway_url": "https://"}),
     "gateway_whitespace": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com /x"}),
     "gateway_newline": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com\nX: y"}),
+    "gateway_query": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com?route=x"}),
+    "gateway_empty_query": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com?"}),
+    "gateway_fragment": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com#x"}),
+    "gateway_userinfo": json.dumps({"api_key": "test-key", "gateway_url": "https://user:pw@tenant-api.example.com"}),
+    "gateway_bad_port": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com:99999"}),
     "gateway_int": json.dumps({"api_key": "test-key", "gateway_url": 42}),
     "gateway_list": json.dumps({"api_key": "test-key", "gateway_url": [TENANT_GATEWAY]}),
     "gateway_dict": json.dumps({"api_key": "test-key", "gateway_url": {"url": TENANT_GATEWAY}}),
