@@ -64,7 +64,7 @@ def curl_shim(tmp_path):
     shim = shim_dir / "curl"
     shim.write_text(CURL_SHIM)
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    return shim_dir, tmp_path / "curl-urls.log"
+    return shim_dir, tmp_path / "curl-logs"
 
 
 def _write_config(home, raw):
@@ -72,14 +72,16 @@ def _write_config(home, raw):
     (home / ".unbound" / "config.json").write_text(raw, encoding="utf-8")
 
 
-def _run_hook(tool, home, curl_shim, gateway_env=None):
+def _run_hook(tool, home, curl_shim, gateway_env=None, timeout=60):
     """Run `unbound-hook hook <tool> <event>` with no inherited gateway env.
 
     Returns (completed process, sorted list of URLs curl was asked for).
     """
-    shim_dir, log = curl_shim
-    if log.exists():
-        log.unlink()
+    shim_dir, log_dir = curl_shim
+    # A fresh log per run: a previous run's fire-and-forget curl children may
+    # still be appending to theirs.
+    log_dir.mkdir(exist_ok=True)
+    log = log_dir / f"run-{len(list(log_dir.iterdir()))}.log"
     env = {k: v for k, v in os.environ.items()
            if k != "UNBOUND_GATEWAY_URL" and not k.endswith("_API_KEY")}
     env.pop("UNBOUND_HOOK_FROZEN", None)
@@ -91,6 +93,8 @@ def _run_hook(tool, home, curl_shim, gateway_env=None):
         # Belt and braces for any non-curl client: a dead proxy.
         "HTTPS_PROXY": "http://127.0.0.1:9", "https_proxy": "http://127.0.0.1:9",
         "HTTP_PROXY": "http://127.0.0.1:9", "http_proxy": "http://127.0.0.1:9",
+        # ...which a developer shell exporting NO_PROXY=* must not bypass.
+        "NO_PROXY": "", "no_proxy": "",
     })
     if gateway_env is not None:
         env["UNBOUND_GATEWAY_URL"] = gateway_env
@@ -98,7 +102,7 @@ def _run_hook(tool, home, curl_shim, gateway_env=None):
     got = subprocess.run(
         [sys.executable, str(ENTRY), "hook", tool, event],
         input=json.dumps(EVENT_PAYLOADS[tool][event]),
-        capture_output=True, text=True, timeout=60, env=env,
+        capture_output=True, text=True, timeout=timeout, env=env,
     )
     urls = sorted(set(log.read_text().split())) if log.exists() else []
     return got, urls
@@ -126,8 +130,12 @@ def test_trailing_slash_is_stripped(sandbox_home, curl_shim):
     _assert_routed_to(urls, TENANT_GATEWAY)
 
 
-def test_port_and_path_prefix_are_kept(sandbox_home, curl_shim):
-    gateway = "https://tenant-api.example.com:8443/edge"
+@pytest.mark.parametrize("gateway", [
+    "https://tenant-api.example.com:8443/edge",  # port + path prefix
+    "https://[2001:db8::1]:8443",                # IPv6 literal with port
+    "https://xn--tenant-api-9za.example.com",    # punycode host
+])
+def test_well_formed_base_urls_are_kept(gateway, sandbox_home, curl_shim):
     _write_config(sandbox_home, json.dumps({"api_key": "test-key", "gateway_url": gateway}))
     _, urls = _run_hook("claude-code", sandbox_home, curl_shim)
     _assert_routed_to(urls, gateway)
@@ -163,6 +171,15 @@ DEFAULT_GATEWAY_CONFIGS = {
     "gateway_fragment": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com#x"}),
     "gateway_userinfo": json.dumps({"api_key": "test-key", "gateway_url": "https://user:pw@tenant-api.example.com"}),
     "gateway_bad_port": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com:99999"}),
+    "gateway_empty_userinfo": json.dumps({"api_key": "test-key", "gateway_url": "https://@evil.example"}),
+    "gateway_brace_host": json.dumps({"api_key": "test-key", "gateway_url": "https://{a,b}.example.com"}),
+    "gateway_range_host": json.dumps({"api_key": "test-key", "gateway_url": "https://[1-3].example.com"}),
+    "gateway_glob_path": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com/{a,b}"}),
+    "gateway_brackets_path": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com/[1-3]"}),
+    "gateway_backslash": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\\evil.example.com"}),
+    "gateway_zero_width": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\u200b.example.com"}),
+    "gateway_bidi": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\u202e.example.com"}),
+    "gateway_homoglyph": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-\u0430pi.example.com"}),
     "gateway_int": json.dumps({"api_key": "test-key", "gateway_url": 42}),
     "gateway_list": json.dumps({"api_key": "test-key", "gateway_url": [TENANT_GATEWAY]}),
     "gateway_dict": json.dumps({"api_key": "test-key", "gateway_url": {"url": TENANT_GATEWAY}}),
@@ -195,6 +212,30 @@ def test_unreadable_config_keeps_default_gateway(sandbox_home, curl_shim):
     assert got.returncode == 0
     json.loads(got.stdout)
     _assert_routed_to(urls, DEFAULT_GATEWAY)
+
+
+def test_config_fifo_does_not_hang(sandbox_home, curl_shim):
+    """A FIFO at the config path must not block the hook on open(). The hard
+    timeout turns a regression into a failure instead of a hung run."""
+    if not hasattr(os, "mkfifo"):
+        pytest.skip("no FIFOs on this platform")
+    (sandbox_home / ".unbound").mkdir()
+    os.mkfifo(sandbox_home / ".unbound" / "config.json")
+    got, urls = _run_hook("claude-code", sandbox_home, curl_shim, timeout=30)
+    assert got.returncode == 0
+    json.loads(got.stdout)
+    _assert_routed_to(urls, DEFAULT_GATEWAY)
+
+
+def test_symlinked_config_is_followed(sandbox_home, curl_shim):
+    """A user-managed symlink (dotfiles) resolves to the same file the hook
+    modules read api_key from."""
+    real = sandbox_home / "dotfiles-config.json"
+    real.write_text(json.dumps({"api_key": "test-key", "gateway_url": TENANT_GATEWAY}))
+    (sandbox_home / ".unbound").mkdir()
+    (sandbox_home / ".unbound" / "config.json").symlink_to(real)
+    _, urls = _run_hook("claude-code", sandbox_home, curl_shim)
+    _assert_routed_to(urls, TENANT_GATEWAY)
 
 
 def test_config_directory_keeps_default_gateway(sandbox_home, curl_shim):
@@ -241,3 +282,21 @@ def test_detached_entries_resolve_gateway_before_import(entry, sandbox_home, mon
     monkeypatch.setattr(hook_cmd, "load_hook_module", fake_load)
     assert getattr(hook_cmd, entry)(["claude-code"]) == 0
     assert seen == [TENANT_GATEWAY]
+
+
+def test_unimportable_tenant_module_fails_open(monkeypatch):
+    """If the resolver itself can't be imported (a broken frozen bundle), the
+    dispatcher still loads and runs the hook module."""
+    from unbound_hook import hook_cmd
+
+    monkeypatch.setitem(sys.modules, "unbound_hook._tenant", None)
+    ran = []
+
+    class FakeModule:
+        @staticmethod
+        def main():
+            ran.append(True)
+
+    monkeypatch.setattr(hook_cmd, "load_hook_module", lambda tool: FakeModule)
+    assert hook_cmd.run(["claude-code", "PreToolUse"]) == 0
+    assert ran == [True]
