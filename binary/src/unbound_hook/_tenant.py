@@ -36,7 +36,8 @@ _MAX_CONFIG_BYTES = 1024 * 1024
 # [1-3] into several requests — each carrying the bearer key. So the gateway is
 # held to a conservative ASCII allowlist (no braces, backslashes, "@", "?",
 # "#", whitespace, control or non-ASCII look-alike characters), and brackets
-# are accepted only as the delimiters of an IPv6 literal host.
+# are accepted only as the delimiters of an IPv6 literal host. "%" is for a
+# percent-encoded path prefix only — never the authority (see below).
 _GATEWAY_CHARS = re.compile(r"[A-Za-z0-9.\-:\[\]/_~%]+")
 _IPV6_NETLOC = re.compile(r"\[[0-9A-Fa-f:.]+\](:[0-9]*)?")
 
@@ -54,6 +55,11 @@ def _clean_gateway_url(value):
     except ValueError:
         return None
     if parsed.scheme != "https" or not parsed.hostname:
+        return None
+    # urlparse leaves the authority percent-encoded, so "%40" / "%2F" / "%3A"
+    # slip past the "@", path and port checks; curl then either rejects the URL
+    # outright or decodes it — neither is the host the value appears to name.
+    if "%" in parsed.netloc:
         return None
     if "[" in parsed.path or "]" in parsed.path:
         return None

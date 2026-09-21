@@ -134,6 +134,7 @@ def test_trailing_slash_is_stripped(sandbox_home, curl_shim):
     "https://tenant-api.example.com:8443/edge",  # port + path prefix
     "https://[2001:db8::1]:8443",                # IPv6 literal with port
     "https://xn--tenant-api-9za.example.com",    # punycode host
+    "https://tenant-api.example.com/pre%20fix",  # percent-encoded path prefix
 ])
 def test_well_formed_base_urls_are_kept(gateway, sandbox_home, curl_shim):
     _write_config(sandbox_home, json.dumps({"api_key": "test-key", "gateway_url": gateway}))
@@ -180,6 +181,9 @@ DEFAULT_GATEWAY_CONFIGS = {
     "gateway_zero_width": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\u200b.example.com"}),
     "gateway_bidi": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api\u202e.example.com"}),
     "gateway_homoglyph": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-\u0430pi.example.com"}),
+    "gateway_encoded_at": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com%40evil.example"}),
+    "gateway_encoded_slash": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com%2Fevil.example"}),
+    "gateway_encoded_port": json.dumps({"api_key": "test-key", "gateway_url": "https://tenant-api.example.com%3A8443"}),
     "gateway_int": json.dumps({"api_key": "test-key", "gateway_url": 42}),
     "gateway_list": json.dumps({"api_key": "test-key", "gateway_url": [TENANT_GATEWAY]}),
     "gateway_dict": json.dumps({"api_key": "test-key", "gateway_url": {"url": TENANT_GATEWAY}}),
