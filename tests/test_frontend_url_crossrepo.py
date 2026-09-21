@@ -12,11 +12,19 @@ REAL onboard.py / setup.py against it — no reimplementation of the parsers.
 
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from tests.conftest import load_module
+
+# onboard.sh.tmpl exits before parsing any args on non-macOS hosts, so its
+# arg-loop assertions are only meaningful on Darwin (CI runs on Linux).
+_macos_only = pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="onboard.sh.tmpl is macOS-only and exits before parsing args elsewhere",
+)
 
 # Exact output of unbound-fe buildCommand("macOS", key, "claude-code", "subscription")
 # with tenant URLs NEXT_PUBLIC_BASE_URL / _GATEWAY_URL / _FRONTEND_DOMAIN set.
@@ -177,6 +185,7 @@ def _run_onboard_sh(*extra):
     )
 
 
+@_macos_only
 def test_onboard_sh_recognizes_frontend_url():
     proc = _run_onboard_sh("--frontend-url", FE_FRONTEND, "--api-key", "K")
     # The flag is understood: it is never reported as unknown. (The run then
@@ -185,6 +194,7 @@ def test_onboard_sh_recognizes_frontend_url():
     assert proc.returncode != 2
 
 
+@_macos_only
 def test_onboard_sh_treats_frontend_url_as_a_value_flag():
     proc = _run_onboard_sh("--frontend-url")
     # A value-taking flag rejects a missing value with exit 2 — proof it is
