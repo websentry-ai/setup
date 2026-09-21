@@ -37,6 +37,9 @@ fi
 
 API_KEY="" DISCOVERY_KEY="" BACKEND_URL="https://backend.getunbound.ai"
 GATEWAY_URL="https://api.getunbound.ai" CLEAR=0 BACKFILL=0 SKIP_MANAGED=0
+# Optional tenant override with no baked default: empty = the flag is not
+# passed to `setup` at all.
+FRONTEND_URL=""
 CURRENT_STEP="init"
 tmpdir=""
 # Set to 1 only on the install path right before its `exit 0`, so the EXIT
@@ -148,14 +151,17 @@ run_with_timeout() {
   return "$rc"
 }
 
-# Positional token matchers for the Jamf $4-$10 mapping: each slot accepts
+# Positional token matchers for the Jamf $4-$11 mapping: each slot accepts
 # generic booleans plus ONLY its own named token, so a value landing in the
 # wrong slot (e.g. "backfill" in the clear slot) can never trigger teardown.
 is_clear_token()    { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|clear|--clear) return 0;; *) return 1;; esac; }
 is_backfill_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|backfill|--backfill) return 0;; *) return 1;; esac; }
 is_skip_managed_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|skip-managed-settings|--skip-managed-settings) return 0;; *) return 1;; esac; }
 
-# --- Arguments: --flags for direct runs, $4-$9 positional from Jamf ----------
+# --- Arguments: --flags for direct runs, $4-$11 positional from Jamf ---------
+# $4 api key, $5 discovery key (deprecated, ignored), $6 backend url,
+# $7 gateway url, $8 clear token, $9 backfill token, $10 skip-managed token,
+# $11 frontend url. $6, $7 and $11 are optional tenant overrides.
 CURRENT_STEP="parse_args"
 if [[ $# -gt 0 && "${1:-}" != --* ]]; then
   # Jamf convention: $1 mount point, $2 computer name, $3 username, params at $4+.
@@ -165,6 +171,7 @@ if [[ $# -gt 0 && "${1:-}" != --* ]]; then
   is_clear_token "${8:-}" && CLEAR=1
   is_backfill_token "${9:-}" && BACKFILL=1
   is_skip_managed_token "${10:-}" && SKIP_MANAGED=1
+  [[ -n "${11:-}" ]] && FRONTEND_URL="${11}"
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -174,6 +181,9 @@ else
       --discovery-key) if [[ "${2:-}" == --* || $# -lt 2 ]]; then shift; else DISCOVERY_KEY="$2"; shift 2; fi ;;
       --backend-url)   BACKEND_URL="$2"; shift 2 ;;
       --gateway-url)   GATEWAY_URL="$2"; shift 2 ;;
+      --frontend-url)
+        [[ $# -ge 2 && "$2" != --* ]] || { echo "--frontend-url requires a value" >&2; exit 2; }
+        FRONTEND_URL="$2"; shift 2 ;;
       --clear)         CLEAR=1; shift ;;
       --backfill)      BACKFILL=1; shift ;;
       --skip-managed-settings) SKIP_MANAGED=1; shift ;;
@@ -272,10 +282,16 @@ backfill_flag=""
 [[ $BACKFILL -eq 1 ]] && backfill_flag="--backfill"
 skip_managed_flag=""
 [[ $SKIP_MANAGED -eq 1 ]] && skip_managed_flag="--skip-managed-settings"
+# Optional URL value, so an array (never word-split or globbed) rather than an
+# unquoted string. The ${arr[@]+...} form is required: macOS ships bash 3.2,
+# where expanding an EMPTY array under `set -u` is an "unbound variable" abort.
+frontend_args=()
+[[ -n "$FRONTEND_URL" ]] && frontend_args=(--frontend-url "$FRONTEND_URL")
 "$PREFIX/current/unbound-hook/unbound-hook" setup \
   --api-key "$API_KEY" \
   --backend-url "$BACKEND_URL" \
   --gateway-url "$GATEWAY_URL" \
+  ${frontend_args[@]+"${frontend_args[@]}"} \
   $backfill_flag $skip_managed_flag
 
 # Reached only when every step above (incl. the idempotent re-run skip) and

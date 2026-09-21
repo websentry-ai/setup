@@ -25,6 +25,23 @@ The rendered `onboard.sh` (from `../mdm/onboard.sh.tmpl`) is the Jamf
 Script payload: the script never travels over the network, only the
 hash-pinned pkg does.
 
+`onboard.sh` takes `--flags` on a direct run and positional script
+parameters from Jamf (`$1`-`$3` are Jamf's own):
+
+| Flag | Jamf parameter | Notes |
+|---|---|---|
+| `--api-key <key>` | `$4` | Required (not needed with `--clear`) |
+| `--discovery-key <key>` | `$5` | Deprecated; accepted and ignored |
+| `--backend-url <url>` | `$6` | Optional tenant override (default `https://backend.getunbound.ai`) |
+| `--gateway-url <url>` | `$7` | Optional tenant override (default `https://api.getunbound.ai`) |
+| `--clear` | `$8` = `clear` | Tear the runtime down instead of installing |
+| `--backfill` | `$9` = `backfill` | Opt in to transcript backfill |
+| `--skip-managed-settings` | `$10` = `skip-managed-settings` | Claude Code only |
+| `--frontend-url <url>` | `$11` | Optional tenant override, e.g. `https://tenant-app.example.com`. No default: when empty it is not passed to `unbound-hook setup` |
+
+Empty parameters keep their defaults, so a policy that fills only `$4`
+needs no change when later slots are added.
+
 ## On-disk layout installed by the pkg
 
 ```
