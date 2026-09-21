@@ -57,13 +57,13 @@ Assert 'T5' 'scalar exit under 200-line stdout (==0)' ($r.ProcExit -eq 0) "ProcE
 
 # T7 - Intune remediation front door
 $r = Invoke-OnboardRun -Mode intune -ChildExit 0
-Assert 'T7-ok'   'intune success -> exit 0' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
+Assert 'T7-ok'   'intune success -> exit 0 + marker written' (($r.ProcExit -eq 0) -and $r.MarkerWritten) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 $r = Invoke-OnboardRun -Mode intune -ChildExit 1
 Assert 'T7-fail' 'intune failure -> non-zero, no marker' (($r.ProcExit -ne 0) -and (-not $r.MarkerWritten)) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 
 # T8 - Scheduled Task front door
 $r = Invoke-OnboardRun -Mode task -ChildExit 0
-Assert 'T8-ok'   'task success -> exit 0' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
+Assert 'T8-ok'   'task success -> exit 0 + marker written' (($r.ProcExit -eq 0) -and $r.MarkerWritten) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 $r = Invoke-OnboardRun -Mode task -ChildExit 1
 Assert 'T8-fail' 'task failure -> non-zero, no marker' (($r.ProcExit -ne 0) -and (-not $r.MarkerWritten)) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 
