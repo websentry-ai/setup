@@ -357,3 +357,41 @@ class TestSessionEndWaitsBeforeReading(unittest.TestCase):
         wait = body.index("_await_vscode_journal(")
         guard = body.rindex("if event_name == 'SessionEnd':", 0, wait)
         self.assertLess(wait - guard, 400, "the wait must stay under the SessionEnd guard")
+
+
+class TestExchangeCarriesTheAccount(unittest.TestCase):
+    """The turn row is what the account inventory is built from, so every payload
+    that reaches send_to_api has to carry account_identity. Codex shipped without
+    this and its accounts never appeared, with nothing failing to say so."""
+
+    def _send_and_capture(self):
+        sent = []
+        entries = [_user("q", "p1"), _assistant("a")]
+        pending = {"turn_request_id": "tid-1", "conversation_id": SESSION,
+                   "prompt_id": "p1", "since": None, "until": "2026-08-31T00:00:00Z"}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = _transcript(tmpdir, entries)
+            event = {"transcript_path": str(path)}
+            with patch.object(unbound, "pending_turn_usage",
+                              lambda *a, **k: {"input_tokens": 5}), \
+                    patch.object(unbound, "_vscode_turn_model", lambda *a, **k: None), \
+                    patch.object(unbound, "build_account_identity",
+                                 lambda **k: {"user_email": "dev@acme.com",
+                                              "email_domain": "acme.com"}), \
+                    patch.object(unbound, "send_to_api",
+                                 lambda ex, key: sent.append(ex) or True):
+                unbound.complete_pending_turn(event, pending, "key")
+        return sent
+
+    def test_the_late_usage_send_carries_the_account(self):
+        sent = self._send_and_capture()
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(sent[0]["account_identity"],
+                         {"user_email": "dev@acme.com", "email_domain": "acme.com"})
+
+    def test_the_turn_exchange_builder_asks_for_the_account(self):
+        # build_exchange_from_transcript is the other payload that reaches the same
+        # endpoint; both have to carry it, so pin the call site.
+        import inspect
+        body = inspect.getsource(unbound.build_exchange_from_transcript)
+        self.assertIn("'account_identity': build_account_identity(", body)

@@ -50,6 +50,7 @@ DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 APPROVAL_POLL_PHASES = (
     (5 * 60,        3),    # 0-5 min: 3s
@@ -1385,6 +1386,153 @@ def is_autopilot_continuation(data):
                           or data.get('source') == 'system')
 
 
+def _email_domain(email: Optional[str]) -> Optional[str]:
+    try:
+        if email and '@' in email:
+            domain = email.rsplit('@', 1)[1].strip().lower()
+            return domain or None
+    except Exception:
+        pass
+    return None
+
+
+def _config_email() -> Optional[str]:
+    """The email the installer wrote to ~/.unbound/config.json. Never raises."""
+    try:
+        with open(UNBOUND_CONFIG_PATH, 'r', encoding='utf-8') as f:
+            cfg = json.loads(f.read())
+        if isinstance(cfg, dict):
+            return (cfg.get('email') or '').strip() or None
+    except Exception:
+        pass
+    return None
+
+
+def read_account_identity(event: Optional[Dict] = None) -> Dict:
+    """The signed-in account. Copilot exposes no account file, so only the email is
+    known; the gateway resolves the org from the API key."""
+    email = _config_email()
+    return {
+        'org_id': None,
+        'plan': None,
+        'auth_mode': None,
+        'user_email': email,
+        'email_domain': _email_domain(email),
+    }
+
+
+_PLACEHOLDER_SERIALS = {
+    '', '0', '00000000', '000000000', '0000000000', 'none', 'na', 'n/a',
+    'unknown', 'default', 'default string', 'to be filled by o.e.m.',
+    'to be filled by oem', 'system serial number', 'serial number',
+    'not applicable', 'not specified', 'not available', 'oem', 'o.e.m.',
+    'invalid', '123456789', 'xxxxxxxx',
+}
+
+
+def _valid_serial(value: Optional[str]) -> bool:
+    return bool(value) and value.strip().lower() not in _PLACEHOLDER_SERIALS
+
+
+def _get_device_serial() -> Optional[str]:
+    """Hardware serial, falling back to a per-install id. Placeholder values are
+    rejected so two machines never collide on the same fake serial."""
+    try:
+        system = platform.system().lower()
+        if system == 'darwin':
+            out = subprocess.run(['system_profiler', 'SPHardwareDataType'],
+                                 capture_output=True, text=True, timeout=10)
+            if out.returncode == 0:
+                for line in out.stdout.split('\n'):
+                    if 'Serial Number' in line:
+                        parts = line.split(': ', 1)
+                        if len(parts) >= 2 and _valid_serial(parts[1]):
+                            return parts[1].strip()
+        elif system == 'linux':
+            try:
+                out = subprocess.run(['dmidecode', '-s', 'system-serial-number'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            for path in ('/etc/machine-id', '/var/lib/dbus/machine-id'):
+                try:
+                    value = Path(path).read_text(encoding='utf-8').strip()
+                    if _valid_serial(value):
+                        return value
+                except Exception:
+                    continue
+        elif system == 'windows':
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      '(Get-CimInstance -ClassName Win32_BIOS).SerialNumber'],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+            try:
+                out = subprocess.run(['powershell', '-NoProfile', '-Command',
+                                      "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"],
+                                     capture_output=True, text=True, timeout=10)
+                if out.returncode == 0 and _valid_serial(out.stdout):
+                    return out.stdout.strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return None
+
+
+def _device_serial(probe: bool = True) -> Optional[str]:
+    """Hardware serial, probed once and cached. probe=False reads the cache only, so
+    the latency-critical paths never run a subprocess. Never raises."""
+    data = {}
+    try:
+        loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
+        if isinstance(loaded, dict):
+            data = loaded
+            cached = data.get('device_serial')
+            if isinstance(cached, str) and cached.strip():
+                return cached.strip()
+    except Exception:
+        data = {}
+    if not probe:
+        return None
+    try:
+        serial = _get_device_serial()
+    except Exception:
+        serial = None
+    if serial:
+        try:
+            data['device_serial'] = serial
+            IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(str(tmp), str(IDENTITY_CACHE_PATH))
+        except Exception:
+            pass
+    return serial
+
+
+def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
+    """The account plus the device serial. The event is unused here. Never raises."""
+    try:
+        identity = read_account_identity(event)
+        if not isinstance(identity, dict):
+            identity = {}
+    except Exception:
+        identity = {}
+    try:
+        serial = _device_serial(probe=probe)
+        if serial:
+            identity['device_serial'] = serial
+    except Exception:
+        pass
+    return identity
+
+
 def turn_prompt_id(entry, conversation_id, index, content):
     """Stable id for a user prompt entry. An entry without an envelope id still has to be
     watermarked, or every later Stop re-selects it and re-uploads its text with the
@@ -1443,6 +1591,9 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'turn_request_id': pending['turn_request_id'],
         'requestInitialized': pending.get('since') or pending.get('until'),
         'requestCompleted': pending.get('until'),
+        # Cache-only: called once per waiting turn, so probing here would cost a
+        # 10s command on each of them.
+        'account_identity': build_account_identity(),
     }
     if usage:
         exchange['usage'] = usage
@@ -5451,6 +5602,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
+        'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
