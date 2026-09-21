@@ -911,6 +911,10 @@ def run(argv) -> int:
     # --domain) sees a schemed, trailing-slash-free URL.
     opts["backend_url"] = m0.normalize_url(opts["backend_url"])
     opts["gateway_url"] = m0.normalize_url(opts["gateway_url"])
+    # Optional: only when given, so an absent value stays None and the config
+    # writer keeps skipping it.
+    if opts["frontend_url"]:
+        opts["frontend_url"] = m0.normalize_url(opts["frontend_url"])
 
     statuses = {}
 
