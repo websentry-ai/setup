@@ -3324,11 +3324,23 @@ REPO_GATE_BLOCK_CONTEXT = (
 )
 
 
+_CODEX_SHELL_ALIASES = frozenset({'exec_command', 'shell', 'local_shell'})
+
+
+def _canonical_codex_tool(tool_name: Optional[str]) -> str:
+    """Codex spells its shell tool exec_command / shell; the gate speaks Bash."""
+    return 'Bash' if tool_name in _CODEX_SHELL_ALIASES else (tool_name or '')
+
+
 def _repo_gate_command(tool_input: Optional[Dict]) -> Optional[str]:
-    """The shell command a Bash call carries, in this hook's payload shape."""
+    """The shell command a Bash call carries; exec_command spells it `cmd`."""
     if not isinstance(tool_input, dict):
         return None
     command = tool_input.get('command')
+    if command is None:
+        command = tool_input.get('cmd')
+    if isinstance(command, list):
+        command = ' '.join(str(part) for part in command)
     return command if isinstance(command, str) else None
 
 
@@ -3378,7 +3390,7 @@ def _repo_gate_candidates(tool_name: Optional[str], tool_input: Optional[Dict], 
     tool_input = tool_input or {}
     candidates = []
     if tool_name == 'Bash':
-        command = tool_input.get('command')
+        command = _repo_gate_command(tool_input)
         if isinstance(command, str):
             candidates.extend(
                 p for p in _ABS_PATH_RE.findall(command)
@@ -3504,7 +3516,7 @@ def _repo_gate_report(gate: Optional[Dict], block_policies: List[Dict], context:
 def _repo_gate_evaluate(event: Dict) -> Optional[Dict]:
     """Verdict for one tool call: None allows, else deny. Never raises."""
     try:
-        tool_name = event.get('tool_name') or ''
+        tool_name = _canonical_codex_tool(event.get('tool_name'))
         tool_input = event.get('tool_input')
         if not _repo_gate_applies(tool_name, _repo_gate_command(tool_input)):
             return None

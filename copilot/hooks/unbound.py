@@ -90,7 +90,7 @@ READ_TOOLS = {'read_file', 'readFile', 'view', 'cat'}
 WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'new_file'}
 EDIT_TOOLS = {
     'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit',
-    'replace_string_in_file',
+    'replace_string_in_file', 'multi_replace_string_in_file',
 }
 
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
