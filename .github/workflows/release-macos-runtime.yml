@@ -394,6 +394,16 @@ jobs:
           VENV=$([ "${{ steps.cfg.outputs.builder }}" = "nuitka" ] && echo .build-venv-nuitka || echo .build-venv)
           "$VENV/bin/python" -m pytest binary/tests/ -q
 
+      # The Linux suite runs this file under bash 5. Jamf runs onboard.sh under
+      # macOS's /bin/bash 3.2, where an empty array under `set -u` aborts, so
+      # this runner is the only place that failure class is exercised. Fully
+      # sandboxed: stubbed system tools, no root, no network, temp dir only.
+      - name: onboard.sh argv gate — rendered template under /bin/bash 3.2
+        run: |
+          set -euo pipefail
+          VENV=$([ "${{ steps.cfg.outputs.builder }}" = "nuitka" ] && echo .build-venv-nuitka || echo .build-venv)
+          "$VENV/bin/python" -m pytest tests/test_mdm_onboard_sh.py -q
+
       - name: Import Developer ID certs into throwaway keychain
         if: steps.cfg.outputs.sign == 'true'
         env:

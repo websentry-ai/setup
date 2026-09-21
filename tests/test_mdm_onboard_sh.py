@@ -1,17 +1,20 @@
 """The macOS runtime bootstrap (`mdm/onboard.sh.tmpl`) ends by handing its
 parameters to `unbound-hook setup`. These tests run the rendered script end to
-end under `/bin/bash` (3.2 on macOS, the shell Jamf uses) and assert on the argv
-that handoff actually receives.
+end under the host's `/bin/bash` and assert on the argv that handoff actually
+receives. On macOS that is bash 3.2, the shell Jamf uses, and the only place the
+`set -u` + empty-array behaviour is exercised; on Linux it is a newer bash.
 
 The script is production-shaped: it insists on root, a fixed /opt/unbound
 prefix and macOS system tools. Nothing in the template is loosened for that.
 Instead the test renders the template the way the release workflow does and
-then, on its own private copy only, points PREFIX at a temp dir and neutralises
-the two root checks; every system tool the script shells out to is a stub on
-PATH. `rm` is a guard stub that only deletes inside the sandbox, so a run can
-never touch the host's real /Library or /usr/local paths.
+then, on its own private copy only, points PREFIX and the download dir at a
+temp dir and neutralises the two root checks; every system tool the script
+shells out to is a stub on PATH. `rm` is a guard stub that only deletes inside
+the sandbox, so a run can never touch the host's real /Library, /usr/local or
+/tmp paths.
 """
 
+import glob
 import os
 import re
 import stat
@@ -62,12 +65,12 @@ STUBS = {
         '[[ $code -eq 1 ]] && printf 200\n'
         'exit 0'
     ),
-    # Deletes only inside the sandbox (and the script's own mktemp dir).
+    # Deletes only inside the sandbox.
     "rm": (
         'keep=()\n'
         'for a in "$@"; do\n'
         '  case "$a" in\n'
-        '    -*|"$SANDBOX"/*|/tmp/unbound-onboard.*) keep+=("$a") ;;\n'
+        '    -*|"$SANDBOX"/*) keep+=("$a") ;;\n'
         '    *) echo "$a" >> "$SANDBOX/rm-refused.log" ;;\n'
         '  esac\n'
         'done\n'
@@ -88,8 +91,8 @@ def _write_exec(path: Path, body: str):
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _render(prefix: Path) -> str:
-    """Release-workflow substitutions, then the two test-only rewrites. Each
+def _render(prefix: Path, download_root: Path) -> str:
+    """Release-workflow substitutions, then the three test-only rewrites. Each
     rewrite asserts its match count so template drift fails loudly here rather
     than letting a run fall through to the real /opt/unbound."""
     text = (REPO / "mdm/onboard.sh.tmpl").read_text()
@@ -105,6 +108,9 @@ def _render(prefix: Path) -> str:
 
     assert text.count('PREFIX="/opt/unbound"\n') == 1
     text = text.replace('PREFIX="/opt/unbound"\n', f'PREFIX="{prefix}"\n')
+    assert text.count("mktemp -d /tmp/unbound-onboard.XXXXXX") == 1
+    text = text.replace("mktemp -d /tmp/unbound-onboard.XXXXXX",
+                        f'mktemp -d "{download_root}/unbound-onboard.XXXXXX"')
     assert text.count("[[ $EUID -eq 0 ]]") == 2
     return text.replace("[[ $EUID -eq 0 ]]", "[[ 0 -eq 0 ]]")
 
@@ -122,7 +128,9 @@ class Sandbox:
         _write_exec(hook_dir / "unbound-hook", HOOK_STUB)
         (self.prefix / "current").symlink_to(self.prefix / VERSION)
         self.script = root / "onboard.sh"
-        self.script.write_text(_render(self.prefix))
+        self.downloads = root / "downloads"
+        self.downloads.mkdir()
+        self.script.write_text(_render(self.prefix, self.downloads))
 
     def run(self, *args, installed=VERSION):
         env = {
@@ -180,10 +188,14 @@ def test_frontend_url_flag_is_forwarded_to_setup(sandbox):
 
 def test_frontend_url_is_forwarded_after_a_fresh_install_too(sandbox):
     """No matching pkg receipt: the download/verify/install path runs first."""
+    host_tmp_before = set(glob.glob("/tmp/unbound-onboard.*"))
     argv = _setup_argv(sandbox, "--api-key", "K", "--frontend-url", TENANT_FRONTEND,
                        installed="")
     assert argv == BASELINE_ARGV + ["--frontend-url", TENANT_FRONTEND]
-    assert any("-o" in call for call in sandbox.curl_calls()), "pkg was never downloaded"
+    downloads = [c[c.index("-o") + 1] for c in sandbox.curl_calls() if "-o" in c and "-X" not in c]
+    assert len(downloads) == 1 and downloads[0].startswith(str(sandbox.downloads))
+    assert list(sandbox.downloads.iterdir()) == [], "download dir was not reaped"
+    assert set(glob.glob("/tmp/unbound-onboard.*")) == host_tmp_before
 
 
 def test_jamf_parameter_11_is_forwarded_to_setup(sandbox):
@@ -195,9 +207,25 @@ def test_jamf_parameter_11_is_forwarded_to_setup(sandbox):
     ["K"],                                # $5-$11 absent (existing policies)
     ["K", "", "", "", "", "", ""],        # through $10, no $11
     ["K", "", "", "", "", "", "", ""],    # $11 present but empty
+    ["K", "", "", "", "", "", "", "   "],  # whitespace-only counts as empty
 ])
 def test_jamf_form_without_parameter_11_is_the_baseline(sandbox, params):
     assert _setup_argv(sandbox, *jamf(*params)) == BASELINE_ARGV
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_an_empty_frontend_url_flag_is_the_baseline(sandbox, value):
+    assert _setup_argv(sandbox, "--api-key", "K", "--frontend-url", value) == BASELINE_ARGV
+
+
+@pytest.mark.parametrize("misplaced", ["--skip-managed-settings", "-x", " --backfill"])
+def test_jamf_parameter_11_holding_a_flag_is_rejected_before_any_work(sandbox, misplaced):
+    """A token shifted into the URL slot must not be recorded as the frontend URL."""
+    result = sandbox.run(*jamf("K", "", "", "", "", "", "", misplaced))
+    assert result.returncode == 2
+    assert "--frontend-url requires a value" in result.stderr
+    assert "UNBOUND_INSTALL_FAILED step=parse_args code=2" in result.stderr
+    assert sandbox.hook_calls() == []
 
 
 def test_jamf_tenant_urls_and_tokens_combine(sandbox):
@@ -227,7 +255,7 @@ def test_frontend_url_reaches_setup_as_one_unexpanded_argument(sandbox):
     assert argv == BASELINE_ARGV + ["--frontend-url", url]
 
 
-@pytest.mark.parametrize("tail", [[], ["--backfill"]])
+@pytest.mark.parametrize("tail", [[], ["--backfill"], ["-x"]])
 def test_frontend_url_with_no_value_is_rejected_before_any_work(sandbox, tail):
     """Never a silent mis-parse: the following flag is not swallowed as the URL."""
     result = sandbox.run("--api-key", "K", "--frontend-url", *tail)

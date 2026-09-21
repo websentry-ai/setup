@@ -158,6 +158,16 @@ is_clear_token()    { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')
 is_backfill_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|backfill|--backfill) return 0;; *) return 1;; esac; }
 is_skip_managed_token() { case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in 1|true|yes|skip-managed-settings|--skip-managed-settings) return 0;; *) return 1;; esac; }
 
+# One check for --frontend-url and Jamf $11. Whitespace-only = not given. A
+# leading "-" is a flag or token that landed in the wrong slot, never a URL:
+# refuse it rather than record it in every user's config.
+set_frontend_url() {
+  local compact="${1//[[:space:]]/}"
+  [[ -n "$compact" ]] || return 0
+  [[ "$compact" != -* ]] || { echo "--frontend-url requires a value" >&2; exit 2; }
+  FRONTEND_URL="$1"
+}
+
 # --- Arguments: --flags for direct runs, $4-$11 positional from Jamf ---------
 # $4 api key, $5 discovery key (deprecated, ignored), $6 backend url,
 # $7 gateway url, $8 clear token, $9 backfill token, $10 skip-managed token,
@@ -171,7 +181,7 @@ if [[ $# -gt 0 && "${1:-}" != --* ]]; then
   is_clear_token "${8:-}" && CLEAR=1
   is_backfill_token "${9:-}" && BACKFILL=1
   is_skip_managed_token "${10:-}" && SKIP_MANAGED=1
-  [[ -n "${11:-}" ]] && FRONTEND_URL="${11}"
+  set_frontend_url "${11:-}"
 else
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -182,8 +192,8 @@ else
       --backend-url)   BACKEND_URL="$2"; shift 2 ;;
       --gateway-url)   GATEWAY_URL="$2"; shift 2 ;;
       --frontend-url)
-        [[ $# -ge 2 && "$2" != --* ]] || { echo "--frontend-url requires a value" >&2; exit 2; }
-        FRONTEND_URL="$2"; shift 2 ;;
+        [[ $# -ge 2 ]] || { echo "--frontend-url requires a value" >&2; exit 2; }
+        set_frontend_url "$2"; shift 2 ;;
       --clear)         CLEAR=1; shift ;;
       --backfill)      BACKFILL=1; shift ;;
       --skip-managed-settings) SKIP_MANAGED=1; shift ;;

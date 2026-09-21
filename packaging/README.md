@@ -39,8 +39,12 @@ parameters from Jamf (`$1`-`$3` are Jamf's own):
 | `--skip-managed-settings` | `$10` = `skip-managed-settings` | Claude Code only |
 | `--frontend-url <url>` | `$11` | Optional tenant override, e.g. `https://tenant-app.example.com`. No default: when empty it is not passed to `unbound-hook setup` |
 
-Empty parameters keep their defaults, so a policy that fills only `$4`
-needs no change when later slots are added.
+Every slot after `$4` is optional and may be left empty; an empty or
+whitespace-only value keeps the default. A frontend URL that starts with
+`-` is rejected (exit 2) on both forms, and `unbound-hook setup` normalises
+the accepted value the same way as the backend and gateway URLs. `$11` is
+the final Jamf script parameter, so any further option is flag-only or has
+to share a slot.
 
 ## On-disk layout installed by the pkg
 

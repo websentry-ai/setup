@@ -186,6 +186,27 @@ def test_setup_full_run_configures_everything(env):
     assert env["backfilled"] == []
 
 
+def _user_config(env):
+    return json.loads((env["home"] / ".unbound" / "config.json").read_text())
+
+
+def test_setup_records_the_frontend_url_normalized_like_backend_and_gateway(env):
+    rc = setup_cmd.run(["--api-key", "admin-key", "--backend-url", "tenant-backend.example.com/",
+                        "--gateway-url", "tenant-api.example.com/",
+                        "--frontend-url", " tenant-app.example.com/ "])
+    assert rc == 0
+    cfg = _user_config(env)
+    assert cfg["base_url"] == "https://tenant-backend.example.com"
+    assert cfg["gateway_url"] == "https://tenant-api.example.com"
+    assert cfg["frontend_url"] == "https://tenant-app.example.com"
+
+
+@pytest.mark.parametrize("extra", [[], ["--frontend-url", ""], ["--frontend-url", "   "]])
+def test_setup_without_a_frontend_url_records_none(env, extra):
+    assert setup_cmd.run(["--api-key", "admin-key", *extra]) == 0
+    assert "frontend_url" not in _user_config(env)
+
+
 def test_setup_component_failure_does_not_abort_others(env, monkeypatch):
     # claude-code's key fetch fails; everything else must still configure.
     monkeypatch.setattr(env["modules"]["claude-code"], "fetch_api_key_from_mdm",
