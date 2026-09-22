@@ -168,12 +168,9 @@ def test_old_domain_command_does_not_persist_frontend_url(monkeypatch, tmp_path)
 
 
 # ---------------------------------------------------------------------------
-# T9 — gateway-mode installers do not parse --frontend-url yet, so the page's
-# frontend URL is dropped there. This asserts the correct contract (it SHOULD be
-# forwarded) and is marked xfail(strict): it flips to a hard failure the moment a
-# gateway installer starts forwarding it, forcing this marker to be removed then.
+# T9 — gateway-mode installers forward --frontend-url, so the page's frontend URL
+# reaches the per-user config. Asserts that contract for every gateway installer.
 # ---------------------------------------------------------------------------
-@pytest.mark.xfail(strict=True, reason="gateway-mode installers do not forward the frontend URL yet")
 @pytest.mark.parametrize("relpath", GATEWAY_TOOLS)
 def test_gateway_installer_forwards_frontend_url(relpath, monkeypatch, tmp_path):
     call = _run_installer(relpath, INSTALLER_ARGV, monkeypatch, tmp_path)
