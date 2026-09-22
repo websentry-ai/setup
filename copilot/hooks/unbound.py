@@ -1030,6 +1030,31 @@ def get_policy_check_failure_action():
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
+def get_unbound_attribution_enabled():
+    """Read the org's Unbound attribution setting from cache, defaulting to off. Ignores TTL."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return False
+    return cache.get('unbound_attribution_enabled') is True
+
+
+def _attribution_footer(trace_id=None):
+    """Footer closing a block shown to the user; no ID when no gateway saw the decision."""
+    if trace_id:
+        return '\n\nEnforced by Unbound · Trace ID ' + trace_id
+    return '\n\nEnforced by Unbound'
+
+
+def _split_attribution_footer(reason, trace_id=None):
+    """(reason without its trailing footer, footer), so the footer can be shown last."""
+    footer = _attribution_footer(trace_id)
+    # An ask reason carries one trailing newline after the footer (Claude Code layout).
+    body = reason.rstrip('\n') if isinstance(reason, str) else ''
+    if body.endswith(footer):
+        return body[:-len(footer)], footer
+    return reason, ''
+
+
 def get_repo_policies():
     """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
     cache = _read_policy_cache_raw()
@@ -1039,7 +1064,7 @@ def get_repo_policies():
     return policies if isinstance(policies, list) else []
 
 
-def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None):
+def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None, unbound_attribution_enabled=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1050,11 +1075,14 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, rep
             policy_check_failure_action = get_policy_check_failure_action()
         if not isinstance(repo_policies, list):
             repo_policies = get_repo_policies()
+        if not isinstance(unbound_attribution_enabled, bool):
+            unbound_attribution_enabled = prior.get('unbound_attribution_enabled') is True
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
             'repo_policies': repo_policies,
+            'unbound_attribution_enabled': unbound_attribution_enabled,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
@@ -1070,11 +1098,13 @@ def _cache_policies_from_response(api_response):
         'tools_to_check' in api_response
         or 'policy_check_failure_action' in api_response
         or 'repo_policies' in api_response
+        or 'unbound_attribution_enabled' in api_response
     ):
         save_policy_cache(
             tools_to_check=api_response.get('tools_to_check'),
             policy_check_failure_action=api_response.get('policy_check_failure_action'),
             repo_policies=api_response.get('repo_policies'),
+            unbound_attribution_enabled=api_response.get('unbound_attribution_enabled'),
         )
 
 
@@ -3955,7 +3985,7 @@ def _is_approval_retry(command):
         return False
 
 
-def _set_approval_marker(command, policy_ids, application_id, request_id=''):
+def _set_approval_marker(command, policy_ids, application_id, request_id='', unbound_trace_id=''):
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -3963,6 +3993,7 @@ def _set_approval_marker(command, policy_ids, application_id, request_id=''):
         'policyIds': policy_ids,
         'applicationId': application_id,
         'requestId': request_id,
+        'unboundTraceId': unbound_trace_id,
     }
     _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
 
@@ -4054,7 +4085,9 @@ def transform_response_for_copilot(api_response):
     # running Copilot surface reads: the top-level form documented in the
     # Copilot CLI hooks reference, AND the nested hookSpecificOutput form
     # (Claude-compatible, used by the VS Code agent). Same values, no conflict.
-    model_reason = ' '.join(part for part in (reason, additional_context) if part)
+    # The attribution footer must be the last thing the user reads, after the context.
+    reason, footer = _split_attribution_footer(reason, api_response.get('unbound_trace_id'))
+    model_reason = ' '.join(part for part in (reason, additional_context) if part) + footer
     return {
         'permissionDecision': decision,
         'permissionDecisionReason': model_reason,
@@ -4106,8 +4139,9 @@ def process_pre_tool_use(event, api_key):
     if gate:
         return transform_response_for_copilot({
             'decision': 'deny',
-            'reason': _repo_gate_block_reason(gate['repo']),
+            'reason': _repo_gate_block_reason(gate['repo'], gate.get('trace_id')),
             'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+            'unbound_trace_id': gate.get('trace_id'),
         })
     return _evaluate_pre_tool_use_policies(event, api_key)
 
@@ -4229,6 +4263,8 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             policy_ids = marker_data.get('policyIds', [])
             application_id = marker_data.get('applicationId', '')
             request_id = marker_data.get('requestId', '')
+            unbound_trace_id = marker_data.get('unboundTraceId')
+            footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
             _clear_approval_marker()
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
@@ -4237,14 +4273,16 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             elif result == 'deny':
                 return transform_response_for_copilot({
                     'decision': 'deny',
-                    'reason': 'Blocked by organization policy. This action was denied via Slack.',
+                    'reason': 'Blocked by organization policy. This action was denied via Slack.' + footer,
                     'additionalContext': 'This action was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
+                    'unbound_trace_id': unbound_trace_id,
                 })
             else:
                 return transform_response_for_copilot({
                     'decision': 'deny',
-                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.',
+                    'reason': 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.' + footer,
                     'additionalContext': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
+                    'unbound_trace_id': unbound_trace_id,
                 })
 
     if need_pull_policies:
@@ -4254,9 +4292,10 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
     if not api_response:
         if get_policy_check_failure_action() == 'block':
+            footer = _attribution_footer() if get_unbound_attribution_enabled() else ''
             return transform_response_for_copilot({
                 'decision': 'deny',
-                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
+                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON + footer,
                 'additionalContext': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
             })
         report_error_to_gateway(
@@ -4273,11 +4312,15 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         policy_ids = approval_check.get('policyIds', [])
         application_id = approval_check.get('applicationId', '')
         request_id = approval_check.get('requestId', '')
+        # The gateway logged this hold under a trace ID; the retry's local verdicts reuse it.
+        unbound_trace_id = api_response.get('unbound_trace_id') or ''
+        footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
 
-        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id)
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id, unbound_trace_id=unbound_trace_id)
         return transform_response_for_copilot({
             'decision': 'deny',
-            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.',
+            'reason': 'An approval request has been sent to your Slack DMs. Please approve it there.' + footer,
+            'unbound_trace_id': unbound_trace_id,
             'additionalContext': (
                 'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
                 'Tell the user: "An approval request has been sent to your Slack DMs. '
@@ -4763,11 +4806,12 @@ def _repo_gate_session_id(event):
     return event.get('session_id') or event.get('sessionId')
 
 
-def _repo_gate_block_reason(repo):
-    return (
+def _repo_gate_block_reason(repo, trace_id=None):
+    reason = (
         'Blocked by organization policy. "%s" is outside your organization\'s '
         'allowed repository scope.' % repo
     )
+    return reason + _attribution_footer(trace_id) if trace_id else reason
 
 
 # --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
@@ -4842,7 +4886,7 @@ def _repo_gate_report(gate, block_policies, context):
             tool_input = next((v for v in named if isinstance(v, str) and v), None)
         # The pretool envelope every other post uses; the verdict rides under repo_gate.
         app_label = context.get('app_label')
-        _repo_gate_post(json.dumps({
+        envelope = {
             'conversation_id': context.get('session_id'),
             'event_name': 'RepoGate',
             'unbound_app_label': app_label,
@@ -4859,7 +4903,11 @@ def _repo_gate_report(gate, block_policies, context):
                 'prompt_text': _repo_gate_clip(context.get('prompt_text')),
                 'tool_input': _repo_gate_clip(tool_input),
             },
-        }), api_key)
+        }
+        # Only with attribution on: support finds the incident by the ID the user saw.
+        if gate.get('trace_id'):
+            envelope['repo_gate']['trace_id'] = gate['trace_id']
+        _repo_gate_post(json.dumps(envelope), api_key)
     except Exception:
         pass
 
@@ -4881,6 +4929,8 @@ def _repo_gate_evaluate(event):
             canonical, tool_input, event.get('cwd'))
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
         gate = {'decision': 'deny', 'repo': repo} if repo else None
+        if gate and get_unbound_attribution_enabled():
+            gate['trace_id'] = str(uuid.uuid4())
         _repo_gate_report(gate, block_policies, {
             'app_label': 'copilot',
             'session_id': event.get('session_id'),
