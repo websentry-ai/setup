@@ -1129,6 +1129,20 @@ def _augment_session_start(augment, cwd):
     return out
 
 
+def test_augment_session_start_still_advises_when_the_identity_read_fails(augment, repos,
+                                                                        monkeypatch):
+    """The plan warm-up runs first; a failure there must not swallow the gate."""
+    monkeypatch.delenv('AUGMENT_PROJECT_DIR', raising=False)
+    _set_policies(augment, [BLOCK_ORG])
+    event = {'hook_event_name': 'SessionStart', 'session_id': 'S1',
+             'workspace_roots': [repos.out_scope]}
+    with patch.object(augment, '_device_serial', MagicMock()), \
+         patch.object(augment, 'read_account_identity', side_effect=RuntimeError('boom')), \
+         patch.object(augment, '_dispatch_discovery', MagicMock()):
+        out, _, _ = _run_main(augment, event)
+    assert 'acme/widgets' in out['hookSpecificOutput']['additionalContext']
+
+
 def test_augment_session_start_advises_in_an_out_of_scope_workspace(augment, repos,
                                                                     monkeypatch):
     """Advisory only — SessionStart cannot block — and it must not spend the

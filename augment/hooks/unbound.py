@@ -4251,7 +4251,12 @@ def main():
         # debounced discovery scan dispatch.
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
-            _augment_plan(read_account_identity(event).get('user_email'), probe=True)
+            try:
+                identity = read_account_identity(event)
+                _augment_plan(identity.get('user_email') if isinstance(identity, dict) else None,
+                              probe=True)
+            except Exception:
+                pass  # the repo gate below must still print
             _dispatch_discovery()
             print(json.dumps(_repo_gate_session_start_output(event)), flush=True)
             return

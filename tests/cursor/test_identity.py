@@ -233,6 +233,22 @@ class TestUnreadableStateDb(unittest.TestCase):
         self.assertEqual(identity["user_email"], "attacker@gmail.com")
         self.assertEqual(identity["email_domain"], "gmail.com")
 
+    def test_another_event_account_drops_the_cached_team_and_plan(self):
+        """A locked database serves the cached account; a different signed-in
+        address must not inherit its tenant."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("INSERT INTO ItemTable VALUES (?, ?)",
+                     ("cursorAuth/cachedTeam", '{"teamId":22471406}'))
+        conn.commit()
+        conn.close()
+        unbound.read_account_identity()
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            other = unbound.build_account_identity({"user_email": "someone@other.io"})
+            same = unbound.build_account_identity({"user_email": "USER@acme.io"})
+        self.assertEqual((other["org_id"], other["plan"]), (None, None))
+        self.assertEqual((same["org_id"], same["plan"]), ("22471406", "pro"))
+
     def test_a_write_ahead_log_value_is_visible(self):
         """The old immutable open ignored the -wal, so a value Cursor had not yet
         checkpointed read back as missing."""

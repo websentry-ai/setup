@@ -205,6 +205,11 @@ class TestCopilotSeat(unittest.TestCase):
         self.assertEqual(result, (None, None))
         fetch.assert_not_called()
 
+    def test_an_unknown_host_is_not_asked(self):
+        result, fetch = self._seat({"login": "octocat"}, host=None)
+        self.assertEqual(result, (None, None))
+        fetch.assert_not_called()
+
     def test_a_failed_call_reports_nothing(self):
         with patch.object(unbound, "_fetch_copilot_seat", side_effect=OSError("offline")):
             self.assertEqual(unbound._copilot_seat("octocat", "https://github.com", True),

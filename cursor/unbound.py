@@ -1310,6 +1310,9 @@ def build_account_identity(event=None, probe=False):
         if isinstance(event, dict):
             email = (event.get('user_email') or '').strip() or None
             if email:
+                # Plan and team read with another account are not this one's.
+                if (identity.get('user_email') or '').lower() != email.lower():
+                    identity['plan'] = identity['org_id'] = None
                 # Recompute, never keep: a domain left over from another account
                 # is the field the gate matches on.
                 identity['user_email'] = email

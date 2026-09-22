@@ -1584,7 +1584,8 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
             return cached.get('plan'), cached.get('org')
     except Exception:
         pass
-    if not probe or (host and urlparse(host).hostname != 'github.com'):
+    # An unknown host may be Enterprise Server; its token must not reach github.com.
+    if not probe or urlparse(host or '').hostname != 'github.com':
         return None, None
     try:
         seat = _fetch_copilot_seat()
