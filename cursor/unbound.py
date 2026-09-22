@@ -20,6 +20,7 @@ import sqlite3
 import shutil
 import urllib.request
 import platform
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote, unquote, urlparse
 
@@ -719,6 +720,21 @@ def get_policy_check_failure_action():
     return value if value in ('allow', 'block') else POLICY_CHECK_FAILURE_DEFAULT
 
 
+def get_unbound_attribution_enabled():
+    """Read the org's Unbound attribution setting from cache, defaulting to off. Ignores TTL."""
+    cache = _read_policy_cache_raw()
+    if cache is None:
+        return False
+    return cache.get('unbound_attribution_enabled') is True
+
+
+def _attribution_footer(trace_id=None):
+    """Footer closing a block shown to the user; no ID when no gateway saw the decision."""
+    if trace_id:
+        return '\n\nEnforced by Unbound · Trace ID ' + trace_id
+    return '\n\nEnforced by Unbound'
+
+
 def get_repo_policies():
     """Repo-scope policies from cache, [] if absent; a stale cache still applies."""
     cache = _read_policy_cache_raw()
@@ -728,7 +744,7 @@ def get_repo_policies():
     return policies if isinstance(policies, list) else []
 
 
-def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None):
+def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None, unbound_attribution_enabled=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
         POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -739,11 +755,14 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, rep
             policy_check_failure_action = get_policy_check_failure_action()
         if not isinstance(repo_policies, list):
             repo_policies = get_repo_policies()
+        if not isinstance(unbound_attribution_enabled, bool):
+            unbound_attribution_enabled = prior.get('unbound_attribution_enabled') is True
         cache = {
             'last_synced': datetime.utcnow().isoformat() + 'Z',
             'tools_to_check': tools_to_check,
             'policy_check_failure_action': policy_check_failure_action,
             'repo_policies': repo_policies,
+            'unbound_attribution_enabled': unbound_attribution_enabled,
         }
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
@@ -753,9 +772,10 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, rep
 
 def _gateway_unreachable_response():
     """Cursor deny shape for gateway-unreachable when failure mode is 'block'."""
+    footer = _attribution_footer() if get_unbound_attribution_enabled() else ''
     return {
         'permission': 'deny',
-        'user_message': POLICY_CHECK_FAILURE_BLOCK_REASON,
+        'user_message': POLICY_CHECK_FAILURE_BLOCK_REASON + footer,
         'agent_message': 'The organization policy engine could not be reached. This is a transient infrastructure failure. Tell the user the policy engine is unavailable and ask them to retry.',
     }
 
@@ -768,11 +788,13 @@ def _cache_policies_from_response(api_response):
         'tools_to_check' in api_response
         or 'policy_check_failure_action' in api_response
         or 'repo_policies' in api_response
+        or 'unbound_attribution_enabled' in api_response
     ):
         save_policy_cache(
             tools_to_check=api_response.get('tools_to_check'),
             policy_check_failure_action=api_response.get('policy_check_failure_action'),
             repo_policies=api_response.get('repo_policies'),
+            unbound_attribution_enabled=api_response.get('unbound_attribution_enabled'),
         )
 
 
@@ -915,7 +937,7 @@ def _is_approval_retry(command):
         return False
 
 
-def _set_approval_marker(command, policy_ids, application_id, request_id='', escalated_admin_contact=''):
+def _set_approval_marker(command, policy_ids, application_id, request_id='', escalated_admin_contact='', unbound_trace_id=''):
     _APPROVAL_MARKER_FILE.parent.mkdir(parents=True, exist_ok=True)
     data = {
         'cmd': hashlib.sha256(command.encode()).hexdigest()[:16],
@@ -924,6 +946,7 @@ def _set_approval_marker(command, policy_ids, application_id, request_id='', esc
         'applicationId': application_id,
         'requestId': request_id,
         'escalatedAdminContact': escalated_admin_contact,
+        'unboundTraceId': unbound_trace_id,
     }
     _APPROVAL_MARKER_FILE.write_text(json.dumps(data))
 
@@ -1102,15 +1125,12 @@ def read_account_identity():
     except Exception:
         unreadable = True
     if email:
-        _remember_account(email, plan)
+        _remember_account(email, plan, org_id)
     elif unreadable:
         # Only when the read itself failed. A database that reads fine and holds
         # no account means signed out, and reusing the last account there would
         # hand a signed-out or switched user the previous approval.
-        email, plan = _cached_account(plan)
-        # The cache carries no team, and one kept from another account would
-        # name the wrong tenant.
-        org_id = None
+        email, plan, org_id = _cached_account(plan)
     else:
         _forget_account()
     return {
@@ -1131,20 +1151,22 @@ def _cached_account(plan):
     try:
         loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
     except Exception:
-        return None, plan
+        return None, plan, None
     if not isinstance(loaded, dict):
-        return None, plan
+        return None, plan, None
     account = loaded.get('cursor_account')
     if not isinstance(account, dict):
-        return None, plan
+        return None, plan, None
     seen_at = account.get('seen_at')
     if not isinstance(seen_at, (int, float)):
-        return None, plan
+        return None, plan, None
     if (time.time() - seen_at) > ACCOUNT_CACHE_MAX_AGE_SECONDS:
-        return None, plan
+        return None, plan, None
     email = account.get('user_email')
     email = email.strip() if isinstance(email, str) else None
-    return (email or None), (plan or account.get('plan'))
+    # The team is the one read with this email, so it names the same tenant.
+    org_id = account.get('org_id') if isinstance(account.get('org_id'), str) else None
+    return (email or None), (plan or account.get('plan')), (org_id if email else None)
 
 
 def _forget_account():
@@ -1165,7 +1187,7 @@ def _forget_account():
         pass
 
 
-def _remember_account(email, plan):
+def _remember_account(email, plan, org_id=None):
     """Merge into the cache the device serial already shares. Never raises."""
     try:
         data = {}
@@ -1177,12 +1199,12 @@ def _remember_account(email, plan):
             data = {}
         current = data.get('cursor_account')
         if (isinstance(current, dict) and current.get('user_email') == email
-                and current.get('plan') == plan
+                and current.get('plan') == plan and current.get('org_id') == org_id
                 and isinstance(current.get('seen_at'), (int, float))
                 and (time.time() - current['seen_at']) < ACCOUNT_CACHE_REFRESH_SECONDS):
             return
         data['cursor_account'] = {
-            'user_email': email, 'plan': plan, 'seen_at': int(time.time()),
+            'user_email': email, 'plan': plan, 'org_id': org_id, 'seen_at': int(time.time()),
         }
         IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
@@ -1311,6 +1333,9 @@ def build_account_identity(event=None, probe=False):
         if isinstance(event, dict):
             email = (event.get('user_email') or '').strip() or None
             if email:
+                # Plan and team read with another account are not this one's.
+                if (identity.get('user_email') or '').lower() != email.lower():
+                    identity['plan'] = identity['org_id'] = None
                 # Recompute, never keep: a domain left over from another account
                 # is the field the gate matches on.
                 identity['user_email'] = email
@@ -1379,7 +1404,7 @@ def process_pre_tool_use(event, api_key):
     """preToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for file tools when no policy covers them."""
     gate = _repo_gate_evaluate(event, event.get('tool_name', ''))
     if gate:
-        return _repo_gate_deny_response(gate['repo'])
+        return _repo_gate_deny_response(gate['repo'], gate.get('trace_id'))
     return _evaluate_pre_tool_use_policies(event, api_key)
 
 
@@ -1441,6 +1466,8 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             policy_ids = marker_data.get('policyIds', [])
             application_id = marker_data.get('applicationId', '')
             request_id = marker_data.get('requestId', '')
+            unbound_trace_id = marker_data.get('unboundTraceId')
+            footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
             _clear_approval_marker()
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
@@ -1449,7 +1476,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
             elif result == 'deny':
                 return {
                     'permission': 'deny',
-                    'user_message': 'Blocked by organization policy. This action was denied via Slack.',
+                    'user_message': 'Blocked by organization policy. This action was denied via Slack.' + footer,
                     'agent_message': 'This action was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
                 }
             else:
@@ -1460,7 +1487,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                     timeout_user_message = 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry.'
                 return {
                     'permission': 'deny',
-                    'user_message': timeout_user_message,
+                    'user_message': timeout_user_message + footer,
                     'agent_message': 'This action was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
 
@@ -1496,10 +1523,13 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         else:
             user_message = 'An approval request has been sent to your Slack DMs. Please approve it there.'
 
-        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id, escalated_admin_contact=admin_contact)
+        # The gateway logged this hold under a trace ID; the retry's local verdicts reuse it.
+        unbound_trace_id = api_response.get('unbound_trace_id') or ''
+        footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id, escalated_admin_contact=admin_contact, unbound_trace_id=unbound_trace_id)
         return {
             'permission': 'deny',
-            'user_message': user_message,
+            'user_message': user_message + footer,
             'agent_message': (
                 'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
                 f'Tell the user: "{user_message}" '
@@ -2709,7 +2739,7 @@ def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_serve
     """beforeShellExecution / beforeMCPExecution entry point; the gate runs first and applies to the shell event only, an MCP call names no local path to resolve."""
     gate = _repo_gate_evaluate(event, tool_name, command)
     if gate:
-        return _repo_gate_deny_response(gate['repo'])
+        return _repo_gate_deny_response(gate['repo'], gate.get('trace_id'))
     return _evaluate_pre_tool_use_execution_policies(
         event, api_key, tool_name, command, mcp_server=mcp_server, mcp_tool=mcp_tool)
 
@@ -2773,6 +2803,8 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
             policy_ids = marker_data.get('policyIds', [])
             application_id = marker_data.get('applicationId', '')
             request_id = marker_data.get('requestId', '')
+            unbound_trace_id = marker_data.get('unboundTraceId')
+            footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
             _clear_approval_marker()
             result = poll_approval_status(api_key, policy_ids, application_id, request_id=request_id)
 
@@ -2781,7 +2813,7 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
             elif result == 'deny':
                 return {
                     'permission': 'deny',
-                    'user_message': 'Blocked by organization policy. This command was denied via Slack.',
+                    'user_message': 'Blocked by organization policy. This command was denied via Slack.' + footer,
                     'agent_message': 'This command was denied by an organization security policy. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. Inform the user and stop.',
                 }
             else:
@@ -2792,7 +2824,7 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
                     timeout_user_message = 'Blocked by organization policy. Approval request timed out — check your Slack DMs and retry the command.'
                 return {
                     'permission': 'deny',
-                    'user_message': timeout_user_message,
+                    'user_message': timeout_user_message + footer,
                     'agent_message': 'This command was blocked by an organization security policy that requires approval. Do not attempt to achieve the same result using alternative tools, file operations, or workarounds. The user must approve via Slack and retry.',
                 }
 
@@ -2828,10 +2860,13 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
         else:
             user_message = 'An approval request has been sent to your Slack DMs. Please approve it there.'
 
-        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id, escalated_admin_contact=admin_contact)
+        # The gateway logged this hold under a trace ID; the retry's local verdicts reuse it.
+        unbound_trace_id = api_response.get('unbound_trace_id') or ''
+        footer = _attribution_footer(unbound_trace_id) if unbound_trace_id else ''
+        _set_approval_marker(approval_key, policy_ids, application_id, request_id=request_id, escalated_admin_contact=admin_contact, unbound_trace_id=unbound_trace_id)
         return {
             'permission': 'deny',
-            'user_message': user_message,
+            'user_message': user_message + footer,
             'agent_message': (
                 'This is NOT a permanent block — it is a temporary hold pending Slack approval. '
                 f'Tell the user: "{user_message}" '
@@ -3410,11 +3445,12 @@ def _repo_gate_candidates(event, tool_name, command):
     return []
 
 
-def _repo_gate_block_reason(repo):
-    return (
+def _repo_gate_block_reason(repo, trace_id=None):
+    reason = (
         'Blocked by organization policy. "%s" is outside your organization\'s '
         'allowed repository scope.' % repo
     )
+    return reason + _attribution_footer(trace_id) if trace_id else reason
 
 
 # --- incident reporting: telemetry only, dispatched after the verdict and never waited on ---
@@ -3489,7 +3525,7 @@ def _repo_gate_report(gate, block_policies, context):
             tool_input = next((v for v in named if isinstance(v, str) and v), None)
         # The pretool envelope every other post uses; the verdict rides under repo_gate.
         app_label = context.get('app_label')
-        _repo_gate_post(json.dumps({
+        envelope = {
             'conversation_id': context.get('session_id'),
             'event_name': 'RepoGate',
             'unbound_app_label': app_label,
@@ -3506,7 +3542,11 @@ def _repo_gate_report(gate, block_policies, context):
                 'prompt_text': _repo_gate_clip(context.get('prompt_text')),
                 'tool_input': _repo_gate_clip(tool_input),
             },
-        }), api_key)
+        }
+        # Only with attribution on: support finds the incident by the ID the user saw.
+        if gate.get('trace_id'):
+            envelope['repo_gate']['trace_id'] = gate['trace_id']
+        _repo_gate_post(json.dumps(envelope), api_key)
     except Exception:
         pass
 
@@ -3523,6 +3563,8 @@ def _repo_gate_evaluate(event, tool_name, command=''):
         candidates = _repo_gate_candidates(event, tool_name, command)
         repo = _repo_gate_violating_repo(candidates, block_policies, {})
         gate = {'decision': 'deny', 'repo': repo} if repo else None
+        if gate and get_unbound_attribution_enabled():
+            gate['trace_id'] = str(uuid.uuid4())
         _repo_gate_report(gate, block_policies, {
             'app_label': 'cursor',
             'session_id': event.get('conversation_id'),
@@ -3535,10 +3577,10 @@ def _repo_gate_evaluate(event, tool_name, command=''):
         return None
 
 
-def _repo_gate_deny_response(repo):
+def _repo_gate_deny_response(repo, trace_id=None):
     return format_hook_response({
         'decision': 'deny',
-        'reason': _repo_gate_block_reason(repo),
+        'reason': _repo_gate_block_reason(repo, trace_id),
         'additionalContext': REPO_GATE_BLOCK_CONTEXT,
     })
 
