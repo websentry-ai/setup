@@ -49,29 +49,36 @@ foreach ($c in 0, 1, 3, 42) {
     Assert "T4-$c" "exit code == child code $c" ($r.ProcExit -eq $c) "ProcExit=$($r.ProcExit)"
 }
 
-# T5 - scalar int under heavy multi-line stdout (not object[]/line count).
-# On the pre-change artifact those 200 lines join the object[] that masks the
-# code; the direct object[]-vs-int contrast is proven by Invoke-ProvenToFail.ps1.
+# T5 - the object[]-masking path under heavy multi-line stdout. On the
+# pre-change artifact those 200 lines join the object[] that swallows the code
+# (see Invoke-ProvenToFail.ps1). Success stays scalar 0, and a distinctive
+# failing code must survive the 200 lines rather than be masked - a plain 0
+# here would also hold on the buggy code, so the failing leg is what guards it.
 $r = Invoke-OnboardRun -Mode direct -ChildExit 0 -StdoutLines 200
-Assert 'T5' 'scalar exit under 200-line stdout (==0)' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit)"
+Assert 'T5-ok'   'scalar exit under 200-line stdout (==0)' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit)"
+$r = Invoke-OnboardRun -Mode direct -ChildExit 42 -StdoutLines 200
+Assert 'T5-fail' 'distinctive fail code survives 200-line stdout (==42)' ($r.ProcExit -eq 42) "ProcExit=$($r.ProcExit)"
 
 # T7 - Intune remediation front door
 $r = Invoke-OnboardRun -Mode intune -ChildExit 0
 Assert 'T7-ok'   'intune success -> exit 0 + marker written' (($r.ProcExit -eq 0) -and $r.MarkerWritten) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 $r = Invoke-OnboardRun -Mode intune -ChildExit 1
-Assert 'T7-fail' 'intune failure -> non-zero, no marker' (($r.ProcExit -ne 0) -and (-not $r.MarkerWritten)) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
+Assert 'T7-fail' 'intune failure -> exit 1, no marker' (($r.ProcExit -eq 1) -and (-not $r.MarkerWritten)) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 
 # T8 - Scheduled Task front door
 $r = Invoke-OnboardRun -Mode task -ChildExit 0
 Assert 'T8-ok'   'task success -> exit 0 + marker written' (($r.ProcExit -eq 0) -and $r.MarkerWritten) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 $r = Invoke-OnboardRun -Mode task -ChildExit 1
-Assert 'T8-fail' 'task failure -> non-zero, no marker' (($r.ProcExit -ne 0) -and (-not $r.MarkerWritten)) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
+Assert 'T8-fail' 'task failure -> exit 1, no marker' (($r.ProcExit -eq 1) -and (-not $r.MarkerWritten)) "ProcExit=$($r.ProcExit) marker=$($r.MarkerWritten)"
 
-# T9 - stress: 5000-line stdout + stderr under $ErrorActionPreference='Continue'
+# T9 - stress: 5000-line stdout + stderr under $ErrorActionPreference='Continue'.
+# The failing leg uses a distinctive 42 rather than 1: a masking regression can
+# surface a generic 1 of its own, so ==1 would be ambiguous; ==42 proves the
+# child's real code reached the process exit through 5000 lines of output.
 $r = Invoke-OnboardRun -Mode direct -ChildExit 0 -StdoutLines 5000
 Assert 'T9-ok'   'stress success -> exit 0' ($r.ProcExit -eq 0) "ProcExit=$($r.ProcExit)"
-$r = Invoke-OnboardRun -Mode direct -ChildExit 1 -StdoutLines 5000
-Assert 'T9-fail' 'stress failure -> exit 1' ($r.ProcExit -eq 1) "ProcExit=$($r.ProcExit)"
+$r = Invoke-OnboardRun -Mode direct -ChildExit 42 -StdoutLines 5000
+Assert 'T9-fail' 'stress failure -> exit 42 (distinctive, not a masking 1)' ($r.ProcExit -eq 42) "ProcExit=$($r.ProcExit)"
 
 Write-Host ""
 $fail = @($results | Where-Object { -not $_.Pass })

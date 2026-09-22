@@ -31,21 +31,24 @@ $head   = Invoke-OnboardRun -Mode direct -ChildExit $ChildExit
 Write-Host ("  PARENT (pre-change) ProcExit = {0}" -f $parent.ProcExit)
 Write-Host ("  HEAD   (fixed)      ProcExit = {0}" -f $head.ProcExit)
 
-$bugPresent = ($parent.ProcExit -ne $ChildExit)     # parent masks the real code
-$falseOk    = ($parent.ProcExit -eq 0)              # strongest form: reports success
-$fixed      = ($head.ProcExit -eq $ChildExit)       # head passes the real code through
+$falseOk = ($parent.ProcExit -eq 0)              # the WEB-5890 defect: false success
+$fixed   = ($head.ProcExit -eq $ChildExit)       # head passes the real code through
 
 if ($falseOk) {
     Write-Host "  -> PARENT reported SUCCESS (exit 0) on a FAILED child: WEB-5890 reproduced." -ForegroundColor Yellow
-} elseif ($bugPresent) {
-    Write-Host "  -> PARENT masked the failure (exit $($parent.ProcExit) != $ChildExit): bug present." -ForegroundColor Yellow
+} elseif ($parent.ProcExit -ne $ChildExit) {
+    Write-Host "  -> PARENT masked the failure (exit $($parent.ProcExit) != $ChildExit) but did not report the false success this guard pins." -ForegroundColor Yellow
 }
 
-$pass = ($bugPresent -and $fixed)
+# The defect is specifically a FALSE SUCCESS - the pre-change wrapper reported
+# exit 0 on a failed child, so Intune/Task Scheduler recorded the run as good.
+# Requiring parent==0 (not merely parent!=child) ties the guard to that exact
+# symptom; a parent that surfaced some other non-zero code was never the bug.
+$pass = ($falseOk -and $fixed)
 Write-Host ""
 if ($pass) {
-    Write-Host "== T6 PASS: parent masks failure, head reports it =="
+    Write-Host "== T6 PASS: parent falsely reports success (0), head reports the real code =="
     exit 0
 }
-Write-Host "== T6 FAIL: bugPresent=$bugPresent fixed=$fixed (parent=$($parent.ProcExit) head=$($head.ProcExit)) =="
+Write-Host "== T6 FAIL: falseOk=$falseOk fixed=$fixed (parent=$($parent.ProcExit) head=$($head.ProcExit)) =="
 exit 1

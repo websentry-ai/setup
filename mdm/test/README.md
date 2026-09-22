@@ -3,10 +3,15 @@
 Guards the fix that stops the Intune remediation reporting **success on a failed
 run**. `Main` piped the python child's stdout into its own success stream, so
 `$exitCode = Main` captured an `object[]` instead of an int and `exit $exitCode`
-reported the wrong code. The fix routes the child's stdout through `| Out-Host`.
+reported the wrong code — a **false success (exit 0)** on a failed run, exactly
+what Intune/Task Scheduler then recorded as good. The fix routes the child's
+stdout through `| Out-Host`.
 
 This is Windows PowerShell 5.1 stream behaviour, so the battery **only runs on a
-Windows VM**. It was written and staged on macOS; nothing here has been executed.
+Windows VM**. It has been run green on Windows PowerShell 5.1 (elevated,
+python 3.11): the main battery passes every assertion, and the proven-to-fail
+harness reproduces the defect — the pre-change wrapper returns **exit 0** on a
+failing child while the fixed wrapper returns the child's real code.
 
 ## Requirements (on the Windows VM)
 
@@ -51,16 +56,13 @@ assertion fails.
 | T2 | direct | exit 0 | child stdout visible on the process stdout (Out-Host) |
 | T3 | direct | exit 1, 3 | process exit == child code (headline guard) |
 | T4 | direct | exit 0/1/3/42 | process exit == child code (LASTEXITCODE fidelity) |
-| T5 | direct | exit 0, 200 stdout lines | process exit == 0 (scalar, not object[]/line count) |
-| T6 | direct | exit 3 | **parent** masks (exit != 3, ideally 0); **head** reports 3 |
-| T7 | Intune remediation wrapper | exit 0 / 1 | success -> exit 0; failure -> non-zero and no `last-success.txt` |
-| T8 | Scheduled Task runner | exit 0 / 1 | success -> exit 0; failure -> non-zero and no `last-success.txt` |
-| T9 | direct | exit 0 / 1, 5000 stdout lines | exit == child code (no NativeCommandError abort, no masking) |
+| T5 | direct | exit 0 and 42, 200 stdout lines | success stays scalar 0; the distinctive **42 survives the 200 lines** (a plain 0 would also hold on the buggy code, so the failing leg is the guard) |
+| T6 | direct | exit 3 | **parent** falsely reports success (exit **0**); **head** reports 3 |
+| T7 | Intune remediation wrapper | exit 0 / 1 | success -> exit 0 + marker; failure -> **exit 1** and no `last-success.txt` |
+| T8 | Scheduled Task runner | exit 0 / 1 | success -> exit 0 + marker; failure -> **exit 1** and no `last-success.txt` |
+| T9 | direct | exit 0 and 42, 5000 stdout lines | exit == child code; the failing leg uses a distinctive **42**, not 1, so a masking regression's own generic 1 cannot be mistaken for a pass |
 
 T10 lives in `unbound-integration-tests`
 (`tests/connect/discovery/test_discovery_key_backcompat_e2e.py`): the existing
 Windows `onboard.ps1` tests are repointed from `refs/heads/main` to this PR's
 commit so the UIT Windows job exercises the PR artifact. Run it there, not here.
-
-Nothing in this directory has been run. All results are pending the Windows-VM
-pass.

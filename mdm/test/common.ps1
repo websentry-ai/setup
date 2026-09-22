@@ -137,8 +137,11 @@ exit `$code
     $env:UNBOUND_TEST_STDOUT_LINES = "$StdoutLines"
     $env:UNBOUND_TEST_BASEDIR      = $work
 
+    # Start-Process joins -ArgumentList with spaces and adds no quoting, so the
+    # runner path must be quoted itself or a $env:TEMP under "C:\Users\First Last"
+    # would split into two arguments and powershell.exe would never find the file.
     $p = Start-Process -FilePath 'powershell.exe' `
-        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $runner) `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$runner`"") `
         -Wait -PassThru -WindowStyle Hidden `
         -RedirectStandardOutput $out -RedirectStandardError $err
 
