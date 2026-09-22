@@ -1,13 +1,12 @@
 """
-Tests for account-identity helpers in copilot/hooks/unbound.py.
+Tests for account identity in copilot/hooks/unbound.py.
 
-Covers:
-  - _email_domain
-  - read_account_identity  (~/.unbound/config.json is the only source)
-  - build_account_identity
+The account is the GitHub login Copilot itself records on sign-in. The
+installer's email is deliberately not used: it names the device's owner, not
+the Copilot account, and reporting it would dress a signed-out machine as a
+signed-in one.
 """
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,99 +16,117 @@ from tests.conftest import tool_module
 
 unbound = tool_module("copilot/hooks")
 
+SIGNED_IN = '// User settings\n{"lastLoggedInUser":{"host":"https://github.com","login":"octocat"}}'
+
 
 class _IsolatedConfig(unittest.TestCase):
-    """Redirect unbound.UNBOUND_CONFIG_PATH at a temp file so read_account_identity
-    never reads the developer's real ~/.unbound/config.json. UNBOUND_CONFIG_PATH is
-    bound at import time, so we patch the module attribute directly."""
+    """Point the hook at a temp config so it never reads the developer's own."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.config_path = Path(self._tmp.name) / "config.json"
-        self._patch = patch.object(unbound, "UNBOUND_CONFIG_PATH", self.config_path)
+        self._patch = patch.object(unbound, "COPILOT_CONFIG_PATH", self.config_path)
         self._patch.start()
         self.addCleanup(self._patch.stop)
 
-    def _write_config(self, config: dict):
-        self.config_path.write_text(json.dumps(config))
+    def _write(self, body: str):
+        self.config_path.write_text(body, encoding="utf-8")
 
 
 class TestEmailDomain(unittest.TestCase):
     def test_returns_domain_for_normal_address(self):
         self.assertEqual(unbound._email_domain("alice@example.com"), "example.com")
 
-    def test_returns_lowercase(self):
-        self.assertEqual(unbound._email_domain("Alice@Example.COM"), "example.com")
+    def test_a_login_has_no_domain(self):
+        self.assertIsNone(unbound._email_domain("octocat"))
 
     def test_none_input_returns_none(self):
         self.assertIsNone(unbound._email_domain(None))
 
-    def test_no_at_sign_returns_none(self):
-        self.assertIsNone(unbound._email_domain("not-an-address"))
 
-    def test_empty_domain_after_at_returns_none(self):
-        self.assertIsNone(unbound._email_domain("alice@"))
+class TestCopilotLogin(_IsolatedConfig):
+    def test_reads_the_login_past_the_jsonc_comment(self):
+        """The file opens with // User settings, which json.loads alone rejects."""
+        self._write(SIGNED_IN)
+        self.assertEqual(unbound._copilot_login(), ("octocat", "https://github.com"))
+
+    def test_plain_json_works_too(self):
+        self._write('{"lastLoggedInUser":{"host":"https://github.com","login":"devuser"}}')
+        self.assertEqual(unbound._copilot_login()[0], "devuser")
+
+    def test_falls_back_to_the_logged_in_users_list(self):
+        self._write('{"loggedInUsers":[{"host":"https://x.ghe.com","login":"ghe-user"}]}')
+        self.assertEqual(unbound._copilot_login(), ("ghe-user", "https://x.ghe.com"))
+
+    def test_signed_out_yields_nothing(self):
+        self._write('// User settings\n{"appTipShown":true}')
+        self.assertEqual(unbound._copilot_login(), (None, None))
+
+    def test_a_missing_file_yields_nothing(self):
+        self.assertEqual(unbound._copilot_login(), (None, None))
+
+    def test_an_unreadable_file_is_logged(self):
+        """Signed out and corrupt both report nothing, so the failure has to say so."""
+        self._write("{not json")
+        with patch.object(unbound, "log_error") as logged:
+            self.assertEqual(unbound._copilot_login(), (None, None))
+        self.assertEqual(logged.call_count, 1)
 
 
 class TestReadAccountIdentity(_IsolatedConfig):
-    def test_reads_email_from_config(self):
-        self._write_config({"email": "dev@acme.com"})
-        self.assertEqual(unbound.read_account_identity()["user_email"], "dev@acme.com")
+    def test_the_login_is_the_account(self):
+        self._write(SIGNED_IN)
+        self.assertEqual(unbound.read_account_identity()["user_email"], "octocat")
 
-    def test_derives_email_domain(self):
-        self._write_config({"email": "dev@acme.com"})
-        self.assertEqual(unbound.read_account_identity()["email_domain"], "acme.com")
+    def test_a_signed_in_seat_reports_its_auth_mode(self):
+        self._write(SIGNED_IN)
+        self.assertEqual(unbound.read_account_identity()["auth_mode"], "subscription")
 
-    def test_org_plan_auth_mode_always_none(self):
-        """The Copilot CLI exposes none of these; the gateway resolves the org
-        from the API key instead."""
-        self._write_config({"email": "dev@acme.com"})
+    def test_org_and_plan_are_never_known(self):
+        """A Copilot seat carries neither where the CLI can read it."""
+        self._write(SIGNED_IN)
         identity = unbound.read_account_identity()
         self.assertIsNone(identity["org_id"])
         self.assertIsNone(identity["plan"])
-        self.assertIsNone(identity["auth_mode"])
 
-    def test_missing_config_returns_all_nulls(self):
+    def test_a_login_carries_no_domain(self):
+        self._write(SIGNED_IN)
+        self.assertIsNone(unbound.read_account_identity()["email_domain"])
+
+    def test_signed_out_reports_nothing_at_all(self):
+        self._write('// User settings\n{"appTipShown":true}')
         identity = unbound.read_account_identity()
         self.assertIsNone(identity["user_email"])
-        self.assertIsNone(identity["email_domain"])
+        self.assertIsNone(identity["auth_mode"])
 
-    def test_config_without_email_field_returns_none(self):
-        self._write_config({"org_name": "acme"})
-        self.assertIsNone(unbound.read_account_identity()["user_email"])
-
-    def test_blank_email_returns_none(self):
-        self._write_config({"email": "   "})
-        self.assertIsNone(unbound.read_account_identity()["user_email"])
-
-    def test_corrupt_config_is_failsafe_none(self):
-        self.config_path.write_text("{not json")
-        self.assertIsNone(unbound.read_account_identity()["user_email"])
+    def test_the_installer_email_is_not_used(self):
+        """It names the device owner, not the Copilot account."""
+        self._write('// User settings\n{"appTipShown":true}')
+        with patch.object(unbound, "UNBOUND_CONFIG_PATH", Path("/nonexistent")):
+            self.assertIsNone(unbound.read_account_identity()["user_email"])
 
 
 class TestBuildAccountIdentity(_IsolatedConfig):
     def test_adds_device_serial(self):
-        self._write_config({"email": "dev@acme.com"})
+        self._write(SIGNED_IN)
         with patch.object(unbound, "_device_serial", return_value="SERIAL1"):
             self.assertEqual(unbound.build_account_identity()["device_serial"], "SERIAL1")
 
     def test_omits_device_serial_when_unavailable(self):
-        self._write_config({"email": "dev@acme.com"})
+        self._write(SIGNED_IN)
         with patch.object(unbound, "_device_serial", return_value=None):
             self.assertNotIn("device_serial", unbound.build_account_identity())
 
-    def test_never_raises_when_identity_read_fails(self):
+    def test_never_raises_when_the_serial_probe_fails(self):
+        self._write(SIGNED_IN)
+        with patch.object(unbound, "_device_serial", side_effect=OSError("boom")):
+            self.assertEqual(unbound.build_account_identity()["user_email"], "octocat")
+
+    def test_never_raises_when_the_identity_read_fails(self):
         with patch.object(unbound, "read_account_identity", side_effect=OSError("boom")):
             with patch.object(unbound, "_device_serial", return_value=None):
                 self.assertEqual(unbound.build_account_identity(), {})
-
-    def test_never_raises_when_serial_probe_fails(self):
-        self._write_config({"email": "dev@acme.com"})
-        with patch.object(unbound, "_device_serial", side_effect=OSError("boom")):
-            self.assertEqual(
-                unbound.build_account_identity()["user_email"], "dev@acme.com"
-            )
 
 
 if __name__ == "__main__":

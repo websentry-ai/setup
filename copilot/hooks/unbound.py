@@ -50,6 +50,8 @@ DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
+# Copilot writes the signed-in account here on login: lastLoggedInUser.{login,host}.
+COPILOT_CONFIG_PATH = Path.home() / ".copilot" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 APPROVAL_POLL_PHASES = (
@@ -1408,16 +1410,52 @@ def _config_email() -> Optional[str]:
     return None
 
 
+def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
+    """The GitHub account Copilot is signed in as, and its host.
+
+    `copilot login` writes lastLoggedInUser to ~/.copilot/config.json. The file is
+    JSONC — it opens with a // comment — so the comments come out before parsing.
+    Never raises."""
+    try:
+        raw = COPILOT_CONFIG_PATH.read_text(encoding='utf-8')
+    except Exception:
+        return None, None
+    try:
+        cfg = json.loads(re.sub(r'^\s*//.*$', '', raw, flags=re.M))
+        user = cfg.get('lastLoggedInUser')
+        if not isinstance(user, dict):
+            users = cfg.get('loggedInUsers')
+            user = users[0] if isinstance(users, list) and users else None
+        if not isinstance(user, dict):
+            return None, None
+        login = (user.get('login') or '').strip() or None
+        host = (user.get('host') or '').strip() or None
+        return login, host
+    except Exception:
+        log_error('copilot config unparsable, account not reported', 'config')
+        return None, None
+
+
 def read_account_identity(event: Optional[Dict] = None) -> Dict:
-    """The signed-in account. Copilot exposes no account file, so only the email is
-    known; the gateway resolves the org from the API key."""
-    email = _config_email()
+    """The account Copilot is signed in as.
+
+    The identifier is a GitHub login, not an address — it is what Copilot records,
+    and what an admin matches a seat by. Signed out, nothing is reported: the
+    installer's own email names the device's owner, not the Copilot account, and
+    sending it here would dress a signed-out machine as a signed-in one."""
+    login, _host = _copilot_login()
+    if not login:
+        return {'org_id': None, 'plan': None, 'auth_mode': None,
+                'user_email': None, 'email_domain': None}
     return {
+        # A Copilot seat carries no org or plan the CLI can read; the gateway
+        # resolves the org from the API key.
         'org_id': None,
         'plan': None,
-        'auth_mode': None,
-        'user_email': email,
-        'email_domain': _email_domain(email),
+        'auth_mode': 'subscription',
+        'user_email': login,
+        # Only a real address has a domain; a login has none.
+        'email_domain': _email_domain(login),
     }
 
 
