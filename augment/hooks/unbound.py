@@ -13,6 +13,7 @@ import hashlib
 import re
 import tempfile
 import platform
+import shutil
 from urllib.parse import unquote, urlparse, urlsplit, urlunsplit
 
 
@@ -2562,6 +2563,49 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
+AUGMENT_PLAN_CACHE_PATH = Path.home() / ".unbound" / "augment_plan.json"
+AUGMENT_PLAN_TTL = 24 * 3600
+
+
+def _fetch_augment_plan() -> Optional[str]:
+    auggie = shutil.which('auggie')
+    if not auggie:
+        return None
+    result = subprocess.run([auggie, 'account', 'status', '--json'],
+                            capture_output=True, timeout=15)
+    if result.returncode != 0:
+        return None
+    plan = json.loads(result.stdout).get('planName')
+    return plan.strip() or None if isinstance(plan, str) else None
+
+
+def _augment_plan(email: Optional[str], probe: bool) -> Optional[str]:
+    """The plan, which Auggie reports only through its own CLI. It takes seconds,
+    so only SessionStart (60s budget) asks; turns read the day-long cache. Never raises."""
+    try:
+        cached = json.loads(AUGMENT_PLAN_CACHE_PATH.read_text(encoding='utf-8'))
+        if cached.get('email') == email and time.time() - cached.get('at', 0) < AUGMENT_PLAN_TTL:
+            return cached.get('plan')
+    except Exception:
+        pass
+    if not probe:
+        return None
+    try:
+        plan = _fetch_augment_plan()
+    except Exception:
+        plan = None
+    # A miss is cached too, or a machine without the CLI asks every turn.
+    try:
+        AUGMENT_PLAN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = AUGMENT_PLAN_CACHE_PATH.parent / (".augment_plan.%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps({'email': email, 'plan': plan, 'at': time.time()}),
+                       encoding='utf-8')
+        os.replace(str(tmp), str(AUGMENT_PLAN_CACHE_PATH))
+    except Exception:
+        pass
+    return plan
+
+
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
     """read_account_identity reads context.userEmail off the event; just add the
     device serial. probe defaults False so the latency-critical pre-tool path only
@@ -2573,6 +2617,10 @@ def build_account_identity(event: Optional[Dict] = None, probe: bool = False) ->
             identity = {}
     except Exception:
         identity = {}
+    try:
+        identity['plan'] = _augment_plan(identity.get('user_email'), probe=False)
+    except Exception:
+        pass
     try:
         serial = _device_serial(probe=probe)
         if serial:
@@ -4203,6 +4251,12 @@ def main():
         # debounced discovery scan dispatch.
         if hook_event_name == "SessionStart":
             _device_serial()  # warm the (slow) serial probe + cache once per session
+            try:
+                identity = read_account_identity(event)
+                _augment_plan(identity.get('user_email') if isinstance(identity, dict) else None,
+                              probe=True)
+            except Exception:
+                pass  # the repo gate below must still print
             _dispatch_discovery()
             print(json.dumps(_repo_gate_session_start_output(event)), flush=True)
             return

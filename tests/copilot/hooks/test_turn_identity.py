@@ -377,7 +377,9 @@ class TestExchangeCarriesTheAccount(unittest.TestCase):
                     patch.object(unbound, "_vscode_turn_model", lambda *a, **k: None), \
                     patch.object(unbound, "build_account_identity",
                                  lambda **k: {"user_email": "dev@acme.com",
-                                              "email_domain": "acme.com"}), \
+                                              "email_domain": "acme.com",
+                                              "account_login": "octocat",
+                                              "account_host": "https://github.com"}), \
                     patch.object(unbound, "send_to_api",
                                  lambda ex, key: sent.append(ex) or True):
                 unbound.complete_pending_turn(event, pending, "key")
@@ -387,7 +389,10 @@ class TestExchangeCarriesTheAccount(unittest.TestCase):
         sent = self._send_and_capture()
         self.assertEqual(len(sent), 1)
         self.assertEqual(sent[0]["account_identity"],
-                         {"user_email": "dev@acme.com", "email_domain": "acme.com"})
+                         {"user_email": "dev@acme.com",
+                          "email_domain": "acme.com",
+                          "account_login": "octocat",
+                          "account_host": "https://github.com"})
 
     def test_the_turn_exchange_builder_asks_for_the_account(self):
         # build_exchange_from_transcript is the other payload that reaches the same
