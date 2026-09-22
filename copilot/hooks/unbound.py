@@ -1549,6 +1549,66 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
+COPILOT_SEAT_CACHE_PATH = Path.home() / ".unbound" / "copilot_seat.json"
+COPILOT_SEAT_TTL = 24 * 3600
+
+
+def _fetch_copilot_seat() -> Optional[Dict]:
+    """GitHub's view of the seat. Never reads Copilot's keychain item: only
+    Copilot's own binary may, and anything else prompts the user."""
+    for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
+        token = (os.environ.get(var) or '').strip()
+        if token:
+            curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
+            result = subprocess.run(
+                [curl, "-fsS", "--max-time", "5", "-H", "@-",
+                 "https://api.github.com/copilot_internal/user"],
+                input=("Authorization: token %s\n" % token).encode(),
+                capture_output=True, timeout=10)
+            return json.loads(result.stdout) if result.returncode == 0 else None
+    gh = shutil.which('gh')
+    if gh:
+        result = subprocess.run([gh, 'api', '/copilot_internal/user'],
+                                capture_output=True, timeout=10)
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+    return None
+
+
+def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optional[str], Optional[str]]:
+    """Plan and org of the seat, which Copilot keeps nowhere on disk. Cached a
+    day; only the end-of-turn path (probe) asks GitHub. Never raises."""
+    try:
+        cached = json.loads(COPILOT_SEAT_CACHE_PATH.read_text(encoding='utf-8'))
+        if cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
+            return cached.get('plan'), cached.get('org')
+    except Exception:
+        pass
+    if not probe or (host and urlparse(host).hostname != 'github.com'):
+        return None, None
+    try:
+        seat = _fetch_copilot_seat()
+    except Exception:
+        seat = None
+    plan = org = None
+    # Another account's token (a different gh login) must not lend its seat.
+    if isinstance(seat, dict) and str(seat.get('login') or '').lower() == login.lower():
+        plan = seat.get('copilot_plan') if isinstance(seat.get('copilot_plan'), str) else None
+        orgs = seat.get('organization_login_list')
+        orgs = sorted(o for o in orgs if isinstance(o, str) and o) if isinstance(orgs, list) else []
+        org = orgs[0] if orgs else None
+    # A miss is cached too, or a machine with no token asks GitHub every turn.
+    try:
+        COPILOT_SEAT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COPILOT_SEAT_CACHE_PATH.parent / (".copilot_seat.%d.tmp" % os.getpid())
+        tmp.write_text(json.dumps({'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
+                       encoding='utf-8')
+        os.replace(str(tmp), str(COPILOT_SEAT_CACHE_PATH))
+    except Exception:
+        pass
+    return plan, org
+
+
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
     """The account plus the device serial. The event is unused here. Never raises."""
     try:
@@ -1557,6 +1617,12 @@ def build_account_identity(event: Optional[Dict] = None, probe: bool = False) ->
             identity = {}
     except Exception:
         identity = {}
+    try:
+        if identity.get('account_login'):
+            identity['plan'], identity['org_id'] = _copilot_seat(
+                identity['account_login'], identity.get('account_host'), probe)
+    except Exception:
+        pass
     try:
         serial = _device_serial(probe=probe)
         if serial:

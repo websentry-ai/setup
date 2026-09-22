@@ -180,6 +180,23 @@ class TestUnreadableStateDb(unittest.TestCase):
         self.assertEqual(result["email_domain"], "acme.io")
         self.assertEqual(result["plan"], "pro")
 
+    def test_an_unreadable_database_keeps_the_team_of_the_last_account(self):
+        """The fallback used to drop the team, so a locked database reported a
+        team account with no org."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("INSERT INTO ItemTable VALUES (?, ?)",
+                     ("cursorAuth/cachedTeam", '{"teamId":22471406,"name":"Acme"}'))
+        conn.commit()
+        conn.close()
+        self.assertEqual(unbound.read_account_identity()["org_id"], "22471406")
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "22471406")
+
+    def test_a_personal_account_falls_back_with_no_team(self):
+        unbound.read_account_identity()
+        with patch.object(unbound, "_read_cursor_item_table", return_value=None):
+            self.assertIsNone(unbound.read_account_identity()["org_id"])
+
     def test_a_signed_out_account_is_not_restored_from_the_cache(self):
         """A database that reads fine and holds no account means signed out.
         Reusing the last account there hands the previous approval to whoever

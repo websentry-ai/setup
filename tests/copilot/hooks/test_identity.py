@@ -147,5 +147,78 @@ class TestBuildAccountIdentity(_IsolatedConfig):
                 self.assertEqual(unbound.build_account_identity(), {})
 
 
+
+class TestCopilotSeat(unittest.TestCase):
+    """Plan and org come from GitHub, since Copilot keeps neither on disk."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        p = patch.object(unbound, "COPILOT_SEAT_CACHE_PATH", Path(self._tmp.name) / "seat.json")
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _seat(self, seat, login="octocat", host="https://github.com", probe=True):
+        with patch.object(unbound, "_fetch_copilot_seat", return_value=seat) as fetch:
+            return unbound._copilot_seat(login, host, probe), fetch
+
+    def test_reads_the_plan_and_the_org(self):
+        (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "business",
+                                     "organization_login_list": ["zeta", "acme"]})
+        self.assertEqual((plan, org), ("business", "acme"))
+
+    def test_a_personal_seat_has_no_org(self):
+        (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "individual",
+                                     "organization_login_list": []})
+        self.assertEqual((plan, org), ("individual", None))
+
+    def test_another_accounts_seat_is_refused(self):
+        """A gh login that is not Copilot's must not lend its plan."""
+        result, _ = self._seat({"login": "someone-else", "copilot_plan": "enterprise"})
+        self.assertEqual(result, (None, None))
+
+    def test_the_pre_tool_path_never_calls_github(self):
+        result, fetch = self._seat({"login": "octocat"}, probe=False)
+        self.assertEqual(result, (None, None))
+        fetch.assert_not_called()
+
+    def test_a_cached_seat_is_served_without_a_call(self):
+        self._seat({"login": "octocat", "copilot_plan": "business",
+                    "organization_login_list": ["acme"]})
+        result, fetch = self._seat(None, probe=False)
+        self.assertEqual(result, ("business", "acme"))
+        fetch.assert_not_called()
+
+    def test_a_cache_for_another_login_is_ignored(self):
+        self._seat({"login": "octocat", "copilot_plan": "business"})
+        result, _ = self._seat(None, login="hubot", probe=False)
+        self.assertEqual(result, (None, None))
+
+    def test_a_miss_is_cached_so_the_next_turn_does_not_ask(self):
+        self._seat({"login": "someone-else"})
+        result, fetch = self._seat({"login": "octocat", "copilot_plan": "business"})
+        self.assertEqual(result, (None, None))
+        fetch.assert_not_called()
+
+    def test_an_enterprise_server_host_is_not_asked(self):
+        result, fetch = self._seat({"login": "octocat"}, host="https://acme.ghe.com")
+        self.assertEqual(result, (None, None))
+        fetch.assert_not_called()
+
+    def test_a_failed_call_reports_nothing(self):
+        with patch.object(unbound, "_fetch_copilot_seat", side_effect=OSError("offline")):
+            self.assertEqual(unbound._copilot_seat("octocat", "https://github.com", True),
+                             (None, None))
+
+    def test_the_identity_carries_the_seat(self):
+        with patch.object(unbound, "read_account_identity",
+                          return_value={"account_login": "octocat",
+                                        "account_host": "https://github.com"}), \
+                patch.object(unbound, "_copilot_seat", return_value=("business", "acme")), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True)
+        self.assertEqual((identity["plan"], identity["org_id"]), ("business", "acme"))
+
+
 if __name__ == "__main__":
     unittest.main()
