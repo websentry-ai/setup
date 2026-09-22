@@ -78,14 +78,24 @@ def test_onboard_forwards_frontend_url_intact():
 
 # ---------------------------------------------------------------------------
 # Harness: drive a real installer main() far enough to reach the config write,
-# stubbing only the OS/network leaves. write_unbound_config_for_user is captured,
-# then a BaseException stops main before it mutates the machine.
+# stubbing only the OS/network leaves (including the hook-script download).
+# write_unbound_config_for_user is captured, then a BaseException stops main
+# before it mutates the machine.
 # ---------------------------------------------------------------------------
 class _StopAtPersist(BaseException):
     pass
 
 
 # Patched only if the module actually defines them (the tools differ slightly).
+def _stub_download_file(url, dest_path, *_args, **_kwargs):
+    # Copilot curls the hook script (download_file) before the config write.
+    # A live miss would fail the persist assertion even when the URL was parsed.
+    dest = Path(dest_path)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("# stub hook\n", encoding="utf-8")
+    return True
+
+
 _SAFE_STUBS = {
     "check_admin_privileges": lambda *a, **k: True,
     "get_device_identifier": lambda *a, **k: "DEV-SERIAL",
@@ -98,6 +108,7 @@ _SAFE_STUBS = {
     "remove_user_level_hooks": lambda *a, **k: None,
     "set_env_var_system_wide": lambda *a, **k: (True, False),
     "set_env_var": lambda *a, **k: (True, False, "ok"),
+    "download_file": _stub_download_file,
 }
 
 
