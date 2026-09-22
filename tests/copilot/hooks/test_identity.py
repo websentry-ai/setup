@@ -163,66 +163,140 @@ class TestCopilotSeat(unittest.TestCase):
             return unbound._copilot_seat(login, host, probe), fetch
 
     def test_reads_the_plan_and_the_org(self):
-        (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "business",
+        (plan, org, _email), _ = self._seat({"login": "octocat", "copilot_plan": "business",
                                      "organization_login_list": ["zeta", "acme"]})
         self.assertEqual((plan, org), ("business", "acme"))
 
     def test_a_personal_seat_has_no_org(self):
-        (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "individual",
+        (plan, org, _email), _ = self._seat({"login": "octocat", "copilot_plan": "individual",
                                      "organization_login_list": []})
         self.assertEqual((plan, org), ("individual", None))
 
     def test_another_accounts_seat_is_refused(self):
         """A gh login that is not Copilot's must not lend its plan."""
         result, _ = self._seat({"login": "someone-else", "copilot_plan": "enterprise"})
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
 
     def test_the_pre_tool_path_never_calls_github(self):
         result, fetch = self._seat({"login": "octocat"}, probe=False)
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
         fetch.assert_not_called()
 
     def test_a_cached_seat_is_served_without_a_call(self):
         self._seat({"login": "octocat", "copilot_plan": "business",
                     "organization_login_list": ["acme"]})
         result, fetch = self._seat(None, probe=False)
-        self.assertEqual(result, ("business", "acme"))
+        self.assertEqual(result, ("business", "acme", None))
         fetch.assert_not_called()
 
     def test_a_cache_for_another_login_is_ignored(self):
         self._seat({"login": "octocat", "copilot_plan": "business"})
         result, _ = self._seat(None, login="hubot", probe=False)
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
 
     def test_a_miss_is_cached_so_the_next_turn_does_not_ask(self):
         self._seat({"login": "someone-else"})
         result, fetch = self._seat({"login": "octocat", "copilot_plan": "business"})
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
         fetch.assert_not_called()
 
     def test_an_enterprise_server_host_is_not_asked(self):
         result, fetch = self._seat({"login": "octocat"}, host="https://acme.ghe.com")
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
         fetch.assert_not_called()
 
     def test_an_unknown_host_is_not_asked(self):
         result, fetch = self._seat({"login": "octocat"}, host=None)
-        self.assertEqual(result, (None, None))
+        self.assertEqual(result, (None, None, None))
         fetch.assert_not_called()
 
     def test_a_failed_call_reports_nothing(self):
         with patch.object(unbound, "_fetch_copilot_seat", side_effect=OSError("offline")):
             self.assertEqual(unbound._copilot_seat("octocat", "https://github.com", True),
-                             (None, None))
+                             (None, None, None))
 
     def test_the_identity_carries_the_seat(self):
         with patch.object(unbound, "read_account_identity",
                           return_value={"account_login": "octocat",
                                         "account_host": "https://github.com"}), \
-                patch.object(unbound, "_copilot_seat", return_value=("business", "acme")), \
+                patch.object(unbound, "_copilot_seat", return_value=("business", "acme", None)), \
                 patch.object(unbound, "_device_serial", return_value=None):
             identity = unbound.build_account_identity(probe=True)
         self.assertEqual((identity["plan"], identity["org_id"]), ("business", "acme"))
+
+
+    def test_a_cache_for_another_host_is_ignored(self):
+        self._seat({"login": "octocat", "copilot_plan": "business"})
+        result, _ = self._seat(None, host="https://acme.ghe.com", probe=False)
+        self.assertEqual(result, (None, None, None))
+
+    def test_the_seat_carries_a_verified_email(self):
+        with patch.object(unbound, "_verified_email", return_value="octo@acme.com") as verified:
+            (_, _, email), _ = self._seat({"login": "octocat", "copilot_plan": "business",
+                                           "organization_login_list": ["acme"]})
+        self.assertEqual(email, "octo@acme.com")
+        verified.assert_called_once_with("octocat", "acme")
+
+    def test_another_accounts_seat_is_never_asked_for_an_email(self):
+        with patch.object(unbound, "_verified_email") as verified:
+            self._seat({"login": "someone-else"})
+        verified.assert_not_called()
+
+    def test_a_verified_email_becomes_the_account_email(self):
+        with patch.object(unbound, "read_account_identity",
+                          return_value={"account_login": "octocat", "user_email": None,
+                                        "account_host": "https://github.com"}), \
+                patch.object(unbound, "_copilot_seat", return_value=("business", "acme", "octo@acme.com")), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True)
+        self.assertEqual((identity["user_email"], identity["email_domain"]), ("octo@acme.com", "acme.com"))
+        self.assertEqual(identity["account_login"], "octocat")
+
+    def test_no_email_keeps_the_login_only(self):
+        with patch.object(unbound, "read_account_identity",
+                          return_value={"account_login": "octocat", "user_email": None}), \
+                patch.object(unbound, "_copilot_seat", return_value=("business", "acme", None)), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            self.assertIsNone(unbound.build_account_identity(probe=True)["user_email"])
+
+
+class TestVerifiedEmail(unittest.TestCase):
+    """Only GitHub-verified addresses: the org's verified domain, then the public
+    profile email. Commit author emails are never asked for."""
+
+    def _email(self, responses, org="acme"):
+        calls = []
+        def fake(path, graphql=None):
+            calls.append(path)
+            return responses.get(path)
+        with patch.object(unbound, "_github", side_effect=fake):
+            return unbound._verified_email("octocat", org), calls
+
+    def test_the_org_verified_domain_email_wins(self):
+        email, calls = self._email({
+            "/graphql": {"data": {"viewer": {"organizationVerifiedDomainEmails": ["b@acme.com", "a@acme.com"]}}},
+            "/users/octocat": {"email": "octo@gmail.com"}})
+        self.assertEqual(email, "a@acme.com")
+        self.assertEqual(calls, ["/graphql"])
+
+    def test_falls_back_to_the_public_profile_email(self):
+        email, _ = self._email({
+            "/graphql": {"data": {"viewer": {"organizationVerifiedDomainEmails": []}}},
+            "/users/octocat": {"email": "octo@acme.com"}})
+        self.assertEqual(email, "octo@acme.com")
+
+    def test_no_org_asks_only_the_profile(self):
+        email, calls = self._email({"/users/octocat": {"email": "octo@acme.com"}}, org=None)
+        self.assertEqual((email, calls), ("octo@acme.com", ["/users/octocat"]))
+
+    def test_nothing_published_means_no_email(self):
+        email, _ = self._email({"/graphql": {"data": {"viewer": None}},
+                                "/users/octocat": {"email": None}})
+        self.assertIsNone(email)
+
+    def test_commits_are_never_searched(self):
+        _, calls = self._email({})
+        self.assertFalse(any("commit" in c for c in calls))
 
 
 if __name__ == "__main__":

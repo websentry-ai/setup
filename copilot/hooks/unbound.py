@@ -1583,61 +1583,95 @@ COPILOT_SEAT_CACHE_PATH = Path.home() / ".unbound" / "copilot_seat.json"
 COPILOT_SEAT_TTL = 24 * 3600
 
 
-def _fetch_copilot_seat() -> Optional[Dict]:
-    """GitHub's view of the seat. Never reads Copilot's keychain item: only
-    Copilot's own binary may, and anything else prompts the user."""
+def _github(path: str, graphql: Optional[Dict] = None) -> Optional[Dict]:
+    """One GitHub API call as the signed-in developer. Never reads Copilot's
+    keychain item: only Copilot's own binary may, and anything else prompts."""
+    body = json.dumps(graphql).encode() if graphql is not None else None
     for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
         token = (os.environ.get(var) or '').strip()
         if token:
             curl = _windows_system32_path("curl.exe") if _is_windows() else "curl"
-            result = subprocess.run(
-                [curl, "-fsS", "--max-time", "5", "-H", "@-",
-                 "https://api.github.com/copilot_internal/user"],
-                input=("Authorization: token %s\n" % token).encode(),
-                capture_output=True, timeout=10)
+            headers = "Authorization: token %s\n" % token
+            args = [curl, "-fsS", "--max-time", "5", "-H", "@-"]
+            if body is not None:
+                # The header rides on stdin, so the body goes in a temp file.
+                with tempfile.NamedTemporaryFile(delete=False) as f:
+                    f.write(body)
+                args += ["-X", "POST", "--data-binary", "@" + f.name]
+            try:
+                result = subprocess.run(args + ["https://api.github.com" + path],
+                                        input=headers.encode(), capture_output=True, timeout=10)
+            finally:
+                if body is not None:
+                    os.unlink(f.name)
             return json.loads(result.stdout) if result.returncode == 0 else None
     gh = shutil.which('gh')
     if gh:
-        result = subprocess.run([gh, 'api', '/copilot_internal/user'],
-                                capture_output=True, timeout=10)
+        args = [gh, 'api', path.lstrip('/')] + (['--input', '-'] if body is not None else [])
+        result = subprocess.run(args, input=body, capture_output=True, timeout=10)
         if result.returncode == 0:
             return json.loads(result.stdout)
     return None
 
 
-def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optional[str], Optional[str]]:
-    """Plan and org of the seat, which Copilot keeps nowhere on disk. Cached a
-    day; only the end-of-turn path (probe) asks GitHub. Never raises."""
+def _fetch_copilot_seat() -> Optional[Dict]:
+    return _github('/copilot_internal/user')
+
+
+def _verified_email(login: str, org: Optional[str]) -> Optional[str]:
+    """A GitHub-verified address only. The seat org's verified-domain email comes
+    first; a public profile email must be verified too. Commit author emails are
+    never used: any commit can claim any address."""
+    if org:
+        data = _github('/graphql', {
+            'query': 'query($o:String!){viewer{organizationVerifiedDomainEmails(login:$o)}}',
+            'variables': {'o': org}})
+        emails = (((data or {}).get('data') or {}).get('viewer') or {}).get('organizationVerifiedDomainEmails')
+        emails = sorted(e for e in emails if isinstance(e, str) and '@' in e) if isinstance(emails, list) else []
+        if emails:
+            return emails[0]
+    public = (_github('/users/%s' % login) or {}).get('email')
+    return public.strip() or None if isinstance(public, str) and '@' in public else None
+
+
+def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Plan, org and verified email of the seat, which Copilot keeps nowhere on
+    disk. Cached a day; only the end-of-turn path (probe) asks GitHub. Never raises."""
     try:
         cached = json.loads(COPILOT_SEAT_CACHE_PATH.read_text(encoding='utf-8'))
-        if cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
-            return cached.get('plan'), cached.get('org')
+        if (cached.get('login') == login and cached.get('host') == host
+                and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL):
+            return cached.get('plan'), cached.get('org'), cached.get('email')
     except Exception:
         pass
     # An unknown host may be Enterprise Server; its token must not reach github.com.
     if not probe or urlparse(host or '').hostname != 'github.com':
-        return None, None
+        return None, None, None
     try:
         seat = _fetch_copilot_seat()
     except Exception:
         seat = None
-    plan = org = None
+    plan = org = email = None
     # Another account's token (a different gh login) must not lend its seat.
     if isinstance(seat, dict) and str(seat.get('login') or '').lower() == login.lower():
         plan = seat.get('copilot_plan') if isinstance(seat.get('copilot_plan'), str) else None
         orgs = seat.get('organization_login_list')
         orgs = sorted(o for o in orgs if isinstance(o, str) and o) if isinstance(orgs, list) else []
         org = orgs[0] if orgs else None
+        try:
+            email = _verified_email(login, org)
+        except Exception:
+            email = None
     # A miss is cached too, or a machine with no token asks GitHub every turn.
     try:
         COPILOT_SEAT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = COPILOT_SEAT_CACHE_PATH.parent / (".copilot_seat.%d.tmp" % os.getpid())
-        tmp.write_text(json.dumps({'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
-                       encoding='utf-8')
+        tmp.write_text(json.dumps({'login': login, 'host': host, 'plan': plan, 'org': org,
+                                   'email': email, 'at': time.time()}), encoding='utf-8')
         os.replace(str(tmp), str(COPILOT_SEAT_CACHE_PATH))
     except Exception:
         pass
-    return plan, org
+    return plan, org, email
 
 
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
@@ -1650,8 +1684,11 @@ def build_account_identity(event: Optional[Dict] = None, probe: bool = False) ->
         identity = {}
     try:
         if identity.get('account_login'):
-            identity['plan'], identity['org_id'] = _copilot_seat(
+            identity['plan'], identity['org_id'], email = _copilot_seat(
                 identity['account_login'], identity.get('account_host'), probe)
+            if email:
+                identity['user_email'] = email
+                identity['email_domain'] = _email_domain(email)
     except Exception:
         pass
     try:
