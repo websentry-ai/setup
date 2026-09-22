@@ -50,7 +50,6 @@ DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
-# Copilot writes the signed-in account here on login: lastLoggedInUser.{login,host}.
 COPILOT_CONFIG_PATH = Path.home() / ".copilot" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
@@ -1411,11 +1410,7 @@ def _config_email() -> Optional[str]:
 
 
 def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
-    """The GitHub account Copilot is signed in as, and its host.
-
-    `copilot login` writes lastLoggedInUser to ~/.copilot/config.json. The file is
-    JSONC — it opens with a // comment — so the comments come out before parsing.
-    Never raises."""
+    """The account `copilot login` recorded. JSONC, so comments come out first."""
     try:
         raw = COPILOT_CONFIG_PATH.read_text(encoding='utf-8')
     except Exception:
@@ -1437,24 +1432,16 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
 
 
 def read_account_identity(event: Optional[Dict] = None) -> Dict:
-    """The account Copilot is signed in as.
-
-    The identifier is a GitHub login, not an address — it is what Copilot records,
-    and what an admin matches a seat by. Signed out, nothing is reported: the
-    installer's own email names the device's owner, not the Copilot account, and
-    sending it here would dress a signed-out machine as a signed-in one."""
+    """The signed-in account, keyed by GitHub login rather than address."""
     login, _host = _copilot_login()
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None}
     return {
-        # A Copilot seat carries no org or plan the CLI can read; the gateway
-        # resolves the org from the API key.
         'org_id': None,
         'plan': None,
         'auth_mode': 'subscription',
         'user_email': login,
-        # Only a real address has a domain; a login has none.
         'email_domain': _email_domain(login),
     }
 
