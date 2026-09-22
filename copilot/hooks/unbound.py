@@ -32,6 +32,10 @@ def _copilot_home():
     return Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
 
 
+def _copilot_config_path():
+    return _copilot_home() / 'config.json'
+
+
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
@@ -50,7 +54,6 @@ DISCOVERY_INSTALL_PS1 = DISCOVERY_INSTALL_DIR / "install.ps1"
 DISCOVERY_INSTALL_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.sh"
 DISCOVERY_INSTALL_PS1_URL = "https://raw.githubusercontent.com/websentry-ai/coding-discovery-tool/main/install.ps1"
 UNBOUND_CONFIG_PATH = Path.home() / ".unbound" / "config.json"
-COPILOT_CONFIG_PATH = Path.home() / ".copilot" / "config.json"
 IDENTITY_CACHE_PATH = Path.home() / ".unbound" / "identity.json"
 
 APPROVAL_POLL_PHASES = (
@@ -1412,7 +1415,7 @@ def _config_email() -> Optional[str]:
 def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
     """The account `copilot login` recorded. JSONC, so comments come out first."""
     try:
-        raw = COPILOT_CONFIG_PATH.read_text(encoding='utf-8')
+        raw = _copilot_config_path().read_text(encoding='utf-8')
     except Exception:
         return None, None
     try:
@@ -1433,16 +1436,21 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
 
 def read_account_identity(event: Optional[Dict] = None) -> Dict:
     """The signed-in account, keyed by GitHub login rather than address."""
-    login, _host = _copilot_login()
+    login, host = _copilot_login()
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
-                'user_email': None, 'email_domain': None}
+                'user_email': None, 'email_domain': None,
+                'account_login': None, 'account_host': None}
     return {
         'org_id': None,
         'plan': None,
         'auth_mode': 'subscription',
-        'user_email': login,
-        'email_domain': _email_domain(login),
+        # Never user_email: the gateway maps that to device.email, which
+        # provisions and hands off devices to whatever address it names.
+        'user_email': None,
+        'email_domain': None,
+        'account_login': login,
+        'account_host': host,
     }
 
 
