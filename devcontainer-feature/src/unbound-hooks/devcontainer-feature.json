@@ -2,7 +2,7 @@
   "id": "unbound-hooks",
   "version": "0.1.0",
   "name": "Unbound Container Hooks",
-  "description": "Installs the canonical Unbound hook (sourced from this repo's claude-code/hooks/unbound.py) plus managed settings so Claude Code running in this dev container enforces Unbound policy. The hook resolves credentials at runtime via UNBOUND_CLAUDE_API_KEY or a mounted ~/.unbound/config.json (read natively by the hook) and calls the Unbound gateway. Requires python3 (installed via the official python feature) and curl (installed best-effort).",
+  "description": "Installs the canonical Unbound hooks (sourced from this repo's claude-code/hooks/unbound.py and cursor/unbound.py) plus managed settings so Claude Code and Cursor running in this dev container enforce Unbound policy. Claude Code gets /unbound/unbound.py + /etc/claude-code managed settings; Cursor gets the enterprise-managed hooks at /etc/cursor (the same layout cursor/mdm/setup.py installs on Linux). Both resolve credentials at runtime via their env key (UNBOUND_CLAUDE_API_KEY / UNBOUND_CURSOR_API_KEY) or a mounted ~/.unbound/config.json, and call the Unbound gateway. Requires python3 (installed via the official python feature) and curl (installed best-effort).",
   "documentationURL": "https://github.com/websentry-ai/setup/tree/main/devcontainer-feature/src/unbound-hooks",
   "dependsOn": {
     "ghcr.io/devcontainers/features/python:1": {

@@ -5,9 +5,10 @@ name: publish-feature
 # :0.1.0, :0.1, :0, :latest under ghcr.io/websentry-ai/setup/unbound-hooks.
 # Auth uses the built-in GITHUB_TOKEN.
 #
-# Zero-drift: before publishing, the canonical hook is copied from
-# claude-code/hooks/unbound.py into the feature dir (the committed tree does NOT contain
-# that copy — it is .gitignored), so the published Feature always carries the current hook.
+# Zero-drift: before publishing, the canonical hooks are copied into the feature dir —
+# claude-code/hooks/unbound.py, plus cursor/unbound.py + cursor/hooks.json (the committed
+# tree does NOT contain these copies — they are .gitignored), so the published Feature
+# always carries the current Claude Code and Cursor hooks.
 #
 # Triggers (deliberately scoped to NOT collide with this repo's own release tags):
 #   - push a dedicated tag:  git push origin container-addon-v0.1.0
@@ -31,8 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Vendor canonical hook into the feature (zero-drift)
-        run: cp claude-code/hooks/unbound.py devcontainer-feature/src/unbound-hooks/unbound.py
+      - name: Vendor canonical hooks into the feature (zero-drift)
+        run: |
+          cp claude-code/hooks/unbound.py devcontainer-feature/src/unbound-hooks/unbound.py
+          cp cursor/unbound.py devcontainer-feature/src/unbound-hooks/cursor-unbound.py
+          cp cursor/hooks.json devcontainer-feature/src/unbound-hooks/cursor-hooks.json
 
       - name: Sync feature version to the release tag (single source of truth)
         # The git tag is the single source of truth for BOTH the addon image tag and the
