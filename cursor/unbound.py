@@ -2736,8 +2736,9 @@ def _read_mcp_server_config(server_name, config_path):
 
 
 def _cursor_mcp_server_config(event, server_name):
-    """A project's .cursor/mcp.json overrides the global one, as in Cursor. A remote
-    server set up elsewhere (a plugin) is still fingerprinted by the URL on the event."""
+    """Cursor reads MCP servers from each project's .cursor/mcp.json and from
+    ~/.cursor/mcp.json; the project file is checked first. A remote server set up
+    elsewhere (a plugin) is still fingerprinted by the URL on the event."""
     roots = event.get('workspace_roots') or []
     paths = [Path(root) / '.cursor' / 'mcp.json' for root in roots if isinstance(root, str) and root]
     for path in paths + [CURSOR_MCP_CONFIG_PATH]:
