@@ -1125,15 +1125,12 @@ def read_account_identity():
     except Exception:
         unreadable = True
     if email:
-        _remember_account(email, plan)
+        _remember_account(email, plan, org_id)
     elif unreadable:
         # Only when the read itself failed. A database that reads fine and holds
         # no account means signed out, and reusing the last account there would
         # hand a signed-out or switched user the previous approval.
-        email, plan = _cached_account(plan)
-        # The cache carries no team, and one kept from another account would
-        # name the wrong tenant.
-        org_id = None
+        email, plan, org_id = _cached_account(plan)
     else:
         _forget_account()
     return {
@@ -1154,20 +1151,22 @@ def _cached_account(plan):
     try:
         loaded = json.loads(IDENTITY_CACHE_PATH.read_text(encoding='utf-8'))
     except Exception:
-        return None, plan
+        return None, plan, None
     if not isinstance(loaded, dict):
-        return None, plan
+        return None, plan, None
     account = loaded.get('cursor_account')
     if not isinstance(account, dict):
-        return None, plan
+        return None, plan, None
     seen_at = account.get('seen_at')
     if not isinstance(seen_at, (int, float)):
-        return None, plan
+        return None, plan, None
     if (time.time() - seen_at) > ACCOUNT_CACHE_MAX_AGE_SECONDS:
-        return None, plan
+        return None, plan, None
     email = account.get('user_email')
     email = email.strip() if isinstance(email, str) else None
-    return (email or None), (plan or account.get('plan'))
+    # The team is the one read with this email, so it names the same tenant.
+    org_id = account.get('org_id') if isinstance(account.get('org_id'), str) else None
+    return (email or None), (plan or account.get('plan')), (org_id if email else None)
 
 
 def _forget_account():
@@ -1188,7 +1187,7 @@ def _forget_account():
         pass
 
 
-def _remember_account(email, plan):
+def _remember_account(email, plan, org_id=None):
     """Merge into the cache the device serial already shares. Never raises."""
     try:
         data = {}
@@ -1200,12 +1199,12 @@ def _remember_account(email, plan):
             data = {}
         current = data.get('cursor_account')
         if (isinstance(current, dict) and current.get('user_email') == email
-                and current.get('plan') == plan
+                and current.get('plan') == plan and current.get('org_id') == org_id
                 and isinstance(current.get('seen_at'), (int, float))
                 and (time.time() - current['seen_at']) < ACCOUNT_CACHE_REFRESH_SECONDS):
             return
         data['cursor_account'] = {
-            'user_email': email, 'plan': plan, 'seen_at': int(time.time()),
+            'user_email': email, 'plan': plan, 'org_id': org_id, 'seen_at': int(time.time()),
         }
         IDENTITY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = IDENTITY_CACHE_PATH.parent / (".identity.%d.tmp" % os.getpid())
@@ -1334,6 +1333,9 @@ def build_account_identity(event=None, probe=False):
         if isinstance(event, dict):
             email = (event.get('user_email') or '').strip() or None
             if email:
+                # Plan and team read with another account are not this one's.
+                if (identity.get('user_email') or '').lower() != email.lower():
+                    identity['plan'] = identity['org_id'] = None
                 # Recompute, never keep: a domain left over from another account
                 # is the field the gate matches on.
                 identity['user_email'] = email

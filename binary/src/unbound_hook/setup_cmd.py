@@ -223,8 +223,8 @@ def _cursor_hooks_json():
 
 def _augment_hooks_config():
     """The Augment hooks block with binary commands. Structure + per-event
-    timeouts (ms) copied verbatim from augment build_hooks_block; no per-hook
-    metadata (Auggie rejects it) and no UserPromptSubmit (Augment has no such
+    timeouts (ms) copied verbatim from augment build_hooks_block; block-level
+    metadata is set by the writer and no UserPromptSubmit (Augment has no such
     event). No Windows `shell` key — the binary path is macOS-only."""
     cmd = lambda ev: hook_command_for_event("augment", ev)
     return {
@@ -371,6 +371,21 @@ def _write_augment_managed_settings(m) -> bool:
             elif existing_config is None:
                 settings["hooks"][event] = new_config
             # A foreign non-list hooks[event] is left untouched.
+
+        # Without these Auggie sends no context, so no account email. Set on
+        # existing blocks too, so installed devices pick them up on re-run.
+        for event, flags in m._HOOK_METADATA.items():
+            blocks = settings["hooks"].get(event)
+            if not isinstance(blocks, list):
+                continue
+            our_command = hooks_config[event][0]["hooks"][0]["command"]
+            for item in blocks:
+                if isinstance(item, dict) and any(
+                        isinstance(hook, dict) and hook.get("command", "") == our_command
+                        for hook in item.get("hooks", [])):
+                    if not isinstance(item.get("metadata"), dict):
+                        item["metadata"] = {}
+                    item["metadata"].update(flags)
 
         # Merge toolPermissions, preserving foreign rules. Match on our identity
         # (toolName + shellInputRegex) so re-running never duplicates.
