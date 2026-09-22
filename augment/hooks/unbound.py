@@ -3742,6 +3742,15 @@ def build_llm_exchange(event: Dict, post_tool_events: List[Dict], model: Optiona
     }
 
 
+_RETRYABLE_4XX = ('408', '429')
+
+
+def _permanent_failure(stdout):
+    """A 4xx that is not transient: the same body will be rejected again, so stop retrying."""
+    status = (stdout or b'').decode('utf-8', errors='ignore').strip()[-3:]
+    return status.isdigit() and status[0] == '4' and status not in _RETRYABLE_4XX
+
+
 def send_to_api(exchange: Dict, api_key: str) -> bool:
     """Send the end-of-turn exchange to the Unbound audit endpoint
     (/v1/hooks/augment). Fail-open: any non-2xx (curl -f -> rc != 0 -> False) is a
@@ -3760,6 +3769,7 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
                 [f"Authorization: Bearer {api_key}"],
                 ["-fsSL", "-X", "POST",
                  "-H", "Content-Type: application/json",
+                 "-w", "%{http_code}",
                  "--data-binary", "@-", url],
                 input=data.encode(),
                 timeout=10,
@@ -3771,6 +3781,8 @@ def send_to_api(exchange: Dict, api_key: str) -> bool:
             else:
                 error_msg = result.stderr.decode('utf-8', errors='ignore').strip() if result.stderr else "Unknown error"
                 log_error(f"API request failed: {error_msg}", 'api_call')
+                if _permanent_failure(result.stdout):
+                    return False
         except Exception as e:
             log_error(f"Exception in send_to_api: {str(e)}", 'api_call')
 
