@@ -30,8 +30,8 @@ _CONFIG_DIR = Path(os.path.abspath(_env_config_dir)) if _env_config_dir else Pat
 AUDIT_LOG = _CONFIG_DIR / "hooks" / "agent-audit.log"
 ERROR_LOG = _CONFIG_DIR / "hooks" / "error.log"
 LAST_REPORT_FILE = _CONFIG_DIR / "hooks" / ".last_error_report"
-ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit']  # MCP tools (mcp__*) are always checked separately
-NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit'}
+ALLOWED_NON_MCP_HOOK_NAMES = ['Bash', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit']  # MCP tools (mcp__*) are always checked separately
+NATIVE_FILE_TOOLS = {'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit'}
 MCP_TOOL_PREFIX = 'mcp__'
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
 # when the tool reports it, otherwise a deterministic synthetic one. The backend
@@ -4065,7 +4065,7 @@ def _get_project(cwd: Optional[str]) -> Optional[str]:
 # Per-repo observation tiers for the end-of-turn exchange. The hook reports
 # raw facts (which repos the turn touched, and how); the attribution policy
 # lives server-side where it can be tuned without redeploying hooks.
-_WRITE_TOOLS = {'Edit', 'Write', 'NotebookEdit'}
+_WRITE_TOOLS = {'Edit', 'Write', 'MultiEdit', 'NotebookEdit'}
 _READ_TOOLS = {'Read', 'Grep', 'Glob'}
 
 # Absolute paths inside a Bash command; the left boundary stops a relative

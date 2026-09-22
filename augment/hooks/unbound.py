@@ -36,13 +36,14 @@ AUGMENT_TOOL_FAMILY = {
     'view': 'Read',
     'read-file': 'Read',
     'remove-files': 'Delete',
+    'apply_patch': 'Edit',
 }
 # Native (non-MCP) Augment tools whose family is a file operation — used to gate
 # the policy-cache "tools_to_check" fast path, mirroring claude-code's
 # NATIVE_FILE_TOOLS. Expressed in Augment vocab. remove-files is deliberately
 # EXCLUDED: it is a destructive delete that must always reach the gateway, so it
 # lives only in ALLOWED_NON_MCP_HOOK_NAMES (never eligible for the fast path).
-NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file'}
+NATIVE_FILE_TOOLS = {'str-replace-editor', 'save-file', 'view', 'read-file', 'apply_patch'}
 # INVARIANT: every skill entry below carries a tool_use_id - the native one
 # when the tool reports it, otherwise a deterministic synthetic one. The backend
 # relies on this: two id-less invocations of one skill with the same arguments
@@ -54,7 +55,7 @@ _SKILL_BODY_SCAN_LIMIT = 400
 _SKILL_BODY_MATCH_CHARS = 400
 # Non-MCP Augment tools we always evaluate (the rest fall through to the cache
 # fast path). MCP tools are detected via the is_mcp_tool flag, not a name prefix.
-ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files']
+ALLOWED_NON_MCP_HOOK_NAMES = ['launch-process', 'str-replace-editor', 'save-file', 'view', 'read-file', 'remove-files', 'apply_patch']
 CLAUDE_PLUGIN_CACHE_DIR = Path.home() / ".claude" / "plugins" / "cache"
 POLICY_CACHE_FILE = Path.home() / ".augment" / "hooks" / ".policy_cache.json"
 CACHE_TTL_SECONDS = 300
@@ -3201,7 +3202,7 @@ def _is_shell_write_command(command):
 
 # Write tools, git commands and shell writes only; the read tools (view, read-file) are ungated, remove-files is a write, and every other shell command (ls, cat, npm test) is ungated.
 _REPO_GATE_WRITE_TOOLS = frozenset({'str-replace-editor', 'save-file',
-                                    'remove-files'})
+                                    'remove-files', 'apply_patch'})
 _REPO_GATE_SHELL_TOOLS = frozenset({'launch-process'})
 _REPO_GATE_TOOLS = _REPO_GATE_WRITE_TOOLS | _REPO_GATE_SHELL_TOOLS
 REPO_GATE_BLOCK_CONTEXT = (
