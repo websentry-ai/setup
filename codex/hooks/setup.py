@@ -654,7 +654,10 @@ def disable_codex_hooks_feature_status() -> str:
         new_lines = _strip_hooks_flags(lines)
         if len(new_lines) == len(lines):
             return "not_found"
-        if not _write_is_safe(''.join(new_lines), False):
+        # The strip drops only our anchored flag line and _config_lines already skips multi-line
+        # values, so the result is valid TOML. _write_is_safe needs tomllib (3.11+) and otherwise
+        # refuses any multi-line config — which left the flag unremovable — so gate it on tomllib.
+        if tomllib is not None and not _write_is_safe(''.join(new_lines), False):
             return "failed"
         with open(config_path, 'w', encoding='utf-8') as f:
             f.writelines(new_lines)
@@ -997,7 +1000,8 @@ def disable_codex_hooks_feature() -> None:
             lines = f.readlines()
 
         new_lines = _strip_hooks_flags(lines)
-        if len(new_lines) != len(lines) and _write_is_safe(''.join(new_lines), False):
+        # Parser check is best-effort — skipped without tomllib so an older Python still clears it.
+        if len(new_lines) != len(lines) and (tomllib is None or _write_is_safe(''.join(new_lines), False)):
             with open(config_path, 'w', encoding='utf-8') as f:
                 f.writelines(new_lines)
             debug_print("Removed hooks feature flag from config.toml")
