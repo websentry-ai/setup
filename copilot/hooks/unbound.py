@@ -1521,15 +1521,28 @@ def _device_serial(probe: bool = True) -> Optional[str]:
 
 
 def _github_actor() -> Optional[str]:
-    """The human who triggered the session. Sandbox env names only the bot, but the
-    agent co-authors its commits with the requester."""
+    """The human who triggered the session. The sandbox environment names only the
+    bot, but the agent co-authors its commits with the requester.
+
+    Scoped to commits this session created. An unscoped search reads whatever
+    trailer sits nearest the top of the branch — on a Stop that fires before the
+    first commit, that is unrelated history, and a stranger's login would be
+    uploaded as this session's actor and backfilled against later."""
+    base = os.environ.get('COPILOT_AGENT_BASE_COMMIT')
+    if not base:
+        return None
     try:
-        out = subprocess.run(['git', 'log', '-20', '--format=%B'],
+        out = subprocess.run(['git', 'log', '%s..HEAD' % base, '--format=%B'],
                              capture_output=True, timeout=5)
+        if out.returncode != 0:
+            log_error('github actor: git log %s..HEAD failed rc=%s %s' % (
+                base, out.returncode, out.stderr.decode('utf-8', 'replace')[:200]), 'identity')
+            return None
         match = re.search(r'^Co-authored-by:\s*([^<\n]+)<',
                           out.stdout.decode('utf-8', 'replace'), re.M | re.I)
-        return match.group(1).strip() or None if match else None
-    except Exception:
+        return (match.group(1).strip() or None) if match else None
+    except Exception as e:
+        log_error('github actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
         return None
 
 
