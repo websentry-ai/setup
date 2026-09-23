@@ -7,6 +7,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import base64
 import json
+import io
 import os
 import ntpath
 import platform
@@ -21,6 +22,7 @@ import hashlib
 import re
 import sqlite3
 import shutil
+import struct
 import urllib.request
 import uuid
 from contextlib import closing
@@ -5754,6 +5756,670 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'project': _get_project(cwd),
         'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
+
+
+# Visual Studio ships no hook surface, so Copilot Chat is read off disk and backfilled.
+_VS_ROLE_USER = 0
+_VS_ROLE_ASSISTANT = 1
+_VS_TEXT_BLOCK = 3
+_VS_MAX_SESSION_BYTES = 8 << 20
+_VS_MAX_SESSIONS_PER_RUN = 200
+# Solution state lives at <solution>/.vs/<name>/copilot-chat/<id>/sessions/<session-guid>.
+_VS_SESSION_TAIL = '.vs/*/copilot-chat/*/sessions/*'
+# Bounds one log read. KEEP IN SYNC with mdm/setup.py's _backfill_capped_lines.
+_VS_MAX_LOG_LINES = 200000
+_VS_MAX_LOG_LINE_CHARS = 1 << 20
+# Scanned only for each turn's own time and model, which the replayed history does not carry.
+_VS_MAX_METADATA_REQUESTS = 200
+# Bytes of a chat log one run reads. A log only grows, so the tail is the recent activity.
+_VS_MAX_LOG_BYTES = 64 << 20
+# Ceiling across all conversations in one log, so many chats cannot exhaust memory.
+_VS_MAX_KEPT_REQUESTS = 2000
+# Bounds container nesting; real transcripts sit well under ten levels.
+_VS_MAX_NESTING = 64
+# Bounds the walk so a pathological tree cannot stall an MDM install.
+_VS_MAX_WALK_DIRS = 20000
+# The only source of real usage; turns known only to the .vs store fall back to estimates.
+_VS_USAGE_MARKER = 'InputTokenCount'
+_VS_LOG_TIME_RE = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+ ')
+# Links a logged request to its chat. Startup lines carry the key empty, so require a guid.
+_VS_SESSION_RE = re.compile(r'SessionId=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
+# VS 2026 prepends this synthetic `user` message to every turn; it is not a prompt.
+_VS_SYNTHETIC_USER_PREFIX = '# IDESTATE CONTEXT'
+
+
+def _mp_read_str(buf, pos, size):
+    return buf[pos:pos + size].decode('utf-8', 'replace'), pos + size
+
+
+def _mp_read_array(buf, pos, size, depth):
+    out = []
+    for _ in range(size):
+        value, pos = _mp_read(buf, pos, depth)
+        out.append(value)
+    return out, pos
+
+
+def _mp_read_map(buf, pos, size, depth):
+    out = {}
+    for _ in range(size):
+        key, pos = _mp_read(buf, pos, depth)
+        value, pos = _mp_read(buf, pos, depth)
+        out[key if isinstance(key, str) else str(key)] = value
+    return out, pos
+
+
+def _mp_timestamp(payload):
+    """MessagePack's -1 extension as epoch seconds; VS stamps messages with it."""
+    if len(payload) == 4:
+        return float(int.from_bytes(payload, 'big'))
+    if len(payload) == 8:
+        packed = int.from_bytes(payload, 'big')
+        return (packed & 0x3FFFFFFFF) + ((packed >> 34) / 1e9)
+    if len(payload) == 12:
+        return int.from_bytes(payload[4:], 'big', signed=True) + int.from_bytes(payload[:4], 'big') / 1e9
+    return None
+
+
+def _mp_read_ext(buf, pos, size):
+    ext_type = int.from_bytes(buf[pos:pos + 1], 'big', signed=True)
+    pos += 1
+    payload = buf[pos:pos + size]
+    pos += size
+    return (_mp_timestamp(payload) if ext_type == -1 else None), pos
+
+
+def _mp_read(buf, pos, depth=0):
+    """One MessagePack value as (value, next_pos). Visual Studio writes its chat store in it."""
+    # Nested containers recurse, so a file of repeated 0x91 would exhaust the stack.
+    if depth > _VS_MAX_NESTING:
+        raise ValueError('messagepack nesting deeper than %d' % _VS_MAX_NESTING)
+    code = buf[pos]
+    pos += 1
+    if code <= 0x7F:
+        return code, pos
+    if code >= 0xE0:
+        return code - 0x100, pos
+    if 0x80 <= code <= 0x8F:
+        return _mp_read_map(buf, pos, code & 0x0F, depth + 1)
+    if 0x90 <= code <= 0x9F:
+        return _mp_read_array(buf, pos, code & 0x0F, depth + 1)
+    if 0xA0 <= code <= 0xBF:
+        return _mp_read_str(buf, pos, code & 0x1F)
+    if code == 0xC0:
+        return None, pos
+    if code == 0xC2:
+        return False, pos
+    if code == 0xC3:
+        return True, pos
+    if code in (0xC4, 0xC5, 0xC6):
+        width = 1 << (code - 0xC4)
+        size = int.from_bytes(buf[pos:pos + width], 'big')
+        pos += width
+        return bytes(buf[pos:pos + size]), pos + size
+    if code in (0xC7, 0xC8, 0xC9):
+        width = 1 << (code - 0xC7)
+        size = int.from_bytes(buf[pos:pos + width], 'big')
+        return _mp_read_ext(buf, pos + width, size)
+    if code == 0xCA:
+        return struct.unpack_from('>f', buf, pos)[0], pos + 4
+    if code == 0xCB:
+        return struct.unpack_from('>d', buf, pos)[0], pos + 8
+    if 0xCC <= code <= 0xCF:
+        width = 1 << (code - 0xCC)
+        return int.from_bytes(buf[pos:pos + width], 'big'), pos + width
+    if 0xD0 <= code <= 0xD3:
+        width = 1 << (code - 0xD0)
+        return int.from_bytes(buf[pos:pos + width], 'big', signed=True), pos + width
+    if 0xD4 <= code <= 0xD8:
+        return _mp_read_ext(buf, pos, 1 << (code - 0xD4))
+    if code in (0xD9, 0xDA, 0xDB):
+        width = 1 << (code - 0xD9)
+        size = int.from_bytes(buf[pos:pos + width], 'big')
+        pos += width
+        return _mp_read_str(buf, pos, size)
+    if code in (0xDC, 0xDD):
+        width = 2 if code == 0xDC else 4
+        size = int.from_bytes(buf[pos:pos + width], 'big')
+        return _mp_read_array(buf, pos + width, size, depth + 1)
+    if code in (0xDE, 0xDF):
+        width = 2 if code == 0xDE else 4
+        size = int.from_bytes(buf[pos:pos + width], 'big')
+        return _mp_read_map(buf, pos + width, size, depth + 1)
+    raise ValueError('unsupported msgpack code 0x%02X' % code)
+
+
+def _mp_unpack_all(blob):
+    """Every top-level value in the stream; VS appends one per message."""
+    out, pos, size = [], 0, len(blob)
+    while pos < size:
+        value, pos = _mp_read(blob, pos)
+        out.append(value)
+    return out
+
+
+def _vs_installed():
+    """Whether Visual Studio is installed, from the installer's own instance registry.
+
+    Independent of install location, which a Program Files check is not."""
+    instances = Path(os.environ.get('ProgramData', r'C:\ProgramData')) / \
+        'Microsoft' / 'VisualStudio' / 'Packages' / '_Instances'
+    try:
+        return any(instances.iterdir())
+    except OSError:
+        return False
+
+
+def _vs_solution_roots():
+    """The scanned user's own tree only. ~/source/repos is absent because it sits under
+    ~/source. Shared roots like C:\\src are walked by every user and nothing in one says
+    whose a session is; those conversations still arrive through the chat log."""
+    home = Path.home()
+    roots = []
+    for root in (home / 'source', home / 'Documents'):
+        try:
+            if root.is_dir():
+                roots.append(root)
+        except OSError:
+            continue
+    return roots
+
+
+def _vs_within(root, path):
+    """Whether path is still under root once junctions and symlinks are resolved."""
+    try:
+        resolved = Path(os.path.realpath(str(path)))
+        return resolved == root or root in resolved.parents
+    except OSError:
+        return False
+
+
+def _vs_file_key(info):
+    return (info.st_dev, info.st_ino)
+
+
+def _vs_open_verified(path, root, key):
+    """The file the walk cleared, or None. Checking the path again still races a junction
+    planted in between, so the open handle is checked instead."""
+    if not _vs_within(root, path):
+        log_error('visual studio path escapes its root: %s' % path, 'visual_studio')
+        return None
+    try:
+        handle = open(path, 'rb')
+    except OSError as e:
+        log_error('visual studio file unreadable (%s): %s' % (path, e), 'visual_studio')
+        return None
+    try:
+        if _vs_file_key(os.fstat(handle.fileno())) != key:
+            log_error('visual studio file changed under the walk: %s' % path, 'visual_studio')
+            handle.close()
+            return None
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _iter_vs_sessions(cutoff_mtime, budget=None):
+    """Session files newer than the cutoff, from solutions at most two levels under a root.
+
+    `budget` is a one-element list set to True when the walk stops early."""
+    seen = set()
+    scanned = 0
+    found = []
+    for root in _vs_solution_roots():
+        try:
+            real_root = Path(os.path.realpath(str(root)))
+        except OSError:
+            continue
+        for depth in ('', '*/', '*/*/'):
+            # glob() only builds a generator; the disk is touched by iterating it.
+            try:
+                for path in root.glob(depth + _VS_SESSION_TAIL):
+                    scanned += 1
+                    if scanned > _VS_MAX_WALK_DIRS:
+                        log_error('visual studio walk hit its directory budget', 'visual_studio')
+                        if budget is not None:
+                            budget[0] = True
+                        return sorted(found, key=lambda item: (item[0], str(item[1])))
+                    key = str(path)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    try:
+                        info = path.stat()
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(info.st_mode) or info.st_size > _VS_MAX_SESSION_BYTES:
+                        continue
+                    if info.st_mtime < cutoff_mtime:
+                        continue
+                    # A junction out of the tree would be read with the sweep's own rights.
+                    if not _vs_within(real_root, path):
+                        log_error('visual studio session escapes its root: %s' % path,
+                                  'visual_studio')
+                        continue
+                    found.append((info.st_mtime, path, real_root, _vs_file_key(info)))
+            except OSError as e:
+                log_error('visual studio walk failed under %s: %s' % (root, e), 'visual_studio')
+                continue
+    # Oldest first, so a run stopped by the cap can resume past what it finished.
+    return sorted(found, key=lambda item: (item[0], str(item[1])))
+
+
+def _vs_block_text(payload):
+    """Concatenated text blocks of one message; tool-call blocks carry no prose and are skipped."""
+    parts = []
+    for block in payload.get('Content') or []:
+        if not (isinstance(block, list) and len(block) > 1 and isinstance(block[1], dict)):
+            continue
+        if block[0] != _VS_TEXT_BLOCK:
+            continue
+        text = block[1].get('Content')
+        if isinstance(text, str) and text.strip():
+            parts.append(text)
+    return '\n\n'.join(parts)
+
+
+def _vs_model_name(payload):
+    """Model recorded on a message; VS writes it as a map, or a list whose second item holds it."""
+    model = payload.get('Model')
+    if isinstance(model, list):
+        model = next((item for item in model if isinstance(item, dict)), None)
+    if isinstance(model, dict):
+        name = model.get('Family') or model.get('ModelId')
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _vs_iso(epoch):
+    try:
+        return datetime.fromtimestamp(epoch, timezone.utc).isoformat().replace('+00:00', 'Z')
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _vs_timestamp(payload):
+    """Wall-clock for a message. Only replies carry one, on the quota snapshot taken with them."""
+    for key in ('Timestamp', 'TimeCreated'):
+        value = payload.get(key)
+        if isinstance(value, (int, float)):
+            return _vs_iso(value)
+    for quota in payload.get('Quotas') or []:
+        if isinstance(quota, dict) and isinstance(quota.get('Timestamp'), (int, float)):
+            return _vs_iso(quota['Timestamp'])
+    return None
+
+
+def _vs_session_id(value):
+    """Session ids are compared across two sources, and the log's regex accepts either case."""
+    return value.lower() if isinstance(value, str) else value
+
+
+def _vs_session_turns(objects):
+    """Settled (prompt, reply) pairs; VS tags 0 as the prompt and 1 as the reply.
+
+    A reply with no text yet is still running. Waiting is safe rather than lossy: VS
+    rewrites the entry once the turn completes, so it arrives on a later sweep."""
+    turns, pending, index = [], None, -1
+    for obj in objects:
+        if not (isinstance(obj, list) and len(obj) == 2 and isinstance(obj[1], dict)):
+            continue
+        role, payload = obj[0], obj[1]
+        if role == _VS_ROLE_USER:
+            pending = payload
+            index += 1
+        elif role == _VS_ROLE_ASSISTANT and pending is not None:
+            turns.append((index, pending, payload))
+            pending = None
+    return [(i, p, r) for i, p, r in turns if _vs_block_text(r).strip()]
+
+
+def _vs_capped_lines(handle):
+    """Lines bounded in count and in length. KEEP IN SYNC: mdm/setup.py's
+    _backfill_capped_lines. A count cap alone does not bound memory."""
+    count = 0
+    while count < _VS_MAX_LOG_LINES:
+        line = handle.readline(_VS_MAX_LOG_LINE_CHARS)
+        if not line:
+            return
+        count += 1
+        if len(line) >= _VS_MAX_LOG_LINE_CHARS and not line.endswith('\n'):
+            while count < _VS_MAX_LOG_LINES:
+                rest = handle.readline(_VS_MAX_LOG_LINE_CHARS)
+                count += 1
+                if not rest or rest.endswith('\n'):
+                    break
+            continue
+        yield line
+
+
+def _iter_vs_chat_logs(cutoff_mtime):
+    """Visual Studio's live per-request chat log, newest first. Derived from the scanned
+    home rather than %LOCALAPPDATA%, which points at the caller when a sweep runs per-user."""
+    root = Path.home() / 'AppData' / 'Local' / 'Temp' / 'VSGitHubCopilotLogs'
+    found = []
+    try:
+        real_root = Path(os.path.realpath(str(root)))
+        for path in root.glob('*_VSGitHubCopilot.chat.log'):
+            try:
+                info = path.stat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime < cutoff_mtime:
+                continue
+            # A junction out of the tree would be read with the sweep's own rights.
+            if not _vs_within(real_root, path):
+                log_error('visual studio chat log escapes its root: %s' % path, 'visual_studio')
+                continue
+            found.append((info.st_mtime, path, _vs_file_key(info)))
+    except OSError:
+        return []
+    # Oldest first: a restart replays the whole history, and the first write of a turn wins.
+    return [(real_root, path, key) for _, path, key in sorted(found, key=lambda i: i[0])]
+
+
+def _vs_log_line_time(line):
+    """`[2026-09-21 13:33:05.862 Conversations V]` -> ISO UTC. The stamp is machine-local."""
+    match = _VS_LOG_TIME_RE.match(line)
+    if not match:
+        return None
+    try:
+        naive = datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S')
+        return naive.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _vs_usage_from_line(line):
+    """`[CopilotClient EventType(11)] [{"InputTokenCount":5187,...}]` -> usage dict.
+
+    2022 leaves CachedInputTokenCount null and puts the figure under AdditionalCounts.
+    Cached tokens come out of input, which the other surfaces bill separately."""
+    start = line.find('[{')
+    if start < 0:
+        return None
+    try:
+        entries = json.loads(line[start:])
+    except ValueError:
+        return None
+    if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+        return None
+    entry = entries[0]
+    total_in = entry.get('InputTokenCount')
+    out = entry.get('OutputTokenCount')
+    if not isinstance(total_in, int) or not isinstance(out, int):
+        return None
+    cached = entry.get('CachedInputTokenCount')
+    if not isinstance(cached, int):
+        extra = entry.get('AdditionalCounts')
+        cached = (extra or {}).get('prompt_tokens_details_cached_tokens')
+    cached = cached if isinstance(cached, int) else 0
+    return {'input_tokens': max(total_in - cached, 0),
+            'output_tokens': out,
+            'cache_read_input_tokens': cached}
+
+
+def _vs_add_usage(into, extra):
+    """Agent mode bills several calls per user turn, so a turn's usage is their sum."""
+    for field in ('input_tokens', 'output_tokens', 'cache_read_input_tokens'):
+        into[field] = into.get(field, 0) + extra.get(field, 0)
+
+
+def _vs_user_messages(body):
+    """The prompts a person actually typed. VS 2026 prepends a synthetic `user` message
+    carrying editor state; counting it puts every later turn's usage on its neighbour."""
+    out = []
+    for message in body.get('messages') or []:
+        if not isinstance(message, dict) or message.get('role') != 'user':
+            continue
+        content = message.get('content')
+        if isinstance(content, str) and not content.startswith(_VS_SYNTHETIC_USER_PREFIX):
+            out.append(content)
+    return out
+
+
+def _vs_seek_tail(handle, path):
+    """Start a long log at its tail, and say whether it did. Reading the head would spend
+    the line budget on ancient requests and never reach what the sweep is here for."""
+    try:
+        size = os.fstat(handle.fileno()).st_size
+        if size <= _VS_MAX_LOG_BYTES:
+            return False
+        handle.seek(size - _VS_MAX_LOG_BYTES)
+        handle.readline()
+    except OSError:
+        return False
+    log_error('visual studio chat log read from its tail: %s' % path.name, 'visual_studio')
+    return True
+
+
+def _vs_chat_log_requests(path, root, key):
+    """Requests oldest-first as (timestamp, model, turn_index, body, session_id), plus
+    usage keyed by (session_id, turn_index).
+
+    Read forward: the `SessionId=` marker preceding a request is the only thing tying it
+    to a chat, and the log filename names the VS process, so it would merge unrelated
+    chats. Turns are keyed by position, never text -- agent mode issues several requests
+    per turn, and keying on the prompt would merge two that both say "continue"."""
+    requests, usage_by_turn = [], {}
+    slot = None
+    session_id = None
+    raw = _vs_open_verified(path, root, key)
+    if raw is None:
+        return [], {}
+    seeked = _vs_seek_tail(raw, path)
+    try:
+        with io.TextIOWrapper(raw, encoding='utf-8', errors='replace') as handle:
+            for line in _vs_capped_lines(handle):
+                marker = _VS_SESSION_RE.search(line)
+                if marker:
+                    session_id = _vs_session_id(marker.group(1))
+                    seeked = False
+                    continue
+                # Started mid-file, so nothing here is tied to a chat until a marker is.
+                if seeked:
+                    continue
+                if _VS_USAGE_MARKER in line:
+                    # Usage is logged after the request it belongs to.
+                    usage = _vs_usage_from_line(line)
+                    if usage and slot is not None:
+                        _vs_add_usage(usage_by_turn.setdefault(slot, {}), usage)
+                    continue
+                if '"messages"' not in line:
+                    continue
+                start = line.find('{"')
+                if start < 0:
+                    continue
+                try:
+                    body = json.loads(line[start:])
+                except ValueError:
+                    continue
+                if not isinstance(body, dict) or not body.get('messages'):
+                    continue
+                turn_index = max(len(_vs_user_messages(body)) - 1, 0)
+                slot = (session_id, turn_index)
+                requests.append((_vs_log_line_time(line), body.get('model'),
+                                 turn_index, body, session_id))
+    except OSError:
+        return [], {}
+    return _vs_recent_per_session(requests), usage_by_turn
+
+
+def _vs_recent_per_session(requests):
+    """The most recent requests of each conversation. A single tail would drop a whole
+    chat that a busier one in the same log outran."""
+    counts, kept = {}, []
+    for item in reversed(requests):
+        session_id = item[4]
+        if counts.get(session_id, 0) >= _VS_MAX_METADATA_REQUESTS:
+            continue
+        counts[session_id] = counts.get(session_id, 0) + 1
+        kept.append(item)
+        if len(kept) >= _VS_MAX_KEPT_REQUESTS:
+            log_error('visual studio log held more requests than one run reads',
+                      'visual_studio')
+            break
+    kept.reverse()
+    return kept
+
+
+def _vs_chat_log_turns(body):
+    """Settled (prompt, reply) pairs from one request body.
+
+    VS never logs a response; it replays it as history on the next call, so the trailing
+    turn is withheld until a later prompt settles it. Only the trailing one: filtering by
+    text would also remove an earlier turn that repeated the same prompt."""
+    turns, prompt, reply, index = [], None, [], 0
+    for message in body.get('messages') or []:
+        if not isinstance(message, dict):
+            continue
+        role, content = message.get('role'), message.get('content')
+        if not isinstance(content, str):
+            continue
+        if role == 'user':
+            if content.startswith(_VS_SYNTHETIC_USER_PREFIX):
+                continue
+            if prompt is not None:
+                turns.append((index, prompt, '\n\n'.join(reply)))
+                index += 1
+            prompt, reply = content, []
+        elif role == 'assistant' and prompt is not None and content.strip():
+            reply.append(content)
+    return [(i, p, r) for i, p, r in turns if p.strip() and r.strip()]
+
+
+def _vs_session(sessions, session_id):
+    return sessions.setdefault(session_id, {'session_id': session_id, 'turns': {}})
+
+
+def _vs_turn_marker(conversation_id, prompt, index):
+    """Stable id, derived identically from either source. Scoped to its conversation, or
+    two chats opening with "continue" collide. Excludes the reply, which grows across
+    agent-mode calls while the turn still runs and would record it twice."""
+    digest = hashlib.sha256()
+    digest.update((conversation_id or '').encode('utf-8', 'replace'))
+    digest.update(b'\x00')
+    digest.update((prompt or '').encode('utf-8', 'replace'))
+    digest.update(b'\x00%d' % index)
+    return 'vs-' + digest.hexdigest()[:24]
+
+
+def _vs_add_turn(session, index, prompt, reply, model, timestamp, usage):
+    """Record one turn at its own position; the first source to reach it wins."""
+    session['turns'].setdefault(index, (prompt, reply, model, timestamp, usage))
+
+
+def _vs_finalize(session):
+    """The two entries parse_copilot_session walks, plus one usage slot per exchange.
+    Positions can skip a cancelled turn but the backend pairs usage[i] with exchange i,
+    so the slots are packed here while the position keeps feeding the id."""
+    turns = session.pop('turns')
+    entries, usage = [], []
+    for index in sorted(turns):
+        prompt, reply, model, timestamp, turn_usage = turns[index]
+        entry = {'type': 'user.message',
+                 'id': _vs_turn_marker(session['session_id'], prompt, index),
+                 'data': {'content': prompt}}
+        if timestamp:
+            entry['timestamp'] = timestamp
+        entries.append(entry)
+        entries.append({'type': 'assistant.message',
+                        'data': {'content': reply, 'model': model or 'auto'}})
+        usage.append(turn_usage or {})
+    return entries, usage
+
+
+def _vs_collect_chat_logs(cutoff, sessions, logged):
+    """Live source: prompts land here per request, and it is the only one carrying usage."""
+    for root, path, key in _iter_vs_chat_logs(cutoff):
+        fallback_id = path.stem.replace('_VSGitHubCopilot.chat', '')
+        requests, usage_by_turn = _vs_chat_log_requests(path, root, key)
+        # A turn belongs to the request it was the intent of, not to one replaying it.
+        for timestamp, model, turn_index, _, session_id in requests:
+            key = (_vs_session_id(session_id or fallback_id), turn_index)
+            if key not in logged:
+                logged[key] = (timestamp, model,
+                               usage_by_turn.get((session_id, turn_index)))
+        for timestamp, model, _, body, session_id in requests:
+            conversation_id = _vs_session_id(session_id or fallback_id)
+            if not session_id:
+                log_error('visual studio request had no session marker in %s' % path.name,
+                          'visual_studio')
+            session = _vs_session(sessions, conversation_id)
+            for index, prompt, reply in _vs_chat_log_turns(body):
+                key = (conversation_id, index)
+                usage = usage_by_turn.get((session_id, index))
+                own_time, own_model, _ = logged.get(key, (None, None, None))
+                logged[key] = (own_time or timestamp, own_model or model, usage)
+                _vs_add_turn(session, index, prompt, reply,
+                             own_model or model, own_time or timestamp, usage)
+
+
+def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
+    """Backstop for turns the chat log withheld or lost. Usage comes from the log."""
+    undiscovered = [False]
+    for count, (mtime, path, root, key) in enumerate(_iter_vs_sessions(cutoff, undiscovered)):
+        if count >= _VS_MAX_SESSIONS_PER_RUN:
+            log_error('visual studio session cap reached; remaining files deferred',
+                      'visual_studio')
+            truncated[0] = True
+            break
+        handle = _vs_open_verified(path, root, key)
+        if handle is None:
+            continue
+        try:
+            with handle:
+                objects = _mp_unpack_all(handle.read())
+        except (OSError, ValueError, IndexError, struct.error) as e:
+            log_error('visual studio session unreadable (%s): %s' % (path.name, e), 'visual_studio')
+            continue
+        session = _vs_session(sessions, _vs_session_id(path.name))
+        for index, prompt_payload, reply_payload in _vs_session_turns(objects):
+            prompt = _vs_block_text(prompt_payload)
+            if not prompt:
+                continue
+            # The log holds real token counts even when only the store holds the reply.
+            own_time, own_model, usage = logged.get(
+                (_vs_session_id(path.name), index), (None, None, None))
+            _vs_add_turn(session, index, prompt, _vs_block_text(reply_payload),
+                         own_model or _vs_model_name(reply_payload)
+                         or _vs_model_name(prompt_payload),
+                         own_time or _vs_timestamp(reply_payload)
+                         or _vs_timestamp(prompt_payload),
+                         usage)
+        resume[0] = mtime
+    if undiscovered[0]:
+        # The walk stopped mid-glob, so what it never reached may be older than the last
+        # file it read. Only a complete walk sorts by mtime, and only that can resume.
+        truncated[0] = True
+        resume[0] = None
+
+
+def collect_visual_studio_sessions(cutoff):
+    """Visual Studio Copilot conversations touched since the cutoff, in backfill shape.
+
+    Returns (sessions, truncated, resume_at). A truncated walk left files unread; the
+    caller advances its cutoff only as far as resume_at, or not at all if that is None."""
+    if not _is_windows() or not _vs_installed():
+        return [], False, None
+    sessions, truncated, logged, resume = {}, [False], {}, [None]
+    # Chat logs first: a superset of the .vs stores and the only source with real usage.
+    _vs_collect_chat_logs(cutoff, sessions, logged)
+    _vs_collect_stores(cutoff, sessions, truncated, logged, resume)
+    out = []
+    for session in sessions.values():
+        entries, usage = _vs_finalize(session)
+        if not entries:
+            continue
+        session['entries'] = entries
+        # A list of empty slots says nothing the backend cannot work out itself.
+        if any(usage):
+            session['usage'] = usage
+        out.append(session)
+    # Everything older than the last finished store file has been read, chat logs included.
+    return out, truncated[0], (resume[0] if truncated[0] else None)
 
 
 def send_to_api(exchange, api_key):

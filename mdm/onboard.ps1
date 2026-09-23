@@ -208,10 +208,14 @@ function Main {
         # NativeCommandError when the output is redirected into a pipeline, which is
         # terminating under the Stop preference set above. onboard.py logs to stderr,
         # so the first log line would abort onboarding for any caller that pipes us.
+        # Pipe the child's stdout to the host so it reaches the console but never
+        # enters this function's output stream. Otherwise every stdout line would be
+        # returned by Main alongside the status, and `$exitCode = Main` would capture
+        # an object array instead of the integer - making a failed run exit 0.
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            & $pythonCmd @pythonArgs
+            & $pythonCmd @pythonArgs | Out-Host
             $exitCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
