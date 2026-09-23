@@ -5771,6 +5771,8 @@ _VS_MAX_LOG_LINES = 200000
 _VS_MAX_LOG_LINE_CHARS = 1 << 20
 # Scanned only for each turn's own time and model, which the replayed history does not carry.
 _VS_MAX_METADATA_REQUESTS = 200
+# Bytes of a chat log one run reads. A log only grows, so the tail is the recent activity.
+_VS_MAX_LOG_BYTES = 64 << 20
 # Ceiling across all conversations in one log, so many chats cannot exhaust memory.
 _VS_MAX_KEPT_REQUESTS = 2000
 # Bounds container nesting; real transcripts sit well under ten levels.
@@ -6178,6 +6180,21 @@ def _vs_user_messages(body):
     return out
 
 
+def _vs_seek_tail(handle, path):
+    """Start a long log at its tail, and say whether it did. Reading the head would spend
+    the line budget on ancient requests and never reach what the sweep is here for."""
+    try:
+        size = os.fstat(handle.fileno()).st_size
+        if size <= _VS_MAX_LOG_BYTES:
+            return False
+        handle.seek(size - _VS_MAX_LOG_BYTES)
+        handle.readline()
+    except OSError:
+        return False
+    log_error('visual studio chat log read from its tail: %s' % path.name, 'visual_studio')
+    return True
+
+
 def _vs_chat_log_requests(path, root, key):
     """Requests oldest-first as (timestamp, model, turn_index, body, session_id), plus
     usage keyed by (session_id, turn_index).
@@ -6192,12 +6209,17 @@ def _vs_chat_log_requests(path, root, key):
     raw = _vs_open_verified(path, root, key)
     if raw is None:
         return [], {}
+    seeked = _vs_seek_tail(raw, path)
     try:
         with io.TextIOWrapper(raw, encoding='utf-8', errors='replace') as handle:
             for line in _vs_capped_lines(handle):
                 marker = _VS_SESSION_RE.search(line)
                 if marker:
                     session_id = _vs_session_id(marker.group(1))
+                    seeked = False
+                    continue
+                # Started mid-file, so nothing here is tied to a chat until a marker is.
+                if seeked:
                     continue
                 if _VS_USAGE_MARKER in line:
                     # Usage is logged after the request it belongs to.

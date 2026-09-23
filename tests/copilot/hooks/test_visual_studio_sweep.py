@@ -743,3 +743,37 @@ class UsageSlotAlignment(unittest.TestCase):
         prompts = [e["data"]["content"] for e in sessions[0]["entries"]
                    if e["type"] == "user.message"]
         self.assertEqual(prompts, ["first", "second"])
+
+
+class LongChatLog(unittest.TestCase):
+    def test_a_long_log_is_read_from_its_tail(self):
+        # The head spends the budget on ancient requests; the file only grows.
+        with tempfile.TemporaryDirectory() as home:
+            entries = [("session", OTHER)]
+            entries += [("body", _body([_msg("user", "ancient %d" % n)])) for n in range(200)]
+            entries += [("session", SESSION),
+                        ("body", _body([_msg("user", "recent"), _msg("assistant", "a"),
+                                        _msg("user", "settle")]))]
+            path = _chat_log(home, entries)
+            key = unbound._vs_file_key(path.stat())
+            raw = path.read_bytes()
+            # A window opening mid-way through the line before the second marker.
+            line_start = raw.rfind(b"\n", 0, raw.index(SESSION.encode())) + 1
+            window = len(raw) - (line_start - 5)
+            with patch.object(unbound, "_VS_MAX_LOG_BYTES", window), \
+                    patch.object(unbound, "log_error"):
+                requests, _ = unbound._vs_chat_log_requests(path, path.parent.resolve(), key)
+
+        self.assertTrue(requests, "the tail must still yield the recent requests")
+        self.assertEqual({r[4] for r in requests}, {SESSION},
+                         "requests before the first marker in the window are not attributed")
+
+    def test_a_short_log_is_read_whole(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = _chat_log(home, [("session", SESSION),
+                                    ("body", _body([_msg("user", "one")]))])
+            key = unbound._vs_file_key(path.stat())
+            with patch.object(unbound, "log_error"):
+                requests, _ = unbound._vs_chat_log_requests(path, path.parent.resolve(), key)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][4], SESSION)
