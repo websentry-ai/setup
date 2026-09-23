@@ -780,3 +780,40 @@ class LongChatLog(unittest.TestCase):
                 requests, _ = unbound._vs_chat_log_requests(path, path.parent.resolve(), key)
         self.assertEqual(len(requests), 1)
         self.assertEqual(requests[0][4], SESSION)
+
+
+class WalkBudgetResume(unittest.TestCase):
+    """A partial walk sorts a partial set, so its newest file is not a watermark."""
+
+    def _collect(self, home, budget):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                patch.object(unbound, "_VS_MAX_WALK_DIRS", budget), \
+                patch.object(unbound, "log_error"):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def _seed(self, home):
+        for n, name in enumerate(("alpha", "beta", "gamma")):
+            path = _session_file(home, _prompt("ask %d" % n) + _reply("answer %d" % n),
+                                 session="%s-0000-0000-0000-00000000000%d" % (SESSION[:8], n),
+                                 solution=name)
+            os.utime(path, (1789900000 + n * 100, 1789900000 + n * 100))
+
+    def test_a_walk_stopped_by_its_budget_names_no_resume_point(self):
+        # Advancing to the newest file it happened to reach would filter out every older
+        # store it never visited, on this sweep and every one after it.
+        with tempfile.TemporaryDirectory() as home:
+            self._seed(home)
+            _, truncated, resume_at = self._collect(home, 2)
+        self.assertTrue(truncated)
+        self.assertIsNone(resume_at, "an incomplete walk cannot say what it has read")
+
+    def test_a_complete_walk_still_resumes(self):
+        with tempfile.TemporaryDirectory() as home:
+            self._seed(home)
+            with patch.object(unbound, "_VS_MAX_SESSIONS_PER_RUN", 2):
+                _, truncated, resume_at = self._collect(home, 10000)
+        self.assertTrue(truncated)
+        self.assertEqual(resume_at, 1789900100)

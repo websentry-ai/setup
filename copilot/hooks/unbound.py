@@ -6358,11 +6358,9 @@ def _vs_collect_chat_logs(cutoff, sessions, logged):
 
 
 def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
-    """Backstop for turns the chat log withheld or lost. Usage comes from the log.
-
-    A session found only under a shared root is skipped: nothing there proves whose it is,
-    and the chat log that would prove it is this user's has no record of the session."""
-    for count, (mtime, path, root, key) in enumerate(_iter_vs_sessions(cutoff, truncated)):
+    """Backstop for turns the chat log withheld or lost. Usage comes from the log."""
+    undiscovered = [False]
+    for count, (mtime, path, root, key) in enumerate(_iter_vs_sessions(cutoff, undiscovered)):
         if count >= _VS_MAX_SESSIONS_PER_RUN:
             log_error('visual studio session cap reached; remaining files deferred',
                       'visual_studio')
@@ -6392,6 +6390,11 @@ def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
                          or _vs_timestamp(prompt_payload),
                          usage)
         resume[0] = mtime
+    if undiscovered[0]:
+        # The walk stopped mid-glob, so what it never reached may be older than the last
+        # file it read. Only a complete walk sorts by mtime, and only that can resume.
+        truncated[0] = True
+        resume[0] = None
 
 
 def collect_visual_studio_sessions(cutoff):
