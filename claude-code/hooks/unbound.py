@@ -3210,7 +3210,8 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
             else:
                 email = None
             auth_mode = 'subscription'
-        elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
+        elif (os.getenv('ANTHROPIC_API_KEY') or os.getenv('ANTHROPIC_AUTH_TOKEN')
+              or (config.get('customApiKeyResponses') or {}).get('approved')):
             auth_mode = 'api_key'
     except Exception:
         pass
@@ -3232,6 +3233,12 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
             email = _desktop_session_email()
         except Exception:
             email = None
+    if not org_id and not email:
+        # No sign-in to name: the endpoint it talks to (a company gateway) is the account.
+        try:
+            org_id = _gateway_host()
+        except Exception:
+            org_id = None
     return {
         'org_id': org_id,
         'plan': plan,
@@ -3239,6 +3246,32 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
         'user_email': email,
         'email_domain': _email_domain(email),
     }
+
+
+MANAGED_SETTINGS_PATHS = (
+    Path('/Library/Application Support/ClaudeCode/managed-settings.json'),
+    Path('/etc/claude-code/managed-settings.json'),
+    Path('C:/ProgramData/ClaudeCode/managed-settings.json'),
+)
+USER_SETTINGS_PATH = _CONFIG_DIR / 'settings.json'
+
+
+def _gateway_host() -> Optional[str]:
+    """Host of ANTHROPIC_BASE_URL: the process env, then managed settings, then the
+    user's settings.json. The host only, never the path or anything secret."""
+    urls = [os.environ.get('ANTHROPIC_BASE_URL')]
+    for path in (*MANAGED_SETTINGS_PATHS, USER_SETTINGS_PATH):
+        try:
+            env = json.loads(path.read_text(encoding='utf-8')).get('env')
+        except Exception:
+            continue
+        if isinstance(env, dict):
+            urls.append(env.get('ANTHROPIC_BASE_URL'))
+    for url in urls:
+        host = urlparse(url.strip()).hostname if isinstance(url, str) and url.strip() else None
+        if host:
+            return host.lower()
+    return None
 
 
 # DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a

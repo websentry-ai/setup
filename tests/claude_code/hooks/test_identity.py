@@ -7,6 +7,7 @@ Covers:
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -253,6 +254,64 @@ class TestReadAccountIdentity(unittest.TestCase):
         self.assertEqual(result["auth_mode"], "subscription")
         self.assertEqual(result["org_id"], "org-x")
         self.assertIsNone(result["user_email"])
+
+
+class TestGatewayHostAsTheAccount(unittest.TestCase):
+    """Claude Code run through a company gateway has no Anthropic sign-in, so the
+    endpoint it talks to stands in as the account's org."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.claude_json = self.tmp / ".claude.json"
+        for target, value in (("CLAUDE_MCP_CONFIG_PATH", self.claude_json),
+                              ("USER_SETTINGS_PATH", self.tmp / "settings.json"),
+                              ("MANAGED_SETTINGS_PATHS", (self.tmp / "managed-settings.json",))):
+            p = patch.object(unbound, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(unbound, "_claude_desktop_support_dirs", return_value=[self.tmp])
+        p.start()
+        self.addCleanup(p.stop)
+        self.claude_json.write_text("{}", encoding="utf-8")
+
+    def _settings(self, name, base_url):
+        (self.tmp / name).write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+
+    def test_the_env_base_url_host_is_the_org(self):
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal/v1/anthropic"}):
+            identity = unbound.read_account_identity()
+        self.assertEqual(identity["org_id"], "llm.acme.internal")
+        self.assertIsNone(identity["user_email"])
+
+    def test_managed_settings_supply_it_when_the_env_does_not(self):
+        self._settings("managed-settings.json", "https://gateway.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
+
+    def test_the_user_settings_are_the_last_resort(self):
+        self._settings("settings.json", "http://localhost:8080/proxy")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "localhost")
+
+    def test_only_the_host_is_kept(self):
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://user:secret@llm.acme.com:8443/path?key=abc"}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "llm.acme.com")
+
+    def test_a_signed_in_account_keeps_its_own_org(self):
+        self.claude_json.write_text(json.dumps({"oauthAccount": {
+            "organizationUuid": "org-abc", "emailAddress": "dev@acme.com"}}), encoding="utf-8")
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "org-abc")
+
+    def test_no_base_url_anywhere_means_no_org(self):
+        self.assertIsNone(unbound.read_account_identity()["org_id"])
+
+    def test_an_auth_token_marks_it_an_api_key_setup(self):
+        with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
+            self.assertEqual(unbound.read_account_identity()["auth_mode"], "api_key")
+
+    def test_a_corrupt_settings_file_is_skipped(self):
+        (self.tmp / "managed-settings.json").write_text("{not json", encoding="utf-8")
+        self._settings("settings.json", "https://gateway.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
 
 
 class TestBuildAccountIdentity(unittest.TestCase):
