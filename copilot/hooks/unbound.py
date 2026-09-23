@@ -5775,6 +5775,8 @@ _VS_MAX_METADATA_REQUESTS = 200
 _VS_MAX_LOG_BYTES = 64 << 20
 # Ceiling across all conversations in one log, so many chats cannot exhaust memory.
 _VS_MAX_KEPT_REQUESTS = 2000
+# NTFS marks junctions and symlinks with it; absent from stat() on other platforms.
+_VS_REPARSE_POINT = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
 # Bounds container nesting; real transcripts sit well under ten levels.
 _VS_MAX_NESTING = 64
 # Bounds the walk so a pathological tree cannot stall an MDM install.
@@ -5938,6 +5940,26 @@ def _vs_file_key(info):
     return (info.st_dev, info.st_ino)
 
 
+def _vs_is_link(info):
+    """Whether a no-follow stat landed on a symlink or an NTFS reparse point."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, 'st_file_attributes', 0) & _VS_REPARSE_POINT)
+
+
+def _vs_plain_stat(path):
+    """A regular file's own identity, or None. Never follows: a stat through a link would
+    record what the link points at, and the check at the read would then confirm it."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return None
+    if _vs_is_link(info):
+        log_error('visual studio path is a link: %s' % path, 'visual_studio')
+        return None
+    return info if stat.S_ISREG(info.st_mode) else None
+
+
 def _vs_open_verified(path, root, key):
     """The file the walk cleared, or None. Checking the path again still races a junction
     planted in between, so the open handle is checked instead."""
@@ -5986,11 +6008,8 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                     if key in seen:
                         continue
                     seen.add(key)
-                    try:
-                        info = path.stat()
-                    except OSError:
-                        continue
-                    if not stat.S_ISREG(info.st_mode) or info.st_size > _VS_MAX_SESSION_BYTES:
+                    info = _vs_plain_stat(path)
+                    if info is None or info.st_size > _VS_MAX_SESSION_BYTES:
                         continue
                     if info.st_mtime < cutoff_mtime:
                         continue
@@ -6103,11 +6122,8 @@ def _iter_vs_chat_logs(cutoff_mtime):
     try:
         real_root = Path(os.path.realpath(str(root)))
         for path in root.glob('*_VSGitHubCopilot.chat.log'):
-            try:
-                info = path.stat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_mtime < cutoff_mtime:
+            info = _vs_plain_stat(path)
+            if info is None or info.st_mtime < cutoff_mtime:
                 continue
             # A junction out of the tree would be read with the sweep's own rights.
             if not _vs_within(real_root, path):
