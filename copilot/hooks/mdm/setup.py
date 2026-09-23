@@ -41,6 +41,14 @@ BACKFILL_STATE_FILE = '.unbound_last_backfill'
 # fleet is on the new hook.
 BACKFILL_ENABLED = False
 
+# Separate from BACKFILL_ENABLED, which holds back Copilot's CLI/VS Code re-walk:
+# Visual Studio has no live hook and so no rows to duplicate.
+VS_SWEEP_ENABLED = True
+VS_STATE_FILE = '.unbound_last_vs_sweep'
+# How far a first sweep reaches without --backfill; history beyond it is what the flag
+# opts into.
+VS_FIRST_RUN_DAYS = 1
+
 
 def normalize_url(value: str) -> str:
     value = (value or "").strip()
@@ -1269,16 +1277,17 @@ def _backfill_vscode_workspace_roots(home_dir: Path) -> List[Path]:
     return bases
 
 
-def _backfill_state_path(home: Path) -> Path:
-    return home / '.copilot' / 'hooks' / BACKFILL_STATE_FILE
+def _backfill_state_path(home: Path, name: str = BACKFILL_STATE_FILE) -> Path:
+    return home / '.copilot' / 'hooks' / name
 
 
-def _backfill_read_cutoff(home: Path) -> float:
+def _backfill_read_cutoff(home: Path, name: str = BACKFILL_STATE_FILE,
+                          max_age_days: int = BACKFILL_MAX_AGE_DAYS) -> float:
     """mtime cutoff for transcript selection: the last successful backfill when
     cached (so cron reruns only seed sessions touched since), else 30 days ago."""
-    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    default_cutoff = time.time() - (max_age_days * 86400)
     try:
-        last = float(_backfill_state_path(home).read_text().strip())
+        last = float(_backfill_state_path(home, name).read_text().strip())
     except (OSError, ValueError):
         return default_cutoff
     # Ignore corrupt or future timestamps (clock skew).
@@ -1287,11 +1296,11 @@ def _backfill_read_cutoff(home: Path) -> float:
     return last
 
 
-def _backfill_write_cutoff(home: Path, ts: float) -> None:
+def _backfill_write_cutoff(home: Path, ts: float, name: str = BACKFILL_STATE_FILE) -> None:
     # Write via temp + atomic replace so an overlapping cron run never reads a
     # half-written timestamp.
     try:
-        path = _backfill_state_path(home)
+        path = _backfill_state_path(home, name)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
         tmp.write_text(str(ts))
@@ -1454,12 +1463,15 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
 
 
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False) -> bool:
+                           force: bool = False, backfilled: bool = True) -> bool:
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
         # request itself, so this only narrows what force applies to; it cannot grant it.
         payload['force'] = True
+    if not backfilled:
+        # First delivery, not a replay: it must reach the live-only consumers.
+        payload['backfilled'] = False
     payload_bytes = json.dumps(payload).encode('utf-8')
 
     auth_headers = _backfill_edr_headers({
@@ -1617,6 +1629,10 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
                 'record_index_base': record_index_base,
                 'entries': candidate_entries,
             }
+            # Per-session, so every slice carries it or the slice maps to no device.
+            for key in ('device_serial', 'user_email'):
+                if session.get(key):
+                    candidate[key] = session[key]
             usage_slice = session_usage[
                 record_index_base:record_index_base + candidate_count
             ]
@@ -1649,7 +1665,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 
 
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
-                            forced: bool = False) -> Tuple[int, int, int]:
+                            forced: bool = False,
+                            backfilled: bool = True) -> Tuple[int, int, int]:
     """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts
     distinct input session_ids that landed at least one successful chunk."""
     chunks_total = 0
@@ -1663,7 +1680,7 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         if not current_chunk:
             return
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced):
+        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced, backfilled):
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))
@@ -1762,6 +1779,78 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
+
+
+def _vs_with_user_home(home_dir: Path, fn, *args):
+    """Point Path.home() at the scanned user; under MDM this runs as SYSTEM."""
+    previous = {name: os.environ.get(name) for name in ('HOME', 'USERPROFILE')}
+    for name in previous:
+        os.environ[name] = str(home_dir)
+    try:
+        return fn(*args)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def _vs_collect_for_user(home_dir: Path, seed_history: bool = False) -> Optional[Dict]:
+    hook = _backfill_load_hook_module()
+    if hook is None or not hasattr(hook, 'collect_visual_studio_sessions'):
+        return None
+    first_run = not _backfill_state_path(home_dir, VS_STATE_FILE).exists()
+    days = BACKFILL_MAX_AGE_DAYS if seed_history else VS_FIRST_RUN_DAYS
+    cutoff = _backfill_read_cutoff(home_dir, VS_STATE_FILE, days)
+    sessions = _vs_with_user_home(home_dir, hook.collect_visual_studio_sessions, cutoff)
+    return {'sessions': sessions or [], 'first_run': first_run}
+
+
+def run_visual_studio_sweep(api_key: str, backend_url: str,
+                            user_homes: List[Tuple[str, Path]],
+                            hook_source: Optional[str] = None,
+                            device_serial: Optional[str] = None,
+                            seed_history: bool = False) -> None:
+    """Upload each user's Visual Studio conversations touched since their last sweep.
+
+    An ordinary sweep is the only delivery those turns get, so it declares itself
+    not-backfilled. The --backfill seed is the exception: a month of history must not
+    raise a month of alerts. Never raises; runs at the tail of a successful install."""
+    if not VS_SWEEP_ENABLED or platform.system().lower() != 'windows':
+        return
+    if os.environ.get('UNBOUND_VS_SWEEP_DISABLED') == '1':
+        debug_print("UNBOUND_VS_SWEEP_DISABLED=1 - skipping visual studio sweep")
+        return
+    global _BACKFILL_HOOK_MODULE, _BACKFILL_HOOK_SOURCE
+    if hook_source is not None:
+        _BACKFILL_HOOK_MODULE = None
+        _BACKFILL_HOOK_SOURCE = hook_source
+    try:
+        started_at = time.time()
+        for username, home_dir in user_homes:
+            if home_dir is None:
+                continue
+            result = _run_as_user(username, _vs_collect_for_user, home_dir, seed_history)
+            if not result or not result.get('sessions'):
+                continue
+            sessions = result['sessions']
+            # Or the server attributes these rows to the upload key's application.
+            if device_serial:
+                for session in sessions:
+                    session['device_serial'] = device_serial
+            historical = bool(result.get('first_run') and seed_history)
+            sent, _, failed = _backfill_send_sessions(
+                api_key, backend_url, sessions, backfilled=historical)
+            # Anything not delivered must leave the cutoff, or it is never re-read.
+            if failed or sent < len(sessions):
+                debug_print("visual studio: %d of %d session(s) delivered for %s, retrying next run"
+                            % (sent, len(sessions), username))
+                continue
+            _run_as_user(username, _backfill_write_cutoff, home_dir, started_at, VS_STATE_FILE)
+            print(f"[visual-studio] Queued {sent} conversation(s) for {username}")
+    except Exception as e:
+        print(f"[visual-studio] Skipped due to error: {e}", file=sys.stderr)
 
 
 def detect_install_state() -> Optional[str]:
@@ -2508,6 +2597,12 @@ def main():
 
     if success and backfill_mode:
         run_backfill(api_key, base_url, user_homes, script_text)
+
+    # Not gated on backfill_mode: with no live hook, skipping captures nothing at all.
+    # The flag only decides how far the first sweep reaches back.
+    if success:
+        run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
+                                device_serial=device_id, seed_history=backfill_mode)
 
     return success
 
