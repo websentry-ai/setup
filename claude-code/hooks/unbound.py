@@ -3248,26 +3248,35 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
     }
 
 
-MANAGED_SETTINGS_PATHS = (
-    Path('/Library/Application Support/ClaudeCode/managed-settings.json'),
-    Path('/etc/claude-code/managed-settings.json'),
-    Path('C:/ProgramData/ClaudeCode/managed-settings.json'),
+MANAGED_SETTINGS_DIRS = (
+    Path('/Library/Application Support/ClaudeCode'),
+    Path('/etc/claude-code'),
+    Path(os.environ.get('ProgramFiles') or r'C:\Program Files') / 'ClaudeCode',
 )
 USER_SETTINGS_PATH = _CONFIG_DIR / 'settings.json'
 
 
+def _settings_base_url(path: Path) -> Optional[str]:
+    try:
+        env = json.loads(path.read_text(encoding='utf-8')).get('env')
+    except Exception:
+        return None
+    url = env.get('ANTHROPIC_BASE_URL') if isinstance(env, dict) else None
+    return url if isinstance(url, str) and url.strip() else None
+
+
 def _gateway_host() -> Optional[str]:
-    """Host of ANTHROPIC_BASE_URL: the process env, then managed settings, then the
-    user's settings.json. The host only, never the path or anything secret."""
-    urls = [os.environ.get('ANTHROPIC_BASE_URL')]
-    for path in (*MANAGED_SETTINGS_PATHS, USER_SETTINGS_PATH):
+    """Host of ANTHROPIC_BASE_URL: the process env, then managed settings (drop-ins
+    override the base file), then the user's settings.json. The host only."""
+    managed = None
+    for directory in MANAGED_SETTINGS_DIRS:
         try:
-            env = json.loads(path.read_text(encoding='utf-8')).get('env')
+            dropins = sorted((directory / 'managed-settings.d').glob('*.json'))
         except Exception:
-            continue
-        if isinstance(env, dict):
-            urls.append(env.get('ANTHROPIC_BASE_URL'))
-    for url in urls:
+            dropins = []
+        for path in [directory / 'managed-settings.json', *dropins]:
+            managed = _settings_base_url(path) or managed
+    for url in (os.environ.get('ANTHROPIC_BASE_URL'), managed, _settings_base_url(USER_SETTINGS_PATH)):
         host = urlparse(url.strip()).hostname if isinstance(url, str) and url.strip() else None
         if host:
             return host.lower()

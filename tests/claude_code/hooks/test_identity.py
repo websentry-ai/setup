@@ -16,6 +16,8 @@ from unittest.mock import patch
 from tests.conftest import tool_module
 
 unbound = tool_module("claude-code/hooks")
+# Taken before any fixture redirects it.
+REAL_MANAGED_SETTINGS_DIRS = unbound.MANAGED_SETTINGS_DIRS
 class TestEmailDomain(unittest.TestCase):
     def test_returns_domain_for_normal_address(self):
         self.assertEqual(unbound._email_domain("alice@example.com"), "example.com")
@@ -265,7 +267,7 @@ class TestGatewayHostAsTheAccount(unittest.TestCase):
         self.claude_json = self.tmp / ".claude.json"
         for target, value in (("CLAUDE_MCP_CONFIG_PATH", self.claude_json),
                               ("USER_SETTINGS_PATH", self.tmp / "settings.json"),
-                              ("MANAGED_SETTINGS_PATHS", (self.tmp / "managed-settings.json",))):
+                              ("MANAGED_SETTINGS_DIRS", (self.tmp,))):
             p = patch.object(unbound, target, value)
             p.start()
             self.addCleanup(p.stop)
@@ -275,7 +277,9 @@ class TestGatewayHostAsTheAccount(unittest.TestCase):
         self.claude_json.write_text("{}", encoding="utf-8")
 
     def _settings(self, name, base_url):
-        (self.tmp / name).write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+        path = self.tmp / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
 
     def test_the_env_base_url_host_is_the_org(self):
         with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal/v1/anthropic"}):
@@ -307,6 +311,20 @@ class TestGatewayHostAsTheAccount(unittest.TestCase):
     def test_an_auth_token_marks_it_an_api_key_setup(self):
         with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
             self.assertEqual(unbound.read_account_identity()["auth_mode"], "api_key")
+
+    def test_a_managed_drop_in_is_read(self):
+        """The MDM install writes managed-settings.d/unbound.json, not the base file."""
+        self._settings("managed-settings.d/unbound.json", "https://gateway.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
+
+    def test_a_drop_in_overrides_the_base_managed_file(self):
+        self._settings("managed-settings.json", "https://old.acme.com")
+        self._settings("managed-settings.d/50-gateway.json", "https://new.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "new.acme.com")
+
+    def test_windows_managed_settings_live_under_program_files(self):
+        self.assertIn("ClaudeCode", str(REAL_MANAGED_SETTINGS_DIRS[-1]))
+        self.assertNotIn("ProgramData", str(REAL_MANAGED_SETTINGS_DIRS[-1]))
 
     def test_a_corrupt_settings_file_is_skipped(self):
         (self.tmp / "managed-settings.json").write_text("{not json", encoding="utf-8")
