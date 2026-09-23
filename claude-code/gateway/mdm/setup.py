@@ -789,7 +789,8 @@ def remove_env_var_from_user(username: str, home_dir: Path, var_name: str,
 
 
 def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
-                                  gateway_url: str = None) -> None:
+                                  gateway_url: str = None,
+                                  frontend_url: str = None) -> None:
     """Write API key to ~/.unbound/config.json for a given user.
     Privilege-drops to the target user before any FS op."""
     config_dir = home_dir / ".unbound"
@@ -814,6 +815,9 @@ def write_unbound_config_for_user(username: str, home_dir: Path, api_key: str,
             # Recorded so teardown can recognise a custom endpoint as ours later; without
             # it a --gateway-url install leaves its own routing behind.
             config['gateway_url'] = normalize_url(gateway_url)
+        if frontend_url:
+            # Custom-tenant devices need the tenant frontend to build console links.
+            config['frontend_url'] = frontend_url
         flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
         fd = os.open(str(config_file), flags, 0o600)
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1253,6 +1257,7 @@ def main():
 
     base_url = "https://backend.getunbound.ai"
     gateway_url = DEFAULT_GATEWAY_URL
+    frontend_url = None
     app_name = None
     auth_api_key = None
 
@@ -1264,6 +1269,9 @@ def main():
             i += 2
         elif args[i] == "--gateway-url" and i + 1 < len(args):
             gateway_url = normalize_url(args[i + 1])
+            i += 2
+        elif args[i] == "--frontend-url" and i + 1 < len(args):
+            frontend_url = args[i + 1]
             i += 2
         elif args[i] == "--app_name" and i + 1 < len(args):
             app_name = args[i + 1]
@@ -1322,7 +1330,8 @@ def main():
     for username, home_dir in get_all_user_homes():
         remove_hooks_unbound_script_for_user(username, home_dir)
         remove_user_level_gateway_for_user(username, home_dir)
-        write_unbound_config_for_user(username, home_dir, claude_api_key, gateway_url)
+        write_unbound_config_for_user(username, home_dir, claude_api_key, gateway_url,
+                                      frontend_url=frontend_url)
 
     print("\n🔧 Configuring Claude managed settings...")
     if setup_managed_settings(claude_api_key, gateway_url=gateway_url):

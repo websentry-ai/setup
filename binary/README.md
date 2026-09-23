@@ -32,6 +32,17 @@ argv IS load-bearing: claude-code/copilot/codex share event names, so the
 event alone can't select a module. Dispatcher failures fail open (`{}`,
 exit 0) — this process sits between the user and their editor.
 
+**Tenant gateway.** At hook start (`hook`, `sync-skills`, `mcp-diagnostic`)
+the dispatcher resolves the gateway before loading the module: a non-blank
+`UNBOUND_GATEWAY_URL` in the environment takes precedence; otherwise
+`gateway_url` from `~/.unbound/config.json` (recorded by
+`setup --gateway-url`) is used when it is a well-formed `https://` URL;
+otherwise the default `https://api.getunbound.ai` applies. The recorded
+gateway must be an `https://` base URL — host, optional port and path prefix,
+no credentials, query or fragment; anything else leaves the default gateway
+in place. Resolution is fail-open — an absent or unreadable config leaves the
+default in place.
+
 ## Frozen-mode gates (in the modules, inert under python)
 
 When `sys.frozen` (or `UNBOUND_HOOK_FROZEN=1` for tests):

@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
 # devcontainer Feature installer. Runs at image-build time as root. Places:
-#   /unbound/unbound.py                      — the canonical, self-contained hook
-#   /etc/claude-code/managed-settings.json   — managed hook settings (highest tier)
+#   /unbound/unbound.py                      — the canonical Claude Code hook
+#   /etc/claude-code/managed-settings.json   — Claude Code managed hook settings (highest tier)
+#   /etc/cursor/hooks/unbound.py             — the canonical Cursor hook
+#   /etc/cursor/hooks.json                   — Cursor enterprise-managed hooks config
 #
-# The hook is the canonical copy from this repo's claude-code/hooks/unbound.py (CI copies
-# it into this feature dir before publish — see .github/workflows/publish-feature.yml), so
-# there is no vendored/drifting duplicate.
+# Both hooks are the canonical copies from this repo (claude-code/hooks/unbound.py and
+# cursor/unbound.py + cursor/hooks.json); CI vendors them into this feature dir before
+# publish — see .github/workflows/publish-feature.yml — so there is no drifting duplicate.
 #
-# python3 (the hook's only dependency) is installed automatically via the dependsOn the
-# official python feature. The hook reads credentials directly: UNBOUND_CLAUDE_API_KEY in
-# the env, or a mounted ~/.unbound/config.json. No shell env-export bridge is installed —
-# the hook resolves config.json itself.
+# The Cursor enterprise path (/etc/cursor) and layout are exactly what cursor/mdm/setup.py
+# installs on Linux (get_enterprise_hooks_dir + setup_hooks): hooks.json at the root, the
+# script under hooks/, and hooks.json referencing it by the relative "./hooks/unbound.py".
+#
+# python3 (the hooks' only dependency) is installed automatically via the dependsOn the
+# official python feature. Both hooks read credentials the same way: an env key
+# (UNBOUND_CLAUDE_API_KEY / UNBOUND_CURSOR_API_KEY) or a mounted ~/.unbound/config.json,
+# which link-unbound.sh already links into every home — so Cursor needs no extra plumbing.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -39,10 +45,16 @@ fi
 install -D -m 0755 "$HERE/unbound.py" /unbound/unbound.py
 install -D -m 0644 "$HERE/managed-settings.json" /etc/claude-code/managed-settings.json
 
+# Cursor: mirror cursor/mdm/setup.py's Linux layout under /etc/cursor so Cursor's
+# enterprise-managed hooks fire in the container. The script is executable (hooks.json
+# invokes it as the relative "./hooks/unbound.py", which resolves from /etc/cursor).
+install -D -m 0755 "$HERE/cursor-unbound.py" /etc/cursor/hooks/unbound.py
+install -D -m 0644 "$HERE/cursor-hooks.json" /etc/cursor/hooks.json
+
 # Symlink helper: links a mounted config (/usr/local/share/unbound/config.json) into every
 # user's ~/.unbound/config.json so the hook works as ANY user (incl. after su/sudo). Run at
 # container start via the Feature's postStartCommand (see devcontainer-feature.json).
 install -D -m 0755 "$HERE/link-unbound.sh" /usr/local/share/unbound/link-unbound.sh
 
-echo "unbound-hooks: installed hook + managed settings"
-echo "unbound-hooks: mount ~/.unbound/config.json (or set UNBOUND_CLAUDE_API_KEY) to supply creds"
+echo "unbound-hooks: installed Claude Code + Cursor hooks and managed settings"
+echo "unbound-hooks: mount ~/.unbound/config.json (or set UNBOUND_CLAUDE_API_KEY / UNBOUND_CURSOR_API_KEY) to supply creds"

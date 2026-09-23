@@ -157,13 +157,17 @@ def test_setup_full_run_configures_everything(env):
     augment = json.loads((env["tmp"] / "managed-augment" / "settings.json").read_text())
     assert augment["hooks"] == {
         "PreToolUse": [{"matcher": ".*", "hooks": [
-            {"type": "command", "command": _cmd("augment", "PreToolUse"), "timeout": 15000}]}],
+            {"type": "command", "command": _cmd("augment", "PreToolUse"), "timeout": 15000}],
+            "metadata": {"includeUserContext": True, "includeMCPMetadata": True}}],
         "PostToolUse": [{"matcher": ".*", "hooks": [
-            {"type": "command", "command": _cmd("augment", "PostToolUse"), "timeout": 10000}]}],
+            {"type": "command", "command": _cmd("augment", "PostToolUse"), "timeout": 10000}],
+            "metadata": {"includeUserContext": True, "includeMCPMetadata": True}}],
         "Stop": [{"hooks": [
-            {"type": "command", "command": _cmd("augment", "Stop"), "timeout": 10000}]}],
+            {"type": "command", "command": _cmd("augment", "Stop"), "timeout": 10000}],
+            "metadata": {"includeConversationData": True, "includeUserContext": True}}],
         "SessionStart": [{"hooks": [
-            {"type": "command", "command": _cmd("augment", "SessionStart"), "timeout": 60000}]}],
+            {"type": "command", "command": _cmd("augment", "SessionStart"), "timeout": 60000}],
+            "metadata": {"includeUserContext": True}}],
         "SessionEnd": [{"hooks": [
             {"type": "command", "command": _cmd("augment", "SessionEnd"), "timeout": 10000}]}],
     }
@@ -184,6 +188,27 @@ def test_setup_full_run_configures_everything(env):
     assert len(env["notified"]) == 5
     # backfill NOT run without --backfill
     assert env["backfilled"] == []
+
+
+def _user_config(env):
+    return json.loads((env["home"] / ".unbound" / "config.json").read_text())
+
+
+def test_setup_records_the_frontend_url_normalized_like_backend_and_gateway(env):
+    rc = setup_cmd.run(["--api-key", "admin-key", "--backend-url", "tenant-backend.example.com/",
+                        "--gateway-url", "tenant-api.example.com/",
+                        "--frontend-url", " tenant-app.example.com/ "])
+    assert rc == 0
+    cfg = _user_config(env)
+    assert cfg["base_url"] == "https://tenant-backend.example.com"
+    assert cfg["gateway_url"] == "https://tenant-api.example.com"
+    assert cfg["frontend_url"] == "https://tenant-app.example.com"
+
+
+@pytest.mark.parametrize("extra", [[], ["--frontend-url", ""], ["--frontend-url", "   "]])
+def test_setup_without_a_frontend_url_records_none(env, extra):
+    assert setup_cmd.run(["--api-key", "admin-key", *extra]) == 0
+    assert "frontend_url" not in _user_config(env)
 
 
 def test_setup_component_failure_does_not_abort_others(env, monkeypatch):
@@ -243,6 +268,35 @@ def test_setup_is_idempotent(env):
     first = (env["tmp"] / "managed-claude" / "managed-settings.json").read_text()
     assert setup_cmd.run(["--api-key", "admin-key"]) == 0
     assert (env["tmp"] / "managed-claude" / "managed-settings.json").read_text() == first
+
+
+def test_augment_rerun_adds_user_context_to_an_existing_install(env):
+    """Devices installed before the fix have our blocks with no metadata; a
+    re-run must add it, and leave an org's own block alone."""
+    managed = env["tmp"] / "managed-augment"
+    managed.mkdir(parents=True, exist_ok=True)
+    foreign = {"matcher": ".*", "hooks": [{"type": "command", "command": "/org/own.sh"}]}
+    (managed / "settings.json").write_text(json.dumps({"hooks": {
+        "PreToolUse": [foreign, {"matcher": ".*", "hooks": [
+            {"type": "command", "command": _cmd("augment", "PreToolUse"), "timeout": 15000}]}],
+        "Stop": [{"hooks": [
+            {"type": "command", "command": _cmd("augment", "Stop"), "timeout": 10000}]}],
+    }}))
+
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+
+    hooks = json.loads((managed / "settings.json").read_text())["hooks"]
+    assert hooks["PreToolUse"][0] == foreign
+    assert hooks["PreToolUse"][1]["metadata"]["includeUserContext"] is True
+    assert hooks["Stop"][0]["metadata"]["includeUserContext"] is True
+    assert len(hooks["PreToolUse"]) == 2
+
+
+def test_augment_rerun_keeps_the_metadata_stable(env):
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    first = (env["tmp"] / "managed-augment" / "settings.json").read_text()
+    assert setup_cmd.run(["--api-key", "admin-key"]) == 0
+    assert (env["tmp"] / "managed-augment" / "settings.json").read_text() == first
 
 
 def test_setup_codex_user_hooks_idempotent(env):
