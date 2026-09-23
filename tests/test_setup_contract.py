@@ -301,6 +301,17 @@ def test_copilot_backfill_ships_disabled(relpath):
     assert "BACKFILL_ENABLED = False" in (REPO / relpath).read_text(), relpath
 
 
+def test_visual_studio_sweep_ships_enabled():
+    """The only thing between "the sweep runs" and "it does not". Read from source for the
+    same reason as the flag above: the loader rewrites these on every module it imports.
+
+    Deliberately separate from BACKFILL_ENABLED, which holds back Copilot's CLI/VS Code
+    re-walk. Visual Studio has no live hook, so it has no rows to duplicate."""
+    source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
+    assert "VS_SWEEP_ENABLED = True" in source
+    assert "BACKFILL_ENABLED = False" in source
+
+
 # Installers MDM runs with stdout redirected. On Windows that pipe encodes as cp1252,
 # where one non-ASCII character in a status line takes down the whole run.
 MDM_ENTRY_POINTS = [s for s in SETUPS if "/mdm/" in s] + ["mdm/onboard.py"]
