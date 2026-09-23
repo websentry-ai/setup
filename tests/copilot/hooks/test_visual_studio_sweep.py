@@ -132,7 +132,7 @@ class TurnPairing(unittest.TestCase):
     def test_role_zero_is_the_prompt_and_one_is_the_reply(self):
         turns = unbound._vs_session_turns(unbound._mp_unpack_all(_prompt("ask") + _reply("answer")))
         self.assertEqual(len(turns), 1)
-        self.assertEqual(unbound._vs_block_text(turns[0][0]), "ask")
+        self.assertEqual(unbound._vs_block_text(turns[0][1]), "ask")
 
     def test_a_reply_with_no_text_is_still_running_and_withheld(self):
         blob = _prompt("ask") + _mp_array([bytes([0x01]), _mp_map([("Content", _mp_array([]))])])
@@ -142,7 +142,7 @@ class TurnPairing(unittest.TestCase):
 class ChatLogTurns(unittest.TestCase):
     def test_the_trailing_turn_is_withheld_until_it_settles(self):
         body = _body([_msg("user", "one"), _msg("assistant", "first"), _msg("user", "two")])
-        self.assertEqual(unbound._vs_chat_log_turns(body), [("one", "first")])
+        self.assertEqual(unbound._vs_chat_log_turns(body), [(0, "one", "first")])
 
     def test_a_repeated_prompt_earlier_in_the_chat_is_not_dropped(self):
         # Filtering by text rather than position would delete the settled first "continue".
@@ -150,18 +150,18 @@ class ChatLogTurns(unittest.TestCase):
                       _msg("user", "continue"), _msg("assistant", "b"),
                       _msg("user", "continue")])
         self.assertEqual(unbound._vs_chat_log_turns(body),
-                         [("continue", "a"), ("continue", "b")])
+                         [(0, "continue", "a"), (1, "continue", "b")])
 
     def test_the_synthetic_idestate_message_opens_no_turn(self):
         body = _body([_msg("user", IDESTATE), _msg("user", "real one"),
                       _msg("assistant", "answer"),
                       _msg("user", IDESTATE), _msg("user", "real two")])
-        self.assertEqual(unbound._vs_chat_log_turns(body), [("real one", "answer")])
+        self.assertEqual(unbound._vs_chat_log_turns(body), [(0, "real one", "answer")])
 
     def test_tool_messages_do_not_break_pairing(self):
         body = _body([_msg("system", "sys"), _msg("user", "ask"), _msg("assistant", "part"),
                       _msg("tool", "output"), _msg("assistant", "more"), _msg("user", "next")])
-        self.assertEqual(unbound._vs_chat_log_turns(body), [("ask", "part\n\nmore")])
+        self.assertEqual(unbound._vs_chat_log_turns(body), [(0, "ask", "part\n\nmore")])
 
 
 class UsageAttribution(unittest.TestCase):
@@ -190,7 +190,7 @@ class Collection(unittest.TestCase):
     def _collect(self, tmp, installed=True):
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=installed), \
-                patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
             sessions, _, _ = unbound.collect_visual_studio_sessions(0)
         return sessions
@@ -396,7 +396,7 @@ class TruncationAndOrdering(unittest.TestCase):
     def _collect(self, tmp):
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=True), \
-                patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
             return unbound.collect_visual_studio_sessions(0)
 
@@ -450,7 +450,7 @@ class MetadataAndResume(unittest.TestCase):
     def _collect(self, tmp):
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=True), \
-                patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
             return unbound.collect_visual_studio_sessions(0)
 
@@ -512,15 +512,16 @@ class MetadataAndResume(unittest.TestCase):
                                      session="%s-0000-0000-0000-00000000000%d" % (SESSION[:8], n),
                                      solution=name)
                 os.utime(path, (1789900000 - n * 500, 1789900000 - n * 500))
-            with patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]):
+            with patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]):
                 mtimes = [m for m, _, _ in unbound._iter_vs_sessions(0)]
         self.assertEqual(mtimes, sorted(mtimes))
 
 
 class SharedRootsAndHostileFiles(unittest.TestCase):
-    """A sweep runs once per user, but not every path it walks belongs to that user."""
+    """A sweep runs once per user, and not every path it could walk belongs to that user."""
 
-    def _collect(self, home, roots):
+    def _collect(self, home, roots=None):
+        roots = [Path(home)] if roots is None else roots
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=True), \
                 patch.object(unbound, "_vs_solution_roots", return_value=roots), \
@@ -528,25 +529,19 @@ class SharedRootsAndHostileFiles(unittest.TestCase):
                 patch.object(unbound, "log_error"):
             return unbound.collect_visual_studio_sessions(0)
 
-    def test_a_shared_root_session_this_user_never_opened_is_skipped(self):
-        # C:\src is walked by every user on the device, and anyone can write there.
-        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as shared:
-            _session_file(shared, _prompt("someone else's prompt") + _reply("reply"))
-            sessions, _, _ = self._collect(home, [(Path(shared), True)])
-        self.assertEqual(sessions, [])
+    def test_machine_wide_roots_are_not_walked(self):
+        # A chat log the user can write is no proof of who owns what is found there.
+        with tempfile.TemporaryDirectory() as home:
+            with patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                    patch.object(unbound.Path, "is_dir", lambda self: True):
+                roots = [str(r) for r in unbound._vs_solution_roots()]
+        self.assertTrue(all(str(home) in r for r in roots), roots)
+        self.assertEqual(len(roots), 2)
 
-    def test_a_shared_root_session_this_user_logged_is_kept(self):
-        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as shared:
-            _session_file(shared, _prompt("ask") + _reply("answer"))
-            _chat_log(home, [("session", SESSION), ("body", _body([_msg("user", "ask")]))])
-            sessions, _, _ = self._collect(home, [(Path(shared), True)])
-        self.assertEqual(len(sessions), 1)
-        self.assertEqual(sessions[0]["entries"][-1]["data"]["content"], "answer")
-
-    def test_a_home_root_session_needs_no_log_to_prove_whose_it_is(self):
+    def test_a_home_root_session_is_collected(self):
         with tempfile.TemporaryDirectory() as home:
             _session_file(home, _prompt("ask") + _reply("answer"))
-            sessions, _, _ = self._collect(home, [(Path(home), False)])
+            sessions, _, _ = self._collect(home)
         self.assertEqual(len(sessions), 1)
 
     def test_a_session_symlinked_out_of_its_root_is_not_read(self):
@@ -557,15 +552,31 @@ class SharedRootsAndHostileFiles(unittest.TestCase):
             planted = _session_file(home, b"")
             planted.unlink()
             planted.symlink_to(secret)
-            sessions, _, _ = self._collect(home, [(Path(home), False)])
+            sessions, _, _ = self._collect(home)
+        self.assertEqual(sessions, [])
+
+    def test_a_session_swapped_for_a_symlink_after_the_walk_is_not_read(self):
+        # The walk clears a path, then sorts; the read happens later.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "secret"
+            secret.write_bytes(_prompt("stolen") + _reply("secret contents"))
+            planted = _session_file(home, _prompt("ask") + _reply("answer"))
+            real = unbound._iter_vs_sessions
+
+            def swap(cutoff, budget=None):
+                found = real(cutoff, budget)
+                planted.unlink()
+                planted.symlink_to(secret)
+                return found
+
+            with patch.object(unbound, "_iter_vs_sessions", swap):
+                sessions, _, _ = self._collect(home)
         self.assertEqual(sessions, [])
 
     def test_a_chat_log_symlinked_out_of_its_root_is_not_read(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
             secret = Path(outside) / "secret.log"
-            secret.write_text("[2026-09-21 13:33:00.000 CopilotFunctionRegistry V] "
-                              "[FunctionProviderWrapper.OnNext] SessionId=%s FunctionsCount=8\n"
-                              % SESSION, encoding="utf-8")
+            secret.write_text("x\n", encoding="utf-8")
             planted = _chat_log(home, [])
             planted.unlink()
             planted.symlink_to(secret)
@@ -577,9 +588,75 @@ class SharedRootsAndHostileFiles(unittest.TestCase):
         # RecursionError is not in the caller's except clause, so it would abort the walk.
         with tempfile.TemporaryDirectory() as home:
             _session_file(home, b"\x91" * 20000)
-            sessions, _, _ = self._collect(home, [(Path(home), False)])
+            sessions, _, _ = self._collect(home)
         self.assertEqual(sessions, [])
 
-    def test_real_transcript_nesting_stays_well_inside_the_cap(self):
-        blob = _prompt("ask") + _reply("answer")
-        self.assertTrue(unbound._mp_unpack_all(blob))
+
+class TurnPositions(unittest.TestCase):
+    """A turn's position is its own, not its rank among the turns that finished."""
+
+    def _collect(self, home):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                patch.object(unbound, "log_error"):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_cancelled_first_turn_does_not_shift_the_usage_of_the_second(self):
+        # VS keys usage by position among every prompt, so the cancelled turn holds slot 0.
+        with tempfile.TemporaryDirectory() as home:
+            _chat_log(home, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "cancelled"), _msg("assistant", ""),
+                                _msg("user", "real one")])),
+                ("usage", _usage(100, 5)),
+                ("body", _body([_msg("user", "cancelled"), _msg("assistant", ""),
+                                _msg("user", "real one"), _msg("assistant", "answer"),
+                                _msg("user", "real two")])),
+                ("usage", _usage(700, 40)),
+            ])
+            sessions, _, _ = self._collect(home)
+
+        entries = sessions[0]["entries"]
+        self.assertEqual(entries[0]["data"]["content"], "real one")
+        self.assertEqual(entries[0]["id"], unbound._vs_turn_marker(SESSION, "real one", 1),
+                         "the surviving turn keeps slot 1, so its id is stable across sweeps")
+        self.assertEqual(sessions[0]["usage"][1],
+                         {"input_tokens": 100, "output_tokens": 5,
+                          "cache_read_input_tokens": 0})
+
+    def test_a_cancelled_turn_keeps_the_positions_of_the_turns_after_it(self):
+        turns = unbound._vs_chat_log_turns(_body([
+            _msg("user", "cancelled"), _msg("assistant", ""),
+            _msg("user", "one"), _msg("assistant", "a"),
+            _msg("user", "two"), _msg("assistant", "b"),
+            _msg("user", "trailing")]))
+        self.assertEqual(turns, [(1, "one", "a"), (2, "two", "b")])
+
+    def test_the_store_numbers_a_textless_turn_the_same_way(self):
+        blob = (_prompt("cancelled") + _mp_array([bytes([0x01]), _mp_map([("Content", _mp_array([]))])])
+                + _prompt("one") + _reply("a"))
+        turns = unbound._vs_session_turns(unbound._mp_unpack_all(blob))
+        self.assertEqual([i for i, _, _ in turns], [1])
+
+
+class LogRequestBudget(unittest.TestCase):
+    def test_a_quiet_conversation_survives_a_busy_one_in_the_same_log(self):
+        # A single tail of the log would drop A entirely once B outran it.
+        entries = [("session", OTHER), ("body", _body([_msg("user", "from A"),
+                                                       _msg("assistant", "a"),
+                                                       _msg("user", "settle A")]))]
+        entries.append(("session", SESSION))
+        for n in range(unbound._VS_MAX_METADATA_REQUESTS + 5):
+            entries.append(("body", _body([_msg("user", "B %d" % n)])))
+
+        with tempfile.TemporaryDirectory() as home:
+            path = _chat_log(home, entries)
+            with patch.object(unbound, "log_error"):
+                requests, _ = unbound._vs_chat_log_requests(path)
+
+        kept = {r[4] for r in requests}
+        self.assertIn(OTHER, kept, "the quiet conversation must not be dropped")
+        self.assertLessEqual(sum(1 for r in requests if r[4] == SESSION),
+                             unbound._VS_MAX_METADATA_REQUESTS)

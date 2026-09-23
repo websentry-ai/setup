@@ -146,3 +146,49 @@ class PerUserIsolation(unittest.TestCase):
             mdm.run_visual_studio_sweep("key", "https://backend", homes)
 
         self.assertEqual(len(uploads), 1, "bob must still be swept after alice raises")
+
+
+class DeliveryAccounting(unittest.TestCase):
+    def test_a_session_whose_remainder_was_dropped_does_not_count_as_sent(self):
+        # One landed slice proves nothing about the exchanges the slicer could not fit.
+        session = {'session_id': 'S1', 'entries': [
+            {'type': 'user.message', 'data': {'content': 'small'}},
+            {'type': 'assistant.message', 'data': {'content': 'ok'}},
+            {'type': 'user.message', 'data': {'content': 'x' * 4096}},
+            {'type': 'assistant.message', 'data': {'content': 'y' * 4096}},
+        ]}
+        with patch.object(mdm, '_backfill_upload_chunk', return_value=True), \
+                patch.object(mdm, 'BACKFILL_CHUNK_BYTES', 900):
+            sent, _, failed = mdm._backfill_send_sessions('k', 'https://b', [session])
+        self.assertEqual(failed, 0)
+        self.assertEqual(sent, 0, "a part-delivered session must not advance the cutoff")
+
+    def test_a_session_delivered_whole_still_counts(self):
+        session = {'session_id': 'S1', 'entries': [
+            {'type': 'user.message', 'data': {'content': 'small'}},
+            {'type': 'assistant.message', 'data': {'content': 'ok'}},
+        ]}
+        with patch.object(mdm, '_backfill_upload_chunk', return_value=True):
+            sent, _, failed = mdm._backfill_send_sessions('k', 'https://b', [session])
+        self.assertEqual((sent, failed), (1, 0))
+
+
+class FirstRunCutoff(unittest.TestCase):
+    def test_a_failed_first_sweep_does_not_move_the_floor_forward(self):
+        import tempfile, time
+        with tempfile.TemporaryDirectory() as home:
+            home = Path(home)
+            hook = type('H', (), {'collect_visual_studio_sessions': staticmethod(
+                lambda cutoff: ([], False, None))})
+            with patch.object(mdm, '_backfill_load_hook_module', return_value=hook), \
+                    patch.object(mdm, '_vs_with_user_home',
+                                 lambda h, fn, *a: fn(*a)):
+                mdm._vs_collect_for_user(home)
+                pinned = float(mdm._backfill_state_path(home, mdm.VS_STATE_FILE).read_text())
+                # A day later, a second run must read the pinned floor, not now minus a day.
+                tomorrow = time.time() + 86400
+                with patch.object(mdm.time, 'time', lambda: tomorrow):
+                    mdm._vs_collect_for_user(home)
+                    again = float(
+                        mdm._backfill_state_path(home, mdm.VS_STATE_FILE).read_text())
+        self.assertEqual(pinned, again, "the first run's floor must survive a failed sweep")

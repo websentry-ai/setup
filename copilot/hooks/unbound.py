@@ -5770,6 +5770,8 @@ _VS_MAX_LOG_LINES = 200000
 _VS_MAX_LOG_LINE_CHARS = 1 << 20
 # Scanned only for each turn's own time and model, which the replayed history does not carry.
 _VS_MAX_METADATA_REQUESTS = 200
+# Ceiling across all conversations in one log, so many chats cannot exhaust memory.
+_VS_MAX_KEPT_REQUESTS = 2000
 # Bounds container nesting; real transcripts sit well under ten levels.
 _VS_MAX_NESTING = 64
 # Bounds the walk so a pathological tree cannot stall an MDM install.
@@ -5906,18 +5908,18 @@ def _vs_installed():
 
 
 def _vs_solution_roots():
-    """(directory, shared) pairs worth walking for solution state. ~/source/repos is
-    deliberately absent: it sits under ~/source, so listing both walks that tree twice.
+    """Directories worth walking for solution state. ~/source/repos is deliberately absent:
+    it sits under ~/source, so listing both walks that tree twice.
 
-    Shared roots sit outside any home, so every user on the device walks the same files."""
+    Only the scanned user's own tree. Shared roots like C:\\src are walked by every user on
+    the device and nothing in one says whose a session is. Their conversations still arrive
+    through the chat log, which lives in the user's own profile."""
     home = Path.home()
-    candidates = [(home / 'source', False), (home / 'Documents', False),
-                  (Path('C:/src'), True), (Path('C:/dev'), True), (Path('C:/code'), True)]
     roots = []
-    for root, shared in candidates:
+    for root in (home / 'source', home / 'Documents'):
         try:
             if root.is_dir():
-                roots.append((root, shared))
+                roots.append(root)
         except OSError:
             continue
     return roots
@@ -5939,7 +5941,7 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
     seen = set()
     scanned = 0
     found = []
-    for root, shared in _vs_solution_roots():
+    for root in _vs_solution_roots():
         try:
             real_root = Path(os.path.realpath(str(root)))
         except OSError:
@@ -5971,7 +5973,7 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                         log_error('visual studio session escapes its root: %s' % path,
                                   'visual_studio')
                         continue
-                    found.append((info.st_mtime, path, shared))
+                    found.append((info.st_mtime, path, real_root))
             except OSError as e:
                 log_error('visual studio walk failed under %s: %s' % (root, e), 'visual_studio')
                 continue
@@ -6034,17 +6036,18 @@ def _vs_session_turns(objects):
 
     A reply with no text yet is still running. Waiting is safe rather than lossy: VS
     rewrites the entry once the turn completes, so it arrives on a later sweep."""
-    turns, pending = [], None
+    turns, pending, index = [], None, -1
     for obj in objects:
         if not (isinstance(obj, list) and len(obj) == 2 and isinstance(obj[1], dict)):
             continue
         role, payload = obj[0], obj[1]
         if role == _VS_ROLE_USER:
             pending = payload
+            index += 1
         elif role == _VS_ROLE_ASSISTANT and pending is not None:
-            turns.append((pending, payload))
+            turns.append((index, pending, payload))
             pending = None
-    return [(p, r) for p, r in turns if _vs_block_text(r).strip()]
+    return [(i, p, r) for i, p, r in turns if _vs_block_text(r).strip()]
 
 
 def _vs_capped_lines(handle):
@@ -6088,7 +6091,7 @@ def _iter_vs_chat_logs(cutoff_mtime):
     except OSError:
         return []
     # Oldest first: a restart replays the whole history, and the first write of a turn wins.
-    return [path for _, path in sorted(found)]
+    return [(real_root, path) for _, path in sorted(found)]
 
 
 def _vs_log_line_time(line):
@@ -6192,7 +6195,25 @@ def _vs_chat_log_requests(path):
                                  turn_index, body, session_id))
     except OSError:
         return [], {}
-    return requests[-_VS_MAX_METADATA_REQUESTS:], usage_by_turn
+    return _vs_recent_per_session(requests), usage_by_turn
+
+
+def _vs_recent_per_session(requests):
+    """The most recent requests of each conversation. A single tail would drop a whole
+    chat that a busier one in the same log outran."""
+    counts, kept = {}, []
+    for item in reversed(requests):
+        session_id = item[4]
+        if counts.get(session_id, 0) >= _VS_MAX_METADATA_REQUESTS:
+            continue
+        counts[session_id] = counts.get(session_id, 0) + 1
+        kept.append(item)
+        if len(kept) >= _VS_MAX_KEPT_REQUESTS:
+            log_error('visual studio log held more requests than one run reads',
+                      'visual_studio')
+            break
+    kept.reverse()
+    return kept
 
 
 def _vs_chat_log_turns(body):
@@ -6201,7 +6222,7 @@ def _vs_chat_log_turns(body):
     VS never logs a response; it replays it as history on the next call, so the trailing
     turn is withheld until a later prompt settles it. Only the trailing one: filtering by
     text would also remove an earlier turn that repeated the same prompt."""
-    turns, prompt, reply = [], None, []
+    turns, prompt, reply, index = [], None, [], 0
     for message in body.get('messages') or []:
         if not isinstance(message, dict):
             continue
@@ -6212,13 +6233,12 @@ def _vs_chat_log_turns(body):
             if content.startswith(_VS_SYNTHETIC_USER_PREFIX):
                 continue
             if prompt is not None:
-                turns.append((prompt, '\n\n'.join(reply)))
+                turns.append((index, prompt, '\n\n'.join(reply)))
+                index += 1
             prompt, reply = content, []
         elif role == 'assistant' and prompt is not None and content.strip():
             reply.append(content)
-    if turns:
-        turns = turns[:-1] if prompt is None else turns
-    return [(p, r) for p, r in turns if p.strip() and r.strip()]
+    return [(i, p, r) for i, p, r in turns if p.strip() and r.strip()]
 
 
 def _vs_session(sessions, session_id):
@@ -6265,7 +6285,11 @@ def _vs_add_turn(session, index, prompt, reply, model, timestamp, usage):
 
 def _vs_collect_chat_logs(cutoff, sessions, logged):
     """Live source: prompts land here per request, and it is the only one carrying usage."""
-    for path in _iter_vs_chat_logs(cutoff):
+    for root, path in _iter_vs_chat_logs(cutoff):
+        # Re-checked at the read for the same reason the store paths are.
+        if not _vs_within(root, path):
+            log_error('visual studio chat log escapes its root: %s' % path, 'visual_studio')
+            continue
         fallback_id = path.stem.replace('_VSGitHubCopilot.chat', '')
         requests, usage_by_turn = _vs_chat_log_requests(path)
         # A turn belongs to the request it was the intent of, not to one replaying it.
@@ -6280,7 +6304,7 @@ def _vs_collect_chat_logs(cutoff, sessions, logged):
                 log_error('visual studio request had no session marker in %s' % path.name,
                           'visual_studio')
             session = _vs_session(sessions, conversation_id)
-            for index, (prompt, reply) in enumerate(_vs_chat_log_turns(body)):
+            for index, prompt, reply in _vs_chat_log_turns(body):
                 key = (conversation_id, index)
                 usage = usage_by_turn.get((session_id, index))
                 own_time, own_model, _ = logged.get(key, (None, None, None))
@@ -6294,21 +6318,23 @@ def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
 
     A session found only under a shared root is skipped: nothing there proves whose it is,
     and the chat log that would prove it is this user's has no record of the session."""
-    for count, (mtime, path, shared) in enumerate(_iter_vs_sessions(cutoff, truncated)):
+    for count, (mtime, path, root) in enumerate(_iter_vs_sessions(cutoff, truncated)):
         if count >= _VS_MAX_SESSIONS_PER_RUN:
             log_error('visual studio session cap reached; remaining files deferred',
                       'visual_studio')
             truncated[0] = True
             break
+        # Re-checked at the read: the walk cleared this path before it sorted them.
+        if not _vs_within(root, path):
+            log_error('visual studio session escapes its root: %s' % path, 'visual_studio')
+            continue
         try:
             objects = _mp_unpack_all(path.read_bytes())
         except (OSError, ValueError, IndexError, struct.error) as e:
             log_error('visual studio session unreadable (%s): %s' % (path.name, e), 'visual_studio')
             continue
-        if shared and _vs_session_id(path.name) not in sessions:
-            continue
         session = _vs_session(sessions, _vs_session_id(path.name))
-        for index, (prompt_payload, reply_payload) in enumerate(_vs_session_turns(objects)):
+        for index, prompt_payload, reply_payload in _vs_session_turns(objects):
             prompt = _vs_block_text(prompt_payload)
             if not prompt:
                 continue

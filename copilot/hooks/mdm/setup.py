@@ -1562,7 +1562,7 @@ def _backfill_tool_call_ids(entries: List[Dict]):
     return call_ids
 
 
-def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
+def _backfill_slice_session(session: Dict, max_chunk_bytes: int, dropped: Optional[set] = None):
     """Yield session payloads ≤ max_chunk_bytes. Sessions that already fit are
     yielded as-is. Oversized sessions are split at server-side exchange
     boundaries; each slice carries record_index_base = cumulative exchange
@@ -1612,6 +1612,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 
         if last_fit_end is None:
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            if dropped is not None:
+                dropped.add(session_id)
             return
 
         fit_ends = [end_idx for end_idx in ends if end_idx <= last_fit_end]
@@ -1665,8 +1667,9 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int):
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
                             forced: bool = False,
                             backfilled: bool = True) -> Tuple[int, int, int]:
-    """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts
-    distinct input session_ids that landed at least one successful chunk."""
+    """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts distinct
+    input session_ids delivered whole: one landed slice proves nothing about the rest, and
+    counting a part-delivered session would advance the cutoff past what it never sent."""
     chunks_total = 0
     chunks_sent = 0
     sessions_sent_ids: set = set()
@@ -1685,13 +1688,16 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         current_chunk = []
         current_size = 2
 
+    dropped: set = set()
     for session in sessions:
-        for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
+        for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES, dropped):
             try:
                 slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
             except (TypeError, ValueError):
+                dropped.add(slice_session.get('session_id'))
                 continue
             if slice_bytes > BACKFILL_CHUNK_BYTES:
+                dropped.add(slice_session.get('session_id'))
                 continue
             if current_chunk and current_size + slice_bytes + 1 > BACKFILL_CHUNK_BYTES:
                 _flush()
@@ -1699,7 +1705,7 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
             current_size += slice_bytes + 1
 
     _flush()
-    return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
+    return len(sessions_sent_ids - dropped), chunks_sent, chunks_total - chunks_sent
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]],
@@ -1801,6 +1807,9 @@ def _vs_collect_for_user(home_dir: Path, seed_history: bool = False) -> Optional
     first_run = not _backfill_state_path(home_dir, VS_STATE_FILE).exists()
     days = BACKFILL_MAX_AGE_DAYS if seed_history else VS_FIRST_RUN_DAYS
     cutoff = _backfill_read_cutoff(home_dir, VS_STATE_FILE, days)
+    # Pinned before delivery: the default is relative to now, so a failed sweep moves it.
+    if first_run:
+        _backfill_write_cutoff(home_dir, cutoff, VS_STATE_FILE)
     sessions, truncated, resume_at = _vs_with_user_home(
         home_dir, hook.collect_visual_studio_sessions, cutoff)
     return {'sessions': sessions or [], 'first_run': first_run,
