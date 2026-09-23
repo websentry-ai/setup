@@ -5757,8 +5757,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
-# Visual Studio ships no hook surface, so its Copilot Chat sessions are read off disk and
-# uploaded through the same S3 backfill path the other tools use.
+# Visual Studio ships no hook surface, so Copilot Chat is read off disk and backfilled.
 _VS_ROLE_USER = 0
 _VS_ROLE_ASSISTANT = 1
 _VS_TEXT_BLOCK = 3
@@ -5773,12 +5772,10 @@ _VS_MAX_LOG_LINE_CHARS = 1 << 20
 _VS_MAX_METADATA_REQUESTS = 200
 # Bounds the walk so a pathological tree cannot stall an MDM install.
 _VS_MAX_WALK_DIRS = 20000
-# The only place real usage exists; the .vs transcript carries none, so turns recovered
-# from it fall back to the backend estimate.
+# The only source of real usage; turns known only to the .vs store fall back to estimates.
 _VS_USAGE_MARKER = 'InputTokenCount'
 _VS_LOG_TIME_RE = re.compile(r'^\[(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)\.\d+ ')
-# The only link from a logged request back to its chat. Startup lines carry the key with
-# no value, so the guid is required.
+# Links a logged request to its chat. Startup lines carry the key empty, so require a guid.
 _VS_SESSION_RE = re.compile(r'SessionId=([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})')
 # VS 2026 prepends this synthetic `user` message to every turn; it is not a prompt.
 _VS_SYNTHETIC_USER_PREFIX = '# IDESTATE CONTEXT'
@@ -6059,8 +6056,7 @@ def _iter_vs_chat_logs(cutoff_mtime):
                 found.append((info.st_mtime, path))
     except OSError:
         return []
-    # Oldest first: a restart opens a new log whose first request replays the whole
-    # history, and the first write of a turn wins.
+    # Oldest first: a restart replays the whole history, and the first write of a turn wins.
     return [path for _, path in sorted(found)]
 
 
@@ -6241,9 +6237,7 @@ def _vs_collect_chat_logs(cutoff, sessions, logged):
     for path in _iter_vs_chat_logs(cutoff):
         fallback_id = path.stem.replace('_VSGitHubCopilot.chat', '')
         requests, usage_by_turn = _vs_chat_log_requests(path)
-        # A turn's own time and model belong to the request it was the intent of. Reading
-        # them off whichever request replays it as history dates the turn to that later
-        # request, and models it with whatever was selected by then.
+        # A turn belongs to the request it was the intent of, not to one replaying it.
         for timestamp, model, turn_index, _, session_id in requests:
             key = (_vs_session_id(session_id or fallback_id), turn_index)
             if key not in logged:
@@ -6282,8 +6276,7 @@ def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
             prompt = _vs_block_text(prompt_payload)
             if not prompt:
                 continue
-            # The log holds this turn's real token counts even when only the store
-            # holds its reply, which is every conversation's most recent finished turn.
+            # The log holds real token counts even when only the store holds the reply.
             own_time, own_model, usage = logged.get(
                 (_vs_session_id(path.name), index), (None, None, None))
             _vs_add_turn(session, index, prompt, _vs_block_text(reply_payload),
@@ -6315,8 +6308,7 @@ def collect_visual_studio_sessions(cutoff):
         if not any(session['usage']):
             session.pop('usage')
         out.append(session)
-    # Everything older than the last store file finished has been read, chat logs
-    # included, so a capped run can resume from there instead of repeating itself.
+    # Everything older than the last finished store file has been read, chat logs included.
     return out, truncated[0], (resume[0] if truncated[0] else None)
 
 

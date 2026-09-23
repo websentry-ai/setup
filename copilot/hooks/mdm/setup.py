@@ -41,12 +41,10 @@ BACKFILL_STATE_FILE = '.unbound_last_backfill'
 # fleet is on the new hook.
 BACKFILL_ENABLED = False
 
-# Separate from BACKFILL_ENABLED, which holds back Copilot's CLI/VS Code re-walk:
-# Visual Studio has no live hook and so no rows to duplicate.
+# Separate from BACKFILL_ENABLED: Visual Studio has no live hook and so no rows to duplicate.
 VS_SWEEP_ENABLED = True
 VS_STATE_FILE = '.unbound_last_vs_sweep'
-# How far a first sweep reaches without --backfill; history beyond it is what the flag
-# opts into.
+# How far a first sweep reaches without --backfill.
 VS_FIRST_RUN_DAYS = 1
 
 
@@ -1849,8 +1847,7 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
                 debug_print("visual studio: %d of %d session(s) delivered for %s, retrying next run"
                             % (sent, len(sessions), username))
                 continue
-            # A capped walk moves the cutoff only as far as it actually read, so the next
-            # run resumes past that rather than re-reading the same files forever.
+            # A capped walk resumes past what it read, not from where it started.
             mark = started_at
             if result.get('truncated'):
                 mark = result.get('resume_at')
@@ -2607,8 +2604,7 @@ def main():
     if success and backfill_mode:
         run_backfill(api_key, base_url, user_homes, script_text)
 
-    # Not gated on backfill_mode: with no live hook, skipping captures nothing at all.
-    # The flag only decides how far the first sweep reaches back.
+    # Not gated on backfill_mode: the flag only sets how far the first sweep reaches back.
     if success:
         run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
                                 device_serial=device_id, seed_history=backfill_mode)

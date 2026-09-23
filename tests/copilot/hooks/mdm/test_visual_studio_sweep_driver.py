@@ -90,8 +90,7 @@ class TestVisualStudioSweepDriver(unittest.TestCase):
         self.assertEqual(advanced, [])
 
     def test_a_capped_walk_resumes_where_it_stopped(self):
-        # Advancing to now would skip the files it never reached; holding the cutoff
-        # outright would re-read the same ones every run and never reach them either.
+        # Advancing to now skips unread files; holding outright never reaches them.
         _, advanced = self._run({"sessions": [_session()], "first_run": False,
                                  "truncated": True, "resume_at": 1789900100})
         self.assertEqual(len(advanced), 1)

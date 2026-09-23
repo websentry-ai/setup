@@ -208,9 +208,7 @@ class Collection(unittest.TestCase):
         self.assertEqual(sessions[0]["session_id"], SESSION)
 
     def test_the_entry_id_is_derived_so_both_sources_agree_on_it(self):
-        # Taking the .vs store's CorrelationId would key the same turn differently
-        # depending on which source reached it first. Without any id the server keys on
-        # prompt content, which cannot tell repeated prompts apart.
+        # Without an id the server keys on prompt text, which cannot tell repeats apart.
         with tempfile.TemporaryDirectory() as tmp:
             _session_file(tmp, _prompt("ask") + _reply("answer"))
             from_store = self._collect(tmp)
@@ -424,9 +422,7 @@ class TruncationAndOrdering(unittest.TestCase):
         self.assertFalse(truncated)
 
     def test_the_metered_copy_of_a_turn_wins_over_a_later_replay(self):
-        # A VS restart opens a new log whose first request replays the whole history.
-        # Reading newest-first records those turns from the replay -- no usage, wrong
-        # time -- and the older log that holds their EventType(11) lines cannot correct it.
+        # A restart replays the history; read newest-first, the replay wins and loses usage.
         with tempfile.TemporaryDirectory() as tmp:
             _chat_log(tmp, [
                 ("session", SESSION),
@@ -459,8 +455,7 @@ class MetadataAndResume(unittest.TestCase):
             return unbound.collect_visual_studio_sessions(0)
 
     def test_a_turn_keeps_the_model_it_ran_on(self):
-        # The request that replays a turn as history carries whatever model is selected
-        # by then; reading it off that request re-attributes yesterday's turn to today's.
+        # Reading the model off the request that replays a turn re-dates it to today.
         with tempfile.TemporaryDirectory() as tmp:
             _chat_log(tmp, [
                 ("session", SESSION),
