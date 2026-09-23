@@ -583,16 +583,19 @@ class SharedRootsAndHostileFiles(unittest.TestCase):
                 sessions, _, _ = self._collect(home)
         self.assertEqual(sessions, [])
 
-    def test_a_session_swapped_for_another_real_file_after_the_walk_is_not_read(self):
-        # Re-checking the path cannot catch this: the swapped-in file is inside the root.
+    def test_a_session_renamed_over_after_the_walk_is_not_read(self):
+        # Re-checking the path cannot catch this: the file moved into place is inside the
+        # root, so it resolves cleanly. Renaming carries the decoy's own identity across,
+        # which is what a junction or a hardlink to another user's file would do too.
         with tempfile.TemporaryDirectory() as home:
             planted = _session_file(home, _prompt("ask") + _reply("answer"))
+            decoy = planted.parent.parent / "decoy"  # outside the session glob
+            decoy.write_bytes(_prompt("swapped in") + _reply("after the check"))
             real = unbound._iter_vs_sessions
 
             def swap(cutoff, budget=None):
                 found = real(cutoff, budget)
-                planted.unlink()
-                planted.write_bytes(_prompt("swapped in") + _reply("after the check"))
+                os.replace(decoy, planted)
                 return found
 
             with patch.object(unbound, "_iter_vs_sessions", swap), \
