@@ -1803,8 +1803,9 @@ def _vs_collect_for_user(home_dir: Path, seed_history: bool = False) -> Optional
     first_run = not _backfill_state_path(home_dir, VS_STATE_FILE).exists()
     days = BACKFILL_MAX_AGE_DAYS if seed_history else VS_FIRST_RUN_DAYS
     cutoff = _backfill_read_cutoff(home_dir, VS_STATE_FILE, days)
-    sessions = _vs_with_user_home(home_dir, hook.collect_visual_studio_sessions, cutoff)
-    return {'sessions': sessions or [], 'first_run': first_run}
+    sessions, truncated = _vs_with_user_home(
+        home_dir, hook.collect_visual_studio_sessions, cutoff)
+    return {'sessions': sessions or [], 'first_run': first_run, 'truncated': truncated}
 
 
 def run_visual_studio_sweep(api_key: str, backend_url: str,
@@ -1842,8 +1843,9 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
             historical = bool(result.get('first_run') and seed_history)
             sent, _, failed = _backfill_send_sessions(
                 api_key, backend_url, sessions, backfilled=historical)
-            # Anything not delivered must leave the cutoff, or it is never re-read.
-            if failed or sent < len(sessions):
+            # Anything not delivered, and any file the walk never reached, must leave
+            # the cutoff where it is or it is never re-read.
+            if failed or sent < len(sessions) or result.get('truncated'):
                 debug_print("visual studio: %d of %d session(s) delivered for %s, retrying next run"
                             % (sent, len(sessions), username))
                 continue

@@ -53,49 +53,55 @@ class TestVisualStudioSweepDriver(unittest.TestCase):
         return uploads, advanced
 
     def test_an_ordinary_sweep_declares_itself_not_backfilled(self):
-        uploads, _ = self._run({"sessions": [_session()], "first_run": False})
+        uploads, _ = self._run({"sessions": [_session()], "first_run": False, "truncated": False})
         self.assertEqual(len(uploads), 1)
         self.assertIs(uploads[0]["backfilled"], False)
 
     def test_the_opt_in_seed_is_marked_historical(self):
         # A month of past turns must not raise a month of live alerts at once.
-        uploads, _ = self._run({"sessions": [_session()], "first_run": True},
+        uploads, _ = self._run({"sessions": [_session()], "first_run": True, "truncated": False},
                                seed_history=True)
         self.assertIs(uploads[0]["backfilled"], True)
 
     def test_a_first_run_without_the_flag_is_still_live(self):
-        uploads, _ = self._run({"sessions": [_session()], "first_run": True})
+        uploads, _ = self._run({"sessions": [_session()], "first_run": True, "truncated": False})
         self.assertIs(uploads[0]["backfilled"], False)
 
     def test_the_device_serial_rides_along_so_rows_map_to_a_device(self):
-        uploads, _ = self._run({"sessions": [_session()], "first_run": False},
+        uploads, _ = self._run({"sessions": [_session()], "first_run": False, "truncated": False},
                                device_serial="SERIAL-1")
         self.assertEqual(uploads[0]["sessions"][0]["device_serial"], "SERIAL-1")
 
     def test_a_delivered_upload_advances_the_cutoff(self):
-        _, advanced = self._run({"sessions": [_session()], "first_run": False})
+        _, advanced = self._run({"sessions": [_session()], "first_run": False, "truncated": False})
         self.assertEqual(len(advanced), 1)
         self.assertEqual(advanced[0][2], mdm.VS_STATE_FILE)
 
     def test_a_failed_chunk_holds_the_cutoff_so_the_turns_retry(self):
-        _, advanced = self._run({"sessions": [_session()], "first_run": False},
+        _, advanced = self._run({"sessions": [_session()], "first_run": False, "truncated": False},
                                 failed_chunks=1)
         self.assertEqual(advanced, [])
 
     def test_a_session_the_slicer_declined_also_holds_the_cutoff(self):
         # Dropped-before-send counts no failed chunk, so the delivered count is the guard.
         _, advanced = self._run(
-            {"sessions": [_session("S1"), _session("S2")], "first_run": False},
+            {"sessions": [_session("S1"), _session("S2")], "first_run": False, "truncated": False},
             failed_chunks=0, sent_override=1)
         self.assertEqual(advanced, [])
 
+    def test_a_capped_walk_holds_the_cutoff_even_when_the_upload_succeeds(self):
+        # Files the walk never reached would fall behind a cutoff advanced past them.
+        _, advanced = self._run({"sessions": [_session()], "first_run": False,
+                                 "truncated": True})
+        self.assertEqual(advanced, [])
+
     def test_nothing_collected_uploads_nothing(self):
-        uploads, advanced = self._run({"sessions": [], "first_run": True})
+        uploads, advanced = self._run({"sessions": [], "first_run": True, "truncated": False})
         self.assertEqual(uploads, [])
         self.assertEqual(advanced, [])
 
     def test_the_env_kill_switch_stops_the_sweep(self):
-        uploads, _ = self._run({"sessions": [_session()], "first_run": False},
+        uploads, _ = self._run({"sessions": [_session()], "first_run": False, "truncated": False},
                                env={"UNBOUND_VS_SWEEP_DISABLED": "1"})
         self.assertEqual(uploads, [])
 

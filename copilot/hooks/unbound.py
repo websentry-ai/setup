@@ -5919,8 +5919,10 @@ def _vs_solution_roots():
     return roots
 
 
-def _iter_vs_sessions(cutoff_mtime):
-    """Session files newer than the cutoff, from solutions at most two levels under a root."""
+def _iter_vs_sessions(cutoff_mtime, budget=None):
+    """Session files newer than the cutoff, from solutions at most two levels under a root.
+
+    `budget` is a one-element list set to True when the walk stops early."""
     seen = set()
     scanned = 0
     for root in _vs_solution_roots():
@@ -5931,6 +5933,8 @@ def _iter_vs_sessions(cutoff_mtime):
                     scanned += 1
                     if scanned > _VS_MAX_WALK_DIRS:
                         log_error('visual studio walk hit its directory budget', 'visual_studio')
+                        if budget is not None:
+                            budget[0] = True
                         return
                     key = str(path)
                     if key in seen:
@@ -6052,7 +6056,9 @@ def _iter_vs_chat_logs(cutoff_mtime):
                 found.append((info.st_mtime, path))
     except OSError:
         return []
-    return [path for _, path in sorted(found, reverse=True)]
+    # Oldest first: a restart opens a new log whose first request replays the whole
+    # history, and the first write of a turn wins.
+    return [path for _, path in sorted(found)]
 
 
 def _vs_log_line_time(line):
@@ -6243,12 +6249,13 @@ def _vs_collect_chat_logs(cutoff, sessions):
                              usage_by_turn.get((session_id, index)))
 
 
-def _vs_collect_stores(cutoff, sessions):
+def _vs_collect_stores(cutoff, sessions, truncated):
     """Backstop for turns whose chat log has been purged from %TEMP%. Carries no usage."""
-    for count, path in enumerate(_iter_vs_sessions(cutoff)):
+    for count, path in enumerate(_iter_vs_sessions(cutoff, truncated)):
         if count >= _VS_MAX_SESSIONS_PER_RUN:
             log_error('visual studio session cap reached; remaining files deferred',
                       'visual_studio')
+            truncated[0] = True
             break
         try:
             objects = _mp_unpack_all(path.read_bytes())
@@ -6269,14 +6276,14 @@ def _vs_collect_stores(cutoff, sessions):
 def collect_visual_studio_sessions(cutoff):
     """Visual Studio Copilot conversations touched since the cutoff, in backfill shape.
 
-    Returned in full, not incrementally: the server refuses a session whose existing rows
-    none of the uploaded records match."""
+    Returns (sessions, truncated). A truncated walk means files were left unread, so the
+    caller must not advance its cutoff past them."""
     if not _is_windows() or not _vs_installed():
-        return []
-    sessions = {}
+        return [], False
+    sessions, truncated = {}, [False]
     # Chat logs first: a superset of the .vs stores and the only source with real usage.
     _vs_collect_chat_logs(cutoff, sessions)
-    _vs_collect_stores(cutoff, sessions)
+    _vs_collect_stores(cutoff, sessions, truncated)
     out = []
     for session in sessions.values():
         session.pop('_seen', None)
@@ -6286,7 +6293,7 @@ def collect_visual_studio_sessions(cutoff):
         if not any(session['usage']):
             session.pop('usage')
         out.append(session)
-    return out
+    return out, truncated[0]
 
 
 def send_to_api(exchange, api_key):

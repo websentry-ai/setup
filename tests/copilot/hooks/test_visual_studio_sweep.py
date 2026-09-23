@@ -191,7 +191,8 @@ class Collection(unittest.TestCase):
                 patch.object(unbound, "_vs_installed", return_value=installed), \
                 patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
-            return unbound.collect_visual_studio_sessions(0)
+            sessions, _ = unbound.collect_visual_studio_sessions(0)
+        return sessions
 
     def test_a_turn_becomes_the_two_entries_the_parser_walks(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,7 +365,7 @@ class Collection(unittest.TestCase):
 
     def test_nothing_runs_off_windows(self):
         with patch.object(unbound, "_is_windows", return_value=False):
-            self.assertEqual(unbound.collect_visual_studio_sessions(0), [])
+            self.assertEqual(unbound.collect_visual_studio_sessions(0), ([], False))
 
 
 class LogReading(unittest.TestCase):
@@ -388,3 +389,59 @@ class LogReading(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TruncationAndOrdering(unittest.TestCase):
+    """Two ways a sweep can quietly lose turns that the cutoff then hides forever."""
+
+    def _collect(self, tmp):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_capped_walk_is_reported_so_the_caller_holds_the_cutoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, name in enumerate(("alpha", "beta", "gamma")):
+                _session_file(tmp, _prompt("ask %d" % n) + _reply("answer %d" % n),
+                              session="%s-0000-0000-0000-00000000000%d" % (SESSION[:8], n),
+                              solution=name)
+            with patch.object(unbound, "_VS_MAX_SESSIONS_PER_RUN", 1), \
+                    patch.object(unbound, "log_error"):
+                sessions, truncated = self._collect(tmp)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertTrue(truncated, "a capped walk must tell the caller, or the cutoff "
+                                   "advances past files it never read")
+
+    def test_an_uncapped_walk_reports_no_truncation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _session_file(tmp, _prompt("ask") + _reply("answer"))
+            sessions, truncated = self._collect(tmp)
+        self.assertEqual(len(sessions), 1)
+        self.assertFalse(truncated)
+
+    def test_the_metered_copy_of_a_turn_wins_over_a_later_replay(self):
+        # A VS restart opens a new log whose first request replays the whole history.
+        # Reading newest-first records those turns from the replay -- no usage, wrong
+        # time -- and the older log that holds their EventType(11) lines cannot correct it.
+        with tempfile.TemporaryDirectory() as tmp:
+            _chat_log(tmp, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "ask")])),
+                ("usage", _usage(500, 20, cached=300)),
+                ("body", _body([_msg("user", "ask"), _msg("assistant", "answer"),
+                                _msg("user", "later")])),
+            ], name="20260921_010101.000_VSGitHubCopilot.chat.log")
+            _chat_log(tmp, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "ask"), _msg("assistant", "answer"),
+                                _msg("user", "after restart")])),
+            ], name="20260922_020202.000_VSGitHubCopilot.chat.log")
+            sessions, _ = self._collect(tmp)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["usage"][0],
+                         {"input_tokens": 200, "output_tokens": 20,
+                          "cache_read_input_tokens": 300})
