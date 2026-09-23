@@ -11,6 +11,7 @@ it and prepend a synthetic `# IDESTATE CONTEXT` user message to every turn.
 """
 
 import json
+import os
 import struct
 import tempfile
 import unittest
@@ -191,7 +192,7 @@ class Collection(unittest.TestCase):
                 patch.object(unbound, "_vs_installed", return_value=installed), \
                 patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
-            sessions, _ = unbound.collect_visual_studio_sessions(0)
+            sessions, _, _ = unbound.collect_visual_studio_sessions(0)
         return sessions
 
     def test_a_turn_becomes_the_two_entries_the_parser_walks(self):
@@ -365,7 +366,7 @@ class Collection(unittest.TestCase):
 
     def test_nothing_runs_off_windows(self):
         with patch.object(unbound, "_is_windows", return_value=False):
-            self.assertEqual(unbound.collect_visual_studio_sessions(0), ([], False))
+            self.assertEqual(unbound.collect_visual_studio_sessions(0), ([], False, None))
 
 
 class LogReading(unittest.TestCase):
@@ -409,7 +410,7 @@ class TruncationAndOrdering(unittest.TestCase):
                               solution=name)
             with patch.object(unbound, "_VS_MAX_SESSIONS_PER_RUN", 1), \
                     patch.object(unbound, "log_error"):
-                sessions, truncated = self._collect(tmp)
+                sessions, truncated, _ = self._collect(tmp)
 
         self.assertEqual(len(sessions), 1)
         self.assertTrue(truncated, "a capped walk must tell the caller, or the cutoff "
@@ -418,7 +419,7 @@ class TruncationAndOrdering(unittest.TestCase):
     def test_an_uncapped_walk_reports_no_truncation(self):
         with tempfile.TemporaryDirectory() as tmp:
             _session_file(tmp, _prompt("ask") + _reply("answer"))
-            sessions, truncated = self._collect(tmp)
+            sessions, truncated, _ = self._collect(tmp)
         self.assertEqual(len(sessions), 1)
         self.assertFalse(truncated)
 
@@ -439,9 +440,83 @@ class TruncationAndOrdering(unittest.TestCase):
                 ("body", _body([_msg("user", "ask"), _msg("assistant", "answer"),
                                 _msg("user", "after restart")])),
             ], name="20260922_020202.000_VSGitHubCopilot.chat.log")
-            sessions, _ = self._collect(tmp)
+            sessions, _, _ = self._collect(tmp)
 
         self.assertEqual(len(sessions), 1)
         self.assertEqual(sessions[0]["usage"][0],
                          {"input_tokens": 200, "output_tokens": 20,
                           "cache_read_input_tokens": 300})
+
+
+class MetadataAndResume(unittest.TestCase):
+    """Three ways a sweep mis-reported or stalled, all flagged on #335."""
+
+    def _collect(self, tmp):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_turn_keeps_the_model_it_ran_on(self):
+        # The request that replays a turn as history carries whatever model is selected
+        # by then; reading it off that request re-attributes yesterday's turn to today's.
+        with tempfile.TemporaryDirectory() as tmp:
+            _chat_log(tmp, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "first")], model="model-a")),
+                ("body", _body([_msg("user", "first"), _msg("assistant", "a"),
+                                _msg("user", "second")], model="model-b")),
+                ("body", _body([_msg("user", "first"), _msg("assistant", "a"),
+                                _msg("user", "second"), _msg("assistant", "b"),
+                                _msg("user", "third")], model="model-c")),
+            ])
+            sessions, _, _ = self._collect(tmp)
+
+        models = [e["data"]["model"] for e in sessions[0]["entries"]
+                  if e["type"] == "assistant.message"]
+        self.assertEqual(models, ["model-a", "model-b"])
+
+    def test_the_last_finished_turn_keeps_its_logged_usage(self):
+        # Its reply only exists in the .vs store, but its token counts are in the log.
+        with tempfile.TemporaryDirectory() as tmp:
+            _session_file(tmp, _prompt("ask") + _reply("answer"))
+            _chat_log(tmp, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "ask")])),
+                ("usage", _usage(900, 30, cached=400)),
+            ])
+            sessions, _, _ = self._collect(tmp)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["entries"][0]["data"]["content"], "ask")
+        self.assertEqual(sessions[0]["usage"][0],
+                         {"input_tokens": 500, "output_tokens": 30,
+                          "cache_read_input_tokens": 400})
+
+    def test_a_capped_walk_reports_where_to_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, name in enumerate(("alpha", "beta", "gamma")):
+                path = _session_file(tmp, _prompt("ask %d" % n) + _reply("answer %d" % n),
+                                     session="%s-0000-0000-0000-00000000000%d" % (SESSION[:8], n),
+                                     solution=name)
+                os.utime(path, (1789900000 + n * 100, 1789900000 + n * 100))
+            with patch.object(unbound, "_VS_MAX_SESSIONS_PER_RUN", 2), \
+                    patch.object(unbound, "log_error"):
+                sessions, truncated, resume_at = self._collect(tmp)
+
+        self.assertEqual(len(sessions), 2)
+        self.assertTrue(truncated)
+        self.assertEqual(resume_at, 1789900100,
+                         "must resume past the last file it finished, not repeat them")
+
+    def test_the_store_walk_runs_oldest_first(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for n, name in enumerate(("newer", "older")):
+                path = _session_file(tmp, _prompt("ask %d" % n) + _reply("answer %d" % n),
+                                     session="%s-0000-0000-0000-00000000000%d" % (SESSION[:8], n),
+                                     solution=name)
+                os.utime(path, (1789900000 - n * 500, 1789900000 - n * 500))
+            with patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]):
+                mtimes = [m for m, _ in unbound._iter_vs_sessions(0)]
+        self.assertEqual(mtimes, sorted(mtimes))

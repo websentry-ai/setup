@@ -89,10 +89,17 @@ class TestVisualStudioSweepDriver(unittest.TestCase):
             failed_chunks=0, sent_override=1)
         self.assertEqual(advanced, [])
 
-    def test_a_capped_walk_holds_the_cutoff_even_when_the_upload_succeeds(self):
-        # Files the walk never reached would fall behind a cutoff advanced past them.
+    def test_a_capped_walk_resumes_where_it_stopped(self):
+        # Advancing to now would skip the files it never reached; holding the cutoff
+        # outright would re-read the same ones every run and never reach them either.
         _, advanced = self._run({"sessions": [_session()], "first_run": False,
-                                 "truncated": True})
+                                 "truncated": True, "resume_at": 1789900100})
+        self.assertEqual(len(advanced), 1)
+        self.assertEqual(advanced[0][1], 1789900100)
+
+    def test_a_capped_walk_with_nothing_finished_holds_the_cutoff(self):
+        _, advanced = self._run({"sessions": [_session()], "first_run": False,
+                                 "truncated": True, "resume_at": None})
         self.assertEqual(advanced, [])
 
     def test_nothing_collected_uploads_nothing(self):

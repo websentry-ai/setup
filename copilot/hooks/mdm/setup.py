@@ -1803,9 +1803,10 @@ def _vs_collect_for_user(home_dir: Path, seed_history: bool = False) -> Optional
     first_run = not _backfill_state_path(home_dir, VS_STATE_FILE).exists()
     days = BACKFILL_MAX_AGE_DAYS if seed_history else VS_FIRST_RUN_DAYS
     cutoff = _backfill_read_cutoff(home_dir, VS_STATE_FILE, days)
-    sessions, truncated = _vs_with_user_home(
+    sessions, truncated, resume_at = _vs_with_user_home(
         home_dir, hook.collect_visual_studio_sessions, cutoff)
-    return {'sessions': sessions or [], 'first_run': first_run, 'truncated': truncated}
+    return {'sessions': sessions or [], 'first_run': first_run,
+            'truncated': truncated, 'resume_at': resume_at}
 
 
 def run_visual_studio_sweep(api_key: str, backend_url: str,
@@ -1843,13 +1844,19 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
             historical = bool(result.get('first_run') and seed_history)
             sent, _, failed = _backfill_send_sessions(
                 api_key, backend_url, sessions, backfilled=historical)
-            # Anything not delivered, and any file the walk never reached, must leave
-            # the cutoff where it is or it is never re-read.
-            if failed or sent < len(sessions) or result.get('truncated'):
+            # Anything not delivered must leave the cutoff where it is.
+            if failed or sent < len(sessions):
                 debug_print("visual studio: %d of %d session(s) delivered for %s, retrying next run"
                             % (sent, len(sessions), username))
                 continue
-            _run_as_user(username, _backfill_write_cutoff, home_dir, started_at, VS_STATE_FILE)
+            # A capped walk moves the cutoff only as far as it actually read, so the next
+            # run resumes past that rather than re-reading the same files forever.
+            mark = started_at
+            if result.get('truncated'):
+                mark = result.get('resume_at')
+                if not mark:
+                    continue
+            _run_as_user(username, _backfill_write_cutoff, home_dir, mark, VS_STATE_FILE)
             print(f"[visual-studio] Queued {sent} conversation(s) for {username}")
     except Exception as e:
         print(f"[visual-studio] Skipped due to error: {e}", file=sys.stderr)

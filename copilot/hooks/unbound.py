@@ -5925,6 +5925,7 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
     `budget` is a one-element list set to True when the walk stops early."""
     seen = set()
     scanned = 0
+    found = []
     for root in _vs_solution_roots():
         for depth in ('', '*/', '*/*/'):
             # glob() only builds a generator; the disk is touched by iterating it.
@@ -5948,10 +5949,12 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                         continue
                     if info.st_mtime < cutoff_mtime:
                         continue
-                    yield path
+                    found.append((info.st_mtime, path))
             except OSError as e:
                 log_error('visual studio walk failed under %s: %s' % (root, e), 'visual_studio')
                 continue
+    # Oldest first, so a run stopped by the cap can resume past what it finished.
+    return sorted(found)
 
 
 def _vs_block_text(payload):
@@ -6233,25 +6236,37 @@ def _vs_add_turn(session, index, prompt, reply, model, timestamp, usage):
     session['usage'].append(usage or {})
 
 
-def _vs_collect_chat_logs(cutoff, sessions):
+def _vs_collect_chat_logs(cutoff, sessions, logged):
     """Live source: prompts land here per request, and it is the only one carrying usage."""
     for path in _iter_vs_chat_logs(cutoff):
         fallback_id = path.stem.replace('_VSGitHubCopilot.chat', '')
         requests, usage_by_turn = _vs_chat_log_requests(path)
+        # A turn's own time and model belong to the request it was the intent of. Reading
+        # them off whichever request replays it as history dates the turn to that later
+        # request, and models it with whatever was selected by then.
+        for timestamp, model, turn_index, _, session_id in requests:
+            key = (_vs_session_id(session_id or fallback_id), turn_index)
+            if key not in logged:
+                logged[key] = (timestamp, model,
+                               usage_by_turn.get((session_id, turn_index)))
         for timestamp, model, _, body, session_id in requests:
-            conversation_id = session_id or fallback_id
+            conversation_id = _vs_session_id(session_id or fallback_id)
             if not session_id:
                 log_error('visual studio request had no session marker in %s' % path.name,
                           'visual_studio')
             session = _vs_session(sessions, conversation_id)
             for index, (prompt, reply) in enumerate(_vs_chat_log_turns(body)):
-                _vs_add_turn(session, index, prompt, reply, model, timestamp,
-                             usage_by_turn.get((session_id, index)))
+                key = (conversation_id, index)
+                usage = usage_by_turn.get((session_id, index))
+                own_time, own_model, _ = logged.get(key, (None, None, None))
+                logged[key] = (own_time or timestamp, own_model or model, usage)
+                _vs_add_turn(session, index, prompt, reply,
+                             own_model or model, own_time or timestamp, usage)
 
 
-def _vs_collect_stores(cutoff, sessions, truncated):
-    """Backstop for turns whose chat log has been purged from %TEMP%. Carries no usage."""
-    for count, path in enumerate(_iter_vs_sessions(cutoff, truncated)):
+def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
+    """Backstop for turns the chat log withheld or lost. Usage comes from the log."""
+    for count, (mtime, path) in enumerate(_iter_vs_sessions(cutoff, truncated)):
         if count >= _VS_MAX_SESSIONS_PER_RUN:
             log_error('visual studio session cap reached; remaining files deferred',
                       'visual_studio')
@@ -6267,23 +6282,30 @@ def _vs_collect_stores(cutoff, sessions, truncated):
             prompt = _vs_block_text(prompt_payload)
             if not prompt:
                 continue
+            # The log holds this turn's real token counts even when only the store
+            # holds its reply, which is every conversation's most recent finished turn.
+            own_time, own_model, usage = logged.get(
+                (_vs_session_id(path.name), index), (None, None, None))
             _vs_add_turn(session, index, prompt, _vs_block_text(reply_payload),
-                         _vs_model_name(reply_payload) or _vs_model_name(prompt_payload),
-                         _vs_timestamp(reply_payload) or _vs_timestamp(prompt_payload),
-                         None)
+                         own_model or _vs_model_name(reply_payload)
+                         or _vs_model_name(prompt_payload),
+                         own_time or _vs_timestamp(reply_payload)
+                         or _vs_timestamp(prompt_payload),
+                         usage)
+        resume[0] = mtime
 
 
 def collect_visual_studio_sessions(cutoff):
     """Visual Studio Copilot conversations touched since the cutoff, in backfill shape.
 
-    Returns (sessions, truncated). A truncated walk means files were left unread, so the
-    caller must not advance its cutoff past them."""
+    Returns (sessions, truncated, resume_at). A truncated walk left files unread; the
+    caller advances its cutoff only as far as resume_at, or not at all if that is None."""
     if not _is_windows() or not _vs_installed():
-        return [], False
-    sessions, truncated = {}, [False]
+        return [], False, None
+    sessions, truncated, logged, resume = {}, [False], {}, [None]
     # Chat logs first: a superset of the .vs stores and the only source with real usage.
-    _vs_collect_chat_logs(cutoff, sessions)
-    _vs_collect_stores(cutoff, sessions, truncated)
+    _vs_collect_chat_logs(cutoff, sessions, logged)
+    _vs_collect_stores(cutoff, sessions, truncated, logged, resume)
     out = []
     for session in sessions.values():
         session.pop('_seen', None)
@@ -6293,7 +6315,9 @@ def collect_visual_studio_sessions(cutoff):
         if not any(session['usage']):
             session.pop('usage')
         out.append(session)
-    return out, truncated[0]
+    # Everything older than the last store file finished has been read, chat logs
+    # included, so a capped run can resume from there instead of repeating itself.
+    return out, truncated[0], (resume[0] if truncated[0] else None)
 
 
 def send_to_api(exchange, api_key):
