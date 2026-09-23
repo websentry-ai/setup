@@ -122,3 +122,27 @@ class TestVisualStudioSweepDriver(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerUserIsolation(unittest.TestCase):
+    def test_one_user_failing_does_not_skip_the_users_after_them(self):
+        homes = [("alice", Path("/home/alice")), ("bob", Path("/home/bob"))]
+        uploads = []
+
+        def _fake_run_as_user(username, fn, *args, **kw):
+            if fn is not mdm._vs_collect_for_user:
+                return None
+            if username == "alice":
+                raise RuntimeError("unreadable tree")
+            return {"sessions": [_session()], "first_run": False, "truncated": False}
+
+        def _fake_send(api_key, backend_url, sessions, forced=False, backfilled=True):
+            uploads.append(sessions)
+            return len(sessions), 1, 0
+
+        with patch.object(mdm.platform, "system", return_value="Windows"), \
+                patch.object(mdm, "_run_as_user", _fake_run_as_user), \
+                patch.object(mdm, "_backfill_send_sessions", _fake_send):
+            mdm.run_visual_studio_sweep("key", "https://backend", homes)
+
+        self.assertEqual(len(uploads), 1, "bob must still be swept after alice raises")

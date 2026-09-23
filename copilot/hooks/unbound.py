@@ -5770,6 +5770,8 @@ _VS_MAX_LOG_LINES = 200000
 _VS_MAX_LOG_LINE_CHARS = 1 << 20
 # Scanned only for each turn's own time and model, which the replayed history does not carry.
 _VS_MAX_METADATA_REQUESTS = 200
+# Bounds container nesting; real transcripts sit well under ten levels.
+_VS_MAX_NESTING = 64
 # Bounds the walk so a pathological tree cannot stall an MDM install.
 _VS_MAX_WALK_DIRS = 20000
 # The only source of real usage; turns known only to the .vs store fall back to estimates.
@@ -5785,19 +5787,19 @@ def _mp_read_str(buf, pos, size):
     return buf[pos:pos + size].decode('utf-8', 'replace'), pos + size
 
 
-def _mp_read_array(buf, pos, size):
+def _mp_read_array(buf, pos, size, depth):
     out = []
     for _ in range(size):
-        value, pos = _mp_read(buf, pos)
+        value, pos = _mp_read(buf, pos, depth)
         out.append(value)
     return out, pos
 
 
-def _mp_read_map(buf, pos, size):
+def _mp_read_map(buf, pos, size, depth):
     out = {}
     for _ in range(size):
-        key, pos = _mp_read(buf, pos)
-        value, pos = _mp_read(buf, pos)
+        key, pos = _mp_read(buf, pos, depth)
+        value, pos = _mp_read(buf, pos, depth)
         out[key if isinstance(key, str) else str(key)] = value
     return out, pos
 
@@ -5822,8 +5824,11 @@ def _mp_read_ext(buf, pos, size):
     return (_mp_timestamp(payload) if ext_type == -1 else None), pos
 
 
-def _mp_read(buf, pos):
+def _mp_read(buf, pos, depth=0):
     """One MessagePack value as (value, next_pos). Visual Studio writes its chat store in it."""
+    # Nested containers recurse, so a file of repeated 0x91 would exhaust the stack.
+    if depth > _VS_MAX_NESTING:
+        raise ValueError('messagepack nesting deeper than %d' % _VS_MAX_NESTING)
     code = buf[pos]
     pos += 1
     if code <= 0x7F:
@@ -5831,9 +5836,9 @@ def _mp_read(buf, pos):
     if code >= 0xE0:
         return code - 0x100, pos
     if 0x80 <= code <= 0x8F:
-        return _mp_read_map(buf, pos, code & 0x0F)
+        return _mp_read_map(buf, pos, code & 0x0F, depth + 1)
     if 0x90 <= code <= 0x9F:
-        return _mp_read_array(buf, pos, code & 0x0F)
+        return _mp_read_array(buf, pos, code & 0x0F, depth + 1)
     if 0xA0 <= code <= 0xBF:
         return _mp_read_str(buf, pos, code & 0x1F)
     if code == 0xC0:
@@ -5871,11 +5876,11 @@ def _mp_read(buf, pos):
     if code in (0xDC, 0xDD):
         width = 2 if code == 0xDC else 4
         size = int.from_bytes(buf[pos:pos + width], 'big')
-        return _mp_read_array(buf, pos + width, size)
+        return _mp_read_array(buf, pos + width, size, depth + 1)
     if code in (0xDE, 0xDF):
         width = 2 if code == 0xDE else 4
         size = int.from_bytes(buf[pos:pos + width], 'big')
-        return _mp_read_map(buf, pos + width, size)
+        return _mp_read_map(buf, pos + width, size, depth + 1)
     raise ValueError('unsupported msgpack code 0x%02X' % code)
 
 
@@ -5901,19 +5906,30 @@ def _vs_installed():
 
 
 def _vs_solution_roots():
-    """Directories worth walking for solution state. ~/source/repos is deliberately absent:
-    it sits under ~/source, so listing both walks that tree twice."""
+    """(directory, shared) pairs worth walking for solution state. ~/source/repos is
+    deliberately absent: it sits under ~/source, so listing both walks that tree twice.
+
+    Shared roots sit outside any home, so every user on the device walks the same files."""
     home = Path.home()
-    candidates = [home / 'source', home / 'Documents',
-                  Path('C:/src'), Path('C:/dev'), Path('C:/code')]
+    candidates = [(home / 'source', False), (home / 'Documents', False),
+                  (Path('C:/src'), True), (Path('C:/dev'), True), (Path('C:/code'), True)]
     roots = []
-    for root in candidates:
+    for root, shared in candidates:
         try:
             if root.is_dir():
-                roots.append(root)
+                roots.append((root, shared))
         except OSError:
             continue
     return roots
+
+
+def _vs_within(root, path):
+    """Whether path is still under root once junctions and symlinks are resolved."""
+    try:
+        resolved = Path(os.path.realpath(str(path)))
+        return resolved == root or root in resolved.parents
+    except OSError:
+        return False
 
 
 def _iter_vs_sessions(cutoff_mtime, budget=None):
@@ -5923,7 +5939,11 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
     seen = set()
     scanned = 0
     found = []
-    for root in _vs_solution_roots():
+    for root, shared in _vs_solution_roots():
+        try:
+            real_root = Path(os.path.realpath(str(root)))
+        except OSError:
+            continue
         for depth in ('', '*/', '*/*/'):
             # glob() only builds a generator; the disk is touched by iterating it.
             try:
@@ -5946,12 +5966,17 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                         continue
                     if info.st_mtime < cutoff_mtime:
                         continue
-                    found.append((info.st_mtime, path))
+                    # A junction out of the tree would be read with the sweep's own rights.
+                    if not _vs_within(real_root, path):
+                        log_error('visual studio session escapes its root: %s' % path,
+                                  'visual_studio')
+                        continue
+                    found.append((info.st_mtime, path, shared))
             except OSError as e:
                 log_error('visual studio walk failed under %s: %s' % (root, e), 'visual_studio')
                 continue
     # Oldest first, so a run stopped by the cap can resume past what it finished.
-    return sorted(found)
+    return sorted(found, key=lambda item: (item[0], str(item[1])))
 
 
 def _vs_block_text(payload):
@@ -6047,13 +6072,19 @@ def _iter_vs_chat_logs(cutoff_mtime):
     root = Path.home() / 'AppData' / 'Local' / 'Temp' / 'VSGitHubCopilotLogs'
     found = []
     try:
+        real_root = Path(os.path.realpath(str(root)))
         for path in root.glob('*_VSGitHubCopilot.chat.log'):
             try:
                 info = path.stat()
             except OSError:
                 continue
-            if stat.S_ISREG(info.st_mode) and info.st_mtime >= cutoff_mtime:
-                found.append((info.st_mtime, path))
+            if not stat.S_ISREG(info.st_mode) or info.st_mtime < cutoff_mtime:
+                continue
+            # A junction out of the tree would be read with the sweep's own rights.
+            if not _vs_within(real_root, path):
+                log_error('visual studio chat log escapes its root: %s' % path, 'visual_studio')
+                continue
+            found.append((info.st_mtime, path))
     except OSError:
         return []
     # Oldest first: a restart replays the whole history, and the first write of a turn wins.
@@ -6259,8 +6290,11 @@ def _vs_collect_chat_logs(cutoff, sessions, logged):
 
 
 def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
-    """Backstop for turns the chat log withheld or lost. Usage comes from the log."""
-    for count, (mtime, path) in enumerate(_iter_vs_sessions(cutoff, truncated)):
+    """Backstop for turns the chat log withheld or lost. Usage comes from the log.
+
+    A session found only under a shared root is skipped: nothing there proves whose it is,
+    and the chat log that would prove it is this user's has no record of the session."""
+    for count, (mtime, path, shared) in enumerate(_iter_vs_sessions(cutoff, truncated)):
         if count >= _VS_MAX_SESSIONS_PER_RUN:
             log_error('visual studio session cap reached; remaining files deferred',
                       'visual_studio')
@@ -6270,6 +6304,8 @@ def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
             objects = _mp_unpack_all(path.read_bytes())
         except (OSError, ValueError, IndexError, struct.error) as e:
             log_error('visual studio session unreadable (%s): %s' % (path.name, e), 'visual_studio')
+            continue
+        if shared and _vs_session_id(path.name) not in sessions:
             continue
         session = _vs_session(sessions, _vs_session_id(path.name))
         for index, (prompt_payload, reply_payload) in enumerate(_vs_session_turns(objects)):

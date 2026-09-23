@@ -190,7 +190,7 @@ class Collection(unittest.TestCase):
     def _collect(self, tmp, installed=True):
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=installed), \
-                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
             sessions, _, _ = unbound.collect_visual_studio_sessions(0)
         return sessions
@@ -396,7 +396,7 @@ class TruncationAndOrdering(unittest.TestCase):
     def _collect(self, tmp):
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=True), \
-                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
             return unbound.collect_visual_studio_sessions(0)
 
@@ -450,7 +450,7 @@ class MetadataAndResume(unittest.TestCase):
     def _collect(self, tmp):
         with patch.object(unbound, "_is_windows", return_value=True), \
                 patch.object(unbound, "_vs_installed", return_value=True), \
-                patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]), \
                 patch.object(unbound.Path, "home", staticmethod(lambda: Path(tmp))):
             return unbound.collect_visual_studio_sessions(0)
 
@@ -512,6 +512,74 @@ class MetadataAndResume(unittest.TestCase):
                                      session="%s-0000-0000-0000-00000000000%d" % (SESSION[:8], n),
                                      solution=name)
                 os.utime(path, (1789900000 - n * 500, 1789900000 - n * 500))
-            with patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]):
-                mtimes = [m for m, _ in unbound._iter_vs_sessions(0)]
+            with patch.object(unbound, "_vs_solution_roots", return_value=[(Path(tmp), False)]):
+                mtimes = [m for m, _, _ in unbound._iter_vs_sessions(0)]
         self.assertEqual(mtimes, sorted(mtimes))
+
+
+class SharedRootsAndHostileFiles(unittest.TestCase):
+    """A sweep runs once per user, but not every path it walks belongs to that user."""
+
+    def _collect(self, home, roots):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=roots), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                patch.object(unbound, "log_error"):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_shared_root_session_this_user_never_opened_is_skipped(self):
+        # C:\src is walked by every user on the device, and anyone can write there.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as shared:
+            _session_file(shared, _prompt("someone else's prompt") + _reply("reply"))
+            sessions, _, _ = self._collect(home, [(Path(shared), True)])
+        self.assertEqual(sessions, [])
+
+    def test_a_shared_root_session_this_user_logged_is_kept(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as shared:
+            _session_file(shared, _prompt("ask") + _reply("answer"))
+            _chat_log(home, [("session", SESSION), ("body", _body([_msg("user", "ask")]))])
+            sessions, _, _ = self._collect(home, [(Path(shared), True)])
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["entries"][-1]["data"]["content"], "answer")
+
+    def test_a_home_root_session_needs_no_log_to_prove_whose_it_is(self):
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, _prompt("ask") + _reply("answer"))
+            sessions, _, _ = self._collect(home, [(Path(home), False)])
+        self.assertEqual(len(sessions), 1)
+
+    def test_a_session_symlinked_out_of_its_root_is_not_read(self):
+        # The sweep runs with the installer's rights, not the planter's.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "secret"
+            secret.write_bytes(_prompt("stolen") + _reply("secret contents"))
+            planted = _session_file(home, b"")
+            planted.unlink()
+            planted.symlink_to(secret)
+            sessions, _, _ = self._collect(home, [(Path(home), False)])
+        self.assertEqual(sessions, [])
+
+    def test_a_chat_log_symlinked_out_of_its_root_is_not_read(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "secret.log"
+            secret.write_text("[2026-09-21 13:33:00.000 CopilotFunctionRegistry V] "
+                              "[FunctionProviderWrapper.OnNext] SessionId=%s FunctionsCount=8\n"
+                              % SESSION, encoding="utf-8")
+            planted = _chat_log(home, [])
+            planted.unlink()
+            planted.symlink_to(secret)
+            with patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                    patch.object(unbound, "log_error"):
+                self.assertEqual(unbound._iter_vs_chat_logs(0), [])
+
+    def test_a_nested_session_file_raises_instead_of_exhausting_the_stack(self):
+        # RecursionError is not in the caller's except clause, so it would abort the walk.
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, b"\x91" * 20000)
+            sessions, _, _ = self._collect(home, [(Path(home), False)])
+        self.assertEqual(sessions, [])
+
+    def test_real_transcript_nesting_stays_well_inside_the_cap(self):
+        blob = _prompt("ask") + _reply("answer")
+        self.assertTrue(unbound._mp_unpack_all(blob))

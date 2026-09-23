@@ -1826,9 +1826,10 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
     if hook_source is not None:
         _BACKFILL_HOOK_MODULE = None
         _BACKFILL_HOOK_SOURCE = hook_source
-    try:
-        started_at = time.time()
-        for username, home_dir in user_homes:
+    started_at = time.time()
+    for username, home_dir in user_homes:
+        # Per user, so one unreadable tree does not skip everyone after it.
+        try:
             if home_dir is None:
                 continue
             result = _run_as_user(username, _vs_collect_for_user, home_dir, seed_history)
@@ -1855,8 +1856,8 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
                     continue
             _run_as_user(username, _backfill_write_cutoff, home_dir, mark, VS_STATE_FILE)
             print(f"[visual-studio] Queued {sent} conversation(s) for {username}")
-    except Exception as e:
-        print(f"[visual-studio] Skipped due to error: {e}", file=sys.stderr)
+        except Exception as e:
+            print(f"[visual-studio] Skipped {username} due to error: {e}", file=sys.stderr)
 
 
 def detect_install_state() -> Optional[str]:
