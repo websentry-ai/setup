@@ -1658,6 +1658,8 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int, dropped: Option
                 break
         if slice_payload is None:
             debug_print(f"skipped session {session_id}: smallest exchange slice exceeds {max_chunk_bytes} bytes")
+            if dropped is not None:
+                dropped.add(session_id)
             return
         yield slice_payload
         record_index_base += last_fit_base_count

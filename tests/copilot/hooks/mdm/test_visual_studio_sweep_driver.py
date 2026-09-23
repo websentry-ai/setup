@@ -192,3 +192,27 @@ class FirstRunCutoff(unittest.TestCase):
                     again = float(
                         mdm._backfill_state_path(home, mdm.VS_STATE_FILE).read_text())
         self.assertEqual(pinned, again, "the first run's floor must survive a failed sweep")
+
+
+class SlicerDropAccounting(unittest.TestCase):
+    def test_a_remainder_dropped_by_the_real_size_check_is_recorded(self):
+        # The byte estimate fits but the serialised slice does not, on a later slice.
+        session = {'session_id': 'S1', 'entries': [
+            {'type': 'user.message', 'data': {'content': 'small'}},
+            {'type': 'assistant.message', 'data': {'content': 'ok'}},
+            {'type': 'user.message', 'data': {'content': 'ü' * 3000}},
+            {'type': 'assistant.message', 'data': {'content': 'ü' * 3000}},
+        ]}
+        dropped = set()
+        list(mdm._backfill_slice_session(session, 4000, dropped))
+        self.assertIn('S1', dropped)
+
+    def test_a_session_that_slices_cleanly_is_not_recorded_as_dropped(self):
+        session = {'session_id': 'S1', 'entries': [
+            {'type': 'user.message', 'data': {'content': 'small'}},
+            {'type': 'assistant.message', 'data': {'content': 'ok'}},
+        ]}
+        dropped = set()
+        slices = list(mdm._backfill_slice_session(session, 100000, dropped))
+        self.assertEqual(dropped, set())
+        self.assertEqual(len(slices), 1)

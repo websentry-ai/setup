@@ -513,7 +513,7 @@ class MetadataAndResume(unittest.TestCase):
                                      solution=name)
                 os.utime(path, (1789900000 - n * 500, 1789900000 - n * 500))
             with patch.object(unbound, "_vs_solution_roots", return_value=[Path(tmp)]):
-                mtimes = [m for m, _, _ in unbound._iter_vs_sessions(0)]
+                mtimes = [m for m, _, _, _ in unbound._iter_vs_sessions(0)]
         self.assertEqual(mtimes, sorted(mtimes))
 
 
@@ -555,6 +555,16 @@ class SharedRootsAndHostileFiles(unittest.TestCase):
             sessions, _, _ = self._collect(home)
         self.assertEqual(sessions, [])
 
+    def test_a_walk_that_hits_its_budget_still_returns_what_it_found(self):
+        # A bare return handed the caller None once this stopped being a generator.
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, _prompt("ask") + _reply("answer"))
+            with patch.object(unbound, "_VS_MAX_WALK_DIRS", 0), \
+                    patch.object(unbound, "log_error"):
+                sessions, truncated, _ = self._collect(home)
+        self.assertEqual(sessions, [])
+        self.assertTrue(truncated)
+
     def test_a_session_swapped_for_a_symlink_after_the_walk_is_not_read(self):
         # The walk clears a path, then sorts; the read happens later.
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
@@ -572,6 +582,23 @@ class SharedRootsAndHostileFiles(unittest.TestCase):
             with patch.object(unbound, "_iter_vs_sessions", swap):
                 sessions, _, _ = self._collect(home)
         self.assertEqual(sessions, [])
+
+    def test_a_session_swapped_for_another_real_file_after_the_walk_is_not_read(self):
+        # Re-checking the path cannot catch this: the swapped-in file is inside the root.
+        with tempfile.TemporaryDirectory() as home:
+            planted = _session_file(home, _prompt("ask") + _reply("answer"))
+            real = unbound._iter_vs_sessions
+
+            def swap(cutoff, budget=None):
+                found = real(cutoff, budget)
+                planted.unlink()
+                planted.write_bytes(_prompt("swapped in") + _reply("after the check"))
+                return found
+
+            with patch.object(unbound, "_iter_vs_sessions", swap), \
+                    patch.object(unbound, "log_error"):
+                sessions, _, _ = self._collect(home)
+        self.assertEqual(sessions, [], "the handle must be checked, not the path")
 
     def test_a_chat_log_symlinked_out_of_its_root_is_not_read(self):
         with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
@@ -622,9 +649,11 @@ class TurnPositions(unittest.TestCase):
         self.assertEqual(entries[0]["data"]["content"], "real one")
         self.assertEqual(entries[0]["id"], unbound._vs_turn_marker(SESSION, "real one", 1),
                          "the surviving turn keeps slot 1, so its id is stable across sweeps")
-        self.assertEqual(sessions[0]["usage"][1],
+        self.assertEqual(len(sessions[0]["usage"]), 1)
+        self.assertEqual(sessions[0]["usage"][0],
                          {"input_tokens": 100, "output_tokens": 5,
-                          "cache_read_input_tokens": 0})
+                          "cache_read_input_tokens": 0},
+                         "the backend pairs usage[i] with exchange i, so no pad slots")
 
     def test_a_cancelled_turn_keeps_the_positions_of_the_turns_after_it(self):
         turns = unbound._vs_chat_log_turns(_body([
@@ -653,10 +682,64 @@ class LogRequestBudget(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as home:
             path = _chat_log(home, entries)
+            key = unbound._vs_file_key(path.stat())
             with patch.object(unbound, "log_error"):
-                requests, _ = unbound._vs_chat_log_requests(path)
+                requests, _ = unbound._vs_chat_log_requests(path, path.parent.resolve(), key)
 
         kept = {r[4] for r in requests}
         self.assertIn(OTHER, kept, "the quiet conversation must not be dropped")
         self.assertLessEqual(sum(1 for r in requests if r[4] == SESSION),
                              unbound._VS_MAX_METADATA_REQUESTS)
+
+
+class UsageSlotAlignment(unittest.TestCase):
+    def test_every_usage_slot_lines_up_with_an_exchange(self):
+        # Positions can skip a cancelled turn; the backend cannot.
+        with tempfile.TemporaryDirectory() as home:
+            _chat_log(home, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "cancelled"), _msg("assistant", ""),
+                                _msg("user", "one")])),
+                ("usage", _usage(100, 5)),
+                ("body", _body([_msg("user", "cancelled"), _msg("assistant", ""),
+                                _msg("user", "one"), _msg("assistant", "a"),
+                                _msg("user", "two")])),
+                ("usage", _usage(700, 40)),
+                ("body", _body([_msg("user", "cancelled"), _msg("assistant", ""),
+                                _msg("user", "one"), _msg("assistant", "a"),
+                                _msg("user", "two"), _msg("assistant", "b"),
+                                _msg("user", "three")])),
+                ("usage", _usage(900, 60)),
+            ])
+            with patch.object(unbound, "_is_windows", return_value=True), \
+                    patch.object(unbound, "_vs_installed", return_value=True), \
+                    patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                    patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                    patch.object(unbound, "log_error"):
+                sessions, _, _ = unbound.collect_visual_studio_sessions(0)
+
+        session = sessions[0]
+        exchanges = [e for e in session["entries"] if e["type"] == "user.message"]
+        self.assertEqual([e["data"]["content"] for e in exchanges], ["one", "two"])
+        self.assertEqual(len(session["usage"]), len(exchanges))
+        self.assertEqual([u["input_tokens"] for u in session["usage"]], [100, 700])
+
+    def test_a_turn_recovered_late_still_lands_in_order(self):
+        # The store is read after every log, so a turn only it holds arrives last.
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, _prompt("first") + _reply("a") + _prompt("second") + _reply("b"))
+            _chat_log(home, [
+                ("session", SESSION),
+                ("body", _body([_msg("user", "first"), _msg("assistant", "a"),
+                                _msg("user", "second")])),
+            ])
+            with patch.object(unbound, "_is_windows", return_value=True), \
+                    patch.object(unbound, "_vs_installed", return_value=True), \
+                    patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                    patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                    patch.object(unbound, "log_error"):
+                sessions, _, _ = unbound.collect_visual_studio_sessions(0)
+
+        prompts = [e["data"]["content"] for e in sessions[0]["entries"]
+                   if e["type"] == "user.message"]
+        self.assertEqual(prompts, ["first", "second"])

@@ -7,6 +7,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 import sys
 import base64
 import json
+import io
 import os
 import ntpath
 import platform
@@ -5908,12 +5909,9 @@ def _vs_installed():
 
 
 def _vs_solution_roots():
-    """Directories worth walking for solution state. ~/source/repos is deliberately absent:
-    it sits under ~/source, so listing both walks that tree twice.
-
-    Only the scanned user's own tree. Shared roots like C:\\src are walked by every user on
-    the device and nothing in one says whose a session is. Their conversations still arrive
-    through the chat log, which lives in the user's own profile."""
+    """The scanned user's own tree only. ~/source/repos is absent because it sits under
+    ~/source. Shared roots like C:\\src are walked by every user and nothing in one says
+    whose a session is; those conversations still arrive through the chat log."""
     home = Path.home()
     roots = []
     for root in (home / 'source', home / 'Documents'):
@@ -5932,6 +5930,32 @@ def _vs_within(root, path):
         return resolved == root or root in resolved.parents
     except OSError:
         return False
+
+
+def _vs_file_key(info):
+    return (info.st_dev, info.st_ino)
+
+
+def _vs_open_verified(path, root, key):
+    """The file the walk cleared, or None. Checking the path again still races a junction
+    planted in between, so the open handle is checked instead."""
+    if not _vs_within(root, path):
+        log_error('visual studio path escapes its root: %s' % path, 'visual_studio')
+        return None
+    try:
+        handle = open(path, 'rb')
+    except OSError as e:
+        log_error('visual studio file unreadable (%s): %s' % (path, e), 'visual_studio')
+        return None
+    try:
+        if _vs_file_key(os.fstat(handle.fileno())) != key:
+            log_error('visual studio file changed under the walk: %s' % path, 'visual_studio')
+            handle.close()
+            return None
+    except OSError:
+        handle.close()
+        return None
+    return handle
 
 
 def _iter_vs_sessions(cutoff_mtime, budget=None):
@@ -5955,7 +5979,7 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                         log_error('visual studio walk hit its directory budget', 'visual_studio')
                         if budget is not None:
                             budget[0] = True
-                        return
+                        return sorted(found, key=lambda item: (item[0], str(item[1])))
                     key = str(path)
                     if key in seen:
                         continue
@@ -5973,7 +5997,7 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                         log_error('visual studio session escapes its root: %s' % path,
                                   'visual_studio')
                         continue
-                    found.append((info.st_mtime, path, real_root))
+                    found.append((info.st_mtime, path, real_root, _vs_file_key(info)))
             except OSError as e:
                 log_error('visual studio walk failed under %s: %s' % (root, e), 'visual_studio')
                 continue
@@ -6087,11 +6111,11 @@ def _iter_vs_chat_logs(cutoff_mtime):
             if not _vs_within(real_root, path):
                 log_error('visual studio chat log escapes its root: %s' % path, 'visual_studio')
                 continue
-            found.append((info.st_mtime, path))
+            found.append((info.st_mtime, path, _vs_file_key(info)))
     except OSError:
         return []
     # Oldest first: a restart replays the whole history, and the first write of a turn wins.
-    return [(real_root, path) for _, path in sorted(found)]
+    return [(real_root, path, key) for _, path, key in sorted(found, key=lambda i: i[0])]
 
 
 def _vs_log_line_time(line):
@@ -6154,7 +6178,7 @@ def _vs_user_messages(body):
     return out
 
 
-def _vs_chat_log_requests(path):
+def _vs_chat_log_requests(path, root, key):
     """Requests oldest-first as (timestamp, model, turn_index, body, session_id), plus
     usage keyed by (session_id, turn_index).
 
@@ -6165,8 +6189,11 @@ def _vs_chat_log_requests(path):
     requests, usage_by_turn = [], {}
     slot = None
     session_id = None
+    raw = _vs_open_verified(path, root, key)
+    if raw is None:
+        return [], {}
     try:
-        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+        with io.TextIOWrapper(raw, encoding='utf-8', errors='replace') as handle:
             for line in _vs_capped_lines(handle):
                 marker = _VS_SESSION_RE.search(line)
                 if marker:
@@ -6242,16 +6269,13 @@ def _vs_chat_log_turns(body):
 
 
 def _vs_session(sessions, session_id):
-    return sessions.setdefault(session_id, {'session_id': session_id, 'entries': [],
-                                            'usage': [], '_seen': set()})
+    return sessions.setdefault(session_id, {'session_id': session_id, 'turns': {}})
 
 
 def _vs_turn_marker(conversation_id, prompt, index):
-    """Stable id for a turn, derived identically from either source.
-
-    Scoped to its conversation, or two chats opening with "continue" share one id.
-    Excludes the reply, which grows across agent-mode calls while the turn is still
-    running and would record it twice."""
+    """Stable id, derived identically from either source. Scoped to its conversation, or
+    two chats opening with "continue" collide. Excludes the reply, which grows across
+    agent-mode calls while the turn still runs and would record it twice."""
     digest = hashlib.sha256()
     digest.update((conversation_id or '').encode('utf-8', 'replace'))
     digest.update(b'\x00')
@@ -6261,37 +6285,35 @@ def _vs_turn_marker(conversation_id, prompt, index):
 
 
 def _vs_add_turn(session, index, prompt, reply, model, timestamp, usage):
-    """Append one turn as the two entries parse_copilot_session walks.
+    """Record one turn at its own position; the first source to reach it wins."""
+    session['turns'].setdefault(index, (prompt, reply, model, timestamp, usage))
 
-    The id is derived, not taken from the transcript: only the .vs store carries a
-    CorrelationId, so using it would key a turn by whichever source reached it first.
-    Omitting it is worse -- the server then keys on prompt content, and a chat with a
-    repeated prompt falls to a positional fallback that refuses the whole session."""
-    if index in session['_seen']:
-        return
-    session['_seen'].add(index)
-    prompt_entry = {'type': 'user.message',
-                    'id': _vs_turn_marker(session['session_id'], prompt, index),
-                    'data': {'content': prompt}}
-    if timestamp:
-        prompt_entry['timestamp'] = timestamp
-    session['entries'].append(prompt_entry)
-    session['entries'].append({'type': 'assistant.message',
-                               'data': {'content': reply, 'model': model or 'auto'}})
-    while len(session['usage']) < index:
-        session['usage'].append({})
-    session['usage'].append(usage or {})
+
+def _vs_finalize(session):
+    """The two entries parse_copilot_session walks, plus one usage slot per exchange.
+    Positions can skip a cancelled turn but the backend pairs usage[i] with exchange i,
+    so the slots are packed here while the position keeps feeding the id."""
+    turns = session.pop('turns')
+    entries, usage = [], []
+    for index in sorted(turns):
+        prompt, reply, model, timestamp, turn_usage = turns[index]
+        entry = {'type': 'user.message',
+                 'id': _vs_turn_marker(session['session_id'], prompt, index),
+                 'data': {'content': prompt}}
+        if timestamp:
+            entry['timestamp'] = timestamp
+        entries.append(entry)
+        entries.append({'type': 'assistant.message',
+                        'data': {'content': reply, 'model': model or 'auto'}})
+        usage.append(turn_usage or {})
+    return entries, usage
 
 
 def _vs_collect_chat_logs(cutoff, sessions, logged):
     """Live source: prompts land here per request, and it is the only one carrying usage."""
-    for root, path in _iter_vs_chat_logs(cutoff):
-        # Re-checked at the read for the same reason the store paths are.
-        if not _vs_within(root, path):
-            log_error('visual studio chat log escapes its root: %s' % path, 'visual_studio')
-            continue
+    for root, path, key in _iter_vs_chat_logs(cutoff):
         fallback_id = path.stem.replace('_VSGitHubCopilot.chat', '')
-        requests, usage_by_turn = _vs_chat_log_requests(path)
+        requests, usage_by_turn = _vs_chat_log_requests(path, root, key)
         # A turn belongs to the request it was the intent of, not to one replaying it.
         for timestamp, model, turn_index, _, session_id in requests:
             key = (_vs_session_id(session_id or fallback_id), turn_index)
@@ -6318,18 +6340,18 @@ def _vs_collect_stores(cutoff, sessions, truncated, logged, resume):
 
     A session found only under a shared root is skipped: nothing there proves whose it is,
     and the chat log that would prove it is this user's has no record of the session."""
-    for count, (mtime, path, root) in enumerate(_iter_vs_sessions(cutoff, truncated)):
+    for count, (mtime, path, root, key) in enumerate(_iter_vs_sessions(cutoff, truncated)):
         if count >= _VS_MAX_SESSIONS_PER_RUN:
             log_error('visual studio session cap reached; remaining files deferred',
                       'visual_studio')
             truncated[0] = True
             break
-        # Re-checked at the read: the walk cleared this path before it sorted them.
-        if not _vs_within(root, path):
-            log_error('visual studio session escapes its root: %s' % path, 'visual_studio')
+        handle = _vs_open_verified(path, root, key)
+        if handle is None:
             continue
         try:
-            objects = _mp_unpack_all(path.read_bytes())
+            with handle:
+                objects = _mp_unpack_all(handle.read())
         except (OSError, ValueError, IndexError, struct.error) as e:
             log_error('visual studio session unreadable (%s): %s' % (path.name, e), 'visual_studio')
             continue
@@ -6363,12 +6385,13 @@ def collect_visual_studio_sessions(cutoff):
     _vs_collect_stores(cutoff, sessions, truncated, logged, resume)
     out = []
     for session in sessions.values():
-        session.pop('_seen', None)
-        if not session['entries']:
+        entries, usage = _vs_finalize(session)
+        if not entries:
             continue
+        session['entries'] = entries
         # A list of empty slots says nothing the backend cannot work out itself.
-        if not any(session['usage']):
-            session.pop('usage')
+        if any(usage):
+            session['usage'] = usage
         out.append(session)
     # Everything older than the last finished store file has been read, chat logs included.
     return out, truncated[0], (resume[0] if truncated[0] else None)
