@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.conftest import tool_module
+from tests.conftest import REPO, tool_module
 
 mdm = tool_module("copilot/hooks/mdm", "setup")
 
@@ -216,3 +216,22 @@ class SlicerDropAccounting(unittest.TestCase):
         slices = list(mdm._backfill_slice_session(session, 100000, dropped))
         self.assertEqual(dropped, set())
         self.assertEqual(len(slices), 1)
+
+
+class InstallerOrderingAndSeeding(unittest.TestCase):
+    """--backfill reaches this installer again, which changes both of these."""
+
+    def setUp(self):
+        self.source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
+
+    def test_the_sweep_runs_before_the_re_walk(self):
+        # The re-walk is bounded by session count, not time, and onboard.py allows one
+        # installer 600s. Visual Studio's only delivery must not queue behind it.
+        # The call sites, not the definitions: run_backfill is defined first either way.
+        self.assertLess(self.source.index("run_visual_studio_sweep(api_key, base_url"),
+                        self.source.index("run_backfill(api_key, base_url"))
+
+    def test_the_installer_never_asks_the_sweep_to_seed(self):
+        # Seeding tags recent turns historical, which skips the checks a live turn gets.
+        self.assertIn("seed_history=False", self.source)
+        self.assertNotIn("seed_history=backfill_mode", self.source)
