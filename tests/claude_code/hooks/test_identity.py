@@ -292,8 +292,36 @@ class TestGatewayHostAsTheAccount(unittest.TestCase):
         self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
 
     def test_the_user_settings_are_the_last_resort(self):
-        self._settings("settings.json", "http://localhost:8080/proxy")
-        self.assertEqual(unbound.read_account_identity()["org_id"], "localhost")
+        self._settings("settings.json", "https://llm.acme.com:8080/proxy")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "llm.acme.com")
+
+    def test_unbounds_own_gateway_is_not_an_account(self):
+        """Our gateway installers point every customer's Claude Code at it."""
+        for url in ("https://api.getunbound.ai", "https://zendesk-gateway.getunbound.ai/v1"):
+            with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": url}):
+                self.assertIsNone(unbound.read_account_identity()["org_id"], url)
+
+    def test_the_hooks_own_tenant_gateway_is_not_an_account(self):
+        with patch.object(unbound, "UNBOUND_GATEWAY_URL", "https://gw.tenant.example"), \
+                patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://gw.tenant.example/anthropic"}):
+            self.assertIsNone(unbound.read_account_identity()["org_id"])
+
+    def test_a_loopback_proxy_is_not_an_account(self):
+        for url in ("http://localhost:4000", "http://127.0.0.1:8080"):
+            with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": url}):
+                self.assertIsNone(unbound.read_account_identity()["org_id"], url)
+
+    def test_the_env_wins_without_reading_any_settings_file(self):
+        """build_account_identity runs on the latency-critical pre-tool path."""
+        with patch.object(unbound, "_settings_base_url", side_effect=AssertionError("read")), \
+                patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
+            self.assertEqual(unbound._gateway_host(), "llm.acme.internal")
+
+    def test_an_unbound_env_url_is_not_overridden_by_stale_settings(self):
+        """Claude Code uses the env value, so a settings file must not replace it."""
+        self._settings("settings.json", "https://llm.acme.com")
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://api.getunbound.ai"}):
+            self.assertIsNone(unbound.read_account_identity()["org_id"])
 
     def test_only_the_host_is_kept(self):
         with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://user:secret@llm.acme.com:8443/path?key=abc"}):

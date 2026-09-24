@@ -3272,22 +3272,36 @@ def _settings_base_url(path: Path) -> Optional[str]:
     return url if isinstance(url, str) and url.strip() else None
 
 
-def _gateway_host() -> Optional[str]:
-    """Host of ANTHROPIC_BASE_URL: the process env, then managed settings (drop-ins
-    override the base file), then the user's settings.json. The host only."""
-    managed = None
+def _managed_base_url() -> Optional[str]:
+    url = None
     for directory in MANAGED_SETTINGS_DIRS:
         try:
             dropins = sorted((directory / 'managed-settings.d').glob('*.json'))
         except Exception:
             dropins = []
         for path in [directory / 'managed-settings.json', *dropins]:
-            managed = _settings_base_url(path) or managed
-    for url in (os.environ.get('ANTHROPIC_BASE_URL'), managed, _settings_base_url(USER_SETTINGS_PATH)):
-        host = urlparse(url.strip()).hostname if isinstance(url, str) and url.strip() else None
-        if host:
-            return host.lower()
-    return None
+            url = _settings_base_url(path) or url
+    return url
+
+
+def _names_no_account(host: str) -> bool:
+    """Unbound's own gateway and loopback proxies are shared by everyone, so they
+    would lump every developer into one fake account."""
+    ours = urlparse(UNBOUND_GATEWAY_URL).hostname or ''
+    return (host == ours or host == 'getunbound.ai' or host.endswith('.getunbound.ai')
+            or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.'))
+
+
+def _gateway_host() -> Optional[str]:
+    """Host of the ANTHROPIC_BASE_URL Claude Code uses: the env, else managed settings
+    (drop-ins override the base file), else the user's settings.json."""
+    url = os.environ.get('ANTHROPIC_BASE_URL')
+    if not (isinstance(url, str) and url.strip()):
+        url = _managed_base_url() or _settings_base_url(USER_SETTINGS_PATH)
+    host = urlparse(url.strip()).hostname if isinstance(url, str) and url.strip() else None
+    if not host or _names_no_account(host.lower()):
+        return None
+    return host.lower()
 
 
 # DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
