@@ -5762,7 +5762,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
-        'surface': copilot_surface(transcript_path),
+        'agent_surface': copilot_surface(transcript_path),
         'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
@@ -6326,7 +6326,7 @@ def _vs_chat_log_turns(body):
 
 def _vs_session(sessions, session_id):
     return sessions.setdefault(
-        session_id, {'session_id': session_id, 'surface': 'visual_studio', 'turns': {}})
+        session_id, {'session_id': session_id, 'agent_surface': 'visual_studio', 'turns': {}})
 
 
 def _vs_turn_marker(conversation_id, prompt, index):

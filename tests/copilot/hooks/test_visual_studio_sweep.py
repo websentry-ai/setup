@@ -931,12 +931,13 @@ class SurfaceLabel(unittest.TestCase):
                     patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
                     patch.object(unbound, "log_error"):
                 sessions, _, _ = unbound.collect_visual_studio_sessions(0)
-        self.assertEqual(sessions[0]["surface"], "visual_studio")
+        self.assertEqual(sessions[0]["agent_surface"], "visual_studio")
 
     def test_the_two_hook_surfaces_are_told_apart_by_their_store(self):
-        self.assertEqual(unbound.copilot_surface("/h/.copilot/session-abc/events"), "cli")
         self.assertEqual(
-            unbound.copilot_surface("/h/Code/User/globalStorage/state.vscdb"), "vscode")
+            unbound.copilot_surface("/h/.copilot/session-state/c-1/events.jsonl"), "cli")
+        self.assertEqual(
+            unbound.copilot_surface("/h/Code/User/.../transcripts/s-1.jsonl"), "vscode")
 
     def test_no_transcript_path_names_nothing(self):
         self.assertIsNone(unbound.copilot_surface(None))
