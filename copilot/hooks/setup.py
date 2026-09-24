@@ -30,11 +30,9 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
-# Off while a turn's request id moves from a hash of its text to the transcript's own id
-# for it. The two derive different ids for the same turn, so a run now inserts a second
-# row for every turn the installed hook already reported. Flip back to True once the
-# fleet is on the new hook.
-BACKFILL_ENABLED = False
+# Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
+# the hook already wrote.
+BACKFILL_ENABLED = True
 
 DEBUG = False
 
