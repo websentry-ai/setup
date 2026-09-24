@@ -80,11 +80,14 @@ def test_a_tool_that_does_not_declare_backfill_never_receives_the_flag():
     assert onboard.tool_arguments(asked, False, False, False) == ["--api-key", "K"]
 
 
-def test_the_tool_table_holds_back_copilot_and_keeps_the_others():
+def test_the_tool_table_declares_backfill_only_where_a_store_exists():
     supports = {name: flag for name, _url, flag, _skip in onboard.TOOLS}
-    assert supports["GitHub Copilot"] is False
+    assert supports["GitHub Copilot"] is True
     assert supports["Claude Code"] is True
     assert supports["Codex"] is True
+    # No historical transcript store to walk.
+    assert supports["Cursor"] is False
+    assert supports["Augment"] is False
 
 
 def test_skip_managed_settings_is_still_appended_only_where_declared():

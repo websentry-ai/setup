@@ -35,11 +35,16 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
-# Off while a turn's request id moves from a hash of its text to the transcript's own id
-# for it. The two derive different ids for the same turn, so a run now inserts a second
-# row for every turn the installed hook already reported. Flip back to True once the
-# fleet is on the new hook.
-BACKFILL_ENABLED = False
+# onboard.py SIGKILLs each installer at 600s; stop first, or the kill fails the whole step.
+BACKFILL_TIME_BUDGET_SECONDS = 420
+# Collected sessions upload past that budget: a profile whose walk alone outlasts it would
+# otherwise be re-walked and discarded on every run.
+BACKFILL_UPLOAD_GRACE_SECONDS = 120
+# Anchored at process start: the hook install and the Visual Studio sweep spend the same 600s.
+_INSTALLER_STARTED_AT = time.monotonic()
+# Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
+# the hook already wrote.
+BACKFILL_ENABLED = True
 
 # Separate from BACKFILL_ENABLED: Visual Studio has no live hook and so no rows to duplicate.
 VS_SWEEP_ENABLED = True
@@ -1460,8 +1465,19 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
+def _backfill_request_timeout(deadline: Optional[float]) -> Optional[int]:
+    """Largest per-request timeout still inside the budget, None when none is. Checked per
+    request, not per chunk: _backfill_http_request spends timeout * 4 + 20 before giving
+    up and a chunk makes three of them, so guarding only the chunk overshoots by all three."""
+    if deadline is None:
+        return 30
+    fits = int((deadline - time.monotonic() - 20) // 4)
+    return min(30, fits) if fits >= 5 else None
+
+
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False, backfilled: bool = True) -> bool:
+                           force: bool = False, backfilled: bool = True,
+                           deadline: Optional[float] = None) -> bool:
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
@@ -1477,12 +1493,16 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         'Content-Type': 'application/json',
     })
 
+    timeout = _backfill_request_timeout(deadline)
+    if timeout is None:
+        debug_print("out of time before requesting an upload url")
+        return False
     code, body = _backfill_http_request(
         f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
         method='POST',
         headers=auth_headers,
         body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
-        timeout=30,
+        timeout=timeout,
     )
     if code < 200 or code >= 300:
         debug_print(f"upload-url request failed: HTTP {code}")
@@ -1499,23 +1519,31 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         debug_print("upload-url response missing fields")
         return False
 
+    timeout = _backfill_request_timeout(deadline)
+    if timeout is None:
+        debug_print("out of time before the S3 upload")
+        return False
     code, _ = _backfill_http_request(
         upload_url,
         method='PUT',
         headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
         body=payload_bytes,
-        timeout=30,
+        timeout=timeout,
     )
     if code < 200 or code >= 300:
         debug_print(f"S3 PUT failed: HTTP {code}")
         return False
 
+    timeout = _backfill_request_timeout(deadline)
+    if timeout is None:
+        debug_print("out of time before the ingest call")
+        return False
     code, _ = _backfill_http_request(
         f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/from-s3/",
         method='POST',
         headers=auth_headers,
         body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
-        timeout=30,
+        timeout=timeout,
     )
     if code < 200 or code >= 300:
         debug_print(f"from-s3 request failed: HTTP {code}")
@@ -1666,12 +1694,19 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int, dropped: Option
         start_idx = last_fit_end
 
 
+def _backfill_out_of_time(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
                             forced: bool = False,
-                            backfilled: bool = True) -> Tuple[int, int, int]:
+                            backfilled: bool = True,
+                            deadline: Optional[float] = None) -> Tuple[int, int, int]:
     """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts distinct
     input session_ids delivered whole: one landed slice proves nothing about the rest, and
-    counting a part-delivered session would advance the cutoff past what it never sent."""
+    counting a part-delivered session would advance the cutoff past what it never sent.
+
+    `deadline` is a time.monotonic() instant past which no further chunk is started."""
     chunks_total = 0
     chunks_sent = 0
     sessions_sent_ids: set = set()
@@ -1683,7 +1718,11 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         if not current_chunk:
             return
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced, backfilled):
+        # Checked here rather than only per session: a chunk that started under the
+        # deadline still spends three HTTP calls against onboard.py's kill.
+        if (not _backfill_out_of_time(deadline)
+                and _backfill_upload_chunk(api_key, backend_url, current_chunk, forced,
+                                           backfilled, deadline)):
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))
@@ -1692,6 +1731,9 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
     dropped: set = set()
     for session in sessions:
+        if _backfill_out_of_time(deadline):
+            # The +1 books the abandoned remainder as unsent, so no cutoff moves past it.
+            return len(sessions_sent_ids - dropped), chunks_sent, chunks_total - chunks_sent + 1
         for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES, dropped):
             try:
                 slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
@@ -1711,12 +1753,17 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]],
-                 hook_source: Optional[str] = None) -> None:
+                 hook_source: Optional[str] = None,
+                 deadline: Optional[float] = None) -> None:
     """Walk every user's Copilot CLI + VS Code transcripts and seed historical sessions.
 
     MDM /get_application_api_key/ returns one per-device key and attribution is
     by device, so all profiles' history is seeded under that single key — the
-    same model as install, which configures every user profile."""
+    same model as install, which configures every user profile.
+
+    `deadline` is a time.monotonic() instant past which no further profile is walked; a
+    profile left unwalked keeps its cutoff and is picked up by the next run. Uploading
+    what was already walked runs to BACKFILL_UPLOAD_GRACE_SECONDS beyond it."""
     if not BACKFILL_ENABLED:
         debug_print("backfill is disabled for this tool — skipping")
         return
@@ -1743,6 +1790,9 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         sessions = []
         collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
+            if _backfill_out_of_time(deadline):
+                print("[backfill] Out of time — unwalked profiles resume on the next run.")
+                break
             result = _run_as_user(username, _backfill_collect_sessions, home_dir,
                                   force_epoch, force_days)
             if result is None:
@@ -1768,10 +1818,12 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Found {total} past sessions. Uploading (this may take a few minutes)...")
         sessions_sent = 0
         chunks_failed = 0
+        upload_deadline = None if deadline is None else deadline + BACKFILL_UPLOAD_GRACE_SECONDS
         for batch, forced in ((forced_sessions, True), (sessions, False)):
             if not batch:
                 continue
-            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced,
+                                                      deadline=upload_deadline)
             sessions_sent += sent
             chunks_failed += failed
 
@@ -2613,13 +2665,16 @@ def main():
                               hook_hash=hook_script_hash(user_homes[0][1] / ".copilot" / "hooks" / "unbound.py"),
                               install_mode="mdm")
 
-    if success and backfill_mode:
-        run_backfill(api_key, base_url, user_homes, script_text)
-
-    # Not gated on backfill_mode: the flag only sets how far the first sweep reaches back.
+    # Before the re-walk: onboard.py allows one installer 600s, and the re-walk yields
+    # whatever the sweep spends of it. seed_history stays off, or a --backfill install
+    # would tag recent Visual Studio turns historical and skip the live checks.
     if success:
         run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
-                                device_serial=device_id, seed_history=backfill_mode)
+                                device_serial=device_id, seed_history=False)
+
+    if success and backfill_mode:
+        run_backfill(api_key, base_url, user_homes, script_text,
+                     deadline=_INSTALLER_STARTED_AT + BACKFILL_TIME_BUDGET_SECONDS)
 
     return success
 
