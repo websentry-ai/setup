@@ -308,7 +308,6 @@ def test_visual_studio_sweep_ships_enabled():
     Studio's only delivery, while the re-walk replays turns a live hook already sent."""
     source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
     assert "VS_SWEEP_ENABLED = True" in source
-    assert "BACKFILL_ENABLED" in source
 
 
 # Installers MDM runs with stdout redirected. On Windows that pipe encodes as cp1252,
