@@ -38,6 +38,10 @@ def _copilot_config_path():
     return _copilot_home() / 'config.json'
 
 
+# Copilot cloud agent sandbox: ephemeral disk, no device, no signed-in user, no approver.
+RUNNING_CLOUD = bool(os.environ.get('COPILOT_AGENT_SESSION_ID'))
+
+
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
@@ -66,7 +70,7 @@ APPROVAL_POLL_PHASES = (
 )
 
 # Use user's home directory for logs
-LOG_DIR = _copilot_home() / "hooks"
+LOG_DIR = Path('/tmp/unbound-copilot') if RUNNING_CLOUD else _copilot_home() / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
@@ -97,6 +101,8 @@ WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'ne
 EDIT_TOOLS = {
     'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit',
     'replace_string_in_file', 'multi_replace_string_in_file',
+    # The cloud agent's name for it; unmapped it canonicalises to nothing and the write is waved through.
+    'edit',
 }
 
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
@@ -1177,6 +1183,8 @@ def stop_session_key(event):
 def copilot_surface(transcript_path):
     """Which Copilot wrote this turn. The two stores are the only thing that says so,
     and the same check already picks which one to read usage from."""
+    if RUNNING_CLOUD:
+        return 'cloud'
     if not isinstance(transcript_path, str) or not transcript_path:
         return None
     return 'cli' if Path(transcript_path).stem == 'events' else 'vscode'
@@ -1587,6 +1595,49 @@ def _device_serial(probe: bool = True) -> Optional[str]:
         except Exception:
             pass
     return serial
+
+
+_GITHUB_COAUTHOR_RE = re.compile(
+    r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>', re.M | re.I)
+
+
+def _github_actor() -> Optional[str]:
+    """The login that triggered the session, read from the co-author trailer the agent stamps.
+
+    Scoped to this session's commits: an unscoped search reads unrelated history and would
+    upload a stranger's login as this session's actor. The login, not the display name — a
+    display name is neither stable nor unique, so it joins to nothing later.
+    """
+    base = os.environ.get('COPILOT_AGENT_BASE_COMMIT')
+    if not base:
+        return None
+    try:
+        # --first-parent --no-merges: a merge landing mid-session drags in other branches' trailers.
+        out = subprocess.run(['git', 'log', '%s..HEAD' % base,
+                              '--first-parent', '--no-merges', '--format=%B'],
+                             capture_output=True, timeout=5)
+        if out.returncode != 0:
+            log_error('github actor: git log %s..HEAD failed rc=%s %s' % (
+                base, out.returncode, out.stderr.decode('utf-8', 'replace')[:200]), 'identity')
+            return None
+        match = _GITHUB_COAUTHOR_RE.search(out.stdout.decode('utf-8', 'replace'))
+        return (match.group(1).strip() or None) if match else None
+    except Exception as e:
+        log_error('github actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
+        return None
+
+
+def build_github_context() -> Optional[Dict]:
+    """Cloud-agent provenance. None on a laptop, where the device identity applies."""
+    if not RUNNING_CLOUD:
+        return None
+    context = {
+        'actor': _github_actor(),
+        'repo': os.environ.get('GITHUB_REPOSITORY'),
+        'session': os.environ.get('COPILOT_AGENT_SESSION_ID'),
+        'event': os.environ.get('COPILOT_JOB_EVENT_TYPE'),
+    }
+    return {key: value for key, value in context.items() if value} or None
 
 
 COPILOT_SEAT_CACHE_PATH = Path.home() / ".unbound" / "copilot_seat.json"
@@ -3947,7 +3998,11 @@ def send_to_hook_api(request_body, api_key):
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    for attempt in range(3):
+    # 3x20s exceeds the cloud config's timeoutSec, and a preToolUse killed by that timeout
+    # fails OPEN. Keep the cloud budget inside it so the deny path stays reachable.
+    attempts, per_attempt = (2, 8) if RUNNING_CLOUD else (3, 20)
+
+    for attempt in range(attempts):
         try:
             result = subprocess.run(
                 ["curl", "-fsSL", "-X", "POST",
@@ -3956,7 +4011,7 @@ def send_to_hook_api(request_body, api_key):
                  "--data-binary", "@-", url],
                 input=data.encode(),
                 capture_output=True,
-                timeout=20
+                timeout=per_attempt
             )
 
             # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
@@ -3974,7 +4029,7 @@ def send_to_hook_api(request_body, api_key):
         except Exception as e:
             log_error(f"Hook API error: {str(e)}", 'api_call')
 
-        if attempt < 2:
+        if attempt < attempts - 1:
             time.sleep(0.5)
 
     return {}
@@ -3985,6 +4040,10 @@ _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
 
 def _is_approval_retry(command):
     """True if a marker exists for this exact command and is fresh."""
+    # A sandbox has no approver, so it never legitimately reaches this path, and the marker
+    # lives under /tmp where the agent can plant one to start a poll that outlives the timeout.
+    if RUNNING_CLOUD:
+        return False
     try:
         if not _APPROVAL_MARKER_FILE.exists():
             return False
@@ -4132,10 +4191,25 @@ def transform_response_for_copilot_prompt(api_response):
     return {}
 
 
+# The cloud agent sends no event-name field at all, so the loader passes the registered
+# name through and it is mapped onto the names main() dispatches on.
+CLOUD_EVENT_NAMES = {
+    'sessionStart': 'SessionStart',
+    'userPromptSubmitted': 'UserPromptSubmit',
+    'preToolUse': 'PreToolUse',
+    'postToolUse': 'PostToolUse',
+    'agentStop': 'Stop',
+    'sessionEnd': 'SessionEnd',
+}
+
+
 def _copilot_event_name(event):
     name = event.get('hook_event_name') or event.get('hookEventName')
     if name:
         return name
+    declared = os.environ.get('UNBOUND_HOOK_EVENT')
+    if declared:
+        return CLOUD_EVENT_NAMES.get(declared, declared)
     # Copilot 1.0.82 omits the event-name field from userPromptTransformed,
     # while still sending both the original and transformed prompt fields.
     if isinstance(event.get('transformedPrompt'), str) and isinstance(event.get('prompt'), str):
@@ -4318,6 +4392,15 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
+        # No approver exists in a sandbox, and the retry path polls until the hook is killed —
+        # a killed preToolUse fails open, so the unapproved action would run. Deny outright.
+        if RUNNING_CLOUD:
+            return transform_response_for_copilot({
+                'decision': 'deny',
+                'reason': 'Blocked by organization policy. This action requires approval, which a cloud agent cannot obtain.',
+                'additionalContext': 'This action requires human approval and a cloud agent session has no approver. Do not retry and do not work around it. Stop and say so in the pull request.',
+            })
+
         approval_check = api_response.get('approvalCheck', {})
         policy_ids = approval_check.get('policyIds', [])
         application_id = approval_check.get('applicationId', '')
@@ -5764,6 +5847,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'project': _get_project(cwd),
         'agent_surface': copilot_surface(transcript_path),
         'account_identity': build_account_identity(probe=True),
+        'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
@@ -7490,10 +7574,14 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
-            _cleanup_skill_policy_state()
-            _snapshot_copilot_skill_inventory(event)
-            _dispatch_discovery()
-            _dispatch_skills_sync(api_key)
+            # None of this survives an ephemeral sandbox: the debounce cache is always empty,
+            # so discovery would reinstall every session and synced skills land in a workspace
+            # that is destroyed minutes later.
+            if not RUNNING_CLOUD:
+                _cleanup_skill_policy_state()
+                _snapshot_copilot_skill_inventory(event)
+                _dispatch_discovery()
+                _dispatch_skills_sync(api_key)
             print("{}")
             return
 
@@ -7532,8 +7620,10 @@ def main():
             # reading only the snake_case name would cost the exchange its start time and
             # its model attribution.
             session_id = event.get('session_id') or event.get('sessionId')
-            if event_name == 'SessionEnd' and not event.get('transcript_path'):
-                recovered = _transcript_path_for_session(event)
+            # The cloud agent names it transcriptPath, so reading only the snake_case key
+            # leaves the exchange with nothing to parse. _copilot_transcript_path takes either.
+            if not event.get('transcript_path'):
+                recovered = _copilot_transcript_path(event)
                 if recovered:
                     event = dict(event, transcript_path=recovered)
             # Watermark key mirrors the exchange's session fallback, so get/record stay

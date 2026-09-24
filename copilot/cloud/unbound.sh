@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Fetches the Unbound hook into the cloud agent sandbox and runs it.
+#
+# Pinned to an immutable commit and digest-checked before it runs: this process holds the
+# organization API key, so unverified bytes from a mutable ref must never reach python3.
+#
+# A fetch that fails leaves policy unevaluated. preToolUse is the one event where that
+# silently permits an action the organization may have denied, so it denies instead.
+
+EVENT="${1:-unknown}"
+HOOK=/tmp/unbound-hook.py
+# Stamped with a release commit at install time; never defaulted to a branch.
+REF="__UNBOUND_HOOK_REF__"
+SRC="${UNBOUND_HOOK_URL:-https://raw.githubusercontent.com/websentry-ai/setup/$REF/copilot/hooks/unbound.py}"
+
+fail() {
+  echo "unbound: $1" >&2
+  if [ "$EVENT" = "preToolUse" ]; then
+    printf '{"permissionDecision":"deny","permissionDecisionReason":"%s"}\n' \
+      "Unbound policy checks are unavailable in this sandbox, so this action cannot be approved. Stop and report it in the pull request."
+  else
+    echo '{}'
+  fi
+  exit 0
+}
+
+# Machines with the agent installed already report through their own hook, and Copilot CLI
+# reads this config there too. Never in a sandbox: the agent can create that path itself.
+if [ -z "${COPILOT_AGENT_SESSION_ID:-}" ] && [ -f "$HOME/.copilot/hooks/unbound.py" ]; then
+  echo '{}'
+  exit 0
+fi
+
+case "$SRC" in
+  *__UNBOUND_HOOK_REF__*) fail "hook ref was never stamped; reinstall from copilot/cloud" ;;
+esac
+
+# The cache sits in /tmp, which the agent can write. Without a digest we cannot tell a
+# planted hook from ours, so it is not reused at all and every event refetches.
+if [ -z "${UNBOUND_HOOK_SHA256:-}" ] || [ ! -s "$HOOK" ]; then
+  # A dropped transfer leaves a partial file that a later event would happily run.
+  curl -fsSL -m 20 "$SRC" -o "$HOOK" || { rm -f "$HOOK"; fail "hook fetch failed from $SRC"; }
+fi
+
+# Every event, not just the one that fetched.
+if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
+  actual=$(sha256sum "$HOOK" 2>/dev/null | cut -d' ' -f1)
+  if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
+    rm -f "$HOOK"
+    fail "hook digest mismatch: expected $UNBOUND_HOOK_SHA256, got ${actual:-none}"
+  fi
+fi
+
+UNBOUND_HOOK_EVENT="$EVENT" exec python3 "$HOOK"
