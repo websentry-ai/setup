@@ -6,18 +6,19 @@ files below are committed to each repository we want covered.
 
 ## Install
 
-Copy both files into the repository:
-
-```
-copilot/cloud/unbound.json  ->  .github/hooks/unbound.json
-copilot/cloud/unbound.sh    ->  .github/hooks/unbound.sh
-```
-
-Then **stamp the release commit** into `unbound.sh`, replacing `__UNBOUND_HOOK_REF__`:
+Copy the config in, and **stamp the release commit** into the loader as you copy it —
+`unbound.sh` ships with `__UNBOUND_HOOK_REF__` as a placeholder and refuses to run until
+it holds a commit sha:
 
 ```bash
-sed -i '' "s/__UNBOUND_HOOK_REF__/$(git rev-parse HEAD)/" .github/hooks/unbound.sh
+mkdir -p .github/hooks
+cp copilot/cloud/unbound.json .github/hooks/unbound.json
+sed "s/__UNBOUND_HOOK_REF__/$(git rev-parse HEAD)/" \
+  copilot/cloud/unbound.sh > .github/hooks/unbound.sh
 ```
+
+Stamping on the way in rather than editing in place keeps this one command portable
+across BSD and GNU `sed`.
 
 The ref is pinned rather than tracking `main` on purpose: the hook runs in a sandbox holding
 the organization API key, so the bytes it executes must be immutable and reviewed. Set

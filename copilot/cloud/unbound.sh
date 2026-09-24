@@ -31,9 +31,13 @@ if [ -z "${COPILOT_AGENT_SESSION_ID:-}" ] && [ -f "$HOME/.copilot/hooks/unbound.
   exit 0
 fi
 
-case "$SRC" in
-  *__UNBOUND_HOOK_REF__*) fail "hook ref was never stamped; reinstall from copilot/cloud" ;;
-esac
+# Checks the ref's shape, not the placeholder text: a guard written as a literal
+# placeholder is itself rewritten by the install step and then matches every stamped URL.
+if [ -z "${UNBOUND_HOOK_URL:-}" ]; then
+  case "$REF" in
+    '' | *[!0-9a-f]*) fail "hook ref is not a commit sha; reinstall from copilot/cloud" ;;
+  esac
+fi
 
 # The cache sits in /tmp, which the agent can write. Without a digest we cannot tell a
 # planted hook from ours, so it is not reused at all and every event refetches.

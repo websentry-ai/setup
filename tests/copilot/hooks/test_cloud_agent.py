@@ -41,6 +41,54 @@ class TestCloudEventName(unittest.TestCase):
             self.assertEqual(unbound._copilot_event_name({}), 'errorOccurred')
 
 
+class TestCloudEventNormalization(unittest.TestCase):
+    """Audit rows are written as they arrive, and every reader matches snake_case names.
+
+    A raw cloud row matches none of them — worst of all the previous-Stop lookup, which
+    loses the turn's usage floor and reports the whole session's usage as that turn's.
+    """
+
+    def _normalize(self, event, name, cloud=True):
+        with patch.object(unbound, 'RUNNING_CLOUD', cloud):
+            return unbound._normalize_cloud_event(event, name)
+
+    def test_the_resolved_name_is_written_onto_the_event(self):
+        event = self._normalize({'sessionId': 's1'}, 'Stop')
+        self.assertEqual(event['hook_event_name'], 'Stop')
+
+    def test_camelcase_identity_is_mirrored_for_the_readers(self):
+        event = self._normalize({'sessionId': 's1', 'transcriptPath': '/t.jsonl'}, 'Stop')
+        self.assertEqual(event['session_id'], 's1')
+        self.assertEqual(event['transcript_path'], '/t.jsonl')
+
+    def test_a_normalized_stop_is_found_by_the_usage_floor_lookup(self):
+        logs = [{'timestamp': 't1', 'event': self._normalize(
+            {'sessionId': 's1', 'transcriptPath': '/t.jsonl'}, 'Stop')}]
+        with patch.object(unbound, 'load_existing_logs', return_value=logs):
+            self.assertEqual(unbound.get_previous_stop_timestamp_for_session({'transcript_path': '/t.jsonl'}), 't1')
+
+    def test_a_raw_cloud_stop_is_invisible_to_that_lookup(self):
+        logs = [{'timestamp': 't1', 'event': {'sessionId': 's1', 'transcriptPath': '/t.jsonl'}}]
+        with patch.object(unbound, 'load_existing_logs', return_value=logs):
+            self.assertIsNone(unbound.get_previous_stop_timestamp_for_session({'transcript_path': '/t.jsonl'}))
+
+    def test_a_normalized_prompt_is_found_by_the_prompt_lookup(self):
+        logs = [{'timestamp': 't1', 'event': self._normalize(
+            {'sessionId': 's1', 'prompt': 'hello'}, 'UserPromptSubmit')}]
+        with patch.object(unbound, 'load_existing_logs', return_value=logs):
+            self.assertEqual(unbound.get_recent_user_prompts_for_session('s1', 5), ['hello'])
+
+    def test_the_payloads_own_names_are_never_overwritten(self):
+        event = self._normalize(
+            {'hook_event_name': 'Stop', 'session_id': 'real', 'sessionId': 'other'}, 'SessionEnd')
+        self.assertEqual(event['hook_event_name'], 'Stop')
+        self.assertEqual(event['session_id'], 'real')
+
+    def test_a_laptop_event_is_returned_untouched(self):
+        original = {'sessionId': 's1', 'transcriptPath': '/t.jsonl'}
+        self.assertIs(self._normalize(original, 'Stop', cloud=False), original)
+
+
 class TestGithubActor(unittest.TestCase):
     """The sandbox names only the bot; the requester is the commit co-author."""
 

@@ -4203,6 +4203,26 @@ CLOUD_EVENT_NAMES = {
 }
 
 
+def _normalize_cloud_event(event, event_name):
+    """Give a cloud payload the field names every audit-log reader matches on.
+
+    The rows are written to the audit log as they arrive, and the cloud agent sends no
+    hook_event_name at all and camelCases the rest. Left raw, the turn-start, prompt,
+    session-model and previous-Stop lookups all match nothing — and a Stop with no floor
+    reports the session's whole usage as that turn's.
+    """
+    if not RUNNING_CLOUD or not isinstance(event, dict):
+        return event
+    filled = {}
+    if event_name and not event.get('hook_event_name'):
+        filled['hook_event_name'] = event_name
+    for snake, camel in (('session_id', 'sessionId'), ('transcript_path', 'transcriptPath')):
+        value = event.get(camel)
+        if not event.get(snake) and value:
+            filled[snake] = value
+    return dict(event, **filled) if filled else event
+
+
 def _copilot_event_name(event):
     name = event.get('hook_event_name') or event.get('hookEventName')
     if name:
@@ -7570,6 +7590,7 @@ def main():
             return
 
         event_name = _copilot_event_name(event)
+        event = _normalize_cloud_event(event, event_name)
 
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
@@ -7620,10 +7641,8 @@ def main():
             # reading only the snake_case name would cost the exchange its start time and
             # its model attribution.
             session_id = event.get('session_id') or event.get('sessionId')
-            # The cloud agent names it transcriptPath, so reading only the snake_case key
-            # leaves the exchange with nothing to parse. _copilot_transcript_path takes either.
-            if not event.get('transcript_path'):
-                recovered = _copilot_transcript_path(event)
+            if event_name == 'SessionEnd' and not event.get('transcript_path'):
+                recovered = _transcript_path_for_session(event)
                 if recovered:
                     event = dict(event, transcript_path=recovered)
             # Watermark key mirrors the exchange's session fallback, so get/record stay
