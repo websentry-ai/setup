@@ -4256,6 +4256,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'tool_use',
+        'agent_surface': copilot_surface(event.get('transcript_path')),
         'pre_tool_use_data': {
             'tool_name': canonical,
             'command': command,
@@ -4375,6 +4376,7 @@ def _evaluate_user_prompt_policy(event, api_key):
         'unbound_app_label': 'copilot',
         'model': model,
         'event_name': 'user_prompt',
+        'agent_surface': copilot_surface(event.get('transcript_path')),
         'messages': [{'role': 'user', 'content': prompt}] if prompt else [],
         'pre_tool_use_data': {'tool_name': '', 'command': '', 'metadata': metadata},
     }

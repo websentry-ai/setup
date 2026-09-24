@@ -942,3 +942,36 @@ class SurfaceLabel(unittest.TestCase):
     def test_no_transcript_path_names_nothing(self):
         self.assertIsNone(unbound.copilot_surface(None))
         self.assertIsNone(unbound.copilot_surface(""))
+
+
+class PretoolSurface(unittest.TestCase):
+    """A blocked call posts its own envelope, so a session filtered by surface would
+    otherwise return its turns and not what interrupted them."""
+
+    def _posted(self, event):
+        captured = {}
+
+        def gw(request_body, api_key):
+            captured.update(request_body)
+            return {"decision": "allow"}
+
+        with patch.object(unbound, "send_to_hook_api", gw), \
+                patch.object(unbound, "log_error"):
+            unbound.process_pre_tool_use(event, "K")
+        return captured
+
+    def _event(self, transcript_path):
+        return {"hook_event_name": "PreToolUse", "tool_name": "Bash",
+                "tool_input": {"command": "ls"}, "cwd": ".", "session_id": "s",
+                "transcript_path": transcript_path}
+
+    def test_a_blocked_call_names_the_surface_it_came_from(self):
+        self.assertEqual(
+            self._posted(self._event("/h/.copilot/session-state/c-1/events.jsonl"))
+            .get("agent_surface"), "cli")
+        self.assertEqual(
+            self._posted(self._event("/h/Code/User/.../transcripts/s-1.jsonl"))
+            .get("agent_surface"), "vscode")
+
+    def test_no_transcript_path_names_nothing(self):
+        self.assertIsNone(self._posted(self._event(None)).get("agent_surface"))
