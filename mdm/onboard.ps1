@@ -66,7 +66,9 @@
     Invoke-WebRequest -Uri "https://getunbound.ai/setup/mdm/onboard.ps1" -OutFile onboard.ps1; .\onboard.ps1 -Clear
 
 .NOTES
-    Requires: Python 3, Administrator privileges
+    Requires: Windows, Python 3, Administrator privileges.
+    On macOS or Linux use the Python onboarding command instead:
+      sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --api-key YOUR_ADMIN_API_KEY
     URL: https://raw.githubusercontent.com/websentry-ai/setup/main/mdm/onboard.py
 #>
 
@@ -134,6 +136,16 @@ function Get-OnboardScript {
 
 # Main execution
 function Main {
+    # Windows only. Test-Administrator calls WindowsIdentity, which PowerShell 7 on
+    # macOS/Linux rejects with "Windows Principal functionality is not supported on
+    # this platform" - a stack trace that hides the real problem (wrong installer
+    # for the OS). Windows PowerShell 5.1 has no Platform key, so the guard is a
+    # no-op there; PowerShell 7 reports Win32NT on Windows and Unix elsewhere.
+    if ($PSVersionTable.Platform -and $PSVersionTable.Platform -ne 'Win32NT') {
+        $unixHint = 'sudo python3 -c "$(curl -fsSL https://getunbound.ai/setup/mdm/onboard)" --api-key YOUR_ADMIN_API_KEY'
+        Exit-WithError ("onboard.ps1 is the Windows installer but this is PowerShell on $($PSVersionTable.Platform). On macOS or Linux run: " + $unixHint)
+    }
+
     # Check administrator privileges
     if (-not (Test-Administrator)) {
         Exit-WithError "This script requires administrator privileges. Right-click PowerShell -> Run as Administrator, then rerun."
