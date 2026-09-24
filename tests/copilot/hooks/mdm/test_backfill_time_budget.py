@@ -71,3 +71,39 @@ class TestTheUploadStopsAtItsDeadline(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChunkStartedUnderTheDeadline(unittest.TestCase):
+    """The per-session check lets a chunk begin under the budget and then spend three
+    HTTP calls past it, which is what reaches onboard.py's kill. The clock here runs out
+    after that check and before the upload, which the session check alone cannot see."""
+
+    def _send(self, expiries):
+        uploaded = []
+        calls = iter(expiries)
+
+        def clock(_deadline):
+            return next(calls, True)
+
+        with patch.object(mdm, "_backfill_upload_chunk",
+                          lambda *a, **k: uploaded.append(a[2]) or True), \
+                patch.object(mdm, "_backfill_out_of_time", clock):
+            sent, chunks_sent, failed = mdm._backfill_send_sessions(
+                "k", "https://b",
+                [{"session_id": "S1", "entries": [
+                    {"type": "user.message", "data": {"content": "x"}},
+                    {"type": "assistant.message", "data": {"content": "y"}}]}],
+                deadline=1.0)
+        return uploaded, sent, failed
+
+    def test_a_chunk_is_not_uploaded_when_the_budget_goes_mid_session(self):
+        # False at the session check, True by the flush: the window this closes.
+        uploaded, sent, failed = self._send([False, True])
+        self.assertEqual(uploaded, [])
+        self.assertEqual(sent, 0)
+        self.assertGreater(failed, 0, "the remainder must hold the cutoff")
+
+    def test_a_chunk_still_uploads_inside_the_budget(self):
+        uploaded, sent, failed = self._send([False, False])
+        self.assertEqual(len(uploaded), 1)
+        self.assertEqual((sent, failed), (1, 0))

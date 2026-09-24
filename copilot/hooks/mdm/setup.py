@@ -1692,7 +1692,10 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         if not current_chunk:
             return
         chunks_total += 1
-        if _backfill_upload_chunk(api_key, backend_url, current_chunk, forced, backfilled):
+        # Checked here rather than only per session: a chunk that started under the
+        # deadline still spends three HTTP calls against onboard.py's kill.
+        if (not _backfill_out_of_time(deadline)
+                and _backfill_upload_chunk(api_key, backend_url, current_chunk, forced, backfilled)):
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))
