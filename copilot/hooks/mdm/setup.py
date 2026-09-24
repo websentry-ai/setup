@@ -2615,10 +2615,12 @@ def main():
     # Ahead of the backfill: onboard.py allows one installer 600s for everything, and a
     # re-walk is bounded by session count rather than time. The sweep is the only delivery
     # Visual Studio turns ever get, while the backfill replays history that keeps.
-    # Not gated on backfill_mode: the flag only sets how far the first sweep reaches back.
+    # seed_history reaches further back and tags what it finds historical, which skips the
+    # checks that run on a live turn. --backfill could not reach this installer before, so
+    # leaving it wired would have turned that on as a side effect of enabling the re-walk.
     if success:
         run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
-                                device_serial=device_id, seed_history=backfill_mode)
+                                device_serial=device_id, seed_history=False)
 
     if success and backfill_mode:
         run_backfill(api_key, base_url, user_homes, script_text)

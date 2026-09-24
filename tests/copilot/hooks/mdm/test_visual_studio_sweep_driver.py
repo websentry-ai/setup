@@ -216,3 +216,16 @@ class SlicerDropAccounting(unittest.TestCase):
         slices = list(mdm._backfill_slice_session(session, 100000, dropped))
         self.assertEqual(dropped, set())
         self.assertEqual(len(slices), 1)
+
+
+class SeedHistoryIsNotWiredToBackfill(unittest.TestCase):
+    def test_the_installer_never_asks_the_sweep_to_seed(self):
+        """--backfill reaches this installer now, and seeding tags recent turns historical,
+        which skips the checks a live turn gets."""
+        source = (Path(mdm.__file__).parent / "setup.py").read_text() \
+            if hasattr(mdm, "__file__") and mdm.__file__ else None
+        if source is None:
+            import pathlib
+            source = pathlib.Path("copilot/hooks/mdm/setup.py").read_text()
+        self.assertIn("seed_history=False", source)
+        self.assertNotIn("seed_history=backfill_mode", source)
