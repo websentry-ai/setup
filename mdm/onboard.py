@@ -77,13 +77,12 @@ DISCOVERY_KILL_GRACE_SECONDS = 120
 
 # (display_name, url, supports_backfill, supports_skip_managed_settings). Only tools
 # whose flag is True get `--backfill` appended. Cursor and Augment have no historical
-# transcript store; Copilot's is held back in its own installer's BACKFILL_ENABLED.
-# `--skip-managed-settings` is Claude Code's alone.
+# transcript store. `--skip-managed-settings` is Claude Code's alone.
 TOOLS = [
     ("Claude Code",    f"{_RAW_SETUP}/claude-code/hooks/mdm/setup.py", True,  True),
     ("Cursor",         f"{_RAW_SETUP}/cursor/mdm/setup.py",            False, False),
     ("Codex",          f"{_RAW_SETUP}/codex/hooks/mdm/setup.py",       True,  False),
-    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     False, False),
+    ("GitHub Copilot", f"{_RAW_SETUP}/copilot/hooks/mdm/setup.py",     True,  False),
     ("Augment",        f"{_RAW_SETUP}/augment/hooks/mdm/setup.py",     False, False),
 ]
 DISCOVERY_INSTALL_SH = f"{_RAW_DISCOVERY}/install.sh"
