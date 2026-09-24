@@ -37,6 +37,9 @@ BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 # onboard.py SIGKILLs each installer at 600s; stop first, or the kill fails the whole step.
 BACKFILL_TIME_BUDGET_SECONDS = 420
+# Collected sessions upload past that budget: a profile whose walk alone outlasts it would
+# otherwise be re-walked and discarded on every run.
+BACKFILL_UPLOAD_GRACE_SECONDS = 120
 # Anchored at process start: the hook install and the Visual Studio sweep spend the same 600s.
 _INSTALLER_STARTED_AT = time.monotonic()
 # Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
@@ -1734,8 +1737,9 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
     by device, so all profiles' history is seeded under that single key — the
     same model as install, which configures every user profile.
 
-    `deadline` is a time.monotonic() instant past which no further profile or chunk is
-    started; a profile left unwalked keeps its cutoff and is picked up by the next run."""
+    `deadline` is a time.monotonic() instant past which no further profile is walked; a
+    profile left unwalked keeps its cutoff and is picked up by the next run. Uploading
+    what was already walked runs to BACKFILL_UPLOAD_GRACE_SECONDS beyond it."""
     if not BACKFILL_ENABLED:
         debug_print("backfill is disabled for this tool — skipping")
         return
@@ -1790,11 +1794,12 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         print(f"[backfill] Found {total} past sessions. Uploading (this may take a few minutes)...")
         sessions_sent = 0
         chunks_failed = 0
+        upload_deadline = None if deadline is None else deadline + BACKFILL_UPLOAD_GRACE_SECONDS
         for batch, forced in ((forced_sessions, True), (sessions, False)):
             if not batch:
                 continue
             sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced,
-                                                      deadline=deadline)
+                                                      deadline=upload_deadline)
             sessions_sent += sent
             chunks_failed += failed
 

@@ -107,3 +107,50 @@ class ChunkStartedUnderTheDeadline(unittest.TestCase):
         uploaded, sent, failed = self._send([False, False])
         self.assertEqual(len(uploaded), 1)
         self.assertEqual((sent, failed), (1, 0))
+
+
+class WorkAlreadyWalkedIsNotDiscarded(unittest.TestCase):
+    """The collect loop checks the budget before each profile, so a profile whose walk
+    alone outlasts it leaves the deadline expired with sessions in hand. Sharing that
+    deadline with the upload threw them away and held the cutoff, so the next run walked
+    and discarded the same work again."""
+
+    def _run(self, walk_seconds, deadline):
+        clock = {"t": 0.0}
+        uploaded, cutoffs = [], []
+
+        def _fake_run_as_user(username, fn, *args, **kwargs):
+            if fn is mdm._backfill_collect_sessions:
+                clock["t"] += walk_seconds
+                return ([{"session_id": username, "entries": [
+                    {"type": "user.message", "data": {"content": "p"}},
+                    {"type": "assistant.message", "data": {"content": "a"}}]}], False, False)
+            if fn is mdm._backfill_write_cutoff:
+                cutoffs.append(username)
+            return None
+
+        with patch.object(mdm, "_run_as_user", _fake_run_as_user), \
+                patch.object(mdm, "_backfill_force_config", lambda *a: (None, None)), \
+                patch.object(mdm, "_backfill_upload_chunk",
+                             lambda *a, **k: uploaded.append(a[2]) or True), \
+                patch.object(mdm.time, "monotonic", lambda: clock["t"]):
+            mdm.run_backfill("k", "https://b",
+                             [("alice", Path("/h/alice")), ("bob", Path("/h/bob"))],
+                             deadline=deadline)
+        return uploaded, cutoffs
+
+    def test_a_walk_that_overruns_still_uploads_what_it_collected(self):
+        uploaded, cutoffs = self._run(walk_seconds=430.0, deadline=420.0)
+        self.assertEqual(len(uploaded), 1, "the walked profile's sessions must be sent")
+        self.assertEqual(cutoffs, ["alice"], "and its cutoff must advance, or it repeats")
+
+    def test_the_grace_window_is_not_unbounded(self):
+        # 541s is one second past the shipped 420 + 120, written out rather than derived
+        # from the constant so that widening the grace has to fail here first.
+        uploaded, cutoffs = self._run(walk_seconds=541.0, deadline=420.0)
+        self.assertEqual(uploaded, [])
+        self.assertEqual(cutoffs, [])
+
+    def test_the_grace_leaves_margin_before_onboard_kills_the_installer(self):
+        self.assertLess(mdm.BACKFILL_TIME_BUDGET_SECONDS
+                        + mdm.BACKFILL_UPLOAD_GRACE_SECONDS, 600)
