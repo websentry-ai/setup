@@ -3248,11 +3248,18 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
     }
 
 
-MANAGED_SETTINGS_DIRS = (
-    Path('/Library/Application Support/ClaudeCode'),
-    Path('/etc/claude-code'),
-    Path(os.environ.get('ProgramFiles') or r'C:\Program Files') / 'ClaudeCode',
-)
+def _managed_settings_dirs():
+    """This OS's managed settings dir only, as the installer picks it. Listing every
+    OS's would make C:\\Program Files a path relative to the cwd on macOS and Linux."""
+    system = platform.system().lower()
+    if system == 'darwin':
+        return (Path('/Library/Application Support/ClaudeCode'),)
+    if system == 'windows':
+        return (Path(os.environ.get('ProgramFiles') or r'C:\Program Files') / 'ClaudeCode',)
+    return (Path('/etc/claude-code'),)
+
+
+MANAGED_SETTINGS_DIRS = _managed_settings_dirs()
 USER_SETTINGS_PATH = _CONFIG_DIR / 'settings.json'
 
 

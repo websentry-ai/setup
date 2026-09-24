@@ -322,9 +322,22 @@ class TestGatewayHostAsTheAccount(unittest.TestCase):
         self._settings("managed-settings.d/50-gateway.json", "https://new.acme.com")
         self.assertEqual(unbound.read_account_identity()["org_id"], "new.acme.com")
 
-    def test_windows_managed_settings_live_under_program_files(self):
-        self.assertIn("ClaudeCode", str(REAL_MANAGED_SETTINGS_DIRS[-1]))
-        self.assertNotIn("ProgramData", str(REAL_MANAGED_SETTINGS_DIRS[-1]))
+    def test_only_this_oss_managed_dir_is_read(self):
+        """Another OS's path would resolve against the working directory."""
+        self.assertEqual(len(REAL_MANAGED_SETTINGS_DIRS), 1)
+        self.assertTrue(REAL_MANAGED_SETTINGS_DIRS[0].is_absolute())
+
+    def test_each_os_gets_the_installers_managed_dir(self):
+        for system, expected in (("Darwin", "/Library/Application Support/ClaudeCode"),
+                                 ("Linux", "/etc/claude-code")):
+            with patch.object(unbound.platform, "system", return_value=system):
+                self.assertEqual(unbound._managed_settings_dirs(), (Path(expected),))
+        with patch.object(unbound.platform, "system", return_value="Windows"), \
+                patch.dict(os.environ, {"ProgramFiles": r"D:\Apps"}):
+            (windows,) = unbound._managed_settings_dirs()
+        self.assertIn("Apps", str(windows))
+        self.assertTrue(str(windows).endswith("ClaudeCode"))
+        self.assertNotIn("ProgramData", str(windows))
 
     def test_a_corrupt_settings_file_is_skipped(self):
         (self.tmp / "managed-settings.json").write_text("{not json", encoding="utf-8")
