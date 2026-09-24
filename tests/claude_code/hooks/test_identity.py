@@ -7,6 +7,7 @@ Covers:
 """
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,6 +16,8 @@ from unittest.mock import patch
 from tests.conftest import tool_module
 
 unbound = tool_module("claude-code/hooks")
+# Taken before any fixture redirects it.
+REAL_MANAGED_SETTINGS_DIRS = unbound.MANAGED_SETTINGS_DIRS
 class TestEmailDomain(unittest.TestCase):
     def test_returns_domain_for_normal_address(self):
         self.assertEqual(unbound._email_domain("alice@example.com"), "example.com")
@@ -253,6 +256,121 @@ class TestReadAccountIdentity(unittest.TestCase):
         self.assertEqual(result["auth_mode"], "subscription")
         self.assertEqual(result["org_id"], "org-x")
         self.assertIsNone(result["user_email"])
+
+
+class TestGatewayHostAsTheAccount(unittest.TestCase):
+    """Claude Code run through a company gateway has no Anthropic sign-in, so the
+    endpoint it talks to stands in as the account's org."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.claude_json = self.tmp / ".claude.json"
+        for target, value in (("CLAUDE_MCP_CONFIG_PATH", self.claude_json),
+                              ("USER_SETTINGS_PATH", self.tmp / "settings.json"),
+                              ("MANAGED_SETTINGS_DIRS", (self.tmp,))):
+            p = patch.object(unbound, target, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = patch.object(unbound, "_claude_desktop_support_dirs", return_value=[self.tmp])
+        p.start()
+        self.addCleanup(p.stop)
+        self.claude_json.write_text("{}", encoding="utf-8")
+
+    def _settings(self, name, base_url):
+        path = self.tmp / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"env": {"ANTHROPIC_BASE_URL": base_url}}), encoding="utf-8")
+
+    def test_the_env_base_url_host_is_the_org(self):
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal/v1/anthropic"}):
+            identity = unbound.read_account_identity()
+        self.assertEqual(identity["org_id"], "llm.acme.internal")
+        self.assertIsNone(identity["user_email"])
+
+    def test_managed_settings_supply_it_when_the_env_does_not(self):
+        self._settings("managed-settings.json", "https://gateway.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
+
+    def test_the_user_settings_are_the_last_resort(self):
+        self._settings("settings.json", "https://llm.acme.com:8080/proxy")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "llm.acme.com")
+
+    def test_unbounds_own_gateway_is_not_an_account(self):
+        """Our gateway installers point every customer's Claude Code at it."""
+        for url in ("https://api.getunbound.ai", "https://zendesk-gateway.getunbound.ai/v1"):
+            with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": url}):
+                self.assertIsNone(unbound.read_account_identity()["org_id"], url)
+
+    def test_the_hooks_own_tenant_gateway_is_not_an_account(self):
+        with patch.object(unbound, "UNBOUND_GATEWAY_URL", "https://gw.tenant.example"), \
+                patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://gw.tenant.example/anthropic"}):
+            self.assertIsNone(unbound.read_account_identity()["org_id"])
+
+    def test_a_loopback_proxy_is_not_an_account(self):
+        for url in ("http://localhost:4000", "http://127.0.0.1:8080"):
+            with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": url}):
+                self.assertIsNone(unbound.read_account_identity()["org_id"], url)
+
+    def test_the_env_wins_without_reading_any_settings_file(self):
+        """build_account_identity runs on the latency-critical pre-tool path."""
+        with patch.object(unbound, "_settings_base_url", side_effect=AssertionError("read")), \
+                patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
+            self.assertEqual(unbound._gateway_host(), "llm.acme.internal")
+
+    def test_an_unbound_env_url_is_not_overridden_by_stale_settings(self):
+        """Claude Code uses the env value, so a settings file must not replace it."""
+        self._settings("settings.json", "https://llm.acme.com")
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://api.getunbound.ai"}):
+            self.assertIsNone(unbound.read_account_identity()["org_id"])
+
+    def test_only_the_host_is_kept(self):
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://user:secret@llm.acme.com:8443/path?key=abc"}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "llm.acme.com")
+
+    def test_a_signed_in_account_keeps_its_own_org(self):
+        self.claude_json.write_text(json.dumps({"oauthAccount": {
+            "organizationUuid": "org-abc", "emailAddress": "dev@acme.com"}}), encoding="utf-8")
+        with patch.dict(os.environ, {"ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
+            self.assertEqual(unbound.read_account_identity()["org_id"], "org-abc")
+
+    def test_no_base_url_anywhere_means_no_org(self):
+        self.assertIsNone(unbound.read_account_identity()["org_id"])
+
+    def test_an_auth_token_marks_it_an_api_key_setup(self):
+        with patch.dict(os.environ, {"ANTHROPIC_AUTH_TOKEN": "t", "ANTHROPIC_BASE_URL": "https://llm.acme.internal"}):
+            self.assertEqual(unbound.read_account_identity()["auth_mode"], "api_key")
+
+    def test_a_managed_drop_in_is_read(self):
+        """The MDM install writes managed-settings.d/unbound.json, not the base file."""
+        self._settings("managed-settings.d/unbound.json", "https://gateway.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
+
+    def test_a_drop_in_overrides_the_base_managed_file(self):
+        self._settings("managed-settings.json", "https://old.acme.com")
+        self._settings("managed-settings.d/50-gateway.json", "https://new.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "new.acme.com")
+
+    def test_only_this_oss_managed_dir_is_read(self):
+        """Another OS's path would resolve against the working directory."""
+        self.assertEqual(len(REAL_MANAGED_SETTINGS_DIRS), 1)
+        self.assertTrue(REAL_MANAGED_SETTINGS_DIRS[0].is_absolute())
+
+    def test_each_os_gets_the_installers_managed_dir(self):
+        for system, expected in (("Darwin", "/Library/Application Support/ClaudeCode"),
+                                 ("Linux", "/etc/claude-code")):
+            with patch.object(unbound.platform, "system", return_value=system):
+                self.assertEqual(unbound._managed_settings_dirs(), (Path(expected),))
+        with patch.object(unbound.platform, "system", return_value="Windows"), \
+                patch.dict(os.environ, {"ProgramFiles": r"D:\Apps"}):
+            (windows,) = unbound._managed_settings_dirs()
+        self.assertIn("Apps", str(windows))
+        self.assertTrue(str(windows).endswith("ClaudeCode"))
+        self.assertNotIn("ProgramData", str(windows))
+
+    def test_a_corrupt_settings_file_is_skipped(self):
+        (self.tmp / "managed-settings.json").write_text("{not json", encoding="utf-8")
+        self._settings("settings.json", "https://gateway.acme.com")
+        self.assertEqual(unbound.read_account_identity()["org_id"], "gateway.acme.com")
 
 
 class TestBuildAccountIdentity(unittest.TestCase):

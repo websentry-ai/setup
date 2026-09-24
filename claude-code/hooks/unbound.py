@@ -3210,7 +3210,8 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
             else:
                 email = None
             auth_mode = 'subscription'
-        elif os.getenv('ANTHROPIC_API_KEY') or (config.get('customApiKeyResponses') or {}).get('approved'):
+        elif (os.getenv('ANTHROPIC_API_KEY') or os.getenv('ANTHROPIC_AUTH_TOKEN')
+              or (config.get('customApiKeyResponses') or {}).get('approved')):
             auth_mode = 'api_key'
     except Exception:
         pass
@@ -3232,6 +3233,12 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
             email = _desktop_session_email()
         except Exception:
             email = None
+    if not org_id and not email:
+        # No sign-in to name: the endpoint it talks to (a company gateway) is the account.
+        try:
+            org_id = _gateway_host()
+        except Exception:
+            org_id = None
     return {
         'org_id': org_id,
         'plan': plan,
@@ -3239,6 +3246,62 @@ def read_account_identity(event: Optional[Dict] = None) -> Dict:
         'user_email': email,
         'email_domain': _email_domain(email),
     }
+
+
+def _managed_settings_dirs():
+    """This OS's managed settings dir only, as the installer picks it. Listing every
+    OS's would make C:\\Program Files a path relative to the cwd on macOS and Linux."""
+    system = platform.system().lower()
+    if system == 'darwin':
+        return (Path('/Library/Application Support/ClaudeCode'),)
+    if system == 'windows':
+        return (Path(os.environ.get('ProgramFiles') or r'C:\Program Files') / 'ClaudeCode',)
+    return (Path('/etc/claude-code'),)
+
+
+MANAGED_SETTINGS_DIRS = _managed_settings_dirs()
+USER_SETTINGS_PATH = _CONFIG_DIR / 'settings.json'
+
+
+def _settings_base_url(path: Path) -> Optional[str]:
+    try:
+        env = json.loads(path.read_text(encoding='utf-8')).get('env')
+    except Exception:
+        return None
+    url = env.get('ANTHROPIC_BASE_URL') if isinstance(env, dict) else None
+    return url if isinstance(url, str) and url.strip() else None
+
+
+def _managed_base_url() -> Optional[str]:
+    url = None
+    for directory in MANAGED_SETTINGS_DIRS:
+        try:
+            dropins = sorted((directory / 'managed-settings.d').glob('*.json'))
+        except Exception:
+            dropins = []
+        for path in [directory / 'managed-settings.json', *dropins]:
+            url = _settings_base_url(path) or url
+    return url
+
+
+def _names_no_account(host: str) -> bool:
+    """Unbound's own gateway and loopback proxies are shared by everyone, so they
+    would lump every developer into one fake account."""
+    ours = urlparse(UNBOUND_GATEWAY_URL).hostname or ''
+    return (host == ours or host == 'getunbound.ai' or host.endswith('.getunbound.ai')
+            or host in ('localhost', '0.0.0.0', '::1') or host.startswith('127.'))
+
+
+def _gateway_host() -> Optional[str]:
+    """Host of the ANTHROPIC_BASE_URL Claude Code uses: the env, else managed settings
+    (drop-ins override the base file), else the user's settings.json."""
+    url = os.environ.get('ANTHROPIC_BASE_URL')
+    if not (isinstance(url, str) and url.strip()):
+        url = _managed_base_url() or _settings_base_url(USER_SETTINGS_PATH)
+    host = urlparse(url.strip()).hostname if isinstance(url, str) and url.strip() else None
+    if not host or _names_no_account(host.lower()):
+        return None
+    return host.lower()
 
 
 # DMI/BIOS serial fields are often unset on VMs and OEM boards and come back as a
