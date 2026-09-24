@@ -888,3 +888,34 @@ class LinkIdentity(unittest.TestCase):
                              unbound._vs_file_key(planted.stat()))
             sessions, _, _ = self._collect(home)
         self.assertEqual(len(sessions), 1)
+
+
+class HardLinkedFiles(unittest.TestCase):
+    """A hard link is an ordinary regular file: lstat, the path check and fstat all agree,
+    so nothing but the link count separates it from the file it aliases."""
+
+    def _collect(self, home):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                patch.object(unbound, "log_error"):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_session_hard_linked_from_outside_the_root_is_not_read(self):
+        with tempfile.TemporaryDirectory() as home:
+            outside = Path(home) / "outside"
+            outside.mkdir()
+            secret = outside / "secret"
+            secret.write_bytes(_prompt("stolen") + _reply("secret contents"))
+            planted = _session_file(home, b"")
+            planted.unlink()
+            os.link(secret, planted)
+            sessions, _, _ = self._collect(home)
+        self.assertEqual(sessions, [], "a link count above one must be refused")
+
+    def test_an_ordinary_file_has_one_link_and_is_read(self):
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, _prompt("ask") + _reply("answer"))
+            sessions, _, _ = self._collect(home)
+        self.assertEqual(len(sessions), 1)

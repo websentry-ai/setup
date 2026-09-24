@@ -5948,14 +5948,22 @@ def _vs_is_link(info):
 
 
 def _vs_plain_stat(path):
-    """A regular file's own identity, or None. Never follows: a stat through a link would
-    record what the link points at, and the check at the read would then confirm it."""
+    """A regular file's own identity, or None.
+
+    Narrows the race rather than ending it. A no-follow stat keeps the final component
+    from supplying an identity that is not its own, and a link count above one rejects a
+    file reachable from outside the tree. Neither covers a directory above it: every
+    level of the session path belongs to the user, so a junction there still resolves the
+    walk and the read to different files. Only running as that user closes it."""
     try:
         info = os.lstat(str(path))
     except OSError:
         return None
     if _vs_is_link(info):
         log_error('visual studio path is a link: %s' % path, 'visual_studio')
+        return None
+    if getattr(info, 'st_nlink', 1) > 1:
+        log_error('visual studio path is hard-linked: %s' % path, 'visual_studio')
         return None
     return info if stat.S_ISREG(info.st_mode) else None
 
@@ -5972,7 +5980,8 @@ def _vs_open_verified(path, root, key):
         log_error('visual studio file unreadable (%s): %s' % (path, e), 'visual_studio')
         return None
     try:
-        if _vs_file_key(os.fstat(handle.fileno())) != key:
+        opened = os.fstat(handle.fileno())
+        if getattr(opened, 'st_nlink', 1) > 1 or _vs_file_key(opened) != key:
             log_error('visual studio file changed under the walk: %s' % path, 'visual_studio')
             handle.close()
             return None
