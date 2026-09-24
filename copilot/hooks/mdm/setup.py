@@ -35,9 +35,8 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
-# The hook and the control plane now derive a turn's request id the same way, from the
-# transcript's own id for it, so a re-walk resolves onto the rows the hook already wrote
-# instead of duplicating them.
+# Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
+# the hook already wrote.
 BACKFILL_ENABLED = True
 
 # Separate from BACKFILL_ENABLED: Visual Studio has no live hook and so no rows to duplicate.
@@ -2612,12 +2611,9 @@ def main():
                               hook_hash=hook_script_hash(user_homes[0][1] / ".copilot" / "hooks" / "unbound.py"),
                               install_mode="mdm")
 
-    # Ahead of the backfill: onboard.py allows one installer 600s for everything, and a
-    # re-walk is bounded by session count rather than time. The sweep is the only delivery
-    # Visual Studio turns ever get, while the backfill replays history that keeps.
-    # seed_history reaches further back and tags what it finds historical, which skips the
-    # checks that run on a live turn. --backfill could not reach this installer before, so
-    # leaving it wired would have turned that on as a side effect of enabling the re-walk.
+    # Before the re-walk: onboard.py allows one installer 600s, and the re-walk is bounded
+    # by session count rather than time. seed_history stays off, or a --backfill install
+    # would tag recent Visual Studio turns historical and skip the live checks.
     if success:
         run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
                                 device_serial=device_id, seed_history=False)

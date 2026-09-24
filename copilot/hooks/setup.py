@@ -30,9 +30,8 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
-# The hook and the control plane now derive a turn's request id the same way, from the
-# transcript's own id for it, so a re-walk resolves onto the rows the hook already wrote
-# instead of duplicating them.
+# Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
+# the hook already wrote.
 BACKFILL_ENABLED = True
 
 DEBUG = False
