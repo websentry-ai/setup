@@ -1174,6 +1174,14 @@ def stop_session_key(event):
     return event.get('session_id') or event.get('sessionId')
 
 
+def copilot_surface(transcript_path):
+    """Which Copilot wrote this turn. The two stores are the only thing that says so,
+    and the same check already picks which one to read usage from."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    return 'cli' if Path(transcript_path).stem == 'events' else 'vscode'
+
+
 def cleanup_old_logs():
     """Manage log file size by keeping only the most recent session's entries once the
     audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
@@ -5754,6 +5762,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
+        'surface': copilot_surface(transcript_path),
         'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
@@ -6316,7 +6325,8 @@ def _vs_chat_log_turns(body):
 
 
 def _vs_session(sessions, session_id):
-    return sessions.setdefault(session_id, {'session_id': session_id, 'turns': {}})
+    return sessions.setdefault(
+        session_id, {'session_id': session_id, 'surface': 'visual_studio', 'turns': {}})
 
 
 def _vs_turn_marker(conversation_id, prompt, index):

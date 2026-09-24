@@ -919,3 +919,25 @@ class HardLinkedFiles(unittest.TestCase):
             _session_file(home, _prompt("ask") + _reply("answer"))
             sessions, _, _ = self._collect(home)
         self.assertEqual(len(sessions), 1)
+
+
+class SurfaceLabel(unittest.TestCase):
+    def test_a_swept_session_names_visual_studio(self):
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, _prompt("ask") + _reply("answer"))
+            with patch.object(unbound, "_is_windows", return_value=True), \
+                    patch.object(unbound, "_vs_installed", return_value=True), \
+                    patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                    patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                    patch.object(unbound, "log_error"):
+                sessions, _, _ = unbound.collect_visual_studio_sessions(0)
+        self.assertEqual(sessions[0]["surface"], "visual_studio")
+
+    def test_the_two_hook_surfaces_are_told_apart_by_their_store(self):
+        self.assertEqual(unbound.copilot_surface("/h/.copilot/session-abc/events"), "cli")
+        self.assertEqual(
+            unbound.copilot_surface("/h/Code/User/globalStorage/state.vscdb"), "vscode")
+
+    def test_no_transcript_path_names_nothing(self):
+        self.assertIsNone(unbound.copilot_surface(None))
+        self.assertIsNone(unbound.copilot_surface(""))
