@@ -1630,7 +1630,7 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int, dropped: Option
                 'entries': candidate_entries,
             }
             # Per-session, so every slice carries it or the slice maps to no device.
-            for key in ('device_serial', 'user_email'):
+            for key in ('device_serial', 'user_email', 'agent_surface'):
                 if session.get(key):
                     candidate[key] = session[key]
             usage_slice = session_usage[

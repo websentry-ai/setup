@@ -1174,6 +1174,14 @@ def stop_session_key(event):
     return event.get('session_id') or event.get('sessionId')
 
 
+def copilot_surface(transcript_path):
+    """Which Copilot wrote this turn. The two stores are the only thing that says so,
+    and the same check already picks which one to read usage from."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    return 'cli' if Path(transcript_path).stem == 'events' else 'vscode'
+
+
 def cleanup_old_logs():
     """Manage log file size by keeping only the most recent session's entries once the
     audit log exceeds AUDIT_LOG_TOTAL_LIMIT. The _unbound_forwarded watermark markers are
@@ -5754,6 +5762,7 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # Turn-level fallback: rows without a per-call project (the user
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
+        'agent_surface': copilot_surface(transcript_path),
         'account_identity': build_account_identity(probe=True),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
@@ -5775,6 +5784,8 @@ _VS_MAX_METADATA_REQUESTS = 200
 _VS_MAX_LOG_BYTES = 64 << 20
 # Ceiling across all conversations in one log, so many chats cannot exhaust memory.
 _VS_MAX_KEPT_REQUESTS = 2000
+# NTFS marks junctions and symlinks with it; absent from stat() on other platforms.
+_VS_REPARSE_POINT = getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400)
 # Bounds container nesting; real transcripts sit well under ten levels.
 _VS_MAX_NESTING = 64
 # Bounds the walk so a pathological tree cannot stall an MDM install.
@@ -5938,6 +5949,34 @@ def _vs_file_key(info):
     return (info.st_dev, info.st_ino)
 
 
+def _vs_is_link(info):
+    """Whether a no-follow stat landed on a symlink or an NTFS reparse point."""
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    return bool(getattr(info, 'st_file_attributes', 0) & _VS_REPARSE_POINT)
+
+
+def _vs_plain_stat(path):
+    """A regular file's own identity, or None.
+
+    Narrows the race rather than ending it. A no-follow stat keeps the final component
+    from supplying an identity that is not its own, and a link count above one rejects a
+    file reachable from outside the tree. Neither covers a directory above it: every
+    level of the session path belongs to the user, so a junction there still resolves the
+    walk and the read to different files. Only running as that user closes it."""
+    try:
+        info = os.lstat(str(path))
+    except OSError:
+        return None
+    if _vs_is_link(info):
+        log_error('visual studio path is a link: %s' % path, 'visual_studio')
+        return None
+    if getattr(info, 'st_nlink', 1) > 1:
+        log_error('visual studio path is hard-linked: %s' % path, 'visual_studio')
+        return None
+    return info if stat.S_ISREG(info.st_mode) else None
+
+
 def _vs_open_verified(path, root, key):
     """The file the walk cleared, or None. Checking the path again still races a junction
     planted in between, so the open handle is checked instead."""
@@ -5950,7 +5989,8 @@ def _vs_open_verified(path, root, key):
         log_error('visual studio file unreadable (%s): %s' % (path, e), 'visual_studio')
         return None
     try:
-        if _vs_file_key(os.fstat(handle.fileno())) != key:
+        opened = os.fstat(handle.fileno())
+        if getattr(opened, 'st_nlink', 1) > 1 or _vs_file_key(opened) != key:
             log_error('visual studio file changed under the walk: %s' % path, 'visual_studio')
             handle.close()
             return None
@@ -5986,11 +6026,8 @@ def _iter_vs_sessions(cutoff_mtime, budget=None):
                     if key in seen:
                         continue
                     seen.add(key)
-                    try:
-                        info = path.stat()
-                    except OSError:
-                        continue
-                    if not stat.S_ISREG(info.st_mode) or info.st_size > _VS_MAX_SESSION_BYTES:
+                    info = _vs_plain_stat(path)
+                    if info is None or info.st_size > _VS_MAX_SESSION_BYTES:
                         continue
                     if info.st_mtime < cutoff_mtime:
                         continue
@@ -6103,11 +6140,8 @@ def _iter_vs_chat_logs(cutoff_mtime):
     try:
         real_root = Path(os.path.realpath(str(root)))
         for path in root.glob('*_VSGitHubCopilot.chat.log'):
-            try:
-                info = path.stat()
-            except OSError:
-                continue
-            if not stat.S_ISREG(info.st_mode) or info.st_mtime < cutoff_mtime:
+            info = _vs_plain_stat(path)
+            if info is None or info.st_mtime < cutoff_mtime:
                 continue
             # A junction out of the tree would be read with the sweep's own rights.
             if not _vs_within(real_root, path):
@@ -6291,7 +6325,8 @@ def _vs_chat_log_turns(body):
 
 
 def _vs_session(sessions, session_id):
-    return sessions.setdefault(session_id, {'session_id': session_id, 'turns': {}})
+    return sessions.setdefault(
+        session_id, {'session_id': session_id, 'agent_surface': 'visual_studio', 'turns': {}})
 
 
 def _vs_turn_marker(conversation_id, prompt, index):
