@@ -41,15 +41,19 @@ case "$SRC" in
 esac
 
 if [ ! -s "$HOOK" ]; then
-  curl -fsSL -m 20 "$SRC" -o "$HOOK" || fail "hook fetch failed from $SRC"
+  # A dropped transfer leaves a partial file that a later event would happily run.
+  curl -fsSL -m 20 "$SRC" -o "$HOOK" || { rm -f "$HOOK"; fail "hook fetch failed from $SRC"; }
+fi
 
-  if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
-    actual=$(sha256sum "$HOOK" 2>/dev/null | cut -d' ' -f1)
-    if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
-      rm -f "$HOOK"
-      fail "hook digest mismatch: expected $UNBOUND_HOOK_SHA256, got ${actual:-none}"
-    fi
+# Every event, not just the one that fetched: the cache sits in /tmp, which the
+# agent can write, so trusting it once would let the agent replace the hook that
+# polices it.
+if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
+  actual=$(sha256sum "$HOOK" 2>/dev/null | cut -d' ' -f1)
+  if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
+    rm -f "$HOOK"
+    fail "hook digest mismatch: expected $UNBOUND_HOOK_SHA256, got ${actual:-none}"
   fi
 fi
 
-exec python3 "$HOOK"
+UNBOUND_HOOK_EVENT="$EVENT" exec python3 "$HOOK"

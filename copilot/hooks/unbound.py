@@ -1601,7 +1601,10 @@ def _github_actor() -> Optional[str]:
             log_error('github actor: git log %s..HEAD failed rc=%s %s' % (
                 base, out.returncode, out.stderr.decode('utf-8', 'replace')[:200]), 'identity')
             return None
-        match = re.search(r'^Co-authored-by:\s*([^<\n]+)<',
+        # The login, not the display name before the '<': GitHub's noreply address
+        # carries it verbatim, and a display name is neither stable nor unique, so
+        # it would not join to anything when these sessions are later mapped to users.
+        match = re.search(r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>',
                           out.stdout.decode('utf-8', 'replace'), re.M | re.I)
         return (match.group(1).strip() or None) if match else None
     except Exception as e:
@@ -4165,10 +4168,26 @@ def transform_response_for_copilot_prompt(api_response):
     return {}
 
 
+# The cloud agent sends no event-name field at all - every payload is just the
+# event's own data - so the loader passes the registered name through and it is
+# mapped onto the names main() dispatches on.
+CLOUD_EVENT_NAMES = {
+    'sessionStart': 'SessionStart',
+    'userPromptSubmitted': 'UserPromptSubmit',
+    'preToolUse': 'PreToolUse',
+    'postToolUse': 'PostToolUse',
+    'agentStop': 'Stop',
+    'sessionEnd': 'SessionEnd',
+}
+
+
 def _copilot_event_name(event):
     name = event.get('hook_event_name') or event.get('hookEventName')
     if name:
         return name
+    declared = os.environ.get('UNBOUND_HOOK_EVENT')
+    if declared:
+        return CLOUD_EVENT_NAMES.get(declared, declared)
     # Copilot 1.0.82 omits the event-name field from userPromptTransformed,
     # while still sending both the original and transformed prompt fields.
     if isinstance(event.get('transformedPrompt'), str) and isinstance(event.get('prompt'), str):
