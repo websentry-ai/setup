@@ -99,6 +99,9 @@ WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'ne
 EDIT_TOOLS = {
     'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit',
     'replace_string_in_file', 'multi_replace_string_in_file',
+    # The cloud agent's own name for it. Unmapped, it canonicalises to nothing and
+    # both the repo gate and the policy evaluator wave the write through.
+    'edit',
 }
 
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
