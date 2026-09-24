@@ -42,8 +42,11 @@ fi
 # The cache sits in /tmp, which the agent can write. Without a digest we cannot tell a
 # planted hook from ours, so it is not reused at all and every event refetches.
 if [ -z "${UNBOUND_HOOK_SHA256:-}" ] || [ ! -s "$HOOK" ]; then
+  # -m 8, not 20: this fetch is spent before the hook's own 2x8s of gateway retries, and
+  # the total has to clear the preToolUse timeout, which defaults to 30s. Overrunning it
+  # gets the hook killed, and a killed preToolUse fails OPEN.
   # A dropped transfer leaves a partial file that a later event would happily run.
-  curl -fsSL -m 20 "$SRC" -o "$HOOK" || { rm -f "$HOOK"; fail "hook fetch failed from $SRC"; }
+  curl -fsSL -m 8 "$SRC" -o "$HOOK" || { rm -f "$HOOK"; fail "hook fetch failed from $SRC"; }
 fi
 
 # Every event, not just the one that fetched.
