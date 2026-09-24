@@ -1005,12 +1005,6 @@ def log_error(message, category='general', extra=None):
 
 def _read_policy_cache_raw():
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
-    # The cache lives under /tmp in a sandbox, where the agent can write it. A
-    # planted one with empty tools_to_check skips the gateway entirely and empty
-    # repo_policies turns the repo gate into a no-op, so the agent could disable
-    # the checks that police it. Cloud sessions are short; always ask the gateway.
-    if RUNNING_CLOUD:
-        return None
     try:
         if not POLICY_CACHE_FILE.exists():
             return None

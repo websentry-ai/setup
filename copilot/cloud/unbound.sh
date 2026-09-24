@@ -31,7 +31,10 @@ fail() {
 
 # Machines with the agent installed already report through their own hook; this
 # config is read by Copilot CLI there too, and both would send the same turn.
-if [ -f "$HOME/.copilot/hooks/unbound.py" ]; then
+# Never in a sandbox: there the agent can create that path itself and every later
+# tool call would skip the evaluator. COPILOT_AGENT_SESSION_ID comes from GitHub,
+# so the agent cannot clear it to look like a laptop.
+if [ -z "${COPILOT_AGENT_SESSION_ID:-}" ] && [ -f "$HOME/.copilot/hooks/unbound.py" ]; then
   echo '{}'
   exit 0
 fi
@@ -40,14 +43,15 @@ case "$SRC" in
   *__UNBOUND_HOOK_REF__*) fail "hook ref was never stamped; reinstall from copilot/cloud" ;;
 esac
 
-if [ ! -s "$HOOK" ]; then
+# The cache sits in /tmp, which the agent can write. With a digest we can tell a
+# planted hook from ours; without one we cannot, so the cache is not reused at all
+# and every event fetches the pinned commit fresh.
+if [ -z "${UNBOUND_HOOK_SHA256:-}" ] || [ ! -s "$HOOK" ]; then
   # A dropped transfer leaves a partial file that a later event would happily run.
   curl -fsSL -m 20 "$SRC" -o "$HOOK" || { rm -f "$HOOK"; fail "hook fetch failed from $SRC"; }
 fi
 
-# Every event, not just the one that fetched: the cache sits in /tmp, which the
-# agent can write, so trusting it once would let the agent replace the hook that
-# polices it.
+# Every event, not just the one that fetched.
 if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
   actual=$(sha256sum "$HOOK" 2>/dev/null | cut -d' ' -f1)
   if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
