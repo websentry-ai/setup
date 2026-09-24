@@ -1005,6 +1005,12 @@ def log_error(message, category='general', extra=None):
 
 def _read_policy_cache_raw():
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
+    # The cache lives under /tmp in a sandbox, where the agent can write it. A
+    # planted one with empty tools_to_check skips the gateway entirely and empty
+    # repo_policies turns the repo gate into a no-op, so the agent could disable
+    # the checks that police it. Cloud sessions are short; always ask the gateway.
+    if RUNNING_CLOUD:
+        return None
     try:
         if not POLICY_CACHE_FILE.exists():
             return None
@@ -1595,7 +1601,11 @@ def _github_actor() -> Optional[str]:
     if not base:
         return None
     try:
-        out = subprocess.run(['git', 'log', '%s..HEAD' % base, '--format=%B'],
+        # --first-parent --no-merges: a merge landing after the session started
+        # drags in other branches' commits, and their trailers name other people.
+        # Newest first, so the first match is this session's latest commit.
+        out = subprocess.run(['git', 'log', '%s..HEAD' % base,
+                              '--first-parent', '--no-merges', '--format=%B'],
                              capture_output=True, timeout=5)
         if out.returncode != 0:
             log_error('github actor: git log %s..HEAD failed rc=%s %s' % (
@@ -4026,6 +4036,12 @@ _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
 
 def _is_approval_retry(command):
     """True if a marker exists for this exact command and is fresh."""
+    # A sandbox has no approver, so it never legitimately reaches the retry path -
+    # and the marker lives under /tmp, which the agent can write. A planted one
+    # would start a poll that outlives the hook timeout, and a preToolUse killed
+    # by that timeout fails open.
+    if RUNNING_CLOUD:
+        return False
     try:
         if not _APPROVAL_MARKER_FILE.exists():
             return False
@@ -6913,8 +6929,11 @@ def main():
             # reading only the snake_case name would cost the exchange its start time and
             # its model attribution.
             session_id = event.get('session_id') or event.get('sessionId')
-            if event_name == 'SessionEnd' and not event.get('transcript_path'):
-                recovered = _transcript_path_for_session(event)
+            # The cloud agent names it transcriptPath, so reading only the snake_case
+            # key leaves the exchange with nothing to parse. _copilot_transcript_path
+            # takes either spelling and falls back to the session-state file on disk.
+            if not event.get('transcript_path'):
+                recovered = _copilot_transcript_path(event)
                 if recovered:
                     event = dict(event, transcript_path=recovered)
             # Watermark key mirrors the exchange's session fallback, so get/record stay
