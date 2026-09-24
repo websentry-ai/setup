@@ -98,7 +98,7 @@ class TestForceStaysScopedToTheProfilesBehind:
                 return collect_by_user[username]
             return None
 
-        def _fake_send(api_key, backend_url, sessions, forced=False):
+        def _fake_send(api_key, backend_url, sessions, forced=False, **kwargs):
             uploads.append((sorted(s["session_id"] for s in sessions), forced))
             return len(sessions), 1, 0
 

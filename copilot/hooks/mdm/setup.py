@@ -35,6 +35,10 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+# onboard.py SIGKILLs each installer at 600s; stop first, or the kill fails the whole step.
+BACKFILL_TIME_BUDGET_SECONDS = 420
+# Anchored at process start: the hook install and the Visual Studio sweep spend the same 600s.
+_INSTALLER_STARTED_AT = time.monotonic()
 # Both sides key a turn on the transcript's own id now, so a re-walk lands on the rows
 # the hook already wrote.
 BACKFILL_ENABLED = True
@@ -1664,12 +1668,19 @@ def _backfill_slice_session(session: Dict, max_chunk_bytes: int, dropped: Option
         start_idx = last_fit_end
 
 
+def _backfill_out_of_time(deadline: Optional[float]) -> bool:
+    return deadline is not None and time.monotonic() >= deadline
+
+
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
                             forced: bool = False,
-                            backfilled: bool = True) -> Tuple[int, int, int]:
+                            backfilled: bool = True,
+                            deadline: Optional[float] = None) -> Tuple[int, int, int]:
     """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts distinct
     input session_ids delivered whole: one landed slice proves nothing about the rest, and
-    counting a part-delivered session would advance the cutoff past what it never sent."""
+    counting a part-delivered session would advance the cutoff past what it never sent.
+
+    `deadline` is a time.monotonic() instant past which no further chunk is started."""
     chunks_total = 0
     chunks_sent = 0
     sessions_sent_ids: set = set()
@@ -1690,6 +1701,9 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
     dropped: set = set()
     for session in sessions:
+        if _backfill_out_of_time(deadline):
+            # The +1 books the abandoned remainder as unsent, so no cutoff moves past it.
+            return len(sessions_sent_ids - dropped), chunks_sent, chunks_total - chunks_sent + 1
         for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES, dropped):
             try:
                 slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
@@ -1709,12 +1723,16 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]],
-                 hook_source: Optional[str] = None) -> None:
+                 hook_source: Optional[str] = None,
+                 deadline: Optional[float] = None) -> None:
     """Walk every user's Copilot CLI + VS Code transcripts and seed historical sessions.
 
     MDM /get_application_api_key/ returns one per-device key and attribution is
     by device, so all profiles' history is seeded under that single key — the
-    same model as install, which configures every user profile."""
+    same model as install, which configures every user profile.
+
+    `deadline` is a time.monotonic() instant past which no further profile or chunk is
+    started; a profile left unwalked keeps its cutoff and is picked up by the next run."""
     if not BACKFILL_ENABLED:
         debug_print("backfill is disabled for this tool — skipping")
         return
@@ -1741,6 +1759,9 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         sessions = []
         collected_homes: List[Tuple[str, Path]] = []
         for username, home_dir in user_homes:
+            if _backfill_out_of_time(deadline):
+                print("[backfill] Out of time — unwalked profiles resume on the next run.")
+                break
             result = _run_as_user(username, _backfill_collect_sessions, home_dir,
                                   force_epoch, force_days)
             if result is None:
@@ -1769,7 +1790,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         for batch, forced in ((forced_sessions, True), (sessions, False)):
             if not batch:
                 continue
-            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
+            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced,
+                                                      deadline=deadline)
             sessions_sent += sent
             chunks_failed += failed
 
@@ -2611,15 +2633,16 @@ def main():
                               hook_hash=hook_script_hash(user_homes[0][1] / ".copilot" / "hooks" / "unbound.py"),
                               install_mode="mdm")
 
-    # Before the re-walk: onboard.py allows one installer 600s, and the re-walk is bounded
-    # by session count rather than time. seed_history stays off, or a --backfill install
+    # Before the re-walk: onboard.py allows one installer 600s, and the re-walk yields
+    # whatever the sweep spends of it. seed_history stays off, or a --backfill install
     # would tag recent Visual Studio turns historical and skip the live checks.
     if success:
         run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
                                 device_serial=device_id, seed_history=False)
 
     if success and backfill_mode:
-        run_backfill(api_key, base_url, user_homes, script_text)
+        run_backfill(api_key, base_url, user_homes, script_text,
+                     deadline=_INSTALLER_STARTED_AT + BACKFILL_TIME_BUDGET_SECONDS)
 
     return success
 

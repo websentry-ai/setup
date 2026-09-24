@@ -26,7 +26,7 @@ class TestForceStaysScopedToTheProfilesBehind(unittest.TestCase):
         def _fake_run_as_user(username, fn, *args, **kwargs):
             return collect[username]
 
-        def _fake_send(api_key, backend_url, sessions, forced=False):
+        def _fake_send(api_key, backend_url, sessions, forced=False, **kwargs):
             uploads.append((sorted(s["session_id"] for s in sessions), forced))
             return len(sessions), 1, 0
 
