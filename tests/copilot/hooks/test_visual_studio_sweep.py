@@ -817,3 +817,105 @@ class WalkBudgetResume(unittest.TestCase):
                 _, truncated, resume_at = self._collect(home, 10000)
         self.assertTrue(truncated)
         self.assertEqual(resume_at, 1789900100)
+
+
+class LinkIdentity(unittest.TestCase):
+    """A stat through a link records what the link points at, and the check at the read
+    then confirms it. The identity has to come from the path itself."""
+
+    def _collect(self, home):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                patch.object(unbound, "log_error"):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_link_that_hides_for_the_path_check_is_still_refused(self):
+        # Link at the walk's stat, real file at the path check, link again at the open.
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "secret"
+            secret.write_bytes(_prompt("stolen") + _reply("secret contents"))
+            planted = _session_file(home, _prompt("ask") + _reply("answer"))
+            innocent = planted.read_bytes()
+
+            def be_link():
+                planted.unlink()
+                planted.symlink_to(secret)
+
+            def be_file():
+                planted.unlink()
+                planted.write_bytes(innocent)
+
+            real_within = unbound._vs_within
+            calls = []
+
+            def within(root, path):
+                if str(path) != str(planted):
+                    return real_within(root, path)
+                calls.append(1)
+                if len(calls) == 1:
+                    be_file()             # the walk's check sees an innocent file
+                    return real_within(root, path)
+                allowed = real_within(root, path)
+                be_link()                 # and the read that follows sees the link
+                return allowed
+
+            be_link()
+            with patch.object(unbound, "_vs_within", within), \
+                    patch.object(unbound, "log_error"):
+                sessions, _, _ = self._collect(home)
+
+        self.assertEqual(sessions, [], "the identity must not be read through the link")
+
+    def test_a_linked_chat_log_is_refused_before_its_identity_is_taken(self):
+        with tempfile.TemporaryDirectory() as home, tempfile.TemporaryDirectory() as outside:
+            secret = Path(outside) / "secret.log"
+            secret.write_text("x\n", encoding="utf-8")
+            planted = _chat_log(home, [])
+            planted.unlink()
+            planted.symlink_to(secret)
+            with patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                    patch.object(unbound, "log_error"):
+                self.assertEqual(unbound._iter_vs_chat_logs(0), [])
+
+    def test_an_ordinary_file_keeps_its_own_identity(self):
+        with tempfile.TemporaryDirectory() as home:
+            planted = _session_file(home, _prompt("ask") + _reply("answer"))
+            info = unbound._vs_plain_stat(planted)
+            self.assertIsNotNone(info)
+            self.assertEqual(unbound._vs_file_key(info),
+                             unbound._vs_file_key(planted.stat()))
+            sessions, _, _ = self._collect(home)
+        self.assertEqual(len(sessions), 1)
+
+
+class HardLinkedFiles(unittest.TestCase):
+    """A hard link is an ordinary regular file: lstat, the path check and fstat all agree,
+    so nothing but the link count separates it from the file it aliases."""
+
+    def _collect(self, home):
+        with patch.object(unbound, "_is_windows", return_value=True), \
+                patch.object(unbound, "_vs_installed", return_value=True), \
+                patch.object(unbound, "_vs_solution_roots", return_value=[Path(home)]), \
+                patch.object(unbound.Path, "home", staticmethod(lambda: Path(home))), \
+                patch.object(unbound, "log_error"):
+            return unbound.collect_visual_studio_sessions(0)
+
+    def test_a_session_hard_linked_from_outside_the_root_is_not_read(self):
+        with tempfile.TemporaryDirectory() as home:
+            outside = Path(home) / "outside"
+            outside.mkdir()
+            secret = outside / "secret"
+            secret.write_bytes(_prompt("stolen") + _reply("secret contents"))
+            planted = _session_file(home, b"")
+            planted.unlink()
+            os.link(secret, planted)
+            sessions, _, _ = self._collect(home)
+        self.assertEqual(sessions, [], "a link count above one must be refused")
+
+    def test_an_ordinary_file_has_one_link_and_is_read(self):
+        with tempfile.TemporaryDirectory() as home:
+            _session_file(home, _prompt("ask") + _reply("answer"))
+            sessions, _, _ = self._collect(home)
+        self.assertEqual(len(sessions), 1)
