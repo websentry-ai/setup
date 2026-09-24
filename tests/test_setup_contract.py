@@ -293,23 +293,22 @@ def test_hook_script_hash_is_sha256_and_survives_a_missing_file(relpath, tmp_pat
 
 
 @pytest.mark.parametrize("relpath", [s for s in BACKFILLERS if "copilot" in s])
-def test_copilot_backfill_ships_disabled(relpath):
-    """Held back while a Copilot turn's request id moves from a hash of its text to the
-    transcript's own id: the two derive different ids, so a run would insert a second row
-    for every turn the installed hook already reported. Read from source, because the
-    loader turns it on for the tests that cover the machinery."""
-    assert "BACKFILL_ENABLED = False" in (REPO / relpath).read_text(), relpath
+def test_copilot_backfill_ships_enabled(relpath):
+    """Both installers ship the same value, or a device re-walks under one path and not
+    the other. Read from source, because the loader turns it on for every module it
+    imports and would hide the flag's shipped value."""
+    assert "BACKFILL_ENABLED = True" in (REPO / relpath).read_text(), relpath
 
 
 def test_visual_studio_sweep_ships_enabled():
     """The only thing between "the sweep runs" and "it does not". Read from source for the
     same reason as the flag above: the loader rewrites these on every module it imports.
 
-    Deliberately separate from BACKFILL_ENABLED, which holds back Copilot's CLI/VS Code
-    re-walk. Visual Studio has no live hook, so it has no rows to duplicate."""
+    Deliberately its own knob, not a reading of BACKFILL_ENABLED: the sweep is Visual
+    Studio's only delivery, while the re-walk replays turns a live hook already sent."""
     source = (REPO / "copilot/hooks/mdm/setup.py").read_text()
     assert "VS_SWEEP_ENABLED = True" in source
-    assert "BACKFILL_ENABLED = False" in source
+    assert "BACKFILL_ENABLED" in source
 
 
 # Installers MDM runs with stdout redirected. On Windows that pipe encodes as cp1252,
