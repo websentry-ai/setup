@@ -91,7 +91,7 @@ def _write_exec(path: Path, body: str):
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _render(prefix: Path, download_root: Path) -> str:
+def _render(prefix: Path, download_root: Path, marker_dir: Path) -> str:
     """Release-workflow substitutions, then the three test-only rewrites. Each
     rewrite asserts its match count so template drift fails loudly here rather
     than letting a run fall through to the real /opt/unbound."""
@@ -111,6 +111,9 @@ def _render(prefix: Path, download_root: Path) -> str:
     assert text.count("mktemp -d /tmp/unbound-onboard.XXXXXX") == 1
     text = text.replace("mktemp -d /tmp/unbound-onboard.XXXXXX",
                         f'mktemp -d "{download_root}/unbound-onboard.XXXXXX"')
+    marker = 'MARKER_DIR="/Library/Application Support/Unbound"\n'
+    assert text.count(marker) == 1
+    text = text.replace(marker, f'MARKER_DIR="{marker_dir}"\n')
     assert text.count("[[ $EUID -eq 0 ]]") == 2
     return text.replace("[[ $EUID -eq 0 ]]", "[[ 0 -eq 0 ]]")
 
@@ -130,7 +133,12 @@ class Sandbox:
         self.script = root / "onboard.sh"
         self.downloads = root / "downloads"
         self.downloads.mkdir()
-        self.script.write_text(_render(self.prefix, self.downloads))
+        self.marker_dir = root / "marker"
+        self.script.write_text(_render(self.prefix, self.downloads, self.marker_dir))
+
+    @property
+    def marker(self) -> Path:
+        return self.marker_dir / "last-success.txt"
 
     def run(self, *args, installed=VERSION):
         env = {
@@ -171,6 +179,20 @@ def _setup_argv(sandbox, *args, **kw):
 def jamf(*params):
     """Jamf passes mount point, computer name and username as $1-$3."""
     return ["/", "test-mac", "someone", *params]
+
+
+def test_a_successful_install_writes_the_inventory_marker(sandbox):
+    """MDM inventory reads this file; without it a clean install reports "never"."""
+    assert sandbox.run("--api-key", "K").returncode == 0
+
+    stamp = sandbox.marker.read_text().strip()
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", stamp), stamp
+
+
+def test_clear_does_not_write_the_marker(sandbox):
+    """A teardown exits 0 too; only an install may claim a successful run."""
+    assert sandbox.run("--clear").returncode == 0
+    assert not sandbox.marker.exists()
 
 
 def test_rendered_script_parses_under_system_bash(sandbox):

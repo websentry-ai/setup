@@ -18,6 +18,10 @@ ARTIFACT_URL="@ARTIFACT_URL@"
 EXPECTED_TEAM_ID="@TEAM_ID@"   # empty = skip signature assert (unsigned dev builds only)
 
 PREFIX="/opt/unbound"
+# Read by MDM inventory (Jamf Extension Attribute, Intune detection) to show
+# the last successful run; nothing on the device depends on it.
+MARKER_DIR="/Library/Application Support/Unbound"
+MARKER_FILE="$MARKER_DIR/last-success.txt"
 PKG_ID="ai.getunbound.runtime"
 DAEMON_LABEL="ai.getunbound.discovery"
 MIN_MACOS_MAJOR=13
@@ -104,6 +108,15 @@ on_exit() {
       *) echo "::install-report POST failed: HTTP ${http_code} (step=${CURRENT_STEP})" >&2 ;;
     esac
   elif [[ $install_succeeded -eq 1 ]]; then
+    # Success marker for MDM inventory. Written here, not by the MDM's own
+    # wrapper, so a policy that just runs this command gets it too — a Jamf
+    # Extension Attribute reads this file, and without it inventory reports
+    # "never" on a Mac that installed cleanly. Best-effort like the POST below:
+    # the install has already succeeded, so a write failure must not fail it.
+    mkdir -p "$MARKER_DIR" 2>/dev/null \
+      && date -u +%Y-%m-%dT%H:%M:%SZ > "$MARKER_FILE" 2>/dev/null \
+      || echo "::could not write $MARKER_FILE" >&2
+
     # Best-effort SUCCESS report (WEB-4826): without this, fleet install
     # coverage was failure-only and a healthy install reported nothing —
     # blank coverage was indistinguishable from total rollout failure. Same
