@@ -3983,7 +3983,12 @@ def send_to_hook_api(request_body, api_key):
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    for attempt in range(3):
+    # 3 x 20s plus backoff exceeds the 60s the cloud config allows a hook, and a
+    # preToolUse killed by that timeout fails OPEN - the unapproved action runs.
+    # Keep the cloud budget inside the timeout so the deny path is reachable.
+    attempts, per_attempt = (2, 8) if RUNNING_CLOUD else (3, 20)
+
+    for attempt in range(attempts):
         try:
             result = subprocess.run(
                 ["curl", "-fsSL", "-X", "POST",
@@ -3992,7 +3997,7 @@ def send_to_hook_api(request_body, api_key):
                  "--data-binary", "@-", url],
                 input=data.encode(),
                 capture_output=True,
-                timeout=20
+                timeout=per_attempt
             )
 
             # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
@@ -4010,7 +4015,7 @@ def send_to_hook_api(request_body, api_key):
         except Exception as e:
             log_error(f"Hook API error: {str(e)}", 'api_call')
 
-        if attempt < 2:
+        if attempt < attempts - 1:
             time.sleep(0.5)
 
     return {}
