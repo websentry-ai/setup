@@ -1465,8 +1465,19 @@ def _backfill_force_config(api_key: str, backend_url: str) -> Tuple[Optional[flo
         return None, None
 
 
+def _backfill_request_timeout(deadline: Optional[float]) -> Optional[int]:
+    """Largest per-request timeout still inside the budget, None when none is. Checked per
+    request, not per chunk: _backfill_http_request spends timeout * 4 + 20 before giving
+    up and a chunk makes three of them, so guarding only the chunk overshoots by all three."""
+    if deadline is None:
+        return 30
+    fits = int((deadline - time.monotonic() - 20) // 4)
+    return min(30, fits) if fits >= 5 else None
+
+
 def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
-                           force: bool = False, backfilled: bool = True) -> bool:
+                           force: bool = False, backfilled: bool = True,
+                           deadline: Optional[float] = None) -> bool:
     payload = {'tool_type': BACKFILL_TOOL_TYPE, 'sessions': sessions}
     if force:
         # Marks this upload as the org's requested re-walk. The server still checks the
@@ -1482,12 +1493,16 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         'Content-Type': 'application/json',
     })
 
+    timeout = _backfill_request_timeout(deadline)
+    if timeout is None:
+        debug_print("out of time before requesting an upload url")
+        return False
     code, body = _backfill_http_request(
         f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/upload-url/",
         method='POST',
         headers=auth_headers,
         body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE}).encode('utf-8'),
-        timeout=30,
+        timeout=timeout,
     )
     if code < 200 or code >= 300:
         debug_print(f"upload-url request failed: HTTP {code}")
@@ -1504,23 +1519,31 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
         debug_print("upload-url response missing fields")
         return False
 
+    timeout = _backfill_request_timeout(deadline)
+    if timeout is None:
+        debug_print("out of time before the S3 upload")
+        return False
     code, _ = _backfill_http_request(
         upload_url,
         method='PUT',
         headers=_backfill_edr_headers({'Content-Type': 'application/json'}),
         body=payload_bytes,
-        timeout=30,
+        timeout=timeout,
     )
     if code < 200 or code >= 300:
         debug_print(f"S3 PUT failed: HTTP {code}")
         return False
 
+    timeout = _backfill_request_timeout(deadline)
+    if timeout is None:
+        debug_print("out of time before the ingest call")
+        return False
     code, _ = _backfill_http_request(
         f"{backend_url.rstrip('/')}/api/v1/coding-tools/backfill/from-s3/",
         method='POST',
         headers=auth_headers,
         body=json.dumps({'tool_type': BACKFILL_TOOL_TYPE, 'object_key': object_key}).encode('utf-8'),
-        timeout=30,
+        timeout=timeout,
     )
     if code < 200 or code >= 300:
         debug_print(f"from-s3 request failed: HTTP {code}")
@@ -1698,7 +1721,8 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         # Checked here rather than only per session: a chunk that started under the
         # deadline still spends three HTTP calls against onboard.py's kill.
         if (not _backfill_out_of_time(deadline)
-                and _backfill_upload_chunk(api_key, backend_url, current_chunk, forced, backfilled)):
+                and _backfill_upload_chunk(api_key, backend_url, current_chunk, forced,
+                                           backfilled, deadline)):
             chunks_sent += 1
             for s in current_chunk:
                 sessions_sent_ids.add(s.get('session_id'))

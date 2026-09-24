@@ -154,3 +154,58 @@ class WorkAlreadyWalkedIsNotDiscarded(unittest.TestCase):
     def test_the_grace_leaves_margin_before_onboard_kills_the_installer(self):
         self.assertLess(mdm.BACKFILL_TIME_BUDGET_SECONDS
                         + mdm.BACKFILL_UPLOAD_GRACE_SECONDS, 600)
+
+
+class EachRequestFitsWhatIsLeft(unittest.TestCase):
+    """A chunk makes three HTTP calls and each spends timeout * 4 + 20 before giving up,
+    so a guard before the chunk overshoots by all three. 420s of overshoot on a 420s
+    budget is what reaches onboard.py's 600s kill."""
+
+    def test_a_full_budget_keeps_the_normal_timeout(self):
+        self.assertEqual(mdm._backfill_request_timeout(None), 30)
+        with patch.object(mdm.time, "monotonic", lambda: 0.0):
+            self.assertEqual(mdm._backfill_request_timeout(1000.0), 30)
+
+    def test_a_thin_budget_shortens_the_request_instead_of_overshooting(self):
+        with patch.object(mdm.time, "monotonic", lambda: 0.0):
+            timeout = mdm._backfill_request_timeout(100.0)
+        self.assertEqual(timeout, 20)
+        self.assertLessEqual(timeout * 4 + 20, 100, "the request must fit the budget")
+
+    def test_no_budget_left_declines_the_request(self):
+        with patch.object(mdm.time, "monotonic", lambda: 0.0):
+            self.assertIsNone(mdm._backfill_request_timeout(30.0))
+
+    def test_a_chunk_out_of_time_sends_nothing(self):
+        requests = []
+        with patch.object(mdm, "_backfill_http_request",
+                          lambda *a, **k: requests.append(k) or (200, b"{}")), \
+                patch.object(mdm.time, "monotonic", lambda: 0.0):
+            self.assertFalse(mdm._backfill_upload_chunk(
+                "k", "https://b", [{"session_id": "S1"}], deadline=30.0))
+        self.assertEqual(requests, [], "not one of the three calls may start")
+
+    def test_the_shortened_timeout_reaches_the_request(self):
+        seen = []
+
+        def _fake_request(url, method, headers, body=None, timeout=30):
+            seen.append(timeout)
+            return 200, b'{"upload_url": "https://s3", "object_key": "k"}'
+
+        with patch.object(mdm, "_backfill_http_request", _fake_request), \
+                patch.object(mdm.time, "monotonic", lambda: 0.0):
+            mdm._backfill_upload_chunk("k", "https://b", [{"session_id": "S1"}],
+                                       deadline=100.0)
+        self.assertEqual(seen, [20, 20, 20], "a flat 30 would outlast the budget")
+
+    def test_the_sender_hands_its_deadline_to_the_chunk(self):
+        # Without this the per-request budget never engages on the path that ships.
+        seen = []
+        with patch.object(mdm, "_backfill_upload_chunk",
+                          lambda *a, **k: seen.append(a[5] if len(a) > 5
+                                                      else k.get("deadline")) or True):
+            mdm._backfill_send_sessions("k", "https://b", [{"session_id": "S1", "entries": [
+                {"type": "user.message", "data": {"content": "x"}},
+                {"type": "assistant.message", "data": {"content": "y"}}]}],
+                deadline=10 ** 9)
+        self.assertEqual(seen, [10 ** 9])
