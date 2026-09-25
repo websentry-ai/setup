@@ -6,7 +6,11 @@ unresolved one captures nothing at all, and a preToolUse that outruns its timeou
 and fails OPEN. RUNNING_CLOUD is read at import, so the call-time readers are patched.
 """
 
+import json
+import tempfile
 import unittest
+from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 from tests.conftest import tool_module
@@ -164,6 +168,65 @@ class TestCloudSurface(unittest.TestCase):
             self.assertEqual(unbound.copilot_surface('/x/events.jsonl'), 'cli')
             self.assertEqual(unbound.copilot_surface('/x/chat.json'), 'vscode')
             self.assertIsNone(unbound.copilot_surface(None))
+
+
+class TestCloudUntrustedTmpState(unittest.TestCase):
+    """/tmp is agent-writable, so sandbox state that can produce an allow is not read."""
+
+    def test_a_planted_policy_cache_cannot_wave_a_native_write_through(self):
+        planted = {'last_synced': datetime.utcnow().isoformat() + 'Z', 'tools_to_check': []}
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.object(unbound, 'load_policy_cache', return_value=planted) as loader, \
+                patch.object(unbound, 'send_to_hook_api', return_value={}) as gateway, \
+                patch.object(unbound, 'get_session_start_model', return_value='auto'), \
+                patch.object(unbound, 'get_recent_user_prompts_for_session', return_value=[]):
+            unbound._evaluate_pre_tool_use_policies(
+                {'tool_name': 'Write', 'tool_input': {'filePath': '/workspace/x.py'},
+                 'session_id': 's1'}, 'key')
+        loader.assert_not_called()
+        self.assertTrue(gateway.called, 'the write short-circuited without asking the gateway')
+
+    def test_the_laptop_still_uses_its_cache(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', False), \
+                patch.object(unbound, 'load_policy_cache', return_value=None) as loader, \
+                patch.object(unbound, 'send_to_hook_api', return_value={}), \
+                patch.object(unbound, 'get_session_start_model', return_value='auto'), \
+                patch.object(unbound, 'get_recent_user_prompts_for_session', return_value=[]):
+            unbound._evaluate_pre_tool_use_policies(
+                {'tool_name': 'Write', 'tool_input': {'filePath': '/x.py'}, 'session_id': 's1'},
+                'key')
+        loader.assert_called_once()
+
+
+class TestCloudAuditTail(unittest.TestCase):
+    """An oversized audit log must not stall preToolUse into its fail-open timeout."""
+
+    def _log_with(self, tmp, rows, filler_bytes=0):
+        path = Path(tmp) / 'agent-audit.log'
+        with open(path, 'w', encoding='utf-8') as f:
+            if filler_bytes:
+                f.write(json.dumps({'event': {'pad': 'x' * filler_bytes}}) + '\n')
+            for row in rows:
+                f.write(json.dumps(row) + '\n')
+        return path
+
+    def test_an_oversized_log_is_read_from_the_tail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [{'timestamp': 't%d' % i, 'event': {'hook_event_name': 'Stop'}}
+                    for i in range(3)]
+            path = self._log_with(tmp, rows, filler_bytes=unbound.CLOUD_AUDIT_READ_LIMIT)
+            with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                    patch.object(unbound, 'AUDIT_LOG', path):
+                logs = unbound.load_existing_logs()
+        self.assertEqual([log['timestamp'] for log in logs], ['t0', 't1', 't2'])
+
+    def test_a_log_under_the_limit_is_read_whole(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [{'timestamp': 't0', 'event': {'hook_event_name': 'Stop'}}]
+            path = self._log_with(tmp, rows)
+            with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                    patch.object(unbound, 'AUDIT_LOG', path):
+                self.assertEqual(len(unbound.load_existing_logs()), 1)
 
 
 class TestCloudPreToolBudget(unittest.TestCase):

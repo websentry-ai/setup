@@ -7,6 +7,10 @@
 # A fetch that fails leaves policy unevaluated. preToolUse is the one event where that
 # silently permits an action the organization may have denied, so it denies instead.
 
+# System paths first: every integrity check below is a bare command name, and one
+# shadowed by an agent-writable directory earlier in PATH would verify nothing.
+PATH=/usr/bin:/bin:$PATH
+
 EVENT="${1:-unknown}"
 HOOK=/tmp/unbound-hook.py
 # Stamped with a release commit at install time; never defaulted to a branch.
@@ -24,9 +28,12 @@ fail() {
   exit 0
 }
 
-# Machines with the agent installed already report through their own hook, and Copilot CLI
-# reads this config there too. Never in a sandbox: the agent can create that path itself.
-if [ -z "${COPILOT_AGENT_SESSION_ID:-}" ] && [ -f "$HOME/.copilot/hooks/unbound.py" ]; then
+# Cloud sessions only. Copilot CLI reads this config on laptops too, where the managed
+# hook already reports the turn -- and where an install may be the binary rather than
+# ~/.copilot/hooks/unbound.py, so presence of that file is the wrong thing to test. On a
+# laptop with no install at all, running anyway would have a repository turn telemetry on,
+# and a blocked raw.githubusercontent.com would deny every preToolUse.
+if [ -z "${COPILOT_AGENT_SESSION_ID:-}" ]; then
   echo '{}'
   exit 0
 fi
@@ -45,8 +52,11 @@ if [ -z "${UNBOUND_HOOK_SHA256:-}" ] || [ ! -s "$HOOK" ]; then
   # -m 8, not 20: this fetch is spent before the hook's own 2x8s of gateway retries, and
   # the total has to clear the preToolUse timeout, which defaults to 30s. Overrunning it
   # gets the hook killed, and a killed preToolUse fails OPEN.
-  # A dropped transfer leaves a partial file that a later event would happily run.
-  curl -fsSL -m 8 "$SRC" -o "$HOOK" || { rm -f "$HOOK"; fail "hook fetch failed from $SRC"; }
+  # Downloaded beside the target and renamed: overlapping events share this path, and a
+  # reader must never see a half-written file.
+  TMP="$HOOK.$$"
+  curl -fsSL -m 8 "$SRC" -o "$TMP" || { rm -f "$TMP"; fail "hook fetch failed from $SRC"; }
+  mv -f "$TMP" "$HOOK" || { rm -f "$TMP"; fail "could not stage the hook at $HOOK"; }
 fi
 
 # Every event, not just the one that fetched.
@@ -58,4 +68,8 @@ if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
   fi
 fi
 
-UNBOUND_HOOK_EVENT="$EVENT" exec python3 "$HOOK"
+# -I is load-bearing, not hygiene. Running a script puts its own directory on sys.path
+# ahead of the standard library, and that directory is /tmp: a planted /tmp/json.py would
+# be imported by the verified hook, which makes the digest chain above prove nothing.
+# Isolated mode drops the script directory, PYTHONPATH and user site-packages.
+UNBOUND_HOOK_EVENT="$EVENT" exec python3 -I "$HOOK"

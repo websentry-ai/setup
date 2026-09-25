@@ -66,9 +66,28 @@ reads. Only two things are outside its reach, and both are load-bearing:
   simply records a failure. The loader in turn pins the hook it fetches to a commit, and
   verifies `UNBOUND_HOOK_SHA256` when one is set.
 
-Everything else the hook keeps under `/tmp` — the audit log, caches, approval markers —
-is writable by the agent and is not treated as trusted. Hardening those individually is
-whack-a-mole; the digest chain above is the boundary that matters.
+Two things make that chain hold in practice:
+
+- **The hook runs under `python3 -I`.** A script's own directory goes on `sys.path` ahead
+  of the standard library, and here that directory is `/tmp` — so a planted `/tmp/json.py`
+  would be imported by the verified hook and the digests above would prove nothing.
+  Isolated mode drops the script directory, `PYTHONPATH` and user site-packages.
+- **`PATH` starts at `/usr/bin:/bin`** in both the config and the loader, so the
+  `sha256sum` doing the verifying cannot itself be shadowed.
+
+Everything else the hook keeps under `/tmp` is writable by the agent. The rule is not that
+those files are hardened individually — it is that **sandbox state is never allowed to
+produce an allow**:
+
+- the policy cache is not read in the cloud, so a planted one cannot send a write down
+  the no-gateway short-circuit;
+- approval markers are ignored, so a planted one cannot start a poll that outlives the
+  hook timeout;
+- the audit log is read from its tail past a size cap, so bloating it cannot stall
+  `preToolUse` into its fail-open timeout.
+
+The audit log, caches and watermarks remain agent-writable as telemetry. That is accepted:
+losing or forging telemetry is not the same as forging a decision.
 
 Two residual limits worth stating plainly:
 
@@ -80,8 +99,13 @@ Two residual limits worth stating plainly:
 
 ## Notes
 
-- `unbound.sh` exits immediately on machines that already have the hook installed — Copilot
-  CLI reads this config too, and both would report the same turn.
+- `unbound.sh` runs in cloud sessions only. Copilot CLI reads this config on laptops too,
+  where a managed install already reports the turn — and where that install may be the
+  binary rather than `~/.copilot/hooks/unbound.py`, so the file's presence is the wrong
+  thing to test. On a laptop with no install, running anyway would let a repository switch
+  telemetry on, and a blocked `raw.githubusercontent.com` would deny every tool call.
+- Cloud sessions send no `device_serial`: an ephemeral VM's machine-id is not a device.
+  The `github` block is their provenance.
 - Changing `unbound.sh` means restamping `__UNBOUND_LOADER_SHA__` too, since the config
   pins its digest.
 - The hook is fetched at session start rather than vendored, so repositories carry thirty

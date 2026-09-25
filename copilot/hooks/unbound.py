@@ -1126,10 +1126,38 @@ def is_cache_stale(cache):
         return True
 
 
+# preToolUse reads this file twice before it can decide, and in the sandbox it sits in
+# agent-writable /tmp. Left unbounded, bloating it stalls the read until the hook is killed
+# -- and a killed preToolUse fails OPEN, so the bloat would buy an unevaluated tool call.
+CLOUD_AUDIT_READ_LIMIT = 4 * 1024 * 1024
+
+
+def _load_audit_tail():
+    """The last CLOUD_AUDIT_READ_LIMIT bytes of the audit log, whole lines only."""
+    logs = []
+    try:
+        with open(AUDIT_LOG, 'rb') as f:
+            f.seek(-CLOUD_AUDIT_READ_LIMIT, os.SEEK_END)
+            f.readline()  # the seek lands mid-line; that fragment is not parseable
+            for raw in f:
+                line = raw.decode('utf-8', 'replace').strip()
+                if not line:
+                    continue
+                try:
+                    logs.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return logs
+
+
 def load_existing_logs():
     """Load existing logs from agent-audit.log into memory."""
     logs = []
     if AUDIT_LOG.exists():
+        if RUNNING_CLOUD and AUDIT_LOG.stat().st_size > CLOUD_AUDIT_READ_LIMIT:
+            return _load_audit_tail()
         try:
             with open(AUDIT_LOG, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -4309,7 +4337,10 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                 'mcp_match',
             )
 
-    cache = load_policy_cache()
+    # Never from disk in the sandbox: the cache lives in agent-writable /tmp, and a planted
+    # one with a fresh last_synced and an empty tools_to_check sends every native write
+    # straight down the short-circuit below without ever asking the gateway.
+    cache = None if RUNNING_CLOUD else load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
     need_pull_policies = cache is None or is_cache_stale(cache)
 
@@ -5866,7 +5897,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
         'agent_surface': copilot_surface(transcript_path),
-        'account_identity': build_account_identity(probe=True),
+        # No probe in the sandbox: an ephemeral VM's machine-id is not a device, and
+        # reporting one invents hardware that rotates or collides across sessions. The
+        # github block below is the provenance for these rows.
+        'account_identity': build_account_identity(probe=not RUNNING_CLOUD),
         'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
