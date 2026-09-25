@@ -101,8 +101,11 @@ losing or forging telemetry is not the same as forging a decision.
 
 Two residual limits worth stating plainly:
 
-- With `UNBOUND_HOOK_SHA256` unset the fetched hook is re-downloaded every event rather
-  than reused from `/tmp`, but nothing verifies it. **Set it for production installs.**
+- With `UNBOUND_HOOK_SHA256` unset, nothing verifies the fetched hook and the trust root
+  is only TLS to the pinned commit. The hook is then never written to disk at all — it is
+  fetched straight into memory and executed from there, because an unverifiable cache is a
+  file the agent can swap for no benefit. **Set the digest for production installs**; with
+  one, the `/tmp` cache is kept and re-verified on every event.
 - `github.actor` is parsed from the co-author trailer on commits the agent itself writes,
   so it is provenance, not authenticated identity. GitHub exposes no actor to the
   sandbox. Treat it as unverified wherever it is displayed.

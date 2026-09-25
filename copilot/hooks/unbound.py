@@ -1007,8 +1007,17 @@ def log_error(message, category='general', extra=None):
     report_error_to_gateway(message, category, _cached_api_key, extra)
 
 
+# The cache file lives in agent-writable /tmp in the sandbox, and every reader of it --
+# the native-write short-circuit, the repo gate's block policies, the fail-open/closed
+# action -- would take a planted one at face value. Hold it in this process instead:
+# writes land here, reads come back from here, and nothing outlives the event.
+_CLOUD_POLICY_CACHE = {}
+
+
 def _read_policy_cache_raw():
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
+    if RUNNING_CLOUD:
+        return dict(_CLOUD_POLICY_CACHE) or None
     try:
         if not POLICY_CACHE_FILE.exists():
             return None
@@ -1075,7 +1084,8 @@ def get_repo_policies():
 def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None, unbound_attribution_enabled=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
-        POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not RUNNING_CLOUD:
+            POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         prior = _read_policy_cache_raw() or {}
         if tools_to_check is None:
             tools_to_check = prior.get('tools_to_check', [])
@@ -1092,6 +1102,10 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, rep
             'repo_policies': repo_policies,
             'unbound_attribution_enabled': unbound_attribution_enabled,
         }
+        if RUNNING_CLOUD:
+            _CLOUD_POLICY_CACHE.clear()
+            _CLOUD_POLICY_CACHE.update(cache)
+            return
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
@@ -1133,22 +1147,30 @@ CLOUD_AUDIT_READ_LIMIT = 4 * 1024 * 1024
 
 
 def _load_audit_tail():
-    """The last CLOUD_AUDIT_READ_LIMIT bytes of the audit log, whole lines only."""
+    """At most CLOUD_AUDIT_READ_LIMIT bytes from the end of the audit log.
+
+    The budget is on the read itself, not just where it starts. Iterating the handle would
+    follow the file as it grows, so a process appending in the background could keep the
+    loop going indefinitely -- the same stall the cap exists to prevent.
+    """
     logs = []
     try:
         with open(AUDIT_LOG, 'rb') as f:
-            f.seek(-CLOUD_AUDIT_READ_LIMIT, os.SEEK_END)
-            f.readline()  # the seek lands mid-line; that fragment is not parseable
-            for raw in f:
-                line = raw.decode('utf-8', 'replace').strip()
-                if not line:
-                    continue
-                try:
-                    logs.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+            size = os.fstat(f.fileno()).st_size
+            if size > CLOUD_AUDIT_READ_LIMIT:
+                f.seek(size - CLOUD_AUDIT_READ_LIMIT)
+                f.readline()  # the seek lands mid-line; that fragment is not parseable
+            data = f.read(CLOUD_AUDIT_READ_LIMIT)
     except Exception:
-        pass
+        return logs
+    for raw in data.splitlines():
+        line = raw.decode('utf-8', 'replace').strip()
+        if not line:
+            continue
+        try:
+            logs.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a line truncated by the budget is simply dropped
     return logs
 
 
@@ -1156,7 +1178,9 @@ def load_existing_logs():
     """Load existing logs from agent-audit.log into memory."""
     logs = []
     if AUDIT_LOG.exists():
-        if RUNNING_CLOUD and AUDIT_LOG.stat().st_size > CLOUD_AUDIT_READ_LIMIT:
+        # Always bounded in the sandbox, whatever the file's size at this instant: it is
+        # agent-writable, and preToolUse reads it twice before it can decide.
+        if RUNNING_CLOUD:
             return _load_audit_tail()
         try:
             with open(AUDIT_LOG, 'r', encoding='utf-8') as f:
@@ -4337,10 +4361,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
                 'mcp_match',
             )
 
-    # Never from disk in the sandbox: the cache lives in agent-writable /tmp, and a planted
-    # one with a fresh last_synced and an empty tools_to_check sends every native write
-    # straight down the short-circuit below without ever asking the gateway.
-    cache = None if RUNNING_CLOUD else load_policy_cache()
+    cache = load_policy_cache()
     tools_to_check = cache.get('tools_to_check', []) if cache else []
     need_pull_policies = cache is None or is_cache_stale(cache)
 

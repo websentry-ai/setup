@@ -171,32 +171,67 @@ class TestCloudSurface(unittest.TestCase):
             self.assertIsNone(unbound.copilot_surface(None))
 
 
-class TestCloudUntrustedTmpState(unittest.TestCase):
-    """/tmp is agent-writable, so sandbox state that can produce an allow is not read."""
+class TestCloudUntrustedPolicyCache(unittest.TestCase):
+    """The cache file is agent-writable in the sandbox, so no reader may honour it.
 
-    def test_a_planted_policy_cache_cannot_wave_a_native_write_through(self):
-        planted = {'last_synced': datetime.utcnow().isoformat() + 'Z', 'tools_to_check': []}
+    Four readers share one file: the native-write short-circuit, the repo gate's block
+    policies, the fail-open/closed action and the attribution flag. Gating them one at a
+    time is whack-a-mole, so the file is not read at all -- the cloud cache lives in this
+    process, written from the gateway's own response.
+    """
+
+    PLANT = {
+        'last_synced': '2999-01-01T00:00:00Z',
+        'tools_to_check': [],
+        'policy_check_failure_action': 'allow',
+        'repo_policies': [],
+        'unbound_attribution_enabled': True,
+    }
+
+    def _with_planted_file(self, cloud):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / '.policy_cache.json'
+        path.write_text(json.dumps(self.PLANT), encoding='utf-8')
+        return patch.object(unbound, 'RUNNING_CLOUD', cloud), \
+            patch.object(unbound, 'POLICY_CACHE_FILE', path)
+
+    def test_no_reader_honours_a_planted_file(self):
+        cloud, cache_path = self._with_planted_file(True)
+        with cloud, cache_path, patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True):
+            self.assertIsNone(unbound.load_policy_cache())
+            self.assertEqual(unbound.get_repo_policies(), [])
+            self.assertFalse(unbound.get_unbound_attribution_enabled())
+            self.assertEqual(unbound.get_policy_check_failure_action(),
+                             unbound.POLICY_CHECK_FAILURE_DEFAULT)
+
+    def test_the_laptop_still_reads_its_file(self):
+        cloud, cache_path = self._with_planted_file(False)
+        with cloud, cache_path:
+            self.assertIsNotNone(unbound.load_policy_cache())
+            self.assertTrue(unbound.get_unbound_attribution_enabled())
+
+    def test_the_gateways_own_answer_is_what_the_cloud_reads_back(self):
+        """Not reading the file must not mean losing a block the gateway just sent."""
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
-                patch.object(unbound, 'load_policy_cache', return_value=planted) as loader, \
+                patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True):
+            unbound.save_policy_cache(tools_to_check=['Bash'],
+                                      policy_check_failure_action='block',
+                                      repo_policies=[{'repo': 'acme/x'}])
+            self.assertEqual(unbound.get_policy_check_failure_action(), 'block')
+            self.assertEqual(unbound.get_repo_policies(), [{'repo': 'acme/x'}])
+
+    def test_a_planted_file_cannot_wave_a_native_write_through(self):
+        cloud, cache_path = self._with_planted_file(True)
+        with cloud, cache_path, \
+                patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True), \
                 patch.object(unbound, 'send_to_hook_api', return_value={}) as gateway, \
                 patch.object(unbound, 'get_session_start_model', return_value='auto'), \
                 patch.object(unbound, 'get_recent_user_prompts_for_session', return_value=[]):
             unbound._evaluate_pre_tool_use_policies(
                 {'tool_name': 'Write', 'tool_input': {'filePath': '/workspace/x.py'},
                  'session_id': 's1'}, 'key')
-        loader.assert_not_called()
         self.assertTrue(gateway.called, 'the write short-circuited without asking the gateway')
-
-    def test_the_laptop_still_uses_its_cache(self):
-        with patch.object(unbound, 'RUNNING_CLOUD', False), \
-                patch.object(unbound, 'load_policy_cache', return_value=None) as loader, \
-                patch.object(unbound, 'send_to_hook_api', return_value={}), \
-                patch.object(unbound, 'get_session_start_model', return_value='auto'), \
-                patch.object(unbound, 'get_recent_user_prompts_for_session', return_value=[]):
-            unbound._evaluate_pre_tool_use_policies(
-                {'tool_name': 'Write', 'tool_input': {'filePath': '/x.py'}, 'session_id': 's1'},
-                'key')
-        loader.assert_called_once()
 
 
 class TestCloudAuditTail(unittest.TestCase):

@@ -46,35 +46,42 @@ if [ -z "${UNBOUND_HOOK_URL:-}" ]; then
   esac
 fi
 
-# The cache sits in /tmp, which the agent can write. Without a digest we cannot tell a
-# planted hook from ours, so it is not reused at all and every event refetches.
-if [ -z "${UNBOUND_HOOK_SHA256:-}" ] || [ ! -s "$HOOK" ]; then
-  # -m 8, not 20: this fetch is spent before the hook's own 2x8s of gateway retries, and
-  # the total has to clear the preToolUse timeout, which defaults to 30s. Overrunning it
-  # gets the hook killed, and a killed preToolUse fails OPEN.
-  # Downloaded beside the target and renamed: overlapping events share this path, and a
-  # reader must never see a half-written file.
-  TMP="$HOOK.$$"
-  curl -fsSL -m 8 "$SRC" -o "$TMP" || { rm -f "$TMP"; fail "hook fetch failed from $SRC"; }
-  mv -f "$TMP" "$HOOK" || { rm -f "$TMP"; fail "could not stage the hook at $HOOK"; }
-fi
+# -q ignores ~/.curlrc, which the agent shares a uid with and could point at a proxy of
+# its own; --proto '=https' refuses any redirect off TLS. -m 8, not 20: this fetch is spent
+# before the hook's own 2x8s of gateway retries, and the total has to clear the preToolUse
+# timeout, which defaults to 30s. Overrunning it gets the hook killed, and a killed
+# preToolUse fails OPEN.
+fetch() { curl -q --proto '=https' -fsSL -m 8 "$SRC"; }
 
-# Read once into memory. Everything from here on is that snapshot, never the path again:
-# a shell variable in this process is the one thing the agent cannot reach, so the bytes
-# verified below are provably the bytes executed. Hashing the file and then handing the
-# interpreter its name would leave a window to swap it in between.
-# `$(cat)` strips trailing newlines and `printf '%s\n'` restores exactly one, which
-# round-trips a file ending in a single newline byte-for-byte -- so UNBOUND_HOOK_SHA256
-# stays the plain sha256 of the published file.
-CODE=$(cat "$HOOK") || fail "could not read the staged hook at $HOOK"
-
-# Every event, not just the one that fetched.
+# Everything below is a snapshot held in this process, never a path re-read: a shell
+# variable is the one thing the agent cannot reach, so the bytes verified are provably the
+# bytes executed. Hashing a file and then handing the interpreter its name would leave a
+# window to swap it in between, and sharing a uid means no file mode closes that window.
 if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
+  # A digest makes the /tmp cache safe to keep: a swap cannot survive the check below, so
+  # later events reuse it instead of refetching.
+  if [ ! -s "$HOOK" ]; then
+    TMP="$HOOK.$$"
+    fetch > "$TMP" || { rm -f "$TMP"; fail "hook fetch failed from $SRC"; }
+    mv -f "$TMP" "$HOOK" || { rm -f "$TMP"; fail "could not stage the hook at $HOOK"; }
+  fi
+  # `$(cat)` strips trailing newlines and `printf '%s\n'` restores exactly one, which
+  # round-trips a file ending in a single newline byte-for-byte -- so UNBOUND_HOOK_SHA256
+  # stays the plain sha256 of the published file.
+  CODE=$(cat "$HOOK") || fail "could not read the staged hook at $HOOK"
   actual=$(printf '%s\n' "$CODE" | sha256sum | cut -d' ' -f1)
   if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
     rm -f "$HOOK"
     fail "hook digest mismatch: expected $UNBOUND_HOOK_SHA256, got ${actual:-none}"
   fi
+else
+  # No digest, so nothing could detect a swap on disk -- which makes /tmp a liability with
+  # no upside, because an unverified cache has to be refetched every event anyway. Fetch
+  # straight into memory and never write the hook down at all. The trust root is then TLS
+  # to the pinned commit, which is what the missing digest leaves us; set
+  # UNBOUND_HOOK_SHA256 in production.
+  CODE=$(fetch) || fail "hook fetch failed from $SRC"
+  [ -n "$CODE" ] || fail "hook fetch returned nothing from $SRC"
 fi
 
 # -I is load-bearing, not hygiene. Running a script puts its own directory on sys.path
