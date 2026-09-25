@@ -1,6 +1,6 @@
 // The HTTP client. Its single hard guarantee: **it never throws**.
 //
-// A throw out of a pi `tool_call` handler is a BLOCK (RESEARCH §F1 — `emitToolCall` has no
+// An exception escaping a pi `tool_call` handler is a BLOCK (RESEARCH §F1 — `emitToolCall` has no
 // try/catch and agent-core turns the exception into a denial whose message leaks to the model), so
 // every path here resolves to a discriminated result instead. There is no `throw` statement in this
 // file, and the whole body of each request — `JSON.stringify` included — sits inside try/catch.
