@@ -89,6 +89,7 @@ APPROVAL_POLL_PHASES = (
 # Use user's home directory for logs
 LOG_DIR = Path('/tmp/unbound-copilot') if RUNNING_CLOUD else _copilot_home() / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
+ERROR_LOG_READ_LIMIT = 256 * 1024
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
@@ -1040,10 +1041,14 @@ def log_error(message, category='general', extra=None):
             f.write(error_entry)
 
         # Keep only last 25 errors
-        handle = _open_regular(ERROR_LOG, 'r')
+        handle = _open_regular(ERROR_LOG, 'rb')
         if handle is not None:
             with handle as f:
-                lines = f.readlines()
+                size = os.fstat(f.fileno()).st_size
+                if size > ERROR_LOG_READ_LIMIT:
+                    f.seek(size - ERROR_LOG_READ_LIMIT)
+                    f.readline()
+                lines = f.read(ERROR_LOG_READ_LIMIT).decode('utf-8', 'replace').splitlines(True)
             if len(lines) > 25:
                 handle = _open_regular(ERROR_LOG, 'w')
                 if handle is not None:
@@ -1259,7 +1264,10 @@ def append_to_audit_log(event_data):
     """Append event to agent-audit.log."""
     try:
         AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
+        handle = _open_regular(AUDIT_LOG, 'a')
+        if handle is None:
+            return
+        with handle as f:
             f.write(json.dumps(event_data) + '\n')
     except Exception:
         pass

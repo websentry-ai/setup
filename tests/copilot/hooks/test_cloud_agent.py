@@ -542,6 +542,28 @@ class TestCloudAuditTail(unittest.TestCase):
             with patch.object(unbound, 'ERROR_LOG', path):
                 unbound.log_error('boom', 'test')
 
+    def test_a_bloated_error_log_is_only_read_from_its_tail(self):
+        """log_error runs inside preToolUse; an unbounded read stalls it into a timeout.
+
+        30 lines of 50KB: the tail window holds far fewer than the 25 the trim needs, so a
+        bounded read leaves the file alone. Reading it whole would find 30 and rewrite it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'error.log'
+            path.write_bytes(b''.join(b'x' * 50_000 + b'\n' for _ in range(30)))
+            before = path.stat().st_size
+            with patch.object(unbound, 'ERROR_LOG', path), \
+                    patch.object(unbound, 'report_error_to_gateway'):
+                unbound.log_error('boom', 'test')
+            self.assertGreater(path.stat().st_size, before)
+
+    def test_a_fifo_cannot_stall_the_audit_append(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'agent-audit.log'
+            os.mkfifo(path)
+            with patch.object(unbound, 'AUDIT_LOG', path):
+                unbound.append_to_audit_log({'event': {}})
+
     def test_a_log_under_the_limit_is_read_whole(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [{'timestamp': 't0', 'event': {'hook_event_name': 'Stop'}}]
