@@ -63,7 +63,8 @@ test("buildPretoolPayload: the tool name is forwarded verbatim, never title-case
 });
 
 test("buildPretoolPayload: the Phase-9 / Future fields are absent, not empty", () => {
-  const body: Record<string, unknown> = buildPretoolPayload(bashInput());
+  // Spread, so `Object.hasOwn` still sees exactly the keys the builder emitted.
+  const body: Record<string, unknown> = { ...buildPretoolPayload(bashInput()) };
   for (const field of ["account_identity", "repo_gate", "first_approval_check", "pull_policies", "user_prompts"]) {
     assert.equal(Object.hasOwn(body, field), false, `${field} must not be sent in Phase 8`);
   }
