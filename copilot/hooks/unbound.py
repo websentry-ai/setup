@@ -39,18 +39,12 @@ def _copilot_config_path():
 
 
 def _detect_cloud():
-    """Whether this is a cloud agent sandbox: ephemeral disk, no device, no signed-in
-    user, no approver.
+    """A cloud agent sandbox: ephemeral disk, no device, no signed-in user, no approver.
 
-    The environment variable alone is not proof of anything. Anyone can export it, and
-    cloud mode is not merely a different code path -- it takes the repo gate's answer from
-    GITHUB_REPOSITORY, labels the turn `cloud`, and drops the device probe. A developer on
-    a managed laptop setting two variables would put themselves outside the repo gate and
-    off their own budget, which uninstalling the hook would have needed admin rights to do.
-
-    So the deciding fact is not the variable but where this code is: the cloud loader
-    streams the hook over a file descriptor and never writes it down, while an installed
-    hook is a file on disk. A frozen build is an install by construction.
+    Not the variable alone — anyone can export it, and cloud mode drops the device probe
+    and takes the repo gate's answer from the environment. The deciding fact is that the
+    cloud loader streams the hook and never writes it down, so an installed hook is a file
+    on disk and this is not.
     """
     if not os.environ.get('COPILOT_AGENT_SESSION_ID'):
         return False
@@ -1041,10 +1035,8 @@ def log_error(message, category='general', extra=None):
     report_error_to_gateway(message, category, _cached_api_key, extra)
 
 
-# The cache file lives in agent-writable /tmp in the sandbox, and every reader of it --
-# the native-write short-circuit, the repo gate's block policies, the fail-open/closed
-# action -- would take a planted one at face value. Hold it in this process instead:
-# writes land here, reads come back from here, and nothing outlives the event.
+# In-process in the sandbox: the cache file sits in agent-writable /tmp, and every reader
+# of it -- native-write short-circuit, repo gate, fail-open action -- would trust a plant.
 _CLOUD_POLICY_CACHE = {}
 
 
@@ -1174,9 +1166,8 @@ def is_cache_stale(cache):
         return True
 
 
-# preToolUse reads this file twice before it can decide, and in the sandbox it sits in
-# agent-writable /tmp. Left unbounded, bloating it stalls the read until the hook is killed
-# -- and a killed preToolUse fails OPEN, so the bloat would buy an unevaluated tool call.
+# preToolUse reads this file twice before deciding, and in the sandbox it is agent-writable:
+# unbounded, a bloated file stalls the read until the hook is killed, which fails OPEN.
 CLOUD_AUDIT_READ_LIMIT = 4 * 1024 * 1024
 
 
@@ -1188,8 +1179,7 @@ def _load_audit_tail():
     loop going indefinitely -- the same stall the cap exists to prevent.
     """
     logs = []
-    # A FIFO here would block open() until the hook is killed, which fails preToolUse open
-    # -- the same unbounded-read problem the byte cap below solves for a huge plant.
+    # A FIFO blocks open() until the hook is killed, which fails preToolUse open.
     if not AUDIT_LOG.is_file():
         return logs
     try:
@@ -1216,8 +1206,7 @@ def load_existing_logs():
     """Load existing logs from agent-audit.log into memory."""
     logs = []
     if AUDIT_LOG.exists():
-        # Always bounded in the sandbox, whatever the file's size at this instant: it is
-        # agent-writable, and preToolUse reads it twice before it can decide.
+        # Always bounded in the sandbox: the file is agent-writable and read twice per decision.
         if RUNNING_CLOUD:
             return _load_audit_tail()
         try:
@@ -1706,10 +1695,9 @@ def _github_actor() -> Optional[str]:
     if not base:
         return None
     try:
-        # --reverse, so the OLDEST commit of the session wins. GitHub stamps the requester
-        # on the agent's first commit; every commit after it is one the agent wrote itself
-        # and could address to anyone. Reading the newest match handed that choice away.
-        # --first-parent --no-merges: a merge landing mid-session drags in other branches' trailers.
+        # --reverse: GitHub stamps the requester on the agent's first commit, and every
+        # later one the agent wrote itself and could address to anyone.
+        # --first-parent --no-merges: a merge mid-session drags in other branches' trailers.
         out = subprocess.run(['git', 'log', '%s..HEAD' % base,
                               '--first-parent', '--no-merges', '--reverse', '--format=%B'],
                              capture_output=True, timeout=5)
@@ -1882,9 +1870,8 @@ def complete_pending_turn(event, pending, api_key, final=False):
         # Cache-only: called once per waiting turn, so probing here would cost a
         # 10s command on each of them.
         'account_identity': build_account_identity(),
-        # A re-send is the same turn, so it has to carry the same provenance. Without
-        # these the row arrives unlabelled and the control plane falls back to the API
-        # key's owner -- billing a turn to whoever the key belongs to.
+        # A re-send is the same turn and needs the same provenance; unlabelled, the control
+        # plane falls back to the API key's owner and bills the turn to them.
         'agent_surface': copilot_surface(transcript_path),
         'github': build_github_context(),
     }
@@ -4100,8 +4087,7 @@ def send_to_hook_api(request_body, api_key):
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    # 3x20s exceeds the cloud config's timeoutSec, and a preToolUse killed by that timeout
-    # fails OPEN. Keep the cloud budget inside it so the deny path stays reachable.
+    # 3x20s exceeds the cloud timeoutSec, and a preToolUse killed by it fails OPEN.
     attempts, per_attempt = (2, 8) if RUNNING_CLOUD else (3, 20)
 
     for attempt in range(attempts):
@@ -4142,8 +4128,8 @@ _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
 
 def _is_approval_retry(command):
     """True if a marker exists for this exact command and is fresh."""
-    # A sandbox has no approver, so it never legitimately reaches this path, and the marker
-    # lives under /tmp where the agent can plant one to start a poll that outlives the timeout.
+    # No approver in a sandbox, and the marker sits in agent-writable /tmp: a planted one
+    # starts a poll that outlives the timeout, and the kill fails open.
     if RUNNING_CLOUD:
         return False
     try:
@@ -4245,10 +4231,8 @@ def transform_response_for_copilot(api_response):
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
-    # Nobody is there to answer in a sandbox, and GitHub does not document 'ask' as
-    # fail-closed for a non-interactive session -- so returning it risks the call simply
-    # proceeding. Same no-approver reasoning already applied to approval_required, applied
-    # here at the one place every decision passes through.
+    # Nobody answers an 'ask' in a sandbox, and GitHub does not document it as fail-closed
+    # for a non-interactive session, so returning one risks the call simply proceeding.
     if RUNNING_CLOUD and decision == 'ask':
         decision = 'deny'
         additional_context = (additional_context + ' ' if additional_context else '') + (
@@ -4372,9 +4356,8 @@ def process_pre_tool_use(event, api_key):
     """
     if RUNNING_CLOUD:
         verdict = _evaluate_pre_tool_use_policies(event, api_key) or {}
-        # Only a deny ends it here. An allow is {} and falls through, but an 'ask' is
-        # truthy without being a stop, and returning early on it would skip the gate for
-        # exactly the calls a repo policy exists to block.
+        # Only a deny ends it: an 'ask' is truthy without being a stop, and returning early
+        # on one would skip the gate for exactly the calls a repo policy exists to block.
         if verdict.get('permissionDecision') == 'deny':
             return verdict
         return _repo_gate_denial(event) or verdict
@@ -4453,11 +4436,9 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     ):
         return {}
 
-    # Both of these are read back out of the audit log, which in the sandbox is a file the
-    # agent can append to. They are not telemetry here: they are sent as the context the
-    # gateway judges this tool call against, so a forged "the user approved deleting prod"
-    # row would be decision input. The gateway already holds the real prompts from
-    # userPromptSubmitted and can rebuild the context server-side.
+    # Both come back out of the agent-writable audit log and are sent as the context the
+    # gateway judges this call against, so a forged row would be decision input. The
+    # gateway already has the real prompts from userPromptSubmitted.
     model = 'auto' if RUNNING_CLOUD else (get_session_start_model(session_id) or 'auto')
     command = extract_command_for_pretool(canonical, tool_input)
 
@@ -4534,9 +4515,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
     if not api_response:
         # Nothing is cached from an earlier event in the sandbox, so the org's setting is
-        # unreadable here and the default is 'allow'. The loader already denies when it
-        # cannot reach GitHub; the evaluator matches it rather than waving the call
-        # through on the likelier of the two failures.
+        # unreadable and the default would be 'allow'. Match the loader, which already denies.
         if RUNNING_CLOUD or get_policy_check_failure_action() == 'block':
             footer = _attribution_footer() if get_unbound_attribution_enabled() else ''
             return transform_response_for_copilot({
@@ -4554,8 +4533,7 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
-        # No approver exists in a sandbox, and the retry path polls until the hook is killed —
-        # a killed preToolUse fails open, so the unapproved action would run. Deny outright.
+        # No approver, and the retry path polls until the hook is killed — which fails open.
         if RUNNING_CLOUD:
             return transform_response_for_copilot({
                 'decision': 'deny',
@@ -4605,10 +4583,8 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
 def _evaluate_user_prompt_policy(event, api_key):
     session_id = event.get('session_id') or event.get('sessionId')
-    # Same reason the pre-tool path stopped reading this: it comes out of the audit log,
-    # which is agent-writable in the sandbox, and is sent as policy context. SessionStart
-    # returns before the audit write, so it is never legitimately recorded there at all --
-    # a planted row would be the only thing this could ever find.
+    # Read out of the agent-writable audit log and sent as policy context. SessionStart
+    # returns before the audit write, so a planted row is the only thing this could find.
     model = 'auto' if RUNNING_CLOUD else (get_session_start_model(session_id) or 'auto')
     prompt = event.get('prompt') or event.get('transformedPrompt') or ''
 
@@ -4665,10 +4641,9 @@ def _github_remote_path(remote_url):
     return None
 
 
-# The cloud gate runs AFTER the loader's fetch and the gateway's retries, so it inherits
-# whatever is left of the pre-tool budget rather than the whole of it. 10s there put the
-# worst case at 34.5s against a 30s timeout, and an overrun is a killed preToolUse, which
-# fails open -- the write the gate exists to block would have run.
+# The cloud gate runs after the loader's fetch and the gateway's retries, so it inherits
+# what is left of the pre-tool budget: 10s put the worst case at 34.5s against a 30s
+# timeout, and an overrun is a killed preToolUse, which fails open.
 def _git_remote_timeout():
     return 3 if RUNNING_CLOUD else 10
 
@@ -6044,9 +6019,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
         'agent_surface': copilot_surface(transcript_path),
-        # No probe in the sandbox: an ephemeral VM's machine-id is not a device, and
-        # reporting one invents hardware that rotates or collides across sessions. The
-        # github block below is the provenance for these rows.
+        # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
+        # rotates or collides across sessions. The github block below is the provenance.
         'account_identity': build_account_identity(probe=not RUNNING_CLOUD),
         'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
@@ -7776,9 +7750,8 @@ def main():
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
-            # None of this survives an ephemeral sandbox: the debounce cache is always empty,
-            # so discovery would reinstall every session and synced skills land in a workspace
-            # that is destroyed minutes later.
+            # None of it survives an ephemeral sandbox: the debounce cache is always empty, so
+            # discovery reinstalls every session and synced skills land in a doomed workspace.
             if not RUNNING_CLOUD:
                 _cleanup_skill_policy_state()
                 _snapshot_copilot_skill_inventory(event)
