@@ -38,6 +38,27 @@ def _copilot_config_path():
     return _copilot_home() / 'config.json'
 
 
+def _detect_cloud():
+    """A cloud agent sandbox: ephemeral disk, no device, no signed-in user, no approver.
+
+    Not the variable alone — anyone can export it, and cloud mode drops the device probe
+    and takes the repo gate's answer from the environment. The deciding fact is that the
+    cloud loader streams the hook and never writes it down, so an installed hook is a file
+    on disk and this is not.
+    """
+    if not os.environ.get('COPILOT_AGENT_SESSION_ID'):
+        return False
+    if getattr(sys, 'frozen', False) or os.environ.get('UNBOUND_HOOK_FROZEN') == '1':
+        return False
+    try:
+        return not os.path.isfile(os.path.abspath(__file__))
+    except Exception:
+        return False
+
+
+RUNNING_CLOUD = _detect_cloud()
+
+
 UNBOUND_GATEWAY_URL = os.environ.get(
     "UNBOUND_GATEWAY_URL", "https://api.getunbound.ai"
 ).rstrip("/")
@@ -66,8 +87,9 @@ APPROVAL_POLL_PHASES = (
 )
 
 # Use user's home directory for logs
-LOG_DIR = _copilot_home() / "hooks"
+LOG_DIR = Path('/tmp/unbound-copilot') if RUNNING_CLOUD else _copilot_home() / "hooks"
 AUDIT_LOG = LOG_DIR / "agent-audit.log"
+ERROR_LOG_READ_LIMIT = 256 * 1024
 ERROR_LOG = LOG_DIR / "error.log"
 LAST_REPORT_FILE = LOG_DIR / ".last_error_report"
 
@@ -97,6 +119,8 @@ WRITE_TOOLS = {'create_file', 'create', 'createFile', 'write', 'write_file', 'ne
 EDIT_TOOLS = {
     'str_replace', 'edit_file', 'editFile', 'apply_patch', 'insert_edit',
     'replace_string_in_file', 'multi_replace_string_in_file',
+    # The cloud agent's name for it; unmapped it canonicalises to nothing and the write is waved through.
+    'edit',
 }
 
 ALLOWED_NON_MCP_HOOK_NAMES = {'Bash', 'Read', 'Write', 'Edit'}
@@ -945,6 +969,17 @@ def redact_secrets(text, key=None):
     return text
 
 
+def _curl_base():
+    """curl argv prefix, with -q first when it is needed.
+
+    -q makes curl ignore ~/.curlrc. In the sandbox that file is agent-writable and a
+    single `insecure` or `resolve` line there redirects the gateway POST below to a server
+    of the agent's own -- which answers the pre-tool check, so it decides allow or deny.
+    Not on a laptop: there the same file is how a corporate proxy is configured.
+    """
+    return ["curl", "-q"] if RUNNING_CLOUD else ["curl"]
+
+
 def report_error_to_gateway(message, category='general', api_key=None, extra=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
@@ -961,7 +996,7 @@ def report_error_to_gateway(message, category='general', api_key=None, extra=Non
             'hook_source': 'copilot',
         })
         proc = subprocess.Popen(
-            ["curl", "-fsSL", "-X", "POST",
+            _curl_base() + ["-fsSL", "-X", "POST",
              "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
              "--data-binary", "@-",
@@ -977,6 +1012,21 @@ def report_error_to_gateway(message, category='general', api_key=None, extra=Non
         _reporting_error = False
 
 
+def _open_regular(path, mode):
+    """Open a regular file in LOG_DIR, or None: a planted FIFO there would block."""
+    flags = {'a': os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+             'r': os.O_RDONLY, 'rb': os.O_RDONLY,
+             'w': os.O_WRONLY | os.O_CREAT | os.O_TRUNC}[mode]
+    flags |= getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(str(path), flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    if mode == 'rb':
+        return os.fdopen(fd, mode)
+    return os.fdopen(fd, mode, encoding='utf-8')
+
+
 def log_error(message, category='general', extra=None):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     message = redact_secrets(message, _cached_api_key)
@@ -984,16 +1034,26 @@ def log_error(message, category='general', extra=None):
     error_entry = f"{timestamp}: {message}\n"
 
     try:
-        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+        handle = _open_regular(ERROR_LOG, 'a')
+        if handle is None:
+            return
+        with handle as f:
             f.write(error_entry)
 
         # Keep only last 25 errors
-        if ERROR_LOG.exists():
-            with open(ERROR_LOG, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+        handle = _open_regular(ERROR_LOG, 'rb')
+        if handle is not None:
+            with handle as f:
+                size = os.fstat(f.fileno()).st_size
+                if size > ERROR_LOG_READ_LIMIT:
+                    f.seek(size - ERROR_LOG_READ_LIMIT)
+                    f.readline()
+                lines = f.read(ERROR_LOG_READ_LIMIT).decode('utf-8', 'replace').splitlines(True)
             if len(lines) > 25:
-                with open(ERROR_LOG, 'w', encoding='utf-8') as f:
-                    f.writelines(lines[-25:])
+                handle = _open_regular(ERROR_LOG, 'w')
+                if handle is not None:
+                    with handle as f:
+                        f.writelines(lines[-25:])
     except Exception:
         pass
 
@@ -1001,8 +1061,15 @@ def log_error(message, category='general', extra=None):
     report_error_to_gateway(message, category, _cached_api_key, extra)
 
 
+# In-process in the sandbox: the cache file sits in agent-writable /tmp, and every reader
+# of it -- native-write short-circuit, repo gate, fail-open action -- would trust a plant.
+_CLOUD_POLICY_CACHE = {}
+
+
 def _read_policy_cache_raw():
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
+    if RUNNING_CLOUD:
+        return dict(_CLOUD_POLICY_CACHE) or None
     try:
         if not POLICY_CACHE_FILE.exists():
             return None
@@ -1069,7 +1136,8 @@ def get_repo_policies():
 def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, repo_policies=None, unbound_attribution_enabled=None):
     """Write policy cache to disk. None for any field preserves the prior value."""
     try:
-        POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if not RUNNING_CLOUD:
+            POLICY_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
         prior = _read_policy_cache_raw() or {}
         if tools_to_check is None:
             tools_to_check = prior.get('tools_to_check', [])
@@ -1086,6 +1154,10 @@ def save_policy_cache(tools_to_check=None, policy_check_failure_action=None, rep
             'repo_policies': repo_policies,
             'unbound_attribution_enabled': unbound_attribution_enabled,
         }
+        if RUNNING_CLOUD:
+            _CLOUD_POLICY_CACHE.clear()
+            _CLOUD_POLICY_CACHE.update(cache)
+            return
         with open(POLICY_CACHE_FILE, 'w', encoding='utf-8') as f:
             f.write(json.dumps(cache))
     except (OSError, TypeError):
@@ -1120,10 +1192,49 @@ def is_cache_stale(cache):
         return True
 
 
+# preToolUse reads this file twice before deciding, and in the sandbox it is agent-writable:
+# unbounded, a bloated file stalls the read until the hook is killed, which fails OPEN.
+CLOUD_AUDIT_READ_LIMIT = 4 * 1024 * 1024
+
+
+def _load_audit_tail():
+    """At most CLOUD_AUDIT_READ_LIMIT bytes from the end of the audit log.
+
+    The budget is on the read itself, not just where it starts. Iterating the handle would
+    follow the file as it grows, so a process appending in the background could keep the
+    loop going indefinitely -- the same stall the cap exists to prevent.
+    """
+    logs = []
+    try:
+        handle = _open_regular(AUDIT_LOG, 'rb')
+        if handle is None:
+            return logs
+        with handle as f:
+            size = os.fstat(f.fileno()).st_size
+            if size > CLOUD_AUDIT_READ_LIMIT:
+                f.seek(size - CLOUD_AUDIT_READ_LIMIT)
+                f.readline()  # the seek lands mid-line; that fragment is not parseable
+            data = f.read(CLOUD_AUDIT_READ_LIMIT)
+    except Exception:
+        return logs
+    for raw in data.splitlines():
+        line = raw.decode('utf-8', 'replace').strip()
+        if not line:
+            continue
+        try:
+            logs.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue  # a line truncated by the budget is simply dropped
+    return logs
+
+
 def load_existing_logs():
     """Load existing logs from agent-audit.log into memory."""
     logs = []
     if AUDIT_LOG.exists():
+        # Always bounded in the sandbox: the file is agent-writable and read twice per decision.
+        if RUNNING_CLOUD:
+            return _load_audit_tail()
         try:
             with open(AUDIT_LOG, 'r', encoding='utf-8') as f:
                 for line in f:
@@ -1153,7 +1264,10 @@ def append_to_audit_log(event_data):
     """Append event to agent-audit.log."""
     try:
         AUDIT_LOG.parent.mkdir(parents=True, exist_ok=True)
-        with open(AUDIT_LOG, 'a', encoding='utf-8') as f:
+        handle = _open_regular(AUDIT_LOG, 'a')
+        if handle is None:
+            return
+        with handle as f:
             f.write(json.dumps(event_data) + '\n')
     except Exception:
         pass
@@ -1177,6 +1291,8 @@ def stop_session_key(event):
 def copilot_surface(transcript_path):
     """Which Copilot wrote this turn. The two stores are the only thing that says so,
     and the same check already picks which one to read usage from."""
+    if RUNNING_CLOUD:
+        return 'cloud'
     if not isinstance(transcript_path, str) or not transcript_path:
         return None
     return 'cli' if Path(transcript_path).stem == 'events' else 'vscode'
@@ -1589,6 +1705,55 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
+_GITHUB_COAUTHOR_RE = re.compile(
+    r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>', re.M | re.I)
+
+
+def _github_actor() -> Optional[str]:
+    """The login that triggered the session, read from the co-author trailer GitHub stamps.
+
+    Claimed, never proven. The agent writes commit messages, so it can address one to any
+    login it likes; taking the session's first commit only means it has to do so before
+    doing anything else. Treat downstream as provenance, not identity.
+
+    Scoped to this session's commits: an unscoped search reads unrelated history and would
+    upload a stranger's login as this session's actor. The login, not the display name — a
+    display name is neither stable nor unique, so it joins to nothing later.
+    """
+    base = os.environ.get('COPILOT_AGENT_BASE_COMMIT')
+    if not base:
+        return None
+    try:
+        # --reverse: GitHub stamps the requester on the agent's first commit, and every
+        # later one the agent wrote itself and could address to anyone.
+        # --first-parent --no-merges: a merge mid-session drags in other branches' trailers.
+        out = subprocess.run(['git', 'log', '%s..HEAD' % base,
+                              '--first-parent', '--no-merges', '--reverse', '--format=%B'],
+                             capture_output=True, timeout=5)
+        if out.returncode != 0:
+            log_error('github actor: git log %s..HEAD failed rc=%s %s' % (
+                base, out.returncode, out.stderr.decode('utf-8', 'replace')[:200]), 'identity')
+            return None
+        match = _GITHUB_COAUTHOR_RE.search(out.stdout.decode('utf-8', 'replace'))
+        return (match.group(1).strip() or None) if match else None
+    except Exception as e:
+        log_error('github actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
+        return None
+
+
+def build_github_context() -> Optional[Dict]:
+    """Cloud-agent provenance. None on a laptop, where the device identity applies."""
+    if not RUNNING_CLOUD:
+        return None
+    context = {
+        'actor': _github_actor(),
+        'repo': os.environ.get('GITHUB_REPOSITORY'),
+        'session': os.environ.get('COPILOT_AGENT_SESSION_ID'),
+        'event': os.environ.get('COPILOT_JOB_EVENT_TYPE'),
+    }
+    return {key: value for key, value in context.items() if value} or None
+
+
 COPILOT_SEAT_CACHE_PATH = Path.home() / ".unbound" / "copilot_seat.json"
 COPILOT_SEAT_TTL = 24 * 3600
 
@@ -1734,6 +1899,10 @@ def complete_pending_turn(event, pending, api_key, final=False):
         # Cache-only: called once per waiting turn, so probing here would cost a
         # 10s command on each of them.
         'account_identity': build_account_identity(),
+        # A re-send is the same turn and needs the same provenance; unlabelled, the control
+        # plane falls back to the API key's owner and bills the turn to them.
+        'agent_surface': copilot_surface(transcript_path),
+        'github': build_github_context(),
     }
     if usage:
         exchange['usage'] = usage
@@ -3947,16 +4116,19 @@ def send_to_hook_api(request_body, api_key):
     url = f"{UNBOUND_GATEWAY_URL}/v1/hooks/pretool"
     data = json.dumps(request_body)
 
-    for attempt in range(3):
+    # 3x20s exceeds the cloud timeoutSec, and a preToolUse killed by it fails OPEN.
+    attempts, per_attempt = (2, 8) if RUNNING_CLOUD else (3, 20)
+
+    for attempt in range(attempts):
         try:
             result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
+                _curl_base() + ["-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
                 input=data.encode(),
                 capture_output=True,
-                timeout=20
+                timeout=per_attempt
             )
 
             # rc==0 means curl got an HTTP 2xx (-f fails on 4xx/5xx), so the
@@ -3974,7 +4146,7 @@ def send_to_hook_api(request_body, api_key):
         except Exception as e:
             log_error(f"Hook API error: {str(e)}", 'api_call')
 
-        if attempt < 2:
+        if attempt < attempts - 1:
             time.sleep(0.5)
 
     return {}
@@ -3985,6 +4157,10 @@ _APPROVAL_MARKER_FILE = LOG_DIR / ".approval_pending"
 
 def _is_approval_retry(command):
     """True if a marker exists for this exact command and is fresh."""
+    # No approver in a sandbox, and the marker sits in agent-writable /tmp: a planted one
+    # starts a poll that outlives the timeout, and the kill fails open.
+    if RUNNING_CLOUD:
+        return False
     try:
         if not _APPROVAL_MARKER_FILE.exists():
             return False
@@ -4050,7 +4226,7 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
         for attempt in range(3):
             try:
                 result = subprocess.run(
-                    ["curl", "-fsSL", "-X", "POST",
+                    _curl_base() + ["-fsSL", "-X", "POST",
                      "-H", f"Authorization: Bearer {api_key}",
                      "-H", "Content-Type: application/json",
                      "--data-binary", "@-", url],
@@ -4083,6 +4259,14 @@ def transform_response_for_copilot(api_response):
     decision = api_response.get('decision', 'allow')
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
+
+    # Nobody answers an 'ask' in a sandbox, and GitHub does not document it as fail-closed
+    # for a non-interactive session, so returning one risks the call simply proceeding.
+    if RUNNING_CLOUD and decision == 'ask':
+        decision = 'deny'
+        additional_context = (additional_context + ' ' if additional_context else '') + (
+            'This needed human approval and a cloud agent session has no one to ask. '
+            'Do not retry or work around it. Stop and say so in the pull request.')
 
     # On 'allow', emit no decision ({}) so Copilot falls through to the user's
     # local config/rules instead of force-allowing over them. Copilot preToolUse
@@ -4132,10 +4316,45 @@ def transform_response_for_copilot_prompt(api_response):
     return {}
 
 
+# The cloud agent sends no event-name field at all, so the loader passes the registered
+# name through and it is mapped onto the names main() dispatches on.
+CLOUD_EVENT_NAMES = {
+    'sessionStart': 'SessionStart',
+    'userPromptSubmitted': 'UserPromptSubmit',
+    'preToolUse': 'PreToolUse',
+    'postToolUse': 'PostToolUse',
+    'agentStop': 'Stop',
+    'sessionEnd': 'SessionEnd',
+}
+
+
+def _normalize_cloud_event(event, event_name):
+    """Give a cloud payload the field names every audit-log reader matches on.
+
+    The rows are written to the audit log as they arrive, and the cloud agent sends no
+    hook_event_name at all and camelCases the rest. Left raw, the turn-start, prompt,
+    session-model and previous-Stop lookups all match nothing — and a Stop with no floor
+    reports the session's whole usage as that turn's.
+    """
+    if not RUNNING_CLOUD or not isinstance(event, dict):
+        return event
+    filled = {}
+    if event_name and not event.get('hook_event_name'):
+        filled['hook_event_name'] = event_name
+    for snake, camel in (('session_id', 'sessionId'), ('transcript_path', 'transcriptPath')):
+        value = event.get(camel)
+        if not event.get(snake) and value:
+            filled[snake] = value
+    return dict(event, **filled) if filled else event
+
+
 def _copilot_event_name(event):
     name = event.get('hook_event_name') or event.get('hookEventName')
     if name:
         return name
+    declared = os.environ.get('UNBOUND_HOOK_EVENT')
+    if declared:
+        return CLOUD_EVENT_NAMES.get(declared, declared)
     # Copilot 1.0.82 omits the event-name field from userPromptTransformed,
     # while still sending both the original and transformed prompt fields.
     if isinstance(event.get('transformedPrompt'), str) and isinstance(event.get('prompt'), str):
@@ -4143,17 +4362,37 @@ def _copilot_event_name(event):
     return None
 
 
-def process_pre_tool_use(event, api_key):
-    """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them."""
+def _repo_gate_denial(event):
+    """The repo gate's deny response, or None when it allows."""
     gate = _repo_gate_evaluate(event)
-    if gate:
-        return transform_response_for_copilot({
-            'decision': 'deny',
-            'reason': _repo_gate_block_reason(gate['repo'], gate.get('trace_id')),
-            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
-            'unbound_trace_id': gate.get('trace_id'),
-        })
-    return _evaluate_pre_tool_use_policies(event, api_key)
+    if not gate:
+        return None
+    return transform_response_for_copilot({
+        'decision': 'deny',
+        'reason': _repo_gate_block_reason(gate['repo'], gate.get('trace_id')),
+        'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        'unbound_trace_id': gate.get('trace_id'),
+    })
+
+
+def process_pre_tool_use(event, api_key):
+    """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them.
+
+    Not in the sandbox. Nothing survives there from an earlier event, so the gate would run
+    with no repo policies at all and allow every repo-scoped write. The evaluator goes
+    first instead -- it always reaches the gateway in cloud -- and the gate then runs
+    against the policies that answer carried back.
+    """
+    if RUNNING_CLOUD:
+        verdict = _evaluate_pre_tool_use_policies(event, api_key) or {}
+        # Only a deny ends it: an 'ask' is truthy without being a stop, and returning early
+        # on one would skip the gate for exactly the calls a repo policy exists to block.
+        if verdict.get('permissionDecision') == 'deny':
+            return verdict
+        return _repo_gate_denial(event) or verdict
+
+    denial = _repo_gate_denial(event)
+    return denial if denial else _evaluate_pre_tool_use_policies(event, api_key)
 
 
 def _evaluate_pre_tool_use_policies(event, api_key):
@@ -4226,10 +4465,13 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     ):
         return {}
 
-    model = get_session_start_model(session_id) or 'auto'
+    # Both come back out of the agent-writable audit log and are sent as the context the
+    # gateway judges this call against, so a forged row would be decision input. The
+    # gateway already has the real prompts from userPromptSubmitted.
+    model = 'auto' if RUNNING_CLOUD else (get_session_start_model(session_id) or 'auto')
     command = extract_command_for_pretool(canonical, tool_input)
 
-    recent_user_prompts = get_recent_user_prompts_for_session(
+    recent_user_prompts = [] if RUNNING_CLOUD else get_recent_user_prompts_for_session(
         session_id, PRETOOL_USER_MESSAGES_LIMIT
     )
 
@@ -4301,7 +4543,9 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     api_response = send_to_hook_api(request_body, api_key)
 
     if not api_response:
-        if get_policy_check_failure_action() == 'block':
+        # Nothing is cached from an earlier event in the sandbox, so the org's setting is
+        # unreadable and the default would be 'allow'. Match the loader, which already denies.
+        if RUNNING_CLOUD or get_policy_check_failure_action() == 'block':
             footer = _attribution_footer() if get_unbound_attribution_enabled() else ''
             return transform_response_for_copilot({
                 'decision': 'deny',
@@ -4318,6 +4562,14 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     _cache_policies_from_response(api_response)
 
     if api_response.get('decision') == 'approval_required':
+        # No approver, and the retry path polls until the hook is killed — which fails open.
+        if RUNNING_CLOUD:
+            return transform_response_for_copilot({
+                'decision': 'deny',
+                'reason': 'Blocked by organization policy. This action requires approval, which a cloud agent cannot obtain.',
+                'additionalContext': 'This action requires human approval and a cloud agent session has no approver. Do not retry and do not work around it. Stop and say so in the pull request.',
+            })
+
         approval_check = api_response.get('approvalCheck', {})
         policy_ids = approval_check.get('policyIds', [])
         application_id = approval_check.get('applicationId', '')
@@ -4360,7 +4612,9 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
 def _evaluate_user_prompt_policy(event, api_key):
     session_id = event.get('session_id') or event.get('sessionId')
-    model = get_session_start_model(session_id) or 'auto'
+    # Read out of the agent-writable audit log and sent as policy context. SessionStart
+    # returns before the audit write, so a planted row is the only thing this could find.
+    model = 'auto' if RUNNING_CLOUD else (get_session_start_model(session_id) or 'auto')
     prompt = event.get('prompt') or event.get('transformedPrompt') or ''
 
     cache = load_policy_cache()
@@ -4416,11 +4670,18 @@ def _github_remote_path(remote_url):
     return None
 
 
+# The cloud gate runs after the loader's fetch and the gateway's retries, so it inherits
+# what is left of the pre-tool budget: 10s put the worst case at 34.5s against a 30s
+# timeout, and an overrun is a killed preToolUse, which fails open.
+def _git_remote_timeout():
+    return 3 if RUNNING_CLOUD else 10
+
+
 def _git_origin_url(cwd):
     """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
     result = subprocess.run(
         ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=_git_remote_timeout(),
     )
     if result.returncode != 0:
         return None
@@ -4759,6 +5020,27 @@ def _repo_gate_scope_allows(policy, org, repo):
     return org == policy['github_org'].strip().lower()
 
 
+def _cloud_gate_violating_repo(block_policies):
+    """The session's repo, from the environment rather than from the checkout.
+
+    Reading it back out of `.git/config` hands the answer to the agent: `git remote
+    set-url origin <an-allowed-repo>` relabels the session, a corrupt config makes git
+    exit non-zero, and an include.path pointing at a FIFO stalls it -- each one ordinary,
+    none of them an attack on the hook, and all three end in the write going through.
+    GITHUB_REPOSITORY is set before the hook starts and the agent cannot reach it.
+
+    Unresolvable is a deny: a block policy exists and nothing here can say it does not
+    apply. Returns the offending slug, or None when the repo is in scope.
+    """
+    slug = (os.environ.get('GITHUB_REPOSITORY') or '').strip().lower()
+    org, _, repo = slug.partition('/')
+    if not org or not repo:
+        return slug or 'an unidentified repository'
+    if any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+        return None
+    return '%s/%s' % (org, repo)
+
+
 def _repo_gate_violating_repo(candidates, block_policies, root_projects):
     """First candidate outside every scope; a git failure propagates to fail open."""
     for candidate in candidates:
@@ -4865,11 +5147,11 @@ def _repo_gate_incident_ordinal():
 def _repo_gate_post(body, api_key):
     """Never waited on, so the blocking path stays free of synchronous work."""
     proc = subprocess.Popen(
-        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
-         '-H', 'Authorization: Bearer %s' % api_key,
-         '-H', 'Content-Type: application/json',
-         '--data-binary', '@-',
-         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        _curl_base() + ['-fsSL', '--max-time', '10', '-X', 'POST',
+                        '-H', 'Authorization: Bearer %s' % api_key,
+                        '-H', 'Content-Type: application/json',
+                        '--data-binary', '@-',
+                        '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc.stdin.write(body.encode())
@@ -4935,9 +5217,12 @@ def _repo_gate_evaluate(event):
         if not block_policies:
             return None
 
-        candidates = _repo_gate_candidates(
-            canonical, tool_input, event.get('cwd'))
-        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        if RUNNING_CLOUD:
+            repo = _cloud_gate_violating_repo(block_policies)
+        else:
+            candidates = _repo_gate_candidates(
+                canonical, tool_input, event.get('cwd'))
+            repo = _repo_gate_violating_repo(candidates, block_policies, {})
         gate = {'decision': 'deny', 'repo': repo} if repo else None
         if gate and get_unbound_attribution_enabled():
             gate['trace_id'] = str(uuid.uuid4())
@@ -5763,7 +6048,10 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # prompt row, or tool-less turns) inherit the session cwd's repo.
         'project': _get_project(cwd),
         'agent_surface': copilot_surface(transcript_path),
-        'account_identity': build_account_identity(probe=True),
+        # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
+        # rotates or collides across sessions. The github block below is the provenance.
+        'account_identity': build_account_identity(probe=not RUNNING_CLOUD),
+        'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
 
@@ -6469,7 +6757,7 @@ def send_to_api(exchange, api_key):
     for attempt in range(3):
         try:
             result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
+                _curl_base() + ["-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
@@ -7486,14 +7774,18 @@ def main():
             return
 
         event_name = _copilot_event_name(event)
+        event = _normalize_cloud_event(event, event_name)
 
         # SessionStart fires once per session — natural TTL gate for the
         # debounced discovery scan dispatch.
         if event_name == 'SessionStart':
-            _cleanup_skill_policy_state()
-            _snapshot_copilot_skill_inventory(event)
-            _dispatch_discovery()
-            _dispatch_skills_sync(api_key)
+            # None of it survives an ephemeral sandbox: the debounce cache is always empty, so
+            # discovery reinstalls every session and synced skills land in a doomed workspace.
+            if not RUNNING_CLOUD:
+                _cleanup_skill_policy_state()
+                _snapshot_copilot_skill_inventory(event)
+                _dispatch_discovery()
+                _dispatch_skills_sync(api_key)
             print("{}")
             return
 
@@ -7634,7 +7926,17 @@ def main():
     except Exception as e:
         # Log errors but still output {} to not break Copilot
         log_error(f"Exception in main: {str(e)}", 'general')
-        print("{}")
+        # Empty output is an allow, and every other cloud failure path denies.
+        if RUNNING_CLOUD and os.environ.get('UNBOUND_HOOK_EVENT') == 'preToolUse':
+            print(json.dumps(transform_response_for_copilot({
+                'decision': 'deny',
+                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
+                'additionalContext': 'The Unbound hook failed before it could evaluate this '
+                                     'action. Do not retry or work around it. Stop and say so '
+                                     'in the pull request.',
+            })), flush=True)
+        else:
+            print("{}")
 
 
 if __name__ == '__main__':
