@@ -37,12 +37,18 @@ if [ -z "${COPILOT_AGENT_SESSION_ID:-}" ]; then
   exit 0
 fi
 
-# Checks the ref's shape, not the placeholder text: a guard written as a literal
-# placeholder is itself rewritten by the install step and then matches every stamped URL.
+# One of the two has to pin the bytes. The default URL is pinned by construction, because
+# it names a commit -- so the ref only has to be shaped like one. An override names
+# whatever it names, and a mirror's content can change under us, so there the digest is the
+# only thing left and it stops being optional.
 if [ -z "${UNBOUND_HOOK_URL:-}" ]; then
+  # Checks the ref's shape, not the placeholder text: a guard written as a literal
+  # placeholder is itself rewritten by the install step and then matches every stamped URL.
   case "$REF" in
     '' | *[!0-9a-f]*) fail "hook ref is not a commit sha; reinstall from copilot/cloud" ;;
   esac
+elif [ -z "${UNBOUND_HOOK_SHA256:-}" ]; then
+  fail "UNBOUND_HOOK_URL requires UNBOUND_HOOK_SHA256: an override is not pinned to a commit"
 fi
 
 # -q ignores ~/.curlrc, which the agent shares a uid with and could point at a proxy of

@@ -35,6 +35,7 @@ changes — a stale `__UNBOUND_LOADER_SHA__` denies every `preToolUse`.
 | Agents secret (Settings -> Secrets and variables -> Agents) | `UNBOUND_COPILOT_API_KEY` |
 | Agents secret | `UNBOUND_GATEWAY_URL` |
 | Agents secret, recommended | `UNBOUND_HOOK_SHA256` — sha256 of `copilot/hooks/unbound.py` at the stamped ref |
+| Agents variable, optional | `UNBOUND_HOOK_URL` — mirror to fetch the hook from, for orgs that will not allowlist `raw.githubusercontent.com`. **Requires `UNBOUND_HOOK_SHA256`**, which the loader enforces: the default URL names a commit and is pinned by construction, a mirror is not. |
 | Allowlist (Settings -> Copilot -> Internet access) | the gateway host, and `raw.githubusercontent.com` |
 
 Both hosts matter: without the gateway a session reports nothing, and without
