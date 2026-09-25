@@ -66,6 +66,16 @@ reads. Only two things are outside its reach, and both are load-bearing:
   simply records a failure. The loader in turn pins the hook it fetches to a commit, and
   verifies `UNBOUND_HOOK_SHA256` when one is set.
 
+Each link **verifies and runs one snapshot**, never a path twice. The config reads the
+loader into a variable, hashes that variable and runs it with `bash -c`; the loader reads
+the hook into a variable, hashes that variable and hands it to the interpreter on a file
+descriptor. Hashing a file and then passing its *name* to the next program would leave a
+window to swap it in between — and since the agent shares our uid, no file mode closes
+that window. A shell variable in a running process is the one thing it cannot reach.
+
+(The hook goes over a descriptor rather than `python3 -c` because it is ~320KB and Linux
+caps a single argument at 128KB. Stdin stays free for the event payload.)
+
 Two things make that chain hold in practice:
 
 - **The hook runs under `python3 -I`.** A script's own directory goes on `sys.path` ahead
@@ -99,11 +109,14 @@ Two residual limits worth stating plainly:
 
 ## Notes
 
-- `unbound.sh` runs in cloud sessions only. Copilot CLI reads this config on laptops too,
-  where a managed install already reports the turn — and where that install may be the
-  binary rather than `~/.copilot/hooks/unbound.py`, so the file's presence is the wrong
-  thing to test. On a laptop with no install, running anyway would let a repository switch
-  telemetry on, and a blocked `raw.githubusercontent.com` would deny every tool call.
+- Cloud sessions only, and the check is the **first thing the config does** — before the
+  digest gate. Copilot CLI reads this config on laptops too, where a managed install
+  already reports the turn, and where that install may be the binary rather than
+  `~/.copilot/hooks/unbound.py`, so the file's presence is the wrong thing to test. Two
+  things would go wrong if the laptop got as far as the gate: a checkout whose
+  `unbound.sh` differs from the default branch would fail the digest and deny every tool
+  call, and a laptop with no install at all would have telemetry switched on by cloning
+  a repository.
 - Cloud sessions send no `device_serial`: an ephemeral VM's machine-id is not a device.
   The `github` block is their provenance.
 - Changing `unbound.sh` means restamping `__UNBOUND_LOADER_SHA__` too, since the config

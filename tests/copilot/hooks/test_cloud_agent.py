@@ -7,13 +7,14 @@ and fails OPEN. RUNNING_CLOUD is read at import, so the call-time readers are pa
 """
 
 import json
+import re
 import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
-from tests.conftest import tool_module
+from tests.conftest import REPO, tool_module
 
 unbound = tool_module("copilot/hooks")
 
@@ -240,10 +241,27 @@ class TestCloudPreToolBudget(unittest.TestCase):
             unbound.send_to_hook_api({'a': 1}, 'key')
         return [call.kwargs['timeout'] for call in run.call_args_list]
 
-    def test_cloud_budget_stays_well_inside_the_configured_timeout(self):
+    # GitHub kills a hook at timeoutSec, which DEFAULTS TO 30 even though the config asks
+    # for 60. Assert against the default: the config's value may simply not be honoured,
+    # and being wrong here means a killed preToolUse, which fails OPEN.
+    HOOK_TIMEOUT_FLOOR = 30
+
+    def _loader_fetch_budget(self):
+        """The -m the loader spends fetching the hook, read from the loader itself so the
+        two files cannot drift apart into a total that no longer fits."""
+        loader = (REPO / 'copilot/cloud/unbound.sh').read_text()
+        match = re.search(r'curl [^\n]*?-m (\d+)', loader)
+        self.assertIsNotNone(match, 'loader no longer caps its fetch')
+        return int(match.group(1))
+
+    def test_the_whole_pretool_budget_fits_inside_the_default_timeout(self):
         timeouts = self._attempts(True)
         self.assertEqual(timeouts, [8, 8])
-        self.assertLess(sum(timeouts), 60)
+        # +0.5s per gap between attempts; the loader's fetch is spent before any of it.
+        total = self._loader_fetch_budget() + sum(timeouts) + 0.5 * (len(timeouts) - 1)
+        self.assertLess(total, self.HOOK_TIMEOUT_FLOOR,
+                        'worst case %.1fs exceeds the %ds default; preToolUse would be '
+                        'killed and fail OPEN' % (total, self.HOOK_TIMEOUT_FLOOR))
 
     def test_the_laptop_budget_is_unchanged(self):
         self.assertEqual(self._attempts(False), [20, 20, 20])

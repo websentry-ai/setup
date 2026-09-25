@@ -59,9 +59,18 @@ if [ -z "${UNBOUND_HOOK_SHA256:-}" ] || [ ! -s "$HOOK" ]; then
   mv -f "$TMP" "$HOOK" || { rm -f "$TMP"; fail "could not stage the hook at $HOOK"; }
 fi
 
+# Read once into memory. Everything from here on is that snapshot, never the path again:
+# a shell variable in this process is the one thing the agent cannot reach, so the bytes
+# verified below are provably the bytes executed. Hashing the file and then handing the
+# interpreter its name would leave a window to swap it in between.
+# `$(cat)` strips trailing newlines and `printf '%s\n'` restores exactly one, which
+# round-trips a file ending in a single newline byte-for-byte -- so UNBOUND_HOOK_SHA256
+# stays the plain sha256 of the published file.
+CODE=$(cat "$HOOK") || fail "could not read the staged hook at $HOOK"
+
 # Every event, not just the one that fetched.
 if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
-  actual=$(sha256sum "$HOOK" 2>/dev/null | cut -d' ' -f1)
+  actual=$(printf '%s\n' "$CODE" | sha256sum | cut -d' ' -f1)
   if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
     rm -f "$HOOK"
     fail "hook digest mismatch: expected $UNBOUND_HOOK_SHA256, got ${actual:-none}"
@@ -69,7 +78,11 @@ if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
 fi
 
 # -I is load-bearing, not hygiene. Running a script puts its own directory on sys.path
-# ahead of the standard library, and that directory is /tmp: a planted /tmp/json.py would
-# be imported by the verified hook, which makes the digest chain above prove nothing.
-# Isolated mode drops the script directory, PYTHONPATH and user site-packages.
-UNBOUND_HOOK_EVENT="$EVENT" exec python3 -I "$HOOK"
+# ahead of the standard library: without it a planted module next to the script is
+# imported by the verified hook, and the digest proves nothing. Isolated mode drops the
+# script directory, PYTHONPATH and user site-packages.
+# The script arrives on fd 3 rather than as a path, which keeps stdin free for the event
+# payload. `-c` is not an option: the hook is ~320KB and Linux caps a single argument at
+# 128KB. The hook's three `__file__` uses are re-invocation paths guarded by
+# os.path.isfile, so they no-op here instead of misfiring.
+UNBOUND_HOOK_EVENT="$EVENT" exec python3 -I /dev/fd/3 3< <(printf '%s\n' "$CODE")

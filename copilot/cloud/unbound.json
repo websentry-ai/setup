@@ -2,22 +2,46 @@
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "type": "command", "bash": "PATH=/usr/bin:/bin:$PATH; echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh sessionStart", "timeoutSec": 60 }
+      {
+        "type": "command",
+        "bash": "PATH=/usr/bin:/bin:$PATH; [ -n \"$COPILOT_AGENT_SESSION_ID\" ] || { echo '{}'; exit 0; }; s=$(cat .github/hooks/unbound.sh) && [ \"$(printf '%s\\n' \"$s\" | sha256sum | cut -d' ' -f1)\" = __UNBOUND_LOADER_SHA__ ] && bash -c \"$s\" unbound sessionStart",
+        "timeoutSec": 60
+      }
     ],
     "userPromptSubmitted": [
-      { "type": "command", "bash": "PATH=/usr/bin:/bin:$PATH; echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh userPromptSubmitted", "timeoutSec": 60 }
+      {
+        "type": "command",
+        "bash": "PATH=/usr/bin:/bin:$PATH; [ -n \"$COPILOT_AGENT_SESSION_ID\" ] || { echo '{}'; exit 0; }; s=$(cat .github/hooks/unbound.sh) && [ \"$(printf '%s\\n' \"$s\" | sha256sum | cut -d' ' -f1)\" = __UNBOUND_LOADER_SHA__ ] && bash -c \"$s\" unbound userPromptSubmitted",
+        "timeoutSec": 60
+      }
     ],
     "preToolUse": [
-      { "type": "command", "bash": "PATH=/usr/bin:/bin:$PATH; echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh preToolUse", "timeoutSec": 60 }
+      {
+        "type": "command",
+        "bash": "PATH=/usr/bin:/bin:$PATH; [ -n \"$COPILOT_AGENT_SESSION_ID\" ] || { echo '{}'; exit 0; }; s=$(cat .github/hooks/unbound.sh) && [ \"$(printf '%s\\n' \"$s\" | sha256sum | cut -d' ' -f1)\" = __UNBOUND_LOADER_SHA__ ] && bash -c \"$s\" unbound preToolUse",
+        "timeoutSec": 60
+      }
     ],
     "postToolUse": [
-      { "type": "command", "bash": "PATH=/usr/bin:/bin:$PATH; echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh postToolUse", "timeoutSec": 60 }
+      {
+        "type": "command",
+        "bash": "PATH=/usr/bin:/bin:$PATH; [ -n \"$COPILOT_AGENT_SESSION_ID\" ] || { echo '{}'; exit 0; }; s=$(cat .github/hooks/unbound.sh) && [ \"$(printf '%s\\n' \"$s\" | sha256sum | cut -d' ' -f1)\" = __UNBOUND_LOADER_SHA__ ] && bash -c \"$s\" unbound postToolUse",
+        "timeoutSec": 60
+      }
     ],
     "agentStop": [
-      { "type": "command", "bash": "PATH=/usr/bin:/bin:$PATH; echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh agentStop", "timeoutSec": 60 }
+      {
+        "type": "command",
+        "bash": "PATH=/usr/bin:/bin:$PATH; [ -n \"$COPILOT_AGENT_SESSION_ID\" ] || { echo '{}'; exit 0; }; s=$(cat .github/hooks/unbound.sh) && [ \"$(printf '%s\\n' \"$s\" | sha256sum | cut -d' ' -f1)\" = __UNBOUND_LOADER_SHA__ ] && bash -c \"$s\" unbound agentStop",
+        "timeoutSec": 60
+      }
     ],
     "sessionEnd": [
-      { "type": "command", "bash": "PATH=/usr/bin:/bin:$PATH; echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh sessionEnd", "timeoutSec": 60 }
+      {
+        "type": "command",
+        "bash": "PATH=/usr/bin:/bin:$PATH; [ -n \"$COPILOT_AGENT_SESSION_ID\" ] || { echo '{}'; exit 0; }; s=$(cat .github/hooks/unbound.sh) && [ \"$(printf '%s\\n' \"$s\" | sha256sum | cut -d' ' -f1)\" = __UNBOUND_LOADER_SHA__ ] && bash -c \"$s\" unbound sessionEnd",
+        "timeoutSec": 60
+      }
     ]
   }
 }
