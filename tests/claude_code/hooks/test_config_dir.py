@@ -243,5 +243,34 @@ class TestSyncedSkillResolution(unittest.TestCase):
             self.assertEqual(m._resolve_skill_path("docx", None), str(local))
 
 
+class TestSyncedSkillReachesInvocationPayload(unittest.TestCase):
+    """The real entrypoint. build_llm_exchange — not the resolver in isolation — is
+    what ships; it must emit both skill_path and content_hash for a synced Skill
+    invocation, or the backend has nothing to join on."""
+
+    def test_synced_invocation_carries_path_and_hash(self):
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            skill = cc / "skills" / "synced" / "org_set" / "docx" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("---\nname: docx\n---\n# docx body\n")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+
+            events = [
+                {"hook_event_name": "UserPromptSubmit", "prompt": "make a doc", "session_id": "s"},
+                {"hook_event_name": "PostToolUse", "tool_name": "Skill",
+                 "tool_input": {"skill": "docx"}, "tool_response": {}, "session_id": "s"},
+            ]
+            exchange = m.build_llm_exchange(events, stop_assistant_message="done")
+            uses = [u for msg in (exchange or {}).get("messages", [])
+                    if msg.get("role") == "assistant"
+                    for u in msg.get("tool_use", [])]
+            docx = [u for u in uses if u.get("skill_name") == "docx"]
+            self.assertTrue(docx, "synced docx invocation not emitted through build_llm_exchange")
+            self.assertEqual(docx[0].get("skill_path"), str(skill))
+            self.assertTrue(docx[0].get("content_hash"),
+                            "no content_hash emitted for the synced skill")
+
+
 if __name__ == '__main__':
     unittest.main()
