@@ -534,6 +534,14 @@ class TestCloudAuditTail(unittest.TestCase):
                     patch.object(unbound, 'AUDIT_LOG', path):
                 self.assertEqual(unbound.load_existing_logs(), [])
 
+    def test_a_fifo_cannot_stall_the_error_log_write(self):
+        """log_error runs inside preToolUse, and a blocked write fails the check open."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'error.log'
+            os.mkfifo(path)
+            with patch.object(unbound, 'ERROR_LOG', path):
+                unbound.log_error('boom', 'test')
+
     def test_a_log_under_the_limit_is_read_whole(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [{'timestamp': 't0', 'event': {'hook_event_name': 'Stop'}}]

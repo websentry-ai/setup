@@ -1011,6 +1011,21 @@ def report_error_to_gateway(message, category='general', api_key=None, extra=Non
         _reporting_error = False
 
 
+def _open_regular(path, mode):
+    """Open a regular file in LOG_DIR, or None: a planted FIFO there would block."""
+    flags = {'a': os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+             'r': os.O_RDONLY, 'rb': os.O_RDONLY,
+             'w': os.O_WRONLY | os.O_CREAT | os.O_TRUNC}[mode]
+    flags |= getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0)
+    fd = os.open(str(path), flags, 0o600)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    if mode == 'rb':
+        return os.fdopen(fd, mode)
+    return os.fdopen(fd, mode, encoding='utf-8')
+
+
 def log_error(message, category='general', extra=None):
     """Log error with timestamp to error.log, keeping only last 25 errors."""
     message = redact_secrets(message, _cached_api_key)
@@ -1018,16 +1033,22 @@ def log_error(message, category='general', extra=None):
     error_entry = f"{timestamp}: {message}\n"
 
     try:
-        with open(ERROR_LOG, 'a', encoding='utf-8') as f:
+        handle = _open_regular(ERROR_LOG, 'a')
+        if handle is None:
+            return
+        with handle as f:
             f.write(error_entry)
 
         # Keep only last 25 errors
-        if ERROR_LOG.exists():
-            with open(ERROR_LOG, 'r', encoding='utf-8') as f:
+        handle = _open_regular(ERROR_LOG, 'r')
+        if handle is not None:
+            with handle as f:
                 lines = f.readlines()
             if len(lines) > 25:
-                with open(ERROR_LOG, 'w', encoding='utf-8') as f:
-                    f.writelines(lines[-25:])
+                handle = _open_regular(ERROR_LOG, 'w')
+                if handle is not None:
+                    with handle as f:
+                        f.writelines(lines[-25:])
     except Exception:
         pass
 
@@ -1179,11 +1200,11 @@ def _load_audit_tail():
     loop going indefinitely -- the same stall the cap exists to prevent.
     """
     logs = []
-    # A FIFO blocks open() until the hook is killed, which fails preToolUse open.
-    if not AUDIT_LOG.is_file():
-        return logs
     try:
-        with open(AUDIT_LOG, 'rb') as f:
+        handle = _open_regular(AUDIT_LOG, 'rb')
+        if handle is None:
+            return logs
+        with handle as f:
             size = os.fstat(f.fileno()).st_size
             if size > CLOUD_AUDIT_READ_LIMIT:
                 f.seek(size - CLOUD_AUDIT_READ_LIMIT)
