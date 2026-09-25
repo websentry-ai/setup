@@ -45,5 +45,13 @@ Use a dedicated application's API key, not one shared with devices. Every cloud 
 attributes to that application, reports `agent_surface: cloud`, and is deliberately kept
 off the key owner's per-user budget.
 
+**`UNBOUND_COPILOT_API_KEY` is readable by the agent, not just by the hook.** GitHub
+exposes Agents secrets "as environment variables in its development environment, so they
+can be used by scripts and tools that Copilot runs" — there is no hook-only channel. A
+prompt-injected agent can therefore read the key, send it to any allowlisted host, and
+call the gateway directly with forged telemetry or pre-tool requests. A dedicated
+application limits the blast radius; it does not prevent the leak. Closing it needs
+short-lived per-session tokens, or server-side validation of `github.session` and `repo`.
+
 Without `UNBOUND_HOOK_SHA256` the hook is fetched into memory on every event and never
 cached, so the trust root is TLS to the pinned commit alone.

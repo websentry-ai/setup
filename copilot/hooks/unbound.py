@@ -4300,17 +4300,33 @@ def _copilot_event_name(event):
     return None
 
 
-def process_pre_tool_use(event, api_key):
-    """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them."""
+def _repo_gate_denial(event):
+    """The repo gate's deny response, or None when it allows."""
     gate = _repo_gate_evaluate(event)
-    if gate:
-        return transform_response_for_copilot({
-            'decision': 'deny',
-            'reason': _repo_gate_block_reason(gate['repo'], gate.get('trace_id')),
-            'additionalContext': REPO_GATE_BLOCK_CONTEXT,
-            'unbound_trace_id': gate.get('trace_id'),
-        })
-    return _evaluate_pre_tool_use_policies(event, api_key)
+    if not gate:
+        return None
+    return transform_response_for_copilot({
+        'decision': 'deny',
+        'reason': _repo_gate_block_reason(gate['repo'], gate.get('trace_id')),
+        'additionalContext': REPO_GATE_BLOCK_CONTEXT,
+        'unbound_trace_id': gate.get('trace_id'),
+    })
+
+
+def process_pre_tool_use(event, api_key):
+    """PreToolUse entry point. The repo gate runs FIRST because _evaluate_pre_tool_use_policies short-circuits for Read/Write/Edit when no policy covers them.
+
+    Not in the sandbox. Nothing survives there from an earlier event, so the gate would run
+    with no repo policies at all and allow every repo-scoped write. The evaluator goes
+    first instead -- it always reaches the gateway in cloud -- and the gate then runs
+    against the policies that answer carried back.
+    """
+    if RUNNING_CLOUD:
+        verdict = _evaluate_pre_tool_use_policies(event, api_key)
+        return verdict if verdict else (_repo_gate_denial(event) or {})
+
+    denial = _repo_gate_denial(event)
+    return denial if denial else _evaluate_pre_tool_use_policies(event, api_key)
 
 
 def _evaluate_pre_tool_use_policies(event, api_key):
@@ -4383,10 +4399,15 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     ):
         return {}
 
-    model = get_session_start_model(session_id) or 'auto'
+    # Both of these are read back out of the audit log, which in the sandbox is a file the
+    # agent can append to. They are not telemetry here: they are sent as the context the
+    # gateway judges this tool call against, so a forged "the user approved deleting prod"
+    # row would be decision input. The gateway already holds the real prompts from
+    # userPromptSubmitted and can rebuild the context server-side.
+    model = 'auto' if RUNNING_CLOUD else (get_session_start_model(session_id) or 'auto')
     command = extract_command_for_pretool(canonical, tool_input)
 
-    recent_user_prompts = get_recent_user_prompts_for_session(
+    recent_user_prompts = [] if RUNNING_CLOUD else get_recent_user_prompts_for_session(
         session_id, PRETOOL_USER_MESSAGES_LIMIT
     )
 
@@ -4458,7 +4479,11 @@ def _evaluate_pre_tool_use_policies(event, api_key):
     api_response = send_to_hook_api(request_body, api_key)
 
     if not api_response:
-        if get_policy_check_failure_action() == 'block':
+        # Nothing is cached from an earlier event in the sandbox, so the org's setting is
+        # unreadable here and the default is 'allow'. The loader already denies when it
+        # cannot reach GitHub; the evaluator matches it rather than waving the call
+        # through on the likelier of the two failures.
+        if RUNNING_CLOUD or get_policy_check_failure_action() == 'block':
             footer = _attribution_footer() if get_unbound_attribution_enabled() else ''
             return transform_response_for_copilot({
                 'decision': 'deny',
