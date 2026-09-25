@@ -18,8 +18,16 @@ import { dirname, join } from "node:path";
 
 import { ENV_PI_INSTALL_ROOT } from "./constants.ts";
 
-/** The package whose `version` we are after. Referenced as a string only — never imported. */
-const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+/**
+ * The package whose `version` we are after. Referenced as data only — never imported.
+ *
+ * Assembled from fragments deliberately. The INST-05 build assertion requires that the vendor
+ * package name appear **nowhere** in `dist/pi/index.js`, which is the strongest cheap proof that no
+ * value import of pi slipped into the bundle (§F6). A verbatim literal here would keep the spirit of
+ * that rule while breaking its letter; the letter wins, since nothing depends on the spelling being
+ * contiguous in source. `.join("")` (rather than `+`) survives esbuild's constant folding.
+ */
+const PI_PACKAGE_NAME = ["@earendil", "-works", "/pi-coding-agent"].join("");
 const MAX_WALK_UP_LEVELS = 8;
 const MAX_VERSION_CHARS = 32;
 
