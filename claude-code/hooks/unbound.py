@@ -4796,8 +4796,11 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
                     return str(matches[0])
 
         # Directory-scoped skills ("apps/web:deploy") hang off an ancestor dir.
-        # A prefixed skill never falls back to the bare name — "slack:standup"
-        # and a personal "standup" are different skills.
+        # A prefixed skill never falls back to the bare name in the local/plugin
+        # search below — "slack:standup" and a personal "standup" are different
+        # skills. The synced glob at the very end is the one exception: a synced
+        # set maps to an opaque bucket rather than a folder, so it resolves by the
+        # bare name.
         nested = segments
         roots = _trusted_ancestors(Path(cwd)) if cwd else []
 
@@ -4821,6 +4824,17 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
                 return None
             if matches:
                 return str(matches[0])
+
+        # Skills synced from claude.ai sit one level deeper, under an opaque
+        # per-account bucket: skills/synced/<bucket>/<name>/SKILL.md. The set a
+        # synced skill is invoked under ("anthropic-skills:docx") maps to that
+        # bucket, not a folder, so match the bare name in any bucket. Two buckets
+        # holding the same name is ambiguous, so resolve nothing.
+        synced = sorted(CLAUDE_SKILLS_ROOT.glob('synced/*/%s/SKILL.md' % name))
+        if len(synced) > 1:
+            return None
+        if synced:
+            return str(synced[0])
         return None
     except Exception:
         return None

@@ -194,5 +194,83 @@ class TestSkillResolutionFollowsConfigDir(unittest.TestCase):
             self.assertEqual(m._resolve_skill_path("unbound-review", None), str(skill))
 
 
+class TestSyncedSkillResolution(unittest.TestCase):
+    """Skills synced from claude.ai live under <config dir>/skills/synced/<bucket>/
+    <name>/ — one level deeper than a bundle. Resolution has to reach the bucket,
+    or every synced skill run reports no path and can never be tied to a body."""
+
+    def _make_synced(self, cc, name, bucket="org_set", body="# synced"):
+        f = cc / "skills" / "synced" / bucket / name / "SKILL.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(body)
+        return f
+
+    def test_bare_synced_name_resolves(self):
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            f = self._make_synced(cc, "docx")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+            self.assertEqual(m._resolve_skill_path("docx", None), str(f))
+
+    def test_set_namespaced_synced_name_resolves(self):
+        # A synced skill is often invoked under its set name
+        # ("anthropic-skills:docx"). The set maps to the opaque bucket, not a
+        # folder, so the bare name has to resolve inside it.
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            f = self._make_synced(cc, "docx")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+            self.assertEqual(m._resolve_skill_path("anthropic-skills:docx", None), str(f))
+
+    def test_two_buckets_with_the_same_name_resolve_nothing(self):
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            self._make_synced(cc, "docx", bucket="orgA_set1")
+            self._make_synced(cc, "docx", bucket="orgB_set2")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+            self.assertIsNone(m._resolve_skill_path("docx", None))
+
+    def test_a_directly_installed_skill_wins_over_a_synced_one(self):
+        # The synced glob is a last-resort fallback: a skill installed directly
+        # under skills/<name> must still resolve to itself, not the synced copy.
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            local = cc / "skills" / "docx" / "SKILL.md"
+            local.parent.mkdir(parents=True)
+            local.write_text("# local")
+            self._make_synced(cc, "docx")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+            self.assertEqual(m._resolve_skill_path("docx", None), str(local))
+
+
+class TestSyncedSkillReachesInvocationPayload(unittest.TestCase):
+    """The real entrypoint. build_llm_exchange — not the resolver in isolation — is
+    what ships; it must emit both skill_path and content_hash for a synced Skill
+    invocation, or the backend has nothing to join on."""
+
+    def test_synced_invocation_carries_path_and_hash(self):
+        with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            skill = cc / "skills" / "synced" / "org_set" / "docx" / "SKILL.md"
+            skill.parent.mkdir(parents=True)
+            skill.write_text("---\nname: docx\n---\n# docx body\n")
+            m = _reload(HOME=home, CLAUDE_CONFIG_DIR=str(cc))
+
+            events = [
+                {"hook_event_name": "UserPromptSubmit", "prompt": "make a doc", "session_id": "s"},
+                {"hook_event_name": "PostToolUse", "tool_name": "Skill",
+                 "tool_input": {"skill": "docx"}, "tool_response": {}, "session_id": "s"},
+            ]
+            exchange = m.build_llm_exchange(events, stop_assistant_message="done")
+            uses = [u for msg in (exchange or {}).get("messages", [])
+                    if msg.get("role") == "assistant"
+                    for u in msg.get("tool_use", [])]
+            docx = [u for u in uses if u.get("skill_name") == "docx"]
+            self.assertTrue(docx, "synced docx invocation not emitted through build_llm_exchange")
+            self.assertEqual(docx[0].get("skill_path"), str(skill))
+            self.assertTrue(docx[0].get("content_hash"),
+                            "no content_hash emitted for the synced skill")
+
+
 if __name__ == '__main__':
     unittest.main()
