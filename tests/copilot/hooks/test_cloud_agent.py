@@ -471,11 +471,34 @@ class TestCloudPreToolBudget(unittest.TestCase):
     def test_the_whole_pretool_budget_fits_inside_the_default_timeout(self):
         timeouts = self._attempts(True)
         self.assertEqual(timeouts, [8, 8])
-        # +0.5s per gap between attempts; the loader's fetch is spent before any of it.
-        total = self._loader_fetch_budget() + sum(timeouts) + 0.5 * (len(timeouts) - 1)
+        # Everything the cloud path can spend before it answers, in order: the loader's
+        # fetch, the gateway retries (+0.5s per gap), then the repo gate's git call --
+        # which only counts because the gate was moved after the evaluator in cloud.
+        with patch.object(unbound, 'RUNNING_CLOUD', True):
+            gate_git = unbound._git_remote_timeout()
+        total = (self._loader_fetch_budget() + sum(timeouts)
+                 + 0.5 * (len(timeouts) - 1) + gate_git)
         self.assertLess(total, self.HOOK_TIMEOUT_FLOOR,
                         'worst case %.1fs exceeds the %ds default; preToolUse would be '
                         'killed and fail OPEN' % (total, self.HOOK_TIMEOUT_FLOOR))
+
+    def test_the_laptop_git_timeout_is_unchanged(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', False):
+            self.assertEqual(unbound._git_remote_timeout(), 10)
+
+    def test_an_ask_becomes_a_deny_in_the_sandbox(self):
+        """No one is there to answer, and GitHub does not document 'ask' as fail-closed
+        for a non-interactive session."""
+        with patch.object(unbound, 'RUNNING_CLOUD', True):
+            response = unbound.transform_response_for_copilot(
+                {'decision': 'ask', 'reason': 'needs approval'})
+        self.assertEqual(response['permissionDecision'], 'deny')
+
+    def test_the_laptop_can_still_ask(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', False):
+            response = unbound.transform_response_for_copilot(
+                {'decision': 'ask', 'reason': 'needs approval'})
+        self.assertEqual(response['permissionDecision'], 'ask')
 
     def test_the_laptop_budget_is_unchanged(self):
         self.assertEqual(self._attempts(False), [20, 20, 20])

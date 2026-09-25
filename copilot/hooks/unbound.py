@@ -4218,6 +4218,16 @@ def transform_response_for_copilot(api_response):
     reason = api_response.get('reason', '')
     additional_context = api_response.get('additionalContext', '')
 
+    # Nobody is there to answer in a sandbox, and GitHub does not document 'ask' as
+    # fail-closed for a non-interactive session -- so returning it risks the call simply
+    # proceeding. Same no-approver reasoning already applied to approval_required, applied
+    # here at the one place every decision passes through.
+    if RUNNING_CLOUD and decision == 'ask':
+        decision = 'deny'
+        additional_context = (additional_context + ' ' if additional_context else '') + (
+            'This needed human approval and a cloud agent session has no one to ask. '
+            'Do not retry or work around it. Stop and say so in the pull request.')
+
     # On 'allow', emit no decision ({}) so Copilot falls through to the user's
     # local config/rules instead of force-allowing over them. Copilot preToolUse
     # precedence: an explicit 'allow' overrides a local deny; '{}' defers to it.
@@ -4628,11 +4638,19 @@ def _github_remote_path(remote_url):
     return None
 
 
+# The cloud gate runs AFTER the loader's fetch and the gateway's retries, so it inherits
+# whatever is left of the pre-tool budget rather than the whole of it. 10s there put the
+# worst case at 34.5s against a 30s timeout, and an overrun is a killed preToolUse, which
+# fails open -- the write the gate exists to block would have run.
+def _git_remote_timeout():
+    return 3 if RUNNING_CLOUD else 10
+
+
 def _git_origin_url(cwd):
     """Origin's URL, else None; raises only if git cannot run, so callers fail open."""
     result = subprocess.run(
         ['git', '-C', cwd, 'remote', 'get-url', 'origin'],
-        capture_output=True, text=True, timeout=10,
+        capture_output=True, text=True, timeout=_git_remote_timeout(),
     )
     if result.returncode != 0:
         return None
