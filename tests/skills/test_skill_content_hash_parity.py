@@ -24,7 +24,7 @@ import pytest
 
 from tests.conftest import tool_module
 
-TOOLS = ["claude-code/hooks", "copilot/hooks", "codex/hooks", "augment/hooks"]
+TOOLS = ["claude-code/hooks", "copilot/hooks", "codex/hooks", "augment/hooks", "cursor"]
 
 CAP = 50 * 1024
 
@@ -91,6 +91,16 @@ def test_exactly_at_cap_reads_whole_file(hook, tmp_path):
     assert _hash(hook, skill) == _expected(raw)
 
 
+def test_over_cap_crlf_is_not_folded(hook, tmp_path):
+    """The fold happens only on the small-file read_text path. Above the cap the
+    scanner reads raw bytes, so CRLF must survive — this locks the branch so a
+    future 'always fold' shortcut cannot pass."""
+    skill = tmp_path / "SKILL.md"
+    raw = b"a\r\n" * ((CAP // 3) + 1000)  # > cap, CRLF throughout
+    skill.write_bytes(raw)
+    assert _hash(hook, skill) == _expected(raw[:CAP])
+
+
 def test_prefix_is_the_file_name_not_a_constant(hook, tmp_path):
     """The recipe prefixes the file name; for a skill that is always SKILL.md.
     A run's hash must equal SKILL.md-prefixed content, never bare content."""
@@ -149,6 +159,16 @@ def test_copilot_prompt_emission_carries_the_hash(tmp_path, monkeypatch):
     assert entries and entries[0]["content_hash"] == expected
 
 
+def test_copilot_invoked_event_emission_carries_the_hash(tmp_path, monkeypatch):
+    """The primary Copilot path is the `skill.invoked` event, not the prompt
+    fallback — it must carry the hash too."""
+    copilot = tool_module("copilot/hooks")
+    skill, expected = _skill_file(tmp_path)
+    monkeypatch.setattr(copilot, "_resolve_skill_path", lambda name, cwd: str(skill))
+    entries = copilot._skill_tool_uses_from_events([{"data": {"name": "docx"}}], None)
+    assert entries and entries[0]["content_hash"] == expected
+
+
 def test_claude_code_posttooluse_emission_carries_the_hash(tmp_path, monkeypatch):
     unbound = tool_module("claude-code/hooks")
     skill, expected = _skill_file(tmp_path)
@@ -161,6 +181,39 @@ def test_claude_code_posttooluse_emission_carries_the_hash(tmp_path, monkeypatch
                    "tool_response": {}}},
     ]
     exchange = unbound.build_llm_exchange(events, stop_assistant_message="done")
+    uses = [u for m in exchange["messages"] if m["role"] == "assistant"
+            for u in m.get("tool_use", [])]
+    skill_uses = [u for u in uses if u.get("skill_name") == "docx"]
+    assert skill_uses and skill_uses[0]["content_hash"] == expected
+
+
+def test_claude_code_typed_slash_skill_carries_the_hash(tmp_path, monkeypatch):
+    """A typed `/skill` never reaches the Skill tool; it is recovered from the
+    prompt and emitted separately, and must carry the hash on that path too."""
+    unbound = tool_module("claude-code/hooks")
+    skill, expected = _skill_file(tmp_path)
+    monkeypatch.setattr(unbound, "_resolve_skill_path", lambda name, cwd: str(skill))
+    events = [{"event": {"hook_event_name": "UserPromptSubmit", "session_id": "s",
+                         "prompt": "/docx do it"}}]
+    exchange = unbound.build_llm_exchange(events, stop_assistant_message="done")
+    uses = [u for m in exchange["messages"] if m["role"] == "assistant"
+            for u in m.get("tool_use", [])]
+    skill_uses = [u for u in uses if u.get("skill_name") == "docx"]
+    assert skill_uses and skill_uses[0]["content_hash"] == expected
+
+
+def test_cursor_before_read_file_carries_the_hash(tmp_path, monkeypatch):
+    """Cursor loads a skill by reading its SKILL.md, so the beforeReadFile entry
+    is its skill invocation — it must carry the hash like the others."""
+    cursor = tool_module("cursor")
+    skill, expected = _skill_file(tmp_path)
+    monkeypatch.setattr(cursor, "_skill_name_from_path", lambda file_path, cwd=None: "docx")
+    events = [
+        {"event": {"hook_event_name": "beforeSubmitPrompt", "prompt": "read docx"}},
+        {"event": {"hook_event_name": "beforeReadFile", "file_path": str(skill), "content": ""}},
+        {"event": {"hook_event_name": "afterAgentResponse", "text": "done"}},
+    ]
+    exchange = cursor.build_llm_exchange(events)
     uses = [u for m in exchange["messages"] if m["role"] == "assistant"
             for u in m.get("tool_use", [])]
     skill_uses = [u for u in uses if u.get("skill_name") == "docx"]
