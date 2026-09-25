@@ -7918,7 +7918,17 @@ def main():
     except Exception as e:
         # Log errors but still output {} to not break Copilot
         log_error(f"Exception in main: {str(e)}", 'general')
-        print("{}")
+        # Empty output is an allow, and every other cloud failure path denies.
+        if RUNNING_CLOUD and os.environ.get('UNBOUND_HOOK_EVENT') == 'preToolUse':
+            print(json.dumps(transform_response_for_copilot({
+                'decision': 'deny',
+                'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
+                'additionalContext': 'The Unbound hook failed before it could evaluate this '
+                                     'action. Do not retry or work around it. Stop and say so '
+                                     'in the pull request.',
+            })), flush=True)
+        else:
+            print("{}")
 
 
 if __name__ == '__main__':

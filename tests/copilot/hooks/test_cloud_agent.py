@@ -625,6 +625,33 @@ class TestCloudPreToolBudget(unittest.TestCase):
         self.assertEqual(self._attempts(False), [20, 20, 20])
 
 
+class TestCloudCatchAllDenies(unittest.TestCase):
+    """Empty output is an allow, and every other cloud failure path denies."""
+
+    def _run_main(self, cloud, event='preToolUse'):
+        out = []
+        payload = json.dumps({'hook_event_name': 'PreToolUse', 'tool_name': 'Bash'})
+        with patch.object(unbound, 'RUNNING_CLOUD', cloud), \
+                patch.dict(unbound.os.environ, {'UNBOUND_HOOK_EVENT': event}), \
+                patch.object(unbound, 'get_api_key', return_value='key'), \
+                patch.object(unbound.sys.stdin, 'read', return_value=payload), \
+                patch.object(unbound, 'process_pre_tool_use', side_effect=RuntimeError('boom')), \
+                patch.object(unbound, 'append_to_audit_log'), \
+                patch.object(unbound, 'log_error'), \
+                patch('builtins.print', lambda *a, **k: out.append(a[0] if a else '')):
+            unbound.main()
+        return out[-1] if out else ''
+
+    def test_an_exception_during_pretool_denies_in_the_sandbox(self):
+        self.assertEqual(json.loads(self._run_main(True)).get('permissionDecision'), 'deny')
+
+    def test_a_laptop_still_emits_nothing(self):
+        self.assertEqual(self._run_main(False), '{}')
+
+    def test_a_non_pretool_cloud_event_emits_nothing(self):
+        self.assertEqual(self._run_main(True, event='agentStop'), '{}')
+
+
 class TestCloudApprovalRetry(unittest.TestCase):
     def test_a_planted_marker_never_starts_a_poll_in_the_sandbox(self):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \

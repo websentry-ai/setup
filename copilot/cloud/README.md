@@ -6,13 +6,20 @@ both files go in every repository to be covered.
 
 ## Per repository
 
-```bash
-cp copilot/cloud/unbound.json .github/hooks/unbound.json
-cp copilot/cloud/unbound.sh   .github/hooks/unbound.sh
+Stamp as you copy: the loader takes the release commit, then the config takes the digest
+of the stamped loader. `sed -i` is not portable, so nothing is edited in place.
 
-# Stamp the release commit and the loader's own digest.
-sed -i '' "s/__UNBOUND_HOOK_REF__/$(git rev-parse HEAD)/" .github/hooks/unbound.sh
-sed -i '' "s/__UNBOUND_LOADER_SHA__/$(sha256sum .github/hooks/unbound.sh | cut -d' ' -f1)/" .github/hooks/unbound.json
+```bash
+mkdir -p .github/hooks
+
+sed "s/__UNBOUND_HOOK_REF__/$(git rev-parse HEAD)/" \
+  copilot/cloud/unbound.sh > .github/hooks/unbound.sh
+
+LOADER_SHA=$( { sha256sum .github/hooks/unbound.sh 2>/dev/null \
+  || shasum -a 256 .github/hooks/unbound.sh; } | cut -d' ' -f1 )
+
+sed "s/__UNBOUND_LOADER_SHA__/$LOADER_SHA/" \
+  copilot/cloud/unbound.json > .github/hooks/unbound.json
 ```
 
 Merge both to the default branch. The ref is pinned, not tracking `main`: the hook runs in
