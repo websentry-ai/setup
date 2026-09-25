@@ -4796,8 +4796,11 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
                     return str(matches[0])
 
         # Directory-scoped skills ("apps/web:deploy") hang off an ancestor dir.
-        # A prefixed skill never falls back to the bare name — "slack:standup"
-        # and a personal "standup" are different skills.
+        # A prefixed skill never falls back to the bare name in the local/plugin
+        # search below — "slack:standup" and a personal "standup" are different
+        # skills. The synced glob at the very end is the one exception: a synced
+        # set maps to an opaque bucket rather than a folder, so it resolves by the
+        # bare name.
         nested = segments
         roots = _trusted_ancestors(Path(cwd)) if cwd else []
 
