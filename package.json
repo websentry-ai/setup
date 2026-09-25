@@ -1,0 +1,28 @@
+{
+  "name": "unbound-hooks-ts",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Unbound policy hooks for TypeScript coding agents (pi extension)",
+  "type": "module",
+  "license": "UNLICENSED",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "build": "node scripts/build.mjs",
+    "test:unit": "node --test --experimental-strip-types packages/core/test/*.test.ts packages/pi/test/*.test.ts",
+    "test:build": "node --test --experimental-strip-types packages/pi/test/build.test.ts",
+    "test": "npm run typecheck && npm run build && npm run test:unit",
+    "mock-api": "node --experimental-strip-types scripts/mock-api.mjs"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.87.x",
+    "@types/node": "^22",
+    "esbuild": "^0.28.2",
+    "typescript": "~5.9.3"
+  }
+}
