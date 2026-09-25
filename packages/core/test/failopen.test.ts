@@ -11,12 +11,20 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MAX_REASON_CHARS } from "../src/constants.ts";
+import {
+  ENGINE_UNAVAILABLE_REASON,
+  ERRORS_PATH,
+  MAX_REASON_CHARS,
+} from "../src/constants.ts";
 import { createApiClient } from "../src/client.ts";
-import type { PretoolResult } from "../src/client.ts";
+import type { ApiClient, PretoolResult } from "../src/client.ts";
+import { createPolicyChecker } from "../src/policy.ts";
+import { createPolicyState } from "../src/policyState.ts";
+import { createTelemetry } from "../src/telemetry.ts";
 import { mapResponseToOutcome, parseDecision, sanitizeReason } from "../src/verdict.ts";
 import type { PretoolRequestBody } from "../src/types.ts";
 import { ATTRIBUTION_SUFFIX, startMockApi } from "./helpers/mockApi.ts";
+import type { MockApi } from "./helpers/mockApi.ts";
 
 const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
@@ -219,4 +227,137 @@ test("mapResponseToOutcome folds ask and approval_required into one confirm outc
   // An out-of-enum decision is an allow, never a block.
   assert.deepEqual(mapResponseToOutcome({ decision: "BLOCK" }), { kind: "allow" });
   assert.deepEqual(mapResponseToOutcome(null), { kind: "allow" });
+});
+
+// --- The composed checker: checkTool() is the only function the pi adapter calls ----------------
+
+const FIXED_NOW = 1_700_000_000_000;
+
+function checkerFor(api: MockApi, client?: ApiClient) {
+  const wire =
+    client ??
+    createApiClient({
+      baseUrl: api.url,
+      apiKey: TEST_KEY,
+      timeoutMs: TIMEOUT_MS,
+      errorsTimeoutMs: TIMEOUT_MS,
+    });
+  // A fixed clock keeps every bypass in this file inside one 60 s window.
+  const telemetry = createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW });
+  return createPolicyChecker({ client: wire, state: createPolicyState(), telemetry });
+}
+
+const errorReports = (api: MockApi) => api.requests.filter((r) => r.path === ERRORS_PATH);
+const sleep = (ms: number): Promise<void> => new Promise((done) => setTimeout(done, ms));
+
+test("checkTool maps a deny, an ask and an approval_required", async () => {
+  const api = await startMockApi({ mode: "deny" });
+  try {
+    assert.deepEqual(await checkerFor(api).checkTool(payload(), "bash"), {
+      kind: "deny",
+      reason: "Reading secrets is blocked.",
+    });
+
+    api.setMode("ask");
+    assert.deepEqual(await checkerFor(api).checkTool(payload(), "bash"), {
+      kind: "confirm",
+      reason: "Unusual command.",
+    });
+
+    api.setMode("approval");
+    assert.deepEqual(await checkerFor(api).checkTool(payload(), "bash"), {
+      kind: "confirm",
+      reason: "Needs admin approval.",
+    });
+
+    api.setMode("allow");
+    assert.deepEqual(await checkerFor(api).checkTool(payload(), "bash"), { kind: "allow" });
+  } finally {
+    await api.close();
+  }
+});
+
+test("RES-01 every failure mode fails open, reporting the bypass once per window", async () => {
+  const api = await startMockApi({ mode: "hang" });
+  try {
+    const checker = checkerFor(api);
+    for (const mode of ["hang", "500", "malformed"] as const) {
+      api.setMode(mode);
+      let outcome: unknown;
+      await assert.doesNotReject(async () => {
+        outcome = await checker.checkTool(payload(), "bash");
+      }, `checkTool must not reject (mode=${mode})`);
+      assert.deepEqual(outcome, { kind: "allow" }, `${mode} fails open`);
+    }
+    await sleep(60);
+    assert.equal(errorReports(api).length, 1, "three bypasses in one 60 s window => one report");
+  } finally {
+    await api.close();
+  }
+});
+
+test("RES-01 a refused connection fails open", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const deadUrl = api.url;
+  await api.close();
+
+  const checker = createPolicyChecker({
+    client: createApiClient({ baseUrl: deadUrl, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS }),
+    state: createPolicyState(),
+    telemetry: createTelemetry({ client: { postHookErrors: async () => true } }),
+  });
+  let outcome: unknown;
+  await assert.doesNotReject(async () => {
+    outcome = await checker.checkTool(payload(), "bash");
+  }, "a refused connection must not reject");
+  assert.deepEqual(outcome, { kind: "allow" });
+});
+
+test("RES-01 cold start: a failure with no remembered action allows, deliberately", async () => {
+  const api = await startMockApi({ mode: "hang" });
+  try {
+    // No success was ever recorded, so there is no `policy_check_failure_action` to honour.
+    assert.deepEqual(await checkerFor(api).checkTool(payload(), "bash"), { kind: "allow" });
+  } finally {
+    await api.close();
+  }
+});
+
+test("RES-01 a remembered policy_check_failure_action of block turns a failure unavailable", async () => {
+  const api = await startMockApi({ mode: "failBlock" });
+  try {
+    const checker = checkerFor(api);
+    // First response: allow + policy_check_failure_action 'block'. Then the mock hangs.
+    assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });
+    assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "unavailable" });
+
+    // The user-facing string lives in constants.ts; the adapter renders it for `unavailable`.
+    assert.match(ENGINE_UNAVAILABLE_REASON, /policy engine unavailable/);
+
+    // The enforcement outcome changed, but the failure still happened — so it is still reported.
+    await sleep(60);
+    assert.equal(errorReports(api).length, 1, "the unavailable path reports the bypass too");
+  } finally {
+    await api.close();
+  }
+});
+
+test("RES-01 a client that throws synchronously still yields an allow", async () => {
+  const throwing: ApiClient = {
+    postPretool: () => {
+      throw new Error("injected fault");
+    },
+    postHookErrors: async () => true,
+  };
+  const checker = createPolicyChecker({
+    client: throwing,
+    state: createPolicyState(),
+    telemetry: createTelemetry({ client: throwing, apiKey: TEST_KEY }),
+  });
+
+  let outcome: unknown;
+  await assert.doesNotReject(async () => {
+    outcome = await checker.checkTool(payload(), "bash");
+  }, "a throwing client must not reject checkTool");
+  assert.deepEqual(outcome, { kind: "allow" }, "the belt to the adapter's braces");
 });
