@@ -43,6 +43,10 @@ export const DENY_PREFIX = "Blocked by Unbound policy: ";
 /** Used when a deny response carries no `reason` at all (nothing guarantees one, §B2). */
 export const GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 export const DECLINED_REASON = "Declined by user (Unbound policy)";
+/** Dialog title; pi renders a confirm as a Yes/No selector titled `title\nmessage` (§A5). */
+export const CONFIRM_TITLE = "Unbound policy";
+/** Appended after the API reason in the confirm body, so the dialog actually asks something. */
+export const CONFIRM_QUESTION_SUFFIX = "\n\nRun this command?";
 export const NO_UI_REASON =
   "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";
