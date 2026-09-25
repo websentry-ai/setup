@@ -1848,6 +1848,11 @@ def complete_pending_turn(event, pending, api_key, final=False):
         # Cache-only: called once per waiting turn, so probing here would cost a
         # 10s command on each of them.
         'account_identity': build_account_identity(),
+        # A re-send is the same turn, so it has to carry the same provenance. Without
+        # these the row arrives unlabelled and the control plane falls back to the API
+        # key's owner -- billing a turn to whoever the key belongs to.
+        'agent_surface': copilot_surface(transcript_path),
+        'github': build_github_context(),
     }
     if usage:
         exchange['usage'] = usage
@@ -4322,8 +4327,13 @@ def process_pre_tool_use(event, api_key):
     against the policies that answer carried back.
     """
     if RUNNING_CLOUD:
-        verdict = _evaluate_pre_tool_use_policies(event, api_key)
-        return verdict if verdict else (_repo_gate_denial(event) or {})
+        verdict = _evaluate_pre_tool_use_policies(event, api_key) or {}
+        # Only a deny ends it here. An allow is {} and falls through, but an 'ask' is
+        # truthy without being a stop, and returning early on it would skip the gate for
+        # exactly the calls a repo policy exists to block.
+        if verdict.get('permissionDecision') == 'deny':
+            return verdict
+        return _repo_gate_denial(event) or verdict
 
     denial = _repo_gate_denial(event)
     return denial if denial else _evaluate_pre_tool_use_policies(event, api_key)

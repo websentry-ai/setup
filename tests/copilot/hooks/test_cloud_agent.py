@@ -288,6 +288,29 @@ class TestCloudFailsClosedAndStillGates(unittest.TestCase):
                          'the gate ran with no policies and could not have blocked anything')
 
 
+    def test_a_non_deny_verdict_still_lets_the_repo_gate_block(self):
+        """An allow is {} and falls through, but an 'ask' is truthy without being a stop."""
+        gate = {'decision': 'deny', 'repo': 'acme/secret'}
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True), \
+                patch.object(unbound, '_evaluate_pre_tool_use_policies',
+                             return_value={'permissionDecision': 'ask'}), \
+                patch.object(unbound, '_repo_gate_evaluate', return_value=gate):
+            response = unbound.process_pre_tool_use(dict(self.EVENT), 'key')
+        self.assertEqual(response.get('permissionDecision'), 'deny')
+
+    def test_a_deny_verdict_is_returned_as_is(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True), \
+                patch.object(unbound, '_evaluate_pre_tool_use_policies',
+                             return_value={'permissionDecision': 'deny',
+                                           'permissionDecisionReason': 'gateway said no'}), \
+                patch.object(unbound, '_repo_gate_evaluate') as gate:
+            response = unbound.process_pre_tool_use(dict(self.EVENT), 'key')
+        self.assertEqual(response['permissionDecisionReason'], 'gateway said no')
+        gate.assert_not_called()
+
+
 class TestCloudDecisionContextIsNotForgeable(unittest.TestCase):
     """The audit log is agent-writable, so it must not become decision input."""
 

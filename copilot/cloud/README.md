@@ -53,5 +53,13 @@ call the gateway directly with forged telemetry or pre-tool requests. A dedicate
 application limits the blast radius; it does not prevent the leak. Closing it needs
 short-lived per-session tokens, or server-side validation of `github.session` and `repo`.
 
-Without `UNBOUND_HOOK_SHA256` the hook is fetched into memory on every event and never
-cached, so the trust root is TLS to the pinned commit alone.
+Without `UNBOUND_HOOK_SHA256` the hook is fetched into memory on every event, so the trust
+root is TLS to the pinned commit alone. With it, the same fetch is verified before it runs.
+
+**`preToolUse` is best-effort against a hostile agent, not a hard stop.** GitHub fails a
+hook open when it exceeds `timeoutSec`, and the agent shares our uid — so it can stall or
+stop the hook and have the tool call proceed unevaluated. Everything here raises the cost
+of that (bounded reads, bounded retries, no disk dependency) but nothing in a hook can
+close it. It holds against a compromised or prompt-injected agent doing ordinary work; it
+does not hold against one deliberately attacking the hook. Catching that needs the gateway
+to notice sessions whose pre-tool checks stop arriving.

@@ -12,7 +12,6 @@
 PATH=/usr/bin:/bin:$PATH
 
 EVENT="${1:-unknown}"
-HOOK=/tmp/unbound-hook.py
 # Stamped with a release commit at install time; never defaulted to a branch.
 REF="__UNBOUND_HOOK_REF__"
 SRC="${UNBOUND_HOOK_URL:-https://raw.githubusercontent.com/websentry-ai/setup/$REF/copilot/hooks/unbound.py}"
@@ -53,37 +52,26 @@ fi
 # preToolUse fails OPEN.
 fetch() { curl -q --proto '=https' -fsSL -m 8 "$SRC"; }
 
-# Everything below is a snapshot held in this process, never a path re-read: a shell
-# variable is the one thing the agent cannot reach, so the bytes verified are provably the
-# bytes executed. Hashing a file and then handing the interpreter its name would leave a
-# window to swap it in between, and sharing a uid means no file mode closes that window.
+# The hook is never written to disk. It was cached under /tmp when a digest was set, but
+# that cache was the only reason this script ever read a path back -- and reading an
+# agent-writable path is unbounded work: a multi-gigabyte file, or a FIFO with no writer,
+# stalls the read until the hook is killed, and a killed preToolUse fails OPEN. Fetching
+# every event costs one request already inside the pre-tool budget and removes the file,
+# the staging rename, the symlink target and the read entirely.
+#
+# What is left is a snapshot in this process. A shell variable is the one thing the agent
+# cannot reach, so the bytes verified below are provably the bytes executed.
+CODE=$(fetch) || fail "hook fetch failed from $SRC"
+[ -n "$CODE" ] || fail "hook fetch returned nothing from $SRC"
+
+# `$(...)` strips trailing newlines and `printf '%s\n'` restores exactly one, which
+# round-trips a file ending in a single newline byte-for-byte -- so UNBOUND_HOOK_SHA256
+# stays the plain sha256 of the published file.
 if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
-  # A digest makes the /tmp cache safe to keep: a swap cannot survive the check below, so
-  # later events reuse it instead of refetching.
-  if [ ! -s "$HOOK" ]; then
-    # mktemp, not "$HOOK.$$": a predictable staging name can be pre-created as a symlink,
-    # and the redirect below would then write through it.
-    TMP=$(mktemp /tmp/unbound-hook.XXXXXX) || fail "could not create a staging file"
-    fetch > "$TMP" || { rm -f "$TMP"; fail "hook fetch failed from $SRC"; }
-    mv -f "$TMP" "$HOOK" || { rm -f "$TMP"; fail "could not stage the hook at $HOOK"; }
-  fi
-  # `$(cat)` strips trailing newlines and `printf '%s\n'` restores exactly one, which
-  # round-trips a file ending in a single newline byte-for-byte -- so UNBOUND_HOOK_SHA256
-  # stays the plain sha256 of the published file.
-  CODE=$(cat "$HOOK") || fail "could not read the staged hook at $HOOK"
   actual=$(printf '%s\n' "$CODE" | sha256sum | cut -d' ' -f1)
   if [ "$actual" != "$UNBOUND_HOOK_SHA256" ]; then
-    rm -f "$HOOK"
     fail "hook digest mismatch: expected $UNBOUND_HOOK_SHA256, got ${actual:-none}"
   fi
-else
-  # No digest, so nothing could detect a swap on disk -- which makes /tmp a liability with
-  # no upside, because an unverified cache has to be refetched every event anyway. Fetch
-  # straight into memory and never write the hook down at all. The trust root is then TLS
-  # to the pinned commit, which is what the missing digest leaves us; set
-  # UNBOUND_HOOK_SHA256 in production.
-  CODE=$(fetch) || fail "hook fetch failed from $SRC"
-  [ -n "$CODE" ] || fail "hook fetch returned nothing from $SRC"
 fi
 
 # -I is load-bearing, not hygiene. Running a script puts its own directory on sys.path
