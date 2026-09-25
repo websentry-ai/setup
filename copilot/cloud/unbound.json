@@ -2,22 +2,22 @@
   "version": 1,
   "hooks": {
     "sessionStart": [
-      { "type": "command", "bash": "bash .github/hooks/unbound.sh sessionStart", "timeoutSec": 60 }
+      { "type": "command", "bash": "echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh sessionStart", "timeoutSec": 60 }
     ],
     "userPromptSubmitted": [
-      { "type": "command", "bash": "bash .github/hooks/unbound.sh userPromptSubmitted", "timeoutSec": 60 }
+      { "type": "command", "bash": "echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh userPromptSubmitted", "timeoutSec": 60 }
     ],
     "preToolUse": [
-      { "type": "command", "bash": "bash .github/hooks/unbound.sh preToolUse", "timeoutSec": 60 }
+      { "type": "command", "bash": "echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh preToolUse", "timeoutSec": 60 }
     ],
     "postToolUse": [
-      { "type": "command", "bash": "bash .github/hooks/unbound.sh postToolUse", "timeoutSec": 60 }
+      { "type": "command", "bash": "echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh postToolUse", "timeoutSec": 60 }
     ],
     "agentStop": [
-      { "type": "command", "bash": "bash .github/hooks/unbound.sh agentStop", "timeoutSec": 60 }
+      { "type": "command", "bash": "echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh agentStop", "timeoutSec": 60 }
     ],
     "sessionEnd": [
-      { "type": "command", "bash": "bash .github/hooks/unbound.sh sessionEnd", "timeoutSec": 60 }
+      { "type": "command", "bash": "echo '__UNBOUND_LOADER_SHA__  .github/hooks/unbound.sh' | sha256sum -c --status && bash .github/hooks/unbound.sh sessionEnd", "timeoutSec": 60 }
     ]
   }
 }
