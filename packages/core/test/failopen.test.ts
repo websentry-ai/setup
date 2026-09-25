@@ -114,8 +114,9 @@ test("RES-01 connection refused resolves ok:false", async () => {
   const result = assertResolved(raw);
   assert.equal(result.ok, false);
   assert.ok(!result.ok && result.errorClass.length > 0, "a non-empty telemetry label");
-  // Pins RESEARCH assumption A1 (undici nests transport failures under err.cause).
-  assert.match(!result.ok ? result.errorClass : "", /^[A-Za-z0-9_]+$/);
+  // Pins RESEARCH assumption A1: undici nests transport failures under `err.cause.code` behind a
+  // generic `TypeError`, so the label must surface the code. Tolerant of Node/undici churn.
+  assert.match(!result.ok ? result.errorClass : "", /^(ECONNREFUSED|ENOTFOUND|UND_ERR_[A-Z_]+)$/);
 });
 
 test("a 200 allow resolves ok:true with the parsed body", async () => {
