@@ -7,6 +7,7 @@ and fails OPEN. RUNNING_CLOUD is read at import, so the call-time readers are pa
 """
 
 import json
+import os
 import re
 import tempfile
 import unittest
@@ -514,6 +515,16 @@ class TestCloudAuditTail(unittest.TestCase):
                     patch.object(unbound, 'AUDIT_LOG', path):
                 logs = unbound.load_existing_logs()
         self.assertEqual([log['timestamp'] for log in logs], ['t0', 't1', 't2'])
+
+    def test_a_fifo_in_place_of_the_log_is_not_opened(self):
+        """open() on a FIFO with no writer blocks until the hook is killed, and a killed
+        preToolUse fails open."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'agent-audit.log'
+            os.mkfifo(path)
+            with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                    patch.object(unbound, 'AUDIT_LOG', path):
+                self.assertEqual(unbound.load_existing_logs(), [])
 
     def test_a_log_under_the_limit_is_read_whole(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -44,9 +44,12 @@ fi
 if [ -z "${UNBOUND_HOOK_URL:-}" ]; then
   # Checks the ref's shape, not the placeholder text: a guard written as a literal
   # placeholder is itself rewritten by the install step and then matches every stamped URL.
+  # Full 40 characters, because "pinned by construction" is the reason the digest is
+  # optional here -- and a short sha or a branch that happens to be all hex is not pinned.
   case "$REF" in
-    '' | *[!0-9a-f]*) fail "hook ref is not a commit sha; reinstall from copilot/cloud" ;;
+    *[!0-9a-f]*) fail "hook ref is not a commit sha; reinstall from copilot/cloud" ;;
   esac
+  [ "${#REF}" -eq 40 ] || fail "hook ref is not a full 40-character commit sha; reinstall from copilot/cloud"
 elif [ -z "${UNBOUND_HOOK_SHA256:-}" ]; then
   fail "UNBOUND_HOOK_URL requires UNBOUND_HOOK_SHA256: an override is not pinned to a commit"
 fi

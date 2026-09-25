@@ -1188,6 +1188,10 @@ def _load_audit_tail():
     loop going indefinitely -- the same stall the cap exists to prevent.
     """
     logs = []
+    # A FIFO here would block open() until the hook is killed, which fails preToolUse open
+    # -- the same unbounded-read problem the byte cap below solves for a huge plant.
+    if not AUDIT_LOG.is_file():
+        return logs
     try:
         with open(AUDIT_LOG, 'rb') as f:
             size = os.fstat(f.fileno()).st_size
