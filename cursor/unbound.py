@@ -3625,6 +3625,31 @@ def _skill_path_key(path):
     return path.replace('\\', '/') if isinstance(path, str) else path
 
 
+# Read cap for the content hash. It must equal the discovery scanner's own cap
+# (MAX_CONFIG_FILE_SIZE), because the hash below has to byte-match what the
+# scanner reports for the same file — a drift here silently stops a reported
+# hash from ever matching a discovered body.
+SKILL_CONTENT_HASH_MAX_BYTES = 50 * 1024
+
+
+def _skill_content_hash(skill_path):
+    """SHA256 identity of the SKILL.md a run used, so the backend can tie the
+    run to an exact discovered body. The recipe mirrors the scanner exactly:
+    ``sha256("<file_name>:<content>")`` where content is read the same way the
+    scanner reads it — ``read_text`` (which folds CRLF to LF) up to the cap, and
+    a byte-truncated read only above it. None when the file cannot be read."""
+    try:
+        path = Path(skill_path)
+        if path.stat().st_size > SKILL_CONTENT_HASH_MAX_BYTES:
+            with open(path, 'rb') as handle:
+                content = handle.read(SKILL_CONTENT_HASH_MAX_BYTES).decode('utf-8', errors='replace')
+        else:
+            content = path.read_text(encoding='utf-8', errors='replace')
+        return hashlib.sha256(('%s:%s' % (path.name, content)).encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+
 def _skill_name_from_path(file_path, cwd=None):
     """Skill name when a path sits under a real skill root, else None. The root
     must hang off cwd's ancestry or home, so a lookalike such as
@@ -3809,6 +3834,7 @@ def build_llm_exchange(events, api_key=None):
                 read_skills.add(_skill_path_key(file_path))
                 read_entry['skill_name'] = skill_name
                 read_entry['skill_path'] = file_path
+                read_entry['content_hash'] = _skill_content_hash(file_path)
             assistant_tool_uses.append(read_entry)
 
         elif hook_event_name == 'postToolUse':
