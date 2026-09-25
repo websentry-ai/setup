@@ -4821,6 +4821,17 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
                 return None
             if matches:
                 return str(matches[0])
+
+        # Skills synced from claude.ai sit one level deeper, under an opaque
+        # per-account bucket: skills/synced/<bucket>/<name>/SKILL.md. The set a
+        # synced skill is invoked under ("anthropic-skills:docx") maps to that
+        # bucket, not a folder, so match the bare name in any bucket. Two buckets
+        # holding the same name is ambiguous, so resolve nothing.
+        synced = sorted(CLAUDE_SKILLS_ROOT.glob('synced/*/%s/SKILL.md' % name))
+        if len(synced) > 1:
+            return None
+        if synced:
+            return str(synced[0])
         return None
     except Exception:
         return None
