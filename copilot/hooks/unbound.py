@@ -1665,7 +1665,11 @@ _GITHUB_COAUTHOR_RE = re.compile(
 
 
 def _github_actor() -> Optional[str]:
-    """The login that triggered the session, read from the co-author trailer the agent stamps.
+    """The login that triggered the session, read from the co-author trailer GitHub stamps.
+
+    Claimed, never proven. The agent writes commit messages, so it can address one to any
+    login it likes; taking the session's first commit only means it has to do so before
+    doing anything else. Treat downstream as provenance, not identity.
 
     Scoped to this session's commits: an unscoped search reads unrelated history and would
     upload a stranger's login as this session's actor. The login, not the display name — a
@@ -1675,9 +1679,12 @@ def _github_actor() -> Optional[str]:
     if not base:
         return None
     try:
+        # --reverse, so the OLDEST commit of the session wins. GitHub stamps the requester
+        # on the agent's first commit; every commit after it is one the agent wrote itself
+        # and could address to anyone. Reading the newest match handed that choice away.
         # --first-parent --no-merges: a merge landing mid-session drags in other branches' trailers.
         out = subprocess.run(['git', 'log', '%s..HEAD' % base,
-                              '--first-parent', '--no-merges', '--format=%B'],
+                              '--first-parent', '--no-merges', '--reverse', '--format=%B'],
                              capture_output=True, timeout=5)
         if out.returncode != 0:
             log_error('github actor: git log %s..HEAD failed rc=%s %s' % (

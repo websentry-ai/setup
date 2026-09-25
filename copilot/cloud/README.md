@@ -63,3 +63,12 @@ of that (bounded reads, bounded retries, no disk dependency) but nothing in a ho
 close it. It holds against a compromised or prompt-injected agent doing ordinary work; it
 does not hold against one deliberately attacking the hook. Catching that needs the gateway
 to notice sessions whose pre-tool checks stop arriving.
+
+**`github.actor` is a claim, and forging it takes no attack.** It is read from the
+co-author trailer GitHub stamps on the agent's *first* commit, but every later commit is
+one the agent wrote — so committing with `Co-authored-by: X <victim@users.noreply.github.com>`
+pins the session to whoever it names. Reading the first commit means it has to do that
+before doing anything else; it does not make the field true, and GitHub exposes no actor
+to the sandbox that would. It is never sent with `preToolUse`, so it changes no policy
+decision — the damage is confined to attribution. Show it as claimed, and verify it
+gateway-side against `repo` and `session` before using it for anything that matters.

@@ -114,13 +114,26 @@ class TestGithubActor(unittest.TestCase):
     def test_scoped_to_this_sessions_first_parent_commits(self):
         _, run = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(TRAILER.encode()))
         self.assertEqual(run.call_args[0][0],
-                         ['git', 'log', 'abc..HEAD', '--first-parent', '--no-merges', '--format=%B'])
+                         ['git', 'log', 'abc..HEAD', '--first-parent', '--no-merges',
+                          '--reverse', '--format=%B'])
 
     def test_no_base_commit_means_no_unscoped_search(self):
         with patch.dict(unbound.os.environ, {}, clear=True), \
                 patch.object(unbound.subprocess, 'run') as run:
             self.assertIsNone(unbound._github_actor())
             run.assert_not_called()
+
+    def test_the_sessions_first_trailer_wins_not_its_last(self):
+        """GitHub stamps the requester on the agent's first commit. Every commit after it
+        was written by the agent, which can address one to any login it likes -- so with
+        --reverse the git output starts at the one commit it did not get to compose."""
+        body = (b'agent first commit\n\n'
+                b'Co-authored-by: Real <1+realuser@users.noreply.github.com>\n'
+                b'agent later commit\n\n'
+                b'Co-authored-by: Victim <2+victim@users.noreply.github.com>\n')
+        actor, run = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
+        self.assertEqual(actor, 'realuser')
+        self.assertIn('--reverse', run.call_args[0][0])
 
     def test_a_real_address_is_not_mistaken_for_a_login(self):
         body = b'Fix\n\nCo-authored-by: Nanda <nanda@unboundsecurity.ai>\n'
