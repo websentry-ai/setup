@@ -231,7 +231,7 @@ class InstallerOrderingAndSeeding(unittest.TestCase):
         self.assertLess(self.source.index("run_visual_studio_sweep(api_key, base_url"),
                         self.source.index("run_backfill(api_key, base_url"))
 
-    def test_the_installer_never_asks_the_sweep_to_seed(self):
-        # Seeding tags recent turns historical, which skips the checks a live turn gets.
-        self.assertIn("seed_history=False", self.source)
-        self.assertNotIn("seed_history=backfill_mode", self.source)
+    def test_the_sweep_seeds_only_when_the_installer_was_asked_to(self):
+        # A month of history needs --backfill here exactly as it does for the re-walk.
+        self.assertIn("seed_history=backfill_mode", self.source)
+        self.assertNotIn("seed_history=False)", self.source)

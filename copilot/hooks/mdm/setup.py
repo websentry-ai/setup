@@ -1824,8 +1824,8 @@ def run_visual_studio_sweep(api_key: str, backend_url: str,
     """Upload each user's Visual Studio conversations touched since their last sweep.
 
     An ordinary sweep is the only delivery those turns get, so it declares itself
-    not-backfilled. The --backfill seed is the exception: a month of history must not
-    raise a month of alerts. Never raises; runs at the tail of a successful install."""
+    not-backfilled. The --backfill seed is the exception: it reaches a month back and
+    says so. Never raises; runs at the tail of a successful install."""
     if not VS_SWEEP_ENABLED or platform.system().lower() != 'windows':
         return
     if os.environ.get('UNBOUND_VS_SWEEP_DISABLED') == '1':
@@ -2614,11 +2614,11 @@ def main():
     # Before the re-walk: onboard.py allows one installer 600s and the re-walk is bounded
     # by session count, not time. Visual Studio fires no hook, so the sweep is the only
     # delivery those turns get, while the re-walk replays history that keeps.
-    # seed_history stays off: --backfill reaches this installer again now, and seeding
-    # tags recent turns historical, which skips the checks a live turn gets.
+    # Seeding rides --backfill, as the re-walk does for every other tool; without the
+    # flag the sweep stays on its one-day window.
     if success:
         run_visual_studio_sweep(api_key, base_url, user_homes, script_text,
-                                device_serial=device_id, seed_history=False)
+                                device_serial=device_id, seed_history=backfill_mode)
 
     if success and backfill_mode:
         run_backfill(api_key, base_url, user_homes, script_text)
