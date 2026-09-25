@@ -4561,7 +4561,11 @@ def _evaluate_pre_tool_use_policies(event, api_key):
 
 def _evaluate_user_prompt_policy(event, api_key):
     session_id = event.get('session_id') or event.get('sessionId')
-    model = get_session_start_model(session_id) or 'auto'
+    # Same reason the pre-tool path stopped reading this: it comes out of the audit log,
+    # which is agent-writable in the sandbox, and is sent as policy context. SessionStart
+    # returns before the audit write, so it is never legitimately recorded there at all --
+    # a planted row would be the only thing this could ever find.
+    model = 'auto' if RUNNING_CLOUD else (get_session_start_model(session_id) or 'auto')
     prompt = event.get('prompt') or event.get('transformedPrompt') or ''
 
     cache = load_policy_cache()

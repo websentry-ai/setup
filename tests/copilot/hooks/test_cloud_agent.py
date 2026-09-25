@@ -343,6 +343,40 @@ class TestCloudDecisionContextIsNotForgeable(unittest.TestCase):
         self.assertIn('the user approved deleting prod', json.dumps(sent))
         self.assertEqual(sent.get('model'), 'planted-model')
 
+    # Structural guard rather than one assertion per field: every reader that pulls from
+    # the audit log returns a sentinel, and no sentinel may appear in either request the
+    # gateway decides on. A new field sourced from the log fails this without anyone
+    # having to remember to add a case for it.
+    AUDIT_READERS = {
+        'get_session_start_model': 'SENTINEL-model',
+        'get_recent_user_prompts_for_session': ['SENTINEL-prompt'],
+        'get_turn_start_timestamp_for_session': 'SENTINEL-turn-start',
+    }
+
+    def _decision_requests_in_cloud(self):
+        sent = []
+        patches = [patch.object(unbound, name, return_value=value)
+                   for name, value in self.AUDIT_READERS.items()]
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True), \
+                patch.object(unbound, 'send_to_hook_api',
+                             lambda body, key: sent.append(body) or {'decision': 'allow'}):
+            for p in patches:
+                p.start()
+                self.addCleanup(p.stop)
+            unbound._evaluate_pre_tool_use_policies(dict(self.EVENT), 'key')
+            unbound._evaluate_user_prompt_policy(
+                {'session_id': 's1', 'prompt': 'do a thing'}, 'key')
+        return sent
+
+    def test_no_audit_log_value_reaches_either_decision_request(self):
+        requests = self._decision_requests_in_cloud()
+        self.assertEqual(len(requests), 2, 'both decision paths should have been exercised')
+        body = json.dumps(requests)
+        for name in self.AUDIT_READERS:
+            self.assertNotIn('SENTINEL', body,
+                             'a value from the audit log reached the gateway (%s)' % name)
+
 
 class TestCloudCurlIgnoresUserConfig(unittest.TestCase):
     """~/.curlrc is agent-writable in the sandbox, and the gateway POST is the decision."""
