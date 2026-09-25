@@ -4989,6 +4989,27 @@ def _repo_gate_scope_allows(policy, org, repo):
     return org == policy['github_org'].strip().lower()
 
 
+def _cloud_gate_violating_repo(block_policies):
+    """The session's repo, from the environment rather than from the checkout.
+
+    Reading it back out of `.git/config` hands the answer to the agent: `git remote
+    set-url origin <an-allowed-repo>` relabels the session, a corrupt config makes git
+    exit non-zero, and an include.path pointing at a FIFO stalls it -- each one ordinary,
+    none of them an attack on the hook, and all three end in the write going through.
+    GITHUB_REPOSITORY is set before the hook starts and the agent cannot reach it.
+
+    Unresolvable is a deny: a block policy exists and nothing here can say it does not
+    apply. Returns the offending slug, or None when the repo is in scope.
+    """
+    slug = (os.environ.get('GITHUB_REPOSITORY') or '').strip().lower()
+    org, _, repo = slug.partition('/')
+    if not org or not repo:
+        return slug or 'an unidentified repository'
+    if any(_repo_gate_scope_allows(p, org, repo) for p in block_policies):
+        return None
+    return '%s/%s' % (org, repo)
+
+
 def _repo_gate_violating_repo(candidates, block_policies, root_projects):
     """First candidate outside every scope; a git failure propagates to fail open."""
     for candidate in candidates:
@@ -5165,9 +5186,12 @@ def _repo_gate_evaluate(event):
         if not block_policies:
             return None
 
-        candidates = _repo_gate_candidates(
-            canonical, tool_input, event.get('cwd'))
-        repo = _repo_gate_violating_repo(candidates, block_policies, {})
+        if RUNNING_CLOUD:
+            repo = _cloud_gate_violating_repo(block_policies)
+        else:
+            candidates = _repo_gate_candidates(
+                canonical, tool_input, event.get('cwd'))
+            repo = _repo_gate_violating_repo(candidates, block_policies, {})
         gate = {'decision': 'deny', 'repo': repo} if repo else None
         if gate and get_unbound_attribution_enabled():
             gate['trace_id'] = str(uuid.uuid4())

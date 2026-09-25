@@ -324,6 +324,55 @@ class TestCloudFailsClosedAndStillGates(unittest.TestCase):
         gate.assert_not_called()
 
 
+class TestCloudRepoGateUsesTheEnvironment(unittest.TestCase):
+    """.git/config is one `git remote set-url` away from saying whatever the agent wants."""
+
+    POLICIES = [{'github_org': 'acme'}]
+
+    def _violating(self, repo_env):
+        env = {'GITHUB_REPOSITORY': repo_env} if repo_env is not None else {}
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.dict(unbound.os.environ, env, clear=True):
+            return unbound._cloud_gate_violating_repo(self.POLICIES)
+
+    def test_a_repo_inside_the_allowed_org_passes(self):
+        self.assertIsNone(self._violating('acme/widgets'))
+
+    def test_a_repo_outside_it_is_named_as_the_violation(self):
+        self.assertEqual(self._violating('other/widgets'), 'other/widgets')
+
+    def test_an_unresolvable_repo_denies_rather_than_allows(self):
+        """A block policy exists and nothing here can say it does not apply."""
+        self.assertIsNotNone(self._violating(None))
+        self.assertIsNotNone(self._violating('not-a-slug'))
+
+    def test_the_gate_never_shells_out_in_the_cloud(self):
+        """Every escape in this finding runs through git; the cloud gate no longer does.
+
+        It also keeps the pre-tool budget honest -- a subprocess here is spent after the
+        loader fetch and the gateway retries, where there is least room for it.
+        """
+        event = {'tool_name': 'Write', 'tool_input': {'filePath': '/workspace/x.py'},
+                 'cwd': '/workspace'}
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.dict(unbound.os.environ, {'GITHUB_REPOSITORY': 'other/widgets'}, clear=True), \
+                patch.object(unbound, 'get_repo_policies', return_value=self.POLICIES), \
+                patch.object(unbound, '_repo_gate_block_policies', return_value=self.POLICIES), \
+                patch.object(unbound.subprocess, 'run') as run:
+            gate = unbound._repo_gate_evaluate(event)
+        run.assert_not_called()
+        self.assertEqual(gate.get('repo'), 'other/widgets')
+
+    def test_the_laptop_still_resolves_the_repo_from_git(self):
+        event = {'tool_name': 'Write', 'tool_input': {'filePath': '/repo/x.py'}, 'cwd': '/repo'}
+        with patch.object(unbound, 'RUNNING_CLOUD', False), \
+                patch.object(unbound, 'get_repo_policies', return_value=self.POLICIES), \
+                patch.object(unbound, '_repo_gate_block_policies', return_value=self.POLICIES), \
+                patch.object(unbound, '_repo_gate_candidates', return_value=['/repo']) as cands:
+            unbound._repo_gate_evaluate(event)
+        cands.assert_called_once()
+
+
 class TestCloudDecisionContextIsNotForgeable(unittest.TestCase):
     """The audit log is agent-writable, so it must not become decision input."""
 
@@ -471,13 +520,10 @@ class TestCloudPreToolBudget(unittest.TestCase):
     def test_the_whole_pretool_budget_fits_inside_the_default_timeout(self):
         timeouts = self._attempts(True)
         self.assertEqual(timeouts, [8, 8])
-        # Everything the cloud path can spend before it answers, in order: the loader's
-        # fetch, the gateway retries (+0.5s per gap), then the repo gate's git call --
-        # which only counts because the gate was moved after the evaluator in cloud.
-        with patch.object(unbound, 'RUNNING_CLOUD', True):
-            gate_git = unbound._git_remote_timeout()
-        total = (self._loader_fetch_budget() + sum(timeouts)
-                 + 0.5 * (len(timeouts) - 1) + gate_git)
+        # Everything the cloud path can spend before it answers: the loader's fetch and
+        # the gateway retries (+0.5s per gap). The repo gate shells out to nothing in
+        # cloud -- asserted separately -- so no git timeout belongs in this sum.
+        total = self._loader_fetch_budget() + sum(timeouts) + 0.5 * (len(timeouts) - 1)
         self.assertLess(total, self.HOOK_TIMEOUT_FLOOR,
                         'worst case %.1fs exceeds the %ds default; preToolUse would be '
                         'killed and fail OPEN' % (total, self.HOOK_TIMEOUT_FLOOR))

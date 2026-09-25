@@ -72,3 +72,9 @@ before doing anything else; it does not make the field true, and GitHub exposes 
 to the sandbox that would. It is never sent with `preToolUse`, so it changes no policy
 decision — the damage is confined to attribution. Show it as claimed, and verify it
 gateway-side against `repo` and `session` before using it for anything that matters.
+
+The repo gate takes the repository from `GITHUB_REPOSITORY`, not from `.git/config`.
+Reading the checkout would let one `git remote set-url` relabel the session as a repo the
+policies allow — and a corrupt config or an `include.path` pointing at a FIFO would make
+git fail or stall, both of which end in the write going through. An unresolvable repo is a
+deny, not an allow.
