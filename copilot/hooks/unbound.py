@@ -795,6 +795,31 @@ def _safe_skill_segment(value):
         and not any(ch in value for ch in '*?[')
 
 
+# Read cap for the content hash. It must equal the discovery scanner's own cap
+# (MAX_CONFIG_FILE_SIZE), because the hash below has to byte-match what the
+# scanner reports for the same file — a drift here silently stops a reported
+# hash from ever matching a discovered body.
+SKILL_CONTENT_HASH_MAX_BYTES = 50 * 1024
+
+
+def _skill_content_hash(skill_path):
+    """SHA256 identity of the SKILL.md a run used, so the backend can tie the
+    run to an exact discovered body. The recipe mirrors the scanner exactly:
+    ``sha256("<file_name>:<content>")`` where content is read the same way the
+    scanner reads it — ``read_text`` (which folds CRLF to LF) up to the cap, and
+    a byte-truncated read only above it. None when the file cannot be read."""
+    try:
+        path = Path(skill_path)
+        if path.stat().st_size > SKILL_CONTENT_HASH_MAX_BYTES:
+            with open(path, 'rb') as handle:
+                content = handle.read(SKILL_CONTENT_HASH_MAX_BYTES).decode('utf-8', errors='replace')
+        else:
+            content = path.read_text(encoding='utf-8', errors='replace')
+        return hashlib.sha256(('%s:%s' % (path.name, content)).encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+
 def _resolve_skill_path(skill, cwd):
     """Absolute path of an invoked skill's SKILL.md, or None when it does not
     resolve. Requiring a real file on disk is what keeps non-skill tokens out."""
@@ -888,6 +913,7 @@ def _skill_tool_uses_from_events(skill_events, cwd, turn_key=None):
                     key.encode('utf-8', 'replace')).hexdigest()[:24],
                 'skill_name': name,
                 'skill_path': path,
+                'content_hash': _skill_content_hash(path),
             })
     except Exception:
         return []
@@ -919,6 +945,7 @@ def _skill_tool_uses_from_prompt(prompt, cwd, session_id, stamp):
                     key.encode('utf-8', 'replace')).hexdigest()[:24],
                 'skill_name': name,
                 'skill_path': path,
+                'content_hash': _skill_content_hash(path),
             })
     except Exception:
         return []

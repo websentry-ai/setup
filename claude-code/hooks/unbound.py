@@ -4745,6 +4745,31 @@ def _safe_skill_segment(value):
         and not any(ch in value for ch in '*?[')
 
 
+# Read cap for the content hash. It must equal the discovery scanner's own cap
+# (MAX_CONFIG_FILE_SIZE), because the hash below has to byte-match what the
+# scanner reports for the same file — a drift here silently stops a reported
+# hash from ever matching a discovered body.
+SKILL_CONTENT_HASH_MAX_BYTES = 50 * 1024
+
+
+def _skill_content_hash(skill_path: Optional[str]) -> Optional[str]:
+    """SHA256 identity of the SKILL.md a run used, so the backend can tie the
+    run to an exact discovered body. The recipe mirrors the scanner exactly:
+    ``sha256("<file_name>:<content>")`` where content is read the same way the
+    scanner reads it — ``read_text`` (which folds CRLF to LF) up to the cap, and
+    a byte-truncated read only above it. None when the file cannot be read."""
+    try:
+        path = Path(skill_path)
+        if path.stat().st_size > SKILL_CONTENT_HASH_MAX_BYTES:
+            with open(path, 'rb') as handle:
+                content = handle.read(SKILL_CONTENT_HASH_MAX_BYTES).decode('utf-8', errors='replace')
+        else:
+            content = path.read_text(encoding='utf-8', errors='replace')
+        return hashlib.sha256(('%s:%s' % (path.name, content)).encode('utf-8')).hexdigest()
+    except Exception:
+        return None
+
+
 def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[str]:
     """Absolute path of the invoked skill's SKILL.md. The tool call carries only
     the skill name, so map it back on device — the backend joins this against
@@ -4864,6 +4889,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     skill, event.get('cwd') or prompt_cwd or cwd)
                 if skill_path:
                     tool_use_entry['skill_path'] = skill_path
+                    tool_use_entry['content_hash'] = _skill_content_hash(skill_path)
             assistant_tool_uses.append(tool_use_entry)
     
     # A queued prompt is consumed into this turn without its own submit event, so it is
@@ -4908,6 +4934,7 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                     typed_key.encode('utf-8', 'replace')).hexdigest()[:24],
                 'skill_name': typed_skill,
                 'skill_path': typed_path,
+                'content_hash': _skill_content_hash(typed_path),
             })
 
     # One message, not one per prompt: the backend keeps only the last user message.
