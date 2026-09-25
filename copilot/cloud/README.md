@@ -44,3 +44,29 @@ attributes to the application that key belongs to.
 
 `UNBOUND_HOOK_URL` serves the hook from a mirror, and then `UNBOUND_HOOK_SHA256` is
 required — an override is not pinned to a commit.
+
+## Trust model
+
+Three limits are known and accepted. Each needs gateway-side work to close, not a hook change.
+
+**`UNBOUND_COPILOT_API_KEY` is readable by the agent, not just by the hook.** GitHub exposes
+Agents secrets as environment variables "so they can be used by scripts and tools that Copilot
+runs" — there is no hook-only channel. A prompt-injected agent can read the key, send it to any
+allowlisted host, and call the gateway directly with forged telemetry. A dedicated application
+limits the blast radius; it does not prevent the leak. Closing it needs short-lived per-session
+tokens, or server-side validation of `github.session` and `repo`.
+
+**`preToolUse` is best-effort against a hostile agent, not a hard stop.** GitHub fails a hook
+open when it exceeds `timeoutSec`, and the agent shares our uid — so it can stall the hook, or
+replace the `python3` the loader execs, and have the tool call proceed unevaluated. Bounded
+reads, bounded retries and no disk dependency raise the cost of that; nothing in a hook closes
+it. It holds against an agent doing ordinary work, not against one attacking the hook. Catching
+that needs the gateway to notice sessions whose pre-tool checks stop arriving.
+
+**`github.actor` is a claim, and forging it takes no attack.** It is read from the co-author
+trailer GitHub stamps on the agent's *first* commit, but every later commit is one the agent
+wrote — so committing with `Co-authored-by: X <victim@users.noreply.github.com>` pins the session
+to whoever it names. Reading the first commit means it has to do that before anything else; it
+does not make the field true. It is never sent with `preToolUse`, so it changes no policy
+decision — the damage is confined to attribution. Show it as claimed, and verify it gateway-side
+against `repo` and `session` before using it for anything that matters.
