@@ -2735,6 +2735,20 @@ def _read_mcp_server_config(server_name, config_path):
         return None
 
 
+def _cursor_mcp_server_config(event, server_name):
+    """Cursor reads MCP servers from each project's .cursor/mcp.json and from
+    ~/.cursor/mcp.json; the project file is checked first. A remote server set up
+    elsewhere (a plugin) is still fingerprinted by the URL on the event."""
+    roots = event.get('workspace_roots') or []
+    paths = [Path(root) / '.cursor' / 'mcp.json' for root in roots if isinstance(root, str) and root]
+    for path in paths + [CURSOR_MCP_CONFIG_PATH]:
+        server_cfg = _read_mcp_server_config(server_name, path)
+        if server_cfg:
+            return server_cfg
+    url = event.get('url') or event.get('mcp_server_url')
+    return {'url': url} if isinstance(url, str) and url else None
+
+
 def process_pre_tool_use_execution(event, api_key, tool_name, command, mcp_server=None, mcp_tool=None):
     """beforeShellExecution / beforeMCPExecution entry point; the gate runs first and applies to the shell event only, an MCP call names no local path to resolve."""
     gate = _repo_gate_evaluate(event, tool_name, command)
@@ -2763,7 +2777,7 @@ def _evaluate_pre_tool_use_execution_policies(event, api_key, tool_name, command
     if mcp_server is not None:
         metadata['mcp_server'] = mcp_server
 
-        server_cfg = _read_mcp_server_config(mcp_server, CURSOR_MCP_CONFIG_PATH)
+        server_cfg = _cursor_mcp_server_config(event, mcp_server)
         if server_cfg:
             metadata['mcp_server_config'] = _augment_script_hash(server_cfg, metadata.get('cwd'))
 
@@ -2932,10 +2946,9 @@ def process_user_prompt_submit(event, api_key):
 
 
 def _deferred_skill_context_path(event):
-    identity = '\x1f'.join((
-        str(event.get('conversation_id') or ''),
-        str(event.get('generation_id') or ''),
-    ))
+    # The Cursor CLI sends a different conversation_id on the prompt than on the tool
+    # calls that follow it; generation_id is shared by both, so it alone keys the turn.
+    identity = str(event.get('generation_id') or event.get('conversation_id') or '')
     digest = hashlib.sha256(identity.encode()).hexdigest()
     return SKILL_POLICY_STATE_ROOT / 'pending' / digest
 
@@ -4542,7 +4555,8 @@ def main():
             return
 
         if hook_event_name == 'beforeMCPExecution':
-            mcp_server = event.get('command', '')
+            # A stdio server is named in `command`; a remote (URL) server only in `mcp_server_name`.
+            mcp_server = event.get('command') or event.get('mcp_server_name') or ''
             mcp_tool_name = event.get('tool_name', '')
 
             response = _with_deferred_skill_context(event, process_pre_tool_use_execution(
