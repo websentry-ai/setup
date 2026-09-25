@@ -483,6 +483,14 @@ class TestCloudCurlIgnoresUserConfig(unittest.TestCase):
         with patch.object(unbound, 'RUNNING_CLOUD', False):
             self.assertEqual(unbound._curl_base(), ['curl'])
 
+    def test_the_repo_gate_incident_post_carries_it(self):
+        """This POST sends the org API key, so ~/.curlrc must not redirect it."""
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.object(unbound.subprocess, 'Popen') as popen:
+            unbound._repo_gate_post('{}', 'key')
+        argv = popen.call_args[0][0]
+        self.assertEqual(argv[:2], ['curl', '-q'])
+
     def test_the_pretool_decision_call_carries_it(self):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
                 patch.object(unbound.subprocess, 'run',

@@ -5118,11 +5118,11 @@ def _repo_gate_incident_ordinal():
 def _repo_gate_post(body, api_key):
     """Never waited on, so the blocking path stays free of synchronous work."""
     proc = subprocess.Popen(
-        ['curl', '-fsSL', '--max-time', '10', '-X', 'POST',
-         '-H', 'Authorization: Bearer %s' % api_key,
-         '-H', 'Content-Type: application/json',
-         '--data-binary', '@-',
-         '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
+        _curl_base() + ['-fsSL', '--max-time', '10', '-X', 'POST',
+                        '-H', 'Authorization: Bearer %s' % api_key,
+                        '-H', 'Content-Type: application/json',
+                        '--data-binary', '@-',
+                        '%s/v1/hooks/pretool' % UNBOUND_GATEWAY_URL],
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     proc.stdin.write(body.encode())
