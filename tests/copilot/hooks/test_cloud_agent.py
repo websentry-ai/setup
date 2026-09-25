@@ -180,11 +180,13 @@ class TestCloudUntrustedPolicyCache(unittest.TestCase):
     process, written from the gateway's own response.
     """
 
+    # Every value differs from the default the readers fall back to, so getting the
+    # default back is proof the file was not read. Planting defaults would prove nothing.
     PLANT = {
         'last_synced': '2999-01-01T00:00:00Z',
-        'tools_to_check': [],
-        'policy_check_failure_action': 'allow',
-        'repo_policies': [],
+        'tools_to_check': ['PlantedTool'],
+        'policy_check_failure_action': 'block',
+        'repo_policies': [{'repo': 'planted/evil'}],
         'unbound_attribution_enabled': True,
     }
 
@@ -200,10 +202,19 @@ class TestCloudUntrustedPolicyCache(unittest.TestCase):
         cloud, cache_path = self._with_planted_file(True)
         with cloud, cache_path, patch.dict(unbound._CLOUD_POLICY_CACHE, {}, clear=True):
             self.assertIsNone(unbound.load_policy_cache())
+            # The repo gate reads this one; an empty result means it evaluates nothing.
             self.assertEqual(unbound.get_repo_policies(), [])
             self.assertFalse(unbound.get_unbound_attribution_enabled())
             self.assertEqual(unbound.get_policy_check_failure_action(),
                              unbound.POLICY_CHECK_FAILURE_DEFAULT)
+
+    def test_the_laptop_reading_the_same_file_proves_the_plant_was_loadable(self):
+        """Guards the test above: a plant the laptop cannot read either would prove
+        nothing about the cloud path."""
+        cloud, cache_path = self._with_planted_file(False)
+        with cloud, cache_path:
+            self.assertEqual(unbound.get_repo_policies(), [{'repo': 'planted/evil'}])
+            self.assertEqual(unbound.get_policy_check_failure_action(), 'block')
 
     def test_the_laptop_still_reads_its_file(self):
         cloud, cache_path = self._with_planted_file(False)
@@ -232,6 +243,28 @@ class TestCloudUntrustedPolicyCache(unittest.TestCase):
                 {'tool_name': 'Write', 'tool_input': {'filePath': '/workspace/x.py'},
                  'session_id': 's1'}, 'key')
         self.assertTrue(gateway.called, 'the write short-circuited without asking the gateway')
+
+
+class TestCloudCurlIgnoresUserConfig(unittest.TestCase):
+    """~/.curlrc is agent-writable in the sandbox, and the gateway POST is the decision."""
+
+    def test_the_sandbox_passes_q_first(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', True):
+            self.assertEqual(unbound._curl_base()[:2], ['curl', '-q'])
+
+    def test_a_laptop_still_honours_its_curlrc(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', False):
+            self.assertEqual(unbound._curl_base(), ['curl'])
+
+    def test_the_pretool_decision_call_carries_it(self):
+        with patch.object(unbound, 'RUNNING_CLOUD', True), \
+                patch.object(unbound.subprocess, 'run',
+                             side_effect=unbound.subprocess.TimeoutExpired('curl', 1)) as run, \
+                patch.object(unbound.time, 'sleep'):
+            unbound.send_to_hook_api({'a': 1}, 'key')
+        argv = run.call_args_list[0][0][0]
+        self.assertEqual(argv[:2], ['curl', '-q'],
+                         'the call that decides allow/deny would follow a planted ~/.curlrc')
 
 
 class TestCloudAuditTail(unittest.TestCase):

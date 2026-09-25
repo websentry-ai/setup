@@ -951,6 +951,17 @@ def redact_secrets(text, key=None):
     return text
 
 
+def _curl_base():
+    """curl argv prefix, with -q first when it is needed.
+
+    -q makes curl ignore ~/.curlrc. In the sandbox that file is agent-writable and a
+    single `insecure` or `resolve` line there redirects the gateway POST below to a server
+    of the agent's own -- which answers the pre-tool check, so it decides allow or deny.
+    Not on a laptop: there the same file is how a corporate proxy is configured.
+    """
+    return ["curl", "-q"] if RUNNING_CLOUD else ["curl"]
+
+
 def report_error_to_gateway(message, category='general', api_key=None, extra=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
@@ -967,7 +978,7 @@ def report_error_to_gateway(message, category='general', api_key=None, extra=Non
             'hook_source': 'copilot',
         })
         proc = subprocess.Popen(
-            ["curl", "-fsSL", "-X", "POST",
+            _curl_base() + ["-fsSL", "-X", "POST",
              "-H", f"Authorization: Bearer {api_key}",
              "-H", "Content-Type: application/json",
              "--data-binary", "@-",
@@ -4057,7 +4068,7 @@ def send_to_hook_api(request_body, api_key):
     for attempt in range(attempts):
         try:
             result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
+                _curl_base() + ["-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],
@@ -4161,7 +4172,7 @@ def poll_approval_status(api_key, policy_ids, application_id, request_id='', tim
         for attempt in range(3):
             try:
                 result = subprocess.run(
-                    ["curl", "-fsSL", "-X", "POST",
+                    _curl_base() + ["-fsSL", "-X", "POST",
                      "-H", f"Authorization: Bearer {api_key}",
                      "-H", "Content-Type: application/json",
                      "--data-binary", "@-", url],
@@ -6628,7 +6639,7 @@ def send_to_api(exchange, api_key):
     for attempt in range(3):
         try:
             result = subprocess.run(
-                ["curl", "-fsSL", "-X", "POST",
+                _curl_base() + ["-fsSL", "-X", "POST",
                  "-H", f"Authorization: Bearer {api_key}",
                  "-H", "Content-Type: application/json",
                  "--data-binary", "@-", url],

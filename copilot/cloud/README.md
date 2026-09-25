@@ -84,6 +84,11 @@ Two things make that chain hold in practice:
   Isolated mode drops the script directory, `PYTHONPATH` and user site-packages.
 - **`PATH` starts at `/usr/bin:/bin`** in both the config and the loader, so the
   `sha256sum` doing the verifying cannot itself be shadowed.
+- **Every `curl` runs with `-q`**, in the loader and in the hook's own calls to the
+  gateway. Without it curl reads `~/.curlrc`, and one `insecure` or `resolve` line there
+  would point the pre-tool check — the call that decides allow or deny — at a server the
+  agent controls. Cloud only: on a laptop that same file is how a corporate proxy is
+  configured.
 
 Everything else the hook keeps under `/tmp` is writable by the agent. The rule is not that
 those files are hardened individually — it is that **sandbox state is never allowed to

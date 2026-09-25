@@ -61,7 +61,9 @@ if [ -n "${UNBOUND_HOOK_SHA256:-}" ]; then
   # A digest makes the /tmp cache safe to keep: a swap cannot survive the check below, so
   # later events reuse it instead of refetching.
   if [ ! -s "$HOOK" ]; then
-    TMP="$HOOK.$$"
+    # mktemp, not "$HOOK.$$": a predictable staging name can be pre-created as a symlink,
+    # and the redirect below would then write through it.
+    TMP=$(mktemp /tmp/unbound-hook.XXXXXX) || fail "could not create a staging file"
     fetch > "$TMP" || { rm -f "$TMP"; fail "hook fetch failed from $SRC"; }
     mv -f "$TMP" "$HOOK" || { rm -f "$TMP"; fail "could not stage the hook at $HOOK"; }
   fi
