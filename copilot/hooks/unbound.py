@@ -38,8 +38,31 @@ def _copilot_config_path():
     return _copilot_home() / 'config.json'
 
 
-# Copilot cloud agent sandbox: ephemeral disk, no device, no signed-in user, no approver.
-RUNNING_CLOUD = bool(os.environ.get('COPILOT_AGENT_SESSION_ID'))
+def _detect_cloud():
+    """Whether this is a cloud agent sandbox: ephemeral disk, no device, no signed-in
+    user, no approver.
+
+    The environment variable alone is not proof of anything. Anyone can export it, and
+    cloud mode is not merely a different code path -- it takes the repo gate's answer from
+    GITHUB_REPOSITORY, labels the turn `cloud`, and drops the device probe. A developer on
+    a managed laptop setting two variables would put themselves outside the repo gate and
+    off their own budget, which uninstalling the hook would have needed admin rights to do.
+
+    So the deciding fact is not the variable but where this code is: the cloud loader
+    streams the hook over a file descriptor and never writes it down, while an installed
+    hook is a file on disk. A frozen build is an install by construction.
+    """
+    if not os.environ.get('COPILOT_AGENT_SESSION_ID'):
+        return False
+    if getattr(sys, 'frozen', False) or os.environ.get('UNBOUND_HOOK_FROZEN') == '1':
+        return False
+    try:
+        return not os.path.isfile(os.path.abspath(__file__))
+    except Exception:
+        return False
+
+
+RUNNING_CLOUD = _detect_cloud()
 
 
 UNBOUND_GATEWAY_URL = os.environ.get(

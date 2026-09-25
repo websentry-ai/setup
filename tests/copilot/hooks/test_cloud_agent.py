@@ -169,6 +169,37 @@ class TestGithubContext(unittest.TestCase):
             self.assertEqual(unbound.build_github_context(), {'session': 'sess-1'})
 
 
+class TestCloudModeCannotBeTurnedOnByEnvironment(unittest.TestCase):
+    """Cloud mode is not just a code path: it takes the repo gate's answer from
+    GITHUB_REPOSITORY, labels the turn `cloud`, and drops the device probe. An installed
+    hook must never enter it, or two exported variables would do what uninstalling the
+    hook needs admin rights for."""
+
+    def _detect(self, env, frozen=False, on_disk=True):
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound.os.path, 'isfile', return_value=on_disk), \
+                patch.object(unbound.sys, 'frozen', frozen, create=True):
+            return unbound._detect_cloud()
+
+    def test_the_variable_alone_does_not_switch_an_installed_hook(self):
+        self.assertFalse(self._detect({'COPILOT_AGENT_SESSION_ID': 'x'}, on_disk=True))
+
+    def test_nor_does_adding_a_repository(self):
+        self.assertFalse(self._detect(
+            {'COPILOT_AGENT_SESSION_ID': 'x', 'GITHUB_REPOSITORY': 'acme/widgets'},
+            on_disk=True))
+
+    def test_a_hook_streamed_over_a_descriptor_is_the_cloud(self):
+        self.assertTrue(self._detect({'COPILOT_AGENT_SESSION_ID': 'x'}, on_disk=False))
+
+    def test_no_session_id_is_never_the_cloud(self):
+        self.assertFalse(self._detect({}, on_disk=False))
+
+    def test_a_frozen_build_is_an_install_by_construction(self):
+        self.assertFalse(self._detect({'COPILOT_AGENT_SESSION_ID': 'x'},
+                                      frozen=True, on_disk=False))
+
+
 class TestCloudSurface(unittest.TestCase):
     """The cloud agent is a fourth Copilot surface, named on the same field as the rest."""
 
@@ -508,6 +539,10 @@ class TestCloudPreToolBudget(unittest.TestCase):
     # for 60. Assert against the default: the config's value may simply not be honoured,
     # and being wrong here means a killed preToolUse, which fails OPEN.
     HOOK_TIMEOUT_FLOOR = 30
+    # Nothing above models process spawns, the TLS handshake, or importing a ~320KB module,
+    # and the timeout is a hard kill. A sum that merely lands under 30 has no room for any
+    # of it, so the budget has to clear the limit by this much.
+    UNMODELLED_ALLOWANCE = 2
 
     def _loader_fetch_budget(self):
         """The -m the loader spends fetching the hook, read from the loader itself so the
@@ -517,16 +552,29 @@ class TestCloudPreToolBudget(unittest.TestCase):
         self.assertIsNotNone(match, 'loader no longer caps its fetch')
         return int(match.group(1))
 
+    def _config_read_budget(self):
+        """The config reads and digests the loader before the loader starts spending, so
+        its own ceiling is part of the same 30s -- and it is in a third file."""
+        config = json.loads((REPO / 'copilot/cloud/unbound.json').read_text())
+        commands = [entry['bash'] for entries in config['hooks'].values() for entry in entries]
+        budgets = {int(m.group(1)) for m in
+                   (re.search(r'timeout (\d+)', cmd) for cmd in commands) if m}
+        self.assertEqual(len(budgets), 1, 'hook entries disagree on their read timeout')
+        return budgets.pop()
+
     def test_the_whole_pretool_budget_fits_inside_the_default_timeout(self):
         timeouts = self._attempts(True)
         self.assertEqual(timeouts, [8, 8])
-        # Everything the cloud path can spend before it answers: the loader's fetch and
-        # the gateway retries (+0.5s per gap). The repo gate shells out to nothing in
-        # cloud -- asserted separately -- so no git timeout belongs in this sum.
-        total = self._loader_fetch_budget() + sum(timeouts) + 0.5 * (len(timeouts) - 1)
-        self.assertLess(total, self.HOOK_TIMEOUT_FLOOR,
-                        'worst case %.1fs exceeds the %ds default; preToolUse would be '
-                        'killed and fail OPEN' % (total, self.HOOK_TIMEOUT_FLOOR))
+        # Everything the cloud path can spend before it answers, across all three files:
+        # the config reading and digesting the loader, the loader's fetch, and the gateway
+        # retries (+0.5s per gap). The repo gate shells out to nothing in cloud -- asserted
+        # separately -- so no git timeout belongs in this sum.
+        total = (self._config_read_budget() + self._loader_fetch_budget()
+                 + sum(timeouts) + 0.5 * (len(timeouts) - 1))
+        self.assertLess(total + self.UNMODELLED_ALLOWANCE, self.HOOK_TIMEOUT_FLOOR,
+                        'worst case %.1fs leaves under %ds of the %ds default for process '
+                        'startup; preToolUse would be killed and fail OPEN'
+                        % (total, self.UNMODELLED_ALLOWANCE, self.HOOK_TIMEOUT_FLOOR))
 
     def test_the_laptop_git_timeout_is_unchanged(self):
         with patch.object(unbound, 'RUNNING_CLOUD', False):
