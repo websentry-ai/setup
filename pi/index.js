@@ -173,7 +173,7 @@ function redactSecrets(text, apiKey) {
 // packages/core/src/piVersion.ts
 import { readFileSync as readFileSync2 } from "node:fs";
 import { dirname, join as join2 } from "node:path";
-var PI_PACKAGE_NAME = ["@earendil", "-works", "/pi-coding-agent"].join("");
+var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 var MAX_WALK_UP_LEVELS = 8;
 var MAX_VERSION_CHARS = 32;
 function readManagedInstallVersion(env) {
