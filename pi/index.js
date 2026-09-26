@@ -222,7 +222,11 @@ function resolveClientEntrypoint(env, argv1) {
 }
 
 // packages/core/src/verdict.ts
-var CONTROL_CHARS = /[\x00-\x09\x0b-\x1f\x7f]/g;
+var CONTROL_CHARS = new RegExp(
+  "[\\x00-\\x09\\x0b-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+  "g"
+);
+var UNICODE_LINE_SEPARATORS = new RegExp("[\\u2028\\u2029]", "g");
 function parseDecision(raw) {
   if (raw === "allow" || raw === "deny" || raw === "ask" || raw === "approval_required") {
     return raw;
@@ -231,7 +235,7 @@ function parseDecision(raw) {
 }
 function sanitizeReason(raw) {
   if (typeof raw !== "string") return void 0;
-  const stripped = raw.replace(CONTROL_CHARS, "");
+  const stripped = raw.replace(CONTROL_CHARS, "").replace(UNICODE_LINE_SEPARATORS, " ");
   if (stripped.length === 0) return void 0;
   return stripped.length > MAX_REASON_CHARS ? stripped.slice(0, MAX_REASON_CHARS) : stripped;
 }
@@ -408,8 +412,11 @@ function buildPretoolPayload(input) {
 }
 
 // packages/pi/src/narrow.ts
-function isBashCall(e) {
-  return e.toolName === "bash" && typeof e.input.command === "string";
+var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
+function isShellCall(e) {
+  if (!SHELL_TOOLS.has(e.toolName)) return false;
+  const input = e.input;
+  return typeof input === "object" && input !== null && typeof input.command === "string";
 }
 
 // packages/pi/src/ui.ts
@@ -436,9 +443,9 @@ async function confirmWithTimeout(ctx, title, message, timeoutMs = CONFIRM_TIMEO
 // packages/pi/src/decide.ts
 async function decideToolCall(event, ctx, deps) {
   try {
-    const bash = isBashCall(event);
-    const command = bash ? event.input.command : "";
-    if (bash && command.trim() === "") return void 0;
+    const shell = isShellCall(event);
+    const command = shell ? event.input.command : "";
+    if (shell && command.trim() === "") return void 0;
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
