@@ -1,7 +1,18 @@
 // The pretool payload builder — a pure function. No fetch, no fs, no logging, and nothing is ever
-// written to disk (ASVS V8 / T-08-12): the body carries the verbatim shell command and cwd.
+// written to disk (ASVS V8 / T-08-12).
 //
-// Two contracts live here:
+// **What the body carries, exactly:** the verbatim shell command, the cwd, a `metadata.file_path` for
+// the native file tools, and an **allowlisted subset** of the model-produced tool input.
+//
+// **File bodies and edit hunks are never forwarded.** Not capped — absent. `write.content` and
+// `edit.edits` are read by nothing server-side: `metadata.tool_input` has three consumers in
+// `preToolUseHandler.ts` (`:914` MCP input DLP, which a pi tool call never reaches; `:1201` RepoGate;
+// `:1594` `buildSyntheticPattern`, which reads `pattern` for grep/find), and paths come from
+// `metadata.file_path` (§C4). Sending them was undeclared egress of file contents for zero
+// enforcement value (WR-04 / T-09-03) — so if a future reader is tempted to "restore" them as a
+// parity fix, the finding to read first is §C4's "nothing reads them".
+//
+// Three contracts live here:
 //
 //   * The §B1 field list, exactly. Every Phase-9 / Future field is absent from the code as well as
 //     the type — the identity field in particular runs a deny-capable gate server-side.
@@ -10,8 +21,17 @@
 //     `!!command || (isValidNativeTool && !!filePath)` (§B3). A pathless search would therefore
 //     skip policy evaluation entirely, so those three tools always send `metadata.file_path`,
 //     defaulting to cwd.
+//   * The allowlist runs BEFORE the existing 16 KB whole-object cap, which stays as defence in
+//     depth for the keys that do survive.
 
-import { APP_LABEL, EVENT_NAME_TOOL_USE, MAX_COMMAND_CHARS, MAX_TOOL_INPUT_BYTES } from "./constants.ts";
+import {
+  APP_LABEL,
+  EVENT_NAME_TOOL_USE,
+  MAX_COMMAND_CHARS,
+  MAX_TOOL_INPUT_BYTES,
+  MAX_TOOL_INPUT_VALUE_BYTES,
+  TOOL_INPUT_ALLOWLIST,
+} from "./constants.ts";
 import type { PreToolUseData, PretoolPayloadInput, PretoolRequestBody } from "./types.ts";
 
 /** Native search tools whose `path` is optional in pi — `file_path` falls back to cwd. */
@@ -51,6 +71,74 @@ export function resolveFilePath(
   const path = toolInput.path;
   if (typeof path === "string" && path.length > 0) return path;
   return isDefaulting ? cwd : undefined;
+}
+
+const ALLOWED_TOOL_INPUT_KEYS: ReadonlySet<string> = new Set(TOOL_INPUT_ALLOWLIST);
+
+/**
+ * Slice a string to at most `maxBytes` UTF-8 bytes **on a code-point boundary**.
+ *
+ * `value.slice(0, maxBytes)` would cut UTF-16 code units, which splits a surrogate pair at the
+ * boundary and turns an emoji into a lone surrogate that serialises as U+FFFD. Iterating code points
+ * and stopping before the budget is exceeded keeps the result valid UTF-8, and the loop is bounded by
+ * `maxBytes` iterations (not by the input length), because it breaks as soon as the next character
+ * would not fit.
+ */
+function sliceToBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value) <= maxBytes) return value;
+  let out = "";
+  let usedBytes = 0;
+  for (const char of value) {
+    const size = Buffer.byteLength(char);
+    if (usedBytes + size > maxBytes) break;
+    out += char;
+    usedBytes += size;
+  }
+  return out;
+}
+
+/**
+ * Apply `TOOL_INPUT_ALLOWLIST` (WR-04). Keeps only allowlisted keys whose values are
+ * `string | number | boolean`, slices any surviving string to `MAX_TOOL_INPUT_VALUE_BYTES`, and says
+ * so:
+ *
+ *   * `_dropped: true` — at least one key or value was removed, so the server can see the forward was
+ *     lossy rather than inferring it from an absence;
+ *   * `_truncated: true` — at least one surviving value is a prefix, not the whole value.
+ *
+ * Neither marker appears when nothing happened, so a clean forward stays byte-diffable. Total: a
+ * non-object input is an empty forward, never a throw.
+ */
+export function sanitizeToolInput(toolInput: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  if (toolInput === null || typeof toolInput !== "object" || Array.isArray(toolInput)) return out;
+
+  let dropped = false;
+  let truncated = false;
+
+  for (const [key, value] of Object.entries(toolInput)) {
+    if (!ALLOWED_TOOL_INPUT_KEYS.has(key)) {
+      dropped = true;
+      continue;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      out[key] = value;
+      continue;
+    }
+    if (typeof value !== "string") {
+      // An object, array, null or undefined on an allowlisted key. Forwarding it would re-open the
+      // egress hole one key at a time, and no evaluator could use it anyway.
+      dropped = true;
+      continue;
+    }
+    const sliced = sliceToBytes(value, MAX_TOOL_INPUT_VALUE_BYTES);
+    if (sliced.length !== value.length) truncated = true;
+    out[key] = sliced;
+  }
+
+  if (truncated) out._truncated = true;
+  if (dropped) out._dropped = true;
+  return out;
 }
 
 /**
@@ -122,7 +210,8 @@ export function capCommand(
 export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestBody {
   const metadata: Record<string, unknown> = {
     cwd: input.cwd,
-    tool_input: capToolInput(input.toolInput),
+    // Allowlist first, then the whole-object cap as defence in depth (WR-04).
+    tool_input: capToolInput(sanitizeToolInput(input.toolInput)),
   };
   const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
   if (filePath !== undefined) metadata.file_path = filePath;

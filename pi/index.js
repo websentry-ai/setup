@@ -46,6 +46,17 @@ var BREAKER_OPEN_MS = 6e4;
 var MAX_REASON_CHARS = 2e3;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
+var MAX_TOOL_INPUT_VALUE_BYTES = 2048;
+var TOOL_INPUT_ALLOWLIST = [
+  "path",
+  "pattern",
+  "glob",
+  "ignoreCase",
+  "literal",
+  "limit",
+  "offset",
+  "timeout"
+];
 var DENY_PREFIX = "Blocked by Unbound policy: ";
 var GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 var DECLINED_REASON = "Declined by user (Unbound policy)";
@@ -193,6 +204,45 @@ function resolveFilePath(toolName, toolInput, cwd) {
   if (typeof path === "string" && path.length > 0) return path;
   return isDefaulting ? cwd : void 0;
 }
+var ALLOWED_TOOL_INPUT_KEYS = new Set(TOOL_INPUT_ALLOWLIST);
+function sliceToBytes(value, maxBytes) {
+  if (Buffer.byteLength(value) <= maxBytes) return value;
+  let out = "";
+  let usedBytes = 0;
+  for (const char of value) {
+    const size = Buffer.byteLength(char);
+    if (usedBytes + size > maxBytes) break;
+    out += char;
+    usedBytes += size;
+  }
+  return out;
+}
+function sanitizeToolInput(toolInput) {
+  const out = {};
+  if (toolInput === null || typeof toolInput !== "object" || Array.isArray(toolInput)) return out;
+  let dropped = false;
+  let truncated = false;
+  for (const [key, value] of Object.entries(toolInput)) {
+    if (!ALLOWED_TOOL_INPUT_KEYS.has(key)) {
+      dropped = true;
+      continue;
+    }
+    if (typeof value === "number" || typeof value === "boolean") {
+      out[key] = value;
+      continue;
+    }
+    if (typeof value !== "string") {
+      dropped = true;
+      continue;
+    }
+    const sliced = sliceToBytes(value, MAX_TOOL_INPUT_VALUE_BYTES);
+    if (sliced.length !== value.length) truncated = true;
+    out[key] = sliced;
+  }
+  if (truncated) out._truncated = true;
+  if (dropped) out._dropped = true;
+  return out;
+}
 function capToolInput(toolInput, maxBytes = MAX_TOOL_INPUT_BYTES) {
   let serialised;
   try {
@@ -228,7 +278,8 @@ function capCommand(command, maxChars = MAX_COMMAND_CHARS) {
 function buildPretoolPayload(input) {
   const metadata = {
     cwd: input.cwd,
-    tool_input: capToolInput(input.toolInput)
+    // Allowlist first, then the whole-object cap as defence in depth (WR-04).
+    tool_input: capToolInput(sanitizeToolInput(input.toolInput))
   };
   const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
   if (filePath !== void 0) metadata.file_path = filePath;
@@ -707,12 +758,14 @@ async function decideToolCall(event, ctx, deps) {
   try {
     const shell = isShellCall(event);
     const command = shell ? event.input.command : "";
-    if (shell && command.trim() === "") return void 0;
+    const toolInput = event.input ?? {};
+    const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
+    if (command.trim() === "" && filePath === void 0) return void 0;
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
       toolUseId: event.toolCallId,
-      toolInput: event.input ?? {},
+      toolInput,
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,

@@ -82,6 +82,34 @@ export const CACHE_TTL_MS = 300_000;
 export const MAX_REASON_CHARS = 2000;
 export const MAX_TOOL_INPUT_BYTES = 16_384;
 export const MAX_COMMAND_CHARS = 8192;
+/**
+ * WR-04: the per-value cap on what survives `TOOL_INPUT_ALLOWLIST`. `pattern` is model-produced and
+ * free-form, and the server truncates it at 4096 anyway (`effectiveCommand.ts:20 PATTERN_MAX`), so
+ * 2 KB costs no enforcement and bounds what a single value can carry off the machine.
+ */
+export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
+/**
+ * The only `metadata.tool_input` keys that leave the machine (WR-04 / T-09-03).
+ *
+ * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a pi tool call
+ * never takes that path), `:1201` (RepoGate only) and `:1594` (`buildSyntheticPattern`, which reads
+ * `pattern` for grep/find and nothing else). File paths arrive as `metadata.file_path`, not from here
+ * (§C4). So `content` (write) and `edits` (edit) are read by nothing at all, and forwarding them was
+ * undeclared egress of file contents.
+ *
+ * **Widening this list is an egress decision, not a convenience.** A test spells the set out
+ * independently so an addition cannot be slipped in as a formatting change.
+ */
+export const TOOL_INPUT_ALLOWLIST = [
+  "path",
+  "pattern",
+  "glob",
+  "ignoreCase",
+  "literal",
+  "limit",
+  "offset",
+  "timeout",
+] as const;
 
 // --- User-facing strings, locked verbatim by 08-CONTEXT.md ------------------------------------
 /** Note the trailing space: the API reason is appended directly after it. */

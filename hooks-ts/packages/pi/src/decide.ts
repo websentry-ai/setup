@@ -23,7 +23,7 @@ import {
   GENERIC_DENY_REASON,
   NO_UI_REASON,
 } from "../../core/src/constants.ts";
-import { buildPretoolPayload } from "../../core/src/payload.ts";
+import { buildPretoolPayload, resolveFilePath } from "../../core/src/payload.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
@@ -60,16 +60,23 @@ export async function decideToolCall(
     // `narrow.ts`. Anything else carries no command and is judged server-side on `metadata`.
     const shell = isShellCall(event);
     const command = shell ? event.input.command : "";
+    // Computed once and handed to both the skip decision and the payload, so the two cannot disagree
+    // about what this call carries. `null` and `undefined` inputs both become `{}` here — see
+    // `narrow.ts` on why `input` is `unknown` and can genuinely be either (WR-07).
+    const toolInput = (event.input ?? {}) as Record<string, unknown>;
 
-    // Nothing to evaluate: the server's entry gate would answer allow after a full round trip, and
-    // pi awaits every call in a batch serially, so each pointless trip is felt N× (§B3 / §F2).
-    if (shell && command.trim() === "") return undefined;
+    // Nothing to evaluate: the server's entry gate needs a non-blank command or a native-tool
+    // `file_path` (§B3), so a call with neither is a guaranteed allow after a full round trip — and
+    // pi awaits every call in a batch serially, so each pointless trip is felt N× (§F2). This covers
+    // every custom/MCP tool that carries no command, not just an empty shell command (WR-04).
+    const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
+    if (command.trim() === "" && filePath === undefined) return undefined;
 
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
       toolUseId: event.toolCallId,
-      toolInput: (event.input ?? {}) as Record<string, unknown>,
+      toolInput,
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
