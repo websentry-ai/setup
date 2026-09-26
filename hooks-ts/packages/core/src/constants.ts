@@ -34,6 +34,12 @@ export const APP_LABEL = "pi";
 /** `hook_source` on POST /v1/hooks/errors — the label rides this field, there is no app label there. */
 export const HOOK_SOURCE = "pi";
 export const EVENT_NAME_TOOL_USE = "tool_use";
+/**
+ * `UserBashEvent` carries no id of its own (`types.d.ts:710-719`), so HOOK-04 mints one per typed
+ * command. Namespaced so a `tool_use_id` in the gateway's audit trail is traceable to a human
+ * keystroke rather than to a model decision.
+ */
+export const USER_BASH_ID_PREFIX = "ubash_";
 export const PRETOOL_PATH = "/v1/hooks/pretool";
 export const ERRORS_PATH = "/v1/hooks/errors";
 

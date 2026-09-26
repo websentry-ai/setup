@@ -5,20 +5,22 @@
 //     exception is an organisation whose last successful response asked for block-on-failure. A
 //     policy engine that cannot be reached must not stop a developer working; that trade-off is the
 //     product decision, and every bypass leaves an audit trail rather than silence.
-//   * **It can never throw.** pi does not guard the handlers it calls: an exception escaping one is
-//     treated as a decision to BLOCK, and the exception text is handed to the model as the tool
-//     result. Both handler bodies below therefore open `try` before their first statement, with
-//     nothing computed, read from `ctx`, or awaited outside it — key resolution and the payload
-//     build both touch the filesystem and can fail with EACCES.
+//   * **It can never throw.** pi does not guard the handlers it calls: an exception escaping a
+//     `tool_call` handler is treated as a decision to BLOCK, and the exception text is handed to the
+//     model as the tool result. `user_bash` is worse still — pi rethrows and then declines to run the
+//     typed command, rendering nothing. Every handler body below therefore opens `try` before its
+//     first statement, with nothing computed, read from `ctx`, or awaited outside it — key resolution
+//     and the payload build both touch the filesystem and can fail with EACCES.
 //   * **Without a UI it blocks on confirmation.** Under `pi -p` / `--mode json` there is nobody to
 //     ask, so a verdict that needs confirmation blocks with an explanatory reason instead of
 //     silently allowing or silently denying.
 //   * **Without an API key it does nothing at all.** No requests, no verdicts, no blocks — just one
 //     notice at session start.
 //
-// Everything else in the extension — the file tools, the shell-escape path, prompt checks, the turn
-// log, the session heartbeat and the on-disk policy cache — is Phase 9. Only the two events below
-// are registered; no placeholder handlers.
+// Only the events actually implemented are registered — there is no placeholder handler anywhere,
+// because a registered handler is one pi will call and every registration is another way to block or
+// hang a session. The tool-result audit, the end-of-turn log and the session heartbeat are still to
+// come; a test asserts the registered set, so adding one is a deliberate act.
 //
 // Built and tested against pi 0.87.1 on Node >= 22.19.0.
 
@@ -39,6 +41,7 @@ import { policyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import { decideToolCall } from "./decide.ts";
 import { notifySafe } from "./ui.ts";
+import { decideUserBash } from "./userBash.ts";
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -206,6 +209,23 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         });
       } catch {
         // The fail-open net of last resort: allow, rather than let pi read an exception as a block.
+        return undefined;
+      }
+    });
+
+    pi.on("user_bash", async (event, ctx) => {
+      try {
+        const state = init();
+        if (state.apiKey === undefined || state.checker === undefined) return undefined;
+        return await decideUserBash(event, ctx, {
+          checker: state.checker,
+          apiKey: state.apiKey,
+          entrypoint: state.entrypoint,
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+        });
+      } catch {
+        // Stricter than the others: pi rethrows out of `emitUserBash` and then declines to run the
+        // command at all, with nothing rendered. `undefined` hands execution back instead.
         return undefined;
       }
     });

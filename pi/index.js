@@ -32,6 +32,7 @@ var KEY_FINGERPRINT_PREFIX = "sha256:";
 var APP_LABEL = "pi";
 var HOOK_SOURCE = "pi";
 var EVENT_NAME_TOOL_USE = "tool_use";
+var USER_BASH_ID_PREFIX = "ubash_";
 var PRETOOL_PATH = "/v1/hooks/pretool";
 var ERRORS_PATH = "/v1/hooks/errors";
 var PRETOOL_TIMEOUT_MS = 2e4;
@@ -837,6 +838,66 @@ async function decideToolCall(event, ctx, deps) {
   }
 }
 
+// packages/pi/src/userBash.ts
+import { randomBytes as randomBytes2 } from "node:crypto";
+
+// packages/pi/src/bashResult.ts
+function denyBashResult(output) {
+  return { result: { output, exitCode: 1, cancelled: false, truncated: false } };
+}
+
+// packages/pi/src/userBash.ts
+function newUserBashId() {
+  return USER_BASH_ID_PREFIX + randomBytes2(10).toString("hex");
+}
+async function decideUserBash(event, ctx, deps) {
+  try {
+    const command = typeof event.command === "string" ? event.command : "";
+    if (command.trim() === "") return void 0;
+    const payload = buildPretoolPayload({
+      // A user-typed command IS a bash command; Phase 7 registered the lowercase name.
+      toolName: "bash",
+      command,
+      toolUseId: newUserBashId(),
+      // Empty by construction: there is no model-produced input here, so the allowlist has nothing
+      // to forward and no file body can ride along.
+      toolInput: {},
+      cwd: event.cwd,
+      sessionId: ctx.sessionManager.getSessionId(),
+      model: ctx.model?.id,
+      clientEntrypoint: deps.entrypoint
+    });
+    const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+    const outcome = await deps.checker.checkTool(payload, "bash", hooks);
+    switch (outcome.kind) {
+      case "allow":
+        return void 0;
+      case "deny": {
+        const reason = outcome.reason;
+        notifySafe(ctx, reason ?? GENERIC_DENY_REASON, "error");
+        return denyBashResult(reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason);
+      }
+      case "confirm": {
+        if (!ctx.hasUI) return denyBashResult(NO_UI_REASON);
+        const reason = outcome.reason ?? GENERIC_DENY_REASON;
+        notifySafe(ctx, reason, "warning");
+        const accepted = await confirmWithTimeout(
+          ctx,
+          CONFIRM_TITLE,
+          reason + CONFIRM_QUESTION_SUFFIX
+        );
+        return accepted ? void 0 : denyBashResult(DECLINED_REASON);
+      }
+      case "unavailable":
+        return denyBashResult(ENGINE_UNAVAILABLE_REASON);
+      default:
+        return void 0;
+    }
+  } catch {
+    return void 0;
+  }
+}
+
 // packages/pi/src/index.ts
 function defaultMakeChecker(apiKey, baseUrl, env = {}, homeDir = "") {
   const client = createApiClient({ baseUrl, apiKey });
@@ -923,6 +984,20 @@ function createExtension(overrides = {}) {
           entrypoint: state.entrypoint,
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
+        });
+      } catch {
+        return void 0;
+      }
+    });
+    pi.on("user_bash", async (event, ctx) => {
+      try {
+        const state = init();
+        if (state.apiKey === void 0 || state.checker === void 0) return void 0;
+        return await decideUserBash(event, ctx, {
+          checker: state.checker,
+          apiKey: state.apiKey,
+          entrypoint: state.entrypoint,
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
         });
       } catch {
