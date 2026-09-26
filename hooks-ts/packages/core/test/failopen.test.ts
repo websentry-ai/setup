@@ -210,6 +210,92 @@ test("sanitizeReason rejects non-strings, caps length and strips control charact
   assert.equal(sanitizeReason("\u0000\u0007"), undefined);
 });
 
+// WR-06 — the reason may be attacker-authored (the upstream `custom_message` prompt-injection
+// finding, ai-gateway#707, is still open) and it is rendered in the TUI *and* handed to the model as
+// the tool-error content. ANSI was already defanged via `\x1b`; these are the Unicode equivalents,
+// characters that change how the same text reads without being visible in it.
+//
+// Every one of them is spelled as a NUMERIC code point and built with `String.fromCodePoint`, never
+// pasted verbatim: a literal would be invisible in this source, so a reviewer could not tell what is
+// being asserted and a stray edit could delete a case silently.
+
+/** Code points `sanitizeReason` must delete outright. */
+const INVISIBLE_CODE_POINTS: readonly number[] = [
+  0x200b, // ZERO WIDTH SPACE
+  0x200c, // ZERO WIDTH NON-JOINER
+  0x200d, // ZERO WIDTH JOINER
+  0x200e, // LEFT-TO-RIGHT MARK
+  0x200f, // RIGHT-TO-LEFT MARK
+  0x202a, // LEFT-TO-RIGHT EMBEDDING
+  0x202b, // RIGHT-TO-LEFT EMBEDDING
+  0x202c, // POP DIRECTIONAL FORMATTING
+  0x202d, // LEFT-TO-RIGHT OVERRIDE
+  0x202e, // RIGHT-TO-LEFT OVERRIDE
+  0x2060, // WORD JOINER
+  0x2061, // FUNCTION APPLICATION
+  0x2062, // INVISIBLE TIMES
+  0x2063, // INVISIBLE SEPARATOR
+  0x2064, // INVISIBLE PLUS
+  0x2066, // LEFT-TO-RIGHT ISOLATE
+  0x2067, // RIGHT-TO-LEFT ISOLATE
+  0x2068, // FIRST STRONG ISOLATE
+  0x2069, // POP DIRECTIONAL ISOLATE
+  0xfeff, // ZERO WIDTH NO-BREAK SPACE / BOM
+];
+
+const RLO = String.fromCodePoint(0x202e);
+const ZWSP = String.fromCodePoint(0x200b);
+const LINE_SEP = String.fromCodePoint(0x2028);
+const PARA_SEP = String.fromCodePoint(0x2029);
+
+function hex(codePoint: number): string {
+  return `U+${codePoint.toString(16).toUpperCase().padStart(4, "0")}`;
+}
+
+test("sanitizeReason strips bidi overrides, zero-width marks and the BOM (WR-06)", () => {
+  // RIGHT-TO-LEFT OVERRIDE reverses the rendering of everything after it, which is enough to make a
+  // deny reason read as an allow, or to forge an `Enforced by Unbound` footer.
+  assert.equal(sanitizeReason(`Allowed${RLO} rm -rf /`), "Allowed rm -rf /");
+  assert.equal(sanitizeReason(`bl${ZWSP}ocked`), "blocked");
+
+  for (const codePoint of INVISIBLE_CODE_POINTS) {
+    const char = String.fromCodePoint(codePoint);
+    assert.equal(sanitizeReason(`a${char}b`), "ab", `${hex(codePoint)} must not survive`);
+  }
+});
+
+test("sanitizeReason turns Unicode line separators into spaces, never new lines (WR-06)", () => {
+  // U+2028/U+2029 are line breaks to a renderer and to the model, so they could inject what reads as
+  // a fresh instruction line. They become a space rather than vanishing, so words stay separated.
+  assert.equal(sanitizeReason(`Blocked.${LINE_SEP}rm -rf /`), "Blocked. rm -rf /");
+  assert.equal(sanitizeReason(`Blocked.${PARA_SEP}rm -rf /`), "Blocked. rm -rf /");
+  for (const codePoint of [0x2028, 0x2029]) {
+    const out = sanitizeReason(`a${String.fromCodePoint(codePoint)}b`);
+    assert.equal(out, "a b", `${hex(codePoint)} becomes a space`);
+    assert.equal(out?.includes("\n"), false, `${hex(codePoint)} never becomes a new line`);
+  }
+  // The review's verified repro, which previously kept both the override and the separator.
+  assert.equal(
+    sanitizeReason(`Allowed by policy${RLO} ${LINE_SEP} rm -rf /`),
+    "Allowed by policy   rm -rf /",
+  );
+});
+
+test("sanitizeReason preserves ordinary Unicode - only the deceptive characters go (WR-06)", () => {
+  // Em dash, an accented letter, CJK, and the footer's middle dot all render as themselves.
+  const emDash = String.fromCodePoint(0x2014);
+  const eAcute = String.fromCodePoint(0x00e9);
+  const middot = String.fromCodePoint(0x00b7);
+  assert.equal(
+    sanitizeReason(`Blocked ${emDash} no caf${eAcute} commands`),
+    `Blocked ${emDash} no caf${eAcute} commands`,
+  );
+  assert.equal(sanitizeReason("禁止された"), "禁止された");
+  // `\n` stays load-bearing: the gateway separates its attribution footer with a blank line.
+  const attributed = `Reading secrets is blocked.\n\nEnforced by Unbound ${middot} Trace ID abc`;
+  assert.equal(sanitizeReason(attributed), attributed, "the footer survives byte-for-byte");
+});
+
 test("mapResponseToOutcome folds ask and approval_required into one confirm outcome", () => {
   assert.deepEqual(mapResponseToOutcome({ decision: "allow" }), { kind: "allow" });
   assert.deepEqual(mapResponseToOutcome({ decision: "deny", reason: "no" }), {

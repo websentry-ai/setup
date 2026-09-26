@@ -18,7 +18,9 @@ API drifted; that alarm only works while the pin stays narrow.
 ## What the extension does
 
 On every pi `tool_call` it asks the Unbound API whether the call is allowed, and turns the verdict
-into editor behaviour:
+into editor behaviour. Both of pi's shell tools are checked on their command — `powershell` as well
+as `bash`, since they share one input type and `powershell` becomes active via `--tools` or the
+`defaultTools` setting; a call with an empty command skips the round trip entirely.
 
 | Verdict | Behaviour |
 | --- | --- |
