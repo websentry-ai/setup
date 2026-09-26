@@ -5,8 +5,9 @@ infrastructure. The **staging smoke** proves the end-to-end path and is gated
 on the Phase 7 API/backend changes being merged and deployed.
 
 Tested against: pi `0.87.1`, Node `v22.22.2`, `dist/pi/index.js` = 18160 bytes at the
-time of the smoke run; now 18197 bytes after the review fix that trims the resolved
-API key (behaviour of every step below is unchanged).
+time of the smoke run; now 18845 bytes after the two review fixes (trimming the resolved API key,
+and keeping the tail of an over-long command) — the behaviour of every step below
+is unchanged.
 
 ---
 

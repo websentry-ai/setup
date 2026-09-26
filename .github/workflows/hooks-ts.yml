@@ -22,6 +22,12 @@ on:
       - "pi/index.js"
       - ".github/workflows/hooks-ts.yml"
 
+# This job runs `npm ci` over third-party devDependencies (esbuild, typescript,
+# the pi package). Read-only is all it needs, so a compromised dependency gets
+# no write scope from the job token.
+permissions:
+  contents: read
+
 defaults:
   run:
     working-directory: hooks-ts

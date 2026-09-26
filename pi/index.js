@@ -359,6 +359,18 @@ function capToolInput(toolInput, maxBytes = MAX_TOOL_INPUT_BYTES) {
   }
   return capped;
 }
+var COMMAND_TRUNCATION_MARKER = "\n#...unbound: omitted...\n";
+function capCommand(command, maxChars = MAX_COMMAND_CHARS) {
+  if (command.length <= maxChars) return { command, truncated: false };
+  const budget = maxChars - COMMAND_TRUNCATION_MARKER.length;
+  if (budget <= 1) return { command: command.slice(0, maxChars), truncated: true };
+  const headChars = Math.ceil(budget / 2);
+  const tailChars = budget - headChars;
+  return {
+    command: command.slice(0, headChars) + COMMAND_TRUNCATION_MARKER + command.slice(-tailChars),
+    truncated: true
+  };
+}
 function buildPretoolPayload(input) {
   const metadata = {
     cwd: input.cwd,
@@ -366,11 +378,16 @@ function buildPretoolPayload(input) {
   };
   const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
   if (filePath !== void 0) metadata.file_path = filePath;
+  const capped = capCommand(input.command);
+  if (capped.truncated) {
+    metadata.command_truncated = true;
+    metadata.command_original_chars = input.command.length;
+  }
   const preToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
     // server never matches the tool and enforcement silently disappears.
     tool_name: input.toolName,
-    command: input.command.length > MAX_COMMAND_CHARS ? input.command.slice(0, MAX_COMMAND_CHARS) : input.command,
+    command: capped.command,
     metadata
   };
   if (typeof input.toolUseId === "string" && input.toolUseId.length > 0) {

