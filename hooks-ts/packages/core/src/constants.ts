@@ -31,6 +31,15 @@ export const CONFIRM_TIMEOUT_MS = 120_000;
 /** One bypass self-report per minute, per `unbound.py`'s convention (§B7). */
 export const ERROR_REPORT_INTERVAL_MS = 60_000;
 export const ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
+/**
+ * Policy-cache freshness window. `unbound.py:70 CACHE_TTL_SECONDS = 300`, in milliseconds so it can
+ * be compared against `Date.now()` without a unit conversion at every call site.
+ *
+ * It bounds `tools_synced_at` only. `policy_check_failure_action` is read **regardless** of age
+ * (`unbound.py:225`): an org's opt-out from fail-open must not silently lapse into fail-open just
+ * because the last successful response was six minutes ago.
+ */
+export const CACHE_TTL_MS = 300_000;
 
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;

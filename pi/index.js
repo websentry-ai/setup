@@ -278,21 +278,70 @@ function parseFailureAction(raw) {
 }
 function parseToolsToCheck(raw) {
   if (!Array.isArray(raw)) return void 0;
-  const tools = raw.filter((entry) => typeof entry === "string");
-  return tools.length > 0 ? tools : void 0;
+  return raw.filter((entry) => typeof entry === "string");
+}
+function parseTimestamp(raw) {
+  return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : void 0;
 }
 function createPolicyState() {
   let failureAction;
   let toolsToCheck;
+  let toolsSyncedAt;
+  let fetchedAt;
   return {
-    recordSuccess(body) {
-      const nextAction = parseFailureAction(body.policy_check_failure_action);
-      if (nextAction !== void 0) failureAction = nextAction;
-      const nextTools = parseToolsToCheck(body.tools_to_check);
-      if (nextTools !== void 0) toolsToCheck = nextTools;
+    recordSuccess(body, nowMs = Date.now()) {
+      let learned = false;
+      const nextTools = parseToolsToCheck(body?.tools_to_check);
+      if (nextTools !== void 0) {
+        toolsToCheck = nextTools;
+        toolsSyncedAt = nowMs;
+        learned = true;
+      }
+      const nextAction = parseFailureAction(body?.policy_check_failure_action);
+      if (nextAction !== void 0) {
+        failureAction = nextAction;
+        learned = true;
+      }
+      if (learned) fetchedAt = nowMs;
     },
     getFailureAction: () => failureAction,
-    getToolsToCheck: () => toolsToCheck
+    // Copy out: a caller that mutates the returned array must not widen the skip set.
+    getToolsToCheck: () => toolsToCheck === void 0 ? void 0 : [...toolsToCheck],
+    getToolsSyncedAt: () => toolsSyncedAt,
+    getFetchedAt: () => fetchedAt,
+    /** Only what was actually learned. An absent key is the honest encoding of "never learned". */
+    snapshot() {
+      const out = {};
+      if (fetchedAt !== void 0) out.fetched_at = fetchedAt;
+      if (toolsSyncedAt !== void 0) out.tools_synced_at = toolsSyncedAt;
+      if (toolsToCheck !== void 0) out.tools_to_check = [...toolsToCheck];
+      if (failureAction !== void 0) out.policy_check_failure_action = failureAction;
+      return out;
+    },
+    /**
+     * Load a disk snapshot, **without downgrading anything learned over the network**. In-memory is
+     * authoritative for the session (09-CONTEXT), which is also what caps T-09-01/T-09-02: a planted
+     * cache can only ever influence a value this instance has not yet been told by the server.
+     *
+     * Every field is re-validated. This object came off a file, so its types are claims.
+     */
+    hydrate(snapshot) {
+      if (snapshot === null || typeof snapshot !== "object" || Array.isArray(snapshot)) return;
+      if (toolsSyncedAt === void 0) {
+        const tools = parseToolsToCheck(snapshot.tools_to_check);
+        const syncedAt = parseTimestamp(snapshot.tools_synced_at);
+        if (tools !== void 0 && syncedAt !== void 0) {
+          toolsToCheck = tools;
+          toolsSyncedAt = syncedAt;
+        }
+      }
+      if (fetchedAt === void 0) {
+        const action = parseFailureAction(snapshot.policy_check_failure_action);
+        if (action !== void 0) failureAction = action;
+        const fetched = parseTimestamp(snapshot.fetched_at);
+        if (fetched !== void 0) fetchedAt = fetched;
+      }
+    }
   };
 }
 var policyState = createPolicyState();
