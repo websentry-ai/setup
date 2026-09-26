@@ -32,6 +32,7 @@ var KEY_FINGERPRINT_PREFIX = "sha256:";
 var APP_LABEL = "pi";
 var HOOK_SOURCE = "pi";
 var EVENT_NAME_TOOL_USE = "tool_use";
+var EVENT_NAME_USER_PROMPT = "user_prompt";
 var USER_BASH_ID_PREFIX = "ubash_";
 var PRETOOL_PATH = "/v1/hooks/pretool";
 var ERRORS_PATH = "/v1/hooks/errors";
@@ -48,6 +49,7 @@ var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
+var MAX_PROMPT_CHARS = 8192;
 var MAX_TOOL_INPUT_VALUE_BYTES = 2048;
 var TOOL_INPUT_ALLOWLIST = [
   "path",
@@ -308,6 +310,25 @@ function buildPretoolPayload(input) {
     event_name: EVENT_NAME_TOOL_USE,
     pre_tool_use_data: preToolUseData,
     messages: [{ role: "user", content: input.lastUserPrompt ?? "" }],
+    unbound_app_label: APP_LABEL,
+    client_entrypoint: input.clientEntrypoint
+  };
+  if (input.pullPolicies === true) body.pull_policies = true;
+  return body;
+}
+function buildPromptPayload(input) {
+  const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
+  const metadata = { cwd: input.cwd, has_ui: input.hasUI };
+  if (capped.truncated) {
+    metadata.prompt_truncated = true;
+    metadata.prompt_original_chars = input.prompt.length;
+  }
+  const body = {
+    conversation_id: input.sessionId,
+    model: input.model !== void 0 && input.model.length > 0 ? input.model : "auto",
+    event_name: EVENT_NAME_USER_PROMPT,
+    pre_tool_use_data: { tool_name: "", command: "", metadata },
+    messages: [{ role: "user", content: capped.command }],
     unbound_app_label: APP_LABEL,
     client_entrypoint: input.clientEntrypoint
   };
@@ -838,6 +859,46 @@ async function decideToolCall(event, ctx, deps) {
   }
 }
 
+// packages/pi/src/prompt.ts
+async function decideInput(event, ctx, deps) {
+  try {
+    if (event.source === "extension") return void 0;
+    const text = typeof event.text === "string" ? event.text : "";
+    if (text.trim() === "") return void 0;
+    const payload = buildPromptPayload({
+      prompt: text,
+      cwd: ctx.cwd,
+      sessionId: ctx.sessionManager.getSessionId(),
+      model: ctx.model?.id,
+      clientEntrypoint: deps.entrypoint,
+      hasUI: ctx.hasUI
+    });
+    const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+    const outcome = await deps.checker.checkTool(payload, "user_prompt", hooks);
+    switch (outcome.kind) {
+      case "deny": {
+        const reason = outcome.reason;
+        notifySafe(ctx, reason === void 0 ? GENERIC_DENY_REASON : DENY_PREFIX + reason, "error");
+        return { action: "handled" };
+      }
+      case "unavailable":
+        notifySafe(ctx, ENGINE_UNAVAILABLE_REASON, "error");
+        return { action: "handled" };
+      case "confirm":
+        notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
+        deps.onPrompt?.(text);
+        return void 0;
+      case "allow":
+        deps.onPrompt?.(text);
+        return void 0;
+      default:
+        return void 0;
+    }
+  } catch {
+    return void 0;
+  }
+}
+
 // packages/pi/src/userBash.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 
@@ -999,6 +1060,22 @@ function createExtension(overrides = {}) {
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
+        });
+      } catch {
+        return void 0;
+      }
+    });
+    pi.on("input", async (event, ctx) => {
+      try {
+        const state = init();
+        if (state.apiKey === void 0 || state.checker === void 0) return void 0;
+        return await decideInput(event, ctx, {
+          checker: state.checker,
+          apiKey: state.apiKey,
+          entrypoint: state.entrypoint,
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
+          // `onPrompt` is intentionally unwired: the turn store lands in a later wave, and an
+          // allowed prompt is the only place its text exists.
         });
       } catch {
         return void 0;

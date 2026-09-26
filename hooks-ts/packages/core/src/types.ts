@@ -80,3 +80,22 @@ export interface PretoolPayloadInput {
   /** Sets `pull_policies` on the body when true; when false or absent the key is omitted. */
   pullPolicies?: boolean;
 }
+
+/**
+ * The structural input for a **prompt** check (HOOK-05). Separate from `PretoolPayloadInput` because
+ * a prompt has no tool semantics at all: no tool name, no command, no tool input, no file path.
+ * Sharing one input type would make every one of those absences an optional field somebody could
+ * accidentally fill.
+ *
+ * `images` is absent on purpose and must stay that way: `InputEvent.images` is base64 image data,
+ * potentially megabytes, that nothing server-side reads (§F5).
+ */
+export interface PromptPayloadInput {
+  prompt: string;
+  cwd: string;
+  sessionId: string;
+  model: string | undefined;
+  clientEntrypoint: string;
+  hasUI: boolean;
+  pullPolicies?: boolean;
+}

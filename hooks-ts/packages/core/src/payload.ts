@@ -27,12 +27,19 @@
 import {
   APP_LABEL,
   EVENT_NAME_TOOL_USE,
+  EVENT_NAME_USER_PROMPT,
   MAX_COMMAND_CHARS,
+  MAX_PROMPT_CHARS,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
 } from "./constants.ts";
-import type { PreToolUseData, PretoolPayloadInput, PretoolRequestBody } from "./types.ts";
+import type {
+  PreToolUseData,
+  PretoolPayloadInput,
+  PretoolRequestBody,
+  PromptPayloadInput,
+} from "./types.ts";
 
 /** Native search tools whose `path` is optional in pi — `file_path` falls back to cwd. */
 export const PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"] as const;
@@ -250,6 +257,48 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   // Set only when true. `pull_policies: false` would say nothing the absence does not already say,
   // and every key that rides a request the caller did not ask for is a key a future reader has to
   // account for.
+  if (input.pullPolicies === true) body.pull_policies = true;
+  return body;
+}
+
+/**
+ * Assemble the **prompt-check** body (HOOK-05), matching `unbound.py:4685-4713` field for field.
+ *
+ * Three things about it are easy to get wrong:
+ *
+ *   * The prompt rides `messages`, not a `user_prompts` field. The server reads it via
+ *     `createGuardrailContext(body.messages, …)` + `setLastUserMessageToText` (`:627-628`).
+ *   * `pre_tool_use_data` is **required by the type even here**, so it is sent with a blank
+ *     `tool_name` and a blank `command`. Those blanks are what keep the request out of the Path-2
+ *     command-policy gate, which is correct: a prompt is not a tool call.
+ *   * Nothing tool-shaped is attached. No `file_path`, no `tool_input`, and above all no `images` —
+ *     see `PromptPayloadInput`.
+ *
+ * Pure, like `buildPretoolPayload`: same input, same output, nothing written anywhere.
+ */
+export function buildPromptPayload(input: PromptPayloadInput): PretoolRequestBody {
+  // The same both-ends discipline a command gets, for the same padding-bypass reason — see
+  // `MAX_PROMPT_CHARS`.
+  const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
+  const metadata: Record<string, unknown> = { cwd: input.cwd, has_ui: input.hasUI };
+  if (capped.truncated) {
+    // Otherwise the server cannot tell a whole prompt from a spliced one, and a guardrail matching
+    // across the join would be matching text the user never typed.
+    metadata.prompt_truncated = true;
+    metadata.prompt_original_chars = input.prompt.length;
+  }
+
+  const body: PretoolRequestBody = {
+    conversation_id: input.sessionId,
+    model: input.model !== undefined && input.model.length > 0 ? input.model : "auto",
+    event_name: EVENT_NAME_USER_PROMPT,
+    pre_tool_use_data: { tool_name: "", command: "", metadata },
+    messages: [{ role: "user", content: capped.command }],
+    unbound_app_label: APP_LABEL,
+    client_entrypoint: input.clientEntrypoint,
+  };
+  // Inert on this path — `handleGuardrails` never attaches `tools_to_check` (§C2) — so it is only
+  // ever set if a caller explicitly asks, and no caller does today.
   if (input.pullPolicies === true) body.pull_policies = true;
   return body;
 }

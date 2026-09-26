@@ -205,8 +205,13 @@ test("RES-01 the default export is a factory registering exactly the implemented
 
   // Grows one entry per implemented event, and no further: an accidental placeholder handler is a
   // handler pi will call, and every registration is another way to block or hang a session.
-  assert.equal(stub.registered.length, 3, `registered ${stub.registered.join(", ")}`);
-  assert.deepStrictEqual([...stub.registered].sort(), ["session_start", "tool_call", "user_bash"]);
+  assert.equal(stub.registered.length, 4, `registered ${stub.registered.join(", ")}`);
+  assert.deepStrictEqual([...stub.registered].sort(), [
+    "input",
+    "session_start",
+    "tool_call",
+    "user_bash",
+  ]);
 });
 
 // HOOK-04's never-throw guarantee, which protects the phase's only SILENT failure mode. Every other

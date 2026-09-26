@@ -35,6 +35,12 @@ export const APP_LABEL = "pi";
 export const HOOK_SOURCE = "pi";
 export const EVENT_NAME_TOOL_USE = "tool_use";
 /**
+ * HOOK-05's `event_name`. Matched server-side at `preToolUseHandler.ts:655`, which routes to
+ * `handleGuardrails` — the one branch that can deny a prompt, and the one that deliberately omits
+ * `tools_to_check` from its response so a prompt check cannot clobber the tool cache (§C2).
+ */
+export const EVENT_NAME_USER_PROMPT = "user_prompt";
+/**
  * `UserBashEvent` carries no id of its own (`types.d.ts:710-719`), so HOOK-04 mints one per typed
  * command. Namespaced so a `tool_use_id` in the gateway's audit trail is traceable to a human
  * keystroke rather than to a model decision.
@@ -88,6 +94,17 @@ export const CACHE_TTL_MS = 300_000;
 export const MAX_REASON_CHARS = 2000;
 export const MAX_TOOL_INPUT_BYTES = 16_384;
 export const MAX_COMMAND_CHARS = 8192;
+/**
+ * The prompt-body cap (HOOK-05). Same value as `MAX_COMMAND_CHARS` and the same rationale: **both
+ * ends are kept**, because head-only truncation is a padding bypass. A prompt-injected or careless
+ * paste can put 8 KB of innocuous prose first and the instruction that matters last, and a guardrail
+ * written against the instruction would then never see it. Injected text lands at either end, so both
+ * ends must survive.
+ *
+ * A separate constant from `MAX_COMMAND_CHARS` deliberately: a command and a prompt are different
+ * inputs with different evaluators, and retuning one must not silently retune the other.
+ */
+export const MAX_PROMPT_CHARS = 8192;
 /**
  * WR-04: the per-value cap on what survives `TOOL_INPUT_ALLOWLIST`. `pattern` is model-produced and
  * free-form, and the server truncates it at 4096 anyway (`effectiveCommand.ts:20 PATTERN_MAX`), so

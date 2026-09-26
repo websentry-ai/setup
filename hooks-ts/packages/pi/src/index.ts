@@ -40,6 +40,7 @@ import type { PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import { decideToolCall } from "./decide.ts";
+import { decideInput } from "./prompt.ts";
 import { notifySafe } from "./ui.ts";
 import { decideUserBash } from "./userBash.ts";
 
@@ -226,6 +227,24 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
       } catch {
         // Stricter than the others: pi rethrows out of `emitUserBash` and then declines to run the
         // command at all, with nothing rendered. `undefined` hands execution back instead.
+        return undefined;
+      }
+    });
+
+    pi.on("input", async (event, ctx) => {
+      try {
+        const state = init();
+        // No key ⇒ the prompt is never suppressed. Silence, not interference.
+        if (state.apiKey === undefined || state.checker === undefined) return undefined;
+        return await decideInput(event, ctx, {
+          checker: state.checker,
+          apiKey: state.apiKey,
+          entrypoint: state.entrypoint,
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          // `onPrompt` is intentionally unwired: the turn store lands in a later wave, and an
+          // allowed prompt is the only place its text exists.
+        });
+      } catch {
         return undefined;
       }
     });
