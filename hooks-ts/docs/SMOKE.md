@@ -13,7 +13,7 @@ Tested against: pi `0.87.1`, Node `v22.22.2`, `dist/pi/index.js` = 18160 bytes.
 Setup (done by the executor before the human runs pi):
 
 ```bash
-cd unbound-hooks-ts
+cd setup/hooks-ts
 npm run build
 mkdir -p ~/.pi/agent/extensions/unbound
 cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js
@@ -86,7 +86,8 @@ Checklist to run once #969 and #2947 are merged and ArgoCD-deployed:
    `unbound policy tool create-terminal --name "Phase-8 smoke — block rm -rf /tmp/x" --command-family <family> --field <key>=<pattern> --action BLOCK --custom-message "Blocked for the Phase-8 smoke test." --group "<single-user-test-group>" --json`
    — capture the policy id.
 4. The gateway caches policies for ~5 minutes — wait it out.
-5. `cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js`, then
+5. `cp ../pi/index.js ~/.pi/agent/extensions/unbound/index.js` (or rebuild first
+   with `npm run build && cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js`), then
    `UNBOUND_GATEWAY_URL=https://api-gateway-staging.unboundsecurity.ai UNBOUND_PI_API_KEY=<application API key for a TEST org> pi`
    and ask pi to run `rm -rf /tmp/x`. Expect the deny with the custom message
    after `Blocked by Unbound policy: ` (+ `Enforced by Unbound · Trace ID …` footer if attribution is on).

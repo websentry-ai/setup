@@ -1,4 +1,4 @@
-# unbound-hooks-ts
+# hooks-ts
 
 Unbound policy hooks for TypeScript coding agents. `packages/core` holds the transport-shaped
 logic (API key / gateway URL resolution, `/v1/hooks/pretool` payload building, a client that
@@ -55,12 +55,34 @@ import { buildPretoolPayload } from "../../core/src/payload.ts";
 `--experimental-strip-types` refuses to strip types for files resolved inside `node_modules/`.
 `packages/core` and `packages/pi` therefore declare no dependency on each other.
 
+## Where the built file lives
+
+`dist/` is git-ignored, so the build output is **committed one level up at
+[`setup/pi/index.js`](../pi/index.js)**. That copy is what users download: this repo is public and
+the extension is deliberately not published to npm, exactly like `unbound.py` and
+`cursor/hooks.json`, which the other installers already fetch raw from here.
+
+Refresh it in the same commit as any source change:
+
+```bash
+cd hooks-ts
+npm run build && cp dist/pi/index.js ../pi/index.js
+```
+
+`.github/workflows/hooks-ts.yml` rebuilds and `cmp`s the two on every PR, so a stale `pi/index.js`
+fails CI rather than shipping behaviour that no longer matches the source beside it.
+
+The **install path does not change**: pi loads the extension from
+`~/.pi/agent/extensions/unbound/index.js`, and Phase 10's `setup/pi/setup.py` is what drops
+`pi/index.js` there. Until then, copy it by hand.
+
 ## Install the built extension
 
 ```bash
+cd hooks-ts
 npm run build
 mkdir -p ~/.pi/agent/extensions/unbound
-cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js
+cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js   # or: cp ../pi/index.js ~/...
 ls ~/.pi/agent/extensions/unbound/index.ts   # must NOT exist
 ```
 
@@ -137,6 +159,7 @@ Staging API host: `https://api-gateway-staging.unboundsecurity.ai`
 hung API deterministically in a real TUI):
 
 ```bash
+cd hooks-ts
 npm run mock-api -- --mode deny --port 8799     # also: --mode ask | hang | 500 | allow
 # in another shell, with the built file installed as above:
 UNBOUND_GATEWAY_URL=http://127.0.0.1:8799 UNBOUND_PI_API_KEY=test pi
