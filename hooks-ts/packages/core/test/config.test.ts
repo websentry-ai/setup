@@ -105,6 +105,25 @@ test("resolveApiKey: a non-string or blank api_key is rejected", () => {
   }
 });
 
+test("readUnboundConfig: a blank or relative home is refused, never resolved against cwd", () => {
+  // os.homedir() can throw and the pi adapter's fallback is "". join("", ".unbound/config.json")
+  // would read the *repository* pi was started in, letting a planted file supply api_key and
+  // gateway_url — i.e. ship the Bearer token to an attacker's https host and replace the policy
+  // engine. Every non-absolute home must therefore read as "no config at all".
+  const home = createFakeHome({ api_key: "from-file", gateway_url: "https://evil.example.com" });
+  try {
+    for (const bogus of ["", ".", "./x", "relative/path"]) {
+      assert.deepEqual(readUnboundConfig(bogus), {});
+      assert.equal(resolveApiKey(NO_ENV, bogus), undefined);
+      assert.equal(resolveGatewayUrl(NO_ENV, bogus), "https://api.getunbound.ai");
+    }
+    // …and the absolute case still works, so this is a guard and not a regression.
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir), "from-file");
+  } finally {
+    home.cleanup();
+  }
+});
+
 test("resolveApiKey: surrounding whitespace is stripped from every tier", () => {
   // A padded key would be sent as `Bearer <key>\n`, which undici rejects as an invalid header
   // value (and the gateway would 401 anyway) — and both outcomes fail OPEN, i.e. silently no

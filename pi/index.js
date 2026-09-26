@@ -121,9 +121,10 @@ function createApiClient(opts) {
 
 // packages/core/src/config.ts
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 function readUnboundConfig(homeDir) {
+  if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute(homeDir)) return {};
   try {
     const raw = readFileSync(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
     const parsed = JSON.parse(raw);

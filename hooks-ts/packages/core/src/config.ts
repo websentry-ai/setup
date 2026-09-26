@@ -13,7 +13,7 @@
 // `unbound login` — cannot be widened here (T-08-09 / ASVS V12).
 
 import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 
 import {
   CONFIG_DIR_NAME,
@@ -32,8 +32,16 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  *
  * Returns `{}` on any failure — ENOENT, EACCES, malformed JSON, or a JSON body that is not an
  * object. Never throws and never echoes the file contents anywhere.
+ *
+ * A **non-absolute** `homeDir` is refused outright. `os.homedir()` can fail, and the caller's
+ * fallback is `""`; `join("", ".unbound/config.json")` resolves relative to the process cwd — i.e.
+ * the repository pi was started in. A repo-planted `.unbound/config.json` could then supply both
+ * `api_key` and `gateway_url`, sending the Bearer token to an attacker's https host (which passes
+ * the https-only check) and silently replacing the policy engine. The config file is a
+ * user-profile artifact; anything that is not an absolute path is not it.
  */
 export function readUnboundConfig(homeDir: string): Record<string, unknown> {
+  if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute(homeDir)) return {};
   try {
     const raw = readFileSync(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
     const parsed: unknown = JSON.parse(raw);
