@@ -236,7 +236,7 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
     preToolUseData.tool_use_id = input.toolUseId;
   }
 
-  return {
+  const body: PretoolRequestBody = {
     conversation_id: input.sessionId,
     // `model` is required on the wire and `ctx.model` may be undefined (§A4); `'auto'` is the same
     // fallback the Python hook uses.
@@ -247,4 +247,9 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
     unbound_app_label: APP_LABEL,
     client_entrypoint: input.clientEntrypoint,
   };
+  // Set only when true. `pull_policies: false` would say nothing the absence does not already say,
+  // and every key that rides a request the caller did not ask for is a key a future reader has to
+  // account for.
+  if (input.pullPolicies === true) body.pull_policies = true;
+  return body;
 }

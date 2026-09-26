@@ -200,6 +200,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
+          // notices — raised deep inside `checkTool` — actually reach the editor on this path.
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
         });
       } catch {
         // The fail-open net of last resort: allow, rather than let pi read an exception as a block.

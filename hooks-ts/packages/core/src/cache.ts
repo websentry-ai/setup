@@ -42,7 +42,7 @@ import {
   PI_AGENT_DIR_SEGMENTS,
 } from "./constants.ts";
 import { parseFailureAction, parseTimestamp, parseToolsToCheck } from "./policyState.ts";
-import type { FailureAction, PolicySnapshot } from "./policyState.ts";
+import type { FailureAction, PolicySnapshot, PolicyState } from "./policyState.ts";
 import { NATIVE_FILE_TOOLS } from "./payload.ts";
 
 /**
@@ -216,22 +216,35 @@ export function writeCache(path: string, value: CachedPolicy): boolean {
 }
 
 /**
- * Is the remembered `tools_to_check` recent enough to skip a round trip?
+ * The freshness question, asked of a bare timestamp.
  *
  * Bounded by `tools_synced_at` **only**. A `fetched_at` from a heartbeat or a prompt check says
  * nothing about the tool list — treating it as if it did is the upstream bug this design exists to
  * avoid. A future-dated stamp is a clock skew, not infinite freshness.
+ *
+ * Split out from `isToolsFresh` so the **in-memory** state can ask it directly. `policyState` holds
+ * the same two values as a cache record but is not one, and constructing a fake record to ask a
+ * question about a number is the kind of indirection that eventually answers it differently.
  */
+export function areToolsFresh(
+  toolsSyncedAt: number | undefined,
+  now: number,
+  ttlMs: number = CACHE_TTL_MS,
+): boolean {
+  const syncedAt = parseTimestamp(toolsSyncedAt);
+  if (syncedAt === undefined) return false;
+  const age = now - syncedAt;
+  if (age < 0) return false;
+  return age <= ttlMs;
+}
+
+/** Is the remembered `tools_to_check` on a cache **record** recent enough to skip a round trip? */
 export function isToolsFresh(
   cache: ToolsFreshness | undefined,
   now: number,
   ttlMs: number = CACHE_TTL_MS,
 ): boolean {
-  const syncedAt = parseTimestamp(cache?.tools_synced_at);
-  if (syncedAt === undefined) return false;
-  const age = now - syncedAt;
-  if (age < 0) return false;
-  return age <= ttlMs;
+  return areToolsFresh(cache?.tools_synced_at, now, ttlMs);
 }
 
 /**
@@ -270,4 +283,24 @@ export function shouldSkipFileTool(
   const tools = cache?.tools_to_check;
   if (!Array.isArray(tools)) return false;
   return !tools.includes(toolName);
+}
+
+/**
+ * The same three conditions, asked of the **live in-memory state** instead of a disk record.
+ *
+ * This is the one the adapter actually calls: in-memory is authoritative for the session, so a
+ * decision taken from a record read at startup could be 300 s behind what this process has since
+ * been told. The predicate is deliberately a single expression over the two getters rather than a
+ * re-implementation — a second copy of "which tools are skippable" is how a skipped check appears.
+ */
+export function shouldSkipFileToolFromState(
+  toolName: string,
+  state: Pick<PolicyState, "getToolsToCheck" | "getToolsSyncedAt">,
+  now: number,
+): boolean {
+  return shouldSkipFileTool(
+    toolName,
+    { tools_synced_at: state.getToolsSyncedAt(), tools_to_check: state.getToolsToCheck() },
+    now,
+  );
 }

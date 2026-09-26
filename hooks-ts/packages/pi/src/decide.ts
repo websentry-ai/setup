@@ -23,8 +23,11 @@ import {
   GENERIC_DENY_REASON,
   NO_UI_REASON,
 } from "../../core/src/constants.ts";
-import { buildPretoolPayload, resolveFilePath } from "../../core/src/payload.ts";
-import type { PolicyChecker } from "../../core/src/policy.ts";
+import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
+import { NATIVE_FILE_TOOLS, buildPretoolPayload, resolveFilePath } from "../../core/src/payload.ts";
+import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import { policyState } from "../../core/src/policyState.ts";
+import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
@@ -42,6 +45,23 @@ export interface DecideDeps {
   checker: PolicyChecker;
   apiKey: string;
   entrypoint: string;
+  /** Injectable clock, so a 300 s cache-TTL test runs in milliseconds. Defaults to `Date.now`. */
+  now?: () => number;
+  /**
+   * The remembered policy metadata. Defaults to the process-wide `policyState`, which is the right
+   * production answer — the memory has to survive across tool calls within a session.
+   *
+   * Injectable because the singleton only ever moves forward: once a response has taught it a
+   * `tools_to_check`, no test in the same process can get back to "nothing learned", and the
+   * cache-skip cases are precisely about that starting point.
+   */
+  state?: PolicyState;
+  /**
+   * The per-call notice channel handed to `checkTool`. Defaults to a closure over the live `ctx`,
+   * which is what makes 09-02's breaker-open and key-rejected notices reachable at all: the checker
+   * is built once in `init()` and can never capture a `ctx` of its own.
+   */
+  hooks?: CheckHooks;
 }
 
 /** What pi reads back from a `tool_call` handler; Phase 8 only ever blocks or says nothing. */
@@ -72,6 +92,23 @@ export async function decideToolCall(
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === undefined) return undefined;
 
+    const now = (deps.now ?? Date.now)();
+    const state = deps.state ?? policyState;
+
+    // RES-03's fast path. When the org's own tool list is tools-FRESH and does not name this tool,
+    // the server has already told us there is no file policy that could apply — so there is nothing
+    // to ask, and no payload is even built. Bounded to the six native file tools: a shell command or
+    // a custom tool is evaluated on its `command`, which no cached list can answer for.
+    if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+      return undefined;
+    }
+
+    // `tools_to_check` arrives on the command-policy path ONLY (§C2), so a genuine tool call is the
+    // only thing that can fill the cache. Ask for it when the list is missing or stale — never by
+    // fabricating a request: a synthetic `ls` would be evaluated as a real tool use and can fire a
+    // Slack approval for a command nobody ran.
+    const pullPolicies = !areToolsFresh(state.getToolsSyncedAt(), now);
+
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
@@ -81,15 +118,14 @@ export async function decideToolCall(
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
+      pullPolicies,
     });
 
-    // The per-call notice channel. The checker is built once in `init()` and cannot capture a `ctx`,
-    // so the breaker's open/close notices and WR-01's key-rejected notice reach the editor through
-    // this closure over the LIVE ctx. `notifySafe` already swallows its own failures, and `policy.ts`
-    // wraps the call again: a notice must never be able to change a verdict.
-    const outcome = await deps.checker.checkTool(payload, event.toolName, {
-      notify: (message, level) => notifySafe(ctx, message, level),
-    });
+    // `notifySafe` already swallows its own failures, and `policy.ts` wraps the call again: a notice
+    // must never be able to change a verdict.
+    const hooks: CheckHooks =
+      deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+    const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
 
     switch (outcome.kind) {
       case "allow":

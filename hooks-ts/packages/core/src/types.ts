@@ -31,6 +31,17 @@ export interface PretoolRequestBody {
   messages: PretoolMessage[];
   unbound_app_label: "pi";
   client_entrypoint?: string;
+  /**
+   * Ask the response to carry the policy payload (RES-03).
+   *
+   * **Only honoured on the command-policy path** (§C2): `handleCommandPolicy` attaches
+   * `tools_to_check` when this is set, while `handleGuardrails` — the `user_prompt` path —
+   * deliberately omits it so a prompt check cannot clobber the tool cache, and the unrecognised-event
+   * fall-through carries no policy payload at all. So the field is meaningful on a genuine tool call
+   * and inert everywhere else; it is never sent as `false`, because an absent key and a false one
+   * mean the same thing to the server and the shorter body is the honest one.
+   */
+  pull_policies?: boolean;
 }
 
 /** The four-value response enum (`DECISION`, `preToolUseHandler.ts:278-283`). */
@@ -66,4 +77,6 @@ export interface PretoolPayloadInput {
   model: string | undefined;
   clientEntrypoint: string;
   lastUserPrompt?: string;
+  /** Sets `pull_policies` on the body when true; when false or absent the key is omitted. */
+  pullPolicies?: boolean;
 }

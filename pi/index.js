@@ -43,6 +43,7 @@ var ERROR_CATEGORY_BLOCKED = "blocked_due_to_failure";
 var KEY_REJECTION_THRESHOLD = 2;
 var BREAKER_FAILURE_THRESHOLD = 3;
 var BREAKER_OPEN_MS = 6e4;
+var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
@@ -298,7 +299,7 @@ function buildPretoolPayload(input) {
   if (typeof input.toolUseId === "string" && input.toolUseId.length > 0) {
     preToolUseData.tool_use_id = input.toolUseId;
   }
-  return {
+  const body = {
     conversation_id: input.sessionId,
     // `model` is required on the wire and `ctx.model` may be undefined (§A4); `'auto'` is the same
     // fallback the Python hook uses.
@@ -309,6 +310,8 @@ function buildPretoolPayload(input) {
     unbound_app_label: APP_LABEL,
     client_entrypoint: input.clientEntrypoint
   };
+  if (input.pullPolicies === true) body.pull_policies = true;
+  return body;
 }
 
 // packages/core/src/cache.ts
@@ -399,6 +402,30 @@ function writeCache(path, value) {
     }
     return false;
   }
+}
+function areToolsFresh(toolsSyncedAt, now, ttlMs = CACHE_TTL_MS) {
+  const syncedAt = parseTimestamp(toolsSyncedAt);
+  if (syncedAt === void 0) return false;
+  const age = now - syncedAt;
+  if (age < 0) return false;
+  return age <= ttlMs;
+}
+function isToolsFresh(cache, now, ttlMs = CACHE_TTL_MS) {
+  return areToolsFresh(cache?.tools_synced_at, now, ttlMs);
+}
+function shouldSkipFileTool(toolName, cache, now) {
+  if (typeof toolName !== "string" || !NATIVE_FILE_TOOLS.has(toolName)) return false;
+  if (!isToolsFresh(cache, now)) return false;
+  const tools = cache?.tools_to_check;
+  if (!Array.isArray(tools)) return false;
+  return !tools.includes(toolName);
+}
+function shouldSkipFileToolFromState(toolName, state, now) {
+  return shouldSkipFileTool(
+    toolName,
+    { tools_synced_at: state.getToolsSyncedAt(), tools_to_check: state.getToolsToCheck() },
+    now
+  );
 }
 
 // packages/core/src/client.ts
@@ -761,6 +788,12 @@ async function decideToolCall(event, ctx, deps) {
     const toolInput = event.input ?? {};
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === void 0) return void 0;
+    const now = (deps.now ?? Date.now)();
+    const state = deps.state ?? policyState;
+    if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+      return void 0;
+    }
+    const pullPolicies = !areToolsFresh(state.getToolsSyncedAt(), now);
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
@@ -769,11 +802,11 @@ async function decideToolCall(event, ctx, deps) {
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
-      clientEntrypoint: deps.entrypoint
+      clientEntrypoint: deps.entrypoint,
+      pullPolicies
     });
-    const outcome = await deps.checker.checkTool(payload, event.toolName, {
-      notify: (message, level) => notifySafe(ctx, message, level)
-    });
+    const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+    const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
     switch (outcome.kind) {
       case "allow":
         return void 0;
@@ -887,7 +920,10 @@ function createExtension(overrides = {}) {
         return await decideToolCall(event, ctx, {
           checker: state.checker,
           apiKey: state.apiKey,
-          entrypoint: state.entrypoint
+          entrypoint: state.entrypoint,
+          // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
+          // notices — raised deep inside `checkTool` — actually reach the editor on this path.
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
         });
       } catch {
         return void 0;
