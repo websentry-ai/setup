@@ -30,6 +30,7 @@ import {
 } from "../src/cache.ts";
 import type { CachedPolicy, CacheIdentity } from "../src/cache.ts";
 import { NATIVE_FILE_TOOLS } from "../src/payload.ts";
+import { createPolicyState } from "../src/policyState.ts";
 import { createFakeHome } from "./helpers/fakeHome.ts";
 
 const GATEWAY = "https://api.getunbound.ai";
@@ -460,6 +461,72 @@ test("shouldSkipFileTool: only a native file tool, only when fresh, only when un
   for (const tool of [SHELL_TOOL, "powershell", "some_mcp_tool", "", "READ"]) {
     assert.equal(shouldSkipFileTool(tool, noPolicies, NOW), false, tool);
     assert.equal(shouldSkipFileTool(tool, fresh, NOW), false, tool);
+  }
+});
+
+// --- the full seam: PolicyState -> snapshot -> writeCache -> readCache -> hydrate ---------------
+
+test("a policy snapshot survives the whole round trip, including the empty-list case", () => {
+  for (const tools of [[SOME_FILE_TOOL], [] as string[]]) {
+    const f = fixture();
+    try {
+      // What `policy.ts` does on a successful response, via the onSync seam.
+      const live = createPolicyState();
+      live.recordSuccess(
+        { decision: "allow", tools_to_check: tools, policy_check_failure_action: "block" },
+        NOW,
+      );
+      const identity = identityFor();
+      assert.equal(
+        writeCache(f.path, {
+          ...live.snapshot(),
+          gateway_url: identity.gatewayUrl,
+          key_fingerprint: identity.fingerprint,
+        }),
+        true,
+      );
+
+      // What the next session does at startup.
+      const onDisk = readCache(f.path, identity);
+      assert.ok(onDisk !== undefined, "the record came back");
+      const cold = createPolicyState();
+      cold.hydrate(onDisk);
+
+      assert.deepEqual(cold.getToolsToCheck(), tools, `tools survived for ${JSON.stringify(tools)}`);
+      assert.equal(cold.getToolsSyncedAt(), NOW, "and so did its timestamp");
+      assert.equal(cold.getFailureAction(), "block", "the fail-open opt-out survived too");
+      assert.equal(cold.getFetchedAt(), NOW);
+      assert.deepEqual(cold.snapshot(), live.snapshot(), "byte-for-byte the same snapshot");
+
+      // And the point of it all: the skip decision is the same on both sides.
+      assert.equal(
+        shouldSkipFileTool(OTHER_FILE_TOOL, onDisk, NOW),
+        !tools.includes(OTHER_FILE_TOOL),
+      );
+    } finally {
+      f.home.cleanup();
+    }
+  }
+});
+
+test("a snapshot written under one gateway URL does not govern a prefixed sibling (WR-09)", () => {
+  const f = fixture();
+  try {
+    const live = createPolicyState();
+    live.recordSuccess({ decision: "allow", tools_to_check: [] }, NOW);
+    const identity = identityFor(GATEWAY);
+    writeCache(f.path, {
+      ...live.snapshot(),
+      gateway_url: identity.gatewayUrl,
+      key_fingerprint: identity.fingerprint,
+    });
+
+    // The prefixed deployment is a different tenant. Before WR-09 both normalised to the same
+    // origin, so this record would have been handed to it — and `tools_to_check: []` would have
+    // disabled every file-tool check for an org that never said so.
+    assert.equal(readCache(f.path, identityFor(OTHER_GATEWAY)), undefined);
+  } finally {
+    f.home.cleanup();
   }
 });
 

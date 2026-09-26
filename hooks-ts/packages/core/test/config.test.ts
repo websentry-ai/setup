@@ -201,11 +201,46 @@ test("resolveGatewayUrl: a rejected env URL falls through to the next tier, it d
   }
 });
 
-test("normalizeGatewayUrl: strips path, query and trailing slash", () => {
-  assert.equal(normalizeGatewayUrl("https://h/x/"), "https://h");
-  assert.equal(normalizeGatewayUrl("https://h/"), "https://h");
-  assert.equal(normalizeGatewayUrl("https://h/v1/hooks/pretool?a=b"), "https://h");
-  assert.equal(normalizeGatewayUrl("https://h:8443/x"), "https://h:8443");
+test("normalizeGatewayUrl: WR-09 — a non-root path prefix is PRESERVED, not truncated", () => {
+  // The bug: a prefixed-tenant deployment (`https://host/unbound` behind an ingress path route or
+  // an API-gateway stage) had its prefix dropped, so every request went to `https://host/v1/hooks/
+  // pretool`, 404'd, and fell through to fail-open — forever, with no local signal. Framing the
+  // truncation as hardening was wrong: in the scenario it defends against, the attacker already
+  // controls the whole host.
+  assert.equal(normalizeGatewayUrl("https://host/unbound"), "https://host/unbound");
+  assert.equal(normalizeGatewayUrl("https://host/unbound/"), "https://host/unbound");
+  assert.equal(normalizeGatewayUrl("https://host/a/b/c///"), "https://host/a/b/c");
+  assert.equal(normalizeGatewayUrl("https://h:8443/x"), "https://h:8443/x");
+
+  // A root path is still normalised away, so the base URL never ends in a slash and the
+  // `${base}${PRETOOL_PATH}` concatenation cannot produce a double slash.
+  assert.equal(normalizeGatewayUrl("https://host/"), "https://host");
+  assert.equal(normalizeGatewayUrl("https://host"), "https://host");
+  assert.equal(normalizeGatewayUrl("https://host///"), "https://host");
+});
+
+test("normalizeGatewayUrl: query and fragment are still dropped", () => {
+  assert.equal(normalizeGatewayUrl("https://host/unbound?x=1#y"), "https://host/unbound");
+  assert.equal(normalizeGatewayUrl("https://h/v1/hooks/pretool?a=b"), "https://h/v1/hooks/pretool");
+  assert.equal(normalizeGatewayUrl("https://host/?a=b"), "https://host");
+  assert.equal(normalizeGatewayUrl("https://host#frag"), "https://host");
+});
+
+test("normalizeGatewayUrl: a URL carrying userinfo is rejected outright", () => {
+  // Credentials in the base URL would be concatenated into every request target and would ride
+  // along beside the Bearer header. There is no legitimate prefixed-tenant case for this.
+  assert.equal(normalizeGatewayUrl("https://user:pass@host/x"), undefined);
+  assert.equal(normalizeGatewayUrl("https://user@host/x"), undefined);
+  assert.equal(normalizeGatewayUrl("https://:pass@host"), undefined);
+  assert.equal(normalizeGatewayUrl("http://user:pass@127.0.0.1:8799"), undefined);
+});
+
+test("normalizeGatewayUrl: the path prefix is part of the cache key, so it must be stable", () => {
+  // `cache.ts` keys a record on this exact string. Two spellings of one deployment must collapse to
+  // one key, or a tenant silently never gets a cache hit.
+  const spellings = ["https://host/unbound", "https://host/unbound/", "https://host/unbound/?a=1"];
+  const normalised = spellings.map((s) => normalizeGatewayUrl(s));
+  assert.deepEqual(new Set(normalised), new Set(["https://host/unbound"]), JSON.stringify(normalised));
 });
 
 test("normalizeGatewayUrl: rejects empty, unparseable, non-http(s) and non-string input", () => {
@@ -222,6 +257,8 @@ test("normalizeGatewayUrl: V9 — plain http is rejected for a real host but exe
   // A hostile UNBOUND_GATEWAY_URL must not receive the Bearer header in cleartext.
   assert.equal(normalizeGatewayUrl("http://example.com"), undefined);
   assert.equal(normalizeGatewayUrl("http://evil.internal:8799"), undefined);
+  // WR-09 changed nothing here: a prefix on a hostile http host is still refused.
+  assert.equal(normalizeGatewayUrl("http://evil.com/unbound"), undefined);
   // The documented exemption: the mock-API smoke (RESEARCH §E4a) runs over loopback http.
   assert.equal(normalizeGatewayUrl("http://127.0.0.1:8799"), "http://127.0.0.1:8799");
   assert.equal(normalizeGatewayUrl("http://localhost:8799"), "http://localhost:8799");

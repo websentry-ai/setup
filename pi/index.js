@@ -151,7 +151,9 @@ function normalizeGatewayUrl(raw) {
     const url = new URL(candidate);
     const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
     if (url.protocol !== "https:" && !isLoopbackHttp) return void 0;
-    return url.origin;
+    if (url.username !== "" || url.password !== "") return void 0;
+    const path = url.pathname.replace(/\/+$/, "");
+    return path === "" ? url.origin : url.origin + path;
   } catch {
     return void 0;
   }
@@ -256,7 +258,13 @@ function createPolicyChecker(opts) {
     try {
       const res = await opts.client.postPretool(payload);
       if (res.ok) {
-        opts.state.recordSuccess(res.body);
+        opts.state.recordSuccess(res.body, (opts.now ?? Date.now)());
+        if (opts.onSync !== void 0) {
+          try {
+            opts.onSync(opts.state.snapshot());
+          } catch {
+          }
+        }
         return mapResponseToOutcome(res.body);
       }
       opts.telemetry.reportBypass({

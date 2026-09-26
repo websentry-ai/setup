@@ -78,11 +78,26 @@ export function resolveApiKey(env: NodeJS.ProcessEnv, homeDir: string): string |
 }
 
 /**
- * Validate and canonicalise a gateway URL. Returns the `origin` — which drops any path, query and
- * trailing slash an attacker (or a copy-paste) appended — or `undefined` when the value is not a
- * usable, safe base URL, so resolution falls through to the next tier.
+ * Validate and canonicalise a gateway URL, or return `undefined` when the value is not a usable,
+ * safe base URL — in which case resolution falls through to the next tier.
  *
  * `https:` is required for every real host; plain `http:` is accepted only on loopback.
+ *
+ * **A non-root path prefix is preserved (WR-09).** This previously returned bare `url.origin`, which
+ * was framed as hardening: drop anything an attacker or a copy-paste appended. That framing was
+ * wrong. In the scenario it defends against the attacker already controls the entire host, so a
+ * preserved prefix adds no attack surface — while dropping it broke a real deployment shape. A
+ * prefixed tenant (`https://host/unbound` behind an ingress path route or an API-gateway stage) had
+ * every request rewritten to `https://host/v1/hooks/pretool`, which 404s, which fails open —
+ * permanently, silently, with no local signal. The prefix is also half the on-disk cache key
+ * (`cache.ts`), so truncating it would silently re-key the cache as well.
+ *
+ * Still dropped or refused, because none of these have a legitimate base-URL meaning:
+ *   * a **root** path (`/`, `///`) — normalised away so the base never ends in a slash and
+ *     `${base}${PRETOOL_PATH}` cannot produce a double slash;
+ *   * **query and fragment** — a base URL carrying either would corrupt every request target;
+ *   * **userinfo** (`https://user:pass@host`) — credentials must not ride the base URL beside the
+ *     Bearer header, and there is no prefixed-tenant case that needs them.
  */
 export function normalizeGatewayUrl(raw: unknown): string | undefined {
   const candidate = usableString(raw);
@@ -92,7 +107,11 @@ export function normalizeGatewayUrl(raw: unknown): string | undefined {
     const url = new URL(candidate);
     const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
     if (url.protocol !== "https:" && !isLoopbackHttp) return undefined;
-    return url.origin;
+    if (url.username !== "" || url.password !== "") return undefined;
+    // `url.pathname` is already percent-normalised by the URL parser; `url.origin` carries no path,
+    // query or fragment, so concatenating the two drops both by construction.
+    const path = url.pathname.replace(/\/+$/, "");
+    return path === "" ? url.origin : url.origin + path;
   } catch {
     return undefined;
   }

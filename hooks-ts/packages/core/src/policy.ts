@@ -14,15 +14,21 @@
 // "client stubbed to raise synchronously" test possible, and it is what will let a future opencode
 // adapter reuse this file untouched.
 //
-// Deliberately NOT here: response caching, memoisation, and `tools_to_check` filtering. Those are
-// RES-03 in Phase 9; `policyState` already stores the field so Phase 9 only adds the read. pi awaits
-// `prepareToolCall` serially even for a parallel tool batch (§F2), so each call is one round trip —
-// worth knowing before adding anything to this path.
+// RES-03's on-disk cache does NOT live here either, and that is the point of `onSync`: this module
+// hands the recorded snapshot to an injected callback and the composition root
+// (`packages/pi/src/index.ts`) decides that the callback writes a file. Importing `cache.ts` here
+// would put a filesystem dependency on the reusable decision path for the sake of one call.
+// (Spelled that way on purpose: the test for this property is a grep of this file for the node
+// filesystem module specifier, and a grep cannot tell a comment from an import.)
+//
+// Deliberately NOT here: response caching and `tools_to_check` filtering — the skip decision happens
+// before a payload is even built, in the adapter (09-03). pi awaits `prepareToolCall` serially even
+// for a parallel tool batch (§F2), so each call that gets here is one round trip.
 
 import { mapResponseToOutcome } from "./verdict.ts";
 import type { PolicyOutcome } from "./verdict.ts";
 import type { ApiClient } from "./client.ts";
-import type { PolicyState } from "./policyState.ts";
+import type { PolicySnapshot, PolicyState } from "./policyState.ts";
 import type { Telemetry } from "./telemetry.ts";
 import type { PretoolRequestBody } from "./types.ts";
 
@@ -34,6 +40,17 @@ export interface PolicyCheckerOptions {
   client: ApiClient;
   state: PolicyState;
   telemetry: Telemetry;
+  /**
+   * Called with the freshly recorded snapshot after every **successful** response, so a caller can
+   * persist it (RES-03). Optional: without it the checker behaves exactly as it did in Phase 8.
+   *
+   * It runs inside its own try/catch. The real implementation touches a filesystem and can therefore
+   * fail (EACCES, ENOSPC), and pi turns an exception out of a `tool_call` handler into a block — so a
+   * failed cache write must be invisible to the verdict.
+   */
+  onSync?: (snapshot: PolicySnapshot) => void;
+  /** Injectable clock, so a TTL test drives 300 s in milliseconds. Defaults to `Date.now`. */
+  now?: () => number;
 }
 
 export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
@@ -46,7 +63,15 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
 
       if (res.ok) {
         // Remember the metadata riding this response before interpreting the decision (§B4).
-        opts.state.recordSuccess(res.body);
+        opts.state.recordSuccess(res.body, (opts.now ?? Date.now)());
+        if (opts.onSync !== undefined) {
+          try {
+            opts.onSync(opts.state.snapshot());
+          } catch {
+            // A cache that could not be written costs one round trip next session. It must never
+            // cost this tool call its verdict, so the failure is swallowed here and not rethrown.
+          }
+        }
         return mapResponseToOutcome(res.body);
       }
 

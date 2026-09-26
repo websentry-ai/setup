@@ -9,6 +9,7 @@
 // production 20 s deadline is never exercised in a unit test.
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
@@ -20,6 +21,7 @@ import { createApiClient } from "../src/client.ts";
 import type { ApiClient, PretoolResult } from "../src/client.ts";
 import { createPolicyChecker } from "../src/policy.ts";
 import { createPolicyState } from "../src/policyState.ts";
+import type { PolicySnapshot } from "../src/policyState.ts";
 import { createTelemetry } from "../src/telemetry.ts";
 import { mapResponseToOutcome, parseDecision, sanitizeReason } from "../src/verdict.ts";
 import type { PretoolRequestBody } from "../src/types.ts";
@@ -446,4 +448,133 @@ test("RES-01 a client that throws synchronously still yields an allow", async ()
     outcome = await checker.checkTool(payload(), "bash");
   }, "a throwing client must not reject checkTool");
   assert.deepEqual(outcome, { kind: "allow" }, "the belt to the adapter's braces");
+});
+
+// --- the onSync persistence seam (RES-03) ------------------------------------------------------
+//
+// `policy.ts` must be able to hand a policy snapshot to a persister without learning what a
+// filesystem is — that purity is what makes the "client stubbed to raise synchronously" test above
+// possible and what will let a future opencode adapter reuse the file untouched. So the cache write
+// is an injected callback, wired by the composition root in `packages/pi/src/index.ts` (09-04).
+
+/** A client that answers with a fixed body and never touches the network. */
+function stubClient(body: Record<string, unknown>, ok = true): ApiClient {
+  return {
+    postPretool: async () =>
+      ok
+        ? { ok: true, body: body as never, elapsedMs: 1 }
+        : { ok: false, errorClass: "HttpStatus500", elapsedMs: 1 },
+    postHookErrors: async () => true,
+  };
+}
+
+function telemetryFor(client: ApiClient) {
+  return createTelemetry({ client, apiKey: TEST_KEY, now: () => FIXED_NOW });
+}
+
+test("RES-03 onSync fires exactly once per successful response, with the recorded snapshot", async () => {
+  const client = stubClient({
+    decision: "allow",
+    tools_to_check: ["read"],
+    policy_check_failure_action: "block",
+  });
+  const seen: PolicySnapshot[] = [];
+  const checker = createPolicyChecker({
+    client,
+    state: createPolicyState(),
+    telemetry: telemetryFor(client),
+    onSync: (snapshot) => {
+      seen.push(snapshot);
+    },
+    now: () => FIXED_NOW,
+  });
+
+  assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });
+  assert.equal(seen.length, 1, "one response, one persist");
+  assert.deepEqual(seen[0], {
+    fetched_at: FIXED_NOW,
+    tools_synced_at: FIXED_NOW,
+    tools_to_check: ["read"],
+    policy_check_failure_action: "block",
+  });
+
+  await checker.checkTool(payload(), "bash");
+  assert.equal(seen.length, 2, "and once more for the second response");
+});
+
+test("RES-03 onSync uses the injected clock, so a TTL test never reads the wall clock", async () => {
+  const client = stubClient({ decision: "allow", tools_to_check: [] });
+  let clock = FIXED_NOW;
+  const seen: PolicySnapshot[] = [];
+  const checker = createPolicyChecker({
+    client,
+    state: createPolicyState(),
+    telemetry: telemetryFor(client),
+    onSync: (snapshot) => {
+      seen.push(snapshot);
+    },
+    now: () => clock,
+  });
+
+  await checker.checkTool(payload(), "bash");
+  clock = FIXED_NOW + 300_001;
+  await checker.checkTool(payload(), "bash");
+
+  assert.equal(seen[0]?.tools_synced_at, FIXED_NOW);
+  assert.equal(seen[1]?.tools_synced_at, FIXED_NOW + 300_001);
+  // `[]` is carried through the seam as a value, not dropped as "nothing to persist".
+  assert.deepEqual(seen[0]?.tools_to_check, []);
+});
+
+test("RES-03 onSync never fires on a failure — a failed check must not refresh the cache", async () => {
+  const client = stubClient({}, false);
+  let calls = 0;
+  const checker = createPolicyChecker({
+    client,
+    state: createPolicyState(),
+    telemetry: telemetryFor(client),
+    onSync: () => {
+      calls += 1;
+    },
+    now: () => FIXED_NOW,
+  });
+
+  assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });
+  assert.equal(calls, 0, "a 500 taught nothing, so there is nothing to write");
+});
+
+test("RES-03 an onSync that throws changes neither the verdict nor the outcome", async () => {
+  // The persister touches a filesystem, so it CAN fail (EACCES, ENOSPC, a full disk). pi turns an
+  // exception out of a tool_call handler into a block, so a failed cache write must be invisible.
+  const client = stubClient({ decision: "deny", reason: "Reading secrets is blocked." });
+  const checker = createPolicyChecker({
+    client,
+    state: createPolicyState(),
+    telemetry: telemetryFor(client),
+    onSync: () => {
+      throw new Error("ENOSPC: no space left on device");
+    },
+    now: () => FIXED_NOW,
+  });
+
+  let outcome: unknown;
+  await assert.doesNotReject(async () => {
+    outcome = await checker.checkTool(payload(), "bash");
+  }, "a throwing persister must not reject checkTool");
+  assert.deepEqual(outcome, { kind: "deny", reason: "Reading secrets is blocked." });
+});
+
+test("RES-03 a checker with no onSync behaves exactly as before", async () => {
+  const client = stubClient({ decision: "allow", tools_to_check: ["read"] });
+  const state = createPolicyState();
+  // The option is optional: every Phase 8 call site constructs the checker without it.
+  const checker = createPolicyChecker({ client, state, telemetry: telemetryFor(client) });
+  assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });
+  assert.deepEqual(state.getToolsToCheck(), ["read"], "the state is still recorded");
+});
+
+test("RES-03 policy.ts stays free of filesystem and of throw", () => {
+  const source = readFileSync(new URL("../src/policy.ts", import.meta.url), "utf8");
+  assert.equal(source.includes("node:fs"), false, "the persister is injected, never imported");
+  assert.equal(/^\s*throw /m.test(source), false, "an exception out of this module would be a block");
 });
