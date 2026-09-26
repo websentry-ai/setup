@@ -25,7 +25,7 @@ import {
 } from "../../core/src/constants.ts";
 import { buildPretoolPayload } from "../../core/src/payload.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
-import { isBashCall } from "./narrow.ts";
+import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 import type { UiCtx } from "./ui.ts";
@@ -56,12 +56,14 @@ export async function decideToolCall(
   deps: DecideDeps,
 ): Promise<BlockResult | undefined> {
   try {
-    const bash = isBashCall(event);
-    const command = bash ? event.input.command : "";
+    // Both of pi's shell tools (`bash` and `powershell`) are checked on their `command` — see
+    // `narrow.ts`. Anything else carries no command and is judged server-side on `metadata`.
+    const shell = isShellCall(event);
+    const command = shell ? event.input.command : "";
 
     // Nothing to evaluate: the server's entry gate would answer allow after a full round trip, and
     // pi awaits every call in a batch serially, so each pointless trip is felt N× (§B3 / §F2).
-    if (bash && command.trim() === "") return undefined;
+    if (shell && command.trim() === "") return undefined;
 
     const payload = buildPretoolPayload({
       toolName: event.toolName,

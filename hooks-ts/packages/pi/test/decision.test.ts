@@ -156,6 +156,68 @@ test("HOOK-01 whitespace-only bash command: zero HTTP requests (§B3)", async ()
   assert.equal(api.requests.length, 0);
 });
 
+// CR-01 — `powershell` is pi's second shell tool. It is a first-class built-in
+// (`allToolNames` in `dist/core/tools/index.js:19-28`) whose input is *the same type* as bash's
+// (`PowerShellToolInput = BashToolInput`, `dist/core/tools/powershell.d.ts:10`). It is merely off in
+// the default active set, so `--tools` / `defaultTools` turns it on. Before these tests it narrowed
+// to "not a shell call", the command never reached the wire, and every terminal policy was silently
+// inapplicable on a machine configured that way.
+
+test("HOOK-01 powershell deny: pi's other shell tool is checked exactly like bash (CR-01)", async () => {
+  const { result, ctx } = await run("deny", {
+    toolName: "powershell",
+    input: { command: "Remove-Item -Recurse -Force C:\\src" },
+  });
+
+  assert.deepStrictEqual(result, {
+    block: true,
+    reason: "Blocked by Unbound policy: Reading secrets is blocked.",
+  });
+  assert.equal(ctx.notifyCalls.length, 1, "exactly one notification");
+  assert.deepStrictEqual(ctx.notifyCalls[0], {
+    message: "Reading secrets is blocked.",
+    type: "error",
+  });
+});
+
+test("HOOK-01 powershell: the wire body carries tool_name and the verbatim command (CR-01)", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const ctx = createFakeCtx();
+  try {
+    const result = await decideToolCall(
+      createFakeToolCallEvent("powershell", { command: "Get-Content C:\\secrets.txt" }, "toolu_ps"),
+      ctx,
+      depsFor(api),
+    );
+
+    assert.equal(result, undefined);
+    const requests = pretoolRequests(api);
+    assert.equal(requests.length, 1, "a powershell call is evaluated");
+    const body = api.requests[0]?.body as {
+      pre_tool_use_data?: { tool_name?: string; command?: string; tool_use_id?: string };
+    };
+    assert.equal(body.pre_tool_use_data?.tool_name, "powershell");
+    assert.equal(
+      body.pre_tool_use_data?.command,
+      "Get-Content C:\\secrets.txt",
+      "the command must reach the gateway, not the empty string",
+    );
+    assert.equal(body.pre_tool_use_data?.tool_use_id, "toolu_ps");
+  } finally {
+    await api.close();
+  }
+});
+
+test("HOOK-01 whitespace-only powershell command: zero HTTP requests (CR-01, §B3)", async () => {
+  const { result, api } = await run("deny", {
+    toolName: "powershell",
+    input: { command: " \t " },
+  });
+
+  assert.equal(result, undefined, "an empty command is nothing to evaluate, in either shell");
+  assert.equal(api.requests.length, 0, "no round trip at all");
+});
+
 test("HOOK-01 a pathless non-bash tool still sends metadata.file_path = cwd", async () => {
   const api = await startMockApi({ mode: "allow" });
   const ctx = createFakeCtx({ cwd: "/tmp/project-x" });
