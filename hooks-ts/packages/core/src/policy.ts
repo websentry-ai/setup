@@ -25,6 +25,9 @@
 // before a payload is even built, in the adapter (09-03). pi awaits `prepareToolCall` serially even
 // for a parallel tool batch (§F2), so each call that gets here is one round trip.
 
+import { createBreaker } from "./breaker.ts";
+import type { Breaker } from "./breaker.ts";
+import { BREAKER_CLOSED_NOTICE, BREAKER_OPEN_NOTICE } from "./constants.ts";
 import { mapResponseToOutcome } from "./verdict.ts";
 import type { PolicyOutcome } from "./verdict.ts";
 import type { ApiClient } from "./client.ts";
@@ -32,8 +35,25 @@ import type { PolicySnapshot, PolicyState } from "./policyState.ts";
 import type { Telemetry } from "./telemetry.ts";
 import type { PretoolRequestBody } from "./types.ts";
 
+/**
+ * The per-call channel back to the live editor session.
+ *
+ * It is a parameter rather than a constructor option because the checker is built once per process in
+ * the adapter's `init()`, while `ctx` — the only thing that can render a notice — arrives with each
+ * event. Optional everywhere, and every call site swallows its failures: a notice is cosmetic and
+ * must never be able to change a verdict (or, worse, become a thrown handler, which pi reads as a
+ * block).
+ */
+export interface CheckHooks {
+  notify?(message: string, level: "info" | "warning" | "error"): void;
+}
+
 export interface PolicyChecker {
-  checkTool(payload: PretoolRequestBody, toolName: string): Promise<PolicyOutcome>;
+  checkTool(
+    payload: PretoolRequestBody,
+    toolName: string,
+    hooks?: CheckHooks,
+  ): Promise<PolicyOutcome>;
 }
 
 export interface PolicyCheckerOptions {
@@ -49,19 +69,53 @@ export interface PolicyCheckerOptions {
    * failed cache write must be invisible to the verdict.
    */
   onSync?: (snapshot: PolicySnapshot) => void;
+  /**
+   * WR-02's consecutive-failure breaker (`breaker.ts`). **Optional with an internally constructed
+   * default**, deliberately: five call sites already build a checker, three of them in Phase 8 test
+   * files this wave does not open, and a required field would fail `npm run typecheck`. Because the
+   * composition root builds one checker per resolved base URL, the default is already per-base-URL.
+   */
+  breaker?: Breaker;
   /** Injectable clock, so a TTL test drives 300 s in milliseconds. Defaults to `Date.now`. */
   now?: () => number;
 }
 
+/** A notice must never change a verdict, so every emission is swallowed. */
+function notify(hooks: CheckHooks | undefined, message: string, level: "info" | "warning"): void {
+  try {
+    hooks?.notify?.(message, level);
+  } catch {
+    // The TUI is not worth a tool call.
+  }
+}
+
 export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
+  // One breaker per checker, built once — a per-call breaker would never accumulate a failure run.
+  const breaker = opts.breaker ?? createBreaker({ now: opts.now });
+
   async function checkTool(
     payload: PretoolRequestBody,
     toolName: string,
+    hooks?: CheckHooks,
   ): Promise<PolicyOutcome> {
     try {
+      // Read once, before the call, and use the same answer for both breaker decisions: an org that
+      // opted out of fail-open is exempt from the breaker entirely (§F8). Skipping its request and
+      // allowing would invert the contract it paid for, and skipping-and-blocking for 60 s would
+      // brick the session — so it keeps getting real attempts, and a real `unavailable`.
+      const breakerApplies = opts.state.getFailureAction() !== "block";
+
+      // Before any fetch: an open breaker means no HTTP and no telemetry — the bypass was already
+      // reported, and notified, when it opened.
+      if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
+
       const res = await opts.client.postPretool(payload);
 
       if (res.ok) {
+        if (breakerApplies) {
+          const closed = breaker.recordSuccess();
+          if (closed !== undefined) notify(hooks, BREAKER_CLOSED_NOTICE, "info");
+        }
         // Remember the metadata riding this response before interpreting the decision (§B4).
         opts.state.recordSuccess(res.body, (opts.now ?? Date.now)());
         if (opts.onSync !== undefined) {
@@ -73,6 +127,11 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
           }
         }
         return mapResponseToOutcome(res.body);
+      }
+
+      if (breakerApplies) {
+        const opened = breaker.recordFailure();
+        if (opened !== undefined) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
       }
 
       // Fail-open, but never silently: the bypass is the audit trail for an accepted risk

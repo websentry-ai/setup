@@ -44,6 +44,15 @@ export const CONFIRM_TIMEOUT_MS = 120_000;
 /** One bypass self-report per minute, per `unbound.py`'s convention (§B7). */
 export const ERROR_REPORT_INTERVAL_MS = 60_000;
 export const ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
+
+// --- The circuit breaker (WR-02) --------------------------------------------------------------
+/** Consecutive `ok:false` results that take the gateway out of circuit for `BREAKER_OPEN_MS`. */
+export const BREAKER_FAILURE_THRESHOLD = 3;
+/**
+ * How long the breaker stays open. The open notice below states this window in words, so the two
+ * must be changed together — a notice promising 60 s while the window is 5 min would be a lie.
+ */
+export const BREAKER_OPEN_MS = 60_000;
 /**
  * Policy-cache freshness window. `unbound.py:70 CACHE_TTL_SECONDS = 300`, in milliseconds so it can
  * be compared against `Date.now()` without a unit conversion at every call site.
@@ -73,3 +82,10 @@ export const NO_UI_REASON =
   "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";
 export const NO_KEY_NOTICE = "Unbound: no API key found — extension inactive";
+/**
+ * WR-02, locked verbatim by 09-CONTEXT.md. Emitted once when the breaker opens — the developer is
+ * entitled to know that the next minute of tool calls is unchecked.
+ */
+export const BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable — allowing tool calls for 60 s";
+/** The other edge: emitted once when a half-open probe succeeds. */
+export const BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again — enforcement resumed";

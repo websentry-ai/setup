@@ -13,10 +13,14 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  BREAKER_CLOSED_NOTICE,
+  BREAKER_OPEN_NOTICE,
   ENGINE_UNAVAILABLE_REASON,
   ERRORS_PATH,
   MAX_REASON_CHARS,
+  PRETOOL_PATH,
 } from "../src/constants.ts";
+import { createBreaker } from "../src/breaker.ts";
 import { createApiClient } from "../src/client.ts";
 import type { ApiClient, PretoolResult } from "../src/client.ts";
 import { createPolicyChecker } from "../src/policy.ts";
@@ -27,6 +31,9 @@ import { mapResponseToOutcome, parseDecision, sanitizeReason } from "../src/verd
 import type { PretoolRequestBody } from "../src/types.ts";
 import { ATTRIBUTION_SUFFIX, startMockApi } from "./helpers/mockApi.ts";
 import type { MockApi } from "./helpers/mockApi.ts";
+// The repo's only pure clock (09-00); it has no imports of its own, so this borrows a fixture, not a
+// dependency on the pi package.
+import { createFakeClock } from "../../pi/test/helpers/fakeCtx.ts";
 
 const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
@@ -571,6 +578,186 @@ test("RES-03 a checker with no onSync behaves exactly as before", async () => {
   const checker = createPolicyChecker({ client, state, telemetry: telemetryFor(client) });
   assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });
   assert.deepEqual(state.getToolsToCheck(), ["read"], "the state is still recorded");
+});
+
+// --- WR-02: the breaker as `checkTool` behaviour ------------------------------------------------
+//
+// The state machine itself is unit-tested in `breaker.test.ts`. What matters here is the wiring: the
+// gate runs BEFORE any fetch (asserted by request count, not by latency alone), the two transitions
+// reach the caller's `hooks.notify` exactly once each, and a fail-CLOSED org is exempt from the whole
+// mechanism (§F8) — skipping its call and allowing would invert the contract it paid for.
+
+const pretoolCalls = (api: MockApi) => api.requests.filter((r) => r.path === PRETOOL_PATH);
+
+interface Notice {
+  message: string;
+  level: "info" | "warning" | "error";
+}
+
+function breakerHarness(api: MockApi, state = createPolicyState()) {
+  const clock = createFakeClock();
+  const wire = createApiClient({
+    baseUrl: api.url,
+    apiKey: TEST_KEY,
+    timeoutMs: TIMEOUT_MS,
+    errorsTimeoutMs: TIMEOUT_MS,
+  });
+  const notices: Notice[] = [];
+  const checker = createPolicyChecker({
+    client: wire,
+    state,
+    telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+    breaker: createBreaker({ now: clock.now }),
+  });
+  const hooks = {
+    notify(message: string, level: "info" | "warning" | "error") {
+      notices.push({ message, level });
+    },
+  };
+  return {
+    clock,
+    notices,
+    state,
+    check: () => checker.checkTool(payload(), "bash", hooks),
+  };
+}
+
+test("WR-02 three failures take the gateway out of circuit: the fourth call makes zero requests", async () => {
+  // `hang` with a 50 ms deadline, so the contrast is visible: a real attempt costs the deadline, a
+  // skipped one costs nothing.
+  const api = await startMockApi({ mode: "hang" });
+  try {
+    const h = breakerHarness(api);
+    for (let i = 0; i < 3; i += 1) {
+      assert.deepEqual(await h.check(), { kind: "allow" }, `failure ${i + 1} fails open`);
+    }
+    assert.equal(pretoolCalls(api).length, 3, "all three failures were real attempts");
+
+    const startedAt = Date.now();
+    assert.deepEqual(await h.check(), { kind: "allow" }, "the fourth call allows immediately");
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(pretoolCalls(api).length, 3, "not a fourth request — the breaker is open");
+    assert.ok(elapsed < TIMEOUT_MS, `the skipped call took ${elapsed}ms, well under the deadline`);
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-02 the open notice is byte-identical and emitted exactly once across four failures", async () => {
+  const api = await startMockApi({ mode: "500" });
+  try {
+    const h = breakerHarness(api);
+    for (let i = 0; i < 4; i += 1) await h.check();
+
+    const opens = h.notices.filter((n) => n.message === BREAKER_OPEN_NOTICE);
+    assert.equal(opens.length, 1, `exactly one open notice, got ${JSON.stringify(h.notices)}`);
+    assert.equal(opens[0]?.level, "warning");
+    // Spelled out as well as compared to the constant: this string is locked by 09-CONTEXT.md and a
+    // typo in `constants.ts` must fail here rather than silently retune the assertion.
+    assert.equal(
+      BREAKER_OPEN_NOTICE,
+      "Unbound policy engine unreachable — allowing tool calls for 60 s",
+    );
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-02 a recovered gateway closes the breaker with exactly one close notice", async () => {
+  const api = await startMockApi({ mode: "500" });
+  try {
+    const h = breakerHarness(api);
+    for (let i = 0; i < 3; i += 1) await h.check();
+    assert.equal(pretoolCalls(api).length, 3);
+
+    // Still open: no probe yet.
+    await h.check();
+    assert.equal(pretoolCalls(api).length, 3, "the window has not elapsed");
+
+    h.clock.advance(60_001);
+    api.setMode("allow");
+    assert.deepEqual(await h.check(), { kind: "allow" }, "the probe goes out and succeeds");
+    assert.equal(pretoolCalls(api).length, 4, "exactly one probe");
+
+    const closes = h.notices.filter((n) => n.message === BREAKER_CLOSED_NOTICE);
+    assert.equal(closes.length, 1, "one close notice");
+    assert.equal(closes[0]?.level, "info");
+
+    // Closed again: ordinary traffic flows and says nothing further.
+    await h.check();
+    assert.equal(pretoolCalls(api).length, 5);
+    assert.equal(h.notices.length, 2, "one open, one close, nothing else");
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-02 a fail-closed org is never disarmed by the breaker (§F8)", async () => {
+  const api = await startMockApi({ mode: "hang" });
+  try {
+    const state = createPolicyState();
+    // The last good response asked for block-on-failure. That org bought real attempts.
+    state.recordSuccess({ decision: "allow", policy_check_failure_action: "block" });
+    const h = breakerHarness(api, state);
+
+    for (let i = 0; i < 4; i += 1) {
+      assert.deepEqual(await h.check(), { kind: "unavailable" }, `call ${i + 1} still blocks`);
+    }
+    assert.equal(
+      pretoolCalls(api).length,
+      4,
+      "four calls, four real requests — the breaker was never consulted",
+    );
+    assert.deepEqual(h.notices, [], "and no notice promising 60 s of allowed tool calls");
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-02 a notify that throws changes neither the verdict nor the outcome", async () => {
+  const api = await startMockApi({ mode: "500" });
+  try {
+    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+    const checker = createPolicyChecker({
+      client: wire,
+      state: createPolicyState(),
+      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+      breaker: createBreaker({ now: () => FIXED_NOW }),
+    });
+    const hostile = {
+      notify() {
+        throw new Error("the TUI exploded");
+      },
+    };
+
+    let outcome: unknown;
+    await assert.doesNotReject(async () => {
+      for (let i = 0; i < 3; i += 1) outcome = await checker.checkTool(payload(), "bash", hostile);
+    }, "a notice must never be able to reject checkTool");
+    assert.deepEqual(outcome, { kind: "allow" });
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-02 hooks is optional: a checker called without it still opens the breaker", async () => {
+  const api = await startMockApi({ mode: "500" });
+  try {
+    const wire = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+    const checker = createPolicyChecker({
+      client: wire,
+      state: createPolicyState(),
+      telemetry: createTelemetry({ client: wire, apiKey: TEST_KEY, now: () => FIXED_NOW }),
+    });
+    for (let i = 0; i < 4; i += 1) {
+      assert.deepEqual(await checker.checkTool(payload(), "bash"), { kind: "allow" });
+    }
+    // The default breaker is internally constructed, so Phase 8 call sites get the protection too.
+    assert.equal(pretoolCalls(api).length, 3, "the fourth call was skipped with no adapter wiring");
+  } finally {
+    await api.close();
+  }
 });
 
 test("RES-03 policy.ts stays free of filesystem and of throw", () => {

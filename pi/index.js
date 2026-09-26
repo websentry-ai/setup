@@ -34,6 +34,8 @@ var ERRORS_TIMEOUT_MS = 1e4;
 var CONFIRM_TIMEOUT_MS = 12e4;
 var ERROR_REPORT_INTERVAL_MS = 6e4;
 var ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
+var BREAKER_FAILURE_THRESHOLD = 3;
+var BREAKER_OPEN_MS = 6e4;
 var MAX_REASON_CHARS = 2e3;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
@@ -45,6 +47,8 @@ var CONFIRM_QUESTION_SUFFIX = "\n\nRun this command?";
 var NO_UI_REASON = "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 var ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable \u2014 please retry";
 var NO_KEY_NOTICE = "Unbound: no API key found \u2014 extension inactive";
+var BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable \u2014 allowing tool calls for 60 s";
+var BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again \u2014 enforcement resumed";
 
 // packages/core/src/client.ts
 var MAX_ERRORS_PER_REQUEST = 10;
@@ -223,6 +227,46 @@ function resolveClientEntrypoint(env, argv1) {
   return `pi/${version}`;
 }
 
+// packages/core/src/breaker.ts
+function createBreaker(opts = {}) {
+  const now = opts.now ?? Date.now;
+  const threshold = typeof opts.threshold === "number" && opts.threshold > 0 ? opts.threshold : BREAKER_FAILURE_THRESHOLD;
+  const openMs = typeof opts.openMs === "number" && opts.openMs > 0 ? opts.openMs : BREAKER_OPEN_MS;
+  let consecutiveFailures = 0;
+  let openedAtMs;
+  let probeStartedAtMs;
+  function phase() {
+    if (openedAtMs === void 0) return "closed";
+    return now() - openedAtMs > openMs ? "half-open" : "open";
+  }
+  return {
+    shouldSkip() {
+      const current = phase();
+      if (current === "closed") return false;
+      if (current === "open") return true;
+      if (probeStartedAtMs !== void 0 && now() - probeStartedAtMs <= openMs) return true;
+      probeStartedAtMs = now();
+      return false;
+    },
+    recordFailure() {
+      probeStartedAtMs = void 0;
+      consecutiveFailures += 1;
+      if (consecutiveFailures < threshold) return void 0;
+      const wasOpen = openedAtMs !== void 0;
+      openedAtMs = now();
+      return wasOpen ? void 0 : "opened";
+    },
+    recordSuccess() {
+      const wasOpen = openedAtMs !== void 0;
+      consecutiveFailures = 0;
+      openedAtMs = void 0;
+      probeStartedAtMs = void 0;
+      return wasOpen ? "closed" : void 0;
+    },
+    state: phase
+  };
+}
+
 // packages/core/src/verdict.ts
 var CONTROL_CHARS = new RegExp(
   "[\\x00-\\x09\\x0b-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
@@ -253,11 +297,24 @@ function mapResponseToOutcome(body) {
 }
 
 // packages/core/src/policy.ts
+function notify(hooks, message, level) {
+  try {
+    hooks?.notify?.(message, level);
+  } catch {
+  }
+}
 function createPolicyChecker(opts) {
-  async function checkTool(payload, toolName) {
+  const breaker = opts.breaker ?? createBreaker({ now: opts.now });
+  async function checkTool(payload, toolName, hooks) {
     try {
+      const breakerApplies = opts.state.getFailureAction() !== "block";
+      if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
       const res = await opts.client.postPretool(payload);
       if (res.ok) {
+        if (breakerApplies) {
+          const closed = breaker.recordSuccess();
+          if (closed !== void 0) notify(hooks, BREAKER_CLOSED_NOTICE, "info");
+        }
         opts.state.recordSuccess(res.body, (opts.now ?? Date.now)());
         if (opts.onSync !== void 0) {
           try {
@@ -266,6 +323,10 @@ function createPolicyChecker(opts) {
           }
         }
         return mapResponseToOutcome(res.body);
+      }
+      if (breakerApplies) {
+        const opened = breaker.recordFailure();
+        if (opened !== void 0) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
       }
       opts.telemetry.reportBypass({
         errorClass: res.errorClass,
