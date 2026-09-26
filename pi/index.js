@@ -134,7 +134,9 @@ function readUnboundConfig(homeDir) {
   }
 }
 function usableString(candidate) {
-  return typeof candidate === "string" && candidate.trim().length > 0 ? candidate : void 0;
+  if (typeof candidate !== "string") return void 0;
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : void 0;
 }
 function resolveApiKey(env, homeDir) {
   const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
@@ -145,7 +147,7 @@ function normalizeGatewayUrl(raw) {
   const candidate = usableString(raw);
   if (candidate === void 0) return void 0;
   try {
-    const url = new URL(candidate.trim());
+    const url = new URL(candidate);
     const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
     if (url.protocol !== "https:" && !isLoopbackHttp) return void 0;
     return url.origin;

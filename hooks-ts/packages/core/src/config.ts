@@ -44,9 +44,18 @@ export function readUnboundConfig(homeDir: string): Record<string, unknown> {
   }
 }
 
-/** A candidate is usable only when it is a non-blank string. */
+/**
+ * A candidate is usable only when it is a non-blank string, and it is returned **trimmed**.
+ *
+ * Returning the raw value would be a silent enforcement hole: `UNBOUND_API_KEY=$(cat keyfile)`
+ * keeps the trailing newline, and `Bearer <key>\n` is either rejected by undici as an invalid
+ * header value or 401s at the gateway — both of which fail open, so every tool runs unchecked
+ * while the developer believes a policy is active.
+ */
 function usableString(candidate: unknown): string | undefined {
-  return typeof candidate === "string" && candidate.trim().length > 0 ? candidate : undefined;
+  if (typeof candidate !== "string") return undefined;
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
 }
 
 /**
@@ -71,7 +80,8 @@ export function normalizeGatewayUrl(raw: unknown): string | undefined {
   const candidate = usableString(raw);
   if (candidate === undefined) return undefined;
   try {
-    const url = new URL(candidate.trim());
+    // `usableString` already trimmed it.
+    const url = new URL(candidate);
     const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
     if (url.protocol !== "https:" && !isLoopbackHttp) return undefined;
     return url.origin;

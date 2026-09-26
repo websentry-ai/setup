@@ -8,7 +8,7 @@ resulting verdict into in-editor behaviour. `npm run build` bundles both into a 
 dependency-free ESM file at `dist/pi/index.js`, which pi loads from
 `~/.pi/agent/extensions/unbound/index.js` on Node >= 22.19.0.
 
-Tested against **pi 0.87.1** on Node `v22.22.2` (built `dist/pi/index.js` = 18160 bytes, smoke record in [`docs/SMOKE.md`](docs/SMOKE.md)); `engines.node` is `>=22.19.0`, matching pi's own floor.
+Tested against **pi 0.87.1** on Node `v22.22.2` (built `dist/pi/index.js` = 18197 bytes, smoke record in [`docs/SMOKE.md`](docs/SMOKE.md)); `engines.node` is `>=22.19.0`, matching pi's own floor.
 `@earendil-works/pi-coding-agent` is a **devDependency pinned to `0.87.x` for types only** — the
 built file must import nothing from it at runtime, because a value import would inline the whole
 agent (multi-MB) and its bare, non-`node:` imports cannot resolve under pi's jiti loader. A failing

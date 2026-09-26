@@ -105,6 +105,33 @@ test("resolveApiKey: a non-string or blank api_key is rejected", () => {
   }
 });
 
+test("resolveApiKey: surrounding whitespace is stripped from every tier", () => {
+  // A padded key would be sent as `Bearer <key>\n`, which undici rejects as an invalid header
+  // value (and the gateway would 401 anyway) — and both outcomes fail OPEN, i.e. silently no
+  // enforcement at all. Every tier must therefore hand back a trimmed token.
+  const home = createFakeHome({ api_key: "  from-file\n" });
+  try {
+    assert.equal(resolveApiKey({ UNBOUND_PI_API_KEY: "pi-key\n" }, home.homeDir), "pi-key");
+    assert.equal(resolveApiKey({ UNBOUND_API_KEY: " generic-key " }, home.homeDir), "generic-key");
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir), "from-file");
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("resolveGatewayUrl: a padded URL is still accepted", () => {
+  const home = createFakeHome({ gateway_url: "\thttps://from-file.example.com\n" });
+  try {
+    assert.equal(
+      resolveGatewayUrl({ UNBOUND_GATEWAY_URL: "  https://from-env.example.com  " }, home.homeDir),
+      "https://from-env.example.com",
+    );
+    assert.equal(resolveGatewayUrl(NO_ENV, home.homeDir), "https://from-file.example.com");
+  } finally {
+    home.cleanup();
+  }
+});
+
 test("resolveGatewayUrl: UNBOUND_GATEWAY_URL beats the config file", () => {
   const home = createFakeHome({ gateway_url: "https://zendesk-api.getunbound.ai" });
   try {
