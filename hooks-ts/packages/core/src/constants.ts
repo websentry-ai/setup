@@ -16,6 +16,19 @@ export const ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
 export const DEFAULT_GATEWAY_URL = "https://api.getunbound.ai";
 export const CONFIG_DIR_NAME = ".unbound";
 export const CONFIG_FILE_NAME = "config.json";
+/**
+ * The policy cache lives beside pi's own install, not in `~/.unbound`: `<agent dir>/.unbound/
+ * policy_cache.json`. Same literal as `CONFIG_DIR_NAME`, deliberately a separate constant — the two
+ * have different parents and relocating one must not move the other.
+ */
+export const CACHE_DIR_NAME = ".unbound";
+export const CACHE_FILE_NAME = "policy_cache.json";
+/** `join(homedir(), ...)` — pi's default agent dir, `PI/dist/config.js:405-427`. */
+export const PI_AGENT_DIR_SEGMENTS = [".pi", "agent"] as const;
+/** pi's own relocation hook, tilde-expanded, takes precedence over the default (§A6). */
+export const ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
+/** The cache is keyed on a digest, never on the key. See `keyFingerprint` (T-09-14). */
+export const KEY_FINGERPRINT_PREFIX = "sha256:";
 /** `unbound_app_label` on the wire; `'pi'` joined the union in Phase 7. */
 export const APP_LABEL = "pi";
 /** `hook_source` on POST /v1/hooks/errors — the label rides this field, there is no app label there. */

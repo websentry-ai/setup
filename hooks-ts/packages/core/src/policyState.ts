@@ -61,7 +61,12 @@ export interface PolicyState {
   hydrate(snapshot: PolicySnapshot): void;
 }
 
-function parseFailureAction(raw: unknown): FailureAction | undefined {
+/**
+ * Exported so `cache.ts` validates a disk value against the same enum. Two copies of the
+ * `'allow' | 'block'` literal pair is one copy too many: a widened enum that reached only one of
+ * them would mean the wire and the file disagreed about what fail-closed means.
+ */
+export function parseFailureAction(raw: unknown): FailureAction | undefined {
   return raw === "allow" || raw === "block" ? raw : undefined;
 }
 
@@ -77,8 +82,12 @@ export function parseToolsToCheck(raw: unknown): string[] | undefined {
   return raw.filter((entry): entry is string => typeof entry === "string");
 }
 
-/** A timestamp off a file another process wrote. Finite, non-negative, or it did not happen. */
-function parseTimestamp(raw: unknown): number | undefined {
+/**
+ * A timestamp off a file another process wrote. Finite, non-negative, or it did not happen.
+ * Exported with the two parsers above so `cache.ts` validates the same four snapshot fields the
+ * same way — the file and the wire must not diverge on what a usable value is.
+ */
+export function parseTimestamp(raw: unknown): number | undefined {
   return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : undefined;
 }
 

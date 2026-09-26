@@ -386,6 +386,10 @@ var PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"];
 var PATH_REQUIRED_TOOLS = ["read", "write", "edit"];
 var PATH_DEFAULTING = new Set(PATH_DEFAULTING_TOOLS);
 var PATH_REQUIRED = new Set(PATH_REQUIRED_TOOLS);
+var NATIVE_FILE_TOOLS = /* @__PURE__ */ new Set([
+  ...PATH_DEFAULTING_TOOLS,
+  ...PATH_REQUIRED_TOOLS
+]);
 function resolveFilePath(toolName, toolInput, cwd) {
   const isDefaulting = PATH_DEFAULTING.has(toolName);
   if (!isDefaulting && !PATH_REQUIRED.has(toolName)) return void 0;

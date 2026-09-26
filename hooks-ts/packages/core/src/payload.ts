@@ -23,6 +23,20 @@ const PATH_DEFAULTING: ReadonlySet<string> = new Set(PATH_DEFAULTING_TOOLS);
 const PATH_REQUIRED: ReadonlySet<string> = new Set(PATH_REQUIRED_TOOLS);
 
 /**
+ * The six tools the API evaluates on `metadata.file_path` rather than on a command —
+ * `PI_NATIVE_FILE_TOOLS` in `taxonomy.ts:137-144`, and the exact set `computeToolsToCheck`
+ * intersects against.
+ *
+ * Exported so `cache.ts` (RES-03's file-tool skip) imports the list instead of retyping it: a
+ * taxonomy change must not be able to drift between the payload builder and the skip decision, and
+ * a name in one place but not the other is either a skipped check or a redundant round trip.
+ */
+export const NATIVE_FILE_TOOLS: ReadonlySet<string> = new Set([
+  ...PATH_DEFAULTING_TOOLS,
+  ...PATH_REQUIRED_TOOLS,
+]);
+
+/**
  * `metadata.file_path` for a tool call, or `undefined` when the tool has no file semantics
  * (`bash`, `powershell`, any custom/MCP tool) — those are evaluated on `command`.
  */
