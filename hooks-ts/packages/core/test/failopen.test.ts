@@ -17,6 +17,8 @@ import {
   BREAKER_OPEN_NOTICE,
   ENGINE_UNAVAILABLE_REASON,
   ERRORS_PATH,
+  ERROR_CATEGORY_BLOCKED,
+  ERROR_CATEGORY_BYPASS,
   MAX_REASON_CHARS,
   PRETOOL_PATH,
 } from "../src/constants.ts";
@@ -430,8 +432,19 @@ test("RES-01 a remembered policy_check_failure_action of block turns a failure u
     assert.match(ENGINE_UNAVAILABLE_REASON, /policy engine unavailable/);
 
     // The enforcement outcome changed, but the failure still happened — so it is still reported.
+    // WR-03: reported as a BLOCK, not as a bypass. This case previously asserted only that a report
+    // happened, which let the mislabelling pass as intended behaviour.
     await sleep(60);
-    assert.equal(errorReports(api).length, 1, "the unavailable path reports the bypass too");
+    const reports = errorReports(api);
+    assert.equal(reports.length, 1, "the unavailable path reports the failure too");
+    const entry = (reports[0]?.body as { errors?: { message?: unknown; category?: unknown }[] })
+      .errors?.[0];
+    assert.equal(entry?.category, ERROR_CATEGORY_BLOCKED, "a block is filed as a block");
+    assert.notEqual(entry?.category, ERROR_CATEGORY_BYPASS, "and never as a bypass");
+    assert.ok(
+      String(entry?.message).startsWith("pi hook blocked_due_to_failure:"),
+      `the Sentry fingerprint carries the honest label: ${String(entry?.message)}`,
+    );
   } finally {
     await api.close();
   }

@@ -10,6 +10,19 @@
 //   2. **It cannot return anything but the four outcomes.** Every branch below ends in a
 //      `PolicyOutcome`; there is no undefined path, no rethrow, and no `null`.
 //
+// The precedence inside `checkTool`, in order, because this is where resilience and enforcement
+// disagree and every adapter depends on the answer:
+//
+//   1. **Revoked key** (WR-01) — an inactive session allows with zero HTTP, even for a fail-closed
+//      org. A rejected credential gives us no authority to decide anything.
+//   2. **Breaker** (WR-02) — an open breaker allows with zero HTTP, but only for a fail-OPEN org; a
+//      `block` org is exempt from the mechanism entirely (§F8).
+//   3. **The request.** A success clears both runs and may close the breaker (one notice).
+//   4. **The latch transition** — the second consecutive 401/403 notifies once, allows, and reports
+//      nothing.
+//   5. **Decide, then report** (WR-03) — the failure action is read before `reportBypass`, so a
+//      fail-closed block is filed as a block and not as a bypass.
+//
 // Pure composition on purpose: no pi import, no HTTP, no filesystem. That is what makes the
 // "client stubbed to raise synchronously" test possible, and it is what will let a future opencode
 // adapter reuse this file untouched.
@@ -27,7 +40,9 @@
 
 import { createBreaker } from "./breaker.ts";
 import type { Breaker } from "./breaker.ts";
-import { BREAKER_CLOSED_NOTICE, BREAKER_OPEN_NOTICE } from "./constants.ts";
+import { BREAKER_CLOSED_NOTICE, BREAKER_OPEN_NOTICE, KEY_REJECTED_NOTICE } from "./constants.ts";
+import { createKeyState } from "./keyState.ts";
+import type { KeyState } from "./keyState.ts";
 import { mapResponseToOutcome } from "./verdict.ts";
 import type { PolicyOutcome } from "./verdict.ts";
 import type { ApiClient } from "./client.ts";
@@ -76,6 +91,12 @@ export interface PolicyCheckerOptions {
    * composition root builds one checker per resolved base URL, the default is already per-base-URL.
    */
   breaker?: Breaker;
+  /**
+   * WR-01's revoked-key latch (`keyState.ts`). Optional with an internal default for the same reason
+   * as `breaker`; the composition root passes one explicitly so the **same** instance is shared with
+   * the telemetry reporter, which is the only way "no further HTTP" can include `/v1/hooks/errors`.
+   */
+  keyState?: KeyState;
   /** Injectable clock, so a TTL test drives 300 s in milliseconds. Defaults to `Date.now`. */
   now?: () => number;
 }
@@ -90,8 +111,10 @@ function notify(hooks: CheckHooks | undefined, message: string, level: "info" | 
 }
 
 export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
-  // One breaker per checker, built once — a per-call breaker would never accumulate a failure run.
+  // One breaker and one latch per checker, built once — per-call instances would never accumulate a
+  // failure run, which is the only thing either of them measures.
   const breaker = opts.breaker ?? createBreaker({ now: opts.now });
+  const keyState = opts.keyState ?? createKeyState();
 
   async function checkTool(
     payload: PretoolRequestBody,
@@ -99,19 +122,25 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
     hooks?: CheckHooks,
   ): Promise<PolicyOutcome> {
     try {
+      // 1. A rejected key first, before anything else. We have no authority to decide, and the
+      //    endpoint would only 401 again — so no request, no report, and never a block (WR-01).
+      if (keyState.isInactive()) return { kind: "allow" };
+
       // Read once, before the call, and use the same answer for both breaker decisions: an org that
       // opted out of fail-open is exempt from the breaker entirely (§F8). Skipping its request and
       // allowing would invert the contract it paid for, and skipping-and-blocking for 60 s would
       // brick the session — so it keeps getting real attempts, and a real `unavailable`.
       const breakerApplies = opts.state.getFailureAction() !== "block";
 
-      // Before any fetch: an open breaker means no HTTP and no telemetry — the bypass was already
-      // reported, and notified, when it opened.
+      // 2. Before any fetch: an open breaker means no HTTP and no telemetry — the bypass was already
+      //    reported, and notified, when it opened.
       if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
 
       const res = await opts.client.postPretool(payload);
 
       if (res.ok) {
+        // 3. A success ends both runs: the key works and the gateway answers.
+        keyState.recordSuccess();
         if (breakerApplies) {
           const closed = breaker.recordSuccess();
           if (closed !== undefined) notify(hooks, BREAKER_CLOSED_NOTICE, "info");
@@ -134,19 +163,35 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
         if (opened !== undefined) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
       }
 
-      // Fail-open, but never silently: the bypass is the audit trail for an accepted risk
-      // (T-08-08). Synchronous and unawaited by contract, so a broken errors endpoint cannot
-      // slow down or change this decision.
+      // 4. A second consecutive rejection ends the session's enforcement. Return allow BEFORE
+      //    consulting the failure action — the latch outranks fail-closed, because a credential
+      //    problem must not become an outage — and report nothing, since the errors endpoint uses
+      //    the same rejected key (§F9).
+      const latched = keyState.recordFailure(res.errorClass);
+      if (latched !== undefined) {
+        notify(hooks, KEY_REJECTED_NOTICE, "warning");
+        return { kind: "allow" };
+      }
+
+      // 5. Decide FIRST, then report (WR-03). A fail-closed org's call was blocked, not bypassed,
+      //    and `message.slice(0,100)` is the Sentry fingerprint — so reporting before deciding filed
+      //    every fail-closed block under the "enforcement was silently skipped" alert.
+      //
+      // The single exception to fail-open: an org that opted out of it via a previously seen
+      // `policy_check_failure_action: 'block'`. With nothing remembered — a cold start — a failure
+      // allows, matching the Python hook (RESEARCH Open Question 4, deliberate).
+      const blocked = opts.state.getFailureAction() === "block";
+
+      // The bypass is the audit trail for an accepted risk (T-08-08). Synchronous and unawaited by
+      // contract, so a broken errors endpoint cannot slow down or change this decision.
       opts.telemetry.reportBypass({
         errorClass: res.errorClass,
         toolName,
         elapsedMs: res.elapsedMs,
+        blocked,
       });
 
-      // The single exception to fail-open: an org that opted out of it via a previously seen
-      // `policy_check_failure_action: 'block'`. With nothing remembered — a cold start — a failure
-      // allows, matching the Python hook (RESEARCH Open Question 4, deliberate).
-      return opts.state.getFailureAction() === "block" ? { kind: "unavailable" } : { kind: "allow" };
+      return blocked ? { kind: "unavailable" } : { kind: "allow" };
     } catch {
       // Unreachable through `createApiClient`, which never rejects — but an injected or future
       // client could, and this is the last net before pi turns an exception into a block.

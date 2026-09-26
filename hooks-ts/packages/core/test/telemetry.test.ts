@@ -10,7 +10,13 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createApiClient } from "../src/client.ts";
-import { ERRORS_PATH, ERROR_CATEGORY_BYPASS, ERROR_REPORT_INTERVAL_MS } from "../src/constants.ts";
+import {
+  ERRORS_PATH,
+  ERROR_CATEGORY_BLOCKED,
+  ERROR_CATEGORY_BYPASS,
+  ERROR_REPORT_INTERVAL_MS,
+} from "../src/constants.ts";
+import { createKeyState } from "../src/keyState.ts";
 import { createPolicyState } from "../src/policyState.ts";
 import { createTelemetry } from "../src/telemetry.ts";
 import type { BypassContext } from "../src/telemetry.ts";
@@ -29,7 +35,12 @@ interface Harness {
 }
 
 async function harness(
-  opts: { errorsMode?: MockErrorsMode; apiKey?: string | undefined; intervalMs?: number } = {},
+  opts: {
+    errorsMode?: MockErrorsMode;
+    apiKey?: string | undefined;
+    intervalMs?: number;
+    isInactive?: () => boolean;
+  } = {},
 ): Promise<Harness> {
   const api = await startMockApi({ mode: "errors", errorsMode: opts.errorsMode ?? "ok" });
   const apiKey = "apiKey" in opts ? opts.apiKey : TEST_KEY;
@@ -44,6 +55,7 @@ async function harness(
     apiKey,
     now: () => clockMs,
     intervalMs: opts.intervalMs ?? ERROR_REPORT_INTERVAL_MS,
+    isInactive: opts.isInactive,
   });
   return {
     api,
@@ -67,7 +79,21 @@ async function settle(h: Harness, count: number, timeoutMs = 800): Promise<Captu
 }
 
 function bypass(overrides: Partial<BypassContext> = {}): BypassContext {
-  return { errorClass: "TimeoutError", toolName: "bash", elapsedMs: 20_003, ...overrides };
+  // `blocked: false` is the fail-OPEN case — a genuine bypass. WR-03's counterpart is `blocked: true`.
+  return {
+    errorClass: "TimeoutError",
+    toolName: "bash",
+    elapsedMs: 20_003,
+    blocked: false,
+    ...overrides,
+  };
+}
+
+/** The one error entry a settled report produced. */
+function entryOf(request: CapturedRequest | undefined): { message: string; category: string } {
+  const body = request?.body as { errors?: { message?: unknown; category?: unknown }[] };
+  const entry = body?.errors?.[0];
+  return { message: String(entry?.message), category: String(entry?.category) };
 }
 
 test("RES-02 one bypass produces exactly one correctly-shaped report", async () => {
@@ -160,6 +186,7 @@ test("RES-02 the message never leaks the key, a Bearer token or the command", as
       errorClass: `Error Bearer sk-live-deadbeef key=${TEST_KEY}`,
       toolName: "bash",
       elapsedMs: 7,
+      blocked: false,
       command: "cat /etc/shadow",
     };
     h.telemetry.reportBypass(leaky);
@@ -217,6 +244,106 @@ test("RES-02 no API key means no report at all", async () => {
     h.telemetry.reportBypass(bypass());
     await sleep(60);
     assert.equal(h.errors().length, 0, "a keyless report would be a guaranteed 401");
+  } finally {
+    await h.close();
+  }
+});
+
+// --- WR-03: a block is not a bypass ------------------------------------------------------------
+//
+// `message.slice(0,100)` is the Sentry fingerprint (§B6), so filing a fail-CLOSED block under
+// `bypassed_due_to_failure` makes the "enforcement was silently skipped" alert fire for exactly the
+// customers who paid for fail-closed and got it. An incident responder then cannot tell the two
+// states apart. `category` is a free string server-side (`hookErrorHandler.ts:55-87`), so the honest
+// label costs no API change.
+
+test("WR-03 a fail-closed block is reported as blocked_due_to_failure", async () => {
+  const h = await harness();
+  try {
+    h.telemetry.reportBypass(bypass({ blocked: true, errorClass: "HttpStatus500" }));
+    const reports = await settle(h, 1);
+    assert.equal(reports.length, 1);
+
+    const { message, category } = entryOf(reports[0]);
+    assert.equal(category, ERROR_CATEGORY_BLOCKED);
+    assert.equal(category, "blocked_due_to_failure", "the literal the server will tag and fingerprint");
+    assert.ok(
+      message.startsWith("pi hook blocked_due_to_failure:"),
+      `the fingerprint window must carry the honest label: ${message}`,
+    );
+    assert.ok(message.endsWith("20003ms"), "and the elapsed-ms suffix is still strictly last");
+    assert.equal(
+      message.includes(ERROR_CATEGORY_BYPASS),
+      false,
+      "a block must not also read as a bypass",
+    );
+  } finally {
+    await h.close();
+  }
+});
+
+test("WR-03 a genuine fail-open bypass keeps bypassed_due_to_failure", async () => {
+  const h = await harness();
+  try {
+    h.telemetry.reportBypass(bypass({ blocked: false }));
+    const { message, category } = entryOf((await settle(h, 1))[0]);
+    assert.equal(category, ERROR_CATEGORY_BYPASS);
+    assert.ok(message.startsWith("pi hook bypassed_due_to_failure:"), message);
+    assert.ok(message.endsWith("20003ms"));
+  } finally {
+    await h.close();
+  }
+});
+
+test("WR-03 the 60 s window is shared, so a block cannot outrun the rate limiter", async () => {
+  const h = await harness();
+  try {
+    h.telemetry.reportBypass(bypass({ blocked: true }));
+    h.setClock(START_MS + 30_000);
+    h.telemetry.reportBypass(bypass({ blocked: false }));
+    assert.equal((await settle(h, 1)).length, 1, "one report per window across both categories");
+
+    h.setClock(START_MS + 60_001);
+    h.telemetry.reportBypass(bypass({ blocked: true }));
+    assert.equal((await settle(h, 2)).length, 2, "and the window still reopens");
+  } finally {
+    await h.close();
+  }
+});
+
+test("WR-03 the blocked category is redacted exactly like the bypass one", async () => {
+  const h = await harness();
+  try {
+    h.telemetry.reportBypass(
+      bypass({ blocked: true, errorClass: `Error Bearer sk-live-deadbeef key=${TEST_KEY}` }),
+    );
+    const raw = JSON.stringify((await settle(h, 1))[0]?.body);
+    assert.equal(raw.includes(TEST_KEY), false, "the literal API key is redacted");
+    assert.equal(raw.includes("sk-live-deadbeef"), false, "the Bearer token is redacted");
+    assert.ok(raw.includes("blocked_due_to_failure"), "while the category survives");
+  } finally {
+    await h.close();
+  }
+});
+
+test("WR-01 an inactive session reports nothing at all", async () => {
+  // The latch and the reporter share one keyState in the composition root. This is the reporter's
+  // half: `/v1/hooks/errors` authenticates with the same rejected key, so a report is pointless.
+  const keyState = createKeyState();
+  const h = await harness({ isInactive: () => keyState.isInactive() });
+  try {
+    h.telemetry.reportBypass(bypass());
+    assert.equal((await settle(h, 1)).length, 1, "active: reported");
+
+    keyState.recordFailure("HttpStatus401");
+    keyState.recordFailure("HttpStatus401");
+    assert.equal(keyState.isInactive(), true);
+
+    h.setClock(START_MS + 120_000); // well outside the rate-limit window
+    h.telemetry.reportBypass(bypass());
+    h.telemetry.reportBypass(bypass({ blocked: true }));
+    await sleep(80);
+    assert.equal(h.errors().length, 1, "inactive: not one further request");
   } finally {
     await h.close();
   }

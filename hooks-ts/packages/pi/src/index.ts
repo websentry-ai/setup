@@ -26,9 +26,12 @@ import { homedir } from "node:os";
 
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
+import { createBreaker } from "../../core/src/breaker.ts";
+import { keyFingerprint, readCache, resolveCachePath, writeCache } from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
 import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
 import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
+import { keyState } from "../../core/src/keyState.ts";
 import { resolveClientEntrypoint } from "../../core/src/piVersion.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
@@ -53,14 +56,73 @@ interface Resolved {
   checker: PolicyChecker | undefined;
 }
 
-/** The real composition: one client shared by the policy path and the bypass reporter. */
-function defaultMakeChecker(apiKey: string, baseUrl: string): PolicyChecker {
+/**
+ * The real composition, and the only place Wave 1's and Wave 2's core mechanisms become reachable
+ * from a running extension:
+ *
+ *   * one client, shared by the policy path and the bypass reporter;
+ *   * **one breaker per checker**, i.e. per resolved base URL, so a `UNBOUND_GATEWAY_URL` change (or
+ *     a `/reload`) starts clean and one gateway's outage never suppresses another's;
+ *   * the **module-scope** `keyState`, handed to both the checker and the reporter — sharing one
+ *     instance is the whole point, because "no further HTTP" has to include `/v1/hooks/errors`, which
+ *     authenticates with the same rejected key (§F9);
+ *   * `onSync` bound to the resolved cache path and identity, so a successful check persists the
+ *     policy snapshot for the next session (RES-03).
+ *
+ * Exported so `compose.test.ts` can assert the per-base-URL breaker directly. `env` / `homeDir`
+ * default to values that make `resolveCachePath` refuse, i.e. no cache rather than a cache in the
+ * wrong place.
+ */
+export function defaultMakeChecker(
+  apiKey: string,
+  baseUrl: string,
+  env: NodeJS.ProcessEnv = {},
+  homeDir = "",
+): PolicyChecker {
   const client = createApiClient({ baseUrl, apiKey });
+  const cachePath = resolveCachePath(env, homeDir);
+  const fingerprint = keyFingerprint(apiKey);
   return createPolicyChecker({
     client,
     state: policyState,
-    telemetry: createTelemetry({ client, apiKey }),
+    telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+    breaker: createBreaker({ now: Date.now }),
+    keyState,
+    onSync:
+      cachePath === undefined
+        ? undefined
+        : (snapshot) => {
+            // Total by contract: `writeCache` returns false rather than throwing, and `policy.ts`
+            // wraps this call anyway — a cache that could not be written is a round trip next
+            // session, never a failed tool call.
+            void writeCache(cachePath, {
+              ...snapshot,
+              gateway_url: baseUrl,
+              key_fingerprint: fingerprint,
+            });
+          },
   });
+}
+
+/**
+ * Warm the in-memory state from disk (RES-03). A missing, unreadable or foreign-identity file is a
+ * cold start, never an error — and `policyState.hydrate` refuses to downgrade anything already
+ * learned over the network, which is what caps what a planted cache can do (T-09-01/T-09-02).
+ */
+function hydrateFromCache(
+  apiKey: string,
+  baseUrl: string,
+  env: NodeJS.ProcessEnv,
+  homeDir: string,
+): void {
+  try {
+    const cachePath = resolveCachePath(env, homeDir);
+    if (cachePath === undefined) return;
+    const onDisk = readCache(cachePath, { gatewayUrl: baseUrl, fingerprint: keyFingerprint(apiKey) });
+    if (onDisk !== undefined) policyState.hydrate(onDisk);
+  } catch {
+    // Every call above is already total; this is the belt to their braces.
+  }
 }
 
 function safeHomeDir(): string {
@@ -72,10 +134,15 @@ function safeHomeDir(): string {
 }
 
 export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory {
+  const env = overrides.env ?? process.env;
+  const homeDir = overrides.homeDir ?? safeHomeDir();
   const deps: Deps = {
-    env: overrides.env ?? process.env,
-    homeDir: overrides.homeDir ?? safeHomeDir(),
-    makeChecker: overrides.makeChecker ?? defaultMakeChecker,
+    env,
+    homeDir,
+    // The cache path is resolved from the same env/home pair the key came from, so a test with a
+    // temp HOME cannot accidentally read or write the developer's real cache.
+    makeChecker:
+      overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
     entrypoint: overrides.entrypoint,
   };
 
@@ -90,13 +157,19 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
   function init(): Resolved {
     if (resolved === undefined) {
       const apiKey = resolveApiKey(deps.env, deps.homeDir);
+      // One resolution, used for the cache identity, the hydrate and the checker — three call sites
+      // that must not be able to disagree, since the base URL is half the cache key (WR-09).
+      const baseUrl = apiKey === undefined ? undefined : resolveGatewayUrl(deps.env, deps.homeDir);
+      if (apiKey !== undefined && baseUrl !== undefined) {
+        hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
+      }
       resolved = {
         apiKey,
         entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
         checker:
-          apiKey === undefined
+          apiKey === undefined || baseUrl === undefined
             ? undefined
-            : deps.makeChecker(apiKey, resolveGatewayUrl(deps.env, deps.homeDir)),
+            : deps.makeChecker(apiKey, baseUrl),
       };
     }
     return resolved;

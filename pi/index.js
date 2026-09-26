@@ -24,6 +24,11 @@ var ENV_PI_INSTALL_ROOT = "PI_MANAGED_INSTALL_ROOT";
 var DEFAULT_GATEWAY_URL = "https://api.getunbound.ai";
 var CONFIG_DIR_NAME = ".unbound";
 var CONFIG_FILE_NAME = "config.json";
+var CACHE_DIR_NAME = ".unbound";
+var CACHE_FILE_NAME = "policy_cache.json";
+var PI_AGENT_DIR_SEGMENTS = [".pi", "agent"];
+var ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
+var KEY_FINGERPRINT_PREFIX = "sha256:";
 var APP_LABEL = "pi";
 var HOOK_SOURCE = "pi";
 var EVENT_NAME_TOOL_USE = "tool_use";
@@ -34,6 +39,8 @@ var ERRORS_TIMEOUT_MS = 1e4;
 var CONFIRM_TIMEOUT_MS = 12e4;
 var ERROR_REPORT_INTERVAL_MS = 6e4;
 var ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
+var ERROR_CATEGORY_BLOCKED = "blocked_due_to_failure";
+var KEY_REJECTION_THRESHOLD = 2;
 var BREAKER_FAILURE_THRESHOLD = 3;
 var BREAKER_OPEN_MS = 6e4;
 var MAX_REASON_CHARS = 2e3;
@@ -49,183 +56,7 @@ var ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable \u2014 please
 var NO_KEY_NOTICE = "Unbound: no API key found \u2014 extension inactive";
 var BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable \u2014 allowing tool calls for 60 s";
 var BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again \u2014 enforcement resumed";
-
-// packages/core/src/client.ts
-var MAX_ERRORS_PER_REQUEST = 10;
-var MAX_ERROR_CLASS_CHARS = 40;
-function classifyError(err) {
-  let candidate = "";
-  try {
-    const record = err;
-    const name = typeof record?.name === "string" ? record.name : "";
-    const code = typeof record?.cause?.code === "string" ? record.cause.code : "";
-    candidate = name === "TypeError" && code !== "" ? code : name !== "" ? name : code;
-  } catch {
-    candidate = "";
-  }
-  const token = candidate.replace(/[^A-Za-z0-9_]/g, "");
-  return token.length > 0 ? token.slice(0, MAX_ERROR_CLASS_CHARS) : "Error";
-}
-function createApiClient(opts) {
-  const timeoutMs = opts.timeoutMs ?? PRETOOL_TIMEOUT_MS;
-  const errorsTimeoutMs = opts.errorsTimeoutMs ?? ERRORS_TIMEOUT_MS;
-  const resolveFetch = () => opts.fetchImpl ?? globalThis.fetch;
-  const headers = () => ({
-    "content-type": "application/json",
-    authorization: `Bearer ${opts.apiKey}`
-  });
-  async function postPretool(payload) {
-    const startedAt = Date.now();
-    const elapsed = () => Date.now() - startedAt;
-    try {
-      const res = await resolveFetch()(`${opts.baseUrl}${PRETOOL_PATH}`, {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(timeoutMs),
-        redirect: "error"
-      });
-      if (!res.ok) {
-        return { ok: false, errorClass: `HttpStatus${res.status}`, elapsedMs: elapsed() };
-      }
-      let parsed;
-      try {
-        parsed = await res.json();
-      } catch {
-        return { ok: false, errorClass: "MalformedJson", elapsedMs: elapsed() };
-      }
-      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-        return { ok: false, errorClass: "MalformedJson", elapsedMs: elapsed() };
-      }
-      return { ok: true, body: parsed, elapsedMs: elapsed() };
-    } catch (err) {
-      return { ok: false, errorClass: classifyError(err), elapsedMs: elapsed() };
-    }
-  }
-  async function postHookErrors(body) {
-    try {
-      const capped = {
-        ...body,
-        errors: body.errors.slice(0, MAX_ERRORS_PER_REQUEST)
-      };
-      const res = await resolveFetch()(`${opts.baseUrl}${ERRORS_PATH}`, {
-        method: "POST",
-        headers: headers(),
-        body: JSON.stringify(capped),
-        signal: AbortSignal.timeout(errorsTimeoutMs),
-        redirect: "error"
-      });
-      return res.ok;
-    } catch {
-      return false;
-    }
-  }
-  return { postPretool, postHookErrors };
-}
-
-// packages/core/src/config.ts
-import { readFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
-var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
-function readUnboundConfig(homeDir) {
-  if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute(homeDir)) return {};
-  try {
-    const raw = readFileSync(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
-    const parsed = JSON.parse(raw);
-    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed;
-  } catch {
-    return {};
-  }
-}
-function usableString(candidate) {
-  if (typeof candidate !== "string") return void 0;
-  const trimmed = candidate.trim();
-  return trimmed.length > 0 ? trimmed : void 0;
-}
-function resolveApiKey(env, homeDir) {
-  const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
-  if (fromEnv !== void 0) return fromEnv;
-  return usableString(readUnboundConfig(homeDir).api_key);
-}
-function normalizeGatewayUrl(raw) {
-  const candidate = usableString(raw);
-  if (candidate === void 0) return void 0;
-  try {
-    const url = new URL(candidate);
-    const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
-    if (url.protocol !== "https:" && !isLoopbackHttp) return void 0;
-    if (url.username !== "" || url.password !== "") return void 0;
-    const path = url.pathname.replace(/\/+$/, "");
-    return path === "" ? url.origin : url.origin + path;
-  } catch {
-    return void 0;
-  }
-}
-function resolveGatewayUrl(env, homeDir) {
-  const fromEnv = normalizeGatewayUrl(env[ENV_GATEWAY_URL]);
-  if (fromEnv !== void 0) return fromEnv;
-  const fromFile = normalizeGatewayUrl(readUnboundConfig(homeDir).gateway_url);
-  return fromFile ?? DEFAULT_GATEWAY_URL;
-}
-function redactSecrets(text, apiKey) {
-  let out = text.replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]");
-  if (apiKey !== void 0 && apiKey.length >= 8) {
-    out = out.split(apiKey).join("[REDACTED]");
-  }
-  return out;
-}
-
-// packages/core/src/piVersion.ts
-import { readFileSync as readFileSync2 } from "node:fs";
-import { dirname, join as join2 } from "node:path";
-var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
-var MAX_WALK_UP_LEVELS = 8;
-var MAX_VERSION_CHARS = 32;
-function readManagedInstallVersion(env) {
-  const root = env[ENV_PI_INSTALL_ROOT];
-  if (typeof root !== "string" || root.length === 0) return void 0;
-  try {
-    const version = readFileSync2(join2(root, "current-version"), "utf8").trim();
-    return version.length > 0 ? version : void 0;
-  } catch {
-    return void 0;
-  }
-}
-function readVersionFromArgv(argv1) {
-  if (typeof argv1 !== "string" || argv1.length === 0) return void 0;
-  let dir = dirname(argv1);
-  for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
-    try {
-      const parsed = JSON.parse(readFileSync2(join2(dir, "package.json"), "utf8"));
-      if (parsed !== null && typeof parsed === "object") {
-        const pkg = parsed;
-        if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
-          return pkg.version;
-        }
-      }
-    } catch {
-    }
-    const parent = dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return void 0;
-}
-function sanitizeVersion(version) {
-  const cleaned = version.replace(/[^A-Za-z0-9._+-]/g, "").slice(0, MAX_VERSION_CHARS);
-  return cleaned.length > 0 ? cleaned : "unknown";
-}
-function resolveClientEntrypoint(env, argv1) {
-  let version = "unknown";
-  try {
-    const found = readManagedInstallVersion(env) ?? readVersionFromArgv(argv1);
-    if (found !== void 0) version = sanitizeVersion(found);
-  } catch {
-    version = "unknown";
-  }
-  return `pi/${version}`;
-}
+var KEY_REJECTED_NOTICE = "Unbound: API key rejected \u2014 enforcement inactive";
 
 // packages/core/src/breaker.ts
 function createBreaker(opts = {}) {
@@ -267,79 +98,10 @@ function createBreaker(opts = {}) {
   };
 }
 
-// packages/core/src/verdict.ts
-var CONTROL_CHARS = new RegExp(
-  "[\\x00-\\x09\\x0b-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
-  "g"
-);
-var UNICODE_LINE_SEPARATORS = new RegExp("[\\u2028\\u2029]", "g");
-function parseDecision(raw) {
-  if (raw === "allow" || raw === "deny" || raw === "ask" || raw === "approval_required") {
-    return raw;
-  }
-  return void 0;
-}
-function sanitizeReason(raw) {
-  if (typeof raw !== "string") return void 0;
-  const stripped = raw.replace(CONTROL_CHARS, "").replace(UNICODE_LINE_SEPARATORS, " ");
-  if (stripped.length === 0) return void 0;
-  return stripped.length > MAX_REASON_CHARS ? stripped.slice(0, MAX_REASON_CHARS) : stripped;
-}
-function mapResponseToOutcome(body) {
-  if (body === null || typeof body !== "object") return { kind: "allow" };
-  const record = body;
-  const decision = parseDecision(record["decision"]);
-  if (decision === "deny") return { kind: "deny", reason: sanitizeReason(record["reason"]) };
-  if (decision === "ask" || decision === "approval_required") {
-    return { kind: "confirm", reason: sanitizeReason(record["reason"]) };
-  }
-  return { kind: "allow" };
-}
-
-// packages/core/src/policy.ts
-function notify(hooks, message, level) {
-  try {
-    hooks?.notify?.(message, level);
-  } catch {
-  }
-}
-function createPolicyChecker(opts) {
-  const breaker = opts.breaker ?? createBreaker({ now: opts.now });
-  async function checkTool(payload, toolName, hooks) {
-    try {
-      const breakerApplies = opts.state.getFailureAction() !== "block";
-      if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
-      const res = await opts.client.postPretool(payload);
-      if (res.ok) {
-        if (breakerApplies) {
-          const closed = breaker.recordSuccess();
-          if (closed !== void 0) notify(hooks, BREAKER_CLOSED_NOTICE, "info");
-        }
-        opts.state.recordSuccess(res.body, (opts.now ?? Date.now)());
-        if (opts.onSync !== void 0) {
-          try {
-            opts.onSync(opts.state.snapshot());
-          } catch {
-          }
-        }
-        return mapResponseToOutcome(res.body);
-      }
-      if (breakerApplies) {
-        const opened = breaker.recordFailure();
-        if (opened !== void 0) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
-      }
-      opts.telemetry.reportBypass({
-        errorClass: res.errorClass,
-        toolName,
-        elapsedMs: res.elapsedMs
-      });
-      return opts.state.getFailureAction() === "block" ? { kind: "unavailable" } : { kind: "allow" };
-    } catch {
-      return { kind: "allow" };
-    }
-  }
-  return { checkTool };
-}
+// packages/core/src/cache.ts
+import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { dirname, isAbsolute, join } from "node:path";
 
 // packages/core/src/policyState.ts
 function parseFailureAction(raw) {
@@ -414,41 +176,6 @@ function createPolicyState() {
   };
 }
 var policyState = createPolicyState();
-
-// packages/core/src/telemetry.ts
-function createTelemetry(opts) {
-  const now = opts.now ?? Date.now;
-  const intervalMs = opts.intervalMs ?? ERROR_REPORT_INTERVAL_MS;
-  let lastReportAtMs;
-  let reporting = false;
-  function reportBypass(ctx) {
-    try {
-      const apiKey = opts.apiKey;
-      if (apiKey === void 0 || apiKey === "") return;
-      if (reporting) return;
-      const at = now();
-      if (lastReportAtMs !== void 0 && at - lastReportAtMs < intervalMs) return;
-      lastReportAtMs = at;
-      reporting = true;
-      const message = redactSecrets(
-        `pi hook ${ERROR_CATEGORY_BYPASS}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
-        apiKey
-      );
-      const body = {
-        errors: [
-          { message, timestamp: new Date(at).toISOString(), category: ERROR_CATEGORY_BYPASS }
-        ],
-        hook_source: HOOK_SOURCE
-      };
-      void opts.client.postHookErrors(body).catch(() => false).finally(() => {
-        reporting = false;
-      });
-    } catch {
-      reporting = false;
-    }
-  }
-  return { reportBypass };
-}
 
 // packages/core/src/payload.ts
 var PATH_DEFAULTING_TOOLS = ["grep", "find", "ls"];
@@ -533,6 +260,419 @@ function buildPretoolPayload(input) {
   };
 }
 
+// packages/core/src/cache.ts
+function expandTilde(raw, homeDir) {
+  if (typeof raw !== "string") return void 0;
+  const trimmed = raw.trim();
+  if (trimmed.length === 0) return void 0;
+  if (trimmed === "~") return homeDir;
+  if (trimmed.startsWith("~/")) return join(homeDir, trimmed.slice(2));
+  return trimmed;
+}
+function resolveCachePath(env, homeDir) {
+  let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
+  if (base === void 0 || !isAbsolute(base)) {
+    if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return void 0;
+    base = join(homeDir, ...PI_AGENT_DIR_SEGMENTS);
+  }
+  if (!isAbsolute(base)) return void 0;
+  return join(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
+}
+function keyFingerprint(apiKey) {
+  const material = typeof apiKey === "string" ? apiKey : "";
+  return KEY_FINGERPRINT_PREFIX + createHash("sha256").update(material, "utf8").digest("hex").slice(0, 16);
+}
+function readCache(path, identity) {
+  let raw;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return void 0;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return void 0;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return void 0;
+  const body = parsed;
+  const gatewayUrl = body.gateway_url;
+  const fingerprint = body.key_fingerprint;
+  if (typeof gatewayUrl !== "string" || gatewayUrl !== identity?.gatewayUrl) return void 0;
+  if (typeof fingerprint !== "string" || fingerprint !== identity?.fingerprint) return void 0;
+  const out = { gateway_url: gatewayUrl, key_fingerprint: fingerprint };
+  const fetchedAt = parseTimestamp(body.fetched_at);
+  if (fetchedAt !== void 0) out.fetched_at = fetchedAt;
+  const action = parseFailureAction(body.policy_check_failure_action);
+  if (action !== void 0) out.policy_check_failure_action = action;
+  const tools = parseToolsToCheck(body.tools_to_check);
+  const syncedAt = parseTimestamp(body.tools_synced_at);
+  if (tools !== void 0 && syncedAt !== void 0) {
+    out.tools_to_check = tools;
+    out.tools_synced_at = syncedAt;
+  }
+  return out;
+}
+function writeCache(path, value) {
+  let tmp;
+  try {
+    const dir = dirname(path);
+    mkdirSync(dir, { recursive: true, mode: 448 });
+    try {
+      chmodSync(dir, 448);
+    } catch {
+    }
+    tmp = `${path}.tmp-${process.pid}-${randomBytes(6).toString("hex")}`;
+    writeFileSync(tmp, JSON.stringify(value), { encoding: "utf8", mode: 384 });
+    try {
+      chmodSync(tmp, 384);
+    } catch {
+    }
+    try {
+      renameSync(tmp, path);
+    } catch {
+      try {
+        unlinkSync(path);
+      } catch {
+      }
+      renameSync(tmp, path);
+    }
+    return true;
+  } catch {
+    if (tmp !== void 0) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+      }
+    }
+    return false;
+  }
+}
+
+// packages/core/src/client.ts
+var MAX_ERRORS_PER_REQUEST = 10;
+var MAX_ERROR_CLASS_CHARS = 40;
+function classifyError(err) {
+  let candidate = "";
+  try {
+    const record = err;
+    const name = typeof record?.name === "string" ? record.name : "";
+    const code = typeof record?.cause?.code === "string" ? record.cause.code : "";
+    candidate = name === "TypeError" && code !== "" ? code : name !== "" ? name : code;
+  } catch {
+    candidate = "";
+  }
+  const token = candidate.replace(/[^A-Za-z0-9_]/g, "");
+  return token.length > 0 ? token.slice(0, MAX_ERROR_CLASS_CHARS) : "Error";
+}
+function createApiClient(opts) {
+  const timeoutMs = opts.timeoutMs ?? PRETOOL_TIMEOUT_MS;
+  const errorsTimeoutMs = opts.errorsTimeoutMs ?? ERRORS_TIMEOUT_MS;
+  const resolveFetch = () => opts.fetchImpl ?? globalThis.fetch;
+  const headers = () => ({
+    "content-type": "application/json",
+    authorization: `Bearer ${opts.apiKey}`
+  });
+  async function postPretool(payload) {
+    const startedAt = Date.now();
+    const elapsed = () => Date.now() - startedAt;
+    try {
+      const res = await resolveFetch()(`${opts.baseUrl}${PRETOOL_PATH}`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(timeoutMs),
+        redirect: "error"
+      });
+      if (!res.ok) {
+        return { ok: false, errorClass: `HttpStatus${res.status}`, elapsedMs: elapsed() };
+      }
+      let parsed;
+      try {
+        parsed = await res.json();
+      } catch {
+        return { ok: false, errorClass: "MalformedJson", elapsedMs: elapsed() };
+      }
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return { ok: false, errorClass: "MalformedJson", elapsedMs: elapsed() };
+      }
+      return { ok: true, body: parsed, elapsedMs: elapsed() };
+    } catch (err) {
+      return { ok: false, errorClass: classifyError(err), elapsedMs: elapsed() };
+    }
+  }
+  async function postHookErrors(body) {
+    try {
+      const capped = {
+        ...body,
+        errors: body.errors.slice(0, MAX_ERRORS_PER_REQUEST)
+      };
+      const res = await resolveFetch()(`${opts.baseUrl}${ERRORS_PATH}`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify(capped),
+        signal: AbortSignal.timeout(errorsTimeoutMs),
+        redirect: "error"
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+  return { postPretool, postHookErrors };
+}
+
+// packages/core/src/config.ts
+import { readFileSync as readFileSync2 } from "node:fs";
+import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
+var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
+function readUnboundConfig(homeDir) {
+  if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute2(homeDir)) return {};
+  try {
+    const raw = readFileSync2(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
+    const parsed = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return parsed;
+  } catch {
+    return {};
+  }
+}
+function usableString(candidate) {
+  if (typeof candidate !== "string") return void 0;
+  const trimmed = candidate.trim();
+  return trimmed.length > 0 ? trimmed : void 0;
+}
+function resolveApiKey(env, homeDir) {
+  const fromEnv = usableString(env[ENV_API_KEY_PI]) ?? usableString(env[ENV_API_KEY_GENERIC]);
+  if (fromEnv !== void 0) return fromEnv;
+  return usableString(readUnboundConfig(homeDir).api_key);
+}
+function normalizeGatewayUrl(raw) {
+  const candidate = usableString(raw);
+  if (candidate === void 0) return void 0;
+  try {
+    const url = new URL(candidate);
+    const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
+    if (url.protocol !== "https:" && !isLoopbackHttp) return void 0;
+    if (url.username !== "" || url.password !== "") return void 0;
+    const path = url.pathname.replace(/\/+$/, "");
+    return path === "" ? url.origin : url.origin + path;
+  } catch {
+    return void 0;
+  }
+}
+function resolveGatewayUrl(env, homeDir) {
+  const fromEnv = normalizeGatewayUrl(env[ENV_GATEWAY_URL]);
+  if (fromEnv !== void 0) return fromEnv;
+  const fromFile = normalizeGatewayUrl(readUnboundConfig(homeDir).gateway_url);
+  return fromFile ?? DEFAULT_GATEWAY_URL;
+}
+function redactSecrets(text, apiKey) {
+  let out = text.replace(/\bBearer\s+\S+/gi, "Bearer [REDACTED]");
+  if (apiKey !== void 0 && apiKey.length >= 8) {
+    out = out.split(apiKey).join("[REDACTED]");
+  }
+  return out;
+}
+
+// packages/core/src/keyState.ts
+var REJECTION_LABELS = /* @__PURE__ */ new Set(["HttpStatus401", "HttpStatus403"]);
+function createKeyState(opts = {}) {
+  const threshold = typeof opts.threshold === "number" && opts.threshold > 0 ? opts.threshold : KEY_REJECTION_THRESHOLD;
+  let consecutiveRejections = 0;
+  let inactive = false;
+  return {
+    recordFailure(errorClass) {
+      if (inactive) return void 0;
+      if (typeof errorClass !== "string" || !REJECTION_LABELS.has(errorClass)) {
+        consecutiveRejections = 0;
+        return void 0;
+      }
+      consecutiveRejections += 1;
+      if (consecutiveRejections < threshold) return void 0;
+      inactive = true;
+      return "inactive";
+    },
+    recordSuccess() {
+      if (inactive) return;
+      consecutiveRejections = 0;
+    },
+    isInactive: () => inactive
+  };
+}
+var keyState = createKeyState();
+
+// packages/core/src/piVersion.ts
+import { readFileSync as readFileSync3 } from "node:fs";
+import { dirname as dirname2, join as join3 } from "node:path";
+var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
+var MAX_WALK_UP_LEVELS = 8;
+var MAX_VERSION_CHARS = 32;
+function readManagedInstallVersion(env) {
+  const root = env[ENV_PI_INSTALL_ROOT];
+  if (typeof root !== "string" || root.length === 0) return void 0;
+  try {
+    const version = readFileSync3(join3(root, "current-version"), "utf8").trim();
+    return version.length > 0 ? version : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function readVersionFromArgv(argv1) {
+  if (typeof argv1 !== "string" || argv1.length === 0) return void 0;
+  let dir = dirname2(argv1);
+  for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
+    try {
+      const parsed = JSON.parse(readFileSync3(join3(dir, "package.json"), "utf8"));
+      if (parsed !== null && typeof parsed === "object") {
+        const pkg = parsed;
+        if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
+          return pkg.version;
+        }
+      }
+    } catch {
+    }
+    const parent = dirname2(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return void 0;
+}
+function sanitizeVersion(version) {
+  const cleaned = version.replace(/[^A-Za-z0-9._+-]/g, "").slice(0, MAX_VERSION_CHARS);
+  return cleaned.length > 0 ? cleaned : "unknown";
+}
+function resolveClientEntrypoint(env, argv1) {
+  let version = "unknown";
+  try {
+    const found = readManagedInstallVersion(env) ?? readVersionFromArgv(argv1);
+    if (found !== void 0) version = sanitizeVersion(found);
+  } catch {
+    version = "unknown";
+  }
+  return `pi/${version}`;
+}
+
+// packages/core/src/verdict.ts
+var CONTROL_CHARS = new RegExp(
+  "[\\x00-\\x09\\x0b-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+  "g"
+);
+var UNICODE_LINE_SEPARATORS = new RegExp("[\\u2028\\u2029]", "g");
+function parseDecision(raw) {
+  if (raw === "allow" || raw === "deny" || raw === "ask" || raw === "approval_required") {
+    return raw;
+  }
+  return void 0;
+}
+function sanitizeReason(raw) {
+  if (typeof raw !== "string") return void 0;
+  const stripped = raw.replace(CONTROL_CHARS, "").replace(UNICODE_LINE_SEPARATORS, " ");
+  if (stripped.length === 0) return void 0;
+  return stripped.length > MAX_REASON_CHARS ? stripped.slice(0, MAX_REASON_CHARS) : stripped;
+}
+function mapResponseToOutcome(body) {
+  if (body === null || typeof body !== "object") return { kind: "allow" };
+  const record = body;
+  const decision = parseDecision(record["decision"]);
+  if (decision === "deny") return { kind: "deny", reason: sanitizeReason(record["reason"]) };
+  if (decision === "ask" || decision === "approval_required") {
+    return { kind: "confirm", reason: sanitizeReason(record["reason"]) };
+  }
+  return { kind: "allow" };
+}
+
+// packages/core/src/policy.ts
+function notify(hooks, message, level) {
+  try {
+    hooks?.notify?.(message, level);
+  } catch {
+  }
+}
+function createPolicyChecker(opts) {
+  const breaker = opts.breaker ?? createBreaker({ now: opts.now });
+  const keyState2 = opts.keyState ?? createKeyState();
+  async function checkTool(payload, toolName, hooks) {
+    try {
+      if (keyState2.isInactive()) return { kind: "allow" };
+      const breakerApplies = opts.state.getFailureAction() !== "block";
+      if (breakerApplies && breaker.shouldSkip()) return { kind: "allow" };
+      const res = await opts.client.postPretool(payload);
+      if (res.ok) {
+        keyState2.recordSuccess();
+        if (breakerApplies) {
+          const closed = breaker.recordSuccess();
+          if (closed !== void 0) notify(hooks, BREAKER_CLOSED_NOTICE, "info");
+        }
+        opts.state.recordSuccess(res.body, (opts.now ?? Date.now)());
+        if (opts.onSync !== void 0) {
+          try {
+            opts.onSync(opts.state.snapshot());
+          } catch {
+          }
+        }
+        return mapResponseToOutcome(res.body);
+      }
+      if (breakerApplies) {
+        const opened = breaker.recordFailure();
+        if (opened !== void 0) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
+      }
+      const latched = keyState2.recordFailure(res.errorClass);
+      if (latched !== void 0) {
+        notify(hooks, KEY_REJECTED_NOTICE, "warning");
+        return { kind: "allow" };
+      }
+      const blocked = opts.state.getFailureAction() === "block";
+      opts.telemetry.reportBypass({
+        errorClass: res.errorClass,
+        toolName,
+        elapsedMs: res.elapsedMs,
+        blocked
+      });
+      return blocked ? { kind: "unavailable" } : { kind: "allow" };
+    } catch {
+      return { kind: "allow" };
+    }
+  }
+  return { checkTool };
+}
+
+// packages/core/src/telemetry.ts
+function createTelemetry(opts) {
+  const now = opts.now ?? Date.now;
+  const intervalMs = opts.intervalMs ?? ERROR_REPORT_INTERVAL_MS;
+  let lastReportAtMs;
+  let reporting = false;
+  function reportBypass(ctx) {
+    try {
+      const apiKey = opts.apiKey;
+      if (apiKey === void 0 || apiKey === "") return;
+      if (opts.isInactive?.() === true) return;
+      if (reporting) return;
+      const at = now();
+      if (lastReportAtMs !== void 0 && at - lastReportAtMs < intervalMs) return;
+      lastReportAtMs = at;
+      reporting = true;
+      const category = ctx.blocked === true ? ERROR_CATEGORY_BLOCKED : ERROR_CATEGORY_BYPASS;
+      const message = redactSecrets(
+        `pi hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
+        apiKey
+      );
+      const body = {
+        errors: [{ message, timestamp: new Date(at).toISOString(), category }],
+        hook_source: HOOK_SOURCE
+      };
+      void opts.client.postHookErrors(body).catch(() => false).finally(() => {
+        reporting = false;
+      });
+    } catch {
+      reporting = false;
+    }
+  }
+  return { reportBypass };
+}
+
 // packages/pi/src/narrow.ts
 var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
 function isShellCall(e) {
@@ -578,7 +718,9 @@ async function decideToolCall(event, ctx, deps) {
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint
     });
-    const outcome = await deps.checker.checkTool(payload, event.toolName);
+    const outcome = await deps.checker.checkTool(payload, event.toolName, {
+      notify: (message, level) => notifySafe(ctx, message, level)
+    });
     switch (outcome.kind) {
       case "allow":
         return void 0;
@@ -610,13 +752,33 @@ async function decideToolCall(event, ctx, deps) {
 }
 
 // packages/pi/src/index.ts
-function defaultMakeChecker(apiKey, baseUrl) {
+function defaultMakeChecker(apiKey, baseUrl, env = {}, homeDir = "") {
   const client = createApiClient({ baseUrl, apiKey });
+  const cachePath = resolveCachePath(env, homeDir);
+  const fingerprint = keyFingerprint(apiKey);
   return createPolicyChecker({
     client,
     state: policyState,
-    telemetry: createTelemetry({ client, apiKey })
+    telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+    breaker: createBreaker({ now: Date.now }),
+    keyState,
+    onSync: cachePath === void 0 ? void 0 : (snapshot) => {
+      void writeCache(cachePath, {
+        ...snapshot,
+        gateway_url: baseUrl,
+        key_fingerprint: fingerprint
+      });
+    }
   });
+}
+function hydrateFromCache(apiKey, baseUrl, env, homeDir) {
+  try {
+    const cachePath = resolveCachePath(env, homeDir);
+    if (cachePath === void 0) return;
+    const onDisk = readCache(cachePath, { gatewayUrl: baseUrl, fingerprint: keyFingerprint(apiKey) });
+    if (onDisk !== void 0) policyState.hydrate(onDisk);
+  } catch {
+  }
 }
 function safeHomeDir() {
   try {
@@ -626,10 +788,14 @@ function safeHomeDir() {
   }
 }
 function createExtension(overrides = {}) {
+  const env = overrides.env ?? process.env;
+  const homeDir = overrides.homeDir ?? safeHomeDir();
   const deps = {
-    env: overrides.env ?? process.env,
-    homeDir: overrides.homeDir ?? safeHomeDir(),
-    makeChecker: overrides.makeChecker ?? defaultMakeChecker,
+    env,
+    homeDir,
+    // The cache path is resolved from the same env/home pair the key came from, so a test with a
+    // temp HOME cannot accidentally read or write the developer's real cache.
+    makeChecker: overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
     entrypoint: overrides.entrypoint
   };
   let resolved;
@@ -637,10 +803,14 @@ function createExtension(overrides = {}) {
   function init() {
     if (resolved === void 0) {
       const apiKey = resolveApiKey(deps.env, deps.homeDir);
+      const baseUrl = apiKey === void 0 ? void 0 : resolveGatewayUrl(deps.env, deps.homeDir);
+      if (apiKey !== void 0 && baseUrl !== void 0) {
+        hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
+      }
       resolved = {
         apiKey,
         entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
-        checker: apiKey === void 0 ? void 0 : deps.makeChecker(apiKey, resolveGatewayUrl(deps.env, deps.homeDir))
+        checker: apiKey === void 0 || baseUrl === void 0 ? void 0 : deps.makeChecker(apiKey, baseUrl)
       };
     }
     return resolved;
@@ -675,5 +845,6 @@ function createExtension(overrides = {}) {
 var index_default = createExtension();
 export {
   createExtension,
-  index_default as default
+  index_default as default,
+  defaultMakeChecker
 };

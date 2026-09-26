@@ -19,7 +19,12 @@
 // would make every latency produce a distinct fingerprint, fragmenting the alert into noise.
 
 import { redactSecrets } from "./config.ts";
-import { ERROR_CATEGORY_BYPASS, ERROR_REPORT_INTERVAL_MS, HOOK_SOURCE } from "./constants.ts";
+import {
+  ERROR_CATEGORY_BLOCKED,
+  ERROR_CATEGORY_BYPASS,
+  ERROR_REPORT_INTERVAL_MS,
+  HOOK_SOURCE,
+} from "./constants.ts";
 import type { ApiClient, HookErrorsBody } from "./client.ts";
 
 /** Everything the report is allowed to know. Note the absence of a command or payload field. */
@@ -27,6 +32,12 @@ export interface BypassContext {
   errorClass: string;
   toolName: string;
   elapsedMs: number;
+  /**
+   * WR-03: did this failure end in a **block** (a fail-closed org) rather than a bypass? The caller
+   * must therefore decide the failure action BEFORE reporting. Required, not optional, so a future
+   * call site cannot silently mislabel a block by forgetting it.
+   */
+  blocked: boolean;
 }
 
 export interface Telemetry {
@@ -39,6 +50,14 @@ export interface TelemetryOptions {
   apiKey?: string | undefined;
   now?: () => number;
   intervalMs?: number;
+  /**
+   * WR-01: the session's revoked-key latch (`keyState.ts`). Once it is set, reporting is pointless —
+   * this endpoint authenticates with the same rejected key (§F9) — so the reporter goes silent too.
+   *
+   * Belt and braces: `checkTool` already returns before any HTTP once the latch trips, but the
+   * reporter must not depend on its only caller getting that right.
+   */
+  isInactive?: () => boolean;
 }
 
 export function createTelemetry(opts: TelemetryOptions): Telemetry {
@@ -51,6 +70,8 @@ export function createTelemetry(opts: TelemetryOptions): Telemetry {
     try {
       const apiKey = opts.apiKey;
       if (apiKey === undefined || apiKey === "") return;
+      // A rejected key cannot authenticate this endpoint either, so an inactive session says nothing.
+      if (opts.isInactive?.() === true) return;
       if (reporting) return;
 
       const at = now();
@@ -59,14 +80,17 @@ export function createTelemetry(opts: TelemetryOptions): Telemetry {
       lastReportAtMs = at;
       reporting = true;
 
+      // One category value, used in both the `category` field and the message prefix, so the Sentry
+      // tag and the fingerprint agree. The `after <n>ms` suffix stays strictly last: the server
+      // fingerprints on `message.slice(0, 100)` (§B6), so a leading latency would fragment one alert
+      // into one per millisecond value.
+      const category = ctx.blocked === true ? ERROR_CATEGORY_BLOCKED : ERROR_CATEGORY_BYPASS;
       const message = redactSecrets(
-        `pi hook ${ERROR_CATEGORY_BYPASS}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
+        `pi hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
         apiKey,
       );
       const body: HookErrorsBody = {
-        errors: [
-          { message, timestamp: new Date(at).toISOString(), category: ERROR_CATEGORY_BYPASS },
-        ],
+        errors: [{ message, timestamp: new Date(at).toISOString(), category }],
         hook_source: HOOK_SOURCE,
       };
 

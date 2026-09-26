@@ -76,7 +76,13 @@ export async function decideToolCall(
       clientEntrypoint: deps.entrypoint,
     });
 
-    const outcome = await deps.checker.checkTool(payload, event.toolName);
+    // The per-call notice channel. The checker is built once in `init()` and cannot capture a `ctx`,
+    // so the breaker's open/close notices and WR-01's key-rejected notice reach the editor through
+    // this closure over the LIVE ctx. `notifySafe` already swallows its own failures, and `policy.ts`
+    // wraps the call again: a notice must never be able to change a verdict.
+    const outcome = await deps.checker.checkTool(payload, event.toolName, {
+      notify: (message, level) => notifySafe(ctx, message, level),
+    });
 
     switch (outcome.kind) {
       case "allow":

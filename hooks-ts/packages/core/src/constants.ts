@@ -44,6 +44,21 @@ export const CONFIRM_TIMEOUT_MS = 120_000;
 /** One bypass self-report per minute, per `unbound.py`'s convention (§B7). */
 export const ERROR_REPORT_INTERVAL_MS = 60_000;
 export const ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
+/**
+ * WR-03. A fail-CLOSED failure was blocked, not bypassed, and `message.slice(0,100)` is the Sentry
+ * fingerprint (§B6) — so filing both under one category makes the "enforcement was silently skipped"
+ * alert fire for the customers who explicitly paid for fail-closed and got it. `category` is a free
+ * string server-side (`hookErrorHandler.ts:55-87`), so this needs no API change.
+ */
+export const ERROR_CATEGORY_BLOCKED = "blocked_due_to_failure";
+
+// --- The revoked-key latch (WR-01) ------------------------------------------------------------
+/**
+ * Consecutive 401/403 responses that deactivate the session. Two, not one: a single rejection can be
+ * a deploy blip or a race with a key rotation, and a session-long enforcement shutdown is too big a
+ * consequence for one transient status.
+ */
+export const KEY_REJECTION_THRESHOLD = 2;
 
 // --- The circuit breaker (WR-02) --------------------------------------------------------------
 /** Consecutive `ok:false` results that take the gateway out of circuit for `BREAKER_OPEN_MS`. */
@@ -89,3 +104,9 @@ export const NO_KEY_NOTICE = "Unbound: no API key found — extension inactive";
 export const BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable — allowing tool calls for 60 s";
 /** The other edge: emitted once when a half-open probe succeeds. */
 export const BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again — enforcement resumed";
+/**
+ * WR-01, locked verbatim by 09-CONTEXT.md. The only signal a developer gets that their key was
+ * rejected — after it, the session is deliberately silent, so this one notice carries the whole
+ * message.
+ */
+export const KEY_REJECTED_NOTICE = "Unbound: API key rejected — enforcement inactive";
