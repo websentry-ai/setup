@@ -1,0 +1,7 @@
+{
+  "name": "@unbound/hooks-core",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Agent-agnostic Unbound hook core: config, payload, client, verdict, telemetry"
+}
