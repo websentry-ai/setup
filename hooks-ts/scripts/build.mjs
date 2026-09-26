@@ -29,8 +29,10 @@ const BANNER = [
   " */",
 ].join("\n");
 
+// Spelled out rather than composed, so `grep dist/meta/pi.json` finds both ends of the link
+// between this script and the assertion in packages/pi/test/build.test.ts.
 const META_DIR = "dist/meta";
-const META_FILE = `${META_DIR}/pi.json`;
+const META_FILE = "dist/meta/pi.json";
 
 try {
   const result = await esbuild.build({
