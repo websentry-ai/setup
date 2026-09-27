@@ -15,8 +15,9 @@
 //
 // **It is on an awaited path.** Registering any `tool_result` handler switches on an extra awaited
 // pass for every tool result (`agent-session.js:267`, the `hasHandlers` gate), between the tool
-// finishing and the model seeing its output. So: one hash, no `await`, no `node:fs`, no `fetch`, no
-// stderr — and a size bail-out in `hashContent` for the 100 MB `read` (§F7).
+// finishing and the model seeing its output. So: one hash, no `await`, no filesystem, no network, no
+// stderr — and a size bail-out in `hashContent` for the 100 MB `read` (§F7). A grep of this file for
+// either capability finds nothing, which is how the property is checked rather than asserted.
 //
 // **The raw content is read once and dropped.** `event.content` is projected, hashed and forgotten;
 // `event.input` is not read at all, because the turn log sends `tool_input: {}` and reaching for it

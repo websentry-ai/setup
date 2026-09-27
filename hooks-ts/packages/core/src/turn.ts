@@ -11,8 +11,10 @@
 //     that is not an enabled `AIModel` (`add_gateway_metrics_task.py:565-577`). Keeping a real model
 //     id in the record would only invite a future reader to send it and silently lose every row. The
 //     real id is available on `agent_end`'s messages if analytics ever wants it server-side.
-//   * **No I/O of any kind.** No `node:fs`, no `fetch`, no stderr. `tool_result` is an awaited pass
-//     over every tool result, so this module is pure computation on data already in memory.
+//   * **No I/O of any kind** — no filesystem, no network, no stderr; `node:crypto` is the only
+//     import. `tool_result` is an awaited pass over every tool result, so this module is pure
+//     computation on data already in memory. A grep of this file for either capability finds
+//     nothing, which is how the property is checked rather than asserted.
 //
 // `startTurn` is called lazily by `recordPrompt` and `recordToolCall`, never by a handler directly.
 // `conversation_id` is load-bearing on the wire — it becomes `thread_id` and `derive_hook_request_id`
@@ -110,7 +112,7 @@ function projectPart(part: unknown): string {
 /**
  * sha256 of the canonical projection of a tool result's content.
  *
- * **Not `JSON.stringify(content)`** (§F7): key order is not content, and `textSignature` is provider
+ * **Not a JSON serialisation of `content`** (§F7): key order is not content, and `textSignature` is provider
  * metadata that changes between runs of the same command — either would make the digest useless for
  * telling "the same output" from "a different output". The projection is built by hand instead, one
  * line per part, joined with `\n`, and the digest is fed part-by-part so a large content array never
