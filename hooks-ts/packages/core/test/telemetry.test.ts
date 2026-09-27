@@ -14,6 +14,7 @@ import {
   ERRORS_PATH,
   ERROR_CATEGORY_BLOCKED,
   ERROR_CATEGORY_BYPASS,
+  ERROR_CATEGORY_TURNLOG,
   ERROR_REPORT_INTERVAL_MS,
 } from "../src/constants.ts";
 import { createKeyState } from "../src/keyState.ts";
@@ -308,6 +309,85 @@ test("WR-03 the 60 s window is shared, so a block cannot outrun the rate limiter
     assert.equal((await settle(h, 2)).length, 2, "and the window still reopens");
   } finally {
     await h.close();
+  }
+});
+
+// A lost audit row is the third thing that can happen, and it is neither of the first two. Filing a
+// failed `POST /v1/hooks/pi` as `bypassed_due_to_failure` put it under the "enforcement was silently
+// skipped" alert — where a turn-log route that is 404 until Phase 7 ships would bury every real
+// fail-open event under noise from a route that enforces nothing.
+
+test("a failed turn log is reported as turn_log_failed, its own category", async () => {
+  const h = await harness();
+  try {
+    h.telemetry.reportTurnLogFailure({ errorClass: "TurnLogFailed", toolName: "agent_end", elapsedMs: 42 });
+    const reports = await settle(h, 1);
+    assert.equal(reports.length, 1, "exactly one POST /v1/hooks/errors");
+
+    const { message, category } = entryOf(reports[0]);
+    assert.equal(category, ERROR_CATEGORY_TURNLOG);
+    assert.equal(category, "turn_log_failed", "the literal the server will tag and fingerprint");
+    assert.ok(message.startsWith("pi hook turn_log_failed:"), `the fingerprint window: ${message}`);
+    assert.ok(message.endsWith("42ms"), "the elapsed-ms suffix is still strictly last");
+    // The whole point: neither enforcement category may appear anywhere in the report.
+    assert.equal(message.includes(ERROR_CATEGORY_BYPASS), false, "never reads as a bypass");
+    assert.equal(message.includes(ERROR_CATEGORY_BLOCKED), false, "and never as a block");
+    const raw = JSON.stringify(reports[0]?.body);
+    assert.equal(raw.includes(ERROR_CATEGORY_BYPASS), false, "not in the category field either");
+    assert.equal(raw.includes(ERROR_CATEGORY_BLOCKED), false);
+  } finally {
+    await h.close();
+  }
+});
+
+test("a turn-log report is rate-limited and redacted on the same terms as a bypass", async () => {
+  const h = await harness();
+  try {
+    const turnLog = (errorClass = "TurnLogFailed") => ({ errorClass, toolName: "agent_end", elapsedMs: 42 });
+
+    h.telemetry.reportTurnLogFailure(turnLog());
+    assert.equal((await settle(h, 1)).length, 1);
+
+    // One window across ALL THREE categories: the budget belongs to the endpoint, not to a category,
+    // and a lost audit row must not buy a second report a bypass could not have.
+    h.setClock(START_MS + 30_000);
+    h.telemetry.reportTurnLogFailure(turnLog());
+    h.telemetry.reportBypass(bypass());
+    assert.equal((await settle(h, 1)).length, 1, "still one report in the window");
+
+    h.setClock(START_MS + 60_001);
+    h.telemetry.reportTurnLogFailure(turnLog(`Error Bearer sk-live-deadbeef key=${TEST_KEY}`));
+    const reports = await settle(h, 2);
+    assert.equal(reports.length, 2, "and the window reopens");
+    const raw = JSON.stringify(reports[1]?.body);
+    assert.equal(raw.includes(TEST_KEY), false, "the literal API key is redacted");
+    assert.equal(raw.includes("sk-live-deadbeef"), false, "the Bearer token is redacted");
+    assert.ok(raw.includes("turn_log_failed"), "while the category survives");
+  } finally {
+    await h.close();
+  }
+});
+
+test("a turn-log report is silenced by a missing key and by the latch, like every other report", async () => {
+  const keyState = createKeyState();
+  const h = await harness({ isInactive: () => keyState.isInactive() });
+  try {
+    keyState.recordFailure("HttpStatus401");
+    keyState.recordFailure("HttpStatus401");
+    h.telemetry.reportTurnLogFailure({ errorClass: "TurnLogFailed", toolName: "agent_end", elapsedMs: 1 });
+    await sleep(80);
+    assert.deepEqual(h.errors(), [], "the errors endpoint uses the same rejected key (§F9)");
+  } finally {
+    await h.close();
+  }
+
+  const keyless = await harness({ apiKey: "" });
+  try {
+    keyless.telemetry.reportTurnLogFailure({ errorClass: "TurnLogFailed", toolName: "agent_end", elapsedMs: 1 });
+    await sleep(80);
+    assert.deepEqual(keyless.errors(), [], "no key, no report");
+  } finally {
+    await keyless.close();
   }
 });
 

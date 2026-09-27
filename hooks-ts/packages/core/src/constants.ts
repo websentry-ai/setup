@@ -110,6 +110,18 @@ export const ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
  * string server-side (`hookErrorHandler.ts:55-87`), so this needs no API change.
  */
 export const ERROR_CATEGORY_BLOCKED = "blocked_due_to_failure";
+/**
+ * The third outcome, and neither of the first two: `POST /v1/hooks/pi` failed, so an audit row was
+ * lost. No policy check was skipped and none was blocked — enforcement already happened, on the
+ * pretool path, minutes earlier.
+ *
+ * It needs its own category because both of the above feed the "enforcement was silently skipped"
+ * alert, and this route is the *most* likely of the three to fail: it 404s entirely until the Phase 7
+ * backend ships. Filing lost rows there would bury every genuine fail-open event under noise from a
+ * route that enforces nothing. `category` is a free string server-side (`hookErrorHandler.ts:55-87`),
+ * so an honest third label costs no API change.
+ */
+export const ERROR_CATEGORY_TURNLOG = "turn_log_failed";
 
 // --- The revoked-key latch (WR-01) ------------------------------------------------------------
 /**

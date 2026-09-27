@@ -89,7 +89,12 @@ export interface PolicyCheckerOptions {
    */
   client: Pick<ApiClient, "postPretool">;
   state: PolicyState;
-  telemetry: Telemetry;
+  /**
+   * Narrowed to the one method this path may use, for the same reason `client` is narrowed above — and
+   * with a second benefit: the decision path reports enforcement outcomes only. A lost audit row has
+   * its own category and its own method, and this file cannot reach it.
+   */
+  telemetry: Pick<Telemetry, "reportBypass">;
   /**
    * Called with the freshly recorded snapshot after every **successful** response, so a caller can
    * persist it (RES-03). Optional: without it the checker behaves exactly as it did in Phase 8.

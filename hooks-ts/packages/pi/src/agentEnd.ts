@@ -41,10 +41,16 @@ export interface AgentEndDeps {
   store: TurnStore;
   /**
    * Optional: one rate-limited report when a post fails, so a permanently broken audit trail is
-   * visible in Sentry rather than silent. `blocked: false` — a failed turn log is a lost row, not a
-   * skipped enforcement, and mislabelling it would fire the fail-open alert for the wrong reason.
+   * visible in Sentry rather than silent.
+   *
+   * Narrowed to `reportTurnLogFailure`, which is not a style choice — it is what makes the rule
+   * enforceable. A failed turn log is a lost row, not a skipped enforcement, and both of
+   * `reportBypass`'s categories feed the "enforcement was silently skipped" alert. This route 404s
+   * until the Phase 7 backend ships, so filing lost rows there would bury every genuine fail-open
+   * event under noise from a route that enforces nothing. Typing the dependency this way means this
+   * file **cannot reach** the bypass reporter, rather than merely choosing not to.
    */
-  telemetry?: Pick<Telemetry, "reportBypass">;
+  telemetry?: Pick<Telemetry, "reportTurnLogFailure">;
   now?: () => number;
 }
 
@@ -77,11 +83,10 @@ export function handleAgentEnd(
       .postTurnLog(body)
       .then((ok) => {
         if (ok) return;
-        deps.telemetry?.reportBypass({
+        deps.telemetry?.reportTurnLogFailure({
           errorClass: "TurnLogFailed",
           toolName: TURNLOG_LABEL,
           elapsedMs: (deps.now ?? Date.now)() - dispatchedAtMs,
-          blocked: false,
         });
       })
       .catch(() => {

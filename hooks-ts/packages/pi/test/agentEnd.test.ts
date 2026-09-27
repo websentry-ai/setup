@@ -14,7 +14,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createApiClient } from "../../core/src/client.ts";
-import { TURNLOG_PATH } from "../../core/src/constants.ts";
+import { ERRORS_PATH, ERROR_CATEGORY_TURNLOG, TURNLOG_PATH } from "../../core/src/constants.ts";
+import { createTelemetry } from "../../core/src/telemetry.ts";
 import { createTurnStore } from "../../core/src/turn.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
@@ -260,10 +261,13 @@ test("a failed post reports at most one telemetry error and never notifies", asy
   const api = await startMockApi({ turnLogMode: "hang" });
   try {
     const ctx = createFakeCtx();
-    const reported: { errorClass: string; toolName: string; blocked: boolean }[] = [];
+    const reported: { errorClass: string; toolName: string }[] = [];
     const telemetry = {
-      reportBypass(entry: { errorClass: string; toolName: string; elapsedMs: number; blocked: boolean }) {
-        reported.push({ errorClass: entry.errorClass, toolName: entry.toolName, blocked: entry.blocked });
+      // NOT `reportBypass`: a lost audit row is not a skipped policy check, and the two share the
+      // Sentry alert if they share the category. `agentEnd.ts` cannot even reach `reportBypass` now —
+      // its `telemetry` is typed to this one method.
+      reportTurnLogFailure(entry: { errorClass: string; toolName: string; elapsedMs: number }) {
+        reported.push({ errorClass: entry.errorClass, toolName: entry.toolName });
       },
     };
 
@@ -280,11 +284,54 @@ test("a failed post reports at most one telemetry error and never notifies", asy
 
     assert.deepEqual(ctx.notifyCalls, [], "never a notice");
     assert.ok(reported.length >= 1, "a silently failing audit trail is worse than a noisy one");
-    assert.equal(reported[0]?.blocked, false, "a failed turn log is not an enforcement failure");
+    assert.equal(reported[0]?.errorClass, "TurnLogFailed");
     // Rate limiting itself is `telemetry.ts`'s job and tested there; this asserts the label.
     assert.equal(reported[0]?.toolName, "agent_end");
   } finally {
     await api.close();
+  }
+});
+
+test("a failed turn log reaches /v1/hooks/errors as turn_log_failed, once", async () => {
+  // End to end through the REAL reporter, because the category is the whole point: filed as
+  // `bypassed_due_to_failure` this fired the "enforcement was silently skipped" alert, so a turn-log
+  // route that 404s until Phase 7 ships would bury every genuine fail-open event under it.
+  //
+  // `hang` and `401` are the two turn-log failure modes the mock scripts; `postTurnLog` answers a
+  // boolean for every non-ok response, so any 4xx/5xx takes this same path.
+  for (const turnLogMode of ["hang", "401"] as const) {
+    const api = await startMockApi({ turnLogMode });
+    try {
+      const telemetry = createTelemetry({
+        client: client(api, SHORT_TIMEOUT_MS),
+        apiKey: TEST_KEY,
+        intervalMs: 0, // the rate limiter is `telemetry.ts`'s own test; this case is about the label
+      });
+      handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx(), {
+        client: client(api, SHORT_TIMEOUT_MS),
+        store: primedStore(),
+        telemetry,
+      });
+      await sleep(SHORT_TIMEOUT_MS + 150);
+
+      const reports = api.requests.filter((r) => r.path === ERRORS_PATH);
+      assert.equal(reports.length, 1, `exactly one report (${turnLogMode}): ${reports.length}`);
+      const entry = (reports[0]?.body as { errors?: { message?: unknown; category?: unknown }[] })
+        .errors?.[0];
+      assert.equal(entry?.category, ERROR_CATEGORY_TURNLOG);
+      assert.equal(entry?.category, "turn_log_failed");
+      assert.ok(
+        String(entry?.message).startsWith("pi hook turn_log_failed:"),
+        `the fingerprint window carries the honest label: ${String(entry?.message)}`,
+      );
+      assert.equal(
+        String(entry?.message).includes("bypassed_due_to_failure"),
+        false,
+        "and never the fail-open one",
+      );
+    } finally {
+      await api.close();
+    }
   }
 });
 

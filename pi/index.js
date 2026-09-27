@@ -48,6 +48,7 @@ var CONFIRM_TIMEOUT_MS = 12e4;
 var ERROR_REPORT_INTERVAL_MS = 6e4;
 var ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
 var ERROR_CATEGORY_BLOCKED = "blocked_due_to_failure";
+var ERROR_CATEGORY_TURNLOG = "turn_log_failed";
 var KEY_REJECTION_THRESHOLD = 2;
 var BREAKER_FAILURE_THRESHOLD = 3;
 var BREAKER_OPEN_MS = 6e4;
@@ -883,7 +884,7 @@ function createTelemetry(opts) {
   const intervalMs = opts.intervalMs ?? ERROR_REPORT_INTERVAL_MS;
   let lastReportAtMs;
   let reporting = false;
-  function reportBypass(ctx) {
+  function report(category, ctx) {
     try {
       const apiKey = opts.apiKey;
       if (apiKey === void 0 || apiKey === "") return;
@@ -893,7 +894,6 @@ function createTelemetry(opts) {
       if (lastReportAtMs !== void 0 && at - lastReportAtMs < intervalMs) return;
       lastReportAtMs = at;
       reporting = true;
-      const category = ctx.blocked === true ? ERROR_CATEGORY_BLOCKED : ERROR_CATEGORY_BYPASS;
       const message = redactSecrets(
         `pi hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
         apiKey
@@ -909,7 +909,14 @@ function createTelemetry(opts) {
       reporting = false;
     }
   }
-  return { reportBypass };
+  return {
+    reportBypass(ctx) {
+      report(ctx.blocked === true ? ERROR_CATEGORY_BLOCKED : ERROR_CATEGORY_BYPASS, ctx);
+    },
+    reportTurnLogFailure(ctx) {
+      report(ERROR_CATEGORY_TURNLOG, ctx);
+    }
+  };
 }
 
 // packages/core/src/turn.ts
@@ -1082,11 +1089,10 @@ function handleAgentEnd(_event, ctx, deps) {
     const dispatchedAtMs = completedAtMs;
     void deps.client.postTurnLog(body).then((ok) => {
       if (ok) return;
-      deps.telemetry?.reportBypass({
+      deps.telemetry?.reportTurnLogFailure({
         errorClass: "TurnLogFailed",
         toolName: TURNLOG_LABEL,
-        elapsedMs: (deps.now ?? Date.now)() - dispatchedAtMs,
-        blocked: false
+        elapsedMs: (deps.now ?? Date.now)() - dispatchedAtMs
       });
     }).catch(() => {
     });
