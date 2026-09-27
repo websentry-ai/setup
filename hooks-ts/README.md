@@ -8,7 +8,7 @@ resulting verdict into in-editor behaviour. `npm run build` bundles both into a 
 dependency-free ESM file at `dist/pi/index.js`, which pi loads from
 `~/.pi/agent/extensions/unbound/index.js` on Node >= 22.19.0.
 
-Tested against **pi 0.87.1** on Node `v22.22.2` (built `dist/pi/index.js` = 18945 bytes, smoke record in [`docs/SMOKE.md`](docs/SMOKE.md)); `engines.node` is `>=22.19.0`, matching pi's own floor.
+Tested against **pi 0.87.1** on Node `v22.22.2` (built `dist/pi/index.js` = 52771 bytes, smoke record in [`docs/SMOKE.md`](docs/SMOKE.md), spike record in [`docs/SPIKES.md`](docs/SPIKES.md)); `engines.node` is `>=22.19.0`, matching pi's own floor.
 `@earendil-works/pi-coding-agent` is a **devDependency pinned to `0.87.x` for types only** — the
 built file must import nothing from it at runtime, because a value import would inline the whole
 agent (multi-MB) and its bare, non-`node:` imports cannot resolve under pi's jiti loader. A failing
@@ -21,6 +21,47 @@ On every pi `tool_call` it asks the Unbound API whether the call is allowed, and
 into editor behaviour. Both of pi's shell tools are checked on their command — `powershell` as well
 as `bash`, since they share one input type and `powershell` becomes active via `--tools` or the
 `defaultTools` setting; a call with an empty command skips the round trip entirely.
+
+## Event parity
+
+Six pi events are registered. The right-hand columns name the hook that carries the same duty in
+Unbound's other integrations — `claude-code/hooks/` and `cursor/hooks.json` in this repo — so a
+reviewer can see at a glance where pi is at parity and where an event simply has no counterpart.
+
+| pi event | What it enforces | Claude Code | Cursor |
+| --- | --- | --- | --- |
+| `tool_call` — shell (`bash`, `powershell`) | the command itself, both-ends capped at 8192 chars; `allow` / `deny` / `ask` / `approval_required` | `PreToolUse` | `beforeShellExecution` |
+| `tool_call` — file tools (`read`, `edit`, `write`, `grep`, `find`, `ls`) | `metadata.file_path` plus a key-allowlisted, 2 KB-capped `tool_input`; **never** the file body, never images. Skipped without a request when the cached `tools_to_check` says the org has no policy for that tool | `PreToolUse` | `beforeReadFile`, `afterFileEdit` |
+| `user_bash` — the `!cmd` / `!!cmd` shell escape | the user's own command, blocked by returning a synthetic non-zero `BashResult` (the event has no `block` field); `tool_use_id` is `ubash_` + 20 hex | *no equivalent* — Claude Code has no user shell escape | *no equivalent* |
+| `input` — the typed prompt | the prompt text; a deny suppresses the turn entirely (`{action:"handled"}`) and a red notification is the user's only feedback channel | `UserPromptSubmit` | `beforeSubmitPrompt` |
+| `tool_result` | audits every result as name + `isError` + a sha256 digest + a byte count. Returns `undefined` on every path, so it can never rewrite what the model reads | `PostToolUse` | `afterShellExecution`, `afterFileEdit` |
+| `agent_end` | one best-effort turn log to `/v1/hooks/pi` per finished turn, dispatched without being awaited because pi gates run settlement on this handler | `Stop` | `stop`, `afterAgentResponse` |
+| `session_start` | resolves the key, announces the session once per process, and warms the fail-open opt-out. Fires again on `/new`, `/resume`, `/fork`, `/clone`, `/reload` — the heartbeat is still sent once per process | `SessionStart` | `sessionStart` |
+
+Two pi events that the other integrations have no analogue for are also the two that carry the most
+pi-specific risk: `user_bash` fails **closed and silently** if a handler throws, and `agent_end`
+blocks run settlement while it runs. Both are why every handler body opens `try` before its first
+statement.
+
+## Intentional gaps
+
+Shipped knowingly, each with its owner and evidence, in
+**[`docs/SPIKES.md`](docs/SPIKES.md) → Intentional parity gaps**. In short:
+
+- **Tool-output and assistant-text DLP cannot fire for pi.** `tool_result` sends a digest, not the
+  output, and the turn record holds no assistant text — so there is nothing for DLP to match on.
+- **Prompt templates are checked unexpanded.** `input` fires before expansion, so `/name args` is
+  checked as the literal text typed, not as what it becomes.
+- **Slash commands never reach the `input` handler.** Built-ins and extension commands are
+  dispatched before the input handlers run. An unmatched `/typo` does arrive, as plain text.
+- **pi is enforced by neither budgets nor spend limits** — it is in neither enforced-label list.
+- **`--no-extensions`, `PI_CODING_AGENT_DIR` and an SDK embedder's `noExtensions` all bypass
+  everything.** Closing that needs MDM-managed settings (Phase 10), not extension code.
+- **A heartbeat cannot warm `tools_to_check`** until the API grows a first-class `session_start`
+  branch, so the first real tool call of a process always round-trips.
+
+There is **no subagent gap**: pi 0.87.1 has no subagent concept at all, and a nested `pi` process
+enforces independently under its own `conversation_id`. Both verified — see `docs/SPIKES.md`.
 
 | Verdict | Behaviour |
 | --- | --- |
@@ -187,7 +228,12 @@ UNBOUND_PI_API_KEY=<staging application key> pi
 
 ## Not in this milestone
 
-Only `tool_call` and `session_start` are registered. Deliberately absent, and tracked as later work:
-the file tools and the user shell-escape path, prompt checking, the end-of-turn log, the session
-heartbeat, the on-disk policy cache with its `tools_to_check` filtering, and Slack approval polling
-(`approval_required` currently uses the same local confirm dialog as `ask`).
+All six events above are registered, along with the on-disk policy cache (`0600`, keyed to gateway
+URL + key fingerprint, 300 s TTL), a circuit breaker and a revoked-key latch. Deliberately absent,
+and tracked as later work:
+
+- **Slack approval polling** — `approval_required` still uses the same local confirm dialog as `ask`.
+- **The installer** — `setup/pi/setup.py` and the MDM drop are Phase 10; until then the built file is
+  copied into `~/.pi/agent/extensions/unbound/` by hand.
+- **npm publish** — the extension ships as a raw file from this repo, on purpose.
+- Everything in **Intentional gaps** above, which is deliberate rather than pending.
