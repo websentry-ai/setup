@@ -32,12 +32,18 @@ var KEY_FINGERPRINT_PREFIX = "sha256:";
 var APP_LABEL = "pi";
 var HOOK_SOURCE = "pi";
 var EVENT_NAME_TOOL_USE = "tool_use";
+var EVENT_NAME_SESSION_START = "session_start";
+var SESSION_PRESENCE_ROW_ENABLED = true;
 var EVENT_NAME_USER_PROMPT = "user_prompt";
 var USER_BASH_ID_PREFIX = "ubash_";
 var PRETOOL_PATH = "/v1/hooks/pretool";
 var ERRORS_PATH = "/v1/hooks/errors";
+var TURNLOG_PATH = "/v1/hooks/pi";
+var TURNLOG_MODEL = "auto";
+var TURNLOG_TOOL_USE_TYPE = "PostToolUse";
 var PRETOOL_TIMEOUT_MS = 2e4;
 var ERRORS_TIMEOUT_MS = 1e4;
+var TURNLOG_TIMEOUT_MS = 1e4;
 var CONFIRM_TIMEOUT_MS = 12e4;
 var ERROR_REPORT_INTERVAL_MS = 6e4;
 var ERROR_CATEGORY_BYPASS = "bypassed_due_to_failure";
@@ -47,6 +53,7 @@ var BREAKER_FAILURE_THRESHOLD = 3;
 var BREAKER_OPEN_MS = 6e4;
 var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
+var MAX_HASH_BYTES = 4194304;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
@@ -469,6 +476,7 @@ function classifyError(err) {
 function createApiClient(opts) {
   const timeoutMs = opts.timeoutMs ?? PRETOOL_TIMEOUT_MS;
   const errorsTimeoutMs = opts.errorsTimeoutMs ?? ERRORS_TIMEOUT_MS;
+  const turnLogTimeoutMs = opts.turnLogTimeoutMs ?? TURNLOG_TIMEOUT_MS;
   const resolveFetch = () => opts.fetchImpl ?? globalThis.fetch;
   const headers = () => ({
     "content-type": "application/json",
@@ -520,7 +528,128 @@ function createApiClient(opts) {
       return false;
     }
   }
-  return { postPretool, postHookErrors };
+  async function postTurnLog(body) {
+    try {
+      const res = await resolveFetch()(`${opts.baseUrl}${TURNLOG_PATH}`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(turnLogTimeoutMs),
+        redirect: "error"
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+  return { postPretool, postHookErrors, postTurnLog };
+}
+
+// packages/core/src/heartbeat.ts
+function buildHeartbeatPayload(input) {
+  return {
+    conversation_id: input.sessionId,
+    model: input.model !== void 0 && input.model.length > 0 ? input.model : TURNLOG_MODEL,
+    event_name: EVENT_NAME_SESSION_START,
+    // Blank tool name, blank command, no `file_path`. See the header: this is what keeps the request
+    // out of the command-policy evaluator.
+    pre_tool_use_data: {
+      tool_name: "",
+      command: "",
+      metadata: { cwd: input.cwd, has_ui: input.hasUI, pi_version: input.piVersion }
+    },
+    // Empty rather than absent: the field is required by the server type, and a heartbeat has no
+    // prompt to report. Sending a blank prompt through the guardrail path is exactly what §C2 warns
+    // against, which is why `event_name` above is not `user_prompt`.
+    messages: [],
+    unbound_app_label: APP_LABEL,
+    client_entrypoint: input.clientEntrypoint,
+    // Harmless here (the fall-through attaches no payload) and future-proof if the API later answers
+    // this shape with one — at which point `recordSuccess` already handles the fields correctly.
+    pull_policies: true,
+    first_approval_check: true
+  };
+}
+function createHeartbeatGate(opts) {
+  let lastSentAt;
+  return {
+    shouldSend(fetchedAt) {
+      try {
+        if (lastSentAt === void 0) return true;
+        if (fetchedAt === void 0 || !Number.isFinite(fetchedAt)) return false;
+        const now = opts.now();
+        if (now - fetchedAt <= opts.ttlMs) return false;
+        return now - lastSentAt > opts.ttlMs;
+      } catch {
+        return false;
+      }
+    },
+    markSent() {
+      try {
+        lastSentAt = opts.now();
+      } catch {
+        lastSentAt = Number.MAX_SAFE_INTEGER;
+      }
+    }
+  };
+}
+
+// packages/core/src/turnLog.ts
+function shouldPostTurn(record) {
+  try {
+    if (record === null || typeof record !== "object") return false;
+    if (typeof record.prompt === "string") return true;
+    return Array.isArray(record.tool_calls) && record.tool_calls.length > 0;
+  } catch {
+    return false;
+  }
+}
+function toolResponseFor(record, toolUseId) {
+  const results = Array.isArray(record.results) ? record.results : [];
+  const match = results.find((entry) => entry?.tool_use_id === toolUseId);
+  if (match === void 0) return {};
+  if (match.hash_skipped === true) {
+    return { hash_skipped: true, content_bytes: match.content_bytes };
+  }
+  if (typeof match.content_sha256 === "string") {
+    return { content_sha256: match.content_sha256, content_bytes: match.content_bytes };
+  }
+  return {};
+}
+function buildTurnLogBody(record, opts) {
+  let conversationId = "";
+  let prompt = "";
+  let toolUse = [];
+  let startedAt;
+  try {
+    const safe = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
+    conversationId = typeof safe.session_id === "string" ? safe.session_id : "";
+    prompt = typeof safe.prompt === "string" ? safe.prompt : "";
+    startedAt = typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : void 0;
+    const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
+    toolUse = calls.map((call) => ({
+      type: TURNLOG_TOOL_USE_TYPE,
+      tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
+      tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
+      // Not `call`-derived and not `event.input`-derived. Empty by design — header decision 2.
+      tool_input: {},
+      tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : "")
+    }));
+  } catch {
+  }
+  const body = {
+    conversation_id: conversationId,
+    model: TURNLOG_MODEL,
+    messages: [
+      { role: "user", content: prompt },
+      { role: "assistant", content: "", tool_use: toolUse }
+    ],
+    cwd: opts.cwd,
+    requestCompleted: new Date(opts.completedAtMs).toISOString(),
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  };
+  if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
+  return body;
 }
 
 // packages/core/src/config.ts
@@ -773,6 +902,154 @@ function createTelemetry(opts) {
   return { reportBypass };
 }
 
+// packages/core/src/turn.ts
+import { createHash as createHash2 } from "node:crypto";
+function projectPart(part) {
+  if (part === null || typeof part !== "object") return "";
+  const record = part;
+  if (record.type === "image") {
+    const mimeType = typeof record.mimeType === "string" ? record.mimeType : "";
+    const data = typeof record.data === "string" ? record.data : "";
+    return `image:${mimeType}:${data}`;
+  }
+  const text = typeof record.text === "string" ? record.text : "";
+  return `text:${text}`;
+}
+function hashContent(parts) {
+  try {
+    const list = Array.isArray(parts) ? parts : [];
+    const projected = list.map(projectPart);
+    let bytes = 0;
+    for (let i = 0; i < projected.length; i += 1) {
+      bytes += Buffer.byteLength(projected[i] ?? "", "utf8");
+      if (i > 0) bytes += 1;
+    }
+    if (bytes > MAX_HASH_BYTES) {
+      return { content_sha256: void 0, content_bytes: bytes, hash_skipped: true };
+    }
+    const hash = createHash2("sha256");
+    for (let i = 0; i < projected.length; i += 1) {
+      if (i > 0) hash.update("\n", "utf8");
+      hash.update(projected[i] ?? "", "utf8");
+    }
+    return { content_sha256: hash.digest("hex"), content_bytes: bytes };
+  } catch {
+    return { content_sha256: void 0, content_bytes: 0, hash_skipped: true };
+  }
+}
+function createTurnStore() {
+  let record = { tool_calls: [], results: [] };
+  const started = () => record.prompt !== void 0 || record.tool_calls.length > 0;
+  function startTurn(sessionId, now) {
+    if (record.session_id === void 0 && typeof sessionId === "string" && sessionId !== "") {
+      record.session_id = sessionId;
+    }
+    if (record.started_at === void 0 && typeof now === "number" && Number.isFinite(now)) {
+      record.started_at = now;
+    }
+  }
+  return {
+    startTurn,
+    recordPrompt(text, sessionId, now = Date.now()) {
+      try {
+        startTurn(sessionId, now);
+        record.prompt = typeof text === "string" ? text : "";
+      } catch {
+      }
+    },
+    recordToolCall(entry, sessionId, now = Date.now()) {
+      try {
+        if (entry === null || typeof entry !== "object") return;
+        startTurn(sessionId, now);
+        record.tool_calls.push({
+          tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
+          tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
+          decision: typeof entry.decision === "string" ? entry.decision : "",
+          ts: now
+        });
+      } catch {
+      }
+    },
+    /**
+     * A result does **not** start a turn. A tool result whose call was never recorded belongs to a
+     * turn already posted (or to one this process never saw), and starting a turn from it would post
+     * a record with no prompt and no call — exactly the noise `PY:4975` refuses to send.
+     */
+    recordResult(entry) {
+      try {
+        if (entry === null || typeof entry !== "object") return;
+        const stored = {
+          tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
+          tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
+          is_error: entry.is_error === true,
+          content_bytes: typeof entry.content_bytes === "number" ? entry.content_bytes : 0
+        };
+        if (typeof entry.content_sha256 === "string") stored.content_sha256 = entry.content_sha256;
+        if (entry.hash_skipped === true) stored.hash_skipped = true;
+        record.results.push(stored);
+      } catch {
+      }
+    },
+    take() {
+      try {
+        if (!started()) return void 0;
+        const taken = record;
+        record = { tool_calls: [], results: [] };
+        return taken;
+      } catch {
+        return void 0;
+      }
+    },
+    isEmpty() {
+      try {
+        return !started();
+      } catch {
+        return true;
+      }
+    },
+    snapshot() {
+      const copy = {
+        tool_calls: record.tool_calls.map((entry) => ({ ...entry })),
+        results: record.results.map((entry) => ({ ...entry }))
+      };
+      if (record.prompt !== void 0) copy.prompt = record.prompt;
+      if (record.session_id !== void 0) copy.session_id = record.session_id;
+      if (record.started_at !== void 0) copy.started_at = record.started_at;
+      return copy;
+    }
+  };
+}
+var turnStore = createTurnStore();
+
+// packages/pi/src/agentEnd.ts
+var TURNLOG_LABEL = "agent_end";
+function handleAgentEnd(_event, ctx, deps) {
+  try {
+    const record = deps.store.take();
+    if (!shouldPostTurn(record)) return void 0;
+    const completedAtMs = (deps.now ?? Date.now)();
+    let cwd = "";
+    try {
+      cwd = typeof ctx?.cwd === "string" ? ctx.cwd : "";
+    } catch {
+    }
+    const body = buildTurnLogBody(record, { cwd, completedAtMs });
+    const dispatchedAtMs = completedAtMs;
+    void deps.client.postTurnLog(body).then((ok) => {
+      if (ok) return;
+      deps.telemetry?.reportBypass({
+        errorClass: "TurnLogFailed",
+        toolName: TURNLOG_LABEL,
+        elapsedMs: (deps.now ?? Date.now)() - dispatchedAtMs,
+        blocked: false
+      });
+    }).catch(() => {
+    });
+  } catch {
+  }
+  return void 0;
+}
+
 // packages/pi/src/narrow.ts
 var SHELL_TOOLS = /* @__PURE__ */ new Set(["bash", "powershell"]);
 function isShellCall(e) {
@@ -803,6 +1080,12 @@ async function confirmWithTimeout(ctx, title, message, timeoutMs = CONFIRM_TIMEO
 }
 
 // packages/pi/src/decide.ts
+function noteDecision(deps, entry) {
+  try {
+    deps.onDecision?.(entry);
+  } catch {
+  }
+}
 async function decideToolCall(event, ctx, deps) {
   try {
     const shell = isShellCall(event);
@@ -813,6 +1096,11 @@ async function decideToolCall(event, ctx, deps) {
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
     if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+      noteDecision(deps, {
+        tool_name: event.toolName,
+        tool_use_id: event.toolCallId,
+        decision: "skipped"
+      });
       return void 0;
     }
     const pullPolicies = !areToolsFresh(state.getToolsSyncedAt(), now);
@@ -829,6 +1117,11 @@ async function decideToolCall(event, ctx, deps) {
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
+    noteDecision(deps, {
+      tool_name: event.toolName,
+      tool_use_id: event.toolCallId,
+      decision: outcome.kind
+    });
     switch (outcome.kind) {
       case "allow":
         return void 0;
@@ -899,6 +1192,24 @@ async function decideInput(event, ctx, deps) {
   }
 }
 
+// packages/pi/src/toolResult.ts
+function recordToolResult(event, store) {
+  try {
+    const content = Array.isArray(event?.content) ? event.content : [];
+    const hashed = hashContent(content);
+    store.recordResult({
+      tool_name: typeof event?.toolName === "string" ? event.toolName : "",
+      tool_use_id: typeof event?.toolCallId === "string" ? event.toolCallId : "",
+      is_error: event?.isError === true,
+      ...hashed.content_sha256 === void 0 ? {} : { content_sha256: hashed.content_sha256 },
+      content_bytes: hashed.content_bytes,
+      ...hashed.hash_skipped === true ? { hash_skipped: true } : {}
+    });
+  } catch {
+  }
+  return void 0;
+}
+
 // packages/pi/src/userBash.ts
 import { randomBytes as randomBytes2 } from "node:crypto";
 
@@ -915,11 +1226,12 @@ async function decideUserBash(event, ctx, deps) {
   try {
     const command = typeof event.command === "string" ? event.command : "";
     if (command.trim() === "") return void 0;
+    const toolUseId = newUserBashId();
     const payload = buildPretoolPayload({
       // A user-typed command IS a bash command; Phase 7 registered the lowercase name.
       toolName: "bash",
       command,
-      toolUseId: newUserBashId(),
+      toolUseId,
       // Empty by construction: there is no model-produced input here, so the allowlist has nothing
       // to forward and no file body can ride along.
       toolInput: {},
@@ -930,6 +1242,7 @@ async function decideUserBash(event, ctx, deps) {
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
+    noteDecision(deps, { tool_name: "bash", tool_use_id: toolUseId, decision: outcome.kind });
     switch (outcome.kind) {
       case "allow":
         return void 0;
@@ -960,6 +1273,26 @@ async function decideUserBash(event, ctx, deps) {
 }
 
 // packages/pi/src/index.ts
+function sessionIdOf(ctx) {
+  try {
+    const id = ctx.sessionManager.getSessionId();
+    return typeof id === "string" ? id : "";
+  } catch {
+    return "";
+  }
+}
+function safeCwd(ctx) {
+  try {
+    return typeof ctx.cwd === "string" ? ctx.cwd : "";
+  } catch {
+    return "";
+  }
+}
+function versionOf(entrypoint) {
+  const slash = entrypoint.indexOf("/");
+  return slash === -1 ? entrypoint : entrypoint.slice(slash + 1);
+}
+var processHeartbeatGate = createHeartbeatGate({ now: Date.now, ttlMs: CACHE_TTL_MS });
 function defaultMakeChecker(apiKey, baseUrl, env = {}, homeDir = "") {
   const client = createApiClient({ baseUrl, apiKey });
   const cachePath = resolveCachePath(env, homeDir);
@@ -1004,7 +1337,8 @@ function createExtension(overrides = {}) {
     // The cache path is resolved from the same env/home pair the key came from, so a test with a
     // temp HOME cannot accidentally read or write the developer's real cache.
     makeChecker: overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
-    entrypoint: overrides.entrypoint
+    entrypoint: overrides.entrypoint,
+    heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate
   };
   let resolved;
   let notified = false;
@@ -1015,10 +1349,14 @@ function createExtension(overrides = {}) {
       if (apiKey !== void 0 && baseUrl !== void 0) {
         hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
       }
+      const inactive = apiKey === void 0 || baseUrl === void 0;
+      const client = inactive ? void 0 : createApiClient({ baseUrl, apiKey });
       resolved = {
         apiKey,
         entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
-        checker: apiKey === void 0 || baseUrl === void 0 ? void 0 : deps.makeChecker(apiKey, baseUrl)
+        checker: inactive ? void 0 : deps.makeChecker(apiKey, baseUrl),
+        client,
+        telemetry: client === void 0 ? void 0 : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() })
       };
     }
     return resolved;
@@ -1030,6 +1368,32 @@ function createExtension(overrides = {}) {
         if (state.apiKey === void 0 && !notified) {
           notified = true;
           notifySafe(ctx, NO_KEY_NOTICE, "info");
+        }
+        if (state.apiKey === void 0 || state.client === void 0) return void 0;
+        if (keyState.isInactive()) return void 0;
+        if (!deps.heartbeatGate.shouldSend(policyState.getFetchedAt())) return void 0;
+        deps.heartbeatGate.markSent();
+        const payload = buildHeartbeatPayload({
+          cwd: safeCwd(ctx),
+          sessionId: sessionIdOf(ctx),
+          model: ctx.model?.id,
+          clientEntrypoint: state.entrypoint,
+          hasUI: ctx.hasUI === true,
+          piVersion: versionOf(state.entrypoint)
+        });
+        const client = state.client;
+        void client.postPretool(payload).then((result) => {
+          if (result.ok) policyState.recordSuccess(result.body);
+        }).catch(() => {
+        });
+        if (SESSION_PRESENCE_ROW_ENABLED) {
+          void client.postTurnLog(
+            buildTurnLogBody(
+              { tool_calls: [], results: [], session_id: sessionIdOf(ctx), started_at: Date.now() },
+              { cwd: safeCwd(ctx), completedAtMs: Date.now() }
+            )
+          ).catch(() => {
+          });
         }
       } catch {
       }
@@ -1045,7 +1409,32 @@ function createExtension(overrides = {}) {
           entrypoint: state.entrypoint,
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
-          hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx))
+        });
+      } catch {
+        return void 0;
+      }
+    });
+    pi.on("tool_result", async (event, _ctx) => {
+      try {
+        recordToolResult(event, turnStore);
+      } catch {
+      }
+      return void 0;
+    });
+    pi.on("agent_end", (event, ctx) => {
+      try {
+        const state = init();
+        if (state.apiKey === void 0 || state.client === void 0) return void 0;
+        if (keyState.isInactive()) {
+          turnStore.take();
+          return void 0;
+        }
+        return handleAgentEnd(event, ctx, {
+          client: state.client,
+          store: turnStore,
+          ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry }
         });
       } catch {
         return void 0;
@@ -1059,7 +1448,8 @@ function createExtension(overrides = {}) {
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
-          hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx))
         });
       } catch {
         return void 0;
@@ -1073,9 +1463,11 @@ function createExtension(overrides = {}) {
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
-          hooks: { notify: (message, level) => notifySafe(ctx, message, level) }
-          // `onPrompt` is intentionally unwired: the turn store lands in a later wave, and an
-          // allowed prompt is the only place its text exists.
+          hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          // The turn log's only source for the prompt: `agent_end.messages` is pi's `newMessages`
+          // and never contains it (§A4). Called for an ALLOWED prompt only — a suppressed turn
+          // produced nothing to log.
+          onPrompt: (text) => turnStore.recordPrompt(text, sessionIdOf(ctx))
         });
       } catch {
         return void 0;

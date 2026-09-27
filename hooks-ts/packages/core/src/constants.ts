@@ -35,6 +35,26 @@ export const APP_LABEL = "pi";
 export const HOOK_SOURCE = "pi";
 export const EVENT_NAME_TOOL_USE = "tool_use";
 /**
+ * RES-05's `event_name`. It lands on `preToolUseHandler.ts:1008-1012` — the fall-through for an
+ * unrecognised event with a blank `tool_name` — which answers a `no_policy` allow carrying
+ * `policy_check_failure_action` and **no `tools_to_check`** (§C2). That is the intended outcome: the
+ * heartbeat warms the fail-open opt-out and announces the extension, and the tool list is pulled on
+ * the first genuine tool call instead. Never send a `tool_name` here — a synthetic `ls` reaches
+ * `handleCommandPolicy` and can fire a real Slack approval for a call nobody made (T-09-20).
+ */
+export const EVENT_NAME_SESSION_START = "session_start";
+/**
+ * The one-line switch from RESEARCH Open Question 1.
+ *
+ * A pretool heartbeat leaves only a Sentry span tag (`preToolUseHandler.ts:220`), so "the backend can
+ * tell the extension is present" is not durably true from it alone. One minimal `/v1/hooks/pi` POST
+ * creates a `GatewayMetrics` row with `app_label='pi'`, which is. Set this to `false` to drop the
+ * durable row and keep the heartbeat; `heartbeat.test.ts` is written to pass either way, so flipping
+ * it needs no test edit. Bounded by `derive_hook_request_id` collapsing identical empty turns into one
+ * row per session.
+ */
+export const SESSION_PRESENCE_ROW_ENABLED = true;
+/**
  * HOOK-05's `event_name`. Matched server-side at `preToolUseHandler.ts:655`, which routes to
  * `handleGuardrails` — the one branch that can deny a prompt, and the one that deliberately omits
  * `tools_to_check` from its response so a prompt check cannot clobber the tool cache (§C2).

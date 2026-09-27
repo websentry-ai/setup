@@ -17,10 +17,37 @@
 //   * **Without an API key it does nothing at all.** No requests, no verdicts, no blocks — just one
 //     notice at session start.
 //
-// Only the events actually implemented are registered — there is no placeholder handler anywhere,
-// because a registered handler is one pi will call and every registration is another way to block or
-// hang a session. The tool-result audit, the end-of-turn log and the session heartbeat are still to
-// come; a test asserts the registered set, so adding one is a deliberate act.
+// **The event surface is complete, and splits cleanly in two.** Three events decide, and three
+// record:
+//
+//   | Event         | Role     | Returns                                                |
+//   | ------------- | -------- | ------------------------------------------------------ |
+//   | `tool_call`   | decide   | `{block, reason}` or `undefined`                       |
+//   | `user_bash`   | decide   | a full `BashResult` or `undefined` — never a partial   |
+//   | `input`       | decide   | `{action:"handled"}` or `undefined` — never a transform |
+//   | `tool_result` | record   | **always `undefined`**                                 |
+//   | `agent_end`   | record   | `undefined`, synchronously, POST not awaited            |
+//   | `session_start`| record  | `undefined`; one gated heartbeat per process            |
+//
+// Nothing is registered speculatively: a registered handler is one pi will call, and every
+// registration is another way to block or hang a session. `nothrow.test.ts` asserts the exact set and
+// `build.test.ts` re-asserts it against the real bundle, so both adding and losing one is a
+// deliberate act.
+//
+// **The two fail-CLOSED exceptions**, against the fail-open default above:
+//   * an org whose last successful response asked for `policy_check_failure_action: block` — ours, and
+//     the only case where an unreachable API stops a tool call;
+//   * a thrown `user_bash` handler — pi's: it rethrows and then declines to run the typed command with
+//     nothing rendered, which is why that file's fallback is `undefined` rather than a result.
+//
+// **The cache** (RES-03) is hydrated from disk at `init()` and written back from `onSync` at `0600`
+// under a `gateway_url` + key-fingerprint identity, so one tenant's snapshot can never be read by
+// another. It bounds `tools_synced_at` only: an org's fail-open opt-out is honoured regardless of age.
+//
+// **The audit trail** is hash-only. Tool output is recorded as a sha256 and a byte count and never
+// leaves the process; the turn log's `model` is pinned to `"auto"` because the backend drops rows for
+// anything else. Two consequences are accepted and documented rather than hidden: tool-output DLP and
+// assistant-text DLP cannot fire for pi.
 //
 // Built and tested against pi 0.87.1 on Node >= 22.19.0.
 
@@ -32,7 +59,14 @@ import { createBreaker } from "../../core/src/breaker.ts";
 import { keyFingerprint, readCache, resolveCachePath, writeCache } from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
 import type { ApiClient } from "../../core/src/client.ts";
-import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
+import {
+  CACHE_TTL_MS,
+  NO_KEY_NOTICE,
+  SESSION_PRESENCE_ROW_ENABLED,
+} from "../../core/src/constants.ts";
+import { buildHeartbeatPayload, createHeartbeatGate } from "../../core/src/heartbeat.ts";
+import type { HeartbeatGate } from "../../core/src/heartbeat.ts";
+import { buildTurnLogBody } from "../../core/src/turnLog.ts";
 import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
 import { keyState } from "../../core/src/keyState.ts";
 import { resolveClientEntrypoint } from "../../core/src/piVersion.ts";
@@ -63,6 +97,33 @@ function sessionIdOf(ctx: { sessionManager: { getSessionId(): string } }): strin
   }
 }
 
+/** `ctx.cwd`, read behind a guard for the same reason. Absent means the column, not the request. */
+function safeCwd(ctx: { cwd: string }): string {
+  try {
+    return typeof ctx.cwd === "string" ? ctx.cwd : "";
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * `"pi/0.87.1"` → `"0.87.1"`, for `metadata.pi_version`.
+ *
+ * Derived from the resolved entrypoint rather than resolved a second time: two independent lookups
+ * could disagree, and the entrypoint is the value that already survived `sanitizeVersion`.
+ */
+function versionOf(entrypoint: string): string {
+  const slash = entrypoint.indexOf("/");
+  return slash === -1 ? entrypoint : entrypoint.slice(slash + 1);
+}
+
+/**
+ * RES-05's rate limit, at module scope so it outlives a session. `session_start` fires on every
+ * session transition, not once per process (§F4), and this is the only thing standing between that and
+ * a heartbeat per `/new`. Reset on `/reload`, like every other module-scope latch here.
+ */
+const processHeartbeatGate: HeartbeatGate = createHeartbeatGate({ now: Date.now, ttlMs: CACHE_TTL_MS });
+
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
   env: NodeJS.ProcessEnv;
@@ -70,6 +131,16 @@ export interface Deps {
   makeChecker(apiKey: string, baseUrl: string): PolicyChecker;
   /** `undefined` means "resolve the pi version lazily, on first use". */
   entrypoint: string | undefined;
+  /**
+   * RES-05's rate limit. Defaults to the module-scope instance, which is the right production answer:
+   * `session_start` fires on every session transition (§F4) and the limit only means something if it
+   * outlives a session.
+   *
+   * Injectable for the same reason `DecideDeps.state` is — the singleton only moves one way. Once a
+   * process has sent its heartbeat, no test in that process can get back to "never sent", so a suite
+   * whose cases each expect a cold gate would be silently order-dependent.
+   */
+  heartbeatGate: HeartbeatGate;
 }
 
 interface Resolved {
@@ -181,6 +252,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     makeChecker:
       overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
     entrypoint: overrides.entrypoint,
+    heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate,
   };
 
   let resolved: Resolved | undefined;
@@ -225,6 +297,51 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         if (state.apiKey === undefined && !notified) {
           notified = true;
           notifySafe(ctx, NO_KEY_NOTICE, "info");
+        }
+        // RES-05, strictly after the notice logic and strictly fire-and-forget. `session_start` is
+        // awaited by pi, so nothing below may be `await`ed: a slow gateway must not delay the session
+        // the developer is trying to start.
+        if (state.apiKey === undefined || state.client === undefined) return undefined;
+        if (keyState.isInactive()) return undefined;
+        if (!deps.heartbeatGate.shouldSend(policyState.getFetchedAt())) return undefined;
+        // Claimed BEFORE dispatch, like `telemetry.ts`'s rate-limit window: two `session_start`
+        // events in the same tick must not both get through.
+        deps.heartbeatGate.markSent();
+
+        const payload = buildHeartbeatPayload({
+          cwd: safeCwd(ctx),
+          sessionId: sessionIdOf(ctx),
+          model: ctx.model?.id,
+          clientEntrypoint: state.entrypoint,
+          hasUI: ctx.hasUI === true,
+          piVersion: versionOf(state.entrypoint),
+        });
+        const client = state.client;
+        void client
+          .postPretool(payload)
+          .then((result) => {
+            // The response warms `policy_check_failure_action` only. `recordSuccess` is what
+            // structurally refuses to stamp tools-freshness for a body with no `tools_to_check`
+            // (§C2/C3), so there is deliberately no special-casing here.
+            if (result.ok) policyState.recordSuccess(result.body);
+          })
+          .catch(() => {
+            // A failed heartbeat is a cache miss, never a block and never a notice.
+          });
+
+        // The durable half: one `GatewayMetrics` row so "the extension is present" is visible in the
+        // console and not only as a Sentry span tag. Behind one constant, per RESEARCH OQ1.
+        if (SESSION_PRESENCE_ROW_ENABLED) {
+          void client
+            .postTurnLog(
+              buildTurnLogBody(
+                { tool_calls: [], results: [], session_id: sessionIdOf(ctx), started_at: Date.now() },
+                { cwd: safeCwd(ctx), completedAtMs: Date.now() },
+              ),
+            )
+            .catch(() => {
+              // ditto
+            });
         }
       } catch {
         // Startup is never worth failing.

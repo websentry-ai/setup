@@ -42,6 +42,14 @@ export interface PretoolRequestBody {
    * mean the same thing to the server and the shorter body is the honest one.
    */
   pull_policies?: boolean;
+  /**
+   * RES-05. Read at `preToolUseHandler.ts:860` → `:2239`, where it suppresses **duplicate
+   * Slack-approval logging** and nothing else — in particular it has no effect on `tools_to_check`
+   * (§C2). Sent on the heartbeat because 09-CONTEXT locks it and because it is the honest description
+   * of a session's first contact; it is deliberately not sent on ordinary tool calls, where
+   * suppressing approval logging would be wrong.
+   */
+  first_approval_check?: boolean;
 }
 
 /** The four-value response enum (`DECISION`, `preToolUseHandler.ts:278-283`). */

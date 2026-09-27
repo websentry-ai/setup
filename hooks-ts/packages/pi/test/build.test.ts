@@ -95,7 +95,24 @@ test("build output stays under the size ceiling", () => {
   assert.ok(size < MAX_BYTES, `dist/pi/index.js is ${size} bytes, ceiling is ${MAX_BYTES}`);
 });
 
-test("build output loads and registers tool_call and session_start", async () => {
+/**
+ * The full event surface, asserted from the REAL build output rather than from the sources.
+ *
+ * A handler that exists in `packages/pi/src` but does not survive into the bundle is enforcement (or,
+ * for the three audit events, an audit trail) that silently does not run in production — and the
+ * sources cannot tell us that. This is also the assertion that makes adding a seventh event a
+ * deliberate act: a new registration fails here until it is named.
+ */
+const EXPECTED_EVENTS = [
+  "agent_end",
+  "input",
+  "session_start",
+  "tool_call",
+  "tool_result",
+  "user_bash",
+] as const;
+
+test("build output loads and registers all six events", async () => {
   const mod = await import(pathToFileURL(distFile).href);
 
   assert.equal(typeof mod.default, "function", "extension must default-export a factory");
@@ -110,9 +127,10 @@ test("build output loads and registers tool_call and session_start", async () =>
 
   await mod.default(stubApi);
 
-  assert.ok(registered.includes("tool_call"), `tool_call not registered (got ${registered.join(", ")})`);
-  assert.ok(
-    registered.includes("session_start"),
-    `session_start not registered (got ${registered.join(", ")})`,
+  assert.deepEqual(
+    [...registered].sort(),
+    [...EXPECTED_EVENTS],
+    `the built bundle registers ${registered.join(", ")}`,
   );
+  assert.equal(registered.length, EXPECTED_EVENTS.length, "and registers each of them exactly once");
 });
