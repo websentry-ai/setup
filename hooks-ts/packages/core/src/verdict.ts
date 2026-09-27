@@ -16,13 +16,17 @@ import type { Decision } from "./types.ts";
 /**
  * What core hands the adapter. `confirm` covers both `ask` and `approval_required`: Phase 8 renders
  * an identical local confirmation for each (Slack approval polling is Future, per 08-CONTEXT).
- * `unavailable` is the one non-allow failure outcome — see `policy.ts`.
+ * `unavailable` is the one non-allow failure outcome — see `policy.ts`. Its `reason` is optional and
+ * is **not** API text: no response body reaches this field, so it is never sanitised and never
+ * attacker-influenced. It is a constant from `constants.ts` naming a failure the generic
+ * `ENGINE_UNAVAILABLE_REASON` would describe wrongly — today, a rejected key at a fail-closed org,
+ * where "please retry" is bad advice. Absent means the generic string.
  */
 export type PolicyOutcome =
   | { kind: "allow" }
   | { kind: "deny"; reason?: string }
   | { kind: "confirm"; reason?: string }
-  | { kind: "unavailable" };
+  | { kind: "unavailable"; reason?: string };
 
 /**
  * Characters that change how the reason *reads* without being visible in it. Dropped outright:

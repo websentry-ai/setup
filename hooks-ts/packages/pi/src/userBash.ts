@@ -125,7 +125,8 @@ export async function decideUserBash(
       }
 
       case "unavailable":
-        return denyBashResult(ENGINE_UNAVAILABLE_REASON);
+        // See `decide.ts`: a core constant when the generic string would be wrong, never API text.
+        return denyBashResult(outcome.reason ?? ENGINE_UNAVAILABLE_REASON);
 
       default:
         // An outcome kind nothing here maps — a future core enum value, or a bug. Returning a

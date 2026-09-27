@@ -110,7 +110,7 @@ export async function decideInput(
       case "unavailable":
         // Only reachable for an org whose last-good failure action was `block`; every other failure
         // resolves to `allow` in core and takes the branch below.
-        notifySafe(ctx, ENGINE_UNAVAILABLE_REASON, "error");
+        notifySafe(ctx, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
         return { action: "handled" };
 
       case "confirm":

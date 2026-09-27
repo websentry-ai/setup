@@ -41,7 +41,8 @@ Strings as they appear verbatim in the built file (compare against the TUI):
 | API failure after a remembered `policy_check_failure_action: block` | `Unbound policy engine unavailable — please retry` |
 | no API key at `session_start` | `Unbound: no API key found — extension inactive` |
 | **Phase 9 —** breaker opens after repeated failures | `Unbound policy engine unreachable — allowing tool calls for 60 s` |
-| **Phase 9 —** key rejected (401/403) enough times | `Unbound: API key rejected — enforcement inactive` |
+| **Phase 9 —** key rejected (401/403) enough times, fail-OPEN org | `Unbound: API key rejected — enforcement inactive` |
+| **Phase 9 —** key rejected (401/403) enough times, org with a remembered `block` | `Unbound API key rejected — this organisation enforces fail-closed; contact your admin` — a block reason, not a notice; the session is **not** deactivated |
 | **Phase 9 —** a blocked prompt (`input`) | the same `Blocked by Unbound policy: ` prefix, raised at `error` level so the notification is **red** |
 | **Phase 9 —** `tool_use_id` of a `!cmd` / `!!cmd` | prefix `ubash_` + 20 hex characters (`ubash_` + `randomBytes(10)`), e.g. `ubash_6f1c…`; native tool calls keep pi's `call_…` format |
 

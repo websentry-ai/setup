@@ -79,6 +79,7 @@ var NO_KEY_NOTICE = "Unbound: no API key found \u2014 extension inactive";
 var BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable \u2014 allowing tool calls for 60 s";
 var BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again \u2014 enforcement resumed";
 var KEY_REJECTED_NOTICE = "Unbound: API key rejected \u2014 enforcement inactive";
+var KEY_REJECTED_BLOCK_REASON = "Unbound API key rejected \u2014 this organisation enforces fail-closed; contact your admin";
 
 // packages/core/src/breaker.ts
 function createBreaker(opts = {}) {
@@ -712,7 +713,7 @@ function createKeyState(opts = {}) {
   let consecutiveRejections = 0;
   let inactive = false;
   return {
-    recordFailure(errorClass) {
+    recordFailure(errorClass, opts2 = {}) {
       if (inactive) return void 0;
       if (typeof errorClass !== "string" || !REJECTION_LABELS.has(errorClass)) {
         consecutiveRejections = 0;
@@ -720,6 +721,10 @@ function createKeyState(opts = {}) {
       }
       consecutiveRejections += 1;
       if (consecutiveRejections < threshold) return void 0;
+      if (opts2.failClosed === true) {
+        consecutiveRejections = threshold;
+        return "rejected";
+      }
       inactive = true;
       return "inactive";
     },
@@ -847,19 +852,20 @@ function createPolicyChecker(opts) {
         const opened = breaker.recordFailure();
         if (opened !== void 0) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
       }
-      const latched = keyState2.recordFailure(res.errorClass);
-      if (latched !== void 0) {
+      const blocked = opts.state.getFailureAction() === "block";
+      const rejection = keyState2.recordFailure(res.errorClass, { failClosed: blocked });
+      if (rejection === "inactive") {
         notify(hooks, KEY_REJECTED_NOTICE, "warning");
         return { kind: "allow" };
       }
-      const blocked = opts.state.getFailureAction() === "block";
       opts.telemetry.reportBypass({
         errorClass: res.errorClass,
         toolName,
         elapsedMs: res.elapsedMs,
         blocked
       });
-      return blocked ? { kind: "unavailable" } : { kind: "allow" };
+      if (!blocked) return { kind: "allow" };
+      return rejection === "rejected" ? { kind: "unavailable", reason: KEY_REJECTED_BLOCK_REASON } : { kind: "unavailable" };
     } catch {
       return { kind: "allow" };
     }
@@ -1145,7 +1151,7 @@ async function decideToolCall(event, ctx, deps) {
         return accepted ? void 0 : { block: true, reason: DECLINED_REASON };
       }
       case "unavailable":
-        return { block: true, reason: ENGINE_UNAVAILABLE_REASON };
+        return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
     }
   } catch {
     return void 0;
@@ -1175,7 +1181,7 @@ async function decideInput(event, ctx, deps) {
         return { action: "handled" };
       }
       case "unavailable":
-        notifySafe(ctx, ENGINE_UNAVAILABLE_REASON, "error");
+        notifySafe(ctx, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
         return { action: "handled" };
       case "confirm":
         notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
@@ -1263,7 +1269,7 @@ async function decideUserBash(event, ctx, deps) {
         return accepted ? void 0 : denyBashResult(DECLINED_REASON);
       }
       case "unavailable":
-        return denyBashResult(ENGINE_UNAVAILABLE_REASON);
+        return denyBashResult(outcome.reason ?? ENGINE_UNAVAILABLE_REASON);
       default:
         return void 0;
     }

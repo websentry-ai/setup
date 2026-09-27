@@ -13,15 +13,18 @@
 // The precedence inside `checkTool`, in order, because this is where resilience and enforcement
 // disagree and every adapter depends on the answer:
 //
-//   1. **Revoked key** (WR-01) — an inactive session allows with zero HTTP, even for a fail-closed
-//      org. A rejected credential gives us no authority to decide anything.
+//   1. **Revoked key** (WR-01) — an inactive session allows with zero HTTP. Only a fail-OPEN org can
+//      ever be inactive; see step 5.
 //   2. **Breaker** (WR-02) — an open breaker allows with zero HTTP, but only for a fail-OPEN org; a
 //      `block` org is exempt from the mechanism entirely (§F8).
 //   3. **The request.** A success clears both runs and may close the breaker (one notice).
-//   4. **The latch transition** — the second consecutive 401/403 notifies once, allows, and reports
-//      nothing.
-//   5. **Decide, then report** (WR-03) — the failure action is read before `reportBypass`, so a
+//   4. **Decide** (WR-03) — the failure action is read before both the latch and `reportBypass`, so a
 //      fail-closed block is filed as a block and not as a bypass.
+//   5. **The rejection** — the second consecutive 401/403. For a fail-open org it latches: one
+//      notice, allow, nothing reported. For a fail-closed org it does NOT latch — it blocks with
+//      `KEY_REJECTED_BLOCK_REASON`, is reported as a block, and leaves the session active so it
+//      recovers on the first success. Going quiet there would be the outage that org opted out of,
+//      and would be reachable by anyone able to force a 403 onto this path.
 //
 // Pure composition on purpose: no pi import, no HTTP, no filesystem. That is what makes the
 // "client stubbed to raise synchronously" test possible, and it is what will let a future opencode
@@ -40,7 +43,12 @@
 
 import { createBreaker } from "./breaker.ts";
 import type { Breaker } from "./breaker.ts";
-import { BREAKER_CLOSED_NOTICE, BREAKER_OPEN_NOTICE, KEY_REJECTED_NOTICE } from "./constants.ts";
+import {
+  BREAKER_CLOSED_NOTICE,
+  BREAKER_OPEN_NOTICE,
+  KEY_REJECTED_BLOCK_REASON,
+  KEY_REJECTED_NOTICE,
+} from "./constants.ts";
 import { createKeyState } from "./keyState.ts";
 import type { KeyState } from "./keyState.ts";
 import { mapResponseToOutcome } from "./verdict.ts";
@@ -170,24 +178,33 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
         if (opened !== undefined) notify(hooks, BREAKER_OPEN_NOTICE, "warning");
       }
 
-      // 4. A second consecutive rejection ends the session's enforcement. Return allow BEFORE
-      //    consulting the failure action — the latch outranks fail-closed, because a credential
-      //    problem must not become an outage — and report nothing, since the errors endpoint uses
-      //    the same rejected key (§F9).
-      const latched = keyState.recordFailure(res.errorClass);
-      if (latched !== undefined) {
-        notify(hooks, KEY_REJECTED_NOTICE, "warning");
-        return { kind: "allow" };
-      }
-
-      // 5. Decide FIRST, then report (WR-03). A fail-closed org's call was blocked, not bypassed,
+      // 4. Decide FIRST, then report (WR-03). A fail-closed org's call was blocked, not bypassed,
       //    and `message.slice(0,100)` is the Sentry fingerprint — so reporting before deciding filed
       //    every fail-closed block under the "enforcement was silently skipped" alert.
       //
       // The single exception to fail-open: an org that opted out of it via a previously seen
       // `policy_check_failure_action: 'block'`. With nothing remembered — a cold start — a failure
       // allows, matching the Python hook (RESEARCH Open Question 4, deliberate).
+      //
+      // Read before the latch, not after it, because what a credential rejection *means* depends on
+      // this answer — which is the whole of the fail-closed half of WR-01.
       const blocked = opts.state.getFailureAction() === "block";
+
+      // 5. A credential rejection, at or past the threshold. Two outcomes, both by design:
+      //
+      //    * **fail-open (and cold start): latch.** One notice, then the session is inactive and
+      //      allows with zero HTTP. Nothing is reported, since `/v1/hooks/errors` authenticates with
+      //      the same rejected key (§F9).
+      //    * **fail-closed: block, and stay active.** Silence would BE the outage that org opted out
+      //      of, and it is one anybody who can produce a 403 on this path could trigger on purpose.
+      //      So the call blocks with a reason that names the cause, the failure is filed as a block
+      //      like any other fail-closed failure, and the session keeps making real attempts — so it
+      //      enforces again on the first success, with no `/reload`.
+      const rejection = keyState.recordFailure(res.errorClass, { failClosed: blocked });
+      if (rejection === "inactive") {
+        notify(hooks, KEY_REJECTED_NOTICE, "warning");
+        return { kind: "allow" };
+      }
 
       // The bypass is the audit trail for an accepted risk (T-08-08). Synchronous and unawaited by
       // contract, so a broken errors endpoint cannot slow down or change this decision.
@@ -198,7 +215,12 @@ export function createPolicyChecker(opts: PolicyCheckerOptions): PolicyChecker {
         blocked,
       });
 
-      return blocked ? { kind: "unavailable" } : { kind: "allow" };
+      if (!blocked) return { kind: "allow" };
+      // `rejection === "rejected"` is only reachable when `blocked` is true. "Please retry" is the
+      // wrong advice for a key the gateway refuses, so that case carries its own reason.
+      return rejection === "rejected"
+        ? { kind: "unavailable", reason: KEY_REJECTED_BLOCK_REASON }
+        : { kind: "unavailable" };
     } catch {
       // Unreachable through `createApiClient`, which never rejects — but an injected or future
       // client could, and this is the last net before pi turns an exception into a block.

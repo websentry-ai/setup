@@ -199,7 +199,9 @@ export async function decideToolCall(
       }
 
       case "unavailable":
-        return { block: true, reason: ENGINE_UNAVAILABLE_REASON };
+        // Core supplies a `reason` only when the generic string would misdescribe the failure (a
+        // rejected key at a fail-closed org). It is a constant, never API text.
+        return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
     }
   } catch {
     // Belt and braces: `index.ts` catches too, but an internal fault must allow, never block.

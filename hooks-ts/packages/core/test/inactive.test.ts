@@ -8,10 +8,13 @@
 //
 // Two precedence rules are asserted here because they are where resilience and enforcement disagree:
 //
-//   1. **The latch outranks fail-closed.** A rejected key means we have no authority to decide
-//      anything, so an inactive session allows even for an org whose last-good
-//      `policy_check_failure_action` is `block`. Blocking every tool call on a credential problem
-//      would turn it into an outage.
+//   1. **The latch does not apply to a fail-closed org.** For an org whose last-good
+//      `policy_check_failure_action` is `block`, a rejected key is a *blocking* failure carrying
+//      `KEY_REJECTED_BLOCK_REASON`, and the session stays active — so it enforces again the moment
+//      the key is fixed, with no `/reload`. Going quiet there would hand anyone who can make this
+//      path return a 403 (a loopback proxy, corporate egress, a WAF) a session-long enforcement
+//      shutdown for the customers who explicitly paid for fail-closed. Orgs *without* a remembered
+//      `block` keep the original latch: one notice, then inactive.
 //   2. **The latch outranks the breaker.** It is checked first, before any failure-action read and
 //      before any fetch, so an inactive session makes zero requests of any kind.
 //
@@ -24,7 +27,13 @@ import test from "node:test";
 
 import { createApiClient } from "../src/client.ts";
 import type { ApiClient, PretoolResult } from "../src/client.ts";
-import { ERRORS_PATH, KEY_REJECTED_NOTICE, PRETOOL_PATH } from "../src/constants.ts";
+import {
+  ERROR_CATEGORY_BLOCKED,
+  ERRORS_PATH,
+  KEY_REJECTED_BLOCK_REASON,
+  KEY_REJECTED_NOTICE,
+  PRETOOL_PATH,
+} from "../src/constants.ts";
 import { createKeyState } from "../src/keyState.ts";
 import { createPolicyChecker } from "../src/policy.ts";
 import { createPolicyState } from "../src/policyState.ts";
@@ -132,6 +141,37 @@ test("WR-01 keyState counts only exact 401/403 labels, and only consecutive ones
   assert.equal(fourth.recordFailure("TimeoutError"), undefined);
   assert.equal(fourth.recordFailure("HttpStatus401"), undefined, "the 401 run restarted");
   assert.equal(fourth.isInactive(), false);
+});
+
+test("WR-01 a fail-closed rejection is reported every time and never latches", () => {
+  const keyState = createKeyState();
+  const failClosed = { failClosed: true };
+
+  assert.equal(keyState.recordFailure("HttpStatus401", failClosed), undefined, "one is still a fluke");
+  assert.equal(keyState.recordFailure("HttpStatus401", failClosed), "rejected", "the second blocks");
+  assert.equal(keyState.isInactive(), false, "a fail-closed org is never deactivated");
+
+  // "rejected" on EVERY subsequent rejection, not just the transition: unlike the one-notice latch,
+  // each of these has to produce a block verdict of its own.
+  assert.equal(keyState.recordFailure("HttpStatus403", failClosed), "rejected");
+  assert.equal(keyState.recordFailure("HttpStatus401", failClosed), "rejected");
+  assert.equal(keyState.isInactive(), false);
+
+  // A working key resets the run, so the next single rejection is an ordinary failure again.
+  keyState.recordSuccess();
+  assert.equal(keyState.recordFailure("HttpStatus401", failClosed), undefined, "the run restarted");
+
+  // A non-credential failure still breaks the run, and is still nobody's business here.
+  assert.equal(keyState.recordFailure("TimeoutError", failClosed), undefined);
+  assert.equal(keyState.recordFailure("HttpStatus401", failClosed), undefined);
+  assert.equal(keyState.isInactive(), false);
+
+  // The flag is per call, because the remembered failure action is read per call. Omitting it is the
+  // fail-open default, which latches.
+  const failOpen = createKeyState();
+  failOpen.recordFailure("HttpStatus401");
+  assert.equal(failOpen.recordFailure("HttpStatus401"), "inactive", "the default is unchanged");
+  assert.equal(failOpen.recordFailure("HttpStatus401", failClosed), undefined, "and stays latched");
 });
 
 test("WR-01 a near-miss label cannot fool the latch (T-09-17)", () => {
@@ -252,24 +292,107 @@ test("WR-01 a success between two 401s resets the run", async () => {
   }
 });
 
-test("WR-01 inactive allows even for a block-on-failure org — the latch outranks fail-closed", async () => {
+test("WR-01 a fail-closed org blocks on a rejected key instead of going inactive", async () => {
   const api = await startMockApi({ mode: "401" });
   try {
     const h = harness(api, { failureAction: "block" });
     assert.equal(h.state.getFailureAction(), "block", "this org opted out of fail-open");
 
-    // The first rejection is an ordinary failure, so the org's contract still applies.
+    // The first rejection is an ordinary failure, so the org's contract applies with the generic
+    // engine-unavailable reason.
     assert.deepEqual(await h.check(), { kind: "unavailable" }, "one 401 still honours block");
 
-    // The second makes it inactive, and an inactive session has no authority to block anything.
-    assert.deepEqual(await h.check(), { kind: "allow" }, "the latch allows, never blocks");
+    // The second is a credential problem, and now says so — but it is still a block. The session
+    // stays ACTIVE, which is the whole point: it recovers the moment the key is fixed.
+    assert.deepEqual(
+      await h.check(),
+      { kind: "unavailable", reason: KEY_REJECTED_BLOCK_REASON },
+      "a rejected key blocks a fail-closed org, and names itself",
+    );
+    assert.equal(h.keyState.isInactive(), false, "and never deactivates it");
+    assert.deepEqual(h.notices, [], "the 'enforcement inactive' notice would be a lie here");
+
+    // A latched session would have stopped making requests. This one has not.
+    const before = pretoolCalls(api).length;
+    assert.deepEqual(await h.check(), { kind: "unavailable", reason: KEY_REJECTED_BLOCK_REASON });
+    assert.equal(pretoolCalls(api).length, before + 1, "every call is still a real attempt");
+    assert.equal(h.keyState.isInactive(), false);
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-01 the fail-closed rejection reason is the locked string", () => {
+  // Spelled out so a reword of the constant is a deliberate act: this is the only thing the
+  // developer and the model see on every blocked call while the key is broken.
+  assert.equal(
+    KEY_REJECTED_BLOCK_REASON,
+    "Unbound API key rejected — this organisation enforces fail-closed; contact your admin",
+  );
+});
+
+test("WR-01 a fail-closed key rejection is filed as a block, not as a bypass", async () => {
+  const api = await startMockApi({ mode: "401" });
+  try {
+    const h = harness(api, { failureAction: "block" });
+    await h.check();
+    await h.check();
+    await sleep(60);
+
+    // The rate limiter is disabled in the harness, so both failures report.
+    const categories = errorReports(api).map(
+      (r) => (r.body as { errors?: { category?: unknown }[] }).errors?.[0]?.category,
+    );
+    assert.deepEqual(
+      categories,
+      [ERROR_CATEGORY_BLOCKED, ERROR_CATEGORY_BLOCKED],
+      `both are blocks, including the rejection: ${JSON.stringify(categories)}`,
+    );
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-01 a fail-closed org enforces again as soon as the key works", async () => {
+  const api = await startMockApi({ mode: "401" });
+  try {
+    const h = harness(api, { failureAction: "block" });
+    await h.check();
+    assert.deepEqual(await h.check(), { kind: "unavailable", reason: KEY_REJECTED_BLOCK_REASON });
+
+    // The developer fixes the key. No `/reload`: a real verdict comes straight back, which a latched
+    // session could never produce because it makes no requests at all.
+    api.setMode("deny");
+    assert.deepEqual(
+      await h.check(),
+      { kind: "deny", reason: "Reading secrets is blocked." },
+      "enforcement resumes on the very next call",
+    );
+    assert.equal(h.keyState.isInactive(), false);
+
+    // And the run is reset, so the next single rejection is an ordinary failure again.
+    api.setMode("401");
+    assert.deepEqual(await h.check(), { kind: "unavailable" }, "no dedicated reason yet");
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-01 an org with no remembered block still latches, exactly as before", async () => {
+  // The cold-start and fail-open case is unchanged: no authority to decide, so no enforcement, one
+  // notice, then silence. Asserted here next to the fail-closed case because the two are the same
+  // code path parameterised by one boolean.
+  const api = await startMockApi({ mode: "401" });
+  try {
+    const h = harness(api, { failureAction: "allow" });
+    assert.deepEqual(await h.check(), { kind: "allow" });
+    assert.deepEqual(await h.check(), { kind: "allow" }, "the latch allows, it never blocks");
     assert.equal(h.keyState.isInactive(), true);
+    assert.deepEqual(h.notices, [{ message: KEY_REJECTED_NOTICE, level: "warning" }]);
 
     const after = pretoolCalls(api).length;
-    for (let i = 0; i < 3; i += 1) {
-      assert.deepEqual(await h.check(), { kind: "allow" }, "and keeps allowing");
-    }
-    assert.equal(pretoolCalls(api).length, after, "with zero requests, even for a block org");
+    await h.check();
+    assert.equal(pretoolCalls(api).length, after, "and then makes no requests");
   } finally {
     await api.close();
   }

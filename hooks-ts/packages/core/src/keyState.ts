@@ -13,10 +13,19 @@
 //   * **Two, not one.** A single 401 can be a deploy blip or a race with a key rotation; going silent
 //     on the first would hand any transient server-side rejection a session-long enforcement
 //     shutdown.
-//   * **Never a block.** A rejected key means we have no authority to decide anything, so the latch
-//     allows — even for an org whose last-good `policy_check_failure_action` is `block`. Turning a
-//     credential problem into an outage is a worse failure than the bypass it would prevent, and the
-//     bypass is already the product's locked posture.
+//   * **Never a block — for an org that has fail-open.** A rejected key means we have no authority to
+//     decide anything, so the latch allows. Turning a credential problem into an outage is a worse
+//     failure than the bypass it would prevent, and the bypass is already that org's posture.
+//   * **But a fail-CLOSED org is not latched at all.** For an org whose last-good
+//     `policy_check_failure_action` is `block`, silence IS the outage it is trying to prevent, and it
+//     is one anybody who can produce a 401/403 on this path could trigger deliberately — a proxy on
+//     loopback, corporate egress, a WAF or CDN in front of the gateway. So `failClosed` makes every
+//     rejection at or past the threshold return `"rejected"` and leaves the session ACTIVE: the
+//     caller blocks with `KEY_REJECTED_BLOCK_REASON`, keeps making real attempts, and starts
+//     enforcing again on the first success, with no `/reload`.
+//
+//     The flag is a per-call argument rather than construction state because the remembered failure
+//     action is read per call: it can only change on a success, and a success resets the run anyway.
 //   * **Exact label equality, never a substring** (T-09-17). `client.ts` builds its label as
 //     `HttpStatus${status}`, so a substring test for `HttpStatus401` would also match a future
 //     `HttpStatus4010`, and a 4010-series status is not a credential rejection.
@@ -32,12 +41,28 @@ import { KEY_REJECTION_THRESHOLD } from "./constants.ts";
 /** The exact `errorClass` labels `client.ts` produces for a rejected credential. */
 const REJECTION_LABELS: ReadonlySet<string> = new Set(["HttpStatus401", "HttpStatus403"]);
 
+/**
+ * What a recorded failure means to the caller.
+ *
+ *   * `undefined` — not a credential rejection, or not enough of them yet. Nothing to do.
+ *   * `"inactive"` — the latch just engaged. Returned on the **transition only**, so the caller
+ *     notifies once per session rather than once per rejected call.
+ *   * `"rejected"` — at or past the threshold with `failClosed`. Returned on **every** such call,
+ *     because each one has to produce its own block verdict. The session is not latched.
+ */
+export type KeyRejectionEffect = "inactive" | "rejected" | undefined;
+
+/** Per-call context the latch cannot read for itself — see the header. */
+export interface KeyFailureOptions {
+  /** `true` when the remembered `policy_check_failure_action` is `block`. Defaults to `false`. */
+  failClosed?: boolean;
+}
+
 export interface KeyState {
   /**
-   * Feed every failure's `errorClass`. Returns `"inactive"` on the transition **only**, so the
-   * caller notifies once per session rather than once per rejected call.
+   * Feed every failure's `errorClass`, plus whether the org is fail-closed *on this call*.
    */
-  recordFailure(errorClass: string): "inactive" | undefined;
+  recordFailure(errorClass: string, opts?: KeyFailureOptions): KeyRejectionEffect;
   /** A success breaks the consecutive run. It does not revive an already-latched session. */
   recordSuccess(): void;
   isInactive(): boolean;
@@ -56,7 +81,7 @@ export function createKeyState(opts: KeyStateOptions = {}): KeyState {
   let inactive = false;
 
   return {
-    recordFailure(errorClass: string): "inactive" | undefined {
+    recordFailure(errorClass: string, opts: KeyFailureOptions = {}): KeyRejectionEffect {
       if (inactive) return undefined;
 
       // `errorClass` is typed `string` but arrives off a network result, so it is treated as data.
@@ -67,6 +92,15 @@ export function createKeyState(opts: KeyStateOptions = {}): KeyState {
 
       consecutiveRejections += 1;
       if (consecutiveRejections < threshold) return undefined;
+
+      if (opts.failClosed === true) {
+        // No latch: the org's contract is that a failure blocks, and a rejection is a failure. The
+        // count is clamped so a long outage cannot drift it upward without bound; `recordSuccess`
+        // is still what clears it.
+        consecutiveRejections = threshold;
+        return "rejected";
+      }
+
       inactive = true;
       return "inactive";
     },

@@ -218,3 +218,14 @@ export const BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again — 
  * message.
  */
 export const KEY_REJECTED_NOTICE = "Unbound: API key rejected — enforcement inactive";
+/**
+ * The fail-CLOSED half of WR-01. An org that opted out of fail-open does not get the latch above:
+ * going quiet on a credential problem would hand anyone able to produce a 401/403 on this path — a
+ * loopback proxy, corporate egress, a WAF — a session-long enforcement shutdown, for exactly the
+ * customers who paid for the opposite. So the rejection blocks, and says why.
+ *
+ * It replaces `ENGINE_UNAVAILABLE_REASON` on that path only: "please retry" is the wrong advice when
+ * retrying cannot work. The session stays active, so the fix is to correct the key, not to reload.
+ */
+export const KEY_REJECTED_BLOCK_REASON =
+  "Unbound API key rejected — this organisation enforces fail-closed; contact your admin";
