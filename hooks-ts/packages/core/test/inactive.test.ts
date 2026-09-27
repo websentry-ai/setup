@@ -315,7 +315,7 @@ test("WR-01 keyState is optional: a checker built without one behaves as in Phas
 });
 
 test("WR-01 an inactive session cannot reject: checkTool stays total", async () => {
-  const hostile: ApiClient = {
+  const hostile: Pick<ApiClient, "postPretool" | "postHookErrors"> = {
     postPretool: (): Promise<PretoolResult> => {
       throw new Error("injected fault");
     },

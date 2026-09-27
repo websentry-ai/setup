@@ -330,7 +330,7 @@ test("mapResponseToOutcome folds ask and approval_required into one confirm outc
 
 const FIXED_NOW = 1_700_000_000_000;
 
-function checkerFor(api: MockApi, client?: ApiClient) {
+function checkerFor(api: MockApi, client?: Pick<ApiClient, "postPretool" | "postHookErrors">) {
   const wire =
     client ??
     createApiClient({
@@ -451,7 +451,9 @@ test("RES-01 a remembered policy_check_failure_action of block turns a failure u
 });
 
 test("RES-01 a client that throws synchronously still yields an allow", async () => {
-  const throwing: ApiClient = {
+  // Annotated with what the checker and the reporter actually consume, not the whole `ApiClient`:
+  // this double has no business knowing that a turn-log endpoint exists.
+  const throwing: Pick<ApiClient, "postPretool" | "postHookErrors"> = {
     postPretool: () => {
       throw new Error("injected fault");
     },
@@ -478,7 +480,10 @@ test("RES-01 a client that throws synchronously still yields an allow", async ()
 // is an injected callback, wired by the composition root in `packages/pi/src/index.ts` (09-04).
 
 /** A client that answers with a fixed body and never touches the network. */
-function stubClient(body: Record<string, unknown>, ok = true): ApiClient {
+function stubClient(
+  body: Record<string, unknown>,
+  ok = true,
+): Pick<ApiClient, "postPretool" | "postHookErrors"> {
   return {
     postPretool: async () =>
       ok
@@ -488,7 +493,7 @@ function stubClient(body: Record<string, unknown>, ok = true): ApiClient {
   };
 }
 
-function telemetryFor(client: ApiClient) {
+function telemetryFor(client: Pick<ApiClient, "postHookErrors">) {
   return createTelemetry({ client, apiKey: TEST_KEY, now: () => FIXED_NOW });
 }
 

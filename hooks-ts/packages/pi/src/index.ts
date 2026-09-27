@@ -31,6 +31,7 @@ import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-a
 import { createBreaker } from "../../core/src/breaker.ts";
 import { keyFingerprint, readCache, resolveCachePath, writeCache } from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
+import type { ApiClient } from "../../core/src/client.ts";
 import { NO_KEY_NOTICE } from "../../core/src/constants.ts";
 import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
 import { keyState } from "../../core/src/keyState.ts";
@@ -39,7 +40,9 @@ import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
+import type { Telemetry } from "../../core/src/telemetry.ts";
 import { turnStore } from "../../core/src/turn.ts";
+import { handleAgentEnd } from "./agentEnd.ts";
 import { decideToolCall } from "./decide.ts";
 import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
@@ -74,6 +77,20 @@ interface Resolved {
   entrypoint: string;
   /** Absent exactly when no key resolved — the inactive state. */
   checker: PolicyChecker | undefined;
+  /**
+   * The client the **non-decision** events use: the turn log and the heartbeat. Absent exactly when
+   * `checker` is.
+   *
+   * A second instance rather than the checker's, deliberately. `ApiClient` is stateless — the state
+   * that matters (the breaker, the key latch) lives in `PolicyChecker` and in the module-scope
+   * `keyState` — and the two paths want different postures: a tool call is worth a 20 s wait and a
+   * circuit breaker, while a turn log is fire-and-forget telemetry that must never open a circuit on
+   * a gateway the decision path still needs. What they DO share is the revoked-key latch, which is
+   * why every registration below consults `keyState` before sending (§F9).
+   */
+  client: ApiClient | undefined;
+  /** Rate-limited failure reporting for the turn log. Absent exactly when `checker` is. */
+  telemetry: Telemetry | undefined;
 }
 
 /**
@@ -183,13 +200,17 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
       if (apiKey !== undefined && baseUrl !== undefined) {
         hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
       }
+      const inactive = apiKey === undefined || baseUrl === undefined;
+      const client = inactive ? undefined : createApiClient({ baseUrl, apiKey });
       resolved = {
         apiKey,
         entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
-        checker:
-          apiKey === undefined || baseUrl === undefined
+        checker: inactive ? undefined : deps.makeChecker(apiKey, baseUrl),
+        client,
+        telemetry:
+          client === undefined
             ? undefined
-            : deps.makeChecker(apiKey, baseUrl),
+            : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
       };
     }
     return resolved;
@@ -244,6 +265,32 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         // wrong about that is a rewritten tool result.
       }
       return undefined;
+    });
+
+    // RES-04. NOT declared `async` and containing no `await`: this event is part of pi's run
+    // settlement (`AC/dist/types.d.ts:418-421`), so the handler hands back a resolved value at once
+    // and the POST finishes on its own time under its own 10 s deadline.
+    pi.on("agent_end", (event, ctx) => {
+      try {
+        const state = init();
+        // No key ⇒ nothing is sent, and the record is left alone rather than discarded: RES-06's
+        // "inert without a key" is about the network, and a `/reload` after adding one should still
+        // find a session's worth of context. A rejected key is different — it is permanent for the
+        // session, so the record is taken and dropped rather than growing without bound (§F9).
+        if (state.apiKey === undefined || state.client === undefined) return undefined;
+        if (keyState.isInactive()) {
+          turnStore.take();
+          return undefined;
+        }
+        return handleAgentEnd(event, ctx, {
+          client: state.client,
+          store: turnStore,
+          ...(state.telemetry === undefined ? {} : { telemetry: state.telemetry }),
+        });
+      } catch {
+        // Telemetry is never worth a diagnostic on the developer's screen.
+        return undefined;
+      }
     });
 
     pi.on("user_bash", async (event, ctx) => {

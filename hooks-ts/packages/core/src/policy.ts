@@ -72,7 +72,14 @@ export interface PolicyChecker {
 }
 
 export interface PolicyCheckerOptions {
-  client: ApiClient;
+  /**
+   * Narrowed to the one method the decision path calls, matching `TelemetryOptions.client`.
+   *
+   * The checker has no business with the turn log or the error endpoint — those have their own
+   * postures and their own call sites — and asking for the whole `ApiClient` would mean every new
+   * endpoint invalidated every test double of a module that never uses it.
+   */
+  client: Pick<ApiClient, "postPretool">;
   state: PolicyState;
   telemetry: Telemetry;
   /**

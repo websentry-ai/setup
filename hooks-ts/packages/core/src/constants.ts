@@ -48,10 +48,37 @@ export const EVENT_NAME_USER_PROMPT = "user_prompt";
 export const USER_BASH_ID_PREFIX = "ubash_";
 export const PRETOOL_PATH = "/v1/hooks/pretool";
 export const ERRORS_PATH = "/v1/hooks/errors";
+/**
+ * The turn log (RES-04). `piHandler` is registered here and at `/hooks/pi`; unlike pretool, a missing
+ * `Authorization: Bearer` is a hard 401 (`hooksHandlerFactory.ts:46-50`).
+ */
+export const TURNLOG_PATH = "/v1/hooks/pi";
+/**
+ * **The turn log's `model` is this literal, not `ctx.model?.id`. Do not "improve" it.**
+ *
+ * `add_gateway_metrics_task.py:565-577` runs `check_valid_record` and returns early on
+ * `"Model Not found"` — silently, with no row created. The `add_new_model` path that would register
+ * an unknown id runs only for proxy requests (`:555-557`), and hook telemetry is not one. So sending
+ * a real id such as `openrouter/openai/gpt-4.1-nano` usually means **the turn is never recorded at
+ * all**. `'auto'` is the fallback every Python hook uses (`unbound.py:4983`) and is listed in
+ * `PROXY_FALLBACK_MODEL_NAMES` (`proxy_service.py:62`).
+ *
+ * The real model id is still available server-side on the proxy path, and on `agent_end`'s messages
+ * for anyone who later wants it — losing it here costs analytics nothing and buys every row.
+ */
+export const TURNLOG_MODEL = "auto";
+/** The `tool_use[]` entry discriminator the backend's reader expects (`PY:4888-4896`). */
+export const TURNLOG_TOOL_USE_TYPE = "PostToolUse";
 
 // --- Timeouts (RESEARCH §F5: an unbounded confirm hangs the whole tool batch) -----------------
 export const PRETOOL_TIMEOUT_MS = 20_000;
 export const ERRORS_TIMEOUT_MS = 10_000;
+/**
+ * The turn-log deadline, locked by 09-CONTEXT and matching the Python hook's 10 s curl timeout
+ * (`PY:5010-5041`). It bounds the REQUEST, not the handler: `agent_end` returns synchronously and the
+ * POST finishes on its own, so this is how long a socket may stay open, never how long pi waits.
+ */
+export const TURNLOG_TIMEOUT_MS = 10_000;
 export const CONFIRM_TIMEOUT_MS = 120_000;
 /** One bypass self-report per minute, per `unbound.py`'s convention (§B7). */
 export const ERROR_REPORT_INTERVAL_MS = 60_000;

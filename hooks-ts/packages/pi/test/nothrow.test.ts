@@ -205,8 +205,9 @@ test("RES-01 the default export is a factory registering exactly the implemented
 
   // Grows one entry per implemented event, and no further: an accidental placeholder handler is a
   // handler pi will call, and every registration is another way to block or hang a session.
-  assert.equal(stub.registered.length, 5, `registered ${stub.registered.join(", ")}`);
+  assert.equal(stub.registered.length, 6, `registered ${stub.registered.join(", ")}`);
   assert.deepStrictEqual([...stub.registered].sort(), [
+    "agent_end",
     "input",
     "session_start",
     "tool_call",
