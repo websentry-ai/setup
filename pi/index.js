@@ -1338,23 +1338,27 @@ function versionOf(entrypoint) {
   return slash === -1 ? entrypoint : entrypoint.slice(slash + 1);
 }
 var processHeartbeatGate = createHeartbeatGate({ now: Date.now, ttlMs: CACHE_TTL_MS });
+function makeCacheSync(apiKey, baseUrl, env = {}, homeDir = "") {
+  const cachePath = resolveCachePath(env, homeDir);
+  if (cachePath === void 0) return void 0;
+  const fingerprint = keyFingerprint(apiKey);
+  return (snapshot) => {
+    void writeCache(cachePath, {
+      ...snapshot,
+      gateway_url: baseUrl,
+      key_fingerprint: fingerprint
+    });
+  };
+}
 function defaultMakeChecker(apiKey, baseUrl, env = {}, homeDir = "") {
   const client = createApiClient({ baseUrl, apiKey });
-  const cachePath = resolveCachePath(env, homeDir);
-  const fingerprint = keyFingerprint(apiKey);
   return createPolicyChecker({
     client,
     state: policyState,
     telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
     breaker: createBreaker({ now: Date.now }),
     keyState,
-    onSync: cachePath === void 0 ? void 0 : (snapshot) => {
-      void writeCache(cachePath, {
-        ...snapshot,
-        gateway_url: baseUrl,
-        key_fingerprint: fingerprint
-      });
-    }
+    onSync: makeCacheSync(apiKey, baseUrl, env, homeDir)
   });
 }
 function hydrateFromCache(apiKey, baseUrl, env, homeDir) {
@@ -1401,7 +1405,8 @@ function createExtension(overrides = {}) {
         entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
         checker: inactive ? void 0 : deps.makeChecker(apiKey, baseUrl),
         client,
-        telemetry: client === void 0 ? void 0 : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() })
+        telemetry: client === void 0 ? void 0 : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+        cacheSync: inactive ? void 0 : makeCacheSync(apiKey, baseUrl, deps.env, deps.homeDir)
       };
     }
     return resolved;
@@ -1432,7 +1437,12 @@ function createExtension(overrides = {}) {
         });
         const client = state.client;
         void client.postPretool(payload).then((result) => {
-          if (result.ok) policyState.recordSuccess(result.body);
+          if (!result.ok) return;
+          policyState.recordSuccess(result.body);
+          try {
+            state.cacheSync?.(policyState.snapshot());
+          } catch {
+          }
         }).catch(() => {
         });
         if (SESSION_PRESENCE_ROW_ENABLED) {
@@ -1536,5 +1546,6 @@ var index_default = createExtension();
 export {
   createExtension,
   index_default as default,
-  defaultMakeChecker
+  defaultMakeChecker,
+  makeCacheSync
 };

@@ -73,6 +73,7 @@ import { resolveClientEntrypoint } from "../../core/src/piVersion.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
+import type { PolicySnapshot } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
 import { turnStore } from "../../core/src/turn.ts";
@@ -162,6 +163,14 @@ interface Resolved {
   client: ApiClient | undefined;
   /** Rate-limited failure reporting for the turn log. Absent exactly when `checker` is. */
   telemetry: Telemetry | undefined;
+  /**
+   * RES-03's cache writer, the SAME closure `defaultMakeChecker` hands to `onSync`. Held here so the
+   * `session_start` heartbeat can persist what it learned: `policy_check_failure_action` is the one
+   * field that turns a failure into a block, the heartbeat is the first thing in a session that can
+   * learn it, and in memory alone it does not survive the `/reload` or restart that `hydrateFromCache`
+   * exists to serve. Absent when no key resolved, or when no cache path could be resolved at all.
+   */
+  cacheSync: ((snapshot: PolicySnapshot) => void) | undefined;
 }
 
 /**
@@ -175,12 +184,35 @@ interface Resolved {
  *     instance is the whole point, because "no further HTTP" has to include `/v1/hooks/errors`, which
  *     authenticates with the same rejected key (§F9);
  *   * `onSync` bound to the resolved cache path and identity, so a successful check persists the
- *     policy snapshot for the next session (RES-03).
+ *     policy snapshot for the next session (RES-03) — built by `makeCacheSync` above, which the
+ *     heartbeat path uses too. One closure, so the two cannot disagree about the identity the file is
+ *     bound to; two copies of that binding would be two chances to write a file the reader rejects.
  *
  * Exported so `compose.test.ts` can assert the per-base-URL breaker directly. `env` / `homeDir`
  * default to values that make `resolveCachePath` refuse, i.e. no cache rather than a cache in the
  * wrong place.
  */
+export function makeCacheSync(
+  apiKey: string,
+  baseUrl: string,
+  env: NodeJS.ProcessEnv = {},
+  homeDir = "",
+): ((snapshot: PolicySnapshot) => void) | undefined {
+  const cachePath = resolveCachePath(env, homeDir);
+  if (cachePath === undefined) return undefined;
+  const fingerprint = keyFingerprint(apiKey);
+  return (snapshot: PolicySnapshot) => {
+    // Total by contract: `writeCache` returns false rather than throwing, and both call sites wrap
+    // this anyway — a cache that could not be written is a round trip next session, never a failed
+    // tool call and never a failed session start.
+    void writeCache(cachePath, {
+      ...snapshot,
+      gateway_url: baseUrl,
+      key_fingerprint: fingerprint,
+    });
+  };
+}
+
 export function defaultMakeChecker(
   apiKey: string,
   baseUrl: string,
@@ -188,27 +220,13 @@ export function defaultMakeChecker(
   homeDir = "",
 ): PolicyChecker {
   const client = createApiClient({ baseUrl, apiKey });
-  const cachePath = resolveCachePath(env, homeDir);
-  const fingerprint = keyFingerprint(apiKey);
   return createPolicyChecker({
     client,
     state: policyState,
     telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
     breaker: createBreaker({ now: Date.now }),
     keyState,
-    onSync:
-      cachePath === undefined
-        ? undefined
-        : (snapshot) => {
-            // Total by contract: `writeCache` returns false rather than throwing, and `policy.ts`
-            // wraps this call anyway — a cache that could not be written is a round trip next
-            // session, never a failed tool call.
-            void writeCache(cachePath, {
-              ...snapshot,
-              gateway_url: baseUrl,
-              key_fingerprint: fingerprint,
-            });
-          },
+    onSync: makeCacheSync(apiKey, baseUrl, env, homeDir),
   });
 }
 
@@ -283,6 +301,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           client === undefined
             ? undefined
             : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+        cacheSync: inactive ? undefined : makeCacheSync(apiKey, baseUrl, deps.env, deps.homeDir),
       };
     }
     return resolved;
@@ -346,7 +365,20 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
             // The response warms `policy_check_failure_action` only. `recordSuccess` is what
             // structurally refuses to stamp tools-freshness for a body with no `tools_to_check`
             // (§C2/C3), so there is deliberately no special-casing here.
-            if (result.ok) policyState.recordSuccess(result.body);
+            if (!result.ok) return;
+            policyState.recordSuccess(result.body);
+            // ...and then to disk, through the same identity-bound seam the checker's `onSync` uses.
+            // In memory alone, an opt-out learned here died with the process — so a fail-closed org
+            // that had only ever been seen by a heartbeat came back up failing OPEN. The snapshot is
+            // whatever `recordSuccess` just left, which is why the two-timestamp rule holds for free:
+            // no heartbeat shape carries `tools_to_check`, so `tools_synced_at` is either absent or
+            // the value hydrated from this same file, never a fresh stamp.
+            try {
+              state.cacheSync?.(policyState.snapshot());
+            } catch {
+              // A cache that could not be written costs one round trip next session. It must never
+              // cost the developer their session start.
+            }
           })
           .catch(() => {
             // A failed heartbeat is a cache miss, never a block and never a notice.
