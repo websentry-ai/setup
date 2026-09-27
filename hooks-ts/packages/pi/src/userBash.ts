@@ -39,6 +39,7 @@ import {
 import { buildPretoolPayload } from "../../core/src/payload.ts";
 import type { CheckHooks } from "../../core/src/policy.ts";
 import { denyBashResult } from "./bashResult.ts";
+import { noteDecision } from "./decide.ts";
 import type { DecideCtx, DecideDeps } from "./decide.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 
@@ -76,11 +77,14 @@ export async function decideUserBash(
     // Nothing to evaluate. The server's entry gate would answer `allow` after a full round trip.
     if (command.trim() === "") return undefined;
 
+    // Hoisted out of the payload build so the turn record can reference the same id the gateway saw:
+    // a `tool_calls[]` entry whose `tool_use_id` did not match the audited call would be unjoinable.
+    const toolUseId = newUserBashId();
     const payload = buildPretoolPayload({
       // A user-typed command IS a bash command; Phase 7 registered the lowercase name.
       toolName: "bash",
       command,
-      toolUseId: newUserBashId(),
+      toolUseId,
       // Empty by construction: there is no model-produced input here, so the allowlist has nothing
       // to forward and no file body can ride along.
       toolInput: {},
@@ -93,6 +97,10 @@ export async function decideUserBash(
     const hooks: CheckHooks =
       deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
+    // A typed `!cmd` is a real tool call in the audit trail, so it belongs in the turn record on the
+    // same terms — `noteDecision` swallows its own failures, which matters more here than anywhere:
+    // a throw out of this function means the command silently never runs (§A1.2).
+    noteDecision(deps, { tool_name: "bash", tool_use_id: toolUseId, decision: outcome.kind });
 
     switch (outcome.kind) {
       case "allow":

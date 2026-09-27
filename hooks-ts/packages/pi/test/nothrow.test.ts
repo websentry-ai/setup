@@ -205,13 +205,36 @@ test("RES-01 the default export is a factory registering exactly the implemented
 
   // Grows one entry per implemented event, and no further: an accidental placeholder handler is a
   // handler pi will call, and every registration is another way to block or hang a session.
-  assert.equal(stub.registered.length, 4, `registered ${stub.registered.join(", ")}`);
+  assert.equal(stub.registered.length, 5, `registered ${stub.registered.join(", ")}`);
   assert.deepStrictEqual([...stub.registered].sort(), [
     "input",
     "session_start",
     "tool_call",
+    "tool_result",
     "user_bash",
   ]);
+});
+
+test("HOOK-06 the registered tool_result handler returns undefined, never a result patch", async () => {
+  const stub = stubApi();
+  await extension(stub.api);
+  const handler = stub.handlers.get("tool_result");
+  assert.ok(handler !== undefined, "tool_result must be registered");
+
+  // Whatever pi hands it — a real result, an error, junk — the answer is the same one value.
+  for (const event of [
+    { type: "tool_result", toolCallId: "c1", toolName: "bash", input: {}, content: [{ type: "text", text: "out" }], isError: false },
+    { type: "tool_result", toolCallId: "c2", toolName: "read", input: {}, content: [], isError: true },
+    { type: "tool_result" },
+    null,
+  ]) {
+    const result = await handler(event, createFakeCtx());
+    assert.strictEqual(
+      result,
+      undefined,
+      `any defined key rewrites the real tool result (agent-session.js:265-294): ${JSON.stringify(event)}`,
+    );
+  }
 });
 
 // HOOK-04's never-throw guarantee, which protects the phase's only SILENT failure mode. Every other

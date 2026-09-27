@@ -62,6 +62,37 @@ export interface DecideDeps {
    * is built once in `init()` and can never capture a `ctx` of its own.
    */
   hooks?: CheckHooks;
+  /**
+   * Hand the decision that actually applied to the turn record (RES-04).
+   *
+   * Without this seam the `PolicyOutcome.kind` dies inside this function — `decideToolCall` returns
+   * `BlockResult | undefined`, which cannot distinguish an allow from a cache skip from a declined
+   * confirm. The turn log's `tool_calls[].decision` has no other source.
+   *
+   * Optional so 09-03's call sites compile untouched, and **called through `noteDecision`**, never
+   * directly: an audit record must not be able to change a verdict.
+   */
+  onDecision?: (entry: { tool_name: string; tool_use_id: string; decision: string }) => void;
+}
+
+/**
+ * Emit one `onDecision` entry, swallowing everything.
+ *
+ * The guard is load-bearing, not defensive noise. `deps.onDecision` is wired to the module-scope turn
+ * store via a closure that reads `ctx.sessionManager.getSessionId()`; a throw from any of that inside
+ * the `try` below would be caught by the fail-open `catch` and return `undefined` — i.e. **allow** —
+ * even when the outcome was a deny. Shared with `userBash.ts`, which has the same hazard and a worse
+ * failure mode.
+ */
+export function noteDecision(
+  deps: Pick<DecideDeps, "onDecision">,
+  entry: { tool_name: string; tool_use_id: string; decision: string },
+): void {
+  try {
+    deps.onDecision?.(entry);
+  } catch {
+    // An audit line is never worth a verdict.
+  }
 }
 
 /** What pi reads back from a `tool_call` handler; Phase 8 only ever blocks or says nothing. */
@@ -100,6 +131,13 @@ export async function decideToolCall(
     // to ask, and no payload is even built. Bounded to the six native file tools: a shell command or
     // a custom tool is evaluated on its `command`, which no cached list can answer for.
     if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+      // Recorded, not silent: "we did not ask" is a different audit fact from "we asked and it was
+      // allowed", and a turn log that showed them identically would make the cache invisible.
+      noteDecision(deps, {
+        tool_name: event.toolName,
+        tool_use_id: event.toolCallId,
+        decision: "skipped",
+      });
       return undefined;
     }
 
@@ -126,6 +164,13 @@ export async function decideToolCall(
     const hooks: CheckHooks =
       deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
+    // Immediately, before the confirm dialog: the decision is what the POLICY said, and a turn log
+    // that waited for a 120 s modal would be recording the developer's answer instead.
+    noteDecision(deps, {
+      tool_name: event.toolName,
+      tool_use_id: event.toolCallId,
+      decision: outcome.kind,
+    });
 
     switch (outcome.kind) {
       case "allow":

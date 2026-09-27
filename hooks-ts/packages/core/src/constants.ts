@@ -92,6 +92,16 @@ export const CACHE_TTL_MS = 300_000;
 
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;
+/**
+ * HOOK-06's bail-out: the largest canonical content projection that is actually hashed (§F7).
+ *
+ * `tool_result` is an **awaited** pass over every tool result (`agent-session.js:265-294` gates it
+ * on `hasHandlers`), so the hash sits on the path between a tool finishing and the model seeing its
+ * output. A `read` of a 100 MB file must not buy a sha256 of 100 MB there; above this cap the record
+ * keeps the byte count, sets `hash_skipped` and hashes nothing. 4 MB is far above any real tool
+ * output and far below anything a developer would feel.
+ */
+export const MAX_HASH_BYTES = 4_194_304;
 export const MAX_TOOL_INPUT_BYTES = 16_384;
 export const MAX_COMMAND_CHARS = 8192;
 /**

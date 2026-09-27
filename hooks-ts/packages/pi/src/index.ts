@@ -39,10 +39,26 @@ import { createPolicyChecker } from "../../core/src/policy.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
+import { turnStore } from "../../core/src/turn.ts";
 import { decideToolCall } from "./decide.ts";
 import { decideInput } from "./prompt.ts";
+import { recordToolResult } from "./toolResult.ts";
 import { notifySafe } from "./ui.ts";
 import { decideUserBash } from "./userBash.ts";
+
+/**
+ * The session id, read defensively: `ctx.sessionManager` is the live object and a fault reading it
+ * must not reach the decision path. `""` means "not known", which `startTurn` declines to store —
+ * better an unstamped record the turn log then skips than a `conversation_id` of `"undefined"`.
+ */
+function sessionIdOf(ctx: { sessionManager: { getSessionId(): string } }): string {
+  try {
+    const id = ctx.sessionManager.getSessionId();
+    return typeof id === "string" ? id : "";
+  } catch {
+    return "";
+  }
+}
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -207,11 +223,27 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx)),
         });
       } catch {
         // The fail-open net of last resort: allow, rather than let pi read an exception as a block.
         return undefined;
       }
+    });
+
+    // HOOK-06. Registered LAST among the tool events in reading order, and first in importance for
+    // one reason: this handler returns `undefined` unconditionally, on every path, for every input.
+    // Anything else here rewrites the tool result pi hands the model (`agent-session.js:265-294`).
+    pi.on("tool_result", async (event, _ctx) => {
+      try {
+        // Recorded with or without a key: the record is in-memory only, and `agent_end` is what
+        // decides whether anything is ever sent. A hash is cheaper than the branch to skip it.
+        recordToolResult(event, turnStore);
+      } catch {
+        // Unreachable — `recordToolResult` is already total — and kept anyway: the cost of being
+        // wrong about that is a rewritten tool result.
+      }
+      return undefined;
     });
 
     pi.on("user_bash", async (event, ctx) => {
@@ -223,6 +255,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
+          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx)),
         });
       } catch {
         // Stricter than the others: pi rethrows out of `emitUserBash` and then declines to run the
@@ -241,8 +274,10 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
-          // `onPrompt` is intentionally unwired: the turn store lands in a later wave, and an
-          // allowed prompt is the only place its text exists.
+          // The turn log's only source for the prompt: `agent_end.messages` is pi's `newMessages`
+          // and never contains it (§A4). Called for an ALLOWED prompt only — a suppressed turn
+          // produced nothing to log.
+          onPrompt: (text) => turnStore.recordPrompt(text, sessionIdOf(ctx)),
         });
       } catch {
         return undefined;
