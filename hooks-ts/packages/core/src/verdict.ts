@@ -29,6 +29,11 @@ export type PolicyOutcome =
  *
  *   * every ASCII control character except `\n` (which is meaningful inside a multi-line reason) —
  *     `\x1b` is in the range, so ANSI escape sequences are defanged;
+ *   * `U+0080-U+009F`, the C1 control block. Non-printing to a terminal and to the TUI, and two of
+ *     them are escape-sequence introducers on their own: `U+009B` is CSI — the single-character form
+ *     of `ESC [`, so it carries the entire ANSI repertoire *without* containing an `ESC` byte — and
+ *     `U+009D` is OSC. Stripping `\x1b` alone left that path open. Written as one contiguous
+ *     `\x7f-\x9f` range together with DEL, because that is what the two are;
  *   * `U+200B-200F` zero-width space/joiners and the LRM/RLM directional marks;
  *   * `U+202A-202E` bidi embeddings and overrides — `U+202E` reverses the rendering of everything
  *     after it, which is enough to make a deny reason read as an allow or to forge the
@@ -36,14 +41,15 @@ export type PolicyOutcome =
  *   * `U+2060-2064` invisible word-joiner/operators, and `U+2066-2069` the bidi isolates;
  *   * `U+FEFF`, a BOM anywhere but the start.
  *
- * Ordinary Unicode — accents, dashes, CJK, the footer's `·` — is untouched.
+ * Ordinary Unicode — accents, dashes, CJK, the footer's `·` — is untouched. The control range stops
+ * at `U+009F`; everything from `U+00A0` up is printable and is not this function's business.
  *
  * Built with `new RegExp` from an escaped string rather than written as a regex literal on purpose:
  * a literal would have to contain these characters *verbatim* in the source, where they are by
  * definition invisible to a reviewer (and `U+2028`/`U+2029` would terminate the line outright).
  */
 const CONTROL_CHARS = new RegExp(
-  "[\\x00-\\x09\\x0b-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+  "[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
   "g",
 );
 

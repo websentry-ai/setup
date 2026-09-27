@@ -785,7 +785,7 @@ function resolveClientEntrypoint(env, argv1) {
 
 // packages/core/src/verdict.ts
 var CONTROL_CHARS = new RegExp(
-  "[\\x00-\\x09\\x0b-\\x1f\\x7f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+  "[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
   "g"
 );
 var UNICODE_LINE_SEPARATORS = new RegExp("[\\u2028\\u2029]", "g");

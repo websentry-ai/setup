@@ -254,6 +254,14 @@ const INVISIBLE_CODE_POINTS: readonly number[] = [
   0xfeff, // ZERO WIDTH NO-BREAK SPACE / BOM
 ];
 
+/**
+ * `U+0080-U+009F`, the C1 control block. Every one of them is non-printing, and two are sequence
+ * introducers in their own right: `U+009B` is CSI (the single-character form of `ESC [`, so it
+ * carries the whole ANSI repertoire without an `ESC` byte) and `U+009D` is OSC. Stripping `\x1b`
+ * alone left that door open. Spelled as an arithmetic range, not pasted, for the reason above.
+ */
+const C1_CODE_POINTS: readonly number[] = Array.from({ length: 32 }, (_, i) => 0x80 + i);
+
 const RLO = String.fromCodePoint(0x202e);
 const ZWSP = String.fromCodePoint(0x200b);
 const LINE_SEP = String.fromCodePoint(0x2028);
@@ -290,6 +298,32 @@ test("sanitizeReason turns Unicode line separators into spaces, never new lines 
     sanitizeReason(`Allowed by policy${RLO} ${LINE_SEP} rm -rf /`),
     "Allowed by policy   rm -rf /",
   );
+});
+
+test("sanitizeReason strips the C1 control block, CSI and OSC included", () => {
+  // The single-character CSI. `ESC [ 2K` erases the line; `U+009B 2K` does the same thing to a
+  // terminal without containing an `ESC`, so the `\x1b` case did not cover it.
+  const CSI = String.fromCodePoint(0x9b);
+  const OSC = String.fromCodePoint(0x9d);
+  assert.equal(sanitizeReason(`Allowed${CSI}2K rm -rf /`), "Allowed2K rm -rf /");
+  assert.equal(sanitizeReason(`Blocked${OSC}0;title${CSI}A`), "Blocked0;titleA");
+
+  for (const codePoint of C1_CODE_POINTS) {
+    const char = String.fromCodePoint(codePoint);
+    assert.equal(sanitizeReason(`a${char}b`), "ab", `${hex(codePoint)} must not survive`);
+  }
+  // A reason that is nothing but C1 bytes is empty afterwards, which is `undefined` not `""`.
+  assert.equal(sanitizeReason(`${CSI}${OSC}`), undefined);
+
+  // The range stops exactly at the C1 block: U+00A0 and up are ordinary printable Unicode and are
+  // not this function's business — see the preservation test below for the characters that matter.
+  const nbsp = String.fromCodePoint(0x00a0);
+  assert.equal(sanitizeReason(`a${nbsp}b`), `a${nbsp}b`, "U+00A0 is outside the C1 block");
+
+  // And the gateway's attribution footer still survives a reason that tried to erase it.
+  const middot = String.fromCodePoint(0x00b7);
+  const footer = `\n\nEnforced by Unbound ${middot} Trace ID abc`;
+  assert.equal(sanitizeReason(`Reading secrets is blocked.${CSI}1A${footer}`), `Reading secrets is blocked.1A${footer}`);
 });
 
 test("sanitizeReason preserves ordinary Unicode - only the deceptive characters go (WR-06)", () => {
