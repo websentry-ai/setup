@@ -136,17 +136,71 @@ test("a turn that begins with a tool call still carries a session id and a start
   assert.equal(store.isEmpty(), false, "a tool call alone is a postable turn");
 });
 
-test("a later event never resets started_at or session_id", () => {
+test("a later event in the SAME session never resets started_at or session_id", () => {
   const store = createTurnStore();
   store.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "allow" }, SESSION, 500);
-  store.recordPrompt("late prompt", "sess-different", 9_000);
-  store.recordToolCall({ tool_name: "read", tool_use_id: "call_2", decision: "skipped" }, "sess-other", 9_500);
+  store.recordPrompt("late prompt", SESSION, 9_000);
+  store.recordToolCall({ tool_name: "read", tool_use_id: "call_2", decision: "skipped" }, SESSION, 9_500);
 
   const snap = store.snapshot();
   assert.equal(snap.started_at, 500, "the turn started when its first event arrived");
   assert.equal(snap.session_id, SESSION);
   assert.equal(snap.prompt, "late prompt");
   assert.equal(snap.tool_calls.length, 2);
+});
+
+test("a DIFFERENT session id rolls the record over instead of joining it", () => {
+  // `/new` mid-turn. The old record can never be posted under the new `conversation_id` — that value
+  // becomes `thread_id` server-side, so joining them would stitch two conversations into one thread.
+  const store = createTurnStore();
+  store.recordPrompt("old question", SESSION, 500);
+  store.recordResult({ tool_name: "bash", tool_use_id: "call_1", is_error: false, content_bytes: 3 });
+  store.recordToolCall({ tool_name: "user_bash", tool_use_id: "ubash_1", decision: "allow" }, "sess-new", 9_000);
+
+  const snap = store.snapshot();
+  assert.equal(snap.session_id, "sess-new", "the new session owns the record");
+  assert.equal(snap.started_at, 9_000, "and it started when its own first event arrived");
+  assert.equal(snap.prompt, undefined, "the old prompt went with the old session");
+  assert.deepEqual(
+    snap.tool_calls.map((call) => call.tool_use_id),
+    ["ubash_1"],
+    "and so did the old calls",
+  );
+  assert.deepEqual(snap.results, [], "and the old results");
+});
+
+test("an unknown session id neither stamps nor rolls over", () => {
+  // `sessionIdOf` answers `""` for a ctx it cannot read. That is "not known", not "changed": it must
+  // never be able to discard a turn that is mid-flight.
+  const store = createTurnStore();
+  store.recordPrompt("still going", SESSION, 500);
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "allow" }, "", 9_000);
+
+  const snap = store.snapshot();
+  assert.equal(snap.session_id, SESSION);
+  assert.equal(snap.started_at, 500);
+  assert.equal(snap.prompt, "still going", "the live record survives an unreadable id");
+  assert.equal(snap.tool_calls.length, 1, "and the call is still recorded");
+});
+
+test("reset drops a record from another session and keeps one from this session", () => {
+  const store = createTurnStore();
+  store.recordPrompt("old question", SESSION, 500);
+
+  // Same session arriving again — `/reload` re-fires `session_start` with it. Nothing to drop.
+  store.reset(SESSION);
+  assert.equal(store.snapshot().prompt, "old question", "the same session keeps its turn");
+
+  // An id that cannot be read is not evidence of a change either.
+  store.reset("");
+  assert.equal(store.snapshot().prompt, "old question", "an unknown id drops nothing");
+
+  // A different session: the pending record is dropped outright, never posted. `agent_end` never
+  // fired for it, so nothing says that turn finished.
+  store.reset("sess-new");
+  assert.deepEqual(store.snapshot(), { tool_calls: [], results: [] });
+  assert.equal(store.isEmpty(), true);
+  assert.equal(store.take(), undefined, "there is nothing left to post");
 });
 
 test("tool calls keep their decision and a timestamp, in arrival order", () => {

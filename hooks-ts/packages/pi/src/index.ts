@@ -291,6 +291,14 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
   return (pi: ExtensionAPI) => {
     pi.on("session_start", async (_event, ctx) => {
       try {
+        // FIRST, before `init()` and before every early return below: a turn record left pending by
+        // the previous session cannot belong to this one, and `/new` is exactly when one is pending
+        // (a `!cmd` records a tool call and pi fires no `agent_end` for it). Dropped, never posted —
+        // nothing says that turn finished, and this handler is awaited by pi, so it is the wrong
+        // place for a POST. `reset` keys on the id, so a `/reload` re-firing with the same session
+        // and a ctx whose id cannot be read both leave a mid-flight turn alone.
+        turnStore.reset(sessionIdOf(ctx));
+
         const state = init();
         // One notice per extension instance. pi clears the module cache on `/reload`, so a reload
         // legitimately produces a fresh notice (§A7).

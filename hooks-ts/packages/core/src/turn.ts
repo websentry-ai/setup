@@ -20,7 +20,16 @@
 // `conversation_id` is load-bearing on the wire — it becomes `thread_id` and `derive_hook_request_id`
 // returns `None` without it (§B2) — and a turn can genuinely begin with a tool call rather than a
 // prompt, because `agent_end` fires for extension-initiated runs too (§F3). Whichever event arrives
-// first therefore stamps the session id and the start time, and no later event resets them.
+// first therefore stamps the session id and the start time, and no later event *in that session*
+// resets them.
+//
+// Across sessions the opposite is required. pi's session id changes on `/new`, `/resume` and `/fork`,
+// and a record pending when that happens can never be posted under the new one — `thread_id` would
+// stitch two conversations together. `user_bash` is what makes this reachable rather than theoretical:
+// it records a tool call, and pi fires no `agent_end` for a bare `!cmd`, so that record is still
+// sitting here when the developer types `/new`. Two guards, belt and braces: `reset(sessionId)` for
+// `session_start` to drop it, and `startTurn` rolling the record over when the id it is handed differs
+// from the stored one. Neither ever posts the old record — `agent_end` never fired for it.
 //
 // Every method is total. A fault here would surface inside a `tool_call` or `tool_result` handler,
 // and pi reads a thrown `tool_call` handler as a BLOCK — an audit record must never be able to change
@@ -85,6 +94,15 @@ export interface TurnRecord {
 export interface TurnStore {
   /** Not called by handlers — `recordPrompt`/`recordToolCall` call it when the store is empty. */
   startTurn(sessionId: string, now: number): void;
+  /**
+   * Drop a pending record that belongs to a different session. Called by `session_start`, which pi
+   * fires again on `/new`, `/resume`, `/fork` and `/reload`.
+   *
+   * Keyed on the id rather than unconditional, because two of those reasons re-fire with the SAME
+   * session: dropping then would discard a turn that is still mid-flight. `""` — what `sessionIdOf`
+   * answers for a ctx it cannot read — means "not known", never "changed", and drops nothing.
+   */
+  reset(sessionId: string): void;
   recordPrompt(text: string, sessionId: string, now?: number): void;
   recordToolCall(entry: Omit<TurnToolCall, "ts">, sessionId: string, now?: number): void;
   recordResult(entry: TurnResult): void;
@@ -154,9 +172,22 @@ export function createTurnStore(): TurnStore {
 
   const started = (): boolean => record.prompt !== undefined || record.tool_calls.length > 0;
 
+  /** `undefined` for anything that is not a usable session id — see `sessionIdOf`'s `""`. */
+  const idOf = (sessionId: unknown): string | undefined =>
+    typeof sessionId === "string" && sessionId !== "" ? sessionId : undefined;
+
   function startTurn(sessionId: string, now: number): void {
-    if (record.session_id === undefined && typeof sessionId === "string" && sessionId !== "") {
-      record.session_id = sessionId;
+    const incoming = idOf(sessionId);
+    // A session id that differs from the stored one is a different conversation, not a later event in
+    // this one. The pending record can never be posted under it — `conversation_id` becomes
+    // `thread_id` (§B2) — so it rolls over here rather than accumulating across `/new`. This is the
+    // backstop for any path that reaches a record before `session_start` resets it; `user_bash` is
+    // the one that made it necessary, because pi fires no `agent_end` for a bare `!cmd`.
+    if (incoming !== undefined && record.session_id !== undefined && record.session_id !== incoming) {
+      record = { tool_calls: [], results: [] };
+    }
+    if (record.session_id === undefined && incoming !== undefined) {
+      record.session_id = incoming;
     }
     if (record.started_at === undefined && typeof now === "number" && Number.isFinite(now)) {
       record.started_at = now;
@@ -165,6 +196,17 @@ export function createTurnStore(): TurnStore {
 
   return {
     startTurn,
+
+    reset(sessionId: string): void {
+      try {
+        const incoming = idOf(sessionId);
+        if (incoming === undefined) return;
+        if (record.session_id === incoming) return;
+        record = { tool_calls: [], results: [] };
+      } catch {
+        // Total by contract — see the header.
+      }
+    },
 
     recordPrompt(text: string, sessionId: string, now: number = Date.now()): void {
       try {

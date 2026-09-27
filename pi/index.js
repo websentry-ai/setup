@@ -946,9 +946,14 @@ function hashContent(parts) {
 function createTurnStore() {
   let record = { tool_calls: [], results: [] };
   const started = () => record.prompt !== void 0 || record.tool_calls.length > 0;
+  const idOf = (sessionId) => typeof sessionId === "string" && sessionId !== "" ? sessionId : void 0;
   function startTurn(sessionId, now) {
-    if (record.session_id === void 0 && typeof sessionId === "string" && sessionId !== "") {
-      record.session_id = sessionId;
+    const incoming = idOf(sessionId);
+    if (incoming !== void 0 && record.session_id !== void 0 && record.session_id !== incoming) {
+      record = { tool_calls: [], results: [] };
+    }
+    if (record.session_id === void 0 && incoming !== void 0) {
+      record.session_id = incoming;
     }
     if (record.started_at === void 0 && typeof now === "number" && Number.isFinite(now)) {
       record.started_at = now;
@@ -956,6 +961,15 @@ function createTurnStore() {
   }
   return {
     startTurn,
+    reset(sessionId) {
+      try {
+        const incoming = idOf(sessionId);
+        if (incoming === void 0) return;
+        if (record.session_id === incoming) return;
+        record = { tool_calls: [], results: [] };
+      } catch {
+      }
+    },
     recordPrompt(text, sessionId, now = Date.now()) {
       try {
         startTurn(sessionId, now);
@@ -1370,6 +1384,7 @@ function createExtension(overrides = {}) {
   return (pi) => {
     pi.on("session_start", async (_event, ctx) => {
       try {
+        turnStore.reset(sessionIdOf(ctx));
         const state = init();
         if (state.apiKey === void 0 && !notified) {
           notified = true;
