@@ -65,6 +65,12 @@ export interface TurnLogBody {
   requestInitialized?: string;
   requestCompleted: string;
   usage: TurnLogUsage;
+  /**
+   * How many tool results the `MAX_TURN_RESULTS` cap dropped from this turn. Diagnostic only — no
+   * reader on the server consumes it — and present only when it is a positive count, so an ordinary
+   * row carries no extra key at all. A truncated row that said nothing would look complete.
+   */
+  results_truncated?: number;
 }
 
 export interface TurnLogOptions {
@@ -114,6 +120,7 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   let prompt = "";
   let toolUse: TurnLogToolUse[] = [];
   let startedAt: number | undefined;
+  let truncated: number | undefined;
 
   try {
     const safe: TurnRecord = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
@@ -121,6 +128,14 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
     prompt = typeof safe.prompt === "string" ? safe.prompt : "";
     startedAt =
       typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : undefined;
+    // A count, or nothing. Zero and anything non-numeric are the same statement — "nothing was
+    // dropped" — and neither is worth a key the server would have to interpret.
+    truncated =
+      typeof safe.results_truncated === "number" &&
+      Number.isFinite(safe.results_truncated) &&
+      safe.results_truncated > 0
+        ? Math.floor(safe.results_truncated)
+        : undefined;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
     toolUse = calls.map((call) => ({
       type: TURNLOG_TOOL_USE_TYPE,
@@ -148,5 +163,6 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   // Omitted rather than guessed when the record was never stamped: `useBodyTimestamps: true` means
   // the server honours what arrives, so a fabricated start time would become a fabricated latency.
   if (startedAt !== undefined) body.requestInitialized = new Date(startedAt).toISOString();
+  if (truncated !== undefined) body.results_truncated = truncated;
   return body;
 }

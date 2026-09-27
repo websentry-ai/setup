@@ -9,8 +9,9 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { MAX_HASH_BYTES } from "../src/constants.ts";
+import { MAX_HASH_BYTES, MAX_TURN_RESULTS } from "../src/constants.ts";
 import { createTurnStore, hashContent } from "../src/turn.ts";
+import type { TurnResult } from "../src/turn.ts";
 
 const SESSION = "sess-turn-1";
 /** Nothing else in the suite contains this string, so a grep for it is decisive. */
@@ -302,6 +303,43 @@ test("take returns the record once and leaves the store empty", () => {
 
   // And the taken record is a detached copy: emptying the store did not hollow it out.
   assert.equal(taken?.tool_calls[0]?.tool_use_id, "call_1");
+});
+
+test("the results array is capped, dropping the oldest and counting the drops", () => {
+  // The backstop for an unbounded turn. `tool_result` fires once per tool result with no ceiling on
+  // how many a single turn can produce, and the record lives for the whole turn — so without a cap
+  // the array is the one part of this module that can grow without limit.
+  const store = createTurnStore();
+  const result = (index: number): TurnResult => ({
+    tool_name: "bash",
+    tool_use_id: `call_${index}`,
+    is_error: false,
+    content_bytes: 1,
+  });
+
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "call_0", decision: "allow" }, SESSION, 100);
+  const overflow = 100;
+  for (let i = 0; i < MAX_TURN_RESULTS + overflow; i += 1) store.recordResult(result(i));
+
+  const snap = store.snapshot();
+  assert.equal(MAX_TURN_RESULTS, 500, "the cap is stated here so a change to it is deliberate");
+  assert.equal(snap.results.length, MAX_TURN_RESULTS, "never more than the cap is retained");
+  assert.equal(snap.results_truncated, overflow, "and the drops are counted, not hidden");
+  // Drop-OLDEST: the most recent results are the ones a developer is looking at, and the earliest
+  // calls keep an honest empty `tool_response` rather than a wrong digest.
+  assert.equal(snap.results[0]?.tool_use_id, `call_${overflow}`, "the oldest went first");
+  assert.equal(snap.results.at(-1)?.tool_use_id, `call_${MAX_TURN_RESULTS + overflow - 1}`);
+
+  // The counter belongs to the turn, so the next one starts clean.
+  assert.equal(store.take()?.results_truncated, overflow);
+  assert.equal(store.snapshot().results_truncated, undefined, "a fresh turn has nothing truncated");
+});
+
+test("a turn under the cap reports no truncation at all", () => {
+  const store = createTurnStore();
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "call_0", decision: "allow" }, SESSION, 100);
+  store.recordResult({ tool_name: "bash", tool_use_id: "call_0", is_error: false, content_bytes: 1 });
+  assert.equal(store.snapshot().results_truncated, undefined, "absent, never a zero to explain");
 });
 
 test("snapshot is a copy — a caller cannot mutate the live record", () => {

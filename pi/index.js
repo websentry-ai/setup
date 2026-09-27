@@ -54,6 +54,7 @@ var BREAKER_OPEN_MS = 6e4;
 var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
 var MAX_HASH_BYTES = 4194304;
+var MAX_TURN_RESULTS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
@@ -622,11 +623,13 @@ function buildTurnLogBody(record, opts) {
   let prompt = "";
   let toolUse = [];
   let startedAt;
+  let truncated;
   try {
     const safe = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
     conversationId = typeof safe.session_id === "string" ? safe.session_id : "";
     prompt = typeof safe.prompt === "string" ? safe.prompt : "";
     startedAt = typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : void 0;
+    truncated = typeof safe.results_truncated === "number" && Number.isFinite(safe.results_truncated) && safe.results_truncated > 0 ? Math.floor(safe.results_truncated) : void 0;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
     toolUse = calls.map((call) => ({
       type: TURNLOG_TOOL_USE_TYPE,
@@ -650,6 +653,7 @@ function buildTurnLogBody(record, opts) {
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
   };
   if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
+  if (truncated !== void 0) body.results_truncated = truncated;
   return body;
 }
 
@@ -994,10 +998,20 @@ function createTurnStore() {
      * A result does **not** start a turn. A tool result whose call was never recorded belongs to a
      * turn already posted (or to one this process never saw), and starting a turn from it would post
      * a record with no prompt and no call — exactly the noise `PY:4975` refuses to send.
+     *
+     * Capped at `MAX_TURN_RESULTS`, dropping the oldest: the newest results are the ones a developer
+     * is looking at, and an early call that loses its digest gets an honest empty `tool_response`
+     * rather than another call's. The caller is expected not to record at all when nothing will post
+     * the record (`index.ts` does exactly that for a keyless or latched session) — this is the
+     * backstop for the turn that legitimately produces more results than anyone wants to read.
      */
     recordResult(entry) {
       try {
         if (entry === null || typeof entry !== "object") return;
+        while (record.results.length >= MAX_TURN_RESULTS) {
+          record.results.shift();
+          record.results_truncated = (record.results_truncated ?? 0) + 1;
+        }
         const stored = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
           tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
@@ -1035,6 +1049,7 @@ function createTurnStore() {
       if (record.prompt !== void 0) copy.prompt = record.prompt;
       if (record.session_id !== void 0) copy.session_id = record.session_id;
       if (record.started_at !== void 0) copy.started_at = record.started_at;
+      if (record.results_truncated !== void 0) copy.results_truncated = record.results_truncated;
       return copy;
     }
   };
@@ -1381,6 +1396,9 @@ function createExtension(overrides = {}) {
     }
     return resolved;
   }
+  function recordingActive(state) {
+    return state.apiKey !== void 0 && state.client !== void 0 && !keyState.isInactive();
+  }
   return (pi) => {
     pi.on("session_start", async (_event, ctx) => {
       try {
@@ -1431,7 +1449,11 @@ function createExtension(overrides = {}) {
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
-          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx))
+          // Re-checked here rather than above: `checkTool` may have latched the key on this very
+          // call, and the turn that latched is one nothing will post.
+          onDecision: (entry) => {
+            if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
+          }
         });
       } catch {
         return void 0;
@@ -1439,6 +1461,7 @@ function createExtension(overrides = {}) {
     });
     pi.on("tool_result", async (event, _ctx) => {
       try {
+        if (!recordingActive(init())) return void 0;
         recordToolResult(event, turnStore);
       } catch {
       }
@@ -1447,8 +1470,7 @@ function createExtension(overrides = {}) {
     pi.on("agent_end", (event, ctx) => {
       try {
         const state = init();
-        if (state.apiKey === void 0 || state.client === void 0) return void 0;
-        if (keyState.isInactive()) {
+        if (!recordingActive(state)) {
           turnStore.take();
           return void 0;
         }
@@ -1470,7 +1492,9 @@ function createExtension(overrides = {}) {
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
-          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx))
+          onDecision: (entry) => {
+            if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
+          }
         });
       } catch {
         return void 0;
@@ -1488,7 +1512,9 @@ function createExtension(overrides = {}) {
           // The turn log's only source for the prompt: `agent_end.messages` is pi's `newMessages`
           // and never contains it (§A4). Called for an ALLOWED prompt only — a suppressed turn
           // produced nothing to log.
-          onPrompt: (text) => turnStore.recordPrompt(text, sessionIdOf(ctx))
+          onPrompt: (text) => {
+            if (recordingActive(state)) turnStore.recordPrompt(text, sessionIdOf(ctx));
+          }
         });
       } catch {
         return void 0;

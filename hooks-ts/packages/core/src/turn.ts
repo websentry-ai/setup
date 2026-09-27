@@ -37,7 +37,7 @@
 
 import { createHash } from "node:crypto";
 
-import { MAX_HASH_BYTES } from "./constants.ts";
+import { MAX_HASH_BYTES, MAX_TURN_RESULTS } from "./constants.ts";
 
 /** pi's `TextContent` (`AI/dist/types.d.ts:242-246`). `textSignature` is provider metadata. */
 export interface TextPart {
@@ -89,6 +89,8 @@ export interface TurnRecord {
   results: TurnResult[];
   session_id?: string;
   started_at?: number;
+  /** How many results the `MAX_TURN_RESULTS` cap dropped. Absent means none — never a zero. */
+  results_truncated?: number;
 }
 
 export interface TurnStore {
@@ -236,10 +238,20 @@ export function createTurnStore(): TurnStore {
      * A result does **not** start a turn. A tool result whose call was never recorded belongs to a
      * turn already posted (or to one this process never saw), and starting a turn from it would post
      * a record with no prompt and no call — exactly the noise `PY:4975` refuses to send.
+     *
+     * Capped at `MAX_TURN_RESULTS`, dropping the oldest: the newest results are the ones a developer
+     * is looking at, and an early call that loses its digest gets an honest empty `tool_response`
+     * rather than another call's. The caller is expected not to record at all when nothing will post
+     * the record (`index.ts` does exactly that for a keyless or latched session) — this is the
+     * backstop for the turn that legitimately produces more results than anyone wants to read.
      */
     recordResult(entry: TurnResult): void {
       try {
         if (entry === null || typeof entry !== "object") return;
+        while (record.results.length >= MAX_TURN_RESULTS) {
+          record.results.shift();
+          record.results_truncated = (record.results_truncated ?? 0) + 1;
+        }
         const stored: TurnResult = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
           tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
@@ -281,6 +293,7 @@ export function createTurnStore(): TurnStore {
       if (record.prompt !== undefined) copy.prompt = record.prompt;
       if (record.session_id !== undefined) copy.session_id = record.session_id;
       if (record.started_at !== undefined) copy.started_at = record.started_at;
+      if (record.results_truncated !== undefined) copy.results_truncated = record.results_truncated;
       return copy;
     },
   };

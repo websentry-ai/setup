@@ -50,6 +50,20 @@ test("model is the pinned constant, never a real model id", () => {
   assert.equal(body.model, TURNLOG_MODEL, "read from the constant, not retyped at the call site");
 });
 
+test("results_truncated rides the body only when results were actually dropped", () => {
+  // A row that silently described 500 of 600 results would be worse than a short row: it would look
+  // complete. The count is the one honest thing to say about what is missing.
+  assert.equal(build(record()).results_truncated, undefined, "absent by default, never a zero");
+  assert.equal(build(record({ results_truncated: 0 })).results_truncated, undefined, "and never a zero");
+  assert.equal(build(record({ results_truncated: 100 })).results_truncated, 100);
+  // Not a count the server can be made to mis-read: a nonsense value is dropped, not forwarded.
+  assert.equal(build(record({ results_truncated: -4 })).results_truncated, undefined);
+  assert.equal(
+    build(record({ results_truncated: "lots" as unknown as number })).results_truncated,
+    undefined,
+  );
+});
+
 // --- the two-message shape ----------------------------------------------------------------------
 
 test("the body is two messages: the user prompt, then an assistant message carrying tool_use", () => {

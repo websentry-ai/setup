@@ -149,6 +149,17 @@ export const MAX_REASON_CHARS = 2000;
  * output and far below anything a developer would feel.
  */
 export const MAX_HASH_BYTES = 4_194_304;
+/**
+ * The most tool results one turn record retains. A backstop, not a budget: `tool_result` fires once
+ * per result with no ceiling on how many a turn can produce, and the record lives until `agent_end`,
+ * so this array is the one part of `turn.ts` that could otherwise grow without limit — a long
+ * agentic turn, or any state where nothing drains the record, would hold every entry.
+ *
+ * 500 is far above any real turn (a `tool_use` array that long is already an unreadable audit row)
+ * and far below anything that costs memory. Past it the OLDEST entries go and `results_truncated`
+ * counts them, because a row that quietly described 500 of 600 results would look complete.
+ */
+export const MAX_TURN_RESULTS = 500;
 export const MAX_TOOL_INPUT_BYTES = 16_384;
 export const MAX_COMMAND_CHARS = 8192;
 /**

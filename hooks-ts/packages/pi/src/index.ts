@@ -288,6 +288,21 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     return resolved;
   }
 
+  /**
+   * Whether anything should be written to the turn record right now.
+   *
+   * The record is in-memory and process-wide, and `agent_end` is the only thing that drains it — so
+   * in any state where `agent_end` will not post, recording is pure accumulation with no reader. It
+   * had one: a keyless session never starts a turn, which means even `take()`'s empty-turn guard
+   * could not clear `results`, so every tool result of every turn was hashed and kept for the life of
+   * the process. A latched session had the same shape one turn later.
+   *
+   * So: if nothing will ever post this record, nothing records into it.
+   */
+  function recordingActive(state: Resolved): state is Resolved & { apiKey: string; client: ApiClient } {
+    return state.apiKey !== undefined && state.client !== undefined && !keyState.isInactive();
+  }
+
   return (pi: ExtensionAPI) => {
     pi.on("session_start", async (_event, ctx) => {
       try {
@@ -369,7 +384,11 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
-          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx)),
+          // Re-checked here rather than above: `checkTool` may have latched the key on this very
+          // call, and the turn that latched is one nothing will post.
+          onDecision: (entry) => {
+            if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
+          },
         });
       } catch {
         // The fail-open net of last resort: allow, rather than let pi read an exception as a block.
@@ -382,8 +401,10 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     // Anything else here rewrites the tool result pi hands the model (`agent-session.js:265-294`).
     pi.on("tool_result", async (event, _ctx) => {
       try {
-        // Recorded with or without a key: the record is in-memory only, and `agent_end` is what
-        // decides whether anything is ever sent. A hash is cheaper than the branch to skip it.
+        // The branch IS cheaper than the hash, and it is also the only thing bounding this array: a
+        // session that cannot post has no reader for what it records, and `recordToolResult` hashes
+        // up to `MAX_HASH_BYTES` of output per call. Checked before the hash, not after it.
+        if (!recordingActive(init())) return undefined;
         recordToolResult(event, turnStore);
       } catch {
         // Unreachable — `recordToolResult` is already total — and kept anyway: the cost of being
@@ -398,12 +419,12 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     pi.on("agent_end", (event, ctx) => {
       try {
         const state = init();
-        // No key ⇒ nothing is sent, and the record is left alone rather than discarded: RES-06's
-        // "inert without a key" is about the network, and a `/reload` after adding one should still
-        // find a session's worth of context. A rejected key is different — it is permanent for the
-        // session, so the record is taken and dropped rather than growing without bound (§F9).
-        if (state.apiKey === undefined || state.client === undefined) return undefined;
-        if (keyState.isInactive()) {
+        // Inert ⇒ nothing is sent, and the record is TAKEN rather than left: nothing records into it
+        // in this state (see `recordingActive`), so there is no "session's worth of context" to
+        // preserve for a later `/reload` — only whatever was pending when the session went inert, and
+        // pinning that would keep it across every following turn. Covers both inert states: no key
+        // (RES-06) and a key the gateway rejected (§F9).
+        if (!recordingActive(state)) {
           turnStore.take();
           return undefined;
         }
@@ -427,7 +448,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
-          onDecision: (entry) => turnStore.recordToolCall(entry, sessionIdOf(ctx)),
+          onDecision: (entry) => {
+            if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
+          },
         });
       } catch {
         // Stricter than the others: pi rethrows out of `emitUserBash` and then declines to run the
@@ -449,7 +472,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // The turn log's only source for the prompt: `agent_end.messages` is pi's `newMessages`
           // and never contains it (§A4). Called for an ALLOWED prompt only — a suppressed turn
           // produced nothing to log.
-          onPrompt: (text) => turnStore.recordPrompt(text, sessionIdOf(ctx)),
+          onPrompt: (text) => {
+            if (recordingActive(state)) turnStore.recordPrompt(text, sessionIdOf(ctx));
+          },
         });
       } catch {
         return undefined;

@@ -158,7 +158,9 @@ Three things about that directory:
 4. none — the extension goes **inactive**: it notifies
    `Unbound: no API key found — extension inactive` once at session start, makes zero HTTP requests
    and never blocks anything. A developer who has not logged in is never blocked by a policy engine
-   that cannot evaluate anything.
+   that cannot evaluate anything. Nothing is recorded either — no prompt, no tool call and no tool
+   result hash enters the in-memory turn record while the extension is inactive, since nothing will
+   ever post it. The same applies after a rejected key deactivates the session.
 
 **Gateway URL — three tiers, first valid match wins:**
 
