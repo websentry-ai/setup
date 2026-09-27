@@ -1,0 +1,7 @@
+{
+  "name": "@unbound/pi-extension",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "pi 0.87.x adapter: pi extension events -> @unbound/hooks-core (imported by relative .ts path, not by package name)"
+}
