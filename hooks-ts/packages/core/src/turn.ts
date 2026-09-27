@@ -108,7 +108,11 @@ export interface TurnStore {
   recordPrompt(text: string, sessionId: string, now?: number): void;
   recordToolCall(entry: Omit<TurnToolCall, "ts">, sessionId: string, now?: number): void;
   recordResult(entry: TurnResult): void;
-  /** The record, plus an empty store — so a retried `agent_end` cannot re-post it (§F3). */
+  /**
+   * The record, plus an empty store — so a retried `agent_end` cannot re-post it (§F3). The store is
+   * emptied even when the answer is `undefined`: a record that is not postable is still consumed,
+   * because nothing else will ever clear it.
+   */
   take(): TurnRecord | undefined;
   /** True when neither a prompt nor a tool call has been seen. Mirrors `PY:4975`. */
   isEmpty(): boolean;
@@ -266,12 +270,22 @@ export function createTurnStore(): TurnStore {
       }
     },
 
+    /**
+     * Consumes the record unconditionally, and answers `undefined` when there was nothing postable.
+     *
+     * The reset is NOT conditional on the record being postable, and that is the point. A turn can
+     * collect results without ever starting — a custom or MCP tool takes the nothing-evaluable skip
+     * and records no decision, an extension-sourced prompt records no prompt — and an early return
+     * here left those results in place, where `agent_end` could never drain them. They then belonged
+     * to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
+     * fail to match them by `tool_use_id`. Consumed and dropped is the honest outcome.
+     */
     take(): TurnRecord | undefined {
       try {
-        if (!started()) return undefined;
         const taken = record;
+        const postable = started();
         record = { tool_calls: [], results: [] };
-        return taken;
+        return postable ? taken : undefined;
       } catch {
         return undefined;
       }

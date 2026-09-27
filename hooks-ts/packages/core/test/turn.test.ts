@@ -342,6 +342,25 @@ test("a turn under the cap reports no truncation at all", () => {
   assert.equal(store.snapshot().results_truncated, undefined, "absent, never a zero to explain");
 });
 
+test("take always empties the store, even when there is nothing to post", () => {
+  // The orphan-result case. A turn can record results without ever *starting*: a custom or MCP tool
+  // takes the nothing-evaluable skip and records no decision, and an extension-sourced prompt records
+  // no prompt — so `started()` stays false while `tool_result` keeps arriving. `take()` used to return
+  // `undefined` WITHOUT resetting, so those results sat here until some later turn started, which
+  // meant `agent_end` had no way to drain them at all.
+  const store = createTurnStore();
+  store.recordResult({ tool_name: "mcp__db__query", tool_use_id: "call_1", is_error: false, content_bytes: 9 });
+  store.recordResult({ tool_name: "mcp__db__query", tool_use_id: "call_2", is_error: false, content_bytes: 9 });
+  assert.equal(store.snapshot().results.length, 2);
+
+  assert.equal(store.take(), undefined, "still not postable — a result alone is not a turn");
+  assert.deepEqual(
+    store.snapshot(),
+    { tool_calls: [], results: [] },
+    "but consumed and dropped, so the next turn starts clean",
+  );
+});
+
 test("snapshot is a copy — a caller cannot mutate the live record", () => {
   const store = createTurnStore();
   store.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "allow" }, SESSION, 1);

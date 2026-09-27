@@ -1024,12 +1024,22 @@ function createTurnStore() {
       } catch {
       }
     },
+    /**
+     * Consumes the record unconditionally, and answers `undefined` when there was nothing postable.
+     *
+     * The reset is NOT conditional on the record being postable, and that is the point. A turn can
+     * collect results without ever starting — a custom or MCP tool takes the nothing-evaluable skip
+     * and records no decision, an extension-sourced prompt records no prompt — and an early return
+     * here left those results in place, where `agent_end` could never drain them. They then belonged
+     * to no turn at all: `shouldPostTurn` refuses to send them, and a later started turn would only
+     * fail to match them by `tool_use_id`. Consumed and dropped is the honest outcome.
+     */
     take() {
       try {
-        if (!started()) return void 0;
         const taken = record;
+        const postable = started();
         record = { tool_calls: [], results: [] };
-        return taken;
+        return postable ? taken : void 0;
       } catch {
         return void 0;
       }
