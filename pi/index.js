@@ -155,9 +155,11 @@ function parseFailureAction(raw) {
 function parseToolsToCheck(raw) {
   if (!Array.isArray(raw)) return void 0;
   if (raw.length > MAX_TOOLS_TO_CHECK) return void 0;
-  return raw.filter(
+  const usable = raw.filter(
     (entry) => typeof entry === "string" && entry.length <= MAX_TOOL_NAME_CHARS
   );
+  if (usable.length !== raw.length) return void 0;
+  return usable;
 }
 function parseTimestamp(raw) {
   return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : void 0;
