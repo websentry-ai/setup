@@ -89,6 +89,9 @@ const oauthAnthropic = (expires = future()) => ({
 });
 
 const noSerial: ExecFileLike = async () => undefined;
+// "No serial" must hold on every runner: the Linux fallback reads /etc/machine-id via `readFile`, not
+// `execFile`, so both probes are stubbed together — a GitHub runner has a machine-id.
+const noSerialProbe = { ...noSerialProbe, readFile: () => undefined } as const;
 
 // --- agent dir -----------------------------------------------------------------------------------
 
@@ -379,7 +382,7 @@ test("an expired token makes no profile call", async () => {
       agentDir: agent.dir,
       profileUrl: server.url,
       timeoutMs: 2_000,
-      execFile: noSerial,
+      ...noSerialProbe,
     });
     assert.deepEqual(await loader.start("anthropic"), { auth_mode: "subscription" });
     assert.equal(server.hits.length, 0, "an expired token is never sent");
