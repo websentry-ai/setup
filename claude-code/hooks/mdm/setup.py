@@ -8,6 +8,8 @@ import sys
 import time
 import platform
 import subprocess
+import signal
+import threading
 import hashlib
 import json
 import shlex
@@ -30,6 +32,8 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+_SCRIPT_START = time.time()
+BACKFILL_DEADLINE_SECONDS = 540  # inside onboard.py's 600s watchdog
 
 
 def normalize_url(value: str) -> str:
@@ -2095,6 +2099,50 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
 
 
+def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
+    """Best-effort backfill, bounded from script start so it can never fail the policy."""
+    budget = BACKFILL_DEADLINE_SECONDS - (time.time() - _SCRIPT_START)
+    if budget <= 0:
+        print("[backfill] Skipped — setup used the time budget; backfill retries on the next run.")
+        return
+    if os.name != 'posix':
+        worker = threading.Thread(
+            target=run_backfill, args=(api_key, backend_url, user_homes), daemon=True,
+        )
+        worker.start()
+        worker.join(budget)
+        if worker.is_alive():
+            print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
+        return
+    # flush so the fork cannot replay buffered output
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.setsid()
+            # self-destruct even if the parent dies first
+            signal.signal(signal.SIGALRM, lambda *_: os.killpg(0, signal.SIGKILL))
+            signal.alarm(int(budget) + 5)
+            run_backfill(api_key, backend_url, user_homes)
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
+    deadline = time.time() + budget
+    while time.time() < deadline:
+        done_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if done_pid:
+            return
+        time.sleep(1)
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    os.waitpid(pid, 0)
+    print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
@@ -2377,7 +2425,7 @@ def main():
                           install_mode="mdm-skip" if skip_managed_settings else "mdm")
 
     if backfill_mode:
-        run_backfill(api_key, base_url, get_all_user_homes())
+        _run_backfill_bounded(api_key, base_url, get_all_user_homes())
 
     return True
 
