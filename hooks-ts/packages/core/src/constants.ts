@@ -238,6 +238,17 @@ export const MAX_COMMAND_CHARS = 8192;
  */
 export const MAX_PROMPT_CHARS = 8192;
 /**
+ * The turn log's cap on assistant text (RES-04), kept at **both ends** like every other cap here.
+ *
+ * Twice `MAX_PROMPT_CHARS` deliberately: an answer is routinely longer than the question that
+ * prompted it — a long explanation, a file listing read back, a diff described in prose — and this
+ * value is not a guardrail input. Nothing matches against it and nothing decides on it; it is an
+ * audit column, so the cost of being generous is bytes on a fire-and-forget POST rather than a
+ * bypass. Past it the middle goes and `assistant_truncated` says so, because the opening and the
+ * conclusion are the two parts of a long answer a reviewer actually reads.
+ */
+export const MAX_ASSISTANT_CHARS = 16_384;
+/**
  * WR-04: the per-value cap on what survives `TOOL_INPUT_ALLOWLIST`. `pattern` is model-produced and
  * free-form, and the server truncates it at 4096 anyway (`effectiveCommand.ts:20 PATTERN_MAX`), so
  * 2 KB costs no enforcement and bounds what a single value can carry off the machine.

@@ -21,16 +21,22 @@
 //      also a documented parity gap: `audit_service.py:113-139` feeds the serialised `tool_use` array
 //      (including `tool_response`) to DLP, so **tool-output DLP cannot fire for pi**. That is a direct
 //      consequence of the locked requirement, not a bug.
-//   4. **The assistant `content` is `""`.** The turn record holds no assistant text, and inventing one
-//      would be new egress nothing asked for — a second documented parity gap (no assistant-text DLP
-//      for pi). Sending the empty string keeps the two-message shape the server reads
-//      (`hooksHandlerFactory.ts:184-203`) without adding a channel.
+//   4. **The assistant `content` is the model's own text**, capped at `MAX_ASSISTANT_CHARS`. It used
+//      to be hard-coded `""`, on the reasoning that the turn record holds no assistant text and
+//      inventing one would be new egress. The record still holds none: the text is read off
+//      `agent_end`'s `messages` by `assistantTextFrom`, handed to this builder through `opts`, and
+//      never stored in the turn store, never written to disk and never logged locally — it exists for
+//      the length of one POST. What the old empty string cost was a row that showed the user's prompt
+//      and a silent assistant, i.e. half a conversation, and assistant-text DLP that could not fire
+//      for want of anything to match on. Capped at both ends with the same marker a command gets, and
+//      `assistant_truncated` rides the body when that happened.
 //
 // `applicationId`, `organizationId` and `key_source` are server-set (`:80-83`) and are never sent. No
 // `unbound_app_label` either: the route already labels this `pi`, which is what makes
 // `metadata.source = 'hooks'` true (`add_gateway_metrics_task.py:676-677`).
 
-import { TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
+import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
+import { capCommand } from "./payload.ts";
 import type { TurnRecord } from "./turn.ts";
 
 /** The hash pair, or the honest statement that the output was too big to hash. */
@@ -80,11 +86,26 @@ export interface TurnLogBody {
   results_truncated?: number;
   /** The same, for the `MAX_TURN_TOOL_CALLS` cap on `tool_calls` (WR-04). Same present-only rule. */
   tool_calls_truncated?: number;
+  /**
+   * `true` when the assistant text is a head-plus-tail of what the model actually said. Present-only,
+   * like the two counters above: a reader must be able to tell a whole answer from a spliced one
+   * without diffing it against the marker.
+   */
+  assistant_truncated?: true;
 }
 
 export interface TurnLogOptions {
   cwd: string;
   completedAtMs: number;
+  /**
+   * What the model said this turn, already extracted from `agent_end`'s messages.
+   *
+   * An option rather than a field on the record, because it never belongs to the record: the record
+   * accumulates across four handler invocations, while this arrives whole at `agent_end` and is used
+   * once. Keeping it out of the store is also what keeps "never logged locally" true by construction —
+   * there is no in-memory copy to leak into a snapshot.
+   */
+  assistantText?: string;
 }
 
 /**
@@ -115,6 +136,23 @@ export function shouldPostTurn(record: TurnRecord | undefined): boolean {
 function toolInputFor(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
   return value as Record<string, unknown>;
+}
+
+/**
+ * The assistant text as it goes on the wire: capped at `MAX_ASSISTANT_CHARS`, both ends kept.
+ *
+ * `capCommand` is reused rather than reimplemented — it is the project's both-ends cap, marker and
+ * all, and a second splicer would be a second thing to get wrong. Anything that is not a non-empty
+ * string is the empty string, so a hostile or half-built message array costs the column, not the row.
+ */
+function capAssistantText(text: unknown): { content: string; truncated: boolean } {
+  try {
+    if (typeof text !== "string" || text === "") return { content: "", truncated: false };
+    const capped = capCommand(text, MAX_ASSISTANT_CHARS);
+    return { content: capped.command, truncated: capped.truncated };
+  } catch {
+    return { content: "", truncated: false };
+  }
 }
 
 /** `{}` for a call with no result, the hash pair otherwise. Never the raw output. */
@@ -179,12 +217,14 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
     // Fall through with the defaults above: a degraded row beats a thrown handler.
   }
 
+  const assistant = capAssistantText(opts?.assistantText);
+
   const body: TurnLogBody = {
     conversation_id: conversationId,
     model: TURNLOG_MODEL,
     messages: [
       { role: "user", content: prompt },
-      { role: "assistant", content: "", tool_use: toolUse },
+      { role: "assistant", content: assistant.content, tool_use: toolUse },
     ],
     cwd: opts.cwd,
     requestCompleted: new Date(opts.completedAtMs).toISOString(),
@@ -195,5 +235,6 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   if (startedAt !== undefined) body.requestInitialized = new Date(startedAt).toISOString();
   if (truncated !== undefined) body.results_truncated = truncated;
   if (callsTruncated !== undefined) body.tool_calls_truncated = callsTruncated;
+  if (assistant.truncated) body.assistant_truncated = true;
   return body;
 }

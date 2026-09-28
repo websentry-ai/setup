@@ -46,6 +46,7 @@ import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import {
   createFakeAgentEndEvent,
+  createFakeAssistantMessage,
   createFakeCtx,
   createFakeInputEvent,
   createFakeSessionStartEvent,
@@ -174,6 +175,36 @@ test("session_start drops a pending record rather than posting it", async () => 
     );
     await sleep(60);
     assert.deepEqual(turnLogs(api), [], "and nothing was sent on the way out");
+  } finally {
+    f.cleanup();
+    await api.close();
+  }
+});
+
+test("assistant text cannot resurrect a record session_start dropped", async () => {
+  // `agent_end` now reads the model's text off the event rather than the record, so it is the one
+  // input to the body that survives a dropped record. It must not make a turn postable on its own:
+  // `shouldPostTurn` asks the RECORD whether anything happened, and after a `/new` the answer is no.
+  const api = await startMockApi({ mode: "allow" });
+  const f = await fixture(api);
+  try {
+    const ctxA = createFakeCtx({ sessionId: SESSION_A });
+    await handlerOf(f, "input")(createFakeInputEvent("half a turn"), ctxA);
+    await handlerOf(f, "session_start")(
+      createFakeSessionStartEvent("new"),
+      createFakeCtx({ sessionId: SESSION_B }),
+    );
+
+    handlerOf(f, "agent_end")(
+      createFakeAgentEndEvent([
+        createFakeAssistantMessage([{ type: "text", text: "an answer belonging to the dropped turn" }]),
+      ]),
+      createFakeCtx({ sessionId: SESSION_B }),
+    );
+    await sleep(60);
+
+    assert.deepEqual(turnLogs(api), [], "no record, no row — whatever the event carried");
+    assert.deepEqual(turnStore.snapshot(), { tool_calls: [], results: [] });
   } finally {
     f.cleanup();
     await api.close();

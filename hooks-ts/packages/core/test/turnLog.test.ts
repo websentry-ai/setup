@@ -14,7 +14,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { TURNLOG_MODEL } from "../src/constants.ts";
+import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL } from "../src/constants.ts";
+import { COMMAND_TRUNCATION_MARKER } from "../src/payload.ts";
 import { buildTurnLogBody, shouldPostTurn } from "../src/turnLog.ts";
 import type { TurnRecord } from "../src/turn.ts";
 
@@ -51,6 +52,9 @@ function record(overrides: Partial<TurnRecord> = {}): TurnRecord {
 }
 
 const build = (rec: TurnRecord) => buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT });
+/** The same, with the assistant text `agent_end` extracted from its messages. */
+const buildWith = (rec: TurnRecord, assistantText: string | undefined) =>
+  buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT, assistantText });
 
 // --- the locked model ---------------------------------------------------------------------------
 
@@ -83,8 +87,58 @@ test("the body is two messages: the user prompt, then an assistant message carry
   assert.equal(body.messages[0]?.role, "user");
   assert.equal(body.messages[0]?.content, "read the config and summarise it");
   assert.equal(body.messages[1]?.role, "assistant");
-  assert.equal(body.messages[1]?.content, "", "no assistant text is recorded, so none is invented");
+  assert.equal(body.messages[1]?.content, "", "no assistant text was passed, so none is invented");
   assert.equal(body.messages[1]?.tool_use?.length, 1);
+});
+
+// --- the assistant text ---------------------------------------------------------------------------
+//
+// It used to be hard-coded `""`, on the reasoning that the turn record holds no assistant text and
+// inventing one would be new egress. The record still holds none — it is read off `agent_end`'s
+// messages and passed straight through this builder, never stored and never logged — but the row is
+// what a reviewer reads, and one that showed the user's prompt and a silent assistant described half a
+// conversation.
+
+test("assistant text arrives verbatim in the assistant message", () => {
+  const body = buildWith(record(), "I read the config. It sets two replicas.");
+
+  assert.equal(body.messages[1]?.role, "assistant");
+  assert.equal(body.messages[1]?.content, "I read the config. It sets two replicas.");
+  assert.equal(body.messages[1]?.tool_use?.length, 1, "and the tool_use array is still there");
+  assert.equal(body.assistant_truncated, undefined, "nothing was capped, so nothing is claimed");
+});
+
+test("no assistant text is the empty string, exactly as before", () => {
+  for (const text of [undefined, "", 42 as unknown as string, {} as unknown as string]) {
+    const body = buildWith(record(), text);
+    assert.equal(body.messages[1]?.content, "", `${JSON.stringify(text)} became the content`);
+    assert.equal(body.messages.length, 2, "the two-message shape the server reads is preserved");
+    assert.equal(body.assistant_truncated, undefined);
+  }
+});
+
+test("assistant text past MAX_ASSISTANT_CHARS keeps both ends, with the marker and a flag", () => {
+  // Both ends for the same reason a command keeps both: the interesting part of a long answer is as
+  // likely to be the conclusion as the opening, and a head-only cut would always lose one of them.
+  const head = "HEAD_OF_THE_ANSWER";
+  const tail = "TAIL_OF_THE_ANSWER";
+  const text = head + "z".repeat(40_000) + tail;
+  const body = buildWith(record(), text);
+  const content = body.messages[1]?.content ?? "";
+
+  assert.equal(content.length, MAX_ASSISTANT_CHARS, "capped to exactly the cap");
+  assert.equal(MAX_ASSISTANT_CHARS, 16_384, "the cap is stated here so a change to it is deliberate");
+  assert.ok(content.startsWith(head), "the opening survives");
+  assert.ok(content.endsWith(tail), "and so does the conclusion");
+  assert.ok(content.includes(COMMAND_TRUNCATION_MARKER), "spliced with the existing marker");
+  assert.equal(body.assistant_truncated, true, "and the row says it is a prefix-plus-suffix");
+});
+
+test("assistant text just under the cap is sent whole and unflagged", () => {
+  const text = "a".repeat(MAX_ASSISTANT_CHARS);
+  const body = buildWith(record(), text);
+  assert.equal(body.messages[1]?.content, text);
+  assert.equal(body.assistant_truncated, undefined);
 });
 
 test("each tool_use entry is the PostToolUse shape the backend reads", () => {
