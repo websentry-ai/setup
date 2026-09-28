@@ -166,6 +166,7 @@ function createPolicyState() {
   let toolsToCheck;
   let toolsSyncedAt;
   let fetchedAt;
+  let toolsConfirmed = false;
   return {
     recordSuccess(body, nowMs = Date.now()) {
       let learned = false;
@@ -173,6 +174,7 @@ function createPolicyState() {
       if (nextTools !== void 0) {
         toolsToCheck = nextTools;
         toolsSyncedAt = nowMs;
+        toolsConfirmed = true;
         learned = true;
       }
       const nextAction = parseFailureAction(body?.policy_check_failure_action);
@@ -186,6 +188,7 @@ function createPolicyState() {
     // Copy out: a caller that mutates the returned array must not widen the skip set.
     getToolsToCheck: () => toolsToCheck === void 0 ? void 0 : [...toolsToCheck],
     getToolsSyncedAt: () => toolsSyncedAt,
+    getToolsConfirmed: () => toolsConfirmed,
     getFetchedAt: () => fetchedAt,
     /** Only what was actually learned. An absent key is the honest encoding of "never learned". */
     snapshot() {
@@ -200,6 +203,13 @@ function createPolicyState() {
      * Load a disk snapshot, **without downgrading anything learned over the network**. In-memory is
      * authoritative for the session (09-CONTEXT), which is also what caps T-09-01/T-09-02: a planted
      * cache can only ever influence a value this instance has not yet been told by the server.
+     *
+     * **`toolsConfirmed` is deliberately not set here** (WR-02). "A value the server has not told us
+     * yet" was doing more work than it looked: the cold window is every session start, and the old
+     * `pullPolicies = !areToolsFresh(hydrated stamp)` then declined to ask the server during exactly
+     * that window — so a planted `tools_to_check: []` with a fresh stamp suppressed all six native
+     * file-tool checks for a full TTL, renewably, with nothing able to correct it. Leaving this bit
+     * false is what makes `decide.ts` confirm a hydrated list once per process.
      *
      * Every field is re-validated. This object came off a file, so its types are claims.
      */
@@ -1164,7 +1174,8 @@ async function decideToolCall(event, ctx, deps) {
     if (command.trim() === "" && filePath === void 0) return void 0;
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
-    if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+    const toolsConfirmed = state.getToolsConfirmed();
+    if (toolsConfirmed && NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
       noteDecision(deps, {
         tool_name: event.toolName,
         tool_use_id: event.toolCallId,
@@ -1172,7 +1183,7 @@ async function decideToolCall(event, ctx, deps) {
       });
       return void 0;
     }
-    const pullPolicies = !areToolsFresh(state.getToolsSyncedAt(), now);
+    const pullPolicies = !toolsConfirmed || !areToolsFresh(state.getToolsSyncedAt(), now);
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,

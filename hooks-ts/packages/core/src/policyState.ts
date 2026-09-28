@@ -57,6 +57,12 @@ export interface PolicyState {
   getFailureAction(): FailureAction | undefined;
   getToolsToCheck(): string[] | undefined;
   getToolsSyncedAt(): number | undefined;
+  /**
+   * Has a **server response in this process** taught us `tools_to_check`, as opposed to a file
+   * claiming it? The provenance WR-02 needs: `getToolsSyncedAt` cannot answer it, because a hydrated
+   * stamp and a network-learned one are the same number.
+   */
+  getToolsConfirmed(): boolean;
   getFetchedAt(): number | undefined;
   snapshot(): PolicySnapshot;
   hydrate(snapshot: PolicySnapshot): void;
@@ -111,6 +117,11 @@ export function createPolicyState(): PolicyState {
   let toolsToCheck: string[] | undefined;
   let toolsSyncedAt: number | undefined;
   let fetchedAt: number | undefined;
+  /**
+   * WR-02's provenance bit: false until a *server* response in this process carries
+   * `tools_to_check`. `hydrate` deliberately never sets it — that is the whole point.
+   */
+  let toolsConfirmed = false;
 
   return {
     recordSuccess(body: PreToolResponseBody, nowMs: number = Date.now()): void {
@@ -121,6 +132,9 @@ export function createPolicyState(): PolicyState {
       if (nextTools !== undefined) {
         toolsToCheck = nextTools;
         toolsSyncedAt = nowMs;
+        // This is the one place it is set: the list came off the wire, from a response this process
+        // received, under the identity this process authenticated with.
+        toolsConfirmed = true;
         learned = true;
       }
 
@@ -138,6 +152,7 @@ export function createPolicyState(): PolicyState {
     // Copy out: a caller that mutates the returned array must not widen the skip set.
     getToolsToCheck: () => (toolsToCheck === undefined ? undefined : [...toolsToCheck]),
     getToolsSyncedAt: () => toolsSyncedAt,
+    getToolsConfirmed: () => toolsConfirmed,
     getFetchedAt: () => fetchedAt,
 
     /** Only what was actually learned. An absent key is the honest encoding of "never learned". */
@@ -154,6 +169,13 @@ export function createPolicyState(): PolicyState {
      * Load a disk snapshot, **without downgrading anything learned over the network**. In-memory is
      * authoritative for the session (09-CONTEXT), which is also what caps T-09-01/T-09-02: a planted
      * cache can only ever influence a value this instance has not yet been told by the server.
+     *
+     * **`toolsConfirmed` is deliberately not set here** (WR-02). "A value the server has not told us
+     * yet" was doing more work than it looked: the cold window is every session start, and the old
+     * `pullPolicies = !areToolsFresh(hydrated stamp)` then declined to ask the server during exactly
+     * that window — so a planted `tools_to_check: []` with a fresh stamp suppressed all six native
+     * file-tool checks for a full TTL, renewably, with nothing able to correct it. Leaving this bit
+     * false is what makes `decide.ts` confirm a hydrated list once per process.
      *
      * Every field is re-validated. This object came off a file, so its types are claims.
      */

@@ -126,11 +126,28 @@ export async function decideToolCall(
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
 
+    // WR-02. "The server has already told us" is the entire justification for the skip below, so the
+    // skip is gated on the server having told *this process* — not on a number a file supplied.
+    // `policyState.hydrate` never sets this bit, so it is false until the first response that carries
+    // `tools_to_check` lands, which the forced pull below guarantees happens on the first real tool
+    // call of the session.
+    //
+    // Without it, a same-UID local process could read `policy_cache.json` — which hands it both
+    // halves of the identity in cleartext — rewrite it as `{tools_to_check: [], tools_synced_at: now}`
+    // and disable every read/write/edit/grep/find/ls for 300 s, renewably, while enforcement reported
+    // itself active. Cost of the fix is one round trip per session; the warm cache still pays for
+    // itself on every call after the first.
+    const toolsConfirmed = state.getToolsConfirmed();
+
     // RES-03's fast path. When the org's own tool list is tools-FRESH and does not name this tool,
     // the server has already told us there is no file policy that could apply — so there is nothing
     // to ask, and no payload is even built. Bounded to the six native file tools: a shell command or
     // a custom tool is evaluated on its `command`, which no cached list can answer for.
-    if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+    if (
+      toolsConfirmed &&
+      NATIVE_FILE_TOOLS.has(event.toolName) &&
+      shouldSkipFileToolFromState(event.toolName, state, now)
+    ) {
       // Recorded, not silent: "we did not ask" is a different audit fact from "we asked and it was
       // allowed", and a turn log that showed them identically would make the cache invisible.
       noteDecision(deps, {
@@ -145,7 +162,12 @@ export async function decideToolCall(
     // only thing that can fill the cache. Ask for it when the list is missing or stale — never by
     // fabricating a request: a synthetic `ls` would be evaluated as a real tool use and can fire a
     // Slack approval for a command nobody ran.
-    const pullPolicies = !areToolsFresh(state.getToolsSyncedAt(), now);
+    //
+    // An UNCONFIRMED list is always pulled, however fresh its stamp looks (WR-02). That is the
+    // self-heal: the first real tool call of the session round-trips, the response re-establishes the
+    // list from the server, `toolsConfirmed` flips, and every call after this one takes the TTL logic
+    // exactly as before.
+    const pullPolicies = !toolsConfirmed || !areToolsFresh(state.getToolsSyncedAt(), now);
 
     const payload = buildPretoolPayload({
       toolName: event.toolName,
