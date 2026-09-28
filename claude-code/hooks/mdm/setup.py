@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import os
+import math
 import random
 import stat
 import shutil
@@ -1886,7 +1887,7 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
 
 
 def _backfill_collect_batch(home_dir: Path, force_epoch=None, force_days=None,
-                            limit=BACKFILL_BATCH_SESSIONS) -> Dict:
+                            limit=BACKFILL_BATCH_SESSIONS, tie_mtime=None) -> Dict:
     """Oldest-mtime-first batch of sessions past this home's cutoff; one dict through the pickle pipe."""
     result = {'sessions': [], 'more': False, 'forced': False, 'last_mtime': 0.0}
     projects_root = home_dir / '.claude' / 'projects'
@@ -1894,10 +1895,6 @@ def _backfill_collect_batch(home_dir: Path, force_epoch=None, force_days=None,
         return result
     cutoff_mtime = _backfill_read_cutoff(home_dir)
     result['forced'] = force_epoch is not None and force_epoch > cutoff_mtime
-    if result['forced']:
-        # Widen only: a narrower window would skip the band the device already reached.
-        window = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
-        cutoff_mtime = min(cutoff_mtime, window)
 
     def _mtime(path):
         try:
@@ -1906,8 +1903,12 @@ def _backfill_collect_batch(home_dir: Path, force_epoch=None, force_days=None,
             return 0.0
 
     candidates = sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime), key=_mtime)
-    taken = candidates if limit is None else candidates[:limit]
-    result['more'] = limit is not None and len(candidates) > limit
+    if tie_mtime is not None:
+        # Bounded drain of one shared-mtime group the scalar bookmark cannot split.
+        candidates = [p for p in candidates if _mtime(p) == tie_mtime]
+        limit = BACKFILL_MAX_SESSIONS_PER_RUN
+    taken = candidates[:limit]
+    result['more'] = len(candidates) > limit
     for transcript_path in taken:
         result['last_mtime'] = max(result['last_mtime'], _mtime(transcript_path))
         session = _backfill_collect_session(transcript_path)
@@ -1922,9 +1923,26 @@ def _backfill_collect_batch(home_dir: Path, force_epoch=None, force_days=None,
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
                                force_days=None) -> Tuple[List[Dict], bool, bool]:
     """(sessions, capped, forced) — the shape sibling installers and the packaged binary share."""
-    batch = _backfill_collect_batch(home_dir, force_epoch, force_days,
-                                    limit=BACKFILL_MAX_SESSIONS_PER_RUN)
-    return batch['sessions'], batch['more'], batch['forced']
+    projects_root = home_dir / '.claude' / 'projects'
+    if not projects_root.exists():
+        return [], False, False
+    cutoff_mtime = _backfill_read_cutoff(home_dir)
+    forced = force_epoch is not None and force_epoch > cutoff_mtime
+    if forced:
+        # Widen only: a narrower window would skip the band the device already reached.
+        window = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+        cutoff_mtime = min(cutoff_mtime, window)
+    sessions = []
+    capped = False
+    for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
+        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
+            capped = True
+            break
+        session = _backfill_collect_session(transcript_path)
+        if session:
+            sessions.append(session)
+    _backfill_attach_identity(sessions, None, _backfill_account_email(home_dir))
+    return sessions, capped, forced
 
 
 def _backfill_edr_headers(extra: Optional[Dict[str, str]] = None) -> Dict[str, str]:
@@ -2178,17 +2196,37 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         chunks_failed = 0
         paused = False
         for username, home_dir in user_homes:
-            limit = BACKFILL_BATCH_SESSIONS
+            tie_mtime = None
             prev_last = None
             while not paused:
                 if time.time() >= deadline:
                     paused = True
                     break
                 batch = _run_as_user(username, _backfill_collect_batch, home_dir,
-                                     force_epoch, force_days, limit)
+                                     force_epoch, force_days, BACKFILL_BATCH_SESSIONS,
+                                     tie_mtime)
                 if batch is None:
                     # Could not read this user's home (fork/perms) — don't advance its
                     # cutoff, or we'd permanently skip its history on the next run.
+                    break
+                if batch['forced']:
+                    # An org re-walk resets the window per collect, which defeats batch
+                    # resumption; forced homes keep the pre-batching single-shot walk.
+                    legacy = _run_as_user(username, _backfill_collect_sessions, home_dir,
+                                          force_epoch, force_days)
+                    if legacy is None:
+                        break
+                    l_sessions, l_capped, _ = legacy
+                    if l_sessions:
+                        _backfill_attach_identity(l_sessions, device_serial, None)
+                        sent, _, failed = _backfill_send_sessions(api_key, backend_url,
+                                                                  l_sessions, True)
+                        queued += sent
+                        chunks_failed += failed
+                        if failed:
+                            break
+                    if not l_capped:
+                        _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
                     break
                 sessions = batch['sessions']
                 if not sessions and not batch['more']:
@@ -2197,17 +2235,27 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
                 # One serial for the machine; the email was attached per home above.
                 _backfill_attach_identity(sessions, device_serial, None)
                 sent, _, failed = _backfill_send_sessions(api_key, backend_url, sessions,
-                                                          batch['forced'])
+                                                          False)
                 queued += sent
                 chunks_failed += failed
                 if failed:
                     break
+                if tie_mtime is not None:
+                    if batch['more']:
+                        # Over 5000 files share one mtime; retried next run, never unbounded.
+                        break
+                    _run_as_user(username, _backfill_write_cutoff, home_dir,
+                                 math.nextafter(tie_mtime, float('inf')))
+                    tie_mtime = None
+                    prev_last = None
+                    continue
                 if not batch['more']:
                     _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
                     break
                 _run_as_user(username, _backfill_write_cutoff, home_dir, batch['last_mtime'])
-                # A capped batch stuck on one shared mtime cannot advance; drain it uncapped.
-                limit = None if batch['last_mtime'] == prev_last else BACKFILL_BATCH_SESSIONS
+                # A batch stuck on one shared mtime cannot advance; drain that tie group.
+                if batch['last_mtime'] == prev_last:
+                    tie_mtime = batch['last_mtime']
                 prev_last = batch['last_mtime']
         if paused:
             print(f"[backfill] Paused at the time budget — queued {queued} so far; continues next run.")
