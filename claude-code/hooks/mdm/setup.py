@@ -1902,15 +1902,18 @@ def _backfill_collect_batch(home_dir: Path, force_epoch=None, force_days=None,
         except OSError:
             return 0.0
 
-    candidates = sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime), key=_mtime)
+    # One mtime observation per file: ordering, tie filtering and the bookmark must
+    # agree, or a file appended mid-run can push the bookmark past unsent files.
+    candidates = sorted((_mtime(p), p) for p in
+                        _backfill_iter_transcripts(projects_root, cutoff_mtime))
     if tie_mtime is not None:
         # Bounded drain of one shared-mtime group the scalar bookmark cannot split.
-        candidates = [p for p in candidates if _mtime(p) == tie_mtime]
+        candidates = [c for c in candidates if c[0] == tie_mtime]
         limit = BACKFILL_MAX_SESSIONS_PER_RUN
     taken = candidates[:limit]
     result['more'] = len(candidates) > limit
-    for transcript_path in taken:
-        result['last_mtime'] = max(result['last_mtime'], _mtime(transcript_path))
+    for observed_mtime, transcript_path in taken:
+        result['last_mtime'] = max(result['last_mtime'], observed_mtime)
         session = _backfill_collect_session(transcript_path)
         if session:
             result['sessions'].append(session)
