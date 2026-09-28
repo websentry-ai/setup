@@ -139,6 +139,27 @@ class TestAFailedKeyWriteIsNotSuccess:
         assert "stay inactive" in out, "the user is told WHY, not just that it failed"
         assert "UNBOUND_PI_API_KEY" in out, "and is given the fallback"
 
+    def test_a_symlinked_config_fails_the_whole_run(
+            self, pi_setup, fake_home, good_fetch, monkeypatch, capsys):
+        """End to end, because the refusal is only worth anything if it reaches the exit
+        status: an installed extension plus a key the extension refuses to read is the exact
+        silent-inactive outcome this run must not call success."""
+        cfg = fake_home.config_path
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        dotfiles = fake_home.home / "dotfiles-unbound.json"
+        dotfiles.write_text("{}")
+        cfg.symlink_to(dotfiles)
+        monkeypatch.setattr(pi_setup.sys, "argv",
+                            ["setup.py", "--api-key", "notakey", "--backend-url", "https://b"])
+        monkeypatch.setattr(pi_setup, "notify_setup_complete",
+                            lambda *a, **k: pytest.fail("no report after a refused key write"))
+
+        assert pi_setup.main() is False
+        out = capsys.readouterr().out
+        assert "Setup complete" not in out
+        assert "symlink" in out
+        assert "UNBOUND_PI_API_KEY" in out, "and the export fallback is still offered"
+
     def test_a_successful_key_write_still_completes(
             self, pi_setup, pi_home, good_fetch, monkeypatch, captured_reports, capsys):
         """The negative above must not be passing because main() is broken outright."""
@@ -392,9 +413,30 @@ class TestNoDurableFileIsWrittenByTruncation:
         assert data["base_url"] == "https://b"
         assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
 
+    def test_the_user_config_write_refuses_a_symlinked_config(
+            self, pi_setup, fake_home, capsys):
+        """The installer's contract has to match the reader's. The extension lstats this path
+        and treats a link as absent (`readSmallRegularFile`), so a key written through a
+        dotfiles symlink is a key it never reads: setup reported success and left an extension
+        that was silently inactive. Refusing also keeps the key out of the dotfiles repo the
+        link points into."""
+        cfg = fake_home.config_path
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        dotfiles = fake_home.home / "dotfiles-unbound.json"
+        original = '{"email": "someone@example.com"}'
+        dotfiles.write_text(original)
+        cfg.symlink_to(dotfiles)
+
+        assert pi_setup.write_unbound_config("newkey", {"base_url": "https://b"}) is False
+        assert dotfiles.read_text() == original, "the key was written through the link"
+        out = capsys.readouterr().out
+        assert "symlink" in out
+        assert "Replace the link" in out, "the refusal has to be actionable"
+
     def test_the_mdm_config_write_refuses_a_symlink(self, pi_mdm_setup, tmp_path):
-        """Root writing into another user's home must not follow a planted link, even though
-        the user installer deliberately DOES follow one in the user's own home."""
+        """Root writing into another user's home must not follow a planted link either -- the
+        same refusal, for the additional reason that the link is an attack there rather than a
+        dotfiles convention."""
         mod = pi_mdm_setup
         outside = tmp_path / "outside.json"
         outside.write_text("untouched")

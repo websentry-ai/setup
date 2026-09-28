@@ -503,9 +503,23 @@ def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
     per-tool URLs, and clobbering them would log the CLI out. The api_key is set
     unconditionally because in the user path unbound-cli already handed us this user's own
     key -- the MDM installer is the one that must only write it when absent.
+
+    A SYMLINKED config.json is refused rather than followed, because the reader refuses it:
+    `readSmallRegularFile` lstats the path and treats a link as absent, so writing through
+    the link would produce an installed extension that reads no key and stays silently
+    inactive -- reported as success. Refusing keeps the installer's contract identical to the
+    extension's, and keeps the key out of wherever the link points.
     """
     config_dir = Path.home() / ".unbound"
     config_file = config_dir / "config.json"
+    if config_file.is_symlink():
+        print(f"❌ {config_file} is a symlink, and the extension refuses a symlinked config:")
+        print("   it lstats that path and treats a link as absent, so a key written through")
+        print("   the link would never be read -- the extension would install and then stay")
+        print("   silently inactive. Writing it would also copy this key to wherever the link")
+        print("   points, typically a dotfiles repository.")
+        print("   Replace the link with a regular file, then re-run.")
+        return False
     try:
         if platform.system().lower() == "windows":
             config_dir.mkdir(parents=True, exist_ok=True)

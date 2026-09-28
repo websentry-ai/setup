@@ -52,6 +52,20 @@ rather than guessing a path.
 It writes nothing else. It does not touch other extension directories, it does not modify your pi
 configuration, and it does not install or update pi itself.
 
+## Where the key goes, and the one config shape that is refused
+
+The key is merged into `~/.unbound/config.json` — the shared identity store `unbound-cli` and five
+other tools read — rather than written over it, so your email, org and per-tool URLs survive.
+
+If `~/.unbound/config.json` is a **symlink** (a dotfiles repository, typically), the installer
+**refuses and exits `1` without writing**. This is not fussiness: the extension reads that path
+with `lstat` and treats a link as absent (`hooks-ts/packages/core/src/safeRead.ts`, which refuses a
+link so a `config.json` replaced by a FIFO cannot wedge pi on session start). A key written through
+the link would therefore never be read — the extension would install and then be silently inactive,
+with setup reporting success — and the key would land in your dotfiles repo as a bonus. Replace the
+link with a regular file and re-run, or export `UNBOUND_PI_API_KEY`, which the extension prefers
+over the config file anyway.
+
 ## The `index.ts` shadow rule
 
 **pi resolves `index.ts` before `index.js` in the same extension directory.** A leftover
