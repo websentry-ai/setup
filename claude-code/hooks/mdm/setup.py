@@ -8,7 +8,7 @@ import sys
 import time
 import platform
 import subprocess
-import threading
+import signal
 import hashlib
 import json
 import shlex
@@ -2097,6 +2097,36 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
 
 
+def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
+    """Bounded and best-effort: setup already succeeded, so backfill must not fail the policy.
+
+    Runs in a child forked from the main thread (fork from a worker thread is unsafe on
+    macOS, and run_backfill forks again via _run_as_user)."""
+    if os.name != 'posix':
+        run_backfill(api_key, backend_url, user_homes)
+        return
+    # Flush before forking so the child does not replay the parent's buffered output.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            run_backfill(api_key, backend_url, user_homes)
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
+    deadline = time.time() + BACKFILL_TIMEOUT_SECONDS
+    while time.time() < deadline:
+        done_pid, _ = os.waitpid(pid, os.WNOHANG)
+        if done_pid:
+            return
+        time.sleep(1)
+    os.kill(pid, signal.SIGKILL)
+    os.waitpid(pid, 0)
+    print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
+
+
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Walk every user's ~/.claude/projects and seed historical sessions.
 
@@ -2379,14 +2409,7 @@ def main():
                           install_mode="mdm-skip" if skip_managed_settings else "mdm")
 
     if backfill_mode:
-        # Bounded and best-effort: setup already succeeded, so backfill must not fail the policy.
-        worker = threading.Thread(
-            target=run_backfill, args=(api_key, base_url, get_all_user_homes()), daemon=True,
-        )
-        worker.start()
-        worker.join(BACKFILL_TIMEOUT_SECONDS)
-        if worker.is_alive():
-            print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
+        _run_backfill_bounded(api_key, base_url, get_all_user_homes())
 
     return True
 
