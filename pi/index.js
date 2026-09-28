@@ -1191,8 +1191,11 @@ async function confirmWithTimeout(ctx, title, message, timeoutMs = CONFIRM_TIMEO
 
 // packages/pi/src/decide.ts
 function noteDecision(deps, entry) {
+  noteSafe(() => deps.onDecision?.(entry));
+}
+function noteSafe(fn) {
   try {
-    deps.onDecision?.(entry);
+    fn?.();
   } catch {
   }
 }
@@ -1290,10 +1293,10 @@ async function decideInput(event, ctx, deps) {
         return { action: "handled" };
       case "confirm":
         notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
-        deps.onPrompt?.(text);
+        noteSafe(() => deps.onPrompt?.(text));
         return void 0;
       case "allow":
-        deps.onPrompt?.(text);
+        noteSafe(() => deps.onPrompt?.(text));
         return void 0;
       default:
         return void 0;

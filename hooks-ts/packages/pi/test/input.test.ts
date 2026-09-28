@@ -348,3 +348,44 @@ test("HOOK-05 no API key: the registered input handler is inert, with zero HTTP"
     await api.close();
   }
 });
+
+// --- WR-06: an audit callback cannot change a verdict -------------------------------------------
+
+test("WR-06 a throwing onPrompt cannot change what the handler returns", async () => {
+  const thrower = () => {
+    // What this stands in for: `onPrompt` is wired to the module-scope turn store through a closure
+    // that reads `ctx.sessionManager.getSessionId()`. A throw from any of that used to land in the
+    // fail-open outer catch, which returns `undefined` — so on the deny branches it would have
+    // silently un-suppressed the prompt.
+    throw new Error("turn store exploded");
+  };
+
+  // `allow` is where the callback fires today, so this is the case that must stay `undefined` for the
+  // right reason rather than by accident.
+  const allowed = await run("allow", "record me", { deps: { onPrompt: thrower } });
+  assert.equal(allowed.result, undefined, "an allowed prompt still proceeds");
+
+  // `confirm` is the other call site: pi is in neither cost gate, so this verdict is defensive, and
+  // it must stay non-blocking.
+  const asked = await run("ask", "ask about me", { deps: { onPrompt: thrower } });
+  assert.equal(asked.result, undefined, "a confirm verdict still proceeds, throw or no throw");
+
+  // And the branches that do NOT call it must be unaffected — a deny stays a deny.
+  const denied = await run("deny", "do not record me", { deps: { onPrompt: thrower } });
+  assert.deepStrictEqual(denied.result, { action: "handled" }, "a suppressed prompt stays suppressed");
+});
+
+test("WR-06 the wrapper swallows the throw rather than the handler's outer catch", async () => {
+  // The distinction the test above cannot see on its own: if the throw were still reaching the outer
+  // `catch`, the notification raised BEFORE the callback would already have happened, but so would an
+  // abandoned switch. Asserting the notice survives pins that the function ran to its own `return`.
+  const { result, ctx } = await run("ask", "ask about me", {
+    deps: {
+      onPrompt: () => {
+        throw new Error("turn store exploded");
+      },
+    },
+  });
+  assert.equal(result, undefined);
+  assert.equal(ctx.notifyCalls.length, 1, "the confirm reason was surfaced and the switch completed");
+});

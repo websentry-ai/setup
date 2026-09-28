@@ -88,8 +88,24 @@ export function noteDecision(
   deps: Pick<DecideDeps, "onDecision">,
   entry: { tool_name: string; tool_use_id: string; decision: string },
 ): void {
+  noteSafe(() => deps.onDecision?.(entry));
+}
+
+/**
+ * The guard itself, for any audit emission that is not a decision entry (WR-06).
+ *
+ * `prompt.ts` used to call `deps.onPrompt?.(text)` bare, inside its own fail-open try/catch, which
+ * restated the invariant by omission instead of reusing it. Benign only by coincidence — both of that
+ * function's call sites already returned `undefined`, so a throw landed on the same answer. It stops
+ * being benign the moment anyone records the prompt before the deny branch, moves the call, or adds a
+ * verdict between them, and the failure would be a silently UN-suppressed prompt with no test
+ * pointing at it, because at that call site the hazard is invisible.
+ *
+ * One wrapper, exported, so the rule has a single place to be true.
+ */
+export function noteSafe(fn: (() => void) | undefined): void {
   try {
-    deps.onDecision?.(entry);
+    fn?.();
   } catch {
     // An audit line is never worth a verdict.
   }
