@@ -52,7 +52,7 @@ way the other MDM installers in this repo do.
 |---|---|---|
 | `<home>/.pi/agent/extensions/unbound/index.js` | `0644` | that user |
 | `<home>/.pi/agent/extensions/unbound/index.js.sha256` | `0644` | that user |
-| an `export UNBOUND_PI_API_KEY="…"` line in `~/.zprofile` + `~/.bash_profile` (macOS) or `~/.zshrc` + `~/.bashrc` (Linux) | — | that user |
+| an `export UNBOUND_PI_API_KEY="…"` line in `~/.zprofile` + `~/.bash_profile` (macOS) or `~/.zshrc` + `~/.bashrc` (Linux) | group/other bits stripped (`0644` → `0600`) | that user |
 | `api_key` in `<home>/.unbound/config.json`, **only when absent or previously written by this installer** | `0600` in a `0700` dir | that user |
 | `pi_mdm_api_key_sha256` in the same file — the digest that marks that `api_key` as ours | `0600` in a `0700` dir | that user |
 
@@ -97,6 +97,13 @@ port of, both called out in comments at the code:
 2. **The `export` value passes a charset allow-list first** (`_is_safe_env_value`). An rc
    file is executed by the user's login shell, so an unvalidated value in it is command
    injection, on every account on the device. This check is an addition, not a port.
+3. **The rc file is published owner-only.** The analog writes `0644`, which is the normal
+   mode for a shell profile — but this line holds a plaintext application key, and a macOS
+   home directory is `0755` by default, so every other local account (including the service
+   accounts this installer skips) could read the key out of `~/.zprofile`. The rewrite strips
+   the group and other bits and never adds a bit the file did not have, so a profile kept at
+   `0600` or `0700` is unchanged. `--clear` removes the export line but does not widen the
+   mode back: the original is not recoverable, and owner-only is the safe end state.
 
 The `UNBOUND_PI_API_KEY` variable is deliberately the pi-specific tier and never the generic
 `UNBOUND_API_KEY`: writing a device key to the generic name would hand it to six other tools.

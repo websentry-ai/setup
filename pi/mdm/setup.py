@@ -40,7 +40,9 @@ Two deliberate divergences from the Augment analog, both called out at the code:
     `pi_mdm_api_key_sha256` digest recorded beside it -- or a revoked key would survive every
     later push in the one tier a GUI-launched pi reads.
   * an `export` line is only written after `_is_safe_env_value()` passes, because an rc file
-    is a shell script and an unvalidated value in it is command injection.
+    is a shell script and an unvalidated value in it is command injection. The rc file is
+    also published with its group and other bits stripped: the line holds a plaintext key,
+    the analog's 0644 is world-readable, and a macOS home is 0755 by default.
 
 About the sha256 sidecar: `pi/index.js.sha256` is fetched from the same origin, over the
 same TLS, from the same ref as the artifact itself. It catches a truncated or corrupt
@@ -124,6 +126,10 @@ DISABLED_SUFFIX = ".unbound-disabled"
 
 # Exactly the files this installer writes, and so exactly what --clear may remove.
 INSTALLED_NAMES = ("index.js", "index.js.sha256")
+
+# Marks a publish-by-rename temp. The full name adds a pid and random bytes -- see
+# _unique_tmp_path -- so two concurrent writers can never share one temp file.
+TMP_MARKER = ".unbound-tmp"
 
 # The charset an env value may contain before it is written into a shell rc file. An rc file
 # is executed by the user's login shell, so anything outside this set -- a quote, a $, a
@@ -433,6 +439,32 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
     except Exception as e:
         debug_print(f"Error enumerating users: {e}")
         return []
+
+
+def _unique_tmp_path(target: Path) -> Path:
+    """A temp name beside `target` that belongs to this writer alone.
+
+    One shared `<name>.unbound-tmp`, unlinked before every open, was a lost-update race with
+    a silent wrong answer: writer B unlinks A's open temp, creates its own at the same name,
+    and A's `os.replace` then publishes B's half-written file over the destination and
+    reports success. An MDM push landing while that user runs `unbound setup pi` is the
+    reachable version -- both write `~/.unbound/config.json`. With the pid and four random
+    bytes in the name, O_EXCL means what it says and the failure path unlinks only our own.
+    """
+    return target.with_name(f"{target.name}{TMP_MARKER}.{os.getpid()}.{os.urandom(4).hex()}")
+
+
+def _unlink_legacy_tmp(target: Path) -> None:
+    """Remove the pre-unique fixed-name temp an older killed run could have left behind.
+
+    Safe to unlink unconditionally because no writer creates this exact name any more, so it
+    can only be debris -- and unlike globbing the unique names, it can never take out a live
+    writer's temp file.
+    """
+    try:
+        os.unlink(str(target.with_name(target.name + TMP_MARKER)))
+    except OSError:
+        pass
 
 
 def _relative_parts(base: Path, path) -> List[str]:
@@ -785,17 +817,14 @@ def _drop_in_home(extdir: Path, target: Path, sidecar: Path, payload: bytes,
     # write that then fails leaves a previously working extension truncated in that user's
     # home, and pi loads the broken file silently -- the user is unprotected with no error
     # anywhere. os.replace is atomic within a directory.
-    tmp = target.with_name(target.name + ".unbound-tmp")
+    tmp = _unique_tmp_path(target)
     # O_EXCL belongs to the TEMP file only -- it must never be reused for a destination that
     # legitimately already exists, which is how a shared `flags` variable silently turned
     # every repeat fleet push into a stale sidecar.
     tmp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
     try:
-        # A temp left by an earlier killed run must not fail the O_EXCL open.
-        try:
-            os.unlink(str(tmp))
-        except FileNotFoundError:
-            pass
+        # Debris from a killed pre-unique run, never another live writer's temp.
+        _unlink_legacy_tmp(target)
         fd = os.open(str(tmp), tmp_flags, 0o644)
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
@@ -971,10 +1000,11 @@ def rc_files_for(home_dir) -> List[Path]:
     return []
 
 
-def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None) -> bool:
+def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None,
+                   holds_secret: bool = False) -> bool:
     """Append `line` to `file_path` exactly once. With `var_name`, any previous
     `export <var_name>=` line is dropped first, so a repeated MDM push rotates the value
-    rather than growing the file.
+    rather than growing the file. `holds_secret` publishes the result owner-only.
 
     A plain open, not O_NOFOLLOW: this already runs as the target user (inside
     _run_as_user), where a symlink grants nothing the user does not already have -- and a
@@ -1007,8 +1037,17 @@ def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None) -
             lines = [l for l in lines if not l.strip().startswith(export_prefix)]
         normalized_line = line.rstrip()
         if not any(l.rstrip() == normalized_line for l in lines):
+            # Terminate the last retained line first. readlines() keeps terminators as they
+            # are and writelines() adds none, so a profile whose final line has no newline
+            # got our export CONCATENATED onto it: `export EDITOR=vim` became
+            # `export EDITOR=vimexport UNBOUND_PI_API_KEY="..."`, which breaks the user's
+            # setting and our own line at once -- and a final `# comment` swallows the export
+            # whole, leaving the account silently unprotected. Only on the append path: a
+            # no-op push must not rewrite a file it has nothing to add to.
+            if lines and not lines[-1].endswith("\n"):
+                lines[-1] += "\n"
             lines.append(f"{line}\n")
-        return _rewrite_rc_file(file_path, lines)
+        return _rewrite_rc_file(file_path, lines, holds_secret=holds_secret)
     except Exception as e:
         print(f"Failed to modify {file_path}: {e}")
         return False
@@ -1031,13 +1070,10 @@ def _atomic_write_text(path, text: str, mode: int = 0o644) -> bool:
         if os.path.islink(str(target)):
             debug_print(f"Refusing to write {target}: it is a symlink")
             return False
-        tmp = target.with_name(target.name + ".unbound-tmp")
+        tmp = _unique_tmp_path(target)
         try:
-            # A temp left by an earlier killed run must not fail the O_EXCL open.
-            try:
-                os.unlink(str(tmp))
-            except FileNotFoundError:
-                pass
+            # Debris from a killed pre-unique run, never another live writer's temp.
+            _unlink_legacy_tmp(target)
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
             fd = os.open(str(tmp), flags, mode)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -1063,7 +1099,7 @@ def _atomic_write_text(path, text: str, mode: int = 0o644) -> bool:
         return False
 
 
-def _rewrite_rc_file(file_path: Path, lines) -> bool:
+def _rewrite_rc_file(file_path: Path, lines, holds_secret: bool = False) -> bool:
     """Replace one shell rc file's contents without a truncate-in-place window.
 
     A plain `open(path, "w")` truncates first, so a write that then fails (ENOSPC, EIO, a
@@ -1073,6 +1109,14 @@ def _rewrite_rc_file(file_path: Path, lines) -> bool:
     A shell rc file symlinked into a dotfiles repo is a common, legitimate setup, so the
     link is resolved and the REAL file is rewritten: os.replace on the link path would
     replace the link itself and silently detach the user from their dotfiles.
+
+    `holds_secret` publishes the file with the group and other bits stripped, because the
+    content we are adding is a plaintext API key. The default 0644 -- which is what a shell
+    profile normally is, and what the Augment analog writes -- is world-readable, and a macOS
+    home is 0755 by default, so every other local account (including the service accounts
+    this installer deliberately skips) could read the key straight out of `~/.zprofile`.
+    Tightening only ever REMOVES bits: a profile the user keeps at 0600 stays 0600, and the
+    owner's own bits are untouched, because the login shell reading the file runs as them.
     """
     try:
         target = Path(os.path.realpath(str(file_path)))
@@ -1083,13 +1127,12 @@ def _rewrite_rc_file(file_path: Path, lines) -> bool:
                 mode = stat.S_IMODE(target.stat().st_mode)
         except OSError:
             pass
-        tmp = target.with_name(target.name + ".unbound-tmp")
+        if holds_secret:
+            mode &= ~(stat.S_IRWXG | stat.S_IRWXO)
+        tmp = _unique_tmp_path(target)
         try:
-            # A temp left by an earlier killed run must not fail the O_EXCL open.
-            try:
-                os.unlink(str(tmp))
-            except FileNotFoundError:
-                pass
+            # Debris from a killed pre-unique run, never another live writer's temp.
+            _unlink_legacy_tmp(target)
             fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
             with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
                 f.writelines(lines)
@@ -1162,7 +1205,8 @@ def set_env_var_for_user(username: str, home_dir, var_name: str,
         for rc_file in rc_files:
             try:
                 exists_already = check_env_var_exists(rc_file, var_name, value)
-                if append_to_file(rc_file, export_line, var_name):
+                # holds_secret: the line being added is the plaintext application key.
+                if append_to_file(rc_file, export_line, var_name, holds_secret=True):
                     _success = True
                     if not exists_already:
                         _changed = True

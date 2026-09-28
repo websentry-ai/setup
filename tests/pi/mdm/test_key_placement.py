@@ -6,10 +6,15 @@ that is already open and to a GUI-launched pi -- but:
 
   * an rc file is EXECUTED by the user's login shell, so the value passes a charset gate
     before any append (`_is_safe_env_value`, an addition to the Augment analog); and
-  * `config.json` `api_key` is written with `setdefault`, where Augment assigns
-    unconditionally -- that file is the shared identity store for unbound-cli, Cursor,
-    Claude Code, Codex, Copilot and Augment, and clobbering it would repoint all of them at
-    this device key.
+  * `config.json` `api_key` is written by ownership, where Augment assigns unconditionally --
+    that file is the shared identity store for unbound-cli, Cursor, Claude Code, Codex,
+    Copilot and Augment, and clobbering it would repoint all of them at this device key. A
+    key THIS installer wrote is still rotatable, tracked by a digest beside it.
+
+Both copies of the key are owner-only on disk. `config.json` is 0600 in a 0700 directory;
+the rc files are published with the group and other bits stripped, because a macOS home is
+0755 by default and a 0644 `~/.zprofile` would hand the plaintext key to every other local
+account on the device.
 """
 
 import json
@@ -130,6 +135,66 @@ def test_a_foreign_rc_file_is_preserved(unix, passthrough, home):
     assert "llm.acme-corp.internal" in body
     assert 'alias ll="ls -la"' in body
     assert f'export UNBOUND_PI_API_KEY="{KEY}"' in body
+
+
+def test_a_profile_with_no_final_newline_is_not_concatenated(unix, passthrough, home):
+    """readlines() keeps terminators as they are and writelines() adds none, so a profile
+    whose last line has no newline had our export glued onto it: `export EDITOR=vim` became
+    `export EDITOR=vimexport UNBOUND_PI_API_KEY="..."`, breaking the user's setting AND our
+    own line in one write. The comment variant is worse -- a final `# note` swallows the
+    export whole and the account is silently unprotected."""
+    rc = home / ".zprofile"
+    rc.write_text('alias ll="ls -la"\nexport EDITOR=vim')  # no trailing newline, on purpose
+
+    unix.set_env_var_for_user("alice", home, unix.ENV_API_KEY_PI, KEY)
+    lines = rc.read_text().splitlines()
+    assert "export EDITOR=vim" in lines, f"the user's last line was mangled: {lines}"
+    assert f'export UNBOUND_PI_API_KEY="{KEY}"' in lines
+
+
+def test_a_final_comment_without_a_newline_cannot_swallow_the_export(unix, passthrough, home):
+    """The same bug with the worst payload: commented out, the export is not a syntax error
+    anywhere -- it just never runs, and nothing reports that the account is uncovered."""
+    rc = home / ".bash_profile"
+    rc.write_text("# managed by our config tool")  # no trailing newline
+
+    unix.set_env_var_for_user("alice", home, unix.ENV_API_KEY_PI, KEY)
+    for line in rc.read_text().splitlines():
+        if f'export UNBOUND_PI_API_KEY="{KEY}"' in line:
+            assert not line.lstrip().startswith("#"), f"the export was commented out: {line!r}"
+            break
+    else:
+        pytest.fail(f"the export is not in the file at all: {rc.read_text()!r}")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_the_rc_files_holding_the_key_are_not_group_or_world_readable(unix, passthrough, home):
+    """The key is plaintext in these files. A macOS home is 0755 by default, so a 0644
+    ~/.zprofile hands the application key to every other local account on the device --
+    including the service accounts this installer deliberately skips. config.json's 0600 does
+    nothing for the rc copies."""
+    for name in (".zprofile", ".bash_profile"):
+        (home / name).write_text("alias ll=\"ls -la\"\n")
+        os.chmod(home / name, 0o644)
+
+    unix.set_env_var_for_user("alice", home, unix.ENV_API_KEY_PI, KEY)
+    for name in (".zprofile", ".bash_profile"):
+        mode = stat.S_IMODE((home / name).stat().st_mode)
+        assert not mode & (stat.S_IRWXG | stat.S_IRWXO), f"{name} is {oct(mode)}"
+        assert mode & stat.S_IRUSR and mode & stat.S_IWUSR, f"{name} is {oct(mode)}"
+        assert KEY in (home / name).read_text()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_tightening_never_adds_a_permission_the_user_did_not_have(unix, passthrough, home):
+    """Tighten means strip, not set: a profile the user keeps executable or at 0400 must not
+    come back with bits it never had. Only group and other are touched."""
+    rc = home / ".zprofile"
+    rc.write_text("# mine\n")
+    os.chmod(rc, 0o700)
+
+    unix.set_env_var_for_user("alice", home, unix.ENV_API_KEY_PI, KEY)
+    assert stat.S_IMODE(rc.stat().st_mode) == 0o700
 
 
 def test_the_export_is_written_with_privileges_dropped(unix, monkeypatch, home):
