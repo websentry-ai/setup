@@ -378,3 +378,72 @@ test("WR-04 a call's session_id stamp is never sent on the wire", () => {
   assert.ok(!serialised.includes("sess-x"), "the per-entry stamp stays local");
   assert.ok(!serialised.includes("session_id"), serialised);
 });
+
+// ---------------------------------------------------------------------------------------------------
+// Secret redaction before egress (#355 review, MEDIUM): the model often quotes what a tool returned,
+// and a command can carry a bearer token. Both are scrubbed with the same `redactSecrets` the
+// telemetry path uses — the session key by literal match, bearer tokens by pattern — before the cap.
+// Server-side DLP scans what remains, exactly as for every other hook's turn log.
+// ---------------------------------------------------------------------------------------------------
+
+const SESSION_KEY = "unb_live_" + "0123456789abcdef";
+
+test("the session key never rides the assistant text", () => {
+  const body = buildTurnLogBody(record(), {
+    cwd: CWD,
+    completedAtMs: COMPLETED_AT,
+    assistantText: `The config uses api_key=${SESSION_KEY} for the gateway.`,
+    apiKey: SESSION_KEY,
+  });
+
+  assert.equal(body.messages[1]?.content.includes(SESSION_KEY), false);
+  assert.equal(body.messages[1]?.content, "The config uses api_key=[REDACTED] for the gateway.");
+});
+
+test("a bearer token quoted by the model is redacted by pattern, key or no key", () => {
+  const body = buildTurnLogBody(record(), {
+    cwd: CWD,
+    completedAtMs: COMPLETED_AT,
+    assistantText: "It sends Authorization: Bearer sk-live-deadbeefcafe to the API.",
+  });
+
+  assert.equal(body.messages[1]?.content.includes("deadbeefcafe"), false);
+  assert.match(body.messages[1]?.content ?? "", /Bearer \[REDACTED\]/);
+});
+
+test("tool_input.command is scrubbed of bearer tokens and the session key before it persists", () => {
+  const rec = record({
+    tool_calls: [
+      {
+        tool_name: "bash",
+        tool_use_id: "call_curl",
+        decision: "allow",
+        ts: STARTED_AT + 5,
+        tool_input: { command: `curl -H "Authorization: Bearer ${SESSION_KEY}" https://x.test` },
+      },
+    ],
+  });
+  const body = buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT, apiKey: SESSION_KEY });
+  const command = body.messages[1]?.tool_use?.[0]?.tool_input.command;
+
+  assert.equal(typeof command, "string");
+  assert.equal(String(command).includes(SESSION_KEY), false);
+  // `redactSecrets`' bearer pattern is greedy to the next whitespace, so the closing quote goes with
+  // the token — the URL that follows is untouched.
+  assert.match(String(command), /^curl -H "Authorization: Bearer \[REDACTED\]\S* https:\/\/x\.test$/);
+  // The record itself is untouched: redaction happens at the wire, not in the store.
+  assert.match(String(rec.tool_calls[0]?.tool_input?.command), /deadbeef|unb_live_/);
+});
+
+test("redaction is applied before the cap, so a key straddling the splice cannot survive", () => {
+  const filler = "a".repeat(MAX_ASSISTANT_CHARS);
+  const body = buildTurnLogBody(record(), {
+    cwd: CWD,
+    completedAtMs: COMPLETED_AT,
+    assistantText: `${filler}${SESSION_KEY}${filler}`,
+    apiKey: SESSION_KEY,
+  });
+
+  assert.equal(body.messages[1]?.content.includes(SESSION_KEY), false);
+  assert.equal(body.assistant_truncated, true);
+});

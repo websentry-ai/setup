@@ -31,8 +31,8 @@ import { createExtension } from "../src/index.ts";
 import { decideUserBash } from "../src/userBash.ts";
 import { createFakeClock, createFakeCtx, createFakeUserBashEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtxOptions } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
 

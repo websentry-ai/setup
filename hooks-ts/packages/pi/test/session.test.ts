@@ -44,6 +44,7 @@ import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 import {
   createFakeAgentEndEvent,
   createFakeAssistantMessage,
@@ -53,7 +54,6 @@ import {
   createFakeUserBashEvent,
 } from "./helpers/fakeCtx.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const SESSION_A = "session-old-aaa";
 const SESSION_B = "session-new-bbb";
 

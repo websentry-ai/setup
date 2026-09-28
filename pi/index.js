@@ -637,86 +637,6 @@ function createHeartbeatGate(opts) {
   };
 }
 
-// packages/core/src/turnLog.ts
-function shouldPostTurn(record) {
-  try {
-    if (record === null || typeof record !== "object") return false;
-    if (typeof record.prompt === "string") return true;
-    return Array.isArray(record.tool_calls) && record.tool_calls.length > 0;
-  } catch {
-    return false;
-  }
-}
-function toolInputFor(value) {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
-  return value;
-}
-function capAssistantText(text) {
-  try {
-    if (typeof text !== "string" || text === "") return { content: "", truncated: false };
-    const capped = capCommand(text, MAX_ASSISTANT_CHARS);
-    return { content: capped.command, truncated: capped.truncated };
-  } catch {
-    return { content: "", truncated: false };
-  }
-}
-function toolResponseFor(record, toolUseId) {
-  const results = Array.isArray(record.results) ? record.results : [];
-  const match = results.find((entry) => entry?.tool_use_id === toolUseId);
-  if (match === void 0) return {};
-  if (match.hash_skipped === true) {
-    return { hash_skipped: true, content_bytes: match.content_bytes };
-  }
-  if (typeof match.content_sha256 === "string") {
-    return { content_sha256: match.content_sha256, content_bytes: match.content_bytes };
-  }
-  return {};
-}
-function buildTurnLogBody(record, opts) {
-  let conversationId = "";
-  let prompt = "";
-  let toolUse = [];
-  let startedAt;
-  let truncated;
-  let callsTruncated;
-  try {
-    const safe = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
-    conversationId = typeof safe.session_id === "string" ? safe.session_id : "";
-    prompt = typeof safe.prompt === "string" ? safe.prompt : "";
-    startedAt = typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : void 0;
-    truncated = typeof safe.results_truncated === "number" && Number.isFinite(safe.results_truncated) && safe.results_truncated > 0 ? Math.floor(safe.results_truncated) : void 0;
-    callsTruncated = typeof safe.tool_calls_truncated === "number" && Number.isFinite(safe.tool_calls_truncated) && safe.tool_calls_truncated > 0 ? Math.floor(safe.tool_calls_truncated) : void 0;
-    const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
-    toolUse = calls.map((call) => ({
-      type: TURNLOG_TOOL_USE_TYPE,
-      tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
-      tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // `call`-derived, and still never `event.input`-derived: what the record holds was already
-      // allowlisted and capped by `auditToolInput` — header decision 2.
-      tool_input: toolInputFor(call?.tool_input),
-      tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : "")
-    }));
-  } catch {
-  }
-  const assistant = capAssistantText(opts?.assistantText);
-  const body = {
-    conversation_id: conversationId,
-    model: TURNLOG_MODEL,
-    messages: [
-      { role: "user", content: prompt },
-      { role: "assistant", content: assistant.content, tool_use: toolUse }
-    ],
-    cwd: opts.cwd,
-    requestCompleted: new Date(opts.completedAtMs).toISOString(),
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  };
-  if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
-  if (truncated !== void 0) body.results_truncated = truncated;
-  if (callsTruncated !== void 0) body.tool_calls_truncated = callsTruncated;
-  if (assistant.truncated) body.assistant_truncated = true;
-  return body;
-}
-
 // packages/core/src/config.ts
 import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -768,6 +688,88 @@ function redactSecrets(text, apiKey) {
     out = out.split(apiKey).join("[REDACTED]");
   }
   return out;
+}
+
+// packages/core/src/turnLog.ts
+function shouldPostTurn(record) {
+  try {
+    if (record === null || typeof record !== "object") return false;
+    if (typeof record.prompt === "string") return true;
+    return Array.isArray(record.tool_calls) && record.tool_calls.length > 0;
+  } catch {
+    return false;
+  }
+}
+function toolInputFor(value, apiKey) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = { ...value };
+  if (typeof input.command === "string") input.command = redactSecrets(input.command, apiKey);
+  return input;
+}
+function capAssistantText(text, apiKey) {
+  try {
+    if (typeof text !== "string" || text === "") return { content: "", truncated: false };
+    const capped = capCommand(redactSecrets(text, apiKey), MAX_ASSISTANT_CHARS);
+    return { content: capped.command, truncated: capped.truncated };
+  } catch {
+    return { content: "", truncated: false };
+  }
+}
+function toolResponseFor(record, toolUseId) {
+  const results = Array.isArray(record.results) ? record.results : [];
+  const match = results.find((entry) => entry?.tool_use_id === toolUseId);
+  if (match === void 0) return {};
+  if (match.hash_skipped === true) {
+    return { hash_skipped: true, content_bytes: match.content_bytes };
+  }
+  if (typeof match.content_sha256 === "string") {
+    return { content_sha256: match.content_sha256, content_bytes: match.content_bytes };
+  }
+  return {};
+}
+function buildTurnLogBody(record, opts) {
+  let conversationId = "";
+  let prompt = "";
+  let toolUse = [];
+  let startedAt;
+  let truncated;
+  let callsTruncated;
+  try {
+    const safe = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
+    conversationId = typeof safe.session_id === "string" ? safe.session_id : "";
+    prompt = typeof safe.prompt === "string" ? safe.prompt : "";
+    startedAt = typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : void 0;
+    truncated = typeof safe.results_truncated === "number" && Number.isFinite(safe.results_truncated) && safe.results_truncated > 0 ? Math.floor(safe.results_truncated) : void 0;
+    callsTruncated = typeof safe.tool_calls_truncated === "number" && Number.isFinite(safe.tool_calls_truncated) && safe.tool_calls_truncated > 0 ? Math.floor(safe.tool_calls_truncated) : void 0;
+    const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
+    toolUse = calls.map((call) => ({
+      type: TURNLOG_TOOL_USE_TYPE,
+      tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
+      tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
+      // `call`-derived, and still never `event.input`-derived: what the record holds was already
+      // allowlisted and capped by `auditToolInput` — header decision 2.
+      tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
+      tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : "")
+    }));
+  } catch {
+  }
+  const assistant = capAssistantText(opts?.assistantText, opts?.apiKey);
+  const body = {
+    conversation_id: conversationId,
+    model: TURNLOG_MODEL,
+    messages: [
+      { role: "user", content: prompt },
+      { role: "assistant", content: assistant.content, tool_use: toolUse }
+    ],
+    cwd: opts.cwd,
+    requestCompleted: new Date(opts.completedAtMs).toISOString(),
+    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  };
+  if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
+  if (truncated !== void 0) body.results_truncated = truncated;
+  if (callsTruncated !== void 0) body.tool_calls_truncated = callsTruncated;
+  if (assistant.truncated) body.assistant_truncated = true;
+  return body;
 }
 
 // packages/core/src/keyState.ts
@@ -1212,7 +1214,8 @@ function handleAgentEnd(event, ctx, deps) {
     const body = buildTurnLogBody(record, {
       cwd,
       completedAtMs,
-      assistantText
+      assistantText,
+      ...deps.apiKey === void 0 ? {} : { apiKey: deps.apiKey }
     });
     const dispatchedAtMs = completedAtMs;
     void deps.client.postTurnLog(body).then((ok) => {
@@ -1639,6 +1642,7 @@ function createExtension(overrides = {}) {
         return handleAgentEnd(event, ctx, {
           client: state.client,
           store: turnStore,
+          ...state.apiKey === void 0 ? {} : { apiKey: state.apiKey },
           ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry }
         });
       } catch {

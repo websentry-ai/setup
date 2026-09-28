@@ -95,6 +95,8 @@ export interface AgentEndCtx {
 export interface AgentEndDeps {
   client: Pick<ApiClient, "postTurnLog">;
   store: TurnStore;
+  /** Optional: the session key, scrubbed from assistant text and commands before they are posted. */
+  apiKey?: string;
   /**
    * Optional: one rate-limited report when a post fails, so a permanently broken audit trail is
    * visible in Sentry rather than silent.
@@ -142,6 +144,7 @@ export function handleAgentEnd(
       cwd,
       completedAtMs,
       assistantText,
+      ...(deps.apiKey === undefined ? {} : { apiKey: deps.apiKey }),
     });
     const dispatchedAtMs = completedAtMs;
 

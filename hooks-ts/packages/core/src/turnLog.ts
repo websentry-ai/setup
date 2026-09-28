@@ -35,6 +35,7 @@
 // `unbound_app_label` either: the route already labels this `pi`, which is what makes
 // `metadata.source = 'hooks'` true (`add_gateway_metrics_task.py:676-677`).
 
+import { redactSecrets } from "./config.ts";
 import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
 import { capCommand } from "./payload.ts";
 import type { TurnRecord } from "./turn.ts";
@@ -106,6 +107,8 @@ export interface TurnLogOptions {
    * there is no in-memory copy to leak into a snapshot.
    */
   assistantText?: string;
+  /** The session's API key, so `redactSecrets` can scrub it from anything the model or a command echoes. */
+  apiKey?: string;
 }
 
 /**
@@ -133,9 +136,13 @@ export function shouldPostTurn(record: TurnRecord | undefined): boolean {
  * meant to see. Anything that is not a plain object is `{}` — a malformed record degrades a key, not
  * the row.
  */
-function toolInputFor(value: unknown): Record<string, unknown> {
+function toolInputFor(value: unknown, apiKey?: string): Record<string, unknown> {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
-  return value as Record<string, unknown>;
+  const input = { ...(value as Record<string, unknown>) };
+  // The command persists in the audit row, so bearer tokens and the session key are scrubbed the same
+  // way the telemetry path scrubs them. The pretool check itself saw the command unredacted.
+  if (typeof input.command === "string") input.command = redactSecrets(input.command, apiKey);
+  return input;
 }
 
 /**
@@ -145,10 +152,12 @@ function toolInputFor(value: unknown): Record<string, unknown> {
  * all, and a second splicer would be a second thing to get wrong. Anything that is not a non-empty
  * string is the empty string, so a hostile or half-built message array costs the column, not the row.
  */
-function capAssistantText(text: unknown): { content: string; truncated: boolean } {
+function capAssistantText(text: unknown, apiKey?: string): { content: string; truncated: boolean } {
   try {
     if (typeof text !== "string" || text === "") return { content: "", truncated: false };
-    const capped = capCommand(text, MAX_ASSISTANT_CHARS);
+    // The model often quotes what a tool returned, so the same secret redaction the telemetry path
+    // applies runs here before the cap; server-side DLP scans what remains, as for every other hook.
+    const capped = capCommand(redactSecrets(text, apiKey), MAX_ASSISTANT_CHARS);
     return { content: capped.command, truncated: capped.truncated };
   } catch {
     return { content: "", truncated: false };
@@ -210,14 +219,14 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
       tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
       // `call`-derived, and still never `event.input`-derived: what the record holds was already
       // allowlisted and capped by `auditToolInput` — header decision 2.
-      tool_input: toolInputFor(call?.tool_input),
+      tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
       tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : ""),
     }));
   } catch {
     // Fall through with the defaults above: a degraded row beats a thrown handler.
   }
 
-  const assistant = capAssistantText(opts?.assistantText);
+  const assistant = capAssistantText(opts?.assistantText, opts?.apiKey);
 
   const body: TurnLogBody = {
     conversation_id: conversationId,

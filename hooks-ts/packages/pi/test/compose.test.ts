@@ -35,8 +35,8 @@ import { createExtension, defaultMakeChecker } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
 

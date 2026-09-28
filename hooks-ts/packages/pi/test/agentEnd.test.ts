@@ -29,6 +29,7 @@ import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import { assistantTextFrom, handleAgentEnd } from "../src/agentEnd.ts";
 import { decideToolCall } from "../src/decide.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 import {
   createFakeAgentEndEvent,
   createFakeAssistantMessage,
@@ -37,7 +38,6 @@ import {
   createFakeUserMessage,
 } from "./helpers/fakeCtx.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const MARKER = "PRIVATE_KEY_BEGIN-never-posted";
 /** Well under the real 10 s deadline, so the abort is observable inside a test run. */
 const SHORT_TIMEOUT_MS = 150;
