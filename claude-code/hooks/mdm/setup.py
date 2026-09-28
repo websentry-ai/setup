@@ -104,7 +104,7 @@ def _run_as_user(username, fn, *args, **kwargs):
             os._exit(1)
     else:
         os.close(w_fd)
-        data = b''
+        chunks = []
         while True:
             try:
                 chunk = os.read(r_fd, 65536)
@@ -112,7 +112,8 @@ def _run_as_user(username, fn, *args, **kwargs):
                 break
             if not chunk:
                 break
-            data += chunk
+            chunks.append(chunk)
+        data = b''.join(chunks)
         os.close(r_fd)
         try:
             _, status = os.waitpid(pid, 0)
