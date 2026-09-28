@@ -398,20 +398,40 @@ def install_extension(agent_dir) -> Optional[str]:
         except OSError as e:
             debug_print(f"Could not set the mode on {extdir}: {e}")
 
+        # Write a sibling temp file and rename it into place, never O_TRUNC on the target.
+        # A truncating in-place write that then fails (ENOSPC, EIO, a killed process) leaves
+        # a previously working extension truncated, and pi loads the broken file silently --
+        # enforcement disappears with no error anywhere. os.replace is atomic within a
+        # directory, so index.js is either the old bytes or all of the new ones.
+        tmp = target.with_name(target.name + ".unbound-tmp")
         try:
             payload = staged.read_bytes()
-            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            # A temp left by an earlier killed run must not fail the O_EXCL open below.
+            try:
+                os.unlink(str(tmp))
+            except FileNotFoundError:
+                pass
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
             with os.fdopen(fd, "wb") as f:
                 f.write(payload)
+                f.flush()
+                # fsync before the rename, or a crash can publish a name whose bytes
+                # never reached the disk.
+                os.fsync(f.fileno())
+            try:
+                # 0644 so pi can read it and nothing else can quietly edit it; O_CREAT's
+                # mode is masked by umask, so set it explicitly before publishing.
+                os.chmod(str(tmp), 0o644)
+            except OSError as e:
+                debug_print(f"Could not set the mode on {tmp}: {e}")
+            os.replace(str(tmp), str(target))
         except OSError as e:
             print(f"❌ Could not write {target}: {e}")
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
             return None
-        try:
-            # 0644 so pi can read it and nothing else can quietly edit it; O_CREAT's mode
-            # is masked by umask and is ignored entirely when the file already existed.
-            os.chmod(target, 0o644)
-        except OSError as e:
-            debug_print(f"Could not set the mode on {target}: {e}")
 
         written = artifact_sha256(target)
         if written != computed:
@@ -779,11 +799,21 @@ def main() -> bool:
     if not digest:
         return False
 
-    write_unbound_config(api_key, {
+    # The key write is NOT best-effort, unlike the report below. config.json is where the
+    # extension reads the key from when neither env var is set, and on the browser-callback
+    # path it is the only place the freshly minted key exists at all -- so a failed write
+    # means an installed extension that stays inactive. Saying "Setup complete" there would
+    # be the worst outcome: silent, and indistinguishable from success.
+    if not write_unbound_config(api_key, {
         "base_url": args["backend_url"],
         "gateway_url": args["gateway_url"],
         "frontend_url": normalize_url(domain) if domain else None,
-    })
+    }):
+        print(f"❌ The extension is installed at {artifact_path(agent_dir)}, but the API key")
+        print(f"   could not be saved to {Path.home() / '.unbound' / 'config.json'}.")
+        print("   The extension reads no key, so it will stay inactive. Fix the permissions")
+        print("   on that file and re-run, or export UNBOUND_PI_API_KEY in your shell.")
+        return False
 
     reported = notify_setup_complete(
         api_key, "pi", backend_url=args["backend_url"], install_state=install_state,

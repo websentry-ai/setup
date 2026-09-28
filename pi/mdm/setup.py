@@ -222,8 +222,12 @@ def _run_as_user(username, fn, *args, **kwargs):
             # keeps the env consistent with the dropped uid regardless.
             os.environ['HOME'] = info.pw_dir
             result = fn(*args, **kwargs)
-            import pickle
-            os.write(w_fd, pickle.dumps(result, protocol=pickle.HIGHEST_PROTOCOL))
+            # json, never pickle: this pipe crosses a privilege boundary in the dangerous
+            # direction -- the writer has already dropped to the unprivileged user and the
+            # reader is still root. Unpickling there would turn any influence over these
+            # bytes into code execution as root on every managed device. json is data-only,
+            # and every value that crosses here is a status string, a bool or None.
+            os.write(w_fd, json.dumps(result).encode('utf-8'))
             os.close(w_fd)
             os._exit(0)
         except Exception:
@@ -250,11 +254,20 @@ def _run_as_user(username, fn, *args, **kwargs):
             return None
         if os.WEXITSTATUS(status) != 0:
             return None
+        if not data:
+            return None
         try:
-            import pickle
-            return pickle.loads(data) if data else None
+            result = json.loads(data.decode('utf-8'))
         except Exception:
             return None
+        # Check the shape before use rather than trusting whatever crossed the boundary.
+        # Callers return a status string, a bool, None, or a small list of those -- anything
+        # else is a failure rather than something to pass along. NOTE a tuple becomes a
+        # list across json; the one caller that returns a pair unpacks either identically.
+        if result is None or isinstance(result, (str, bool, list)):
+            return result
+        debug_print(f"Unexpected result shape across the privilege drop: {type(result)}")
+        return None
 
 
 def check_admin_privileges() -> bool:
@@ -671,20 +684,48 @@ def _drop_in_home(extdir: Path, target: Path, sidecar: Path, payload: bytes,
     if not handle_shadow_files(extdir):
         return "failed: a shadowing file could not be moved aside"
 
-    # O_NOFOLLOW: a symlink planted at index.js is refused rather than written through.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
+    # A symlink planted at index.js by the user is refused rather than written through --
+    # the same guard O_NOFOLLOW gave us, kept explicit now that the bytes go to a temp file
+    # and are renamed into place. os.replace would replace the link rather than follow it,
+    # which is safe, but refusing is the behaviour this installer already promises.
     try:
-        fd = os.open(str(target), flags, 0o644)
+        if os.path.islink(str(target)):
+            return f"failed: {target} is a symlink"
+    except OSError as e:
+        return f"failed: could not inspect {target} ({e})"
+
+    # Write a sibling temp file and rename it in, never O_TRUNC on the target. A truncating
+    # write that then fails leaves a previously working extension truncated in that user's
+    # home, and pi loads the broken file silently -- the user is unprotected with no error
+    # anywhere. os.replace is atomic within a directory.
+    tmp = target.with_name(target.name + ".unbound-tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    try:
+        # A temp left by an earlier killed run must not fail the O_EXCL open.
+        try:
+            os.unlink(str(tmp))
+        except FileNotFoundError:
+            pass
+        fd = os.open(str(tmp), flags, 0o644)
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
+            f.flush()
+            # fsync before the rename, or a crash can publish a name whose bytes never
+            # reached the disk.
+            os.fsync(f.fileno())
+        try:
+            # 0644 so pi can read it; O_CREAT's mode is masked by umask, so set it
+            # explicitly before publishing the name.
+            os.chmod(str(tmp), 0o644)
+        except OSError as e:
+            debug_print(f"Could not set the mode on {tmp}: {e}")
+        os.replace(str(tmp), str(target))
     except OSError as e:
+        try:
+            os.unlink(str(tmp))
+        except OSError:
+            pass
         return f"failed: could not write {target} ({e})"
-    try:
-        # 0644 so pi can read it; O_CREAT's mode is masked by umask and is ignored for a
-        # file that already existed.
-        os.chmod(target, 0o644)
-    except OSError as e:
-        debug_print(f"Could not set the mode on {target}: {e}")
 
     # Re-read from disk, so the hook_hash this device reports is provably the bytes in the
     # home rather than the bytes we downloaded.
@@ -928,14 +969,16 @@ def set_env_var_for_user(username: str, home_dir, var_name: str,
                         _changed = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
-        return _success, _changed
+        # A list, not a tuple: this value crosses the privilege drop as json, which has no
+        # tuple type, so returning a list keeps the round trip lossless by construction.
+        return [_success, _changed]
 
     _repair_user_ownership(username, rc_files)
     result = _run_as_user(username, _do)
-    if result is None:
+    if not isinstance(result, list) or len(result) != 2:
         debug_print(f"Could not set {var_name} for {username}")
         return False, False
-    return result
+    return bool(result[0]), bool(result[1])
 
 
 def remove_env_var_from_user(username: str, home_dir, var_name: str) -> str:
