@@ -31,7 +31,8 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
-BACKFILL_TIMEOUT_SECONDS = 480
+_SCRIPT_START = time.time()
+BACKFILL_DEADLINE_SECONDS = 540  # from script start, inside onboard.py's 600s watchdog
 
 
 def normalize_url(value: str) -> str:
@@ -2101,9 +2102,14 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
     """Bounded and best-effort: setup already succeeded, so backfill must not fail the policy.
 
     Runs in a child forked from the main thread (fork from a worker thread is unsafe on
-    macOS, and run_backfill forks again via _run_as_user)."""
+    macOS, and run_backfill forks again via _run_as_user). The deadline counts from script
+    start so a slow setup cannot push the script past onboarding's outer watchdog."""
     if os.name != 'posix':
         run_backfill(api_key, backend_url, user_homes)
+        return
+    budget = BACKFILL_DEADLINE_SECONDS - (time.time() - _SCRIPT_START)
+    if budget <= 0:
+        print("[backfill] Skipped — setup used the time budget; backfill retries on the next run.")
         return
     # Flush before forking so the child does not replay the parent's buffered output.
     sys.stdout.flush()
@@ -2111,18 +2117,23 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
     pid = os.fork()
     if pid == 0:
         try:
+            os.setsid()
             run_backfill(api_key, backend_url, user_homes)
             sys.stdout.flush()
             sys.stderr.flush()
         finally:
             os._exit(0)
-    deadline = time.time() + BACKFILL_TIMEOUT_SECONDS
+    deadline = time.time() + budget
     while time.time() < deadline:
         done_pid, _ = os.waitpid(pid, os.WNOHANG)
         if done_pid:
             return
         time.sleep(1)
-    os.kill(pid, signal.SIGKILL)
+    # setsid above put the whole backfill tree (collector forks included) in pid's group.
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
     os.waitpid(pid, 0)
     print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
 
