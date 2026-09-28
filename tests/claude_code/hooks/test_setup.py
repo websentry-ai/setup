@@ -298,6 +298,92 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         )
         self.assertEqual(writes, [ok_home])
 
+    def test_capped_home_advances_to_its_resume_point(self):
+        """A capped walk that reports where it stopped -> that home's cutoff moves to
+        the resume mtime (not to now) once every upload lands, so the next run
+        continues instead of re-reading the same slice forever."""
+        mdm = self._load_mdm()
+        heavy = Path("/home/heavy")
+        writes = []
+
+        def fake_run_as_user(username, fn, *args):
+            if fn is mdm._backfill_collect_sessions:
+                return ([{"session_id": "s1", "entries": [{}]}], 1234.5, False)
+            if fn is mdm._backfill_write_cutoff:
+                writes.append(args)
+            return None
+
+        with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
+             patch.object(mdm, "_backfill_force_config", return_value=(None, None)), \
+             patch.object(mdm, "_backfill_send_sessions", return_value=(1, 1, 0)):
+            mdm.run_backfill("key", "https://backend", [("heavy", heavy)])
+        self.assertEqual(writes, [(heavy, 1234.5)])
+
+
+class TestMdmBackfillByteBudget(unittest.TestCase):
+    """The collector holds every session in memory before upload, so one run must
+    stop at a byte budget. A heavy profile otherwise grew the MDM process to ~17 GB
+    and outlived onboard's 600s timeout every day."""
+
+    def setUp(self):
+        self.mdm = tool_module("claude-code/hooks/mdm", "setup")
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp)
+        projects = self.tmp / ".claude" / "projects" / "p"
+        projects.mkdir(parents=True)
+        now = time.time()
+        self.mtimes = {}
+        # Written newest-name-first so path order and mtime order disagree.
+        for i, name in enumerate(["c.jsonl", "b.jsonl", "a.jsonl"]):
+            path = projects / name
+            line = json.dumps({"sessionId": name, "type": "user", "pad": "x" * 1000})
+            path.write_text(line + "\n")
+            mtime = now - 3600 * (3 - i)
+            os.utime(path, (mtime, mtime))
+            self.mtimes[name] = mtime
+
+    def _collect(self, budget):
+        with patch.object(self.mdm, "BACKFILL_MAX_BYTES_PER_RUN", budget), \
+             patch.object(self.mdm, "_backfill_account_email", return_value=None):
+            return self.mdm._backfill_collect_sessions(self.tmp)
+
+    def test_budget_stops_oldest_first_and_reports_resume_point(self):
+        sessions, capped, _ = self._collect(budget=2500)
+        self.assertEqual([s["session_id"] for s in sessions], ["c.jsonl", "b.jsonl"])
+        self.assertEqual(capped, self.mtimes["a.jsonl"])
+
+    def test_under_budget_is_not_capped(self):
+        sessions, capped, _ = self._collect(budget=10 ** 9)
+        self.assertEqual(len(sessions), 3)
+        self.assertIs(capped, False)
+
+    def test_one_file_over_budget_is_still_read(self):
+        """A single transcript larger than the budget must not stall the home."""
+        sessions, capped, _ = self._collect(budget=10)
+        self.assertEqual([s["session_id"] for s in sessions], ["c.jsonl"])
+        self.assertEqual(capped, self.mtimes["b.jsonl"])
+
+
+@unittest.skipIf(os.name == "nt", "fork-based privilege drop is POSIX only")
+class TestRunAsUserLargePayload(unittest.TestCase):
+    """_run_as_user used `bytes +=` per 64 KB pipe read: quadratic in the payload,
+    which pinned a core and blew the MDM timeout on a multi-GB backfill."""
+
+    def test_large_result_comes_back_fast(self):
+        import pwd
+        mdm = tool_module("claude-code/hooks/mdm", "setup")
+        me = pwd.getpwuid(os.getuid()).pw_name
+        payload = b"x" * (128 * 1024 * 1024)
+        # The child drops privileges; as a non-root test user that must be a no-op.
+        with patch.object(mdm.os, "setgroups", lambda *_: None), \
+             patch.object(mdm.os, "setgid", lambda *_: None), \
+             patch.object(mdm.os, "setuid", lambda *_: None):
+            started = time.time()
+            result = mdm._run_as_user(me, lambda: payload)
+            elapsed = time.time() - started
+        self.assertEqual(len(result), len(payload))
+        self.assertLess(elapsed, 10)
+
 
 class TestMdmWriteConfigReportsSuccess(unittest.TestCase):
     """A successful per-user config write must NOT be logged as a failure.

@@ -30,6 +30,7 @@ BACKFILL_TOOL_TYPE = "claude-code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
+BACKFILL_MAX_BYTES_PER_RUN = 128 * 1024 * 1024  # transcript bytes per profile per run
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 _SCRIPT_START = time.time()
@@ -103,16 +104,20 @@ def _run_as_user(username, fn, *args, **kwargs):
             os._exit(1)
     else:
         os.close(w_fd)
-        data = b''
+        # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
+        # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
+        chunks = []
         while True:
             try:
-                chunk = os.read(r_fd, 65536)
+                chunk = os.read(r_fd, 1 << 20)
             except OSError:
                 break
             if not chunk:
                 break
-            data += chunk
+            chunks.append(chunk)
         os.close(r_fd)
+        data = b''.join(chunks)
+        del chunks
         try:
             _, status = os.waitpid(pid, 0)
         except OSError:
@@ -1616,6 +1621,19 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
         yield p
 
 
+def _backfill_oldest_first(paths):
+    """(mtime, size, path) oldest first, so a capped walk has a resume point."""
+    stamped = []
+    for p in paths:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        stamped.append((st.st_mtime, st.st_size, p))
+    stamped.sort(key=lambda t: (t[0], str(t[2])))
+    return stamped
+
+
 def _backfill_is_real_user_prompt(content) -> bool:
     # Mirror server-side parse_claude_code_session._is_real_user_prompt so the
     # client splits exactly where the server starts a new exchange.
@@ -1886,8 +1904,9 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
                                force_days=None) -> Tuple[List[Dict], bool, bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
-    # Returns (sessions, capped, forced); capped=True means the per-run cap was hit and
-    # older files remain unprocessed, so this home's cutoff must not advance.
+    # Returns (sessions, capped, forced). capped is False, or the mtime to resume from
+    # when a per-run cap stopped the walk: files are read oldest first, so the next run
+    # picks up there instead of re-reading the same slice forever.
     projects_root = home_dir / '.claude' / 'projects'
     if not projects_root.exists():
         # Three values like every other exit: the caller unpacks one shape, and a
@@ -1904,10 +1923,17 @@ def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
         cutoff_mtime = min(cutoff_mtime, window)
     sessions = []
     capped = False
-    for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
-        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
-            capped = True
+    bytes_read = 0
+    for mtime, size, transcript_path in _backfill_oldest_first(
+            _backfill_iter_transcripts(projects_root, cutoff_mtime)):
+        # Every session is held in memory (then pickled back through a pipe) before
+        # upload, so the walk is bounded by bytes as well as count. A heavy profile
+        # had one run reach 17 GB and outlive the MDM timeout.
+        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN or (
+                sessions and bytes_read + size > BACKFILL_MAX_BYTES_PER_RUN):
+            capped = mtime
             break
+        bytes_read += size
         session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
@@ -2169,6 +2195,9 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         forced_sessions = []
         sessions = []
         collected_homes: List[Tuple[str, Path]] = []
+        # Capped homes with a resume point: advanced to it (not to started_at) once
+        # every upload lands, so the next run continues past what this one sent.
+        resume_homes: List[Tuple[str, Path, float]] = []
         for username, home_dir in user_homes:
             result = _run_as_user(username, _backfill_collect_sessions, home_dir,
                                   force_epoch, force_days)
@@ -2186,6 +2215,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             # overflow stays eligible on the next run.
             if not capped:
                 collected_homes.append((username, home_dir))
+            elif isinstance(capped, float):
+                resume_homes.append((username, home_dir, capped))
 
         total = len(forced_sessions) + len(sessions)
         if not total:
@@ -2211,6 +2242,8 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         else:
             for username, home_dir in collected_homes:
                 _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
+            for username, home_dir, resume_mtime in resume_homes:
+                _run_as_user(username, _backfill_write_cutoff, home_dir, resume_mtime)
             print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
