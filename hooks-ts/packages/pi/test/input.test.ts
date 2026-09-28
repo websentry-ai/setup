@@ -32,8 +32,8 @@ import { decideInput } from "../src/prompt.ts";
 import type { InputDeps } from "../src/prompt.ts";
 import { createFakeCtx, createFakeInputEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtxOptions, FakeInputOptions } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
 

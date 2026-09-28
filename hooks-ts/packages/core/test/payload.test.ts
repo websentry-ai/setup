@@ -23,6 +23,7 @@ import {
   TOOL_INPUT_ALLOWLIST,
 } from "../src/constants.ts";
 import {
+  auditToolInput,
   buildPretoolPayload,
   capCommand,
   capToolInput,
@@ -282,6 +283,78 @@ test("WR-04 the 16 KB whole-object cap still runs after the allowlist", () => {
   );
   const body = buildPretoolPayload(bashInput({ toolInput: many }));
   assert.ok(Buffer.byteLength(JSON.stringify(body.pre_tool_use_data.metadata.tool_input)) <= MAX_TOOL_INPUT_BYTES);
+});
+
+// --- auditToolInput: the same projection, for the turn log --------------------------------------
+//
+// `tool_use[].tool_input` used to be literally `{}`, on the reasoning that reaching back to the live
+// `event.input` would re-open the egress the allowlist closed. True of `event.input`; not true of
+// what the pretool request already sends. This function is that same value, so the audit row can
+// never carry a key the enforcement request does not — and the cases below are written as the
+// difference between the two: `command` is added (it rides its own field on the wire), file bodies
+// are not.
+
+test("auditToolInput: a bash call carries its command and nothing else", () => {
+  assert.deepEqual(auditToolInput({ command: "echo hi" }, "echo hi"), { command: "echo hi" });
+  // No `_dropped` marker: `command` is deleted BEFORE the allowlist runs rather than filtered out by
+  // it, so a bash call whose every key travels in full is not described as a lossy forward.
+  assert.equal(Object.hasOwn(auditToolInput({ command: "echo hi" }, "echo hi"), "_dropped"), false);
+});
+
+test("auditToolInput: a write's file body is absent, the path survives", () => {
+  const content = "AUDIT_FILE_BODY_" + "x".repeat(50_000);
+  const out = auditToolInput({ path: "/tmp/a.txt", content }, "");
+
+  assert.equal(out.path, "/tmp/a.txt");
+  assert.equal(Object.hasOwn(out, "content"), false, "the body is not forwarded at all");
+  assert.equal(out._dropped, true, "and this forward genuinely was lossy");
+  assert.equal(Object.hasOwn(out, "command"), false, "a file tool has no command");
+  assert.equal(JSON.stringify(out).includes("AUDIT_FILE_BODY_"), false, "not even a prefix");
+});
+
+test("auditToolInput: an edit's hunks go the same way as a write's body", () => {
+  const out = auditToolInput(
+    { path: "/tmp/a.ts", edits: [{ oldText: "API_KEY = 'live'", newText: "x" }] },
+    "",
+  );
+  assert.equal(Object.hasOwn(out, "edits"), false);
+  assert.equal(JSON.stringify(out).includes("API_KEY"), false);
+});
+
+test("auditToolInput: an allowlisted pattern and path both survive", () => {
+  assert.deepEqual(auditToolInput({ pattern: "secret", path: "/src" }, ""), {
+    pattern: "secret",
+    path: "/src",
+  });
+});
+
+test("auditToolInput: the per-value and whole-object caps are the payload's own", () => {
+  const long = "p".repeat(MAX_TOOL_INPUT_VALUE_BYTES + 500);
+  const out = auditToolInput({ pattern: long }, "");
+  assert.equal(Buffer.byteLength(String(out.pattern)), MAX_TOOL_INPUT_VALUE_BYTES);
+  assert.equal(out._truncated, true);
+
+  const many: Record<string, unknown> = {};
+  for (const key of TOOL_INPUT_ALLOWLIST) many[key] = "q".repeat(MAX_TOOL_INPUT_VALUE_BYTES);
+  const capped = auditToolInput(many, "z".repeat(MAX_COMMAND_CHARS * 2));
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(capped)) <= MAX_TOOL_INPUT_BYTES,
+    `${Buffer.byteLength(JSON.stringify(capped))} bytes`,
+  );
+});
+
+test("auditToolInput: the command is capped at both ends, exactly like the wire command", () => {
+  const command = "y".repeat(MAX_COMMAND_CHARS + 500);
+  const out = auditToolInput({ command }, command);
+  assert.equal(String(out.command).length, MAX_COMMAND_CHARS);
+  assert.ok(String(out.command).includes(COMMAND_TRUNCATION_MARKER), "the same marker, spliced");
+});
+
+test("auditToolInput: total, whatever it is handed", () => {
+  assert.doesNotThrow(() => auditToolInput(null as unknown as Record<string, unknown>, ""));
+  assert.deepEqual(auditToolInput(null as unknown as Record<string, unknown>, ""), {});
+  assert.deepEqual(auditToolInput({}, undefined as unknown as string), {});
+  assert.deepEqual(auditToolInput([] as unknown as Record<string, unknown>, "ls"), { command: "ls" });
 });
 
 test("capToolInput: an oversized tool_input is capped before it is sent", () => {

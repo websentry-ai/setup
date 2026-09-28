@@ -14,16 +14,30 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createApiClient } from "../../core/src/client.ts";
-import { ERRORS_PATH, ERROR_CATEGORY_TURNLOG, TURNLOG_PATH } from "../../core/src/constants.ts";
+import {
+  ERRORS_PATH,
+  ERROR_CATEGORY_TURNLOG,
+  MAX_ASSISTANT_CHARS,
+  TURNLOG_PATH,
+} from "../../core/src/constants.ts";
+import { createPolicyChecker } from "../../core/src/policy.ts";
+import { createPolicyState } from "../../core/src/policyState.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import { createTurnStore } from "../../core/src/turn.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi } from "../../core/test/helpers/mockApi.ts";
-import { handleAgentEnd } from "../src/agentEnd.ts";
-import { createFakeAgentEndEvent, createFakeCtx } from "./helpers/fakeCtx.ts";
+import { assistantTextFrom, handleAgentEnd } from "../src/agentEnd.ts";
+import { decideToolCall } from "../src/decide.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import {
+  createFakeAgentEndEvent,
+  createFakeAssistantMessage,
+  createFakeCtx,
+  createFakeToolCallEvent,
+  createFakeUserMessage,
+} from "./helpers/fakeCtx.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const MARKER = "PRIVATE_KEY_BEGIN-never-posted";
 /** Well under the real 10 s deadline, so the abort is observable inside a test run. */
 const SHORT_TIMEOUT_MS = 150;
@@ -43,7 +57,17 @@ function client(api: MockApi, timeoutMs?: number) {
 function primedStore(): TurnStore {
   const store = createTurnStore();
   store.recordPrompt("summarise the config", "sess-agentend", 1_000);
-  store.recordToolCall({ tool_name: "read", tool_use_id: "call_1", decision: "allow" }, "sess-agentend", 1_001);
+  store.recordToolCall(
+    {
+      tool_name: "read",
+      tool_use_id: "call_1",
+      decision: "allow",
+      // What the decision seam would have handed over: `auditToolInput`'s output, already allowlisted.
+      tool_input: { path: "/srv/app/config.yaml" },
+    },
+    "sess-agentend",
+    1_001,
+  );
   store.recordResult({
     tool_name: "read",
     tool_use_id: "call_1",
@@ -101,7 +125,11 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
   try {
     const store = createTurnStore();
     store.recordPrompt("read the deploy key", "sess-marker", 1_000);
-    store.recordToolCall({ tool_name: "read", tool_use_id: "call_1", decision: "allow" }, "sess-marker", 1_001);
+    store.recordToolCall(
+      { tool_name: "read", tool_use_id: "call_1", decision: "allow", tool_input: { path: "/srv/id_rsa" } },
+      "sess-marker",
+      1_001,
+    );
     // What a real handler would have hashed; the marker is what must NOT travel.
     store.recordResult({
       tool_name: "read",
@@ -111,11 +139,15 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
       content_bytes: Buffer.byteLength(MARKER, "utf8"),
     });
 
-    handleAgentEnd(createFakeAgentEndEvent([{ role: "assistant", content: MARKER }]), createFakeCtx(), {
-      client: client(api),
-      store,
-      now: () => 9_000,
-    });
+    // The model's own words DO travel; the output it read does not. Both halves in one case, so the
+    // difference between them stays visible.
+    handleAgentEnd(
+      createFakeAgentEndEvent([
+        createFakeAssistantMessage([{ type: "text", text: "I read the file you asked for." }]),
+      ]),
+      createFakeCtx(),
+      { client: client(api), store, now: () => 9_000 },
+    );
     await sleep(120);
 
     const serialised = JSON.stringify(api.requests);
@@ -127,9 +159,14 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
     };
     assert.equal(body.conversation_id, "sess-marker");
     assert.equal(body.messages?.[0]?.content, "read the deploy key");
+    assert.equal(body.messages?.[1]?.content, "I read the file you asked for.");
     const entries = body.messages?.[1]?.tool_use ?? [];
     assert.equal(entries.length, 1);
-    assert.deepEqual(entries[0]?.tool_input, {}, "tool_input is the empty object by design");
+    assert.deepEqual(
+      entries[0]?.tool_input,
+      { path: "/srv/id_rsa" },
+      "the allowlisted input the pretool check already carried — the row has to say what was read",
+    );
     assert.deepEqual(entries[0]?.tool_response, {
       content_sha256: "f".repeat(64),
       content_bytes: Buffer.byteLength(MARKER, "utf8"),
@@ -139,7 +176,213 @@ test("the posted body carries the prompt, the tool call and the hashes — and n
   }
 });
 
-test("no tool_use entry carries a content, edits or pattern key", async () => {
+test("no tool_use entry carries a content or edits key, and the allowlisted keys are there", async () => {
+  const api = await startMockApi();
+  try {
+    const store = createTurnStore();
+    store.recordPrompt("rewrite the config", "sess-keys", 1_000);
+    // A shell call and a `write`, recorded exactly as the seam records them: the `write`'s 50 KB body
+    // never reached `auditToolInput`'s output, so it cannot reach this row either.
+    store.recordToolCall(
+      { tool_name: "bash", tool_use_id: "c1", decision: "allow", tool_input: { command: "echo hi" } },
+      "sess-keys",
+      1_001,
+    );
+    store.recordToolCall(
+      {
+        tool_name: "write",
+        tool_use_id: "c2",
+        decision: "allow",
+        tool_input: { path: "/srv/app/config.yaml", _dropped: true },
+      },
+      "sess-keys",
+      1_002,
+    );
+
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx(), {
+      client: client(api),
+      store,
+      now: () => 5_000,
+    });
+    await sleep(120);
+
+    const body = turnLogs(api)[0]?.body as { messages?: { tool_use?: unknown }[] };
+    const toolUse = JSON.stringify(body.messages?.[1]?.tool_use);
+    for (const key of ["content", "edits"]) {
+      assert.equal(toolUse.includes(`"${key}":`), false, `${key} came back into the body: ${toolUse}`);
+    }
+    for (const key of ["command", "path"]) {
+      assert.ok(toolUse.includes(`"${key}":`), `${key} is missing from the body: ${toolUse}`);
+    }
+  } finally {
+    await api.close();
+  }
+});
+
+test("a 50 KB write body appears nowhere in the request, path only", async () => {
+  // End to end through the real seam rather than a hand-written record: `decideToolCall` is what
+  // projects pi's live `event.input`, so this is the case that proves the allowlist is on the path
+  // between a `write` and the turn log.
+  const api = await startMockApi({ mode: "allow" });
+  try {
+    const store = createTurnStore();
+    const bodyText = "WRITE_BODY_MARKER_" + "x".repeat(50_000);
+    await decideToolCall(
+      createFakeToolCallEvent("write", { path: "/srv/app/config.yaml", content: bodyText }, "call_w"),
+      createFakeCtx({ sessionId: "sess-write" }),
+      {
+        checker: createPolicyChecker({
+          client: client(api),
+          state: createPolicyState(),
+          telemetry: createTelemetry({ client: client(api), apiKey: TEST_KEY }),
+        }),
+        apiKey: TEST_KEY,
+        entrypoint: "pi/0.87.1",
+        onDecision: (entry) => store.recordToolCall(entry, "sess-write", 1_001),
+      },
+    );
+
+    handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx(), {
+      client: client(api),
+      store,
+      now: () => 5_000,
+    });
+    await sleep(120);
+
+    const entries =
+      (turnLogs(api)[0]?.body as { messages?: { tool_use?: Record<string, unknown>[] }[] }).messages?.[1]
+        ?.tool_use ?? [];
+    const toolInput = entries[0]?.tool_input as Record<string, unknown>;
+    assert.equal(toolInput.path, "/srv/app/config.yaml", "the path is what the row needs");
+    assert.equal(Object.hasOwn(toolInput, "content"), false);
+
+    const serialised = JSON.stringify(api.requests);
+    assert.equal(serialised.includes("WRITE_BODY_MARKER_"), false, "not in the turn log, not in the check");
+    assert.equal(serialised.includes("xxxxxxxxxx"), false, "nor a slice of it");
+  } finally {
+    await api.close();
+  }
+});
+
+// --- the assistant text ---------------------------------------------------------------------------
+//
+// `messages` is the only source for it — `agent_end` is the only event that carries what the model
+// said — and it used to be dropped, so every row showed a prompt and a silent assistant. These cases
+// are about what is read out of that array and, just as much, what is not.
+
+test("the assistant's text reaches the posted body verbatim", async () => {
+  const api = await startMockApi();
+  try {
+    const event = createFakeAgentEndEvent([
+      createFakeAssistantMessage([{ type: "text", text: "The config sets two replicas." }]),
+    ]);
+    handleAgentEnd(event, createFakeCtx(), { client: client(api), store: primedStore(), now: () => 5_000 });
+    await sleep(120);
+
+    const body = turnLogs(api)[0]?.body as { messages?: { role: string; content: string }[] };
+    assert.equal(body.messages?.[1]?.role, "assistant");
+    assert.equal(body.messages?.[1]?.content, "The config sets two replicas.");
+  } finally {
+    await api.close();
+  }
+});
+
+test("several assistant messages and several text parts are joined in order", async () => {
+  const api = await startMockApi();
+  try {
+    // One run can produce two assistant messages — a tool batch splits the answer — and a single
+    // message can carry more than one text part.
+    const event = createFakeAgentEndEvent([
+      createFakeAssistantMessage([
+        { type: "text", text: "first" },
+        { type: "text", text: "second" },
+      ]),
+      createFakeUserMessage("a steering message that is not the model talking"),
+      createFakeAssistantMessage([{ type: "text", text: "third" }]),
+    ]);
+    handleAgentEnd(event, createFakeCtx(), { client: client(api), store: primedStore(), now: () => 5_000 });
+    await sleep(120);
+
+    const body = turnLogs(api)[0]?.body as { messages?: { content: string }[] };
+    assert.equal(body.messages?.[1]?.content, "first\nsecond\nthird");
+    assert.equal(
+      body.messages?.[1]?.content.includes("steering"),
+      false,
+      "a user-role message is not the assistant's text, whatever else is in the array",
+    );
+  } finally {
+    await api.close();
+  }
+});
+
+test("thinking and toolCall parts are not assistant text", async () => {
+  // The two exclusions that matter. Thinking is provider reasoning and the most sensitive thing in
+  // the array; a `toolCall`'s `arguments` are the RAW input the turn log carries an allowlisted
+  // projection of, so forwarding them here would re-open the egress `tool_input` closes.
+  assert.equal(
+    assistantTextFrom([
+      {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "THINKING_MARKER the user probably wants" },
+          { type: "toolCall", id: "c1", name: "write", arguments: { content: "TOOLCALL_BODY_MARKER" } },
+          { type: "text", text: "Done." },
+        ],
+      },
+    ]),
+    "Done.",
+  );
+
+  const api = await startMockApi();
+  try {
+    handleAgentEnd(
+      createFakeAgentEndEvent([
+        createFakeAssistantMessage([
+          { type: "thinking", thinking: "THINKING_MARKER" },
+          { type: "toolCall", id: "c1", name: "write", arguments: { content: "TOOLCALL_BODY_MARKER" } },
+        ]),
+      ]),
+      createFakeCtx(),
+      { client: client(api), store: primedStore(), now: () => 5_000 },
+    );
+    await sleep(120);
+
+    const serialised = JSON.stringify(api.requests);
+    assert.equal(serialised.includes("THINKING_MARKER"), false, "reasoning never leaves the process");
+    assert.equal(serialised.includes("TOOLCALL_BODY_MARKER"), false, "nor raw tool-call arguments");
+    const body = turnLogs(api)[0]?.body as { messages?: { content: string }[] };
+    assert.equal(body.messages?.[1]?.content, "", "a turn with no text said nothing, and says so");
+  } finally {
+    await api.close();
+  }
+});
+
+test("a 40 KB answer is capped at both ends with the marker and a flag", async () => {
+  const api = await startMockApi();
+  try {
+    const text = "OPENING_LINE" + "z".repeat(40_000) + "CLOSING_LINE";
+    handleAgentEnd(
+      createFakeAgentEndEvent([createFakeAssistantMessage([{ type: "text", text }])]),
+      createFakeCtx(),
+      { client: client(api), store: primedStore(), now: () => 5_000 },
+    );
+    await sleep(120);
+
+    const body = turnLogs(api)[0]?.body as {
+      messages?: { content: string }[];
+      assistant_truncated?: boolean;
+    };
+    const content = body.messages?.[1]?.content ?? "";
+    assert.equal(content.length, MAX_ASSISTANT_CHARS);
+    assert.ok(content.startsWith("OPENING_LINE"));
+    assert.ok(content.endsWith("CLOSING_LINE"), "the conclusion is kept, not just the opening");
+    assert.equal(body.assistant_truncated, true);
+  } finally {
+    await api.close();
+  }
+});
+
+test("no assistant text leaves the content empty and the flag absent", async () => {
   const api = await startMockApi();
   try {
     handleAgentEnd(createFakeAgentEndEvent([]), createFakeCtx(), {
@@ -149,11 +392,40 @@ test("no tool_use entry carries a content, edits or pattern key", async () => {
     });
     await sleep(120);
 
-    const body = turnLogs(api)[0]?.body as { messages?: { tool_use?: unknown }[] };
-    const toolUse = JSON.stringify(body.messages?.[1]?.tool_use);
-    for (const key of ["content", "edits", "pattern", "path", "command"]) {
-      assert.equal(toolUse.includes(`"${key}":`), false, `${key} came back into the body: ${toolUse}`);
-    }
+    const body = turnLogs(api)[0]?.body as {
+      messages?: { content: string }[];
+      assistant_truncated?: boolean;
+    };
+    assert.equal(body.messages?.[1]?.content, "");
+    assert.equal(body.assistant_truncated, undefined);
+  } finally {
+    await api.close();
+  }
+});
+
+test("assistantTextFrom is total, and a throwing messages getter costs the column not the row", async () => {
+  for (const junk of [undefined, null, "text", 42, {}, [null, 7, "x"], [{ role: "assistant" }]]) {
+    assert.doesNotThrow(() => assistantTextFrom(junk));
+    assert.equal(assistantTextFrom(junk), "");
+  }
+
+  const api = await startMockApi();
+  try {
+    const hostile = {
+      type: "agent_end",
+      get messages(): unknown[] {
+        throw new Error("messages exploded");
+      },
+    };
+    assert.doesNotThrow(() => {
+      handleAgentEnd(hostile as never, createFakeCtx(), {
+        client: client(api),
+        store: primedStore(),
+        now: () => 5_000,
+      });
+    });
+    await sleep(120);
+    assert.equal(turnLogs(api).length, 1, "the row still went, without the assistant column");
   } finally {
     await api.close();
   }

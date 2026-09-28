@@ -6,27 +6,38 @@
 //
 //   1. **`model` is `TURNLOG_MODEL`.** See that constant. A real model id means the backend drops the
 //      row. This is the single highest-consequence line in the file.
-//   2. **`tool_use[].tool_input` is literally `{}`.** The turn record stores no tool input (09-04 T1),
-//      and reaching back to the live `event.input` here would re-open exactly the egress that 09-02's
-//      `sanitizeToolInput` allowlist closed — file bodies (`content`, `edits`) would ride the turn log
-//      even though they no longer ride the pretool check. The key exists only because the backend's
-//      reader expects it (`coding_tools_backfill_service.py:1207-1219`); nothing reads its contents
-//      for pi. `turnLog.test.ts` asserts the absence of `content`/`edits`/`pattern`/`path`/`command`
-//      inside `tool_use[]` rather than trusting this paragraph.
+//   2. **`tool_use[].tool_input` is the allowlisted input, not `{}`.** It used to be literally `{}`,
+//      on the reasoning that reaching back to the live `event.input` would re-open the egress 09-02's
+//      `sanitizeToolInput` allowlist closed. That was true of `event.input` and false of what the
+//      pretool request already sends, and the cost was a row that named a tool without saying what it
+//      did — `bash` with no command, `read` with no path. So the decision seam now hands
+//      `payload.ts`'s `auditToolInput` projection to the record, and this file emits it verbatim:
+//      `command` (both-ends capped), `path`, `pattern` and the other allowlisted keys; **never**
+//      `content`, `edits` or any file body. One allowlist, shared with the enforcement request, so a
+//      key that cannot ride a pretool check cannot ride an audit row either. `turnLog.test.ts`
+//      asserts both halves — `content`/`edits` absent, `command`/`path`/`pattern` present — rather
+//      than trusting this paragraph.
 //   3. **`tool_response` carries `{content_sha256, content_bytes}`** — HOOK-06's whole point. This is
 //      also a documented parity gap: `audit_service.py:113-139` feeds the serialised `tool_use` array
 //      (including `tool_response`) to DLP, so **tool-output DLP cannot fire for pi**. That is a direct
 //      consequence of the locked requirement, not a bug.
-//   4. **The assistant `content` is `""`.** The turn record holds no assistant text, and inventing one
-//      would be new egress nothing asked for — a second documented parity gap (no assistant-text DLP
-//      for pi). Sending the empty string keeps the two-message shape the server reads
-//      (`hooksHandlerFactory.ts:184-203`) without adding a channel.
+//   4. **The assistant `content` is the model's own text**, capped at `MAX_ASSISTANT_CHARS`. It used
+//      to be hard-coded `""`, on the reasoning that the turn record holds no assistant text and
+//      inventing one would be new egress. The record still holds none: the text is read off
+//      `agent_end`'s `messages` by `assistantTextFrom`, handed to this builder through `opts`, and
+//      never stored in the turn store, never written to disk and never logged locally — it exists for
+//      the length of one POST. What the old empty string cost was a row that showed the user's prompt
+//      and a silent assistant, i.e. half a conversation, and assistant-text DLP that could not fire
+//      for want of anything to match on. Capped at both ends with the same marker a command gets, and
+//      `assistant_truncated` rides the body when that happened.
 //
 // `applicationId`, `organizationId` and `key_source` are server-set (`:80-83`) and are never sent. No
 // `unbound_app_label` either: the route already labels this `pi`, which is what makes
 // `metadata.source = 'hooks'` true (`add_gateway_metrics_task.py:676-677`).
 
-import { TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
+import { redactSecrets } from "./config.ts";
+import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
+import { capCommand } from "./payload.ts";
 import type { TurnRecord } from "./turn.ts";
 
 /** The hash pair, or the honest statement that the output was too big to hash. */
@@ -39,8 +50,11 @@ export interface TurnLogToolUse {
   type: string;
   tool_name: string;
   tool_use_id: string;
-  /** Always `{}` — see decision 2 in the header. */
-  tool_input: Record<string, never>;
+  /**
+   * The allowlisted, capped input the pretool request carried — see decision 2 in the header. `{}`
+   * when the call was recorded without one.
+   */
+  tool_input: Record<string, unknown>;
   tool_response: ToolResponse;
 }
 
@@ -73,11 +87,28 @@ export interface TurnLogBody {
   results_truncated?: number;
   /** The same, for the `MAX_TURN_TOOL_CALLS` cap on `tool_calls` (WR-04). Same present-only rule. */
   tool_calls_truncated?: number;
+  /**
+   * `true` when the assistant text is a head-plus-tail of what the model actually said. Present-only,
+   * like the two counters above: a reader must be able to tell a whole answer from a spliced one
+   * without diffing it against the marker.
+   */
+  assistant_truncated?: true;
 }
 
 export interface TurnLogOptions {
   cwd: string;
   completedAtMs: number;
+  /**
+   * What the model said this turn, already extracted from `agent_end`'s messages.
+   *
+   * An option rather than a field on the record, because it never belongs to the record: the record
+   * accumulates across four handler invocations, while this arrives whole at `agent_end` and is used
+   * once. Keeping it out of the store is also what keeps "never logged locally" true by construction —
+   * there is no in-memory copy to leak into a snapshot.
+   */
+  assistantText?: string;
+  /** The session's API key, so `redactSecrets` can scrub it from anything the model or a command echoes. */
+  apiKey?: string;
 }
 
 /**
@@ -94,6 +125,42 @@ export function shouldPostTurn(record: TurnRecord | undefined): boolean {
     return Array.isArray(record.tool_calls) && record.tool_calls.length > 0;
   } catch {
     return false;
+  }
+}
+
+/**
+ * The recorded `tool_input`, or `{}`.
+ *
+ * Read, never re-sanitised: the allowlist ran at the decision seam, where the live `event.input` still
+ * existed, and a second pass here would only strip the `_dropped` / `_truncated` markers the server is
+ * meant to see. Anything that is not a plain object is `{}` — a malformed record degrades a key, not
+ * the row.
+ */
+function toolInputFor(value: unknown, apiKey?: string): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  const input = { ...(value as Record<string, unknown>) };
+  // The command persists in the audit row, so bearer tokens and the session key are scrubbed the same
+  // way the telemetry path scrubs them. The pretool check itself saw the command unredacted.
+  if (typeof input.command === "string") input.command = redactSecrets(input.command, apiKey);
+  return input;
+}
+
+/**
+ * The assistant text as it goes on the wire: capped at `MAX_ASSISTANT_CHARS`, both ends kept.
+ *
+ * `capCommand` is reused rather than reimplemented — it is the project's both-ends cap, marker and
+ * all, and a second splicer would be a second thing to get wrong. Anything that is not a non-empty
+ * string is the empty string, so a hostile or half-built message array costs the column, not the row.
+ */
+function capAssistantText(text: unknown, apiKey?: string): { content: string; truncated: boolean } {
+  try {
+    if (typeof text !== "string" || text === "") return { content: "", truncated: false };
+    // The model often quotes what a tool returned, so the same secret redaction the telemetry path
+    // applies runs here before the cap; server-side DLP scans what remains, as for every other hook.
+    const capped = capCommand(redactSecrets(text, apiKey), MAX_ASSISTANT_CHARS);
+    return { content: capped.command, truncated: capped.truncated };
+  } catch {
+    return { content: "", truncated: false };
   }
 }
 
@@ -150,20 +217,23 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
       type: TURNLOG_TOOL_USE_TYPE,
       tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
       tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // Not `call`-derived and not `event.input`-derived. Empty by design — header decision 2.
-      tool_input: {},
+      // `call`-derived, and still never `event.input`-derived: what the record holds was already
+      // allowlisted and capped by `auditToolInput` — header decision 2.
+      tool_input: toolInputFor(call?.tool_input, opts?.apiKey),
       tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : ""),
     }));
   } catch {
     // Fall through with the defaults above: a degraded row beats a thrown handler.
   }
 
+  const assistant = capAssistantText(opts?.assistantText, opts?.apiKey);
+
   const body: TurnLogBody = {
     conversation_id: conversationId,
     model: TURNLOG_MODEL,
     messages: [
       { role: "user", content: prompt },
-      { role: "assistant", content: "", tool_use: toolUse },
+      { role: "assistant", content: assistant.content, tool_use: toolUse },
     ],
     cwd: opts.cwd,
     requestCompleted: new Date(opts.completedAtMs).toISOString(),
@@ -174,5 +244,6 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   if (startedAt !== undefined) body.requestInitialized = new Date(startedAt).toISOString();
   if (truncated !== undefined) body.results_truncated = truncated;
   if (callsTruncated !== undefined) body.tool_calls_truncated = callsTruncated;
+  if (assistant.truncated) body.assistant_truncated = true;
   return body;
 }

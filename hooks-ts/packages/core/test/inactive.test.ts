@@ -41,8 +41,8 @@ import { createTelemetry } from "../src/telemetry.ts";
 import type { PretoolRequestBody } from "../src/types.ts";
 import { startMockApi } from "./helpers/mockApi.ts";
 import type { MockApi } from "./helpers/mockApi.ts";
+import { TEST_KEY } from "./helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
 const FIXED_NOW = 1_700_000_000_000;
 

@@ -23,6 +23,10 @@
 //     defaulting to cwd.
 //   * The allowlist runs BEFORE the existing 16 KB whole-object cap, which stays as defence in
 //     depth for the keys that do survive.
+//
+// `auditToolInput` lives here rather than in `turnLog.ts` for the same reason: the turn log's
+// `tool_input` must be the SAME projection this file already sends, so both come out of one allowlist
+// and one pair of caps. A key the pretool request does not carry cannot appear in an audit row.
 
 import {
   APP_LABEL,
@@ -211,6 +215,40 @@ export function capCommand(
     command: command.slice(0, headChars) + COMMAND_TRUNCATION_MARKER + command.slice(-tailChars),
     truncated: true,
   };
+}
+
+/**
+ * The **audit** projection of one tool call's input — what `tool_use[].tool_input` carries in the
+ * turn log (RES-04). Pure, like everything else in this file.
+ *
+ * Built from the same two functions the pretool request is built from, deliberately: the turn log can
+ * then never carry a key the enforcement request does not, so there is exactly one allowlist to
+ * widen rather than two to keep in step. `content` and `edits` are absent here for the same reason
+ * they are absent there, and `sanitizeToolInput`'s 2 KB per-value cap and `capToolInput`'s 16 KB
+ * whole-object cap both still apply.
+ *
+ * `command` is added on top, because it is the one thing the pretool request sends that does NOT ride
+ * `metadata.tool_input`: it travels as `pre_tool_use_data.command`, a top-level field, so the
+ * allowlist has never had a reason to name it — and a turn log that omitted it described a shell call
+ * without saying what the command was. `capCommand` gives it the same both-ends cap and the same
+ * spliced marker the wire command gets, so the audit row and the checked command agree about what
+ * was long.
+ *
+ * It is also **deleted before** the allowlist runs rather than dropped by it, and that is what keeps
+ * `_dropped` honest: a `bash` call carries `command` and nothing else, and a `_dropped` marker on it
+ * would claim a lossy forward for the one key that travels in full, one field over.
+ */
+export function auditToolInput(
+  toolInput: Record<string, unknown>,
+  command: string,
+): Record<string, unknown> {
+  const isObject = toolInput !== null && typeof toolInput === "object" && !Array.isArray(toolInput);
+  // A copy: the caller's `event.input` is pi's live object and must not be mutated (§F9).
+  const source: Record<string, unknown> = isObject ? { ...toolInput } : {};
+  delete source.command;
+  const out = sanitizeToolInput(source);
+  if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
+  return capToolInput(out);
 }
 
 /** Assemble the §B1 body. Pure: same input, same output, no side effects. */

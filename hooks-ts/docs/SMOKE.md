@@ -62,7 +62,7 @@ Strings as they appear verbatim in the built file (compare against the TUI):
 | deny prefix | `Blocked by Unbound policy: ` |
 | deny, no reason from API | `Blocked by Unbound policy.` |
 | confirm title | `Unbound policy` |
-| confirm body suffix | `\n\nRun this command?` |
+| confirm body (the whole of it — the reason is the warning notification, not the dialog) | `Run this command?` |
 | user picked No / dismissed / timed out | `Declined by user (Unbound policy)` |
 | ask while headless (`pi -p`, json) | `Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.` |
 | API failure after a remembered `policy_check_failure_action: block` | `Unbound policy engine unavailable — please retry` |
@@ -80,7 +80,7 @@ unless stated otherwise. Ask pi to run `echo hi` each time.
 | # | Mock mode | Command | Expected | Observed (human, verbatim) | Result |
 |---|---|---|---|---|---|
 | 1 | `deny` | `pi` (TUI) | tool does not run; error tool-result `Blocked by Unbound policy: Reading secrets is blocked.` + red notification | Human (Sumit), 2026-09-26: "1 - pass" | ✅ |
-| 2a | `ask` | `pi` (TUI) → pick **No** | Yes/No overlay titled `Unbound policy`, body has `Unusual command.` + `Run this command?`, countdown visible; transcript shows `Declined by user (Unbound policy)` | Human (Sumit), 2026-09-26: "2 - pass" | ✅ |
+| 2a | `ask` | `pi` (TUI) → pick **No** | yellow warning box carrying `Unusual command.`, then a Yes/No overlay titled `Unbound policy` whose body is `Run this command?` and **does not repeat the reason**, countdown visible; transcript shows `Declined by user (Unbound policy)` | Human (Sumit), 2026-09-26: "2 - pass" — observed against the earlier build, whose overlay also repeated the reason; the de-duplication is covered by `confirm.test.ts` and needs one re-observation | ⚠️ re-run |
 | 2b | `ask` | `pi` (TUI) → pick **Yes** | command runs | Human (Sumit), 2026-09-26: "2 - pass" | ✅ |
 | 3 | `hang` | `pi -p --mode json` (headless, run by the executor at the human's request) | ~20 s pause, then the command runs (bounded fail-open, never indefinite) | `tool_execution_start` at t+2 s → `tool_execution_end` at t+22 s (exactly 20 s), result `hi\n`, `isError:false`. Repeated on a retry: t+23 s → t+43 s. Bounded, then ran. | ✅ |
 | 4 | `ask` | `pi -p --mode json "…echo hi…"` | blocked with the headless reason, no dialog | `tool_execution_end … "text":"Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.", "isError":true`; `toolCallId` = `call_qpLNCvyocPYU1AzKXBmLtmVl` (pins assumption A2: pi's `call_…` id format). In plain `-p` text mode the model paraphrased the same reason. | ✅ |

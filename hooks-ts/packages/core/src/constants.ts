@@ -52,8 +52,11 @@ export const EVENT_NAME_SESSION_START = "session_start";
  * durable row and keep the heartbeat; `heartbeat.test.ts` is written to pass either way, so flipping
  * it needs no test edit. Bounded by `derive_hook_request_id` collapsing identical empty turns into one
  * row per session.
+ *
+ * Disabled 2026-09-28: the row renders in the console as an empty-prompt turn (nothing server-side
+ * distinguishes it from a real turn), and `setup_complete` already marks the device connected.
  */
-export const SESSION_PRESENCE_ROW_ENABLED = true;
+export const SESSION_PRESENCE_ROW_ENABLED = false;
 /**
  * HOOK-05's `event_name`. Matched server-side at `preToolUseHandler.ts:655`, which routes to
  * `handleGuardrails` — the one branch that can deny a prompt, and the one that deliberately omits
@@ -235,6 +238,17 @@ export const MAX_COMMAND_CHARS = 8192;
  */
 export const MAX_PROMPT_CHARS = 8192;
 /**
+ * The turn log's cap on assistant text (RES-04), kept at **both ends** like every other cap here.
+ *
+ * Twice `MAX_PROMPT_CHARS` deliberately: an answer is routinely longer than the question that
+ * prompted it — a long explanation, a file listing read back, a diff described in prose — and this
+ * value is not a guardrail input. Nothing matches against it and nothing decides on it; it is an
+ * audit column, so the cost of being generous is bytes on a fire-and-forget POST rather than a
+ * bypass. Past it the middle goes and `assistant_truncated` says so, because the opening and the
+ * conclusion are the two parts of a long answer a reviewer actually reads.
+ */
+export const MAX_ASSISTANT_CHARS = 16_384;
+/**
  * WR-04: the per-value cap on what survives `TOOL_INPUT_ALLOWLIST`. `pattern` is model-produced and
  * free-form, and the server truncates it at 4096 anyway (`effectiveCommand.ts:20 PATTERN_MAX`), so
  * 2 KB costs no enforcement and bounds what a single value can carry off the machine.
@@ -271,8 +285,19 @@ export const GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 export const DECLINED_REASON = "Declined by user (Unbound policy)";
 /** Dialog title; pi renders a confirm as a Yes/No selector titled `title\nmessage` (§A5). */
 export const CONFIRM_TITLE = "Unbound policy";
-/** Appended after the API reason in the confirm body, so the dialog actually asks something. */
-export const CONFIRM_QUESTION_SUFFIX = "\n\nRun this command?";
+/**
+ * The confirm body, in full — the question and nothing else.
+ *
+ * It used to be a *suffix* appended to the API reason, which meant the reason was rendered twice for
+ * one verdict: once as the `warning` notification raised immediately before the dialog, and again
+ * inside the overlay, which pi draws as `title\nmessage` (§A5). The notification is the copy that
+ * stays (it survives after the dialog closes, and it is the channel that also survives `!!` on the
+ * `user_bash` path), so the dialog no longer repeats it and only has to ask.
+ *
+ * Both call sites still notify first. Removing the notice instead would have left the reason visible
+ * only while the modal was open.
+ */
+export const CONFIRM_QUESTION = "Run this command?";
 export const NO_UI_REASON =
   "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";
