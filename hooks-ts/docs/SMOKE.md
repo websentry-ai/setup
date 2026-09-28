@@ -27,15 +27,33 @@ artifact by the Phase 9 verifier (`09-VERIFICATION.md`). The rows below were not
 Setup (done by the executor before the human runs pi):
 
 ```bash
+unbound setup pi            # installs the published extension; see pi/README.md
 cd setup/hooks-ts
-npm run build
-mkdir -p ~/.pi/agent/extensions/unbound
-cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js
-ls ~/.pi/agent/extensions/unbound/index.ts   # must NOT exist — index.ts shadows index.js
 npm run mock-api -- --mode deny --port 8799   # background; modes: deny | ask | hang | allow …
 curl -s -XPOST http://127.0.0.1:8799/v1/hooks/pretool -d '{}'
 # → {"decision":"deny","reason":"Reading secrets is blocked."}
 ```
+
+`unbound setup pi` fetches the artifact from `setup`'s `main`, verifies it against the
+committed `pi/index.js.sha256`, moves a shadowing `index.ts` aside itself, and writes
+`index.js` at 0644 — so it replaces the four hand-copy lines this recipe used to carry.
+
+<details>
+<summary><strong>Developer fallback</strong> — testing an <em>unpublished</em> build (the published
+artifact is whatever is on <code>main</code>, which is not your working tree)</summary>
+
+```bash
+cd setup/hooks-ts
+npm run build
+mkdir -p ~/.pi/agent/extensions/unbound
+cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js
+test ! -e ~/.pi/agent/extensions/unbound/index.ts   # must NOT exist — index.ts shadows index.js
+```
+
+The hand-copy writes no `index.js.sha256` sidecar and reports nothing to the backend, so
+`unbound setup pi --clear` will report `index.js.sha256: not_found` afterwards. That is
+expected, not a failure.
+</details>
 
 Strings as they appear verbatim in the built file (compare against the TUI):
 
@@ -81,18 +99,27 @@ To switch modes: stop the mock (`kill <pid>`) and restart with `--mode <mode>`.
 Setup, in addition to the block above (the executor does all of this before the human starts):
 
 ```bash
-cd setup/hooks-ts
-npm run build
-cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js
-cmp -s dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js   # must exit 0
-test ! -e ~/.pi/agent/extensions/unbound/index.ts                 # index.ts shadows index.js
+unbound setup pi                                                  # or the developer fallback below
 rm -f ~/.pi/agent/.unbound/policy_cache.json                      # between rows that touch the cache
+cd setup/hooks-ts
 npm run mock-api -- --mode deny --port 8799
 curl -s -XPOST http://127.0.0.1:8799/v1/hooks/pretool \
   -H 'content-type: application/json' \
   -d '{"pre_tool_use_data":{"tool_name":"bash","command":"x","metadata":{}}}'
 # → {"decision":"deny","reason":"Reading secrets is blocked."}
 ```
+
+<details>
+<summary><strong>Developer fallback</strong> — the Phase 9 rows against an unpublished build</summary>
+
+```bash
+cd setup/hooks-ts
+npm run build
+cp dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js
+cmp -s dist/pi/index.js ~/.pi/agent/extensions/unbound/index.js   # must exit 0
+test ! -e ~/.pi/agent/extensions/unbound/index.ts                 # index.ts shadows index.js
+```
+</details>
 
 Two setup facts that did not apply to rows 1–6:
 
@@ -189,3 +216,68 @@ Checklist to run once #969 and #2947 are merged and ArgoCD-deployed:
 8. **Always clean up:** `unbound policy tool delete <policy-id>`.
 
 Never record the staging key, token, or any customer identifier in this file.
+
+---
+
+## 3. Phase 10 install smoke — `unbound setup pi` and the MDM drop
+
+Rows **P1–P6**, numbered separately from the Phase 8/9 rows 1–17 above so both sets stay
+greppable. This section tests the *installer* (`pi/setup.py`, `pi/mdm/setup.py`), not the
+extension's behaviour.
+
+**How the runnable rows were run.** `ARTIFACT_URL` in `pi/setup.py` has deliberately no
+env-var or flag override — an override would be a redirect primitive for anyone who can set
+a variable in a user's shell — and `refs/heads/main` does not yet carry `pi/index.js.sha256`
+(see the END-TO-END block below). So P2–P4 were driven through a throwaway harness that loads
+the real installer module and repoints `ARTIFACT_URL` / `SHA_URL` at a `file://` copy of the
+repo's own committed artifact. `curl` speaks `file://` natively, so the download, the sidecar
+parse, the digest verification, the shadow guard, the 0644 write and the report all run
+through the shipped code path unmodified — **only the origin changes**. Every run used a
+`mktemp -d` HOME and the literal key `notakey`.
+
+| # | Mock mode | Command | Expected | Observed | Result |
+|---|---|---|---|---|---|
+| P1 | n/a (real network) | `rm -rf ~/.pi/agent/extensions/unbound && unbound setup pi`, then a pi session against a staging BLOCK policy | `index.js` present at 0644, `shasum` matches `pi/index.js` on `main`, the next pi session enforces the policy, and the device appears as connected | not run — `pi/setup.py` and `pi/index.js.sha256` both 404 on `refs/heads/main` (`gh api …/contents/pi/setup.py?ref=main` → `{"status":"404"}`), so `unbound setup pi` cannot reach this installer at all; and `POST /setup/complete/` still 4xxs on `tool_type: "pi"` | **SKIPPED** — setup #351 unmerged + `staging`→`main` unpromoted; ai-gateway-data #2947 undeployed |
+| P1b | n/a (real network) | `PI_CODING_AGENT_DIR=/tmp/pi-refusal-check HOME=$(mktemp -d) python3 pi/setup.py --api-key notakey --backend-url https://backend.getunbound.ai` | the sidecar is missing on `main`, so the installer **refuses** and writes nothing | 2026-09-28, executor. Verbatim: `❌ Could not download the integrity sidecar from https://raw.githubusercontent.com/websentry-ai/setup/refs/heads/main/pi/index.js.sha256` / `   The artifact and its sidecar are committed together, so a missing` / `   sidecar means that ref is inconsistent. Refusing to install.` — exit **1**; `/tmp/pi-refusal-check` was **never created** (`ls` → `No such file or directory`), and the scratch HOME was still empty afterwards (no `.unbound/config.json`) | ✅ PASS (executor, real network) |
+| P2 | `file://` origin | plant a developer `index.ts` + a `notes.md` in the extension dir, then install | the `.ts` is moved aside (not deleted), a loud warning prints, `index.js` is written and now wins | 2026-09-28, executor. `⚠️  Found index.ts, which would shadow index.js -- pi resolves it first.` / `   Moved it to index.ts.unbound-disabled; it was not deleted. Nothing else changed.` then `✅ Installed the Unbound extension: …/index.js (59814 bytes, 0644)`. Afterwards: no `index.ts`; `index.ts.unbound-disabled` still holds the developer's exact bytes (`console.log("a developer index.ts");`); `notes.md` untouched | ✅ PASS (executor, headless) |
+| P3 | `file://` origin | `PI_CODING_AGENT_DIR=/tmp/pitest python3 <driver> --api-key notakey` | lands under `/tmp/pitest/extensions/unbound/`, and **not** under the default `~/.pi/agent` | 2026-09-28, executor. `Agent directory: /tmp/pitest` then `✅ Installed the Unbound extension: /tmp/pitest/extensions/unbound/index.js (59814 bytes, 0644)`. `/tmp/pitest/extensions/unbound/` holds `index.js` (0644) + `index.js.sha256`; the scratch HOME has **no `.pi` directory at all**. Installed digest `95a0cc329abe532a…` == `shasum -a 256 pi/index.js` | ✅ PASS (executor, headless) |
+| P4 | n/a (no network) | `python3 pi/setup.py --clear` in the P2 home | `index.js` + `index.js.sha256` gone, the directory and foreign files left, `~/.unbound/config.json` **byte-identical** under `cmp`, sibling extension dirs untouched | 2026-09-28, executor. `  index.js: cleared` / `  index.js.sha256: cleared` / `Cleared. The directory and any other file in it were left in place.` Afterwards the dir holds only `index.ts.unbound-disabled` and `notes.md`; `cmp ~/.unbound/config.json <pre-clear copy>` exits **0**; the sibling `extensions/someone-else/index.js` still reads `other extension`. Run with the real `pi/setup.py` (no driver) and no key — it made no network call | ✅ PASS (executor, headless) |
+| P5 | n/a | `sudo python3 pi/mdm/setup.py --api-key <admin> --app-name "<app>" --debug` on a two-account macOS box | both homes get `index.js` owned by the right uid; exactly one `setup_complete` with `install_mode: "mdm"` | not run — needs **root on a multi-account machine**, which this machine is not. The logic is covered by 120 unit tests with the syscalls intercepted (real `os.link`/symlink trees for the `st_nlink`/`O_NOFOLLOW` guards); the one property that genuinely needs root — that the dropped inode is owned by the target uid — is `tests/pi/mdm/test_drop.py::test_run_as_user_really_drops_privileges`, which skips with `a real fork+setuid privilege drop needs root` | **SKIPPED** — no root multi-account device available to this executor |
+| P6 | n/a | Connect → AI coding tools shows the **Pi Coding Agent** tile with icon, name and a copy-pasteable snippet | the tile renders, the icon resolves, the copy button yields `npm install -g unbound-cli && unbound login --api-key … && unbound setup pi` | not run as a browser observation — it is a visual check on a deployed `unbound-fe`, and the tile is on an unmerged PR. Proven as far as code allows: `npx jest app/connect` → 3 suites / 25 tests green, `assertToolWiredEverywhere("PI", "Pi Coding Agent", "pi")` passes all nine surfaces, and `fs.existsSync` confirms the real `pi_icon.svg` (334 B) | **SKIPPED** — needs the unbound-fe PR deployed; "the device shows as connected" additionally gated on ai-gateway-data #2947 |
+
+### END-TO-END verdict
+
+```
+END-TO-END: SKIPPED — setup #351 unmerged + staging→main unpromoted (artifact on main is Phase 8's); ai-gateway-data #2947 undeployed (setup_complete 4xx)
+```
+
+Gate check run 2026-09-28 (UTC):
+
+```
+gh pr view 351  --repo websentry-ai/setup           --json state,mergedAt  → {"mergedAt":null,"state":"OPEN"}
+gh pr view 969  --repo websentry-ai/ai-gateway      --json state,mergedAt  → {"mergedAt":null,"state":"OPEN"}
+gh pr view 2947 --repo websentry-ai/ai-gateway-data --json state,mergedAt  → {"mergedAt":null,"state":"OPEN"}
+
+gh api 'repos/websentry-ai/setup/contents/pi/index.js?ref=main'                        --jq .size → 18945
+gh api 'repos/websentry-ai/setup/contents/pi/index.js?ref=feat/pi-setup-installer'     --jq .size → 59814
+gh api 'repos/websentry-ai/setup/contents/pi/index.js.sha256?ref=main'                 → {"status":"404"}
+gh api 'repos/websentry-ai/setup/contents/pi/setup.py?ref=main'                        → {"status":"404"}
+```
+
+Both blocking facts, spelled out:
+
+1. **`unbound setup pi` cannot reach this installer yet.** `SETUP_BASE_URL` pins
+   `refs/heads/main`, and `pi/setup.py` does not exist there (404). Even once it does,
+   `pi/index.js` on `main` is the **18,945-byte Phase 8** build, not the **59,814-byte**
+   parity build on this branch — so until `setup` #351 merges to `staging` **and** `staging`
+   is promoted to `main`, a user would install a real, working, parity-incomplete extension
+   and be told it succeeded.
+2. **`POST /api/v1/setup/complete/` rejects `tool_type: "pi"`** until ai-gateway-data #2947
+   deploys, so the device will not show as connected. The installers swallow the 4xx by
+   design and print one `best-effort` line — the install still succeeds.
+
+Row **P1b is the one genuinely end-to-end-provable path today**, and it proves the
+highest-severity guard: against the real `refs/heads/main`, over the real network, the
+installer refuses rather than installing something it cannot verify.
+
+Never record a real API key, admin token, device serial or customer identifier in this file.
