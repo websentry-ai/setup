@@ -1303,10 +1303,17 @@ def main() -> bool:
     # Exactly one report per device run, after the loop, with the state read before it. A
     # run where every home failed still reports -- the backend's view of the fleet would
     # otherwise silently omit the devices that need attention most.
-    reported = notify_setup_complete(
-        api_key, "pi", backend_url=args["backend_url"], install_state=install_state,
-        serial_number=device_id, hook_hash=digest, install_mode="mdm",
-    )
+    try:
+        reported = notify_setup_complete(
+            api_key, "pi", backend_url=args["backend_url"], install_state=install_state,
+            serial_number=device_id, hook_hash=digest, install_mode="mdm",
+        )
+    except Exception as e:
+        # notify_setup_complete swallows internally, so this is belt-and-braces -- but the
+        # rule is absolute: nothing about reporting may change whether the install succeeded,
+        # because the extension is on disk and enforcing either way.
+        debug_print(f"The report raised out of notify_setup_complete: {e}")
+        reported = None
     if reported is not True:
         print("⚠️  Could not report this install to the backend. Install-state reporting is")
         print("   best-effort and does not change the outcome above.")
