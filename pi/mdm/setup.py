@@ -19,11 +19,14 @@ in-home write goes through three primitives, all of them ported from
   1. `_run_as_user` -- fork, then setgroups/setgid/setuid before touching anything. After
      the drop, a symlink in the home pointing at a root-only path fails with EACCES all by
      itself instead of handing root's authority to whoever planted it.
-  2. `_repair_user_ownership` -- opens with O_NOFOLLOW (a symlink becomes ELOOP) and
-     fchowns the resulting file DESCRIPTOR, so the inode inspected is the inode chowned and
-     there is no path TOCTOU. A regular file carrying extra hard links (st_nlink != 1) is
-     refused outright: a hard link to a sensitive root-owned file would otherwise be given
-     away. Directories are reclaimed only when root- or self-owned.
+  2. `_repair_user_ownership` -- walks the path one component at a time, each opened
+     O_NOFOLLOW relative to the previous component's descriptor (openat) and anchored at the
+     passwd home, so a symlinked PARENT cannot redirect the repair out of the home the way a
+     whole-path O_NOFOLLOW allowed. It then fchowns the resulting DESCRIPTOR, so the inode
+     inspected is the inode chowned and there is no path TOCTOU. A regular file carrying
+     extra hard links (st_nlink != 1) is refused outright: a hard link to a sensitive
+     root-owned file would otherwise be given away. Directories are reclaimed only when
+     root- or self-owned, and the home directory itself is never touched.
   3. The drop itself opens `index.js` with O_NOFOLLOW too, and runs the same `index.ts`
      shadow guard the per-user installer runs -- per home, so one user's leftover cannot
      silently defeat enforcement for that user.
@@ -423,54 +426,125 @@ def get_all_user_homes() -> List[Tuple[str, Path]]:
         return []
 
 
-def _repair_user_ownership(username: str, paths: List[Path]) -> None:
+def _relative_parts(base: Path, path) -> List[str]:
+    """The path components of `path` strictly below `base`, or [] when it is not below it.
+
+    Lexical on purpose. Resolving the path first is exactly what re-opens the escape this
+    exists to close: the caller walks these components one at a time with O_NOFOLLOW, so a
+    symlink among them is refused at open time rather than silently followed here.
+    """
+    try:
+        parts = Path(path).relative_to(base).parts
+    except (ValueError, TypeError):
+        return []
+    if any(part in ("", os.curdir, os.pardir) for part in parts):
+        return []
+    return list(parts)
+
+
+def _open_below(base_fd: int, parts: List[str], flags: int, o_directory: int) -> Optional[int]:
+    """A descriptor for `base_fd`/`parts`, opening EVERY component with O_NOFOLLOW (openat).
+
+    Each component is opened relative to the descriptor of the one before it, so a symlink
+    anywhere along the way is an ELOOP that ends the walk -- there is no path string for the
+    kernel to re-resolve. Every component but the last must be a real directory, verified on
+    the fstat as well as with O_DIRECTORY, because O_DIRECTORY is not guaranteed to exist.
+    Returns None on any refusal, and closes every descriptor it opened except the one it
+    hands back.
+    """
+    fd = os.dup(base_fd)  # dup so walking can close as it goes without closing the anchor
+    try:
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            nxt = os.open(part, flags if last else flags | o_directory, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+            if not last and not stat.S_ISDIR(os.fstat(fd).st_mode):
+                return None
+        opened, fd = fd, None
+        return opened
+    except OSError:
+        return None  # missing, a symlink (ELOOP), a fifo, not a directory, or no access
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+
+def _repair_user_ownership(username: str, base, paths: List[Path]) -> None:
     """Root-context best-effort: hand back any of `paths` a previous root run left owned by
     the wrong uid, so the upcoming privilege-dropped write does not fail EACCES.
 
     This runs as root against paths the user controls, so it is hardened against local
-    escalation. Open with O_NOFOLLOW -- a symlink becomes ELOOP -- and fchown the resulting
-    file DESCRIPTOR, so the inode inspected is the inode chowned and there is no path
-    TOCTOU. A regular file with extra hard links (st_nlink != 1) is refused: a hard link to
-    a sensitive root-owned file planted at our target path would otherwise be given away.
-    Directories are opened with O_DIRECTORY and reclaimed ONLY when root- or self-owned; a
-    directory owned by some other non-root user is left alone, because handing it over
-    would be an over-reach rather than a repair. No-op on Windows or without pwd; only
-    fires on the abnormal uid-mismatch case; never raises.
+    escalation -- and the hardening is on EVERY path component, not just the last one.
+    O_NOFOLLOW on a full path only ever protected the final component: with
+    `~/.pi/agent/extensions` replaced by a symlink to `/etc`, opening
+    `~/.pi/agent/extensions/unbound` follows that link without complaint and root hands
+    `/etc/unbound` to the user. So each component is opened separately, O_NOFOLLOW, relative
+    to the descriptor of the component before it, starting from `base` -- the account's home
+    out of the passwd database, which is root's own configuration rather than anything the
+    user can retarget. A symlink, a non-directory or a missing component anywhere along the
+    way simply ends that path's repair.
+
+    `base` itself is NEVER chowned. Home ownership is deliberately root-owned on real
+    accounts (an sshd ChrootDirectory, an admin-locked kiosk account), changing it breaks
+    those logins, and nothing this installer writes needs it: if `~/.pi` cannot be created,
+    the privilege-dropped write should just fail for that user.
+
+    The inode inspected is the inode chowned -- fchown on the descriptor -- so there is no
+    path TOCTOU. A regular file with extra hard links (st_nlink != 1) is refused: a hard link
+    to a sensitive root-owned file planted at our target path would otherwise be given away.
+    Directories are reclaimed ONLY when root- or self-owned; a directory owned by some other
+    non-root user is left alone, because handing it over would be an over-reach rather than a
+    repair. No-op on Windows or without pwd; only fires on the abnormal uid-mismatch case;
+    never raises.
     """
     if platform.system().lower() == "windows" or pwd is None:
         return
+    o_nofollow = getattr(os, "O_NOFOLLOW", None)
+    if o_nofollow is None:
+        return  # cannot open safely without the symlink guard -- skip, never degrade it
+    if os.open not in getattr(os, "supports_dir_fd", ()):
+        return  # no openat, so no way to pin a component to its parent -- skip
     try:
         info = pwd.getpwnam(username)
     except KeyError:
         return
     uid, gid = info.pw_uid, info.pw_gid
-    o_nofollow = getattr(os, "O_NOFOLLOW", None)
-    if o_nofollow is None:
-        return  # cannot open safely without the symlink guard -- skip, never degrade it
+    base = Path(base)
+    if not base.is_absolute():
+        return
     o_directory = getattr(os, "O_DIRECTORY", 0)
-    base_flags = os.O_RDONLY | o_nofollow | getattr(os, "O_NONBLOCK", 0)
-    for path in paths:
-        # The directory open first: O_DIRECTORY succeeds only for a real directory, and
-        # O_NOFOLLOW refuses a symlink to one. ENOTDIR falls through to the file open.
-        try:
-            fd = os.open(str(path), base_flags | o_directory)
-        except OSError:
+    o_nonblock = getattr(os, "O_NONBLOCK", 0)
+    walk_flags = os.O_RDONLY | o_nofollow | o_nonblock
+    try:
+        # The anchor is opened by path, following symlinks: it is the passwd home, which is
+        # root's configuration. Nothing below it is followed.
+        base_fd = os.open(str(base), os.O_RDONLY | o_nonblock | o_directory)
+    except OSError as e:
+        debug_print(f"_repair_user_ownership: no anchor directory at {base}: {e}")
+        return
+    try:
+        for path in paths:
+            parts = _relative_parts(base, path)
+            if not parts:
+                continue  # the anchor itself, or outside it -- neither is ours to repair
+            fd = _open_below(base_fd, parts, walk_flags, o_directory)
+            if fd is None:
+                continue
             try:
-                fd = os.open(str(path), base_flags)
-            except OSError:
-                continue  # missing, a symlink (ELOOP), a fifo, or no access
-        try:
-            st = os.fstat(fd)
-            if stat.S_ISDIR(st.st_mode):
-                if st.st_uid != uid and st.st_uid in (0, uid):
-                    os.fchown(fd, uid, gid)
-            elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
-                if st.st_uid != uid:
-                    os.fchown(fd, uid, gid)
-        except OSError as e:
-            debug_print(f"_repair_user_ownership: could not chown {path}: {e}")
-        finally:
-            os.close(fd)
+                st = os.fstat(fd)
+                if stat.S_ISDIR(st.st_mode):
+                    if st.st_uid != uid and st.st_uid in (0, uid):
+                        os.fchown(fd, uid, gid)
+                elif stat.S_ISREG(st.st_mode) and st.st_nlink == 1:
+                    if st.st_uid != uid:
+                        os.fchown(fd, uid, gid)
+            except OSError as e:
+                debug_print(f"_repair_user_ownership: could not chown {path}: {e}")
+            finally:
+                os.close(fd)
+    finally:
+        os.close(base_fd)
 
 
 # --- the artifact ------------------------------------------------------------------------
@@ -762,9 +836,10 @@ def install_for_user(username: str, home_dir, payload: bytes, digest: str) -> st
     sidecar = sidecar_path(agent_dir)
 
     # A previous root-context run can leave these root-owned, which the dropped user then
-    # cannot write. Repair first (symlink- and hardlink-guarded), then drop.
-    _repair_user_ownership(username, [Path(home_dir), agent_dir.parent, agent_dir,
-                                      extdir.parent, extdir, target, sidecar])
+    # cannot write. Repair first (symlink- and hardlink-guarded), then drop. The home itself
+    # is the anchor, not a repaired path: see _repair_user_ownership.
+    _repair_user_ownership(username, home_dir, [agent_dir.parent, agent_dir,
+                                                extdir.parent, extdir, target, sidecar])
 
     result = _run_as_user(username, _drop_in_home, extdir, target, sidecar, payload, digest)
     if not isinstance(result, str):
@@ -1088,7 +1163,7 @@ def set_env_var_for_user(username: str, home_dir, var_name: str,
         # tuple type, so returning a list keeps the round trip lossless by construction.
         return [_success, _changed]
 
-    _repair_user_ownership(username, rc_files)
+    _repair_user_ownership(username, home_dir, rc_files)
     result = _run_as_user(username, _do)
     if not isinstance(result, list) or len(result) != 2:
         debug_print(f"Could not set {var_name} for {username}")
@@ -1161,7 +1236,7 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
 
     # A previous root-context run can leave these root-owned; repair (symlink-guarded)
     # before dropping, or the write below fails EACCES.
-    _repair_user_ownership(username, [config_dir, config_file])
+    _repair_user_ownership(username, home_dir, [config_dir, config_file])
 
     def _write():
         if platform.system().lower() == "windows":
@@ -1313,8 +1388,8 @@ def clear_setup() -> bool:
                 print(f"  {username}: skipped (no absolute home)")
                 continue
             extdir = extension_dir(agent_dir)
-            _repair_user_ownership(username, [extdir, artifact_path(agent_dir),
-                                              sidecar_path(agent_dir)])
+            _repair_user_ownership(username, home_dir, [extdir, artifact_path(agent_dir),
+                                                        sidecar_path(agent_dir)])
             statuses = _run_as_user(username, _clear_in_home, extdir)
             if statuses is None:
                 any_failed = True

@@ -80,7 +80,7 @@ def test_a_plain_file_is_repaired_by_fd(pi_mdm_setup, repair_probe, tmp_path):
     chowned, uid, gid = repair_probe
     target = tmp_path / "index.js"
     target.write_bytes(PAYLOAD)
-    pi_mdm_setup._repair_user_ownership("target", [target])
+    pi_mdm_setup._repair_user_ownership("target", tmp_path, [target])
     assert chowned == [(target.stat().st_ino, uid, gid)]
 
 
@@ -96,7 +96,7 @@ def test_a_hardlinked_regular_file_is_refused(pi_mdm_setup, repair_probe, tmp_pa
     os.link(sensitive, planted)
     assert planted.stat().st_nlink == 2
 
-    pi_mdm_setup._repair_user_ownership("target", [planted])
+    pi_mdm_setup._repair_user_ownership("target", tmp_path, [planted])
     assert chowned == [], "a hardlinked regular file was chowned to the target user"
 
 
@@ -110,14 +110,97 @@ def test_a_symlink_is_refused_by_o_nofollow(pi_mdm_setup, repair_probe, tmp_path
     link = tmp_path / "index.js"
     link.symlink_to(outside)
 
-    pi_mdm_setup._repair_user_ownership("target", [link])
+    pi_mdm_setup._repair_user_ownership("target", tmp_path, [link])
     assert chowned == []
     # And the same for a symlinked *directory*, which the O_DIRECTORY branch opens first.
     dir_outside = tmp_path / "dir-outside"
     dir_outside.mkdir()
     dir_link = tmp_path / "extensions"
     dir_link.symlink_to(dir_outside, target_is_directory=True)
-    pi_mdm_setup._repair_user_ownership("target", [dir_link])
+    pi_mdm_setup._repair_user_ownership("target", tmp_path, [dir_link])
+    assert chowned == []
+
+
+@pytest.fixture
+def as_root_owned(pi_mdm_setup, monkeypatch):
+    """Report every fstat'd inode as root-owned, so the chown DECISION is what is under test.
+
+    Creating a genuinely root-owned directory needs root; the open, the descriptor and the
+    decision are all the real code path. st_mode is untouched, so the directory/regular-file
+    classification is the real one.
+    """
+    real_fstat = os.fstat
+
+    def _root_owned(fd):
+        fields = list(real_fstat(fd))
+        fields[4] = 0  # st_uid: pretend root created this
+        return os.stat_result(tuple(fields))
+
+    monkeypatch.setattr(pi_mdm_setup.os, "fstat", _root_owned)
+
+
+@pytest.mark.skipif(WINDOWS, reason="O_NOFOLLOW is Unix-only")
+def test_a_symlinked_parent_cannot_redirect_the_repair_outside_the_home(
+        pi_mdm_setup, repair_probe, as_root_owned, tmp_path):
+    """The escalation a whole-path O_NOFOLLOW never covered: it guards the LAST component
+    only. A user who replaced ~/.pi/agent/extensions with a symlink to /etc had root open
+    /etc/unbound -- a real, root-owned directory that passes every other check here -- and
+    hand it over before the privilege drop. Each component is now opened relative to the
+    previous one's descriptor, so the planted link is an ELOOP and the walk stops in the home.
+    """
+    chowned, _, _ = repair_probe
+    home = tmp_path / "home"
+    (home / ".pi" / "agent").mkdir(parents=True)
+    etc = tmp_path / "etc"  # stands in for the root-owned /etc of the real attack
+    (etc / "unbound").mkdir(parents=True)
+    (home / ".pi" / "agent" / "extensions").symlink_to(etc, target_is_directory=True)
+
+    extdir = home / ".pi" / "agent" / "extensions" / "unbound"
+    pi_mdm_setup._repair_user_ownership("target", home, [extdir.parent, extdir])
+    assert chowned == [], "a symlinked parent directory redirected the ownership repair"
+
+
+@pytest.mark.skipif(WINDOWS, reason="Unix ownership semantics")
+def test_a_nested_path_under_the_home_is_still_reclaimed(
+        pi_mdm_setup, repair_probe, as_root_owned, tmp_path):
+    """The positive control for the component-wise walk. The real repair target sits four
+    levels below the home, so a walk that refused anything nested would be a silent no-op
+    rather than a fix -- and every other repair test here uses a single component."""
+    chowned, uid, gid = repair_probe
+    home = tmp_path / "home"
+    extdir = home / ".pi" / "agent" / "extensions" / "unbound"
+    extdir.mkdir(parents=True)
+
+    pi_mdm_setup._repair_user_ownership("target", home, [extdir])
+    assert [(u, g) for _, u, g in chowned] == [(uid, gid)]
+
+
+@pytest.mark.skipif(WINDOWS, reason="Unix ownership semantics")
+def test_the_home_directory_itself_is_never_chowned(
+        pi_mdm_setup, repair_probe, as_root_owned, tmp_path):
+    """A root-owned home is a real configuration, not damage to repair: sshd requires an
+    SFTP-only account's ChrootDirectory to be root-owned and refuses the login once it is
+    not, and an admin-locked kiosk account is the same shape. The anchor is never a repaired
+    path, even when a caller passes it as one."""
+    chowned, _, _ = repair_probe
+    home = tmp_path / "home"
+    home.mkdir()
+
+    pi_mdm_setup._repair_user_ownership("target", home, [home])
+    assert chowned == [], "the MDM push changed the ownership of a root-owned home"
+
+
+@pytest.mark.skipif(WINDOWS, reason="Unix ownership semantics")
+def test_a_path_outside_the_home_is_refused(
+        pi_mdm_setup, repair_probe, as_root_owned, tmp_path):
+    """Nothing above or beside the anchor is repairable, however it was reached."""
+    chowned, _, _ = repair_probe
+    home = tmp_path / "home"
+    home.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    pi_mdm_setup._repair_user_ownership("target", home, [elsewhere, home / ".." / "elsewhere"])
     assert chowned == []
 
 
@@ -130,12 +213,12 @@ def test_a_directory_owned_by_another_non_root_user_is_not_reclaimed(
     chowned, _, _ = repair_probe
     extdir = tmp_path / "unbound"
     extdir.mkdir()
-    pi_mdm_setup._repair_user_ownership("target", [extdir])
+    pi_mdm_setup._repair_user_ownership("target", tmp_path, [extdir])
     assert chowned == []
 
 
 @pytest.mark.skipif(WINDOWS, reason="Unix ownership semantics")
-def test_a_root_owned_directory_is_reclaimed(pi_mdm_setup, repair_probe, monkeypatch, tmp_path):
+def test_a_root_owned_directory_is_reclaimed(pi_mdm_setup, repair_probe, as_root_owned, tmp_path):
     """The case the function exists for: a previous root-context run left ~/.pi root-owned
     and the dropped user now cannot write into it. Creating a genuinely root-owned dir
     needs root, so only the fstat is synthesised -- the open, the fd and the fchown
@@ -145,24 +228,15 @@ def test_a_root_owned_directory_is_reclaimed(pi_mdm_setup, repair_probe, monkeyp
     extdir = tmp_path / "unbound"
     extdir.mkdir()
 
-    real_fstat = os.fstat
-
-    def as_root_owned(fd):
-        st = real_fstat(fd)
-        fields = list(st)
-        fields[4] = 0  # st_uid: pretend root created this directory
-        return os.stat_result(tuple(fields))
-
-    monkeypatch.setattr(mod.os, "fstat", as_root_owned)
-    mod._repair_user_ownership("target", [extdir])
+    mod._repair_user_ownership("target", tmp_path, [extdir])
     assert [(u, g) for _, u, g in chowned] == [(uid, gid)]
 
 
 @pytest.mark.skipif(WINDOWS, reason="Unix-only branch")
 def test_a_missing_path_and_an_unknown_user_are_non_events(pi_mdm_setup, repair_probe, tmp_path):
     chowned, _, _ = repair_probe
-    pi_mdm_setup._repair_user_ownership("target", [tmp_path / "never-existed"])
-    pi_mdm_setup._repair_user_ownership("nosuchuser", [tmp_path])
+    pi_mdm_setup._repair_user_ownership("target", tmp_path, [tmp_path / "never-existed"])
+    pi_mdm_setup._repair_user_ownership("nosuchuser", tmp_path, [tmp_path])
     assert chowned == []
 
 
@@ -174,7 +248,7 @@ def test_the_repair_is_a_no_op_on_windows(pi_mdm_setup, repair_probe, monkeypatc
     monkeypatch.setattr(mod.platform, "system", lambda: "Windows")
     target = tmp_path / "index.js"
     target.write_bytes(PAYLOAD)
-    mod._repair_user_ownership("target", [target])
+    mod._repair_user_ownership("target", tmp_path, [target])
     assert chowned == []
 
 
@@ -259,6 +333,23 @@ def test_a_drop_lands_index_js_at_0644_in_every_home(
         # The sidecar goes down beside it so an operator can verify the install by hand.
         assert (target.parent / "index.js.sha256").read_text().split()[0] == digest
     assert passthrough == ["alice", "bob"]
+
+
+def test_install_for_user_never_offers_the_home_itself_for_repair(
+        pi_mdm_setup, passthrough, homes, digest, monkeypatch):
+    """The call site as well as the primitive: install_for_user used to pass the home in its
+    repair list, and the home is the one path whose ownership an MDM push must not change.
+    The home is the anchor instead, which is never a repaired path."""
+    mod = pi_mdm_setup
+    seen = {}
+    monkeypatch.setattr(mod, "_repair_user_ownership",
+                        lambda username, base, paths: seen.update(
+                            base=str(base), paths=[str(p) for p in paths]))
+    username, home = homes[0]
+
+    mod.install_for_user(username, home, PAYLOAD, digest)
+    assert seen["base"] == str(home)
+    assert str(home) not in seen["paths"]
 
 
 def test_every_in_home_write_goes_through_the_drop(pi_mdm_setup, monkeypatch, homes, digest):

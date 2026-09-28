@@ -93,10 +93,15 @@ Every in-home write goes through three primitives, ported from the Augment analo
 1. **`_run_as_user`** — `fork`, then `setgroups([])` / `setgid` / `setuid` (in that order)
    before touching anything. After the drop, a symlink in the home pointing at a root-only
    path fails with `EACCES` on its own.
-2. **`_repair_user_ownership`** — opens with `O_NOFOLLOW` (a symlink becomes `ELOOP`) and
-   `fchown`s the resulting file **descriptor**, so the inode inspected is the inode chowned
-   and there is no path TOCTOU. A regular file carrying extra hard links (`st_nlink != 1`)
-   is refused outright. Directories are reclaimed only when root- or self-owned.
+2. **`_repair_user_ownership`** — walks the path **one component at a time**, each opened
+   `O_NOFOLLOW` relative to the previous component's descriptor (`openat`) and anchored at the
+   passwd home. A whole-path `O_NOFOLLOW` only guards the *last* component, so a symlinked
+   parent (`~/.pi/agent/extensions` → `/etc`) could redirect the repair outside the home; a
+   component-wise walk cannot. It then `fchown`s the resulting **descriptor**, so the inode
+   inspected is the inode chowned and there is no path TOCTOU. A regular file carrying extra
+   hard links (`st_nlink != 1`) is refused outright. Directories are reclaimed only when root-
+   or self-owned, and the home directory itself is never chowned — a deliberately root-owned
+   home (an sshd `ChrootDirectory`, an admin-locked kiosk account) must survive an MDM push.
 3. **The drop itself** opens `index.js` with `O_NOFOLLOW` too, and runs the `index.ts`
    shadow guard per home.
 
