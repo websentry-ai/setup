@@ -463,6 +463,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         return handleAgentEnd(event, ctx, {
           client: state.client,
           store: turnStore,
+          ...(state.apiKey === undefined ? {} : { apiKey: state.apiKey }),
           ...(state.telemetry === undefined ? {} : { telemetry: state.telemetry }),
         });
       } catch {

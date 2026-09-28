@@ -17,6 +17,7 @@ import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
 const NO_KEY_NOTICE = "Unbound: no API key found — extension inactive";
 const SESSION_START = { type: "session_start", reason: "startup" };
@@ -164,7 +165,7 @@ test("RES-06 with a key: session_start is silent and tool_call issues exactly on
   const home = createFakeHome({});
   try {
     const stub = await build({
-      env: { UNBOUND_PI_API_KEY: "unb_test_key_1234567890", UNBOUND_GATEWAY_URL: api.url },
+      env: { UNBOUND_PI_API_KEY: TEST_KEY, UNBOUND_GATEWAY_URL: api.url },
       homeDir: home.homeDir,
       entrypoint: "pi/0.87.1",
       // This case counts requests to prove the DECISION path costs exactly one. RES-05's heartbeat is
@@ -184,7 +185,7 @@ test("RES-06 with a key: session_start is silent and tool_call issues exactly on
     assert.equal(api.requests[0]?.path, "/v1/hooks/pretool");
     assert.equal(
       api.requests[0]?.headers.authorization,
-      "Bearer unb_test_key_1234567890",
+      `Bearer ${TEST_KEY}`,
       "the resolved key authenticates the call",
     );
   } finally {

@@ -273,6 +273,41 @@ export function createFakeToolResultEvent(
   return event;
 }
 
+/** pi's `ThinkingContent` (pi-ai `types.d.ts:247-255`) - provider reasoning, never sent. */
+export interface FakeThinkingContent {
+  type: "thinking";
+  thinking: string;
+  thinkingSignature?: string;
+}
+
+/** pi's `ToolCall` content part (pi-ai `types.d.ts:261-269`). `arguments` is the RAW tool input. */
+export interface FakeToolCallContent {
+  type: "toolCall";
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+/** The three part kinds an `AssistantMessage.content` array can hold (pi-ai `types.d.ts:353-355`). */
+export type FakeAssistantPart = FakeTextContent | FakeThinkingContent | FakeToolCallContent;
+
+/**
+ * `AssistantMessage` (pi-ai `types.d.ts:353-375`), reduced to the two fields a turn log reads.
+ *
+ * The real message carries `api`, `provider`, `model`, `usage`, `stopReason` and `timestamp` as well.
+ * They are omitted rather than faked because the rule in this file cuts one way only: a factory must
+ * not emit a key pi does not, so that a handler cannot read something here and find it missing at
+ * runtime. Emitting FEWER keys is safe, and `assistantTextFrom` reads exactly `role` and `content`.
+ */
+export function createFakeAssistantMessage(content: FakeAssistantPart[]): Record<string, unknown> {
+  return { role: "assistant", content };
+}
+
+/** The same for a `UserMessage` (pi-ai `types.d.ts:348-352`), whose `content` may be a bare string. */
+export function createFakeUserMessage(content: string | FakeContent[]): Record<string, unknown> {
+  return { role: "user", content };
+}
+
 /** `AgentEndEvent` (`types.d.ts:570-573`). */
 export interface FakeAgentEndEvent {
   type: "agent_end";

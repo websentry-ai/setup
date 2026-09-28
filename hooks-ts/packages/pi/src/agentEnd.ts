@@ -9,12 +9,20 @@
 // immediately; `agentEnd.test.ts` measures the handler against a hanging endpoint and fails above
 // 50 ms. There is no `await` on `postTurnLog` anywhere in this file or in `index.ts`.
 //
-// **`event` is deliberately unused.** `AgentEndEvent.messages` is pi's `newMessages` — only what this
-// run produced, never the user prompt (`agent-loop.js:142,152,170,182`) — so it cannot be the source
-// for the turn log, and the assistant text it does carry is not something the requirement asked us to
-// send (see `turnLog.ts`, decision 4). The in-memory record, fed by the `input` and `tool_call` seams,
-// is the only source. The parameter stays in the signature because pi passes it and a future reader
-// should see that it was considered rather than forgotten.
+// **`event` is read for exactly one thing: the assistant text.** `AgentEndEvent.messages` is pi's
+// `newMessages` — only what this run produced, never the user prompt
+// (`agent-loop.js:142,152,170,182`) — so it cannot be the source for the prompt or the tool calls;
+// those come from the in-memory record, fed by the `input` and `tool_call` seams. What it *does* carry
+// is what the model said, and that used to be dropped on the floor, leaving every row with a silent
+// assistant (see `turnLog.ts`, decision 4).
+//
+// `assistantTextFrom` is the whole of that reading, and it is deliberately narrow: `role:"assistant"`
+// messages only, `type:"text"` parts only. Thinking parts are excluded because provider reasoning is
+// not the answer and is the most sensitive thing in the array; `toolCall` parts are excluded because
+// their arguments are the raw, UN-allowlisted tool input the turn log carries a sanitised projection
+// of — forwarding them here would have re-opened the egress `tool_input` closes one layer down. The
+// text is never stored in the turn record and never logged; it is passed to the body builder, capped
+// there, and lives only as long as the POST.
 //
 // **The record is taken, not read.** `agent_end` fires again on retries, on
 // `stopReason: "error" | "aborted"` and for extension-initiated prompts (§F3), so `take()` empties the
@@ -26,9 +34,57 @@ import type { Telemetry } from "../../core/src/telemetry.ts";
 import { buildTurnLogBody, shouldPostTurn } from "../../core/src/turnLog.ts";
 import type { TurnStore } from "../../core/src/turn.ts";
 
-/** The structural slice of `AgentEndEvent` — see the header on why nothing is read from it. */
+/**
+ * The structural slice of `AgentEndEvent`: pi's `messages`, typed as `unknown[]` on purpose.
+ *
+ * `AgentMessage` is a union that includes host-registered custom message types, so its `content` is
+ * genuinely not a fixed shape at this boundary — narrowing it structurally in `assistantTextFrom` is
+ * what makes reading it safe, rather than a cast that would compile and then find a string where an
+ * array was promised.
+ */
 export interface AgentEndLike {
   messages?: unknown[];
+}
+
+/**
+ * The assistant's own words for this turn, joined and bounded — or `""`.
+ *
+ * Multiple assistant messages are normal for one run (a tool batch splits the answer in two), so they
+ * are joined with `\n` in arrival order, as are multiple text parts within one message. Everything
+ * else in the array is skipped: user and tool-result messages, `thinking` parts, and `toolCall` parts
+ * whose `arguments` are exactly the raw input the turn log deliberately allowlists.
+ *
+ * Total, like every other function reachable from a handler. Exported for `agentEnd.test.ts`, which
+ * asserts the part-by-part filtering directly rather than inferring it from a posted body.
+ */
+export function assistantTextFrom(messages: unknown): string {
+  try {
+    const list = Array.isArray(messages) ? messages : [];
+    const chunks: string[] = [];
+    for (const message of list) {
+      if (message === null || typeof message !== "object") continue;
+      const { role, content } = message as { role?: unknown; content?: unknown };
+      if (role !== "assistant") continue;
+      // pi types an assistant message's content as an array of parts, always
+      // (`pi-ai/types.d.ts:353-355`); only `UserMessage` may carry a bare string. A string here is
+      // therefore a shape pi does not produce, and guessing at it is how a `user` message's text
+      // would end up attributed to the model.
+      if (!Array.isArray(content)) continue;
+      const parts: string[] = [];
+      for (const part of content) {
+        if (part === null || typeof part !== "object") continue;
+        const { type, text } = part as { type?: unknown; text?: unknown };
+        if (type !== "text") continue;
+        if (typeof text !== "string" || text === "") continue;
+        parts.push(text);
+      }
+      if (parts.length > 0) chunks.push(parts.join("\n"));
+    }
+    return chunks.join("\n");
+  } catch {
+    // A message array we cannot read costs the assistant column. The row still goes.
+    return "";
+  }
 }
 
 /** The structural slice of `ExtensionContext` a turn log needs: just the working directory. */
@@ -39,6 +95,8 @@ export interface AgentEndCtx {
 export interface AgentEndDeps {
   client: Pick<ApiClient, "postTurnLog">;
   store: TurnStore;
+  /** Optional: the session key, scrubbed from assistant text and commands before they are posted. */
+  apiKey?: string;
   /**
    * Optional: one rate-limited report when a post fails, so a permanently broken audit trail is
    * visible in Sentry rather than silent.
@@ -58,7 +116,7 @@ export interface AgentEndDeps {
 const TURNLOG_LABEL = "agent_end";
 
 export function handleAgentEnd(
-  _event: AgentEndLike,
+  event: AgentEndLike,
   ctx: AgentEndCtx,
   deps: AgentEndDeps,
 ): undefined {
@@ -75,7 +133,19 @@ export function handleAgentEnd(
     } catch {
       // A hostile or half-built ctx costs the `cwd` column, not the row.
     }
-    const body = buildTurnLogBody(record as NonNullable<typeof record>, { cwd, completedAtMs });
+    let assistantText = "";
+    try {
+      assistantText = assistantTextFrom(event?.messages);
+    } catch {
+      // `assistantTextFrom` is already total; this catches a throwing `messages` getter, which would
+      // otherwise lose the whole row to a field that is only a column.
+    }
+    const body = buildTurnLogBody(record as NonNullable<typeof record>, {
+      cwd,
+      completedAtMs,
+      assistantText,
+      ...(deps.apiKey === undefined ? {} : { apiKey: deps.apiKey }),
+    });
     const dispatchedAtMs = completedAtMs;
 
     // The whole point of the file: dispatched, not awaited.

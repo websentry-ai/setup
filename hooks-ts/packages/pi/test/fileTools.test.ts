@@ -31,8 +31,8 @@ import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import { decideToolCall } from "../src/decide.ts";
 import type { DecideDeps } from "../src/decide.ts";
 import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
 

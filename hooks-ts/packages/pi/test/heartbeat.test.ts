@@ -34,8 +34,8 @@ import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import { createFakeClock, createFakeCtx, createFakeSessionStartEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const ENTRYPOINT = "pi/0.87.1";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;

@@ -31,8 +31,8 @@ import { createExtension } from "../src/index.ts";
 import { decideUserBash } from "../src/userBash.ts";
 import { createFakeClock, createFakeCtx, createFakeUserBashEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtxOptions } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
 
@@ -195,6 +195,16 @@ test("HOOK-04 confirm with a UI asks exactly once, with a bounded dialog", async
   assert.notEqual(opts?.signal, undefined, "and it must be abortable");
 });
 
+test("HOOK-04 confirm: the reason is notified once, and the dialog only asks", async () => {
+  // The same de-duplication as the `tool_call` path — `user_bash` mirrored the composition, so it
+  // rendered the reason twice in exactly the same way.
+  const { ctx } = await run("ask", { ctx: { hasUI: true, confirmResult: true } });
+
+  assert.deepStrictEqual(ctx.notifyCalls, [{ message: "Unusual command.", type: "warning" }]);
+  assert.equal(ctx.confirmCalls[0]?.title, "Unbound policy");
+  assert.equal(ctx.confirmCalls[0]?.message, "Run this command?");
+});
+
 test("HOOK-04 a declined confirmation becomes a BashResult carrying the declined reason", async () => {
   const { result, ctx } = await run("ask", { ctx: { hasUI: true, confirmResult: false } });
 
@@ -251,6 +261,27 @@ test("HOOK-04 the payload carries tool_name bash, the typed command, and the EVE
   );
   // `toolInput` is `{}` by construction, so the allowlist has nothing to forward and cannot leak.
   assert.deepStrictEqual(data.metadata?.tool_input, {});
+});
+
+test("HOOK-04 the recorded decision carries the typed command as its tool_input", async () => {
+  // A `!cmd` has no model-produced input at all, so `{}` in means the capped `command` is the only
+  // key out — and it is the entire content of the call. Without it the audit row said "bash" and
+  // nothing else about what the developer actually ran.
+  const api = await startMockApi({ mode: "allow" });
+  const ctx = createFakeCtx();
+  const entries: { tool_name: string; decision: string; tool_input?: Record<string, unknown> }[] = [];
+  try {
+    await decideUserBash(createFakeUserBashEvent("echo hi"), ctx, {
+      ...depsFor(api),
+      onDecision: (entry) => entries.push(entry),
+    });
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.tool_name, "bash");
+    assert.deepStrictEqual(entries[0]?.tool_input, { command: "echo hi" });
+  } finally {
+    await api.close();
+  }
 });
 
 test("HOOK-04 tool_use_id is a generated ubash_ id, and two calls never share one", async () => {

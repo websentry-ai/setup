@@ -20,6 +20,7 @@ import extension, { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import { createFakeCtx, createFakeToolCallEvent, createFakeUserBashEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
 
@@ -50,7 +51,7 @@ async function build(overrides: Partial<Deps>): Promise<Stub> {
 }
 
 function keyedEnv(gatewayUrl: string): NodeJS.ProcessEnv {
-  return { UNBOUND_PI_API_KEY: "unb_test_key_1234567890", UNBOUND_GATEWAY_URL: gatewayUrl };
+  return { UNBOUND_PI_API_KEY: TEST_KEY, UNBOUND_GATEWAY_URL: gatewayUrl };
 }
 
 /** A checker that is never reached by a well-behaved path. */
