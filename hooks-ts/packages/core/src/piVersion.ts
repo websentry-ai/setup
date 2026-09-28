@@ -21,13 +21,15 @@ import { ENV_PI_INSTALL_ROOT } from "./constants.ts";
 /**
  * The package whose `version` we are after. Referenced as data only — never imported.
  *
- * Assembled from fragments deliberately. The INST-05 build assertion requires that the vendor
- * package name appear **nowhere** in `dist/pi/index.js`, which is the strongest cheap proof that no
- * value import of pi slipped into the bundle (§F6). A verbatim literal here would keep the spirit of
- * that rule while breaking its letter; the letter wins, since nothing depends on the spelling being
- * contiguous in source. `.join("")` (rather than `+`) survives esbuild's constant folding.
+ * This used to be assembled from three fragments, because the INST-05 guard was a substring scan of
+ * `dist/pi/index.js` for the vendor name — a test a source file could satisfy by cheating, which is
+ * precisely what the fragmentation was. The guard now reads esbuild's own metafile
+ * (`dist/meta/pi.json`): every bundled input must be a `packages/` path and every surviving import
+ * must be an external `node:` builtin, neither of which a string literal can influence. So the name
+ * is a plain literal again — **do not re-fragment it.** If a value import of pi ever slips in, the
+ * metafile assertions in `packages/pi/test/build.test.ts` catch it.
  */
-const PI_PACKAGE_NAME = ["@earendil", "-works", "/pi-coding-agent"].join("");
+const PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 const MAX_WALK_UP_LEVELS = 8;
 const MAX_VERSION_CHARS = 32;
 

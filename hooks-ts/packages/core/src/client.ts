@@ -24,7 +24,10 @@ import {
   ERRORS_TIMEOUT_MS,
   PRETOOL_PATH,
   PRETOOL_TIMEOUT_MS,
+  TURNLOG_PATH,
+  TURNLOG_TIMEOUT_MS,
 } from "./constants.ts";
+import type { TurnLogBody } from "./turnLog.ts";
 import type { PreToolResponseBody, PretoolRequestBody } from "./types.ts";
 
 /** The server caps a single `/v1/hooks/errors` request at 10 entries (§B6). */
@@ -56,6 +59,7 @@ export interface HookErrorsBody {
 export interface ApiClient {
   postPretool(payload: PretoolRequestBody): Promise<PretoolResult>;
   postHookErrors(body: HookErrorsBody): Promise<boolean>;
+  postTurnLog(body: TurnLogBody): Promise<boolean>;
 }
 
 export interface ApiClientOptions {
@@ -63,6 +67,8 @@ export interface ApiClientOptions {
   apiKey: string;
   timeoutMs?: number;
   errorsTimeoutMs?: number;
+  /** Injected only by tests, so a 10 s abort is observable in milliseconds. */
+  turnLogTimeoutMs?: number;
   /** Injected only by tests; production resolves `globalThis.fetch` at call time (§F3). */
   fetchImpl?: typeof fetch;
 }
@@ -96,6 +102,7 @@ export function classifyError(err: unknown): string {
 export function createApiClient(opts: ApiClientOptions): ApiClient {
   const timeoutMs = opts.timeoutMs ?? PRETOOL_TIMEOUT_MS;
   const errorsTimeoutMs = opts.errorsTimeoutMs ?? ERRORS_TIMEOUT_MS;
+  const turnLogTimeoutMs = opts.turnLogTimeoutMs ?? TURNLOG_TIMEOUT_MS;
 
   /** Resolved per call: pi swaps `globalThis.fetch` for undici's before extensions load (§F3). */
   const resolveFetch = (): typeof fetch => opts.fetchImpl ?? globalThis.fetch;
@@ -158,5 +165,29 @@ export function createApiClient(opts: ApiClientOptions): ApiClient {
     }
   }
 
-  return { postPretool, postHookErrors };
+  /**
+   * Post one finished turn (RES-04). Shaped exactly like `postHookErrors`: same headers, same
+   * `redirect: "error"`, an `AbortSignal.timeout` deadline, `false` for anything non-2xx, and no throw
+   * on any path.
+   *
+   * The caller does not await this — `agent_end` gates pi's run settlement — so the only thing that
+   * can end a hung request is the signal below. A 200 here means "accepted", not "a row appeared":
+   * the API answers immediately and logs afterwards on a `waitUntil` timer (`:86-89,271-292`).
+   */
+  async function postTurnLog(body: TurnLogBody): Promise<boolean> {
+    try {
+      const res = await resolveFetch()(`${opts.baseUrl}${TURNLOG_PATH}`, {
+        method: "POST",
+        headers: headers(),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(turnLogTimeoutMs),
+        redirect: "error",
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  return { postPretool, postHookErrors, postTurnLog };
 }

@@ -6,13 +6,14 @@
 // `undefined` rather than throw: an exception escaping a pi `tool_call` handler is a BLOCK
 // (RESEARCH §F1), so a filesystem permission problem must never stop a developer's tool call.
 
-import { chmodSync } from "node:fs";
+import { chmodSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createFakeHome } from "./helpers/fakeHome.ts";
-import { DEFAULT_GATEWAY_URL } from "../src/constants.ts";
+import { DEFAULT_GATEWAY_URL, MAX_CONFIG_BYTES } from "../src/constants.ts";
 import {
   normalizeGatewayUrl,
   readUnboundConfig,
@@ -201,11 +202,46 @@ test("resolveGatewayUrl: a rejected env URL falls through to the next tier, it d
   }
 });
 
-test("normalizeGatewayUrl: strips path, query and trailing slash", () => {
-  assert.equal(normalizeGatewayUrl("https://h/x/"), "https://h");
-  assert.equal(normalizeGatewayUrl("https://h/"), "https://h");
-  assert.equal(normalizeGatewayUrl("https://h/v1/hooks/pretool?a=b"), "https://h");
-  assert.equal(normalizeGatewayUrl("https://h:8443/x"), "https://h:8443");
+test("normalizeGatewayUrl: WR-09 — a non-root path prefix is PRESERVED, not truncated", () => {
+  // The bug: a prefixed-tenant deployment (`https://host/unbound` behind an ingress path route or
+  // an API-gateway stage) had its prefix dropped, so every request went to `https://host/v1/hooks/
+  // pretool`, 404'd, and fell through to fail-open — forever, with no local signal. Framing the
+  // truncation as hardening was wrong: in the scenario it defends against, the attacker already
+  // controls the whole host.
+  assert.equal(normalizeGatewayUrl("https://host/unbound"), "https://host/unbound");
+  assert.equal(normalizeGatewayUrl("https://host/unbound/"), "https://host/unbound");
+  assert.equal(normalizeGatewayUrl("https://host/a/b/c///"), "https://host/a/b/c");
+  assert.equal(normalizeGatewayUrl("https://h:8443/x"), "https://h:8443/x");
+
+  // A root path is still normalised away, so the base URL never ends in a slash and the
+  // `${base}${PRETOOL_PATH}` concatenation cannot produce a double slash.
+  assert.equal(normalizeGatewayUrl("https://host/"), "https://host");
+  assert.equal(normalizeGatewayUrl("https://host"), "https://host");
+  assert.equal(normalizeGatewayUrl("https://host///"), "https://host");
+});
+
+test("normalizeGatewayUrl: query and fragment are still dropped", () => {
+  assert.equal(normalizeGatewayUrl("https://host/unbound?x=1#y"), "https://host/unbound");
+  assert.equal(normalizeGatewayUrl("https://h/v1/hooks/pretool?a=b"), "https://h/v1/hooks/pretool");
+  assert.equal(normalizeGatewayUrl("https://host/?a=b"), "https://host");
+  assert.equal(normalizeGatewayUrl("https://host#frag"), "https://host");
+});
+
+test("normalizeGatewayUrl: a URL carrying userinfo is rejected outright", () => {
+  // Credentials in the base URL would be concatenated into every request target and would ride
+  // along beside the Bearer header. There is no legitimate prefixed-tenant case for this.
+  assert.equal(normalizeGatewayUrl("https://user:pass@host/x"), undefined);
+  assert.equal(normalizeGatewayUrl("https://user@host/x"), undefined);
+  assert.equal(normalizeGatewayUrl("https://:pass@host"), undefined);
+  assert.equal(normalizeGatewayUrl("http://user:pass@127.0.0.1:8799"), undefined);
+});
+
+test("normalizeGatewayUrl: the path prefix is part of the cache key, so it must be stable", () => {
+  // `cache.ts` keys a record on this exact string. Two spellings of one deployment must collapse to
+  // one key, or a tenant silently never gets a cache hit.
+  const spellings = ["https://host/unbound", "https://host/unbound/", "https://host/unbound/?a=1"];
+  const normalised = spellings.map((s) => normalizeGatewayUrl(s));
+  assert.deepEqual(new Set(normalised), new Set(["https://host/unbound"]), JSON.stringify(normalised));
 });
 
 test("normalizeGatewayUrl: rejects empty, unparseable, non-http(s) and non-string input", () => {
@@ -222,6 +258,8 @@ test("normalizeGatewayUrl: V9 — plain http is rejected for a real host but exe
   // A hostile UNBOUND_GATEWAY_URL must not receive the Bearer header in cleartext.
   assert.equal(normalizeGatewayUrl("http://example.com"), undefined);
   assert.equal(normalizeGatewayUrl("http://evil.internal:8799"), undefined);
+  // WR-09 changed nothing here: a prefix on a hostile http host is still refused.
+  assert.equal(normalizeGatewayUrl("http://evil.com/unbound"), undefined);
   // The documented exemption: the mock-API smoke (RESEARCH §E4a) runs over loopback http.
   assert.equal(normalizeGatewayUrl("http://127.0.0.1:8799"), "http://127.0.0.1:8799");
   assert.equal(normalizeGatewayUrl("http://localhost:8799"), "http://localhost:8799");
@@ -242,4 +280,68 @@ test("redactSecrets: case-insensitive Bearer, no key, and short keys left alone"
   assert.equal(redactSecrets("value short", "short"), "value short");
   assert.doesNotThrow(() => redactSecrets("a+b(c)", "a+b(c)d?"));
   assert.ok(!redactSecrets("token a+b(c)d? here", "a+b(c)d?").includes("a+b(c)d?"));
+});
+
+// --- CR-01: the config read is bounded and non-blocking too ------------------------------------
+
+test("readUnboundConfig: a FIFO config.json is an empty config, not a permanent hang (CR-01)", (t) => {
+  if (process.platform === "win32") {
+    t.skip("mkfifo is POSIX-only");
+    return;
+  }
+  const home = createFakeHome();
+  try {
+    const configPath = join(home.homeDir, ".unbound", "config.json");
+    execFileSync("mkfifo", [configPath], { stdio: "ignore" });
+
+    // Run it in a child under a hard timeout: `readFileSync` on a writerless pipe blocks the only
+    // thread, so no in-process timer could ever observe the hang it used to cause on `init()`.
+    const moduleUrl = new URL("../src/config.ts", import.meta.url).href;
+    const script = [
+      `const { readUnboundConfig } = await import(${JSON.stringify(moduleUrl)});`,
+      `const out = readUnboundConfig(${JSON.stringify(home.homeDir)});`,
+      `process.stdout.write(JSON.stringify(out));`,
+    ].join("\n");
+    const out = execFileSync(
+      process.execPath,
+      ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", script],
+      { timeout: 2000, killSignal: "SIGKILL", encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    assert.equal(out, "{}");
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("readUnboundConfig: a config above MAX_CONFIG_BYTES is refused, and identity falls through", () => {
+  // Padded past the cap with a key nothing reads, so the only thing under test is the size guard.
+  const home = createFakeHome({ api_key: "from-file", pad: "x".repeat(MAX_CONFIG_BYTES) });
+  try {
+    assert.deepEqual(readUnboundConfig(home.homeDir), {});
+    // An unreadable config is an INERT extension, never a block: no key, default URL.
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.equal(resolveGatewayUrl(NO_ENV, home.homeDir), DEFAULT_GATEWAY_URL);
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("readUnboundConfig: a symlinked config.json is refused even when the target is valid (CR-01)", (t) => {
+  if (process.platform === "win32") {
+    t.skip("symlink creation needs a privilege on Windows");
+    return;
+  }
+  const home = createFakeHome();
+  try {
+    const target = join(home.homeDir, "real_config.json");
+    writeFileSync(target, JSON.stringify({ api_key: "from-link" }), { encoding: "utf8", mode: 0o600 });
+    symlinkSync(target, join(home.homeDir, ".unbound", "config.json"));
+
+    // Following the link is what would let a symlink-to-FIFO block; `unbound login` writes a real
+    // file, so nothing legitimate is lost by refusing one.
+    assert.deepEqual(readUnboundConfig(home.homeDir), {});
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+  } finally {
+    home.cleanup();
+  }
 });

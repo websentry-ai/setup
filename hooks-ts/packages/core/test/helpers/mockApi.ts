@@ -3,6 +3,17 @@
 // One responder table, two entry points: unit tests call `startMockApi()` on an ephemeral port,
 // and `scripts/mock-api.mjs` starts the same server on a fixed port for the manual pi smoke test.
 // Zero dependencies - `node:http` only.
+//
+// THE ENTRY GATE (see `hasEvaluableInput` below) is the reason this mock is trustworthy.
+// The real API only reaches its command-policy evaluator through a Path-2 gate
+// (`preToolUseHandler.ts:846-861`):
+//
+//   isAllowedToolName(tool_name,'pi') && (!!command || (PI_NATIVE_FILE_TOOLS.includes(tool_name) && !!file_path))
+//
+// Anything else falls through to a `no_policy` allow (`:1008-1012`). A mock that denies every
+// request regardless would make a file-tool test that forgets `metadata.file_path` pass
+// VACUOUSLY - green locally, unenforced in production. Modelling the gate means such a test
+// fails instead. That is this model's entire purpose; do not "simplify" it away.
 
 import { createServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
@@ -20,10 +31,20 @@ export type MockMode =
   | "malformed"
   | "hang"
   | "attributed"
-  | "errors";
+  | "errors"
+  // `tools_to_check` has three distinguishable states, because the policy cache treats them
+  // differently: a list (check these), `[]` (no file policies at all) and an absent key (the
+  // response carried no opinion, so a cached value must stand).
+  | "toolsList"
+  | "toolsEmpty"
+  | "toolsOmitted"
+  | "401";
 
 /** Scripted behaviour of `POST /v1/hooks/errors`, independent of `MockMode`. */
 export type MockErrorsMode = "ok" | "500" | "hang";
+
+/** Scripted behaviour of `POST /v1/hooks/pi` (the turn log), independent of `MockMode`. */
+export type MockTurnLogMode = "ok" | "401" | "hang";
 
 export interface CapturedRequest {
   method: string;
@@ -36,6 +57,7 @@ export interface CapturedRequest {
 export interface StartMockApiOptions {
   mode?: MockMode;
   errorsMode?: MockErrorsMode;
+  turnLogMode?: MockTurnLogMode;
   /** 0 (default) binds an ephemeral port; the standalone runner passes a fixed one. */
   port?: number;
 }
@@ -47,14 +69,30 @@ export interface MockApi {
   requests: CapturedRequest[];
   setMode(mode: MockMode): void;
   setErrorsMode(mode: MockErrorsMode): void;
+  setTurnLogMode(mode: MockTurnLogMode): void;
   close(): Promise<void>;
 }
 
 /** What an attributed deny reason looks like once the gateway appends its footer. */
 export const ATTRIBUTION_SUFFIX = "\n\nEnforced by Unbound · Trace ID abc";
 
+/** Marker naming why a request was allowed without evaluation. Assert on it, never on bare allow. */
+export const ENTRY_GATE_MARKER = "no_evaluable_input";
+
+/** `tools_to_check` under `toolsList`: a strict subset, so a `grep` skip is observable. */
+export const TOOLS_LIST = ["read", "write"] as const;
+
+/**
+ * The two `event_name`s the gate never applies to: neither carries a command by design, and the
+ * server routes both to handlers that answer without the Path-2 gate.
+ */
+const GATE_EXEMPT_EVENTS: ReadonlySet<string> = new Set(["user_prompt", "session_start"]);
+
 const JSON_CONTENT_TYPE = "application/json";
 const HANG = "hang" as const;
+
+/** The 401 body shape the API returns for a rejected key. */
+const INVALID_API_KEY_BODY = { error: "invalidApiKey" } as const;
 
 interface ScriptedResponse {
   status: number;
@@ -66,15 +104,73 @@ function json(status: number, payload: unknown): ScriptedResponse {
   return { status, body: JSON.stringify(payload), contentType: JSON_CONTENT_TYPE };
 }
 
+function isNonBlankString(value: unknown): boolean {
+  return typeof value === "string" && value.trim() !== "";
+}
+
+/**
+ * The client half of the server's Path-2 entry gate: does this request carry anything the command
+ * policy engine could possibly evaluate?
+ *
+ * `true` when `pre_tool_use_data.command` is a non-blank string, or `metadata.file_path` is. Read
+ * defensively off an arbitrary parsed body - a test may post a string, `null`, or a half-built
+ * object, and the mock must answer rather than throw.
+ */
+export function hasEvaluableInput(body: unknown): boolean {
+  const data = (body as { pre_tool_use_data?: unknown } | null | undefined)?.pre_tool_use_data as
+    | { command?: unknown; metadata?: unknown }
+    | null
+    | undefined;
+  if (isNonBlankString(data?.command)) return true;
+  const metadata = data?.metadata as { file_path?: unknown } | null | undefined;
+  return isNonBlankString(metadata?.file_path);
+}
+
+/** Is the Path-2 gate relevant to this request at all? `user_prompt` / `session_start` bypass it. */
+function isGatedRequest(body: unknown): boolean {
+  const eventName = (body as { event_name?: unknown } | null | undefined)?.event_name;
+  return !(typeof eventName === "string" && GATE_EXEMPT_EVENTS.has(eventName));
+}
+
+/** The `no_policy` allow a request with nothing evaluable falls through to, plus a named reason. */
+function entryGateResponse(): ScriptedResponse {
+  return json(200, {
+    decision: "allow",
+    policy_check_failure_action: "allow",
+    _entry_gate: ENTRY_GATE_MARKER,
+  });
+}
+
+/** The policy metadata the command path attaches alongside a verdict when `pull_policies` is set. */
+function policyPayload(toolsToCheck: readonly string[] | undefined): Record<string, unknown> {
+  return {
+    decision: "allow",
+    policy_check_failure_action: "allow",
+    ...(toolsToCheck === undefined ? {} : { tools_to_check: [...toolsToCheck] }),
+    repo_policies: [],
+    unbound_attribution_enabled: false,
+  };
+}
+
 /**
  * The pretool responder table. `requestIndex` is 0-based across the lifetime of the server and is
  * only consulted by `failBlock`, which answers once and then hangs so a test can prime the
  * last-good `policy_check_failure_action` and then force a failure.
+ *
+ * `body` is the parsed request body. It is consulted ONLY by the entry gate, which runs before the
+ * mode switch and overrides every mode - including `401` and `hang`. That is deliberate: a request
+ * the server would never have evaluated must not be able to produce a deny, a 401 or a timeout in
+ * a test, because none of those could happen in production either.
  */
 export function pretoolResponse(
   mode: MockMode,
   requestIndex: number,
+  body?: unknown,
 ): ScriptedResponse | typeof HANG {
+  if (body !== undefined && isGatedRequest(body) && !hasEvaluableInput(body)) {
+    return entryGateResponse();
+  }
+
   switch (mode) {
     case "allow":
     case "errors":
@@ -100,7 +196,29 @@ export function pretoolResponse(
       return HANG;
     case "attributed":
       return json(200, { decision: "deny", reason: `Reading secrets is blocked.${ATTRIBUTION_SUFFIX}` });
+    case "toolsList":
+      return json(200, policyPayload(TOOLS_LIST));
+    case "toolsEmpty":
+      // `[]` is a real answer: "this org has no file policies". It must not be confusable with
+      // an absent key, which means "this response carried no opinion".
+      return json(200, policyPayload([]));
+    case "toolsOmitted":
+      return json(200, policyPayload(undefined));
+    case "401":
+      // Pretool only. `/v1/hooks/errors` keeps its independent MockErrorsMode, because WR-01's
+      // test asserts that ZERO errors requests are attempted once the latch trips - a 401 on that
+      // route would never be observed. `setErrorsMode("500")` covers a failing errors endpoint.
+      return json(401, INVALID_API_KEY_BODY);
   }
+}
+
+/** The turn-log responder. Mirrors `hooksHandlerFactory.ts:46-50,86-89`. */
+export function turnLogResponse(mode: MockTurnLogMode): ScriptedResponse | typeof HANG {
+  if (mode === "hang") return HANG;
+  // A missing/invalid Authorization header is a 401 here, unlike pretool which fails open.
+  if (mode === "401") return json(401, INVALID_API_KEY_BODY);
+  // The API answers immediately and logs afterwards, so the 200 says nothing about a row.
+  return json(200, { success: true, message: "Request logged successfully" });
 }
 
 export function errorsResponse(
@@ -134,6 +252,7 @@ function parseBody(raw: string): unknown {
 export async function startMockApi(opts: StartMockApiOptions = {}): Promise<MockApi> {
   let mode: MockMode = opts.mode ?? "allow";
   let errorsMode: MockErrorsMode = opts.errorsMode ?? "ok";
+  let turnLogMode: MockTurnLogMode = opts.turnLogMode ?? "ok";
   const requests: CapturedRequest[] = [];
   /** Sockets deliberately left without a response, so `close()` can destroy them. */
   const heldSockets = new Set<Socket>();
@@ -157,15 +276,16 @@ export async function startMockApi(opts: StartMockApiOptions = {}): Promise<Mock
     void (async () => {
       const raw = await readBody(req);
       const path = (req.url ?? "/").split("?")[0] ?? "/";
+      const parsed = parseBody(raw);
       requests.push({
         method: req.method ?? "GET",
         path,
         headers: req.headers,
-        body: parseBody(raw),
+        body: parsed,
       });
 
       if (req.method === "POST" && path === "/v1/hooks/pretool") {
-        const scripted = pretoolResponse(mode, pretoolCount);
+        const scripted = pretoolResponse(mode, pretoolCount, parsed);
         pretoolCount += 1;
         if (scripted === HANG) hold(res);
         else send(res, scripted);
@@ -173,7 +293,14 @@ export async function startMockApi(opts: StartMockApiOptions = {}): Promise<Mock
       }
 
       if (req.method === "POST" && path === "/v1/hooks/errors") {
-        const scripted = errorsResponse(errorsMode, parseBody(raw));
+        const scripted = errorsResponse(errorsMode, parsed);
+        if (scripted === HANG) hold(res);
+        else send(res, scripted);
+        return;
+      }
+
+      if (req.method === "POST" && path === "/v1/hooks/pi") {
+        const scripted = turnLogResponse(turnLogMode);
         if (scripted === HANG) hold(res);
         else send(res, scripted);
         return;
@@ -207,6 +334,9 @@ export async function startMockApi(opts: StartMockApiOptions = {}): Promise<Mock
     },
     setErrorsMode(next: MockErrorsMode) {
       errorsMode = next;
+    },
+    setTurnLogMode(next: MockTurnLogMode) {
+      turnLogMode = next;
     },
     async close() {
       for (const socket of heldSockets) socket.destroy();
