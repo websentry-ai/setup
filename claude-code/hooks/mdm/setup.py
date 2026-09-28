@@ -33,7 +33,7 @@ BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 _SCRIPT_START = time.time()
-BACKFILL_DEADLINE_SECONDS = 540  # from script start, inside onboard.py's 600s watchdog
+BACKFILL_DEADLINE_SECONDS = 540  # inside onboard.py's 600s watchdog
 
 
 def normalize_url(value: str) -> str:
@@ -2100,12 +2100,7 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 
 
 def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
-    """Bounded and best-effort: setup already succeeded, so backfill must not fail the policy.
-
-    On POSIX this runs in a child forked from the main thread (fork from a worker thread
-    is unsafe on macOS, and run_backfill forks again via _run_as_user); on Windows, where
-    nothing forks, a daemon thread bounds it instead. The deadline counts from script
-    start so a slow setup cannot push the script past onboarding's outer watchdog."""
+    """Best-effort backfill, bounded from script start so it can never fail the policy."""
     budget = BACKFILL_DEADLINE_SECONDS - (time.time() - _SCRIPT_START)
     if budget <= 0:
         print("[backfill] Skipped — setup used the time budget; backfill retries on the next run.")
@@ -2119,14 +2114,14 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
         if worker.is_alive():
             print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
         return
-    # Flush before forking so the child does not replay the parent's buffered output.
+    # flush so the fork cannot replay buffered output
     sys.stdout.flush()
     sys.stderr.flush()
     pid = os.fork()
     if pid == 0:
         try:
             os.setsid()
-            # Self-destruct at the deadline even if the parent was killed first.
+            # self-destruct even if the parent dies first
             signal.signal(signal.SIGALRM, lambda *_: os.killpg(0, signal.SIGKILL))
             signal.alarm(int(budget) + 5)
             run_backfill(api_key, backend_url, user_homes)
@@ -2140,7 +2135,6 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
         if done_pid:
             return
         time.sleep(1)
-    # setsid above put the whole backfill tree (collector forks included) in pid's group.
     try:
         os.killpg(pid, signal.SIGKILL)
     except OSError:
