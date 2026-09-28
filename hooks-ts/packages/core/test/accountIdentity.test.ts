@@ -300,7 +300,7 @@ test("macOS: the serial comes from system_profiler", async () => {
     return "Hardware:\n\n    Model Name: MacBook Pro\n      Serial Number (system): C02ABC123\n";
   };
   assert.equal(await readDeviceSerial({ platform: "darwin", execFile }), "C02ABC123");
-  assert.deepEqual(calls, ["system_profiler SPHardwareDataType"]);
+  assert.deepEqual(calls, ["/usr/sbin/system_profiler SPHardwareDataType"]);
 });
 
 test("linux: dmidecode first, then machine-id; placeholders fall through", async () => {
