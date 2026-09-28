@@ -9,7 +9,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
 
-import { MAX_HASH_BYTES, MAX_TURN_RESULTS } from "../src/constants.ts";
+import { MAX_HASH_BYTES, MAX_TURN_RESULTS, MAX_TURN_TOOL_CALLS } from "../src/constants.ts";
 import { createTurnStore, hashContent } from "../src/turn.ts";
 import type { TurnResult } from "../src/turn.ts";
 
@@ -209,9 +209,11 @@ test("tool calls keep their decision and a timestamp, in arrival order", () => {
   store.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "deny" }, SESSION, 100);
   store.recordToolCall({ tool_name: "read", tool_use_id: "call_2", decision: "skipped" }, SESSION, 200);
 
+  // `session_id` is part of the stored shape since WR-04 — stamped at record time so a pending
+  // `!cmd` call can be attributed rather than merely dropped. It is never sent (see turnLog.test.ts).
   assert.deepEqual(store.snapshot().tool_calls, [
-    { tool_name: "bash", tool_use_id: "call_1", decision: "deny", ts: 100 },
-    { tool_name: "read", tool_use_id: "call_2", decision: "skipped", ts: 200 },
+    { tool_name: "bash", tool_use_id: "call_1", decision: "deny", ts: 100, session_id: SESSION },
+    { tool_name: "read", tool_use_id: "call_2", decision: "skipped", ts: 200, session_id: SESSION },
   ]);
 });
 
@@ -381,4 +383,127 @@ test("the store never throws, whatever it is handed", () => {
     store.snapshot();
     store.take();
   }, "a store fault must never reach a handler — pi reads a throw as a block");
+});
+
+// --- WR-03: the cap must fire before the projection is built, not after -------------------------
+
+test("WR-03 an oversize result is sized without allocating a copy of itself", () => {
+  // 20 MB, five times the cap. `list.map(projectPart)` used to run before the count could fire, on
+  // the AWAITED pass between a tool finishing and the model seeing its output.
+  const big = "x".repeat(20 * 1024 * 1024);
+  assert.ok(big.length > MAX_HASH_BYTES * 4, "the fixture must be well past the cap");
+
+  // Pre-warm, and this is the subtle part of the measurement. `"text:" + big` allocates almost
+  // nothing on its own — V8 returns a lazy cons string — so the old code's copy was not the `+`, it
+  // was the `Buffer.byteLength` that had to FLATTEN that cons string to measure it. Measuring `big`
+  // itself once here pays V8's one-time flatten for the fixture, so the delta below cannot be
+  // attributed to anything but work `hashContent` does on top of it. Measured both ways at this
+  // fixture size: old shape 20.9 MB, new shape 240 bytes.
+  Buffer.byteLength(big, "utf8");
+
+  const before = process.memoryUsage().heapUsed;
+  const hashed = hashContent([{ type: "text", text: big }]);
+  const delta = process.memoryUsage().heapUsed - before;
+
+  assert.equal(hashed.hash_skipped, true);
+  assert.equal(hashed.content_sha256, undefined);
+  // The count is still exact, not "however far we got": sizing is a scan, so bailing early would
+  // save nothing and would make `content_bytes` a lower bound on the one path where it is the only
+  // thing reported.
+  assert.equal(hashed.content_bytes, Buffer.byteLength(`text:${big}`, "utf8"));
+  // 1 MB is ~4000× the new shape's allocation and ~1/20th of the old shape's, so heap-accounting
+  // noise cannot move this either way.
+  assert.ok(
+    delta < 1024 * 1024,
+    `sizing a ${big.length}-byte part allocated ${delta} bytes; the projection is being built`,
+  );
+});
+
+test("WR-03 feeding the digest in two updates did not change any digest", () => {
+  // The byte stream is prefix-then-body per part, `\n` between parts — identical to the joined
+  // projection it replaced. Pinned against literal `createHash` calls so a future refactor of
+  // `projectPart` cannot quietly re-key every stored hash.
+  const text = createHash("sha256").update("text:abc", "utf8").digest("hex");
+  assert.equal(hashContent([{ type: "text", text: "abc" }]).content_sha256, text);
+
+  const image = createHash("sha256").update("image:image/png:AAAA", "utf8").digest("hex");
+  assert.equal(
+    hashContent([{ type: "image", data: "AAAA", mimeType: "image/png" }]).content_sha256,
+    image,
+  );
+
+  const joined = createHash("sha256").update("text:a\ntext:b", "utf8").digest("hex");
+  assert.equal(
+    hashContent([{ type: "text", text: "a" }, { type: "text", text: "b" }]).content_sha256,
+    joined,
+  );
+});
+
+// --- WR-04: tool_calls is bounded, and attributed to the session it happened in -----------------
+
+test("WR-04 tool_calls is capped drop-oldest with a counter, exactly like results", () => {
+  // The clearer unbounded path of the two, and not hypothetical: `user_bash` records a call and pi
+  // fires no `agent_end` for a bare `!cmd`, so nothing calls `take()` and the entry lives for the
+  // whole session. A developer working through a series of them accumulated one per invocation.
+  const store = createTurnStore();
+  const overflow = 100;
+  for (let i = 0; i < MAX_TURN_TOOL_CALLS + overflow; i += 1) {
+    store.recordToolCall({ tool_name: "bash", tool_use_id: `call_${i}`, decision: "allow" }, SESSION, 100 + i);
+  }
+
+  const snap = store.snapshot();
+  assert.equal(MAX_TURN_TOOL_CALLS, 500, "the cap is stated here so a change to it is deliberate");
+  assert.equal(snap.tool_calls.length, MAX_TURN_TOOL_CALLS, "never more than the cap is retained");
+  assert.equal(snap.tool_calls_truncated, overflow, "and the drops are counted, not hidden");
+  assert.equal(snap.tool_calls[0]?.tool_use_id, `call_${overflow}`, "the oldest went first");
+  assert.equal(snap.tool_calls.at(-1)?.tool_use_id, `call_${MAX_TURN_TOOL_CALLS + overflow - 1}`);
+
+  assert.equal(store.take()?.tool_calls_truncated, overflow);
+  assert.equal(store.snapshot().tool_calls_truncated, undefined, "a fresh turn has nothing truncated");
+});
+
+test("WR-04 a call is stamped with the session it happened in", () => {
+  const store = createTurnStore();
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "allow" }, SESSION, 100);
+  assert.equal(store.snapshot().tool_calls[0]?.session_id, SESSION);
+
+  // `sessionIdOf` answers `""` for a ctx it cannot read. That means "not known", so nothing is
+  // stamped — an empty string would be a claim about a session that does not exist.
+  const blind = createTurnStore();
+  blind.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "allow" }, "", 100);
+  assert.equal(blind.snapshot().tool_calls[0]?.session_id, undefined);
+});
+
+test("WR-04 a pending !cmd call from an unidentified session cannot ride the next turn's row", () => {
+  // The hole the whole-record rollover cannot see. `record.session_id` is only ever set from the
+  // FIRST event, so when that event carried no readable id the record has none — and a later real id
+  // then never "differs" from it. Before the per-entry stamp, the earlier session's `!cmd` rode the
+  // next model-driven turn's `tool_use[]`, producing a row claiming two calls for a turn that made
+  // one, which is worse for an audit trail than a missing row.
+  const store = createTurnStore();
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "old_cmd", decision: "allow" }, "sess-A", 100);
+  // No `session_start` in between: `/resume` and `/fork` re-fire it, but nothing guarantees this
+  // store sees one before the next tool call arrives.
+  store.recordToolCall({ tool_name: "read", tool_use_id: "new_call", decision: "allow" }, "sess-B", 200);
+
+  const snap = store.snapshot();
+  assert.deepEqual(
+    snap.tool_calls.map((entry) => entry.tool_use_id),
+    ["new_call"],
+    "the foreign entry is discarded, this session's work is kept",
+  );
+  assert.equal(snap.session_id, "sess-B");
+});
+
+test("WR-04 an unstamped entry is kept — absent means 'unknown', not 'foreign'", () => {
+  const store = createTurnStore();
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "blind_cmd", decision: "allow" }, "", 100);
+  store.recordToolCall({ tool_name: "read", tool_use_id: "known", decision: "allow" }, "sess-A", 200);
+
+  // Dropping an entry we merely cannot attribute would lose a real call from THIS session, which is
+  // the more likely reading of an unreadable ctx.
+  assert.deepEqual(
+    store.snapshot().tool_calls.map((entry) => entry.tool_use_id),
+    ["blind_cmd", "known"],
+  );
 });

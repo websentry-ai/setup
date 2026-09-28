@@ -5,14 +5,14 @@
 //     that does log (T-08-03);
 //   * the URL is normalised and https-only for non-loopback hosts, so a hostile value cannot
 //     receive the Bearer header in cleartext (T-08-04 / ASVS V9);
-//   * the whole file read sits in one try/catch. An exception thrown out of a pi `tool_call`
-//     handler is a BLOCK (RESEARCH §F1), so an EACCES on a config file must never stop a
-//     developer's tool call (T-08-07).
+//   * the whole file read sits in one try/catch, and goes through `safeRead.ts` so it cannot BLOCK
+//     rather than throw (CR-01). An exception thrown out of a pi `tool_call` handler is a BLOCK
+//     (RESEARCH §F1), so an EACCES on a config file must never stop a developer's tool call
+//     (T-08-07) — and a config file that is a FIFO must not stop it either.
 //
 // Read-only by design: Phase 8 adds no writer, so the file's 0600-in-0700 posture — created by
 // `unbound login` — cannot be widened here (T-08-09 / ASVS V12).
 
-import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 import {
@@ -22,7 +22,9 @@ import {
   ENV_API_KEY_GENERIC,
   ENV_API_KEY_PI,
   ENV_GATEWAY_URL,
+  MAX_CONFIG_BYTES,
 } from "./constants.ts";
+import { readSmallRegularFile } from "./safeRead.ts";
 
 /** Hosts for which plain `http:` is allowed — the documented mock-API-smoke exemption (§E4a). */
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -33,6 +35,11 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  * Returns `{}` on any failure — ENOENT, EACCES, malformed JSON, or a JSON body that is not an
  * object. Never throws and never echoes the file contents anywhere.
  *
+ * "Never throws" was not the same as "always returns" (CR-01). The read goes through
+ * `readSmallRegularFile`, which `lstat`s first: a `config.json` that is a FIFO — or a `$HOME` on a
+ * hung network mount — made `readFileSync` block forever here, on the `init()` path every handler
+ * awaits. Only a regular file of at most `MAX_CONFIG_BYTES` is opened.
+ *
  * A **non-absolute** `homeDir` is refused outright. `os.homedir()` can fail, and the caller's
  * fallback is `""`; `join("", ".unbound/config.json")` resolves relative to the process cwd — i.e.
  * the repository pi was started in. A repo-planted `.unbound/config.json` could then supply both
@@ -42,8 +49,9 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  */
 export function readUnboundConfig(homeDir: string): Record<string, unknown> {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute(homeDir)) return {};
+  const raw = readSmallRegularFile(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  if (raw === undefined) return {};
   try {
-    const raw = readFileSync(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;

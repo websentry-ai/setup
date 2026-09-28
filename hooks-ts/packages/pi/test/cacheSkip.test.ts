@@ -251,3 +251,66 @@ test("RES-03 a state that never learned a list skips nothing", () => {
     assert.equal(shouldSkipFileToolFromState(toolName, state, clock.now()), false, toolName);
   }
 });
+
+// --- WR-02: a hydrated list is confirmed once per session before it may suppress anything ---------
+//
+// The threat these two cases close: a same-UID local process reads `policy_cache.json` — which carries
+// both halves of the identity, `gateway_url` and `key_fingerprint`, in cleartext — and rewrites it as
+// `{tools_to_check: [], tools_synced_at: now, fetched_at: now}`. Every read/write/edit/grep/find/ls
+// for the next 300 s was then allowed with zero HTTP, renewably, because `pullPolicies` was derived
+// from the *hydrated* stamp and so the extension declined to ask during exactly the window a planted
+// file controlled. Enforcement reported itself active throughout.
+
+test("WR-02 a planted fresh cache cannot suppress the first tool call of a session", async () => {
+  const clock = createFakeClock();
+  const state = createPolicyState();
+  // Exactly what a planted file produces after `readCache`: a fresh stamp and an empty list, arriving
+  // through `hydrate` rather than `recordSuccess` — which is the only difference that matters.
+  state.hydrate({ tools_to_check: [], tools_synced_at: clock.now(), fetched_at: clock.now() });
+  assert.equal(state.getToolsSyncedAt(), clock.now(), "the plant looks perfectly fresh");
+  assert.equal(state.getToolsConfirmed(), false, "but no server in this process ever said so");
+
+  // `toolsEmpty` answers `[]` too, so the SERVER agrees there are no file policies. The point is not
+  // the answer, it is that we asked at all.
+  const api = await startMockApi({ mode: "toolsEmpty" });
+  const ctx = createFakeCtx({ cwd: "/tmp/project-x" });
+  const deps = depsFor(api, state, clock);
+  try {
+    const first = await decideToolCall(createFakeToolCallEvent("grep", { pattern: "secret" }), ctx, deps);
+    let bodies = pretoolBodies(api);
+    assert.equal(bodies.length, 1, "the first file tool of the session round-trips regardless");
+    assert.equal(bodies[0]?.pull_policies, true, "and asks for the list it refuses to take on faith");
+    assert.equal(first, undefined, "the server's own `[]` allows it");
+
+    // One round trip, then the cache is worth what it was always supposed to be worth.
+    assert.equal(state.getToolsConfirmed(), true, "the response confirmed the list");
+    const second = await decideToolCall(createFakeToolCallEvent("grep", { pattern: "secret" }), ctx, deps);
+    bodies = pretoolBodies(api);
+    assert.equal(bodies.length, 1, "the second call skips — the self-heal costs one trip, not every trip");
+    assert.equal(second, undefined);
+  } finally {
+    await api.close();
+  }
+});
+
+test("WR-02 the confirming round trip still enforces: a planted [] cannot pre-allow a denied tool", async () => {
+  const clock = createFakeClock();
+  const state = createPolicyState();
+  state.hydrate({ tools_to_check: [], tools_synced_at: clock.now(), fetched_at: clock.now() });
+
+  // The attacker's goal, stated as a test: `read` is absent from the planted list, so before WR-02
+  // this returned `undefined` with zero HTTP. A `deny`-scripted mock makes the difference visible.
+  const api = await startMockApi({ mode: "deny" });
+  const ctx = createFakeCtx({ cwd: "/tmp/project-x" });
+  const deps = depsFor(api, state, clock);
+  try {
+    const result = await decideToolCall(createFakeToolCallEvent("read", { path: "/etc/shadow" }), ctx, deps);
+    assert.deepStrictEqual(result, {
+      block: true,
+      reason: "Blocked by Unbound policy: Reading secrets is blocked.",
+    });
+    assert.equal(pretoolBodies(api).length, 1, "the plant bought the attacker nothing");
+  } finally {
+    await api.close();
+  }
+});

@@ -14,11 +14,17 @@
 // Every path here is a temp dir from `createFakeHome`, so nothing touches the real `~/.pi`.
 
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, readFileSync, readdirSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, sep } from "node:path";
 import test from "node:test";
 
-import { CACHE_TTL_MS, ENV_PI_AGENT_DIR, KEY_FINGERPRINT_PREFIX } from "../src/constants.ts";
+import {
+  CACHE_TTL_MS,
+  ENV_PI_AGENT_DIR,
+  KEY_FINGERPRINT_PREFIX,
+  MAX_CACHE_BYTES,
+} from "../src/constants.ts";
 import {
   getFailureActionFromCache,
   isToolsFresh,
@@ -533,4 +539,96 @@ test("a snapshot written under one gateway URL does not govern a prefixed siblin
 test("NATIVE_FILE_TOOLS is the single source of the six names", () => {
   assert.equal(NATIVE_FILE_TOOLS.size, 6);
   assert.equal(NATIVE_FILE_TOOLS.has(SHELL_TOOL), false, "bash is evaluated on its command");
+});
+
+// --- CR-01: only a small regular file is ever opened ------------------------------------------
+//
+// A try/catch cannot intercept a blocking syscall, so these three cases are about what `readCache`
+// must refuse to *open*, not about what it does with the bytes. The FIFO case is the blocker: before
+// the `lstat` guard, `readFileSync` on a writerless pipe never returned and never threw, inside
+// `init()`, inside handlers pi awaits — a permanently wedged agent from a planted file.
+
+/**
+ * Run `readCache` in a child process under a hard timeout, so a regression HANGS THE CHILD rather
+ * than the test runner. An in-process watchdog cannot work here: `readFileSync` blocks the only
+ * thread, so no timer would ever fire to observe it.
+ *
+ * @returns `"miss"` or `"hit"`; throws (ETIMEDOUT) if the read blocked past `timeoutMs`.
+ */
+function readCacheInChild(path: string, identity: CacheIdentity, timeoutMs: number): string {
+  const moduleUrl = new URL("../src/cache.ts", import.meta.url).href;
+  const script = [
+    `const { readCache } = await import(${JSON.stringify(moduleUrl)});`,
+    `const out = readCache(${JSON.stringify(path)}, ${JSON.stringify(identity)});`,
+    `process.stdout.write(out === undefined ? "miss" : "hit");`,
+  ].join("\n");
+  return execFileSync(
+    process.execPath,
+    ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", script],
+    { timeout: timeoutMs, killSignal: "SIGKILL", encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+  );
+}
+
+test("readCache: a FIFO at the cache path is a prompt miss, not a permanent hang (CR-01)", (t) => {
+  if (process.platform === "win32") {
+    t.skip("mkfifo is POSIX-only");
+    return;
+  }
+  const f = fixture();
+  try {
+    mkdirSync(f.dir, { recursive: true, mode: 0o700 });
+    // A real named pipe with no writer — the exact shape `PI_CODING_AGENT_DIR` or a hostile `$HOME`
+    // can plant, and the one `readFileSync` cannot survive.
+    execFileSync("mkfifo", [f.path], { stdio: "ignore" });
+    assert.equal(statSync(f.path).isFIFO(), true, "the fixture really is a pipe");
+
+    const started = Date.now();
+    // 2 s is orders of magnitude above the ~50 ms an lstat-and-refuse costs, and finite — which is
+    // the entire property under test.
+    const out = readCacheInChild(f.path, identityFor(), 2000);
+    assert.equal(out, "miss", "a pipe is a cache miss");
+    assert.ok(Date.now() - started < 2000, "and it returned promptly");
+  } finally {
+    f.home.cleanup();
+  }
+});
+
+test("readCache: a cache file above MAX_CACHE_BYTES is refused unread (CR-01/WR-01)", () => {
+  const f = fixture();
+  try {
+    mkdirSync(f.dir, { recursive: true, mode: 0o700 });
+    // A record that is valid in every other way, padded past the cap with a field the reader would
+    // otherwise simply drop. Without the size guard this parses and returns a usable record.
+    const padded = { ...record(), pad: "x".repeat(MAX_CACHE_BYTES) };
+    writeFileSync(f.path, JSON.stringify(padded), { encoding: "utf8", mode: 0o600 });
+    assert.ok(statSync(f.path).size > MAX_CACHE_BYTES, "the fixture really is oversize");
+
+    assert.equal(readCache(f.path, identityFor()), undefined);
+    // The same record under the cap is still accepted, so the guard is a cap and not a refusal.
+    writeFileSync(f.path, JSON.stringify(record()), { encoding: "utf8", mode: 0o600 });
+    assert.ok(readCache(f.path, identityFor()) !== undefined);
+  } finally {
+    f.home.cleanup();
+  }
+});
+
+test("readCache: a symlinked cache path is a miss even when the target is valid (CR-01)", (t) => {
+  if (process.platform === "win32") {
+    t.skip("symlink creation needs a privilege on Windows");
+    return;
+  }
+  const f = fixture();
+  try {
+    mkdirSync(f.dir, { recursive: true, mode: 0o700 });
+    const target = join(f.dir, "real_cache.json");
+    writeFileSync(target, JSON.stringify(record()), { encoding: "utf8", mode: 0o600 });
+    symlinkSync(target, f.path);
+
+    // `lstat`, not `stat`: the link is refused rather than followed, because following it is what
+    // lets a symlink-to-FIFO block. Nothing legitimately links this path — `writeCache` renames a
+    // real file into place.
+    assert.equal(readCache(f.path, identityFor()), undefined);
+  } finally {
+    f.home.cleanup();
+  }
 });

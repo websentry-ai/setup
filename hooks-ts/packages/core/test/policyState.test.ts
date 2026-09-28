@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CACHE_TTL_MS } from "../src/constants.ts";
+import { CACHE_TTL_MS, MAX_TOOLS_TO_CHECK, MAX_TOOL_NAME_CHARS } from "../src/constants.ts";
 import { createPolicyState, parseToolsToCheck } from "../src/policyState.ts";
 import type { PolicySnapshot } from "../src/policyState.ts";
 import type { PreToolResponseBody } from "../src/types.ts";
@@ -41,11 +41,18 @@ test("parseToolsToCheck: presence, not emptiness, is what undefined means", () =
   assert.equal(parseToolsToCheck(null), undefined);
   assert.equal(parseToolsToCheck(42), undefined);
 
-  // A mixed array keeps only the strings rather than rejecting the whole response.
-  assert.deepEqual(
-    parseToolsToCheck(["read", 1, null, "write", {}, undefined, "grep"]),
-    ["read", "write", "grep"],
-  );
+  // A mixed array is refused WHOLE, and this assertion is the inverse of what it used to be.
+  //
+  // It previously expected `["read", "write", "grep"]`, on the reasoning that dropping junk "narrows
+  // the skip set". That reasoning is backwards: the stored list is the set of tools that DO need
+  // checking, so a dropped entry is a tool that stops being checked. Filtering a list is how a
+  // malformed `write` entry silently disables the `write` policy for 300 s.
+  assert.equal(parseToolsToCheck(["read", 1, null, "write", {}, undefined, "grep"]), undefined);
+  // The worst shape of the same bug: everything filters away, `[]` survives, and `[]` reads as the
+  // positive answer "this org has no file policies" — disabling all six native file tools.
+  assert.equal(parseToolsToCheck([null, 42]), undefined);
+  // A fully well-formed list is of course still a list.
+  assert.deepEqual(parseToolsToCheck(["read", "write"]), ["read", "write"]);
 });
 
 test("recordSuccess: a response carrying tools_to_check sets the list and advances both timestamps", () => {
@@ -247,4 +254,72 @@ test("hydrate copies the list rather than aliasing the caller's array", () => {
 
 test("CACHE_TTL_MS is the Python hook's 300 s in milliseconds", () => {
   assert.equal(CACHE_TTL_MS, 300_000, "unbound.py:70 CACHE_TTL_SECONDS = 300");
+});
+
+// --- WR-01: the list a response can make us hold, write and rescan is bounded -------------------
+
+test("parseToolsToCheck: an over-cap list is 'not synced', not a truncated list", () => {
+  const huge = Array.from({ length: MAX_TOOLS_TO_CHECK + 1 }, (_, i) => `tool_${i}`);
+  // Refused WHOLE, deliberately. Truncating would produce a list that is merely wrong, and being
+  // wrong by omission here means `shouldSkipFileTool` skips a tool the org does have a policy for.
+  assert.equal(parseToolsToCheck(huge), undefined);
+  // Exactly at the cap is still a value — this is a cap, not a smaller taxonomy.
+  assert.equal(parseToolsToCheck(huge.slice(0, MAX_TOOLS_TO_CHECK))?.length, MAX_TOOLS_TO_CHECK);
+});
+
+test("parseToolsToCheck: an over-long entry refuses the whole list, like any other bad entry", () => {
+  const long = "x".repeat(MAX_TOOL_NAME_CHARS + 1);
+  // All-or-nothing: an entry we cannot read means a list we cannot act on. Storing the readable part
+  // would silently stop checking whatever the unreadable entry named.
+  assert.equal(parseToolsToCheck(["read", long, "write"]), undefined);
+  // Exactly at the cap is usable, so this is a cap and not a shorter taxonomy.
+  assert.deepEqual(parseToolsToCheck(["x".repeat(MAX_TOOL_NAME_CHARS)]), ["x".repeat(MAX_TOOL_NAME_CHARS)]);
+});
+
+test("WR-01: an over-cap tools_to_check is not stored and does not stamp tools_synced_at", () => {
+  const state = createPolicyState();
+  state.recordSuccess(
+    {
+      decision: "allow",
+      tools_to_check: Array.from({ length: MAX_TOOLS_TO_CHECK + 1 }, () => "read"),
+      policy_check_failure_action: "block",
+    } as PreToolResponseBody,
+    T1,
+  );
+  // Nothing stored, nothing stamped: the state stays at "never learned", which costs a round trip
+  // per file tool and enforces on every one of them.
+  assert.equal(state.getToolsToCheck(), undefined);
+  assert.equal(state.getToolsSyncedAt(), undefined);
+  assert.equal(state.snapshot().tools_to_check, undefined);
+  // The failure action on the same response is still learned — one bad field must not cost the one
+  // field that can turn an API failure into a block.
+  assert.equal(state.getFailureAction(), "block");
+});
+
+test("WR-01: an over-cap list on DISK is a cache miss for both halves", () => {
+  const state = createPolicyState();
+  state.hydrate({
+    tools_synced_at: T1,
+    tools_to_check: Array.from({ length: MAX_TOOLS_TO_CHECK + 1 }, () => "read"),
+  });
+  // Both or neither: a refused list must not leave its stamp behind, or the stamp alone would look
+  // fresh with nothing to check against.
+  assert.equal(state.getToolsToCheck(), undefined);
+  assert.equal(state.getToolsSyncedAt(), undefined);
+});
+
+test("a malformed tool list never replaces a known one, and never stamps freshness", () => {
+  // The full reported sequence: a good response teaches `['read']`, then a malformed one arrives.
+  const state = createPolicyState();
+  state.recordSuccess({ decision: "allow", tools_to_check: ["read"] } as PreToolResponseBody, T1);
+  assert.deepEqual(state.getToolsToCheck(), ["read"]);
+
+  state.recordSuccess(
+    { decision: "allow", tools_to_check: [null, 42] } as unknown as PreToolResponseBody,
+    T2,
+  );
+  // Rule 1 of this module — never overwrite a known value with an unknown one. `[]` here would have
+  // been a confident "no file policies" and would have skipped `read` for the rest of the TTL.
+  assert.deepEqual(state.getToolsToCheck(), ["read"], "the known list stands");
+  assert.equal(state.getToolsSyncedAt(), T1, "and its freshness was NOT refreshed by a bad response");
 });

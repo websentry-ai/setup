@@ -54,8 +54,13 @@ var BREAKER_FAILURE_THRESHOLD = 3;
 var BREAKER_OPEN_MS = 6e4;
 var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
+var MAX_CACHE_BYTES = 65536;
+var MAX_TOOLS_TO_CHECK = 256;
+var MAX_TOOL_NAME_CHARS = 64;
+var MAX_CONFIG_BYTES = 262144;
 var MAX_HASH_BYTES = 4194304;
 var MAX_TURN_RESULTS = 500;
+var MAX_TURN_TOOL_CALLS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
@@ -124,9 +129,24 @@ function createBreaker(opts = {}) {
 }
 
 // packages/core/src/cache.ts
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
+
+// packages/core/src/safeRead.ts
+import { lstatSync, readFileSync } from "node:fs";
+function readSmallRegularFile(path, maxBytes) {
+  try {
+    if (typeof path !== "string" || path === "") return void 0;
+    const stats = lstatSync(path);
+    if (!stats.isFile()) return void 0;
+    const size = stats.size;
+    if (typeof size !== "number" || !Number.isFinite(size) || size > maxBytes) return void 0;
+    return readFileSync(path, "utf8");
+  } catch {
+    return void 0;
+  }
+}
 
 // packages/core/src/policyState.ts
 function parseFailureAction(raw) {
@@ -134,7 +154,12 @@ function parseFailureAction(raw) {
 }
 function parseToolsToCheck(raw) {
   if (!Array.isArray(raw)) return void 0;
-  return raw.filter((entry) => typeof entry === "string");
+  if (raw.length > MAX_TOOLS_TO_CHECK) return void 0;
+  const usable = raw.filter(
+    (entry) => typeof entry === "string" && entry.length <= MAX_TOOL_NAME_CHARS
+  );
+  if (usable.length !== raw.length) return void 0;
+  return usable;
 }
 function parseTimestamp(raw) {
   return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : void 0;
@@ -144,6 +169,7 @@ function createPolicyState() {
   let toolsToCheck;
   let toolsSyncedAt;
   let fetchedAt;
+  let toolsConfirmed = false;
   return {
     recordSuccess(body, nowMs = Date.now()) {
       let learned = false;
@@ -151,6 +177,7 @@ function createPolicyState() {
       if (nextTools !== void 0) {
         toolsToCheck = nextTools;
         toolsSyncedAt = nowMs;
+        toolsConfirmed = true;
         learned = true;
       }
       const nextAction = parseFailureAction(body?.policy_check_failure_action);
@@ -164,6 +191,7 @@ function createPolicyState() {
     // Copy out: a caller that mutates the returned array must not widen the skip set.
     getToolsToCheck: () => toolsToCheck === void 0 ? void 0 : [...toolsToCheck],
     getToolsSyncedAt: () => toolsSyncedAt,
+    getToolsConfirmed: () => toolsConfirmed,
     getFetchedAt: () => fetchedAt,
     /** Only what was actually learned. An absent key is the honest encoding of "never learned". */
     snapshot() {
@@ -178,6 +206,13 @@ function createPolicyState() {
      * Load a disk snapshot, **without downgrading anything learned over the network**. In-memory is
      * authoritative for the session (09-CONTEXT), which is also what caps T-09-01/T-09-02: a planted
      * cache can only ever influence a value this instance has not yet been told by the server.
+     *
+     * **`toolsConfirmed` is deliberately not set here** (WR-02). "A value the server has not told us
+     * yet" was doing more work than it looked: the cold window is every session start, and the old
+     * `pullPolicies = !areToolsFresh(hydrated stamp)` then declined to ask the server during exactly
+     * that window — so a planted `tools_to_check: []` with a fresh stamp suppressed all six native
+     * file-tool checks for a full TTL, renewably, with nothing able to correct it. Leaving this bit
+     * false is what makes `decide.ts` confirm a hydrated list once per process.
      *
      * Every field is re-validated. This object came off a file, so its types are claims.
      */
@@ -369,12 +404,8 @@ function keyFingerprint(apiKey) {
   return KEY_FINGERPRINT_PREFIX + createHash("sha256").update(material, "utf8").digest("hex").slice(0, 16);
 }
 function readCache(path, identity) {
-  let raw;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return void 0;
-  }
+  const raw = readSmallRegularFile(path, MAX_CACHE_BYTES);
+  if (raw === void 0) return void 0;
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -625,12 +656,14 @@ function buildTurnLogBody(record, opts) {
   let toolUse = [];
   let startedAt;
   let truncated;
+  let callsTruncated;
   try {
     const safe = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
     conversationId = typeof safe.session_id === "string" ? safe.session_id : "";
     prompt = typeof safe.prompt === "string" ? safe.prompt : "";
     startedAt = typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : void 0;
     truncated = typeof safe.results_truncated === "number" && Number.isFinite(safe.results_truncated) && safe.results_truncated > 0 ? Math.floor(safe.results_truncated) : void 0;
+    callsTruncated = typeof safe.tool_calls_truncated === "number" && Number.isFinite(safe.tool_calls_truncated) && safe.tool_calls_truncated > 0 ? Math.floor(safe.tool_calls_truncated) : void 0;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
     toolUse = calls.map((call) => ({
       type: TURNLOG_TOOL_USE_TYPE,
@@ -655,17 +688,18 @@ function buildTurnLogBody(record, opts) {
   };
   if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
   if (truncated !== void 0) body.results_truncated = truncated;
+  if (callsTruncated !== void 0) body.tool_calls_truncated = callsTruncated;
   return body;
 }
 
 // packages/core/src/config.ts
-import { readFileSync as readFileSync2 } from "node:fs";
 import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 function readUnboundConfig(homeDir) {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute2(homeDir)) return {};
+  const raw = readSmallRegularFile(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  if (raw === void 0) return {};
   try {
-    const raw = readFileSync2(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
     const parsed = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed;
@@ -743,7 +777,7 @@ function createKeyState(opts = {}) {
 var keyState = createKeyState();
 
 // packages/core/src/piVersion.ts
-import { readFileSync as readFileSync3 } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join3 } from "node:path";
 var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 var MAX_WALK_UP_LEVELS = 8;
@@ -752,7 +786,7 @@ function readManagedInstallVersion(env) {
   const root = env[ENV_PI_INSTALL_ROOT];
   if (typeof root !== "string" || root.length === 0) return void 0;
   try {
-    const version = readFileSync3(join3(root, "current-version"), "utf8").trim();
+    const version = readFileSync2(join3(root, "current-version"), "utf8").trim();
     return version.length > 0 ? version : void 0;
   } catch {
     return void 0;
@@ -763,7 +797,7 @@ function readVersionFromArgv(argv1) {
   let dir = dirname2(argv1);
   for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
     try {
-      const parsed = JSON.parse(readFileSync3(join3(dir, "package.json"), "utf8"));
+      const parsed = JSON.parse(readFileSync2(join3(dir, "package.json"), "utf8"));
       if (parsed !== null && typeof parsed === "object") {
         const pkg = parsed;
         if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
@@ -921,33 +955,38 @@ function createTelemetry(opts) {
 
 // packages/core/src/turn.ts
 import { createHash as createHash2 } from "node:crypto";
+var EMPTY_PROJECTION = { prefix: "", body: "" };
 function projectPart(part) {
-  if (part === null || typeof part !== "object") return "";
+  if (part === null || typeof part !== "object") return EMPTY_PROJECTION;
   const record = part;
   if (record.type === "image") {
     const mimeType = typeof record.mimeType === "string" ? record.mimeType : "";
     const data = typeof record.data === "string" ? record.data : "";
-    return `image:${mimeType}:${data}`;
+    return { prefix: `image:${mimeType}:`, body: data };
   }
   const text = typeof record.text === "string" ? record.text : "";
-  return `text:${text}`;
+  return { prefix: "text:", body: text };
+}
+function projectionByteLength(projection) {
+  return Buffer.byteLength(projection.prefix, "utf8") + Buffer.byteLength(projection.body, "utf8");
 }
 function hashContent(parts) {
   try {
     const list = Array.isArray(parts) ? parts : [];
-    const projected = list.map(projectPart);
     let bytes = 0;
-    for (let i = 0; i < projected.length; i += 1) {
-      bytes += Buffer.byteLength(projected[i] ?? "", "utf8");
+    for (let i = 0; i < list.length; i += 1) {
       if (i > 0) bytes += 1;
+      bytes += projectionByteLength(projectPart(list[i]));
     }
     if (bytes > MAX_HASH_BYTES) {
       return { content_sha256: void 0, content_bytes: bytes, hash_skipped: true };
     }
     const hash = createHash2("sha256");
-    for (let i = 0; i < projected.length; i += 1) {
+    for (let i = 0; i < list.length; i += 1) {
       if (i > 0) hash.update("\n", "utf8");
-      hash.update(projected[i] ?? "", "utf8");
+      const projection = projectPart(list[i]);
+      hash.update(projection.prefix, "utf8");
+      hash.update(projection.body, "utf8");
     }
     return { content_sha256: hash.digest("hex"), content_bytes: bytes };
   } catch {
@@ -962,6 +1001,12 @@ function createTurnStore() {
     const incoming = idOf(sessionId);
     if (incoming !== void 0 && record.session_id !== void 0 && record.session_id !== incoming) {
       record = { tool_calls: [], results: [] };
+    }
+    if (incoming !== void 0) {
+      const ours = record.tool_calls.filter(
+        (entry) => entry.session_id === void 0 || entry.session_id === incoming
+      );
+      if (ours.length !== record.tool_calls.length) record.tool_calls = ours;
     }
     if (record.session_id === void 0 && incoming !== void 0) {
       record.session_id = incoming;
@@ -988,16 +1033,29 @@ function createTurnStore() {
       } catch {
       }
     },
+    /**
+     * Capped at `MAX_TURN_TOOL_CALLS`, dropping the oldest, exactly as `recordResult` caps `results`
+     * (WR-04). `user_bash` is why: it records a call, pi fires no `agent_end` for a bare `!cmd`, so
+     * nothing drains the record and a developer working through a series of them accumulated an entry
+     * per invocation for the whole session.
+     */
     recordToolCall(entry, sessionId, now = Date.now()) {
       try {
         if (entry === null || typeof entry !== "object") return;
         startTurn(sessionId, now);
-        record.tool_calls.push({
+        while (record.tool_calls.length >= MAX_TURN_TOOL_CALLS) {
+          record.tool_calls.shift();
+          record.tool_calls_truncated = (record.tool_calls_truncated ?? 0) + 1;
+        }
+        const stored = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
           tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
           decision: typeof entry.decision === "string" ? entry.decision : "",
           ts: now
-        });
+        };
+        const incoming = idOf(sessionId);
+        if (incoming !== void 0) stored.session_id = incoming;
+        record.tool_calls.push(stored);
       } catch {
       }
     },
@@ -1067,6 +1125,9 @@ function createTurnStore() {
       if (record.session_id !== void 0) copy.session_id = record.session_id;
       if (record.started_at !== void 0) copy.started_at = record.started_at;
       if (record.results_truncated !== void 0) copy.results_truncated = record.results_truncated;
+      if (record.tool_calls_truncated !== void 0) {
+        copy.tool_calls_truncated = record.tool_calls_truncated;
+      }
       return copy;
     }
   };
@@ -1132,8 +1193,11 @@ async function confirmWithTimeout(ctx, title, message, timeoutMs = CONFIRM_TIMEO
 
 // packages/pi/src/decide.ts
 function noteDecision(deps, entry) {
+  noteSafe(() => deps.onDecision?.(entry));
+}
+function noteSafe(fn) {
   try {
-    deps.onDecision?.(entry);
+    fn?.();
   } catch {
   }
 }
@@ -1146,7 +1210,8 @@ async function decideToolCall(event, ctx, deps) {
     if (command.trim() === "" && filePath === void 0) return void 0;
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
-    if (NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
+    const toolsConfirmed = state.getToolsConfirmed();
+    if (toolsConfirmed && NATIVE_FILE_TOOLS.has(event.toolName) && shouldSkipFileToolFromState(event.toolName, state, now)) {
       noteDecision(deps, {
         tool_name: event.toolName,
         tool_use_id: event.toolCallId,
@@ -1154,7 +1219,7 @@ async function decideToolCall(event, ctx, deps) {
       });
       return void 0;
     }
-    const pullPolicies = !areToolsFresh(state.getToolsSyncedAt(), now);
+    const pullPolicies = !toolsConfirmed || !areToolsFresh(state.getToolsSyncedAt(), now);
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
@@ -1230,10 +1295,10 @@ async function decideInput(event, ctx, deps) {
         return { action: "handled" };
       case "confirm":
         notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
-        deps.onPrompt?.(text);
+        noteSafe(() => deps.onPrompt?.(text));
         return void 0;
       case "allow":
-        deps.onPrompt?.(text);
+        noteSafe(() => deps.onPrompt?.(text));
         return void 0;
       default:
         return void 0;

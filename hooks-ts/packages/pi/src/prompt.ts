@@ -42,6 +42,7 @@ import {
 } from "../../core/src/constants.ts";
 import { buildPromptPayload } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import { noteSafe } from "./decide.ts";
 import { notifySafe } from "./ui.ts";
 import type { UiCtx } from "./ui.ts";
 
@@ -68,6 +69,11 @@ export interface InputDeps {
    * `messages` is only what the run produced and never contains the user prompt, so the turn log has
    * to capture it here — but the store itself lands in a later wave, and this event is the only place
    * the prompt exists. The call site is here now so wiring it is one line, not a re-read of this file.
+   *
+   * Called through `noteSafe`, never directly (WR-06). It closes over the module-scope turn store and
+   * `ctx.sessionManager.getSessionId()`; a throw from any of that inside the outer try/catch below
+   * would be swallowed into `return undefined` — i.e. a prompt that should have been suppressed
+   * silently proceeding.
    */
   onPrompt?: (text: string) => void;
 }
@@ -119,11 +125,11 @@ export async function decideInput(
         // If one ever does, interrupting a developer mid-sentence with a modal is the wrong answer,
         // so the reason is surfaced and the prompt proceeds.
         notifySafe(ctx, outcome.reason ?? GENERIC_DENY_REASON, "warning");
-        deps.onPrompt?.(text);
+        noteSafe(() => deps.onPrompt?.(text));
         return undefined;
 
       case "allow":
-        deps.onPrompt?.(text);
+        noteSafe(() => deps.onPrompt?.(text));
         return undefined;
 
       default:

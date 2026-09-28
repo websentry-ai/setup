@@ -152,6 +152,41 @@ export const CACHE_TTL_MS = 300_000;
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;
 /**
+ * The largest `policy_cache.json` that is opened at all (CR-01 / WR-01).
+ *
+ * Two jobs. The obvious one is a byte cap on untrusted external data, matching the convention the S3
+ * catalog reader already follows. The load-bearing one is that having a cap at all is what forces the
+ * `lstat`-before-`read` in `safeRead.ts`: the size question cannot be asked without a stat, and the
+ * stat is what refuses a FIFO — the shape that makes `readFileSync` block forever rather than throw.
+ *
+ * 64 KiB against a real record of a few hundred bytes. `MAX_TOOLS_TO_CHECK` × `MAX_TOOL_NAME_CHARS`
+ * is ~32 KiB of `tools_to_check` in the worst case the writer can produce, so the cap is above
+ * anything this extension writes and far below anything worth parsing.
+ */
+export const MAX_CACHE_BYTES = 65_536;
+/**
+ * The most entries a `tools_to_check` may carry, and the longest one name may be (WR-01).
+ *
+ * The taxonomy has six entries, so 256 × 64 is generous by two orders of magnitude and still bounds
+ * what one response can make this process hold for a session and write to disk every session after.
+ *
+ * An OVER-CAP list is refused whole, not truncated, and that asymmetry is deliberate. A truncated
+ * list is a *wrong* list: dropping the entry that names the one tool an org does have a policy for
+ * turns `shouldSkipFileTool` into a skip, which is a silently disabled check. Refusing the whole
+ * field means "never learned" — the state that costs a round trip per call and enforces on every one.
+ * Junk entries *inside* a within-cap list are still dropped individually, because there the effect
+ * only ever narrows the skip set.
+ */
+export const MAX_TOOLS_TO_CHECK = 256;
+export const MAX_TOOL_NAME_CHARS = 64;
+/**
+ * The same guard for `~/.unbound/config.json` (CR-01). Separate constant, larger value: the config
+ * file is shared with unbound-cli and six other tools, so it may legitimately carry keys this
+ * extension never reads, and a cap that refused a file the CLI wrote would silently unset identity —
+ * i.e. an inert extension. 256 KiB is far above any credential file and still bounds the read.
+ */
+export const MAX_CONFIG_BYTES = 262_144;
+/**
  * HOOK-06's bail-out: the largest canonical content projection that is actually hashed (§F7).
  *
  * `tool_result` is an **awaited** pass over every tool result (`agent-session.js:265-294` gates it
@@ -164,14 +199,28 @@ export const MAX_HASH_BYTES = 4_194_304;
 /**
  * The most tool results one turn record retains. A backstop, not a budget: `tool_result` fires once
  * per result with no ceiling on how many a turn can produce, and the record lives until `agent_end`,
- * so this array is the one part of `turn.ts` that could otherwise grow without limit — a long
- * agentic turn, or any state where nothing drains the record, would hold every entry.
+ * so this array could otherwise grow without limit — a long agentic turn, or any state where nothing
+ * drains the record, would hold every entry.
  *
  * 500 is far above any real turn (a `tool_use` array that long is already an unreadable audit row)
  * and far below anything that costs memory. Past it the OLDEST entries go and `results_truncated`
  * counts them, because a row that quietly described 500 of 600 results would look complete.
+ *
+ * This comment used to call `results` "the one part of `turn.ts` that could otherwise grow without
+ * limit", which was wrong in the most misleading possible way: `tool_calls` had no cap at all, and a
+ * clearer unbounded path. See `MAX_TURN_TOOL_CALLS`.
  */
 export const MAX_TURN_RESULTS = 500;
+/**
+ * The same backstop for `tool_calls` (WR-04), and the path that made it necessary is not
+ * hypothetical: `user_bash` records a tool call, and pi fires no `agent_end` for a bare `!cmd`
+ * (RESEARCH §F3), so nothing calls `take()` and that entry lives for the whole session.
+ *
+ * Same value and same drop-oldest discipline as `MAX_TURN_RESULTS`, counted by
+ * `tool_calls_truncated`. The two are separate constants because they bound different events with
+ * different producers — retuning one must not silently retune the other.
+ */
+export const MAX_TURN_TOOL_CALLS = 500;
 export const MAX_TOOL_INPUT_BYTES = 16_384;
 export const MAX_COMMAND_CHARS = 8192;
 /**

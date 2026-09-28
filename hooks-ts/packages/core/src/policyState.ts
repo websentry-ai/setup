@@ -28,6 +28,7 @@
 // And `[]` is a **value**: "this org has no file policies" is an answer; "the field was absent" is
 // not. Collapsing the two is what makes rule 2 violable in the first place.
 
+import { MAX_TOOLS_TO_CHECK, MAX_TOOL_NAME_CHARS } from "./constants.ts";
 import type { PreToolResponseBody } from "./types.ts";
 
 export type FailureAction = "allow" | "block";
@@ -56,6 +57,12 @@ export interface PolicyState {
   getFailureAction(): FailureAction | undefined;
   getToolsToCheck(): string[] | undefined;
   getToolsSyncedAt(): number | undefined;
+  /**
+   * Has a **server response in this process** taught us `tools_to_check`, as opposed to a file
+   * claiming it? The provenance WR-02 needs: `getToolsSyncedAt` cannot answer it, because a hydrated
+   * stamp and a network-learned one are the same number.
+   */
+  getToolsConfirmed(): boolean;
   getFetchedAt(): number | undefined;
   snapshot(): PolicySnapshot;
   hydrate(snapshot: PolicySnapshot): void;
@@ -73,13 +80,45 @@ export function parseFailureAction(raw: unknown): FailureAction | undefined {
 /**
  * `undefined` means **the field was absent or unusable**, never "the list was empty".
  *
- * A mixed array keeps its strings rather than rejecting the whole response: dropping a junk entry
- * narrows the skip set (more round trips, same verdicts), while rejecting the response would widen
- * it to whatever stale value was already remembered.
+ * **A list is usable only if EVERY entry is** — one bad entry refuses the whole field. The previous
+ * rule filtered instead, on the argument that "dropping a junk entry narrows the skip set (more round
+ * trips, same verdicts)". That argument is false, and in the dangerous direction. What is stored is
+ * the set of tools that DO need checking, so dropping an entry *widens* the skip set: it is the
+ * removed tool that stops being checked.
+ *
+ * Two reachable consequences, reported independently by two reviewers:
+ *
+ *   * `[null, 42]` filtered to `[]`, which `recordSuccess` then read as the answer "this org has no
+ *     file policies" — stamping `tools_synced_at`, setting `toolsConfirmed`, and replacing a
+ *     previously known `['read']`. Every native file tool then skipped enforcement for the full 300 s
+ *     TTL, including for an org with a remembered fail-closed setting.
+ *   * `['read', <malformed 'write'>]` filtered to `['read']`, and `write` silently stopped being
+ *     checked. Same class, no attacker needed — a serialisation bug on one field is enough.
+ *
+ * So: all-or-nothing. `undefined` means "not synced", which stores nothing, stamps nothing, leaves
+ * `toolsConfirmed` false and makes every file tool pay its round trip. That is strictly safe and
+ * self-correcting — the next well-formed response fixes it — whereas a partially-read list is a
+ * confident wrong answer that disables checks for 300 s.
+ *
+ * A genuinely empty `[]` is still a VALUE, and that distinction is the whole reason this function
+ * exists: "this org has no file policies" is an answer, "the field could not be read" is not.
+ *
+ * Bounded (WR-01). Whatever this returns is held for the session, `JSON.stringify`ed to disk on the
+ * awaited tool-call path, re-read every session after, and linearly scanned on every native file
+ * call — so a compromised or misbehaving gateway answering one pretool call with a 50 MB
+ * `tools_to_check` must not be able to buy any of that. A local process with write access to the
+ * cache file is the same input by another route. Over-cap is refused whole for the same
+ * all-or-nothing reason: see `MAX_TOOLS_TO_CHECK`.
  */
 export function parseToolsToCheck(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
-  return raw.filter((entry): entry is string => typeof entry === "string");
+  if (raw.length > MAX_TOOLS_TO_CHECK) return undefined;
+  const usable = raw.filter(
+    (entry): entry is string => typeof entry === "string" && entry.length <= MAX_TOOL_NAME_CHARS,
+  );
+  // Any entry lost ⇒ this is not a list we can act on. `[]` in still gives `[]` out.
+  if (usable.length !== raw.length) return undefined;
+  return usable;
 }
 
 /**
@@ -96,6 +135,11 @@ export function createPolicyState(): PolicyState {
   let toolsToCheck: string[] | undefined;
   let toolsSyncedAt: number | undefined;
   let fetchedAt: number | undefined;
+  /**
+   * WR-02's provenance bit: false until a *server* response in this process carries
+   * `tools_to_check`. `hydrate` deliberately never sets it — that is the whole point.
+   */
+  let toolsConfirmed = false;
 
   return {
     recordSuccess(body: PreToolResponseBody, nowMs: number = Date.now()): void {
@@ -106,6 +150,9 @@ export function createPolicyState(): PolicyState {
       if (nextTools !== undefined) {
         toolsToCheck = nextTools;
         toolsSyncedAt = nowMs;
+        // This is the one place it is set: the list came off the wire, from a response this process
+        // received, under the identity this process authenticated with.
+        toolsConfirmed = true;
         learned = true;
       }
 
@@ -123,6 +170,7 @@ export function createPolicyState(): PolicyState {
     // Copy out: a caller that mutates the returned array must not widen the skip set.
     getToolsToCheck: () => (toolsToCheck === undefined ? undefined : [...toolsToCheck]),
     getToolsSyncedAt: () => toolsSyncedAt,
+    getToolsConfirmed: () => toolsConfirmed,
     getFetchedAt: () => fetchedAt,
 
     /** Only what was actually learned. An absent key is the honest encoding of "never learned". */
@@ -139,6 +187,13 @@ export function createPolicyState(): PolicyState {
      * Load a disk snapshot, **without downgrading anything learned over the network**. In-memory is
      * authoritative for the session (09-CONTEXT), which is also what caps T-09-01/T-09-02: a planted
      * cache can only ever influence a value this instance has not yet been told by the server.
+     *
+     * **`toolsConfirmed` is deliberately not set here** (WR-02). "A value the server has not told us
+     * yet" was doing more work than it looked: the cold window is every session start, and the old
+     * `pullPolicies = !areToolsFresh(hydrated stamp)` then declined to ask the server during exactly
+     * that window — so a planted `tools_to_check: []` with a fresh stamp suppressed all six native
+     * file-tool checks for a full TTL, renewably, with nothing able to correct it. Leaving this bit
+     * false is what makes `decide.ts` confirm a hydrated list once per process.
      *
      * Every field is re-validated. This object came off a file, so its types are claims.
      */

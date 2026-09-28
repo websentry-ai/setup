@@ -6,13 +6,14 @@
 // `undefined` rather than throw: an exception escaping a pi `tool_call` handler is a BLOCK
 // (RESEARCH §F1), so a filesystem permission problem must never stop a developer's tool call.
 
-import { chmodSync } from "node:fs";
+import { chmodSync, symlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 
 import { createFakeHome } from "./helpers/fakeHome.ts";
-import { DEFAULT_GATEWAY_URL } from "../src/constants.ts";
+import { DEFAULT_GATEWAY_URL, MAX_CONFIG_BYTES } from "../src/constants.ts";
 import {
   normalizeGatewayUrl,
   readUnboundConfig,
@@ -279,4 +280,68 @@ test("redactSecrets: case-insensitive Bearer, no key, and short keys left alone"
   assert.equal(redactSecrets("value short", "short"), "value short");
   assert.doesNotThrow(() => redactSecrets("a+b(c)", "a+b(c)d?"));
   assert.ok(!redactSecrets("token a+b(c)d? here", "a+b(c)d?").includes("a+b(c)d?"));
+});
+
+// --- CR-01: the config read is bounded and non-blocking too ------------------------------------
+
+test("readUnboundConfig: a FIFO config.json is an empty config, not a permanent hang (CR-01)", (t) => {
+  if (process.platform === "win32") {
+    t.skip("mkfifo is POSIX-only");
+    return;
+  }
+  const home = createFakeHome();
+  try {
+    const configPath = join(home.homeDir, ".unbound", "config.json");
+    execFileSync("mkfifo", [configPath], { stdio: "ignore" });
+
+    // Run it in a child under a hard timeout: `readFileSync` on a writerless pipe blocks the only
+    // thread, so no in-process timer could ever observe the hang it used to cause on `init()`.
+    const moduleUrl = new URL("../src/config.ts", import.meta.url).href;
+    const script = [
+      `const { readUnboundConfig } = await import(${JSON.stringify(moduleUrl)});`,
+      `const out = readUnboundConfig(${JSON.stringify(home.homeDir)});`,
+      `process.stdout.write(JSON.stringify(out));`,
+    ].join("\n");
+    const out = execFileSync(
+      process.execPath,
+      ["--experimental-strip-types", "--no-warnings", "--input-type=module", "-e", script],
+      { timeout: 2000, killSignal: "SIGKILL", encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] },
+    );
+    assert.equal(out, "{}");
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("readUnboundConfig: a config above MAX_CONFIG_BYTES is refused, and identity falls through", () => {
+  // Padded past the cap with a key nothing reads, so the only thing under test is the size guard.
+  const home = createFakeHome({ api_key: "from-file", pad: "x".repeat(MAX_CONFIG_BYTES) });
+  try {
+    assert.deepEqual(readUnboundConfig(home.homeDir), {});
+    // An unreadable config is an INERT extension, never a block: no key, default URL.
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+    assert.equal(resolveGatewayUrl(NO_ENV, home.homeDir), DEFAULT_GATEWAY_URL);
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("readUnboundConfig: a symlinked config.json is refused even when the target is valid (CR-01)", (t) => {
+  if (process.platform === "win32") {
+    t.skip("symlink creation needs a privilege on Windows");
+    return;
+  }
+  const home = createFakeHome();
+  try {
+    const target = join(home.homeDir, "real_config.json");
+    writeFileSync(target, JSON.stringify({ api_key: "from-link" }), { encoding: "utf8", mode: 0o600 });
+    symlinkSync(target, join(home.homeDir, ".unbound", "config.json"));
+
+    // Following the link is what would let a symlink-to-FIFO block; `unbound login` writes a real
+    // file, so nothing legitimate is lost by refusing one.
+    assert.deepEqual(readUnboundConfig(home.homeDir), {});
+    assert.equal(resolveApiKey(NO_ENV, home.homeDir), undefined);
+  } finally {
+    home.cleanup();
+  }
 });

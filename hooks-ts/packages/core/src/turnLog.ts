@@ -71,6 +71,8 @@ export interface TurnLogBody {
    * row carries no extra key at all. A truncated row that said nothing would look complete.
    */
   results_truncated?: number;
+  /** The same, for the `MAX_TURN_TOOL_CALLS` cap on `tool_calls` (WR-04). Same present-only rule. */
+  tool_calls_truncated?: number;
 }
 
 export interface TurnLogOptions {
@@ -121,6 +123,7 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   let toolUse: TurnLogToolUse[] = [];
   let startedAt: number | undefined;
   let truncated: number | undefined;
+  let callsTruncated: number | undefined;
 
   try {
     const safe: TurnRecord = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
@@ -135,6 +138,12 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
       Number.isFinite(safe.results_truncated) &&
       safe.results_truncated > 0
         ? Math.floor(safe.results_truncated)
+        : undefined;
+    callsTruncated =
+      typeof safe.tool_calls_truncated === "number" &&
+      Number.isFinite(safe.tool_calls_truncated) &&
+      safe.tool_calls_truncated > 0
+        ? Math.floor(safe.tool_calls_truncated)
         : undefined;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
     toolUse = calls.map((call) => ({
@@ -164,5 +173,6 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   // the server honours what arrives, so a fabricated start time would become a fabricated latency.
   if (startedAt !== undefined) body.requestInitialized = new Date(startedAt).toISOString();
   if (truncated !== undefined) body.results_truncated = truncated;
+  if (callsTruncated !== undefined) body.tool_calls_truncated = callsTruncated;
   return body;
 }
