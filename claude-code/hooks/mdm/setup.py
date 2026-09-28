@@ -9,6 +9,7 @@ import time
 import platform
 import subprocess
 import signal
+import threading
 import hashlib
 import json
 import shlex
@@ -2101,15 +2102,22 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
 def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
     """Bounded and best-effort: setup already succeeded, so backfill must not fail the policy.
 
-    Runs in a child forked from the main thread (fork from a worker thread is unsafe on
-    macOS, and run_backfill forks again via _run_as_user). The deadline counts from script
+    On POSIX this runs in a child forked from the main thread (fork from a worker thread
+    is unsafe on macOS, and run_backfill forks again via _run_as_user); on Windows, where
+    nothing forks, a daemon thread bounds it instead. The deadline counts from script
     start so a slow setup cannot push the script past onboarding's outer watchdog."""
-    if os.name != 'posix':
-        run_backfill(api_key, backend_url, user_homes)
-        return
     budget = BACKFILL_DEADLINE_SECONDS - (time.time() - _SCRIPT_START)
     if budget <= 0:
         print("[backfill] Skipped — setup used the time budget; backfill retries on the next run.")
+        return
+    if os.name != 'posix':
+        worker = threading.Thread(
+            target=run_backfill, args=(api_key, backend_url, user_homes), daemon=True,
+        )
+        worker.start()
+        worker.join(budget)
+        if worker.is_alive():
+            print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
         return
     # Flush before forking so the child does not replay the parent's buffered output.
     sys.stdout.flush()
@@ -2118,6 +2126,9 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
     if pid == 0:
         try:
             os.setsid()
+            # Self-destruct at the deadline even if the parent was killed first.
+            signal.signal(signal.SIGALRM, lambda *_: os.killpg(0, signal.SIGKILL))
+            signal.alarm(int(budget) + 5)
             run_backfill(api_key, backend_url, user_homes)
             sys.stdout.flush()
             sys.stderr.flush()
