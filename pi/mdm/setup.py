@@ -131,6 +131,10 @@ INSTALLED_NAMES = ("index.js", "index.js.sha256")
 # _unique_tmp_path -- so two concurrent writers can never share one temp file.
 TMP_MARKER = ".unbound-tmp"
 
+# bash reads only the FIRST of these that exists, in this order (bash(1), INVOCATION). The
+# order is load-bearing: creating an earlier one shadows a later one the user relies on.
+BASH_LOGIN_FILES = (".bash_profile", ".bash_login", ".profile")
+
 # The charset an env value may contain before it is written into a shell rc file. An rc file
 # is executed by the user's login shell, so anything outside this set -- a quote, a $, a
 # backtick, a semicolon, a newline -- would be code rather than data. Real API keys are
@@ -990,14 +994,42 @@ def _is_safe_env_value(value) -> bool:
 
 
 def rc_files_for(home_dir) -> List[Path]:
-    """The login-shell files an `export` line has to land in, per platform."""
+    """The login-shell files an `export` line has to land in, per platform.
+
+    The bash file is CHOSEN rather than fixed, because bash reads only the FIRST of
+    `.bash_profile`, `.bash_login`, `.profile` that exists. Always writing `.bash_profile`
+    created it for a user who relied on one of the other two, and from that moment every new
+    terminal silently stopped sourcing their PATH and environment -- a breakage this installer
+    caused and `--clear` could not undo. Writing to whichever file bash already reads both
+    avoids the shadowing and puts the export where it actually runs.
+
+    zsh has no such chain -- it sources `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin`, so
+    `.zprofile` is unconditional -- and the Linux pair are interactive rc files, not a
+    first-match login sequence.
+    """
     system = platform.system().lower()
     home_dir = Path(home_dir)
     if system == "darwin":
-        return [home_dir / ".zprofile", home_dir / ".bash_profile"]
+        return [home_dir / ".zprofile", _bash_login_file(home_dir)]
     if system == "linux":
         return [home_dir / ".zshrc", home_dir / ".bashrc"]
     return []
+
+
+def _bash_login_file(home_dir: Path) -> Path:
+    """The bash login profile bash itself would read, or `.bash_profile` to create if none.
+
+    Existence is checked, not followed: a broken symlink at `.bash_profile` is still the name
+    bash resolves first, so it stays the target rather than being stepped over.
+    """
+    for name in BASH_LOGIN_FILES:
+        candidate = home_dir / name
+        try:
+            if candidate.exists() or candidate.is_symlink():
+                return candidate
+        except OSError:
+            continue
+    return home_dir / BASH_LOGIN_FILES[0]
 
 
 def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None,
@@ -1224,6 +1256,31 @@ def set_env_var_for_user(username: str, home_dir, var_name: str,
     return bool(result[0]), bool(result[1])
 
 
+def _warn_if_shadowing_and_empty(rc_file: Path, remaining_lines) -> None:
+    """Name the one thing `--clear` cannot undo: a `.bash_profile` an OLDER version of this
+    installer created, which now shadows the `.bash_login` or `.profile` the user relies on.
+
+    Removing the export empties the file but does not un-shadow it, and bash still reads the
+    empty file first. The file is NOT deleted: an empty `.bash_profile` is sometimes a
+    deliberate way to suppress `.profile`, and silently removing a shell profile from someone's
+    home on an uninstall path is a worse failure than the one being reported. So the operator
+    is told, precisely, and decides. Current versions never create this situation --
+    `rc_files_for` writes to whichever login file bash already reads.
+    """
+    if rc_file.name != BASH_LOGIN_FILES[0]:
+        return
+    if any(line.strip() for line in remaining_lines):
+        return
+    shadowed = [name for name in BASH_LOGIN_FILES[1:] if (rc_file.parent / name).exists()]
+    if not shadowed:
+        return
+    print(f"⚠️  {rc_file} is now empty, and bash reads it BEFORE "
+          f"{' and '.join(shadowed)}.")
+    print("   An older version of this installer created it. Delete it by hand to restore")
+    print(f"   {shadowed[0]}; it is left in place because an empty profile is sometimes")
+    print("   deliberate, and removing a shell profile is not ours to guess at.")
+
+
 def remove_env_var_from_user(username: str, home_dir, var_name: str) -> str:
     """Strip our export line from one user's rc files. "cleared"/"not_found"/"failed"."""
     system = platform.system().lower()
@@ -1263,6 +1320,7 @@ def remove_env_var_from_user(username: str, home_dir, var_name: str) -> str:
                 if len(new_lines) < len(lines):
                     if _rewrite_rc_file(rc_file, new_lines):
                         cleared = True
+                        _warn_if_shadowing_and_empty(rc_file, new_lines)
                     else:
                         had_error = True
             except Exception as e:
@@ -1316,8 +1374,17 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.loads(f.read())
-            except (json.JSONDecodeError, OSError):
+            except json.JSONDecodeError:
+                # Parsed as nothing, so there is nothing in it left to lose.
                 config = {}
+            except OSError as e:
+                # A file we could not READ is a file we know nothing about. Publishing a fresh
+                # object over it would drop this user's email, org and the api_key six tools
+                # authenticate with -- and would hand them the device key in its place, which
+                # is the exact clobber the ownership check above exists to prevent. Same rule
+                # as append_to_file: refuse rather than rewrite what we could not read.
+                debug_print(f"Refusing to rewrite {config_file}, which could not be read: {e}")
+                return False
         if not isinstance(config, dict):
             config = {}
         # DELIBERATE DIVERGENCE from augment/hooks/mdm/setup.py:770, which assigns

@@ -558,9 +558,20 @@ def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
             try:
                 with open(config_file, 'r', encoding='utf-8') as f:
                     config = json.loads(f.read())
-            except (json.JSONDecodeError, OSError):
-                # A hand-edited or truncated config is replaced rather than fatal.
+            except json.JSONDecodeError:
+                # A hand-edited or truncated config is replaced rather than fatal: it parsed
+                # as nothing, so there is nothing in it left to lose.
                 config = {}
+            except OSError as e:
+                # But a file we could not READ is a file we know nothing about, and publishing
+                # a fresh object over it would drop this user's email, org and the api_key six
+                # tools authenticate with -- a mode-000 config in a writable directory cannot
+                # be read and can still be replaced. This is the rule the rc rewrite already
+                # follows: refuse rather than rewrite what we could not read.
+                print(f"❌ Refusing to rewrite {config_file}, which could not be read: {e}")
+                print("   Fix the permissions on that file and re-run, or export")
+                print("   UNBOUND_PI_API_KEY in your shell.")
+                return False
         if not isinstance(config, dict):
             config = {}
         config['api_key'] = api_key

@@ -457,6 +457,26 @@ class TestNoDurableFileIsWrittenByTruncation:
         assert data["base_url"] == "https://b"
         assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
 
+    @pytest.mark.skipif(os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0),
+                        reason="POSIX mode bits, and root ignores them")
+    def test_an_unreadable_config_is_refused_not_replaced(self, pi_setup, fake_home, capsys):
+        """Unreadable is not the same as corrupt. A mode-000 config inside a writable
+        directory cannot be read and CAN still be replaced, and the OSError used to fall into
+        the same `config = {}` branch as a parse failure -- publishing a fresh object over the
+        user's email, org and the api_key six tools authenticate with. A file that fails to
+        parse has nothing left in it to lose; one we could not read we know nothing about."""
+        cfg = fake_home.config_path
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        original = '{"api_key": "pre-existing", "email": "someone@example.com"}'
+        cfg.write_text(original)
+        os.chmod(cfg, 0o000)
+        try:
+            assert pi_setup.write_unbound_config("newkey", {"base_url": "https://b"}) is False
+        finally:
+            os.chmod(cfg, 0o600)
+        assert cfg.read_text() == original, "the file we could not read was rewritten"
+        assert "could not be read" in capsys.readouterr().out
+
     def test_the_user_config_write_refuses_a_symlinked_config(
             self, pi_setup, fake_home, capsys):
         """The installer's contract has to match the reader's. The extension lstats this path

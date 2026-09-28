@@ -224,6 +224,55 @@ def test_linux_uses_the_shell_rc_files_not_the_profiles(pi_mdm_setup, monkeypatc
     assert [p.name for p in pi_mdm_setup.rc_files_for(home)] == [".zprofile", ".bash_profile"]
 
 
+@pytest.mark.parametrize("existing,expected", [
+    ((), ".bash_profile"),                          # nothing to shadow: create the first
+    ((".bash_profile",), ".bash_profile"),
+    ((".bash_login",), ".bash_login"),
+    ((".profile",), ".profile"),
+    ((".bash_login", ".profile"), ".bash_login"),   # bash's own order, not ours
+    ((".bash_profile", ".profile"), ".bash_profile"),
+])
+def test_the_bash_login_file_is_the_one_bash_already_reads(unix, home, existing, expected):
+    """bash reads only the FIRST of .bash_profile, .bash_login, .profile that exists.
+    Unconditionally writing .bash_profile CREATED it for a user who relied on one of the
+    others, and from that moment every new terminal silently stopped sourcing their PATH and
+    environment -- caused by this installer, and not undone by --clear. Writing to whichever
+    file bash already reads avoids the shadowing and puts the export where it runs."""
+    for name in existing:
+        (home / name).write_text("# the user's own login profile\n")
+    assert [p.name for p in unix.rc_files_for(home)] == [".zprofile", expected]
+
+
+def test_an_existing_bash_login_is_never_shadowed_by_a_new_bash_profile(unix, passthrough, home):
+    """End to end: the export lands in the file the user already has, and no new login profile
+    appears beside it to take precedence."""
+    (home / ".bash_login").write_text('export PATH="$HOME/bin:$PATH"\n')
+
+    unix.set_env_var_for_user("alice", home, unix.ENV_API_KEY_PI, KEY)
+    body = (home / ".bash_login").read_text()
+    assert f'export UNBOUND_PI_API_KEY="{KEY}"' in body
+    assert 'export PATH="$HOME/bin:$PATH"' in body, "the user's own PATH survived"
+    assert not (home / ".bash_profile").exists(), "a shadowing .bash_profile was created"
+
+
+def test_clearing_names_a_bash_profile_an_older_version_left_shadowing(unix, passthrough,
+                                                                      home, capsys):
+    """The one case --clear cannot undo: a .bash_profile created by an OLDER version, which
+    still shadows .profile once emptied. The file is deliberately NOT deleted -- an empty
+    .bash_profile is sometimes a deliberate way to suppress .profile, and removing a shell
+    profile from someone's home on an uninstall path is worse than the problem -- so the
+    operator is told exactly what to delete."""
+    (home / ".profile").write_text('export PATH="$HOME/bin:$PATH"\n')
+    (home / ".bash_profile").write_text(f'export UNBOUND_PI_API_KEY="{KEY}"\n')
+
+    assert unix.remove_env_var_from_user("alice", home, unix.ENV_API_KEY_PI) == "cleared"
+    out = capsys.readouterr().out
+    assert ".bash_profile is now empty" in out
+    assert ".profile" in out
+    assert (home / ".bash_profile").exists(), "a shell profile was deleted on our own guess"
+    assert 'export PATH="$HOME/bin:$PATH"' in (home / ".profile").read_text()
+
+
 # --- config.json: the deliberate divergence ------------------------------------------------
 
 
@@ -346,6 +395,28 @@ def test_a_corrupt_config_is_replaced_rather_than_fatal(unix, passthrough, home)
     (unbound_dir / "config.json").write_text("{ this is not json")
     assert unix.write_unbound_config_for_user("alice", home, KEY) is True
     assert json.loads((unbound_dir / "config.json").read_text())["api_key"] == KEY
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0,
+                    reason="POSIX mode bits, and root ignores them")
+def test_an_unreadable_config_is_refused_not_replaced(unix, passthrough, home):
+    """Unreadable is not the same as corrupt. A mode-000 config in a writable directory cannot
+    be read and CAN still be replaced, and publishing a fresh object over it would drop this
+    user's email, org and the api_key six tools authenticate with -- replacing their own
+    credential with the device key, the exact clobber the ownership check exists to prevent.
+    A file that merely fails to parse has nothing left in it to lose; one we could not read we
+    know nothing about. Same rule append_to_file already applies to rc files."""
+    unbound_dir = home / ".unbound"
+    unbound_dir.mkdir()
+    config_path = unbound_dir / "config.json"
+    original = json.dumps({"api_key": "the-users-own-key", "email": "alice@acme.test"})
+    config_path.write_text(original)
+    os.chmod(config_path, 0o000)
+    try:
+        assert unix.write_unbound_config_for_user("alice", home, KEY) is False
+    finally:
+        os.chmod(config_path, 0o600)
+    assert config_path.read_text() == original, "the file we could not read was rewritten"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
