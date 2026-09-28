@@ -140,7 +140,11 @@ class TestInstallRefuses:
                               {artifact_url: ARTIFACT, sha_url: body})
         assert digest is None
         assert not pi_setup.artifact_path(pi_home.agent_dir).exists()
-        capsys.readouterr()
+        out = capsys.readouterr().out
+        # A malformed sidecar says so, rather than printing "expected None" and reading
+        # like a digest mismatch.
+        assert "not a sha256 sidecar" in out
+        assert "expects None" not in out
 
     def test_a_refusal_leaves_an_earlier_good_install_in_place(
             self, pi_setup, pi_home, fake_fetch, urls):

@@ -14,12 +14,14 @@ on:
     paths:
       - "hooks-ts/**"
       - "pi/index.js"
+      - "pi/index.js.sha256"
       - ".github/workflows/hooks-ts.yml"
   push:
     branches: [staging, main]
     paths:
       - "hooks-ts/**"
       - "pi/index.js"
+      - "pi/index.js.sha256"
       - ".github/workflows/hooks-ts.yml"
 
 # This job runs `npm ci` over third-party devDependencies (esbuild, typescript,
@@ -66,3 +68,22 @@ jobs:
             exit 1
           }
           echo "pi/index.js is byte-identical to dist/pi/index.js ($(wc -c < ../pi/index.js) bytes)."
+
+      # pi/setup.py refuses to install unless the artifact it downloads matches this
+      # sidecar, so a rotted sidecar breaks every `unbound setup pi` while cmp stays green.
+      # Run from the repo root, not hooks-ts: the sidecar names the path `pi/index.js`, and
+      # that is the path `shasum -c` resolves relative to its own working directory.
+      - name: pi/index.js.sha256 matches a fresh build
+        working-directory: .
+        run: |
+          shasum -a 256 -c pi/index.js.sha256 || {
+            echo "::error::pi/index.js.sha256 does not match pi/index.js — run: cd hooks-ts && npm run build && cp dist/pi/index.js ../pi/index.js && cd .. && shasum -a 256 pi/index.js > pi/index.js.sha256"
+            exit 1
+          }
+          FRESH="$(shasum -a 256 hooks-ts/dist/pi/index.js | cut -d' ' -f1)"
+          COMMITTED="$(cut -d' ' -f1 < pi/index.js.sha256)"
+          [ "$FRESH" = "$COMMITTED" ] || {
+            echo "::error::pi/index.js.sha256 ($COMMITTED) does not match a fresh build ($FRESH) — run: cd hooks-ts && npm run build && cp dist/pi/index.js ../pi/index.js && cd .. && shasum -a 256 pi/index.js > pi/index.js.sha256"
+            exit 1
+          }
+          echo "pi/index.js.sha256 matches both the committed artifact and a fresh build ($COMMITTED)."

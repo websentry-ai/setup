@@ -21,11 +21,18 @@ exactly how much assurance this is.
 """
 
 import hashlib
+import http.server
+import json
 import os
+import platform
 import shutil
+import socketserver
 import subprocess
 import sys
 import tempfile
+import threading
+import urllib.parse
+import webbrowser
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -72,6 +79,34 @@ def normalize_url(domain: str) -> str:
     else:
         url = f"https://{domain}"
     return url.rstrip('/')
+
+
+def curl_with_auth(auth_headers, curl_args, *, input=None, timeout: int = 10):
+    """Run curl with the secret auth header(s) kept OFF the argv.
+
+    The curl argv is world-readable via `ps` and /proc/<pid>/cmdline, so passing
+    `X-API-KEY: <key>` as `-H "<header>"` would leak the key on a shared host. Write the
+    header line(s) to a 0600 temp file and pass `-H @<tmpfile>` instead, deleting it in a
+    finally. Returns the CompletedProcess, or None if the header file could not be written.
+    """
+    fd, tmp_path = tempfile.mkstemp(prefix=".curlhdr.", suffix=".txt")
+    try:
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write("\n".join(auth_headers) + "\n")
+        except OSError:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            return None
+        cmd = ["curl", *curl_args, "-H", f"@{tmp_path}"]
+        return subprocess.run(cmd, input=input, capture_output=True, timeout=timeout)
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def _expand_tilde(raw, home_dir: str) -> Optional[str]:
@@ -339,7 +374,12 @@ def install_extension(agent_dir) -> Optional[str]:
         ok, computed, expected = verify_artifact(staged, sidecar_text)
         if not ok:
             print(f"❌ Integrity check failed for {ARTIFACT_URL}")
-            print(f"   {SHA_URL} expects {str(expected)[:16]}...")
+            if expected is None:
+                # A sidecar that is not a sha256 line at all: say that, rather than
+                # printing "expected None" and looking like a digest mismatch.
+                print(f"   {SHA_URL} is not a sha256 sidecar: {sidecar_text.strip()[:60]!r}")
+            else:
+                print(f"   {SHA_URL} expects {expected[:16]}...")
             print(f"   the downloaded bytes are {str(computed)[:16]}...")
             print("   Nothing was written; the existing install, if any, is untouched.")
             return None
@@ -392,6 +432,210 @@ def install_extension(agent_dir) -> Optional[str]:
     finally:
         if staging:
             shutil.rmtree(staging, ignore_errors=True)
+
+
+def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
+    """Store the key in ~/.unbound/config.json, the store unbound-cli and five tools read.
+
+    Read-merge-write rather than truncate: this file also holds the user's email, org and
+    per-tool URLs, and clobbering them would log the CLI out. The api_key is set
+    unconditionally because in the user path unbound-cli already handed us this user's own
+    key -- the MDM installer is the one that must only write it when absent.
+    """
+    config_dir = Path.home() / ".unbound"
+    config_file = config_dir / "config.json"
+    try:
+        if platform.system().lower() == "windows":
+            config_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            config_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            os.chmod(config_dir, 0o700)
+        except OSError as e:
+            debug_print(f"Could not tighten {config_dir}: {e}")
+        config = {}
+        if config_file.exists():
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.loads(f.read())
+            except (json.JSONDecodeError, OSError):
+                # A hand-edited or truncated config is replaced rather than fatal.
+                config = {}
+        if not isinstance(config, dict):
+            config = {}
+        config['api_key'] = api_key
+        if urls:
+            config.update({k: v for k, v in urls.items() if v})
+        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(json.dumps(config, indent=2))
+        return True
+    except Exception as e:
+        print(f"⚠️  Could not write config: {e}")
+        return False
+
+
+def run_callback_server(frontend_url: str) -> Optional[dict]:
+    """Mint a key in the browser and catch it on a loopback one-shot server.
+
+    Reached only when unbound-cli passed --domain but no --api-key, which is what it does
+    when nothing was logged in (setup.js:259,262). The app type in the callback URL must be
+    `pi`, or the console mints a `default` key that the extension will not accept.
+    """
+    result = {"method": None, "path": None, "query": None, "headers": None, "body": None}
+    done_evt = threading.Event()
+
+    class CallbackHandler(http.server.BaseHTTPRequestHandler):
+        def _finish(self, code: int = 200,
+                    message: bytes = b"Logged in successfully! You can close this tab.") -> None:
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(message)))
+                self.end_headers()
+                self.wfile.write(message)
+            except Exception:
+                pass
+
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            result["method"] = "GET"
+            result["path"] = self.path
+            result["query"] = dict(urllib.parse.parse_qsl(parsed.query))
+            result["headers"] = {k: v for k, v in self.headers.items()}
+            query = result["query"]
+            if "error" in query:
+                self._finish(code=400,
+                             message=f"Setup failed: {query['error'][:200]}\nPlease try again or contact support.".encode())
+            else:
+                self._finish()
+            done_evt.set()
+
+        def log_message(self, format: str, *args) -> None:
+            return
+
+    class _CallbackServer(socketserver.TCPServer):
+        allow_reuse_address = True
+
+    try:
+        # Port 0 so a second concurrent setup cannot collide, and 127.0.0.1 so nothing
+        # off-box can answer the callback in our place.
+        httpd = _CallbackServer(("127.0.0.1", 0), CallbackHandler)
+        port = httpd.server_address[1]
+        callback_url = f"http://127.0.0.1:{port}/callback"
+
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+
+        encoded_callback = urllib.parse.quote(callback_url, safe="")
+        target_url = (f"{frontend_url.rstrip('/')}/automations/api-key-callback"
+                      f"?callback_url={encoded_callback}&app_type=pi")
+        webbrowser.open(target_url)
+        print("🌐 Opening browser...")
+        print("If browser doesn't open automatically, open this link:")
+        print(target_url)
+        print("Waiting for authentication...")
+
+        try:
+            if not done_evt.wait(timeout=300):
+                print("Timed out waiting for authentication (5 minutes). Please re-run setup.")
+                return None
+        finally:
+            try:
+                httpd.shutdown()
+                httpd.server_close()
+            except Exception:
+                pass
+
+        return result
+    except Exception as e:
+        print(f"❌ Failed to run callback server: {e}")
+        return None
+
+
+def get_device_identifier() -> Optional[str]:
+    """The hardware serial, so the backend can tell two installs by one user apart."""
+    system = platform.system().lower()
+    try:
+        if system == "darwin":
+            # ioreg's IOPlatformSerialNumber key is locale-stable; system_profiler's
+            # "Serial Number" label is localized and fails on non-English macOS.
+            result = subprocess.run(
+                ["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                for line in result.stdout.split('\n'):
+                    if 'IOPlatformSerialNumber' in line:
+                        parts = line.split('=')
+                        if len(parts) >= 2:
+                            serial = parts[1].strip().strip('"').strip()
+                            if serial:
+                                return serial
+            return None
+        if system == "linux":
+            result = subprocess.run(
+                ["cat", "/sys/class/dmi/id/product_serial"],
+                capture_output=True, text=True, timeout=10
+            )
+            serial = result.stdout.strip() if result.returncode == 0 else ""
+            return serial or None
+        if system == "windows":
+            result = subprocess.run(
+                ["wmic", "bios", "get", "serialnumber"],
+                capture_output=True, text=True, timeout=10
+            )
+            if result.returncode == 0:
+                lines = [ln.strip() for ln in result.stdout.split('\n') if ln.strip()]
+                if len(lines) >= 2 and lines[1].lower() != "serialnumber":
+                    return lines[1]
+            return None
+        return None
+    except Exception as e:
+        # A serial is a nice-to-have; never fail an install for the want of one.
+        debug_print(f"Failed to get device identifier: {e}")
+        return None
+
+
+def notify_setup_complete(api_key: str, tool_type: str, backend_url: str = DEFAULT_BACKEND_URL,
+                          install_state: Optional[str] = None, serial_number: Optional[str] = None,
+                          hook_hash: Optional[str] = None, install_mode: Optional[str] = None):
+    """Tell the backend this tool is set up. Never fails the setup.
+
+    The body is assembled BY PRESENCE and the signature is the one every other installer
+    ships: tests/test_setup_contract.py calls this directly on every setup.py in the repo
+    and asserts that a caller passing neither hook_hash nor install_mode sends the exact
+    body it always sent. Returns True when the POST looked like it landed, else None.
+    """
+    try:
+        url = f"{backend_url.rstrip('/')}/api/v1/setup/complete/"
+        body = {"tool_type": tool_type}
+        if install_state is not None:
+            body["install_state"] = install_state
+        if serial_number is not None:
+            body["serial_number"] = serial_number
+        if hook_hash is not None:
+            body["hook_hash"] = hook_hash
+        if install_mode is not None:
+            body["install_mode"] = install_mode
+        data = json.dumps(body)
+        # X-API-KEY off-argv via a 0600 temp header file; body off-argv via stdin.
+        result = curl_with_auth(
+            [f"X-API-KEY: {api_key}"],
+            ["-fsSL", "-X", "POST",
+             "-H", "Content-Type: application/json",
+             "--data-binary", "@-", url],
+            input=data.encode(),
+            timeout=10,
+        )
+        if result is None or getattr(result, "returncode", 1) != 0:
+            debug_print("Setup completion notification did not land")
+            return None
+        debug_print("Setup completion notification sent")
+        return True
+    except Exception as e:
+        debug_print(f"Could not notify backend: {e}")
+        return None
 
 
 def _clear_path(path, label: str) -> str:
@@ -495,18 +739,64 @@ def main() -> bool:
 
     preflight()
 
+    # Resolve the key before touching the network or the disk, so a run with no key at all
+    # leaves the machine exactly as it found it.
+    api_key = args["api_key"]
+    domain = args["domain"]
+    if not api_key:
+        if not domain:
+            print("❌ No API key. Run `unbound login` first, or pass --api-key <key>.")
+            print("   Nothing was written.")
+            return False
+        cb_response = run_callback_server(normalize_url(domain))
+        if cb_response is None:
+            print("❌ Failed to receive the browser callback. Nothing was written.")
+            return False
+        query = {}
+        try:
+            query = cb_response.get("query") or {}
+        except Exception as e:
+            debug_print(f"Malformed callback response: {e}")
+        api_key = query.get("api_key")
+        if not api_key:
+            error_msg = query.get("error")
+            if error_msg:
+                print(f"❌ Login failed: {error_msg}")
+            else:
+                print("❌ The callback returned no API key. Nothing was written.")
+            return False
+
     agent_dir = resolve_agent_dir(Path.home(), os.environ)
     if agent_dir is None:
         print("❌ Could not resolve your home directory, so there is no safe place to install.")
         return False
     print(f"Agent directory: {agent_dir}")
 
+    # Read before the write, or every install would look like a first one.
+    install_state = detect_install_state(artifact_path(agent_dir))
+
     digest = install_extension(agent_dir)
     if not digest:
         return False
 
-    # The key write and the backend report land in the next commit of this plan (Task 3).
-    print("The API key write and the install report are not wired up yet in this commit.")
+    write_unbound_config(api_key, {
+        "base_url": args["backend_url"],
+        "gateway_url": args["gateway_url"],
+        "frontend_url": normalize_url(domain) if domain else None,
+    })
+
+    reported = notify_setup_complete(
+        api_key, "pi", backend_url=args["backend_url"], install_state=install_state,
+        serial_number=get_device_identifier(), hook_hash=digest, install_mode="user",
+    )
+    if reported is not True:
+        print("⚠️  Could not report this install to the backend. Install-state reporting is")
+        print("   best-effort; the extension is installed and enforces regardless.")
+
+    print("=" * 60)
+    print("✅ Setup complete")
+    print("   Start a new pi session to pick up the extension.")
+    print("=" * 60)
     return True
 
 
