@@ -908,21 +908,81 @@ def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None) -
         lines = []
         if file_path.exists():
             try:
-                with open(file_path, "r", encoding="utf-8") as f:
+                # surrogateescape, and NEVER a fallback to an empty list. A single non-UTF-8
+                # byte -- an accented name in a comment, a stray 0x80 -- used to raise here,
+                # get swallowed into `lines = []`, and then the truncating write below
+                # replaced the user's entire shell profile with one export line. As root,
+                # for every account on the device, on every push. surrogateescape decodes
+                # such bytes into lone surrogates that the matching write turns back into
+                # the original bytes, so the file round-trips byte-for-byte.
+                with open(file_path, "r", encoding="utf-8", errors="surrogateescape") as f:
                     lines = f.readlines()
-            except Exception:
-                lines = []
+            except OSError as e:
+                # Unreadable for a real reason (permissions, EIO). Refuse rather than
+                # rewrite: failing to set the variable costs this one account its
+                # enforcement, while rewriting a file we could not read costs them their
+                # shell profile. The caller records this as a per-user failure.
+                print(f"Refusing to rewrite {file_path}, which could not be read: {e}")
+                return False
         if var_name:
             export_prefix = f"export {var_name}="
             lines = [l for l in lines if not l.strip().startswith(export_prefix)]
         normalized_line = line.rstrip()
         if not any(l.rstrip() == normalized_line for l in lines):
             lines.append(f"{line}\n")
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.writelines(lines)
-        return True
+        return _rewrite_rc_file(file_path, lines)
     except Exception as e:
         print(f"Failed to modify {file_path}: {e}")
+        return False
+
+
+def _rewrite_rc_file(file_path: Path, lines) -> bool:
+    """Replace one shell rc file's contents without a truncate-in-place window.
+
+    A plain `open(path, "w")` truncates first, so a write that then fails (ENOSPC, EIO, a
+    killed MDM run) leaves the user with an empty or half-written shell profile. Writing a
+    sibling temp file and renaming makes the outcome all-or-nothing.
+
+    A shell rc file symlinked into a dotfiles repo is a common, legitimate setup, so the
+    link is resolved and the REAL file is rewritten: os.replace on the link path would
+    replace the link itself and silently detach the user from their dotfiles.
+    """
+    try:
+        target = Path(os.path.realpath(str(file_path)))
+        mode = 0o644
+        try:
+            if target.exists():
+                # Keep whatever the user had -- an rc file is sometimes 0600 on purpose.
+                mode = stat.S_IMODE(target.stat().st_mode)
+        except OSError:
+            pass
+        tmp = target.with_name(target.name + ".unbound-tmp")
+        try:
+            # A temp left by an earlier killed run must not fail the O_EXCL open.
+            try:
+                os.unlink(str(tmp))
+            except FileNotFoundError:
+                pass
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(fd, "w", encoding="utf-8", errors="surrogateescape") as f:
+                f.writelines(lines)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.chmod(str(tmp), mode)
+            except OSError as e:
+                debug_print(f"Could not set the mode on {tmp}: {e}")
+            os.replace(str(tmp), str(target))
+            return True
+        except OSError as e:
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            print(f"Failed to rewrite {target}: {e}")
+            return False
+    except Exception as e:
+        print(f"Failed to rewrite {file_path}: {e}")
         return False
 
 
@@ -1022,13 +1082,18 @@ def remove_env_var_from_user(username: str, home_dir, var_name: str) -> str:
             if not rc_file.exists():
                 continue
             try:
-                with open(rc_file, 'r', encoding='utf-8') as f:
+                # surrogateescape so a non-UTF-8 byte anywhere in the file does not make the
+                # whole removal fail (it used to leave our export in place and report
+                # "failed"), and so the bytes we do not understand are written back
+                # unchanged. The rewrite goes through the same atomic helper as the append.
+                with open(rc_file, 'r', encoding='utf-8', errors='surrogateescape') as f:
                     lines = f.readlines()
                 new_lines = [l for l in lines if not l.strip().startswith(export_prefix)]
                 if len(new_lines) < len(lines):
-                    with open(rc_file, 'w', encoding='utf-8') as f:
-                        f.writelines(new_lines)
-                    cleared = True
+                    if _rewrite_rc_file(rc_file, new_lines):
+                        cleared = True
+                    else:
+                        had_error = True
             except Exception as e:
                 debug_print(f"Failed to update {rc_file}: {e}")
                 had_error = True

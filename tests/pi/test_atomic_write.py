@@ -26,6 +26,7 @@ state to lose, and it is the one an O_TRUNC implementation would pass by acciden
 
 import hashlib
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -210,6 +211,118 @@ class TestTheMdmDropIsAtomicToo:
         on_disk = hashlib.sha256((extdir / "index.js").read_bytes()).hexdigest()
         recorded = (extdir / "index.js.sha256").read_text().split()[0]
         assert recorded == on_disk
+
+
+class TestTheRcRewriteNeverDestroysAUserFile:
+    """Cursor Bugbot, third round, HIGH severity -- and the worst defect found on this PR.
+
+    `append_to_file` decoded the rc file as strict UTF-8 and treated ANY failure as an empty
+    file, then truncated and rewrote. So a single non-UTF-8 byte in `.zprofile` -- an
+    accented name in a comment, a stray 0x80 from a copy-paste -- replaced the user's entire
+    shell profile with one `export` line. Running as root, for every account on the device,
+    on every MDM push. A security tool destroying user data is strictly worse than a
+    security tool that fails to install.
+    """
+
+    LATIN1_PROFILE = (
+        b"# Andr\xe9's profile -- latin-1, not UTF-8\n"
+        b"export EDITOR=vim\n"
+        b"alias ll='ls -la'\n"
+    )
+
+    def test_a_non_utf8_rc_file_is_preserved_byte_for_byte(self, pi_mdm_setup, tmp_path):
+        mod = pi_mdm_setup
+        rc = tmp_path / ".zprofile"
+        rc.write_bytes(self.LATIN1_PROFILE)
+
+        assert mod.append_to_file(rc, "export UNBOUND_PI_API_KEY=notakey", "UNBOUND_PI_API_KEY")
+
+        after = rc.read_bytes()
+        assert b"Andr\xe9" in after, "the undecodable byte survived unchanged"
+        assert b"export EDITOR=vim\n" in after
+        assert b"alias ll='ls -la'\n" in after
+        assert b"export UNBOUND_PI_API_KEY=notakey" in after
+        assert after.startswith(self.LATIN1_PROFILE), "nothing before our line was rewritten"
+
+    def test_an_unreadable_rc_file_is_refused_not_rewritten(self, pi_mdm_setup, tmp_path):
+        """When the file genuinely cannot be read, losing the export beats losing the file."""
+        mod = pi_mdm_setup
+        rc = tmp_path / ".zprofile"
+        original = b"# precious\nexport EDITOR=vim\n"
+        rc.write_bytes(original)
+        rc.chmod(0o000)
+        try:
+            if os.access(str(rc), os.R_OK):  # running as root ignores the mode
+                pytest.skip("cannot make a file unreadable as this user")
+            assert mod.append_to_file(rc, "export UNBOUND_PI_API_KEY=k",
+                                      "UNBOUND_PI_API_KEY") is False
+        finally:
+            rc.chmod(0o644)
+        assert rc.read_bytes() == original, "the file we could not read was left alone"
+
+    def test_a_failed_write_leaves_the_profile_intact(
+            self, pi_mdm_setup, tmp_path, monkeypatch):
+        mod = pi_mdm_setup
+        rc = tmp_path / ".zprofile"
+        original = b"# precious\nexport EDITOR=vim\n"
+        rc.write_bytes(original)
+
+        monkeypatch.setattr(mod.os, "replace",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("ENOSPC")))
+        assert mod.append_to_file(rc, "export UNBOUND_PI_API_KEY=k",
+                                  "UNBOUND_PI_API_KEY") is False
+        assert rc.read_bytes() == original
+        assert list(tmp_path.glob("*" + TMP_SUFFIX)) == []
+
+    def test_an_rc_file_symlinked_into_a_dotfiles_repo_keeps_its_link(
+            self, pi_mdm_setup, tmp_path):
+        """The docstring calls a dotfiles symlink a legitimate setup, so the rewrite must
+        follow the link and edit the real file -- os.replace on the link path would swap the
+        link for a regular file and silently detach the user from their dotfiles."""
+        mod = pi_mdm_setup
+        dotfiles = tmp_path / "dotfiles"
+        dotfiles.mkdir()
+        real = dotfiles / "zprofile"
+        real.write_text("# tracked in git\nexport EDITOR=vim\n")
+        home = tmp_path / "home"
+        home.mkdir()
+        rc = home / ".zprofile"
+        rc.symlink_to(real)
+
+        assert mod.append_to_file(rc, "export UNBOUND_PI_API_KEY=k", "UNBOUND_PI_API_KEY")
+        assert rc.is_symlink(), "still a symlink into the dotfiles repo"
+        assert os.path.realpath(str(rc)) == str(real)
+        assert "UNBOUND_PI_API_KEY" in real.read_text(), "the real file got the export"
+        assert "# tracked in git" in real.read_text()
+
+    def test_the_file_mode_is_preserved(self, pi_mdm_setup, tmp_path):
+        """An rc file is sometimes 0600 on purpose; a rewrite must not widen it."""
+        mod = pi_mdm_setup
+        rc = tmp_path / ".zprofile"
+        rc.write_text("export EDITOR=vim\n")
+        rc.chmod(0o600)
+        assert mod.append_to_file(rc, "export UNBOUND_PI_API_KEY=k", "UNBOUND_PI_API_KEY")
+        assert stat.S_IMODE(rc.stat().st_mode) == 0o600
+
+    def test_removal_also_preserves_a_non_utf8_profile(self, pi_mdm_setup, tmp_path,
+                                                       monkeypatch):
+        """The clear path read strict UTF-8 too. It never wiped the file (the write was
+        inside the same try), but it reported "failed" and left our export behind."""
+        mod = pi_mdm_setup
+        home = tmp_path / "erin"
+        home.mkdir()
+        monkeypatch.setattr(mod, "_run_as_user", lambda user, fn, *a, **k: fn(*a, **k))
+        monkeypatch.setattr(mod, "_repair_user_ownership", lambda *a, **k: None)
+        monkeypatch.setattr(mod.platform, "system", lambda: "Darwin")
+
+        rc = home / ".zprofile"
+        rc.write_bytes(self.LATIN1_PROFILE + b"export UNBOUND_PI_API_KEY=notakey\n")
+
+        assert mod.remove_env_var_from_user("erin", home, "UNBOUND_PI_API_KEY") == "cleared"
+        after = rc.read_bytes()
+        assert b"UNBOUND_PI_API_KEY" not in after, "our export is gone"
+        assert b"Andr\xe9" in after, "and the undecodable byte survived"
+        assert b"export EDITOR=vim\n" in after
 
 
 class TestNothingCrossesThePrivilegeDropAsAPickle:
