@@ -29,6 +29,7 @@
 // store and a second fire finds nothing to send. Combined with the empty-turn guard, N fires per
 // prompt produce at most one POST.
 
+import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
 import { buildTurnLogBody, shouldPostTurn } from "../../core/src/turnLog.ts";
@@ -110,6 +111,8 @@ export interface AgentEndDeps {
    */
   telemetry?: Pick<Telemetry, "reportTurnLogFailure">;
   now?: () => number;
+  /** The process's settled account identity, attached to the turn log as `account_identity`. */
+  accountIdentity?: AccountIdentity;
 }
 
 /** The telemetry label for this path. Not a tool name; the field is a free-form label (§B6). */
@@ -145,6 +148,7 @@ export function handleAgentEnd(
       completedAtMs,
       assistantText,
       ...(deps.apiKey === undefined ? {} : { apiKey: deps.apiKey }),
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
     const dispatchedAtMs = completedAtMs;
 

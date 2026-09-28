@@ -38,6 +38,7 @@ import {
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
 } from "./constants.ts";
+import type { AccountIdentity } from "./accountIdentity.ts";
 import type {
   PreToolUseData,
   PretoolPayloadInput,
@@ -251,6 +252,45 @@ export function auditToolInput(
   return capToolInput(out);
 }
 
+const IDENTITY_FIELDS = [
+  "user_email",
+  "org_id",
+  "plan",
+  "auth_mode",
+  "email_domain",
+  "device_serial",
+] as const satisfies readonly (keyof AccountIdentity)[];
+
+/**
+ * A copy of `identity` holding only the six wire fields, and only where they are non-empty strings —
+ * or `undefined` when nothing survives. Every builder attaches identity through this, so a caller that
+ * hands over a wider object (or one holding a credential) cannot widen what is sent.
+ */
+export function sanitizeAccountIdentity(identity: unknown): AccountIdentity | undefined {
+  try {
+    if (identity === null || typeof identity !== "object" || Array.isArray(identity)) return undefined;
+    const source = identity as Record<string, unknown>;
+    const out: AccountIdentity = {};
+    for (const field of IDENTITY_FIELDS) {
+      const value = source[field];
+      if (typeof value === "string" && value.trim() !== "") out[field] = value;
+    }
+    return Object.keys(out).length > 0 ? out : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Set `account_identity` on `body` when there is one; leave the key absent otherwise. */
+export function withAccountIdentity<T extends { account_identity?: AccountIdentity }>(
+  body: T,
+  identity: unknown,
+): T {
+  const clean = sanitizeAccountIdentity(identity);
+  if (clean !== undefined) body.account_identity = clean;
+  return body;
+}
+
 /** Assemble the §B1 body. Pure: same input, same output, no side effects. */
 export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestBody {
   const metadata: Record<string, unknown> = {
@@ -296,7 +336,7 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
   // and every key that rides a request the caller did not ask for is a key a future reader has to
   // account for.
   if (input.pullPolicies === true) body.pull_policies = true;
-  return body;
+  return withAccountIdentity(body, input.accountIdentity);
 }
 
 /**
@@ -338,5 +378,5 @@ export function buildPromptPayload(input: PromptPayloadInput): PretoolRequestBod
   // Inert on this path — `handleGuardrails` never attaches `tools_to_check` (§C2) — so it is only
   // ever set if a caller explicitly asks, and no caller does today.
   if (input.pullPolicies === true) body.pull_policies = true;
-  return body;
+  return withAccountIdentity(body, input.accountIdentity);
 }

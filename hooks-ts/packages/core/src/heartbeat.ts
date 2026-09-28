@@ -22,6 +22,8 @@
 // cycling `/new` five times sends five heartbeats against an ungated implementation (T-09-23).
 
 import { APP_LABEL, EVENT_NAME_SESSION_START, TURNLOG_MODEL } from "./constants.ts";
+import type { AccountIdentity } from "./accountIdentity.ts";
+import { withAccountIdentity } from "./payload.ts";
 import type { PretoolRequestBody } from "./types.ts";
 
 export interface HeartbeatInput {
@@ -32,6 +34,8 @@ export interface HeartbeatInput {
   clientEntrypoint: string;
   hasUI: boolean;
   piVersion: string;
+  /** The account pi is signed in as, when the session_start lookup produced one. */
+  accountIdentity?: AccountIdentity;
 }
 
 export interface HeartbeatGate {
@@ -55,7 +59,7 @@ export interface HeartbeatGateOptions {
  * is not row-gating — but sending the same honest placeholder from both paths beats two conventions.
  */
 export function buildHeartbeatPayload(input: HeartbeatInput): PretoolRequestBody {
-  return {
+  const body: PretoolRequestBody = {
     conversation_id: input.sessionId,
     model: input.model !== undefined && input.model.length > 0 ? input.model : TURNLOG_MODEL,
     event_name: EVENT_NAME_SESSION_START,
@@ -77,6 +81,7 @@ export function buildHeartbeatPayload(input: HeartbeatInput): PretoolRequestBody
     pull_policies: true,
     first_approval_check: true,
   };
+  return withAccountIdentity(body, input.accountIdentity);
 }
 
 /**

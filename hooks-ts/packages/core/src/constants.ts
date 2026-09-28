@@ -326,3 +326,45 @@ export const KEY_REJECTED_NOTICE = "Unbound: API key rejected — enforcement in
  */
 export const KEY_REJECTED_BLOCK_REASON =
   "Unbound API key rejected — this organisation enforces fail-closed; contact your admin";
+
+// --- Account identity (parity with the Claude Code hook's `account_identity`) ------------------
+
+/** pi's credential store, beside its own install: `<agent dir>/auth.json`. Read, never written. */
+export const PI_AUTH_FILE_NAME = "auth.json";
+/** A handful of provider entries. Anything bigger is not pi's auth file, and is not opened. */
+export const MAX_AUTH_FILE_BYTES = 65_536;
+/** The only provider whose OAuth token we know how to turn into an account. */
+export const ANTHROPIC_PROVIDER_ID = "anthropic";
+/** pi's credential `type` for a subscription sign-in. */
+export const PI_AUTH_TYPE_OAUTH = "oauth";
+/**
+ * The profile endpoint Claude Code itself uses. The token goes to its own issuer and nowhere else:
+ * this is the ONLY request that ever carries it, and redirects are refused so it cannot be bounced.
+ */
+export const ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+export const ANTHROPIC_OAUTH_BETA_HEADER = "anthropic-beta";
+export const ANTHROPIC_OAUTH_BETA_VALUE = "oauth-2025-04-20";
+/** The profile answer is a small JSON object; a bigger body is ignored, not parsed. */
+export const MAX_PROFILE_BYTES = 65_536;
+/** Every identity field is a short label; anything longer is dropped rather than truncated. */
+export const MAX_IDENTITY_FIELD_CHARS = 320;
+/** One deadline for the profile call and for the serial probe, like the Python hook's `timeout=10`. */
+export const ACCOUNT_IDENTITY_TIMEOUT_MS = 10_000;
+/** `auth_mode` vocabulary, identical to what the Claude Code hook sends. */
+export const AUTH_MODE_SUBSCRIPTION = "subscription";
+export const AUTH_MODE_API_KEY = "api_key";
+/** Enough for `system_profiler SPHardwareDataType`; anything bigger is killed and ignored. */
+export const MAX_SERIAL_PROBE_BYTES = 1_048_576;
+/** The per-install fallbacks the Python hook reads on Linux when `dmidecode` is unavailable. */
+export const LINUX_MACHINE_ID_PATHS = ["/etc/machine-id", "/var/lib/dbus/machine-id"] as const;
+/**
+ * DMI/BIOS placeholders that come back with a zero exit code on VMs and OEM boards. Mapping them to a
+ * serial would put many machines on one fake device, so they read as "no serial" (`unbound.py`).
+ */
+export const PLACEHOLDER_SERIALS: readonly string[] = [
+  "", "0", "00000000", "000000000", "0000000000", "none", "na", "n/a",
+  "unknown", "default", "default string", "to be filled by o.e.m.",
+  "to be filled by oem", "system serial number", "serial number",
+  "not applicable", "not specified", "not available", "oem", "o.e.m.",
+  "invalid", "123456789", "xxxxxxxx",
+];

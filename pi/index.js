@@ -16,6 +16,11 @@
 // packages/pi/src/index.ts
 import { homedir } from "node:os";
 
+// packages/core/src/accountIdentity.ts
+import { execFile as nodeExecFile } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 // packages/core/src/constants.ts
 var ENV_API_KEY_PI = "UNBOUND_PI_API_KEY";
 var ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
@@ -88,6 +93,337 @@ var BREAKER_OPEN_NOTICE = "Unbound policy engine unreachable \u2014 allowing too
 var BREAKER_CLOSED_NOTICE = "Unbound policy engine reachable again \u2014 enforcement resumed";
 var KEY_REJECTED_NOTICE = "Unbound: API key rejected \u2014 enforcement inactive";
 var KEY_REJECTED_BLOCK_REASON = "Unbound API key rejected \u2014 this organisation enforces fail-closed; contact your admin";
+var PI_AUTH_FILE_NAME = "auth.json";
+var MAX_AUTH_FILE_BYTES = 65536;
+var ANTHROPIC_PROVIDER_ID = "anthropic";
+var PI_AUTH_TYPE_OAUTH = "oauth";
+var ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+var ANTHROPIC_OAUTH_BETA_HEADER = "anthropic-beta";
+var ANTHROPIC_OAUTH_BETA_VALUE = "oauth-2025-04-20";
+var MAX_PROFILE_BYTES = 65536;
+var MAX_IDENTITY_FIELD_CHARS = 320;
+var ACCOUNT_IDENTITY_TIMEOUT_MS = 1e4;
+var AUTH_MODE_SUBSCRIPTION = "subscription";
+var AUTH_MODE_API_KEY = "api_key";
+var MAX_SERIAL_PROBE_BYTES = 1048576;
+var LINUX_MACHINE_ID_PATHS = ["/etc/machine-id", "/var/lib/dbus/machine-id"];
+var PLACEHOLDER_SERIALS = [
+  "",
+  "0",
+  "00000000",
+  "000000000",
+  "0000000000",
+  "none",
+  "na",
+  "n/a",
+  "unknown",
+  "default",
+  "default string",
+  "to be filled by o.e.m.",
+  "to be filled by oem",
+  "system serial number",
+  "serial number",
+  "not applicable",
+  "not specified",
+  "not available",
+  "oem",
+  "o.e.m.",
+  "invalid",
+  "123456789",
+  "xxxxxxxx"
+];
+
+// packages/core/src/safeRead.ts
+import { lstatSync, readFileSync } from "node:fs";
+function readSmallRegularFile(path, maxBytes) {
+  try {
+    if (typeof path !== "string" || path === "") return void 0;
+    const stats = lstatSync(path);
+    if (!stats.isFile()) return void 0;
+    const size = stats.size;
+    if (typeof size !== "number" || !Number.isFinite(size) || size > maxBytes) return void 0;
+    return readFileSync(path, "utf8");
+  } catch {
+    return void 0;
+  }
+}
+
+// packages/core/src/accountIdentity.ts
+var PLACEHOLDERS = new Set(PLACEHOLDER_SERIALS);
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+function label(value) {
+  if (typeof value !== "string") return void 0;
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > MAX_IDENTITY_FIELD_CHARS) return void 0;
+  return trimmed;
+}
+function withDeadline(promise, ms, fallback) {
+  return new Promise((resolve) => {
+    let timer;
+    try {
+      timer = setTimeout(() => resolve(fallback), ms);
+      timer.unref?.();
+    } catch {
+      resolve(fallback);
+      return;
+    }
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(fallback);
+      }
+    );
+  });
+}
+function attempt(fn) {
+  try {
+    return fn();
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+function readPiAuth(agentDir) {
+  try {
+    if (typeof agentDir !== "string" || agentDir === "") return void 0;
+    const raw = readSmallRegularFile(join(agentDir, PI_AUTH_FILE_NAME), MAX_AUTH_FILE_BYTES);
+    if (raw === void 0) return void 0;
+    const parsed = JSON.parse(raw);
+    if (!isRecord(parsed)) return void 0;
+    const out = {};
+    for (const [provider, value] of Object.entries(parsed)) {
+      if (!isRecord(value) || typeof value.type !== "string") continue;
+      const entry = { type: value.type };
+      if (typeof value.access === "string" && value.access.length > 0) entry.access = value.access;
+      if (typeof value.expires === "number" && Number.isFinite(value.expires)) entry.expires = value.expires;
+      out[provider] = entry;
+    }
+    return out;
+  } catch {
+    return void 0;
+  }
+}
+function chooseProvider(auth, modelProvider) {
+  try {
+    const fromModel = label(modelProvider);
+    if (fromModel !== void 0) return fromModel;
+    if (!isRecord(auth)) return void 0;
+    const providers = Object.keys(auth);
+    return providers.length === 1 ? providers[0] : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function isAnthropicOAuth(provider, entry) {
+  return provider === ANTHROPIC_PROVIDER_ID && entry?.type === PI_AUTH_TYPE_OAUTH;
+}
+async function fetchAnthropicProfile(token, opts = {}) {
+  try {
+    if (typeof token !== "string" || token.length === 0) return void 0;
+    const timeoutMs = opts.timeoutMs ?? ACCOUNT_IDENTITY_TIMEOUT_MS;
+    const fetchImpl = opts.fetch ?? globalThis.fetch;
+    const request = attempt(async () => {
+      const res = await fetchImpl(opts.url ?? ANTHROPIC_PROFILE_URL, {
+        method: "GET",
+        headers: {
+          authorization: `Bearer ${token}`,
+          [ANTHROPIC_OAUTH_BETA_HEADER]: ANTHROPIC_OAUTH_BETA_VALUE,
+          accept: "application/json"
+        },
+        // The token must not follow a redirect anywhere, even same-origin.
+        redirect: "error",
+        signal: AbortSignal.timeout(timeoutMs)
+      });
+      if (!res.ok) return void 0;
+      const declared = Number(res.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > MAX_PROFILE_BYTES) return void 0;
+      const text = await res.text();
+      if (text.length > MAX_PROFILE_BYTES) return void 0;
+      return parseProfile(JSON.parse(text));
+    });
+    return await withDeadline(request, timeoutMs, void 0);
+  } catch {
+    return void 0;
+  }
+}
+function parseProfile(body) {
+  if (!isRecord(body)) return void 0;
+  const profile = {};
+  const account = isRecord(body.account) ? body.account : {};
+  const organization = isRecord(body.organization) ? body.organization : {};
+  const email = label(account.email);
+  if (email !== void 0 && email.includes("@")) profile.email = email;
+  const orgId = label(organization.uuid);
+  if (orgId !== void 0) profile.orgId = orgId;
+  const plan = label(organization.organization_type);
+  if (plan !== void 0) profile.plan = plan;
+  return profile;
+}
+function emailDomain(email) {
+  if (email === void 0) return void 0;
+  const at = email.lastIndexOf("@");
+  if (at === -1) return void 0;
+  const domain = email.slice(at + 1).trim().toLowerCase();
+  return domain.length > 0 ? domain : void 0;
+}
+function buildAccountIdentity(input) {
+  try {
+    if (!isRecord(input?.auth)) return void 0;
+    const identity = {};
+    const provider = input.provider;
+    const entry = provider === void 0 ? void 0 : input.auth[provider];
+    if (entry !== void 0) {
+      if (isAnthropicOAuth(provider, entry)) {
+        identity.auth_mode = AUTH_MODE_SUBSCRIPTION;
+        const profile = input.profile;
+        const email = label(profile?.email);
+        if (email !== void 0) {
+          identity.user_email = email;
+          const domain = emailDomain(email);
+          if (domain !== void 0) identity.email_domain = domain;
+        }
+        const orgId = label(profile?.orgId);
+        if (orgId !== void 0) identity.org_id = orgId;
+        const plan = label(profile?.plan);
+        if (plan !== void 0) identity.plan = plan;
+      } else {
+        identity.auth_mode = AUTH_MODE_API_KEY;
+      }
+    }
+    const serial = label(input.deviceSerial);
+    if (serial !== void 0 && isValidSerial(serial)) identity.device_serial = serial;
+    return Object.keys(identity).length > 0 ? identity : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function isValidSerial(value) {
+  return typeof value === "string" && value.trim() !== "" && !PLACEHOLDERS.has(value.trim().toLowerCase());
+}
+function probeToolPath(tool, env = process.env) {
+  switch (tool) {
+    case "system_profiler":
+      return "/usr/sbin/system_profiler";
+    case "dmidecode":
+      return "/usr/sbin/dmidecode";
+    case "powershell": {
+      const root = typeof env.SystemRoot === "string" && env.SystemRoot.trim() !== "" ? env.SystemRoot : "C:\\Windows";
+      return `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+    }
+  }
+}
+var defaultExecFile = (file, args, opts) => new Promise((resolve) => {
+  try {
+    nodeExecFile(
+      file,
+      [...args],
+      { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8", cwd: tmpdir() },
+      (error, stdout) => resolve(error === null && typeof stdout === "string" ? stdout : void 0)
+    );
+  } catch {
+    resolve(void 0);
+  }
+});
+function firstValid(stdout) {
+  return stdout !== void 0 && isValidSerial(stdout) ? stdout.trim() : void 0;
+}
+async function probeSerial(opts, timeoutMs) {
+  const run = opts.execFile ?? defaultExecFile;
+  const exec = (file, args) => attempt(() => run(file, args, { timeoutMs, maxBytes: MAX_SERIAL_PROBE_BYTES })).catch(() => void 0);
+  const platform = opts.platform ?? process.platform;
+  if (platform === "darwin") {
+    const out = await exec(probeToolPath("system_profiler"), ["SPHardwareDataType"]);
+    for (const line of (out ?? "").split("\n")) {
+      if (!line.includes("Serial Number")) continue;
+      const sep = line.indexOf(": ");
+      if (sep === -1) continue;
+      const value = line.slice(sep + 2);
+      if (isValidSerial(value)) return value.trim();
+    }
+    return void 0;
+  }
+  if (platform === "linux") {
+    const dmi = firstValid(await exec(probeToolPath("dmidecode"), ["-s", "system-serial-number"]));
+    if (dmi !== void 0) return dmi;
+    const read = opts.readFile ?? ((path) => readSmallRegularFile(path, 4096));
+    for (const path of LINUX_MACHINE_ID_PATHS) {
+      try {
+        const value = firstValid(read(path));
+        if (value !== void 0) return value;
+      } catch {
+      }
+    }
+    return void 0;
+  }
+  if (platform === "win32") {
+    const bios = firstValid(
+      await exec(probeToolPath("powershell"), ["-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"])
+    );
+    if (bios !== void 0) return bios;
+    return firstValid(
+      await exec(probeToolPath("powershell"), [
+        "-NoProfile",
+        "-Command",
+        "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"
+      ])
+    );
+  }
+  return void 0;
+}
+async function readDeviceSerial(opts = {}) {
+  try {
+    const timeoutMs = opts.timeoutMs ?? ACCOUNT_IDENTITY_TIMEOUT_MS;
+    return await withDeadline(attempt(() => probeSerial(opts, timeoutMs)), timeoutMs, void 0);
+  } catch {
+    return void 0;
+  }
+}
+function createAccountIdentityLoader(opts) {
+  let pending;
+  let settled;
+  async function compute(modelProvider) {
+    const auth = readPiAuth(opts.agentDir);
+    if (auth === void 0) return void 0;
+    const provider = chooseProvider(auth, modelProvider);
+    const entry = provider === void 0 ? void 0 : auth[provider];
+    const now = (opts.now ?? Date.now)();
+    const live = isAnthropicOAuth(provider, entry) && entry?.access !== void 0 && entry.expires !== void 0 && entry.expires > now;
+    const timeoutMs = opts.timeoutMs ?? ACCOUNT_IDENTITY_TIMEOUT_MS;
+    const [profile, deviceSerial] = await Promise.all([
+      live && entry?.access !== void 0 ? fetchAnthropicProfile(entry.access, {
+        timeoutMs,
+        ...opts.fetch === void 0 ? {} : { fetch: opts.fetch },
+        ...opts.profileUrl === void 0 ? {} : { url: opts.profileUrl }
+      }) : Promise.resolve(void 0),
+      readDeviceSerial({ ...opts, timeoutMs })
+    ]);
+    return buildAccountIdentity({
+      auth,
+      provider,
+      ...profile === void 0 ? {} : { profile },
+      ...deviceSerial === void 0 ? {} : { deviceSerial }
+    });
+  }
+  return {
+    start(modelProvider) {
+      if (pending === void 0) {
+        pending = attempt(() => compute(modelProvider)).catch(() => void 0).then((identity) => {
+          settled = identity;
+          return identity;
+        });
+      }
+      return pending;
+    },
+    current() {
+      return settled;
+    }
+  };
+}
 
 // packages/core/src/breaker.ts
 function createBreaker(opts = {}) {
@@ -132,22 +468,7 @@ function createBreaker(opts = {}) {
 // packages/core/src/cache.ts
 import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { dirname, isAbsolute, join } from "node:path";
-
-// packages/core/src/safeRead.ts
-import { lstatSync, readFileSync } from "node:fs";
-function readSmallRegularFile(path, maxBytes) {
-  try {
-    if (typeof path !== "string" || path === "") return void 0;
-    const stats = lstatSync(path);
-    if (!stats.isFile()) return void 0;
-    const size = stats.size;
-    if (typeof size !== "number" || !Number.isFinite(size) || size > maxBytes) return void 0;
-    return readFileSync(path, "utf8");
-  } catch {
-    return void 0;
-  }
-}
+import { dirname, isAbsolute, join as join2 } from "node:path";
 
 // packages/core/src/policyState.ts
 function parseFailureAction(raw) {
@@ -333,6 +654,33 @@ function auditToolInput(toolInput, command) {
   if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
   return capToolInput(out);
 }
+var IDENTITY_FIELDS = [
+  "user_email",
+  "org_id",
+  "plan",
+  "auth_mode",
+  "email_domain",
+  "device_serial"
+];
+function sanitizeAccountIdentity(identity) {
+  try {
+    if (identity === null || typeof identity !== "object" || Array.isArray(identity)) return void 0;
+    const source = identity;
+    const out = {};
+    for (const field of IDENTITY_FIELDS) {
+      const value = source[field];
+      if (typeof value === "string" && value.trim() !== "") out[field] = value;
+    }
+    return Object.keys(out).length > 0 ? out : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function withAccountIdentity(body, identity) {
+  const clean = sanitizeAccountIdentity(identity);
+  if (clean !== void 0) body.account_identity = clean;
+  return body;
+}
 function buildPretoolPayload(input) {
   const metadata = {
     cwd: input.cwd,
@@ -368,7 +716,7 @@ function buildPretoolPayload(input) {
     client_entrypoint: input.clientEntrypoint
   };
   if (input.pullPolicies === true) body.pull_policies = true;
-  return body;
+  return withAccountIdentity(body, input.accountIdentity);
 }
 function buildPromptPayload(input) {
   const capped = capCommand(input.prompt, MAX_PROMPT_CHARS);
@@ -387,7 +735,7 @@ function buildPromptPayload(input) {
     client_entrypoint: input.clientEntrypoint
   };
   if (input.pullPolicies === true) body.pull_policies = true;
-  return body;
+  return withAccountIdentity(body, input.accountIdentity);
 }
 
 // packages/core/src/cache.ts
@@ -396,17 +744,25 @@ function expandTilde(raw, homeDir) {
   const trimmed = raw.trim();
   if (trimmed.length === 0) return void 0;
   if (trimmed === "~") return homeDir;
-  if (trimmed.startsWith("~/")) return join(homeDir, trimmed.slice(2));
+  if (trimmed.startsWith("~/")) return join2(homeDir, trimmed.slice(2));
   return trimmed;
 }
 function resolveCachePath(env, homeDir) {
-  let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
-  if (base === void 0 || !isAbsolute(base)) {
-    if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return void 0;
-    base = join(homeDir, ...PI_AGENT_DIR_SEGMENTS);
+  const base = resolvePiAgentDir(env, homeDir);
+  if (base === void 0) return void 0;
+  return join2(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
+}
+function resolvePiAgentDir(env, homeDir) {
+  try {
+    let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
+    if (base === void 0 || !isAbsolute(base)) {
+      if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return void 0;
+      base = join2(homeDir, ...PI_AGENT_DIR_SEGMENTS);
+    }
+    return isAbsolute(base) ? base : void 0;
+  } catch {
+    return void 0;
   }
-  if (!isAbsolute(base)) return void 0;
-  return join(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
 }
 function keyFingerprint(apiKey) {
   const material = typeof apiKey === "string" ? apiKey : "";
@@ -590,7 +946,7 @@ function createApiClient(opts) {
 
 // packages/core/src/heartbeat.ts
 function buildHeartbeatPayload(input) {
-  return {
+  const body = {
     conversation_id: input.sessionId,
     model: input.model !== void 0 && input.model.length > 0 ? input.model : TURNLOG_MODEL,
     event_name: EVENT_NAME_SESSION_START,
@@ -612,6 +968,7 @@ function buildHeartbeatPayload(input) {
     pull_policies: true,
     first_approval_check: true
   };
+  return withAccountIdentity(body, input.accountIdentity);
 }
 function createHeartbeatGate(opts) {
   let lastSentAt;
@@ -638,11 +995,11 @@ function createHeartbeatGate(opts) {
 }
 
 // packages/core/src/config.ts
-import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
+import { isAbsolute as isAbsolute2, join as join3 } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 function readUnboundConfig(homeDir) {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute2(homeDir)) return {};
-  const raw = readSmallRegularFile(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  const raw = readSmallRegularFile(join3(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
   if (raw === void 0) return {};
   try {
     const parsed = JSON.parse(raw);
@@ -769,7 +1126,7 @@ function buildTurnLogBody(record, opts) {
   if (truncated !== void 0) body.results_truncated = truncated;
   if (callsTruncated !== void 0) body.tool_calls_truncated = callsTruncated;
   if (assistant.truncated) body.assistant_truncated = true;
-  return body;
+  return withAccountIdentity(body, opts?.accountIdentity);
 }
 
 // packages/core/src/keyState.ts
@@ -805,7 +1162,7 @@ var keyState = createKeyState();
 
 // packages/core/src/piVersion.ts
 import { readFileSync as readFileSync2 } from "node:fs";
-import { dirname as dirname2, join as join3 } from "node:path";
+import { dirname as dirname2, join as join4 } from "node:path";
 var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 var MAX_WALK_UP_LEVELS = 8;
 var MAX_VERSION_CHARS = 32;
@@ -813,7 +1170,7 @@ function readManagedInstallVersion(env) {
   const root = env[ENV_PI_INSTALL_ROOT];
   if (typeof root !== "string" || root.length === 0) return void 0;
   try {
-    const version = readFileSync2(join3(root, "current-version"), "utf8").trim();
+    const version = readFileSync2(join4(root, "current-version"), "utf8").trim();
     return version.length > 0 ? version : void 0;
   } catch {
     return void 0;
@@ -824,7 +1181,7 @@ function readVersionFromArgv(argv1) {
   let dir = dirname2(argv1);
   for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
     try {
-      const parsed = JSON.parse(readFileSync2(join3(dir, "package.json"), "utf8"));
+      const parsed = JSON.parse(readFileSync2(join4(dir, "package.json"), "utf8"));
       if (parsed !== null && typeof parsed === "object") {
         const pkg = parsed;
         if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {
@@ -1215,7 +1572,8 @@ function handleAgentEnd(event, ctx, deps) {
       cwd,
       completedAtMs,
       assistantText,
-      ...deps.apiKey === void 0 ? {} : { apiKey: deps.apiKey }
+      ...deps.apiKey === void 0 ? {} : { apiKey: deps.apiKey },
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
     });
     const dispatchedAtMs = completedAtMs;
     void deps.client.postTurnLog(body).then((ok) => {
@@ -1303,7 +1661,8 @@ async function decideToolCall(event, ctx, deps) {
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
-      pullPolicies
+      pullPolicies,
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
@@ -1351,7 +1710,8 @@ async function decideInput(event, ctx, deps) {
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
-      hasUI: ctx.hasUI
+      hasUI: ctx.hasUI,
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "user_prompt", hooks);
@@ -1425,7 +1785,8 @@ async function decideUserBash(event, ctx, deps) {
       cwd: event.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
-      clientEntrypoint: deps.entrypoint
+      clientEntrypoint: deps.entrypoint,
+      ...deps.accountIdentity === void 0 ? {} : { accountIdentity: deps.accountIdentity }
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
@@ -1476,6 +1837,14 @@ function safeCwd(ctx) {
     return typeof ctx.cwd === "string" ? ctx.cwd : "";
   } catch {
     return "";
+  }
+}
+function modelProviderOf(ctx) {
+  try {
+    const provider = ctx.model?.provider;
+    return typeof provider === "string" && provider.length > 0 ? provider : void 0;
+  } catch {
+    return void 0;
   }
 }
 function versionOf(entrypoint) {
@@ -1532,8 +1901,21 @@ function createExtension(overrides = {}) {
     // temp HOME cannot accidentally read or write the developer's real cache.
     makeChecker: overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
     entrypoint: overrides.entrypoint,
-    heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate
+    heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate,
+    identity: overrides.identity ?? {}
   };
+  const identityLoader = createAccountIdentityLoader({
+    ...deps.identity,
+    agentDir: resolvePiAgentDir(env, homeDir)
+  });
+  function identityOption() {
+    try {
+      const identity = identityLoader.current();
+      return identity === void 0 ? {} : { accountIdentity: identity };
+    } catch {
+      return {};
+    }
+  }
   let resolved;
   let notified = false;
   function init() {
@@ -1570,18 +1952,26 @@ function createExtension(overrides = {}) {
         }
         if (state.apiKey === void 0 || state.client === void 0) return void 0;
         if (keyState.isInactive()) return void 0;
+        const identityPending = identityLoader.start(modelProviderOf(ctx));
         if (!deps.heartbeatGate.shouldSend(policyState.getFetchedAt())) return void 0;
         deps.heartbeatGate.markSent();
-        const payload = buildHeartbeatPayload({
+        const heartbeatInput = {
           cwd: safeCwd(ctx),
           sessionId: sessionIdOf(ctx),
           model: ctx.model?.id,
           clientEntrypoint: state.entrypoint,
           hasUI: ctx.hasUI === true,
           piVersion: versionOf(state.entrypoint)
-        });
+        };
         const client = state.client;
-        void client.postPretool(payload).then((result) => {
+        void identityPending.then(
+          (identity) => client.postPretool(
+            buildHeartbeatPayload({
+              ...heartbeatInput,
+              ...identity === void 0 ? {} : { accountIdentity: identity }
+            })
+          )
+        ).then((result) => {
           if (!result.ok) return;
           policyState.recordSuccess(result.body);
           try {
@@ -1611,6 +2001,7 @@ function createExtension(overrides = {}) {
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          ...identityOption(),
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
@@ -1643,7 +2034,8 @@ function createExtension(overrides = {}) {
           client: state.client,
           store: turnStore,
           ...state.apiKey === void 0 ? {} : { apiKey: state.apiKey },
-          ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry }
+          ...state.telemetry === void 0 ? {} : { telemetry: state.telemetry },
+          ...identityOption()
         });
       } catch {
         return void 0;
@@ -1657,6 +2049,7 @@ function createExtension(overrides = {}) {
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          ...identityOption(),
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
           onDecision: (entry) => {
             if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
@@ -1674,6 +2067,7 @@ function createExtension(overrides = {}) {
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          ...identityOption(),
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
           // The turn log's only source for the prompt: `agent_end.messages` is pi's `newMessages`
           // and never contains it (§A4). Called for an ALLOWED prompt only — a suppressed turn
