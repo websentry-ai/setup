@@ -1518,13 +1518,21 @@ def main() -> bool:
 
     rows = []
     installed_any = False
+    covered_any = False
     for username, home_dir in user_homes:
         print(f"\n--- {username} ---")
         extension_status = install_for_user(username, home_dir, payload, digest)
-        if extension_status in ("installed", "persisted"):
+        extension_ok = extension_status in ("installed", "persisted")
+        if extension_ok:
             installed_any = True
         env_ok, _ = set_env_var_for_user(username, home_dir, ENV_API_KEY_PI, api_key)
         config_ok = write_unbound_config_for_user(username, home_dir, api_key, urls=urls)
+        # An installed extension with no key is inert (config.ts resolves no key from an
+        # absent env var and an absent config), so coverage needs BOTH halves. Either key
+        # location is enough on its own: the rc export serves new shells, config.json serves
+        # the current one and GUI launches.
+        if extension_ok and (env_ok or config_ok):
+            covered_any = True
         if env_ok and config_ok:
             key_status = "rc + config.json"
         elif env_ok:
@@ -1558,6 +1566,17 @@ def main() -> bool:
 
     if not installed_any:
         print("❌ The extension reached no user on this device. See the table above.")
+        return False
+
+    # Installed is not configured. An account whose rc files AND config.json both failed has
+    # an extension that loads, reads no key and enforces nothing -- and exiting zero there
+    # told the MDM everything was fine, so nothing was ever remediated. The extension stays
+    # on disk (removing it would be worse), but the run is a failure.
+    if not covered_any:
+        print("❌ The extension is installed, but no account has a key it can read: every")
+        print(f"   {ENV_API_KEY_PI} export and every config.json write failed. The extension")
+        print("   loads and enforces nothing. See the key column above, fix the permissions")
+        print("   on those files, and re-run this push.")
         return False
 
     print("=" * 60)

@@ -201,6 +201,38 @@ def test_one_bad_home_still_covers_the_others_and_reports_once(pi_mdm_setup, dev
     assert "alice" in out and "bob" in out
 
 
+def test_a_run_where_no_account_got_a_key_is_a_failure(pi_mdm_setup, device, monkeypatch,
+                                                       capsys):
+    """Installing the extension was the whole success condition, so a device where every rc
+    write AND every config write failed still printed "Setup complete" and exited zero: an
+    extension loaded in every home, resolving no key, enforcing nothing, and no failure for
+    the MDM to remediate. The extension stays on disk -- removing it would be worse -- but
+    the run is a failure."""
+    mod = pi_mdm_setup
+    monkeypatch.setattr(mod, "set_env_var_for_user", lambda *a, **k: (False, False))
+    monkeypatch.setattr(mod, "write_unbound_config_for_user", lambda *a, **k: False)
+
+    assert mod.main() is False
+    out = capsys.readouterr().out
+    assert "no account has a key" in out
+    assert "Setup complete" not in out
+    for _, home in device.homes:
+        assert _installed(home).exists()
+    assert len(device.reports) == 1, "a device that needs attention must still report"
+
+
+@pytest.mark.parametrize("env_ok,config_ok", [(True, False), (False, True)])
+def test_either_key_location_alone_is_coverage(pi_mdm_setup, device, monkeypatch,
+                                               env_ok, config_ok):
+    """One working key location is a working install: a symlinked config.json is refused by
+    design, and an unwritable rc file is ordinary. Neither failure alone may fail the run."""
+    mod = pi_mdm_setup
+    monkeypatch.setattr(mod, "set_env_var_for_user", lambda *a, **k: (env_ok, env_ok))
+    monkeypatch.setattr(mod, "write_unbound_config_for_user", lambda *a, **k: config_ok)
+
+    assert mod.main() is True
+
+
 def test_a_report_failure_does_not_change_the_exit_status(pi_mdm_setup, device, capsys):
     """The extension is installed and enforcing whether or not the backend heard about it;
     an MDM policy that went red on a telemetry hiccup would be re-run pointlessly."""

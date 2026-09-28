@@ -113,6 +113,15 @@ deleted, and an existing `.unbound-disabled` file is never overwritten.
 One unwritable home costs that user their coverage and nothing more; the loop continues and
 prints a per-user result table.
 
+## What counts as a successful push
+
+An account is covered only when **both** halves landed: the extension, and a key it can read
+(the `UNBOUND_PI_API_KEY` export, or `api_key` in `~/.unbound/config.json` — either one is
+enough). An extension with no readable key loads and enforces nothing, so a run where no
+account got a key exits `1` even though every `index.js` is on disk. The extension is left in
+place; removing it would be worse, and the next push repairs the key. Exiting `0` there used
+to tell the MDM the device was fine, which is precisely the device that needed remediation.
+
 ## The integrity sidecar, honestly
 
 `pi/index.js.sha256` is fetched from the same origin, over the same TLS, from the same ref as
