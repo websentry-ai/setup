@@ -152,6 +152,26 @@ export const CACHE_TTL_MS = 300_000;
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;
 /**
+ * The largest `policy_cache.json` that is opened at all (CR-01 / WR-01).
+ *
+ * Two jobs. The obvious one is a byte cap on untrusted external data, matching the convention the S3
+ * catalog reader already follows. The load-bearing one is that having a cap at all is what forces the
+ * `lstat`-before-`read` in `safeRead.ts`: the size question cannot be asked without a stat, and the
+ * stat is what refuses a FIFO — the shape that makes `readFileSync` block forever rather than throw.
+ *
+ * 64 KiB against a real record of a few hundred bytes. `MAX_TOOLS_TO_CHECK` × `MAX_TOOL_NAME_CHARS`
+ * is ~32 KiB of `tools_to_check` in the worst case the writer can produce, so the cap is above
+ * anything this extension writes and far below anything worth parsing.
+ */
+export const MAX_CACHE_BYTES = 65_536;
+/**
+ * The same guard for `~/.unbound/config.json` (CR-01). Separate constant, larger value: the config
+ * file is shared with unbound-cli and six other tools, so it may legitimately carry keys this
+ * extension never reads, and a cap that refused a file the CLI wrote would silently unset identity —
+ * i.e. an inert extension. 256 KiB is far above any credential file and still bounds the read.
+ */
+export const MAX_CONFIG_BYTES = 262_144;
+/**
  * HOOK-06's bail-out: the largest canonical content projection that is actually hashed (§F7).
  *
  * `tool_result` is an **awaited** pass over every tool result (`agent-session.js:265-294` gates it

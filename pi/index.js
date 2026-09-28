@@ -54,6 +54,8 @@ var BREAKER_FAILURE_THRESHOLD = 3;
 var BREAKER_OPEN_MS = 6e4;
 var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
+var MAX_CACHE_BYTES = 65536;
+var MAX_CONFIG_BYTES = 262144;
 var MAX_HASH_BYTES = 4194304;
 var MAX_TURN_RESULTS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
@@ -124,9 +126,24 @@ function createBreaker(opts = {}) {
 }
 
 // packages/core/src/cache.ts
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
+
+// packages/core/src/safeRead.ts
+import { lstatSync, readFileSync } from "node:fs";
+function readSmallRegularFile(path, maxBytes) {
+  try {
+    if (typeof path !== "string" || path === "") return void 0;
+    const stats = lstatSync(path);
+    if (!stats.isFile()) return void 0;
+    const size = stats.size;
+    if (typeof size !== "number" || !Number.isFinite(size) || size > maxBytes) return void 0;
+    return readFileSync(path, "utf8");
+  } catch {
+    return void 0;
+  }
+}
 
 // packages/core/src/policyState.ts
 function parseFailureAction(raw) {
@@ -369,12 +386,8 @@ function keyFingerprint(apiKey) {
   return KEY_FINGERPRINT_PREFIX + createHash("sha256").update(material, "utf8").digest("hex").slice(0, 16);
 }
 function readCache(path, identity) {
-  let raw;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return void 0;
-  }
+  const raw = readSmallRegularFile(path, MAX_CACHE_BYTES);
+  if (raw === void 0) return void 0;
   let parsed;
   try {
     parsed = JSON.parse(raw);
@@ -659,13 +672,13 @@ function buildTurnLogBody(record, opts) {
 }
 
 // packages/core/src/config.ts
-import { readFileSync as readFileSync2 } from "node:fs";
 import { isAbsolute as isAbsolute2, join as join2 } from "node:path";
 var LOOPBACK_HOSTS = /* @__PURE__ */ new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
 function readUnboundConfig(homeDir) {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute2(homeDir)) return {};
+  const raw = readSmallRegularFile(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  if (raw === void 0) return {};
   try {
-    const raw = readFileSync2(join2(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
     const parsed = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed;
@@ -743,7 +756,7 @@ function createKeyState(opts = {}) {
 var keyState = createKeyState();
 
 // packages/core/src/piVersion.ts
-import { readFileSync as readFileSync3 } from "node:fs";
+import { readFileSync as readFileSync2 } from "node:fs";
 import { dirname as dirname2, join as join3 } from "node:path";
 var PI_PACKAGE_NAME = "@earendil-works/pi-coding-agent";
 var MAX_WALK_UP_LEVELS = 8;
@@ -752,7 +765,7 @@ function readManagedInstallVersion(env) {
   const root = env[ENV_PI_INSTALL_ROOT];
   if (typeof root !== "string" || root.length === 0) return void 0;
   try {
-    const version = readFileSync3(join3(root, "current-version"), "utf8").trim();
+    const version = readFileSync2(join3(root, "current-version"), "utf8").trim();
     return version.length > 0 ? version : void 0;
   } catch {
     return void 0;
@@ -763,7 +776,7 @@ function readVersionFromArgv(argv1) {
   let dir = dirname2(argv1);
   for (let level = 0; level < MAX_WALK_UP_LEVELS; level += 1) {
     try {
-      const parsed = JSON.parse(readFileSync3(join3(dir, "package.json"), "utf8"));
+      const parsed = JSON.parse(readFileSync2(join3(dir, "package.json"), "utf8"));
       if (parsed !== null && typeof parsed === "object") {
         const pkg = parsed;
         if (pkg.name === PI_PACKAGE_NAME && typeof pkg.version === "string" && pkg.version.length > 0) {

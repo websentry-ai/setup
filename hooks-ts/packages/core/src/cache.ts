@@ -19,6 +19,10 @@
 //   * **0600 file in a 0700 directory, written temp+rename** (T-09-01/T-09-15). Concurrent pi
 //     sessions share this file; a torn read is a miss, and the in-memory copy stays authoritative
 //     for the session (`policyState.hydrate` never downgrades a network-learned value).
+//   * **Only a small regular file is opened at all** (CR-01/WR-01, via `safeRead.ts`). A try/catch
+//     cannot intercept a *blocking* syscall, so "every fs call is in a try/catch" was never enough:
+//     a `policy_cache.json` that is a FIFO makes `readFileSync` hang forever inside `init()`, which
+//     every handler awaits. An `lstat` answers both the shape and the size question without blocking.
 //   * **A non-absolute base directory is refused outright**, the same guard `config.ts` carries: a
 //     relative path resolves against the process cwd, i.e. whatever repository pi was started in,
 //     which could then plant its own cache.
@@ -29,7 +33,7 @@
 // what we can act on. The two timestamps replace its single `last_synced`; see `policyState.ts` for
 // why (`handleGuardrails` omits `tools_to_check`, so one timestamp disables file checks for 300 s).
 
-import { chmodSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -39,8 +43,10 @@ import {
   CACHE_TTL_MS,
   ENV_PI_AGENT_DIR,
   KEY_FINGERPRINT_PREFIX,
+  MAX_CACHE_BYTES,
   PI_AGENT_DIR_SEGMENTS,
 } from "./constants.ts";
+import { readSmallRegularFile } from "./safeRead.ts";
 import { parseFailureAction, parseTimestamp, parseToolsToCheck } from "./policyState.ts";
 import type { FailureAction, PolicySnapshot, PolicyState } from "./policyState.ts";
 import { NATIVE_FILE_TOOLS } from "./payload.ts";
@@ -110,17 +116,18 @@ export function keyFingerprint(apiKey: string): string {
  * Read and validate the cache. **Any** surprise is a miss: a missing file, an EACCES, an EISDIR, an
  * empty or half-written file, JSON that is not an object, or an identity that does not match.
  *
+ * The read goes through `readSmallRegularFile`, which `lstat`s first and refuses anything that is not
+ * a regular file of at most `MAX_CACHE_BYTES` (CR-01 / WR-01). A bare `readFileSync` here was the one
+ * genuinely non-total statement in the file: on a FIFO it blocks forever, inside `init()`, inside a
+ * handler pi awaits. See `safeRead.ts` for the two ways that path is reachable.
+ *
  * Field-level damage is narrower than record-level damage, deliberately: a malformed
  * `tools_to_check` drops that field **and its timestamp** (so no file tool is skipped) while leaving
  * the failure action usable, because losing a remembered fail-closed setting is the worse outcome.
  */
 export function readCache(path: string, identity: CacheIdentity): CachedPolicy | undefined {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch {
-    return undefined;
-  }
+  const raw = readSmallRegularFile(path, MAX_CACHE_BYTES);
+  if (raw === undefined) return undefined;
 
   let parsed: unknown;
   try {
