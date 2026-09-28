@@ -220,6 +220,9 @@ no further work), **Phase 10**, or **product** (a decision outside engineering's
 | 9 | **A heartbeat cannot warm `tools_to_check`** | `handleGuardrails` omits the tool list by design (`preToolUseHandler.ts:1399-1405`) and the empty-`tool_name` path omits it too (`:1008-1012`); faking `tool_name: "ls"` was rejected because it can fire a Slack approval for a call that never happened | The first real tool call of a process always round-trips. Needs a first-class `session_start` branch in the API returning `computeToolsToCheck` | Phase 7 / API |
 | 10 | **`'auto'` as the turn-log model is unverified** | Assumption A1: every Python hook uses `'auto'` and those turn logs produce rows, so `'auto'` is inferred to be an enabled global `AIModel` | If it is not, every `/v1/hooks/pi` row is silently dropped (`add_gateway_metrics_task.py:573-577`) and RES-04 is unproven. **Still unverified** — it needs one staging curl, and staging does not yet run Phase 7 | Phase 7 / API |
 
+> **Decision (2026-09-28, #355 review):** assistant text CAN echo tool output — the model quotes what a tool returned — so HOOK-06's "tool output is hashed" guarantee covers the `tool_response` field, not everything the model says about it. This is the same exposure every other hook's turn log has. Mitigations: `redactSecrets` (session key + bearer tokens) runs on assistant text and `tool_input.command` before egress (commit 69ebba3); server-side DLP scans the turn log as it does for Claude Code/Cursor. The pretool row already stores the verbatim command, so the turn-log command adds no new exposure. A per-org opt-out of assistant-text forwarding is a backlog item.
+
+
 ---
 
 ## Metadata
