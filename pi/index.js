@@ -60,6 +60,7 @@ var MAX_TOOL_NAME_CHARS = 64;
 var MAX_CONFIG_BYTES = 262144;
 var MAX_HASH_BYTES = 4194304;
 var MAX_TURN_RESULTS = 500;
+var MAX_TURN_TOOL_CALLS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
@@ -653,12 +654,14 @@ function buildTurnLogBody(record, opts) {
   let toolUse = [];
   let startedAt;
   let truncated;
+  let callsTruncated;
   try {
     const safe = record === null || typeof record !== "object" ? { tool_calls: [], results: [] } : record;
     conversationId = typeof safe.session_id === "string" ? safe.session_id : "";
     prompt = typeof safe.prompt === "string" ? safe.prompt : "";
     startedAt = typeof safe.started_at === "number" && Number.isFinite(safe.started_at) ? safe.started_at : void 0;
     truncated = typeof safe.results_truncated === "number" && Number.isFinite(safe.results_truncated) && safe.results_truncated > 0 ? Math.floor(safe.results_truncated) : void 0;
+    callsTruncated = typeof safe.tool_calls_truncated === "number" && Number.isFinite(safe.tool_calls_truncated) && safe.tool_calls_truncated > 0 ? Math.floor(safe.tool_calls_truncated) : void 0;
     const calls = Array.isArray(safe.tool_calls) ? safe.tool_calls : [];
     toolUse = calls.map((call) => ({
       type: TURNLOG_TOOL_USE_TYPE,
@@ -683,6 +686,7 @@ function buildTurnLogBody(record, opts) {
   };
   if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
   if (truncated !== void 0) body.results_truncated = truncated;
+  if (callsTruncated !== void 0) body.tool_calls_truncated = callsTruncated;
   return body;
 }
 
@@ -996,6 +1000,12 @@ function createTurnStore() {
     if (incoming !== void 0 && record.session_id !== void 0 && record.session_id !== incoming) {
       record = { tool_calls: [], results: [] };
     }
+    if (incoming !== void 0) {
+      const ours = record.tool_calls.filter(
+        (entry) => entry.session_id === void 0 || entry.session_id === incoming
+      );
+      if (ours.length !== record.tool_calls.length) record.tool_calls = ours;
+    }
     if (record.session_id === void 0 && incoming !== void 0) {
       record.session_id = incoming;
     }
@@ -1021,16 +1031,29 @@ function createTurnStore() {
       } catch {
       }
     },
+    /**
+     * Capped at `MAX_TURN_TOOL_CALLS`, dropping the oldest, exactly as `recordResult` caps `results`
+     * (WR-04). `user_bash` is why: it records a call, pi fires no `agent_end` for a bare `!cmd`, so
+     * nothing drains the record and a developer working through a series of them accumulated an entry
+     * per invocation for the whole session.
+     */
     recordToolCall(entry, sessionId, now = Date.now()) {
       try {
         if (entry === null || typeof entry !== "object") return;
         startTurn(sessionId, now);
-        record.tool_calls.push({
+        while (record.tool_calls.length >= MAX_TURN_TOOL_CALLS) {
+          record.tool_calls.shift();
+          record.tool_calls_truncated = (record.tool_calls_truncated ?? 0) + 1;
+        }
+        const stored = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
           tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
           decision: typeof entry.decision === "string" ? entry.decision : "",
           ts: now
-        });
+        };
+        const incoming = idOf(sessionId);
+        if (incoming !== void 0) stored.session_id = incoming;
+        record.tool_calls.push(stored);
       } catch {
       }
     },
@@ -1100,6 +1123,9 @@ function createTurnStore() {
       if (record.session_id !== void 0) copy.session_id = record.session_id;
       if (record.started_at !== void 0) copy.started_at = record.started_at;
       if (record.results_truncated !== void 0) copy.results_truncated = record.results_truncated;
+      if (record.tool_calls_truncated !== void 0) {
+        copy.tool_calls_truncated = record.tool_calls_truncated;
+      }
       return copy;
     }
   };

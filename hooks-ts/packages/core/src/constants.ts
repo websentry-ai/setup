@@ -199,14 +199,28 @@ export const MAX_HASH_BYTES = 4_194_304;
 /**
  * The most tool results one turn record retains. A backstop, not a budget: `tool_result` fires once
  * per result with no ceiling on how many a turn can produce, and the record lives until `agent_end`,
- * so this array is the one part of `turn.ts` that could otherwise grow without limit — a long
- * agentic turn, or any state where nothing drains the record, would hold every entry.
+ * so this array could otherwise grow without limit — a long agentic turn, or any state where nothing
+ * drains the record, would hold every entry.
  *
  * 500 is far above any real turn (a `tool_use` array that long is already an unreadable audit row)
  * and far below anything that costs memory. Past it the OLDEST entries go and `results_truncated`
  * counts them, because a row that quietly described 500 of 600 results would look complete.
+ *
+ * This comment used to call `results` "the one part of `turn.ts` that could otherwise grow without
+ * limit", which was wrong in the most misleading possible way: `tool_calls` had no cap at all, and a
+ * clearer unbounded path. See `MAX_TURN_TOOL_CALLS`.
  */
 export const MAX_TURN_RESULTS = 500;
+/**
+ * The same backstop for `tool_calls` (WR-04), and the path that made it necessary is not
+ * hypothetical: `user_bash` records a tool call, and pi fires no `agent_end` for a bare `!cmd`
+ * (RESEARCH §F3), so nothing calls `take()` and that entry lives for the whole session.
+ *
+ * Same value and same drop-oldest discipline as `MAX_TURN_RESULTS`, counted by
+ * `tool_calls_truncated`. The two are separate constants because they bound different events with
+ * different producers — retuning one must not silently retune the other.
+ */
+export const MAX_TURN_TOOL_CALLS = 500;
 export const MAX_TOOL_INPUT_BYTES = 16_384;
 export const MAX_COMMAND_CHARS = 8192;
 /**

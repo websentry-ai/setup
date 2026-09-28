@@ -37,7 +37,7 @@
 
 import { createHash } from "node:crypto";
 
-import { MAX_HASH_BYTES, MAX_TURN_RESULTS } from "./constants.ts";
+import { MAX_HASH_BYTES, MAX_TURN_RESULTS, MAX_TURN_TOOL_CALLS } from "./constants.ts";
 
 /** pi's `TextContent` (`AI/dist/types.d.ts:242-246`). `textSignature` is provider metadata. */
 export interface TextPart {
@@ -71,6 +71,14 @@ export interface TurnToolCall {
   /** The `PolicyOutcome.kind` that actually applied, or `"skipped"` for a cache-skipped file tool. */
   decision: string;
   ts: number;
+  /**
+   * The session this call actually happened in (WR-04). Never sent — it exists so a record can be
+   * *attributed* rather than merely dropped: the whole-record rollover keys on `record.session_id`,
+   * which is only ever set from whichever event arrived first, so a `ctx` whose session id could not
+   * be read (`sessionIdOf`'s `""`) left entries from two sessions mixed with nothing to separate
+   * them by. Absent means the id was not knowable when the call was recorded.
+   */
+  session_id?: string;
 }
 
 export interface TurnResult {
@@ -91,6 +99,8 @@ export interface TurnRecord {
   started_at?: number;
   /** How many results the `MAX_TURN_RESULTS` cap dropped. Absent means none — never a zero. */
   results_truncated?: number;
+  /** How many tool calls the `MAX_TURN_TOOL_CALLS` cap dropped. Absent means none — never a zero. */
+  tool_calls_truncated?: number;
 }
 
 export interface TurnStore {
@@ -228,6 +238,17 @@ export function createTurnStore(): TurnStore {
     if (incoming !== undefined && record.session_id !== undefined && record.session_id !== incoming) {
       record = { tool_calls: [], results: [] };
     }
+    // Per-entry attribution, for the case the whole-record check above cannot see (WR-04). A `ctx`
+    // whose session id is unreadable stamps `record.session_id` with nothing, so a later real id
+    // never "differs" from it and a pending `!cmd` call from the previous session would ride this
+    // turn's `tool_use[]` — a row claiming N calls for a turn that made one. Entries carry their own
+    // id, so the foreign ones can be dropped without discarding this session's work.
+    if (incoming !== undefined) {
+      const ours = record.tool_calls.filter(
+        (entry) => entry.session_id === undefined || entry.session_id === incoming,
+      );
+      if (ours.length !== record.tool_calls.length) record.tool_calls = ours;
+    }
     if (record.session_id === undefined && incoming !== undefined) {
       record.session_id = incoming;
     }
@@ -259,16 +280,31 @@ export function createTurnStore(): TurnStore {
       }
     },
 
+    /**
+     * Capped at `MAX_TURN_TOOL_CALLS`, dropping the oldest, exactly as `recordResult` caps `results`
+     * (WR-04). `user_bash` is why: it records a call, pi fires no `agent_end` for a bare `!cmd`, so
+     * nothing drains the record and a developer working through a series of them accumulated an entry
+     * per invocation for the whole session.
+     */
     recordToolCall(entry: Omit<TurnToolCall, "ts">, sessionId: string, now: number = Date.now()): void {
       try {
         if (entry === null || typeof entry !== "object") return;
         startTurn(sessionId, now);
-        record.tool_calls.push({
+        while (record.tool_calls.length >= MAX_TURN_TOOL_CALLS) {
+          record.tool_calls.shift();
+          record.tool_calls_truncated = (record.tool_calls_truncated ?? 0) + 1;
+        }
+        const stored: TurnToolCall = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
           tool_use_id: typeof entry.tool_use_id === "string" ? entry.tool_use_id : "",
           decision: typeof entry.decision === "string" ? entry.decision : "",
           ts: now,
-        });
+        };
+        // Stamped at record time, from the id this call was actually made under — not read back off
+        // the record, which may carry an older session's id or none at all.
+        const incoming = idOf(sessionId);
+        if (incoming !== undefined) stored.session_id = incoming;
+        record.tool_calls.push(stored);
       } catch {
         // ditto
       }
@@ -344,6 +380,9 @@ export function createTurnStore(): TurnStore {
       if (record.session_id !== undefined) copy.session_id = record.session_id;
       if (record.started_at !== undefined) copy.started_at = record.started_at;
       if (record.results_truncated !== undefined) copy.results_truncated = record.results_truncated;
+      if (record.tool_calls_truncated !== undefined) {
+        copy.tool_calls_truncated = record.tool_calls_truncated;
+      }
       return copy;
     },
   };

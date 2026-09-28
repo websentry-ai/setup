@@ -217,3 +217,33 @@ test("the builder never throws on a malformed record", () => {
     }),
   );
 });
+
+test("tool_calls_truncated rides the body on the same present-only rule as results_truncated", () => {
+  assert.equal(build(record()).tool_calls_truncated, undefined, "absent by default, never a zero");
+  assert.equal(build(record({ tool_calls_truncated: 0 })).tool_calls_truncated, undefined);
+  assert.equal(build(record({ tool_calls_truncated: 7 })).tool_calls_truncated, 7);
+  assert.equal(build(record({ tool_calls_truncated: -4 })).tool_calls_truncated, undefined);
+  assert.equal(
+    build(record({ tool_calls_truncated: "lots" as unknown as number })).tool_calls_truncated,
+    undefined,
+  );
+  // Independent of the results counter: a turn can drop calls, results, both or neither.
+  const both = build(record({ tool_calls_truncated: 3, results_truncated: 9 }));
+  assert.equal(both.tool_calls_truncated, 3);
+  assert.equal(both.results_truncated, 9);
+});
+
+test("WR-04 a call's session_id stamp is never sent on the wire", () => {
+  // It exists to attribute a record locally, not to add a field to the row. `tool_use[]` is built
+  // from named fields precisely so a future addition to `TurnToolCall` cannot leak by default.
+  const body = build(
+    record({
+      tool_calls: [
+        { tool_name: "read", tool_use_id: "call_1", decision: "allow", ts: STARTED_AT, session_id: "sess-x" },
+      ],
+    }),
+  );
+  const serialised = JSON.stringify(body);
+  assert.ok(!serialised.includes("sess-x"), "the per-entry stamp stays local");
+  assert.ok(!serialised.includes("session_id"), serialised);
+});
