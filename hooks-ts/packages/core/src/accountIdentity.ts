@@ -21,6 +21,7 @@
 // a failed probe is an identity without a serial. Every wait has a deadline.
 
 import { execFile as nodeExecFile } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
@@ -301,14 +302,36 @@ export function isValidSerial(value: unknown): boolean {
   return typeof value === "string" && value.trim() !== "" && !PLACEHOLDERS.has(value.trim().toLowerCase());
 }
 
-/** The production probe: `child_process.execFile`, killed at the deadline, stdout or nothing. */
+/**
+ * Absolute paths for the serial probes. Bare names would be resolved through PATH — and on Windows
+ * libuv searches the current directory first, which under pi is the developer's project checkout,
+ * so a repo shipping `powershell.exe` would run on every session start. Same binaries and arguments
+ * as `unbound.py`'s `_get_device_serial`, so the value is byte-identical across hooks.
+ */
+export function probeToolPath(tool: "system_profiler" | "dmidecode" | "powershell", env: NodeJS.ProcessEnv = process.env): string {
+  switch (tool) {
+    case "system_profiler":
+      return "/usr/sbin/system_profiler";
+    case "dmidecode":
+      return "/usr/sbin/dmidecode";
+    case "powershell": {
+      const root = typeof env.SystemRoot === "string" && env.SystemRoot.trim() !== "" ? env.SystemRoot : "C:\\Windows";
+      return `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+    }
+  }
+}
+
+/**
+ * The production probe: `child_process.execFile`, killed at the deadline, stdout or nothing. `cwd` is
+ * the OS temp dir so the child never inherits the project checkout as its working directory.
+ */
 export const defaultExecFile: ExecFileLike = (file, args, opts) =>
   new Promise<string | undefined>((resolve) => {
     try {
       nodeExecFile(
         file,
         [...args],
-        { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8" },
+        { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8", cwd: tmpdir() },
         (error, stdout) => resolve(error === null && typeof stdout === "string" ? stdout : undefined),
       );
     } catch {
@@ -336,7 +359,7 @@ async function probeSerial(opts: SerialProbeOptions, timeoutMs: number): Promise
   const platform = opts.platform ?? process.platform;
 
   if (platform === "darwin") {
-    const out = await exec("system_profiler", ["SPHardwareDataType"]);
+    const out = await exec(probeToolPath("system_profiler"), ["SPHardwareDataType"]);
     for (const line of (out ?? "").split("\n")) {
       if (!line.includes("Serial Number")) continue;
       const sep = line.indexOf(": ");
@@ -347,7 +370,7 @@ async function probeSerial(opts: SerialProbeOptions, timeoutMs: number): Promise
     return undefined;
   }
   if (platform === "linux") {
-    const dmi = firstValid(await exec("dmidecode", ["-s", "system-serial-number"]));
+    const dmi = firstValid(await exec(probeToolPath("dmidecode"), ["-s", "system-serial-number"]));
     if (dmi !== undefined) return dmi;
     const read = opts.readFile ?? ((path: string) => readSmallRegularFile(path, 4_096));
     for (const path of LINUX_MACHINE_ID_PATHS) {
@@ -362,11 +385,11 @@ async function probeSerial(opts: SerialProbeOptions, timeoutMs: number): Promise
   }
   if (platform === "win32") {
     const bios = firstValid(
-      await exec("powershell", ["-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"]),
+      await exec(probeToolPath("powershell"), ["-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"]),
     );
     if (bios !== undefined) return bios;
     return firstValid(
-      await exec("powershell", [
+      await exec(probeToolPath("powershell"), [
         "-NoProfile",
         "-Command",
         "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid",

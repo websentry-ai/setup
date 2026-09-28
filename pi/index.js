@@ -18,6 +18,7 @@ import { homedir } from "node:os";
 
 // packages/core/src/accountIdentity.ts
 import { execFile as nodeExecFile } from "node:child_process";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 // packages/core/src/constants.ts
@@ -304,12 +305,24 @@ function buildAccountIdentity(input) {
 function isValidSerial(value) {
   return typeof value === "string" && value.trim() !== "" && !PLACEHOLDERS.has(value.trim().toLowerCase());
 }
+function probeToolPath(tool, env = process.env) {
+  switch (tool) {
+    case "system_profiler":
+      return "/usr/sbin/system_profiler";
+    case "dmidecode":
+      return "/usr/sbin/dmidecode";
+    case "powershell": {
+      const root = typeof env.SystemRoot === "string" && env.SystemRoot.trim() !== "" ? env.SystemRoot : "C:\\Windows";
+      return `${root}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`;
+    }
+  }
+}
 var defaultExecFile = (file, args, opts) => new Promise((resolve) => {
   try {
     nodeExecFile(
       file,
       [...args],
-      { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8" },
+      { timeout: opts.timeoutMs, maxBuffer: opts.maxBytes, windowsHide: true, encoding: "utf8", cwd: tmpdir() },
       (error, stdout) => resolve(error === null && typeof stdout === "string" ? stdout : void 0)
     );
   } catch {
@@ -324,7 +337,7 @@ async function probeSerial(opts, timeoutMs) {
   const exec = (file, args) => attempt(() => run(file, args, { timeoutMs, maxBytes: MAX_SERIAL_PROBE_BYTES })).catch(() => void 0);
   const platform = opts.platform ?? process.platform;
   if (platform === "darwin") {
-    const out = await exec("system_profiler", ["SPHardwareDataType"]);
+    const out = await exec(probeToolPath("system_profiler"), ["SPHardwareDataType"]);
     for (const line of (out ?? "").split("\n")) {
       if (!line.includes("Serial Number")) continue;
       const sep = line.indexOf(": ");
@@ -335,7 +348,7 @@ async function probeSerial(opts, timeoutMs) {
     return void 0;
   }
   if (platform === "linux") {
-    const dmi = firstValid(await exec("dmidecode", ["-s", "system-serial-number"]));
+    const dmi = firstValid(await exec(probeToolPath("dmidecode"), ["-s", "system-serial-number"]));
     if (dmi !== void 0) return dmi;
     const read = opts.readFile ?? ((path) => readSmallRegularFile(path, 4096));
     for (const path of LINUX_MACHINE_ID_PATHS) {
@@ -349,11 +362,11 @@ async function probeSerial(opts, timeoutMs) {
   }
   if (platform === "win32") {
     const bios = firstValid(
-      await exec("powershell", ["-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"])
+      await exec(probeToolPath("powershell"), ["-NoProfile", "-Command", "(Get-CimInstance -ClassName Win32_BIOS).SerialNumber"])
     );
     if (bios !== void 0) return bios;
     return firstValid(
-      await exec("powershell", [
+      await exec(probeToolPath("powershell"), [
         "-NoProfile",
         "-Command",
         "(Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Cryptography').MachineGuid"

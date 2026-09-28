@@ -27,6 +27,7 @@ import {
   isValidSerial,
   readDeviceSerial,
   readPiAuth,
+  probeToolPath,
 } from "../src/accountIdentity.ts";
 import type { ExecFileLike } from "../src/accountIdentity.ts";
 import { resolvePiAgentDir } from "../src/cache.ts";
@@ -414,4 +415,36 @@ test("a missing auth.json skips the serial probe and the network entirely", asyn
   } finally {
     agent.cleanup();
   }
+});
+
+// --- probe binaries are addressed by absolute path (review MEDIUM: bare names resolve via cwd on Windows)
+
+test("serial probes run absolute binaries, never bare names", async () => {
+  const seen: string[] = [];
+  const recordingExec: ExecFileLike = async (file) => {
+    seen.push(file);
+    return undefined;
+  };
+  for (const platform of ["darwin", "linux", "win32"]) {
+    await readDeviceSerial({ platform, execFile: recordingExec, readFile: () => undefined, timeoutMs: 500 });
+  }
+  assert.ok(seen.length >= 3, `expected probes on all three platforms, saw ${seen.join(", ")}`);
+  for (const file of seen) {
+    assert.ok(/^(\/|[A-Za-z]:\\)/.test(file), `bare or relative probe name: ${file}`);
+    assert.ok(!file.includes(".."), `traversal in probe path: ${file}`);
+  }
+  assert.ok(seen.includes("/usr/sbin/system_profiler"));
+  assert.ok(seen.includes("/usr/sbin/dmidecode"));
+  assert.ok(seen.some((f) => f.endsWith("\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")));
+});
+
+test("the Windows PowerShell path honours SystemRoot and falls back to C:\\Windows", () => {
+  assert.equal(
+    probeToolPath("powershell", { SystemRoot: "D:\\Win" }),
+    "D:\\Win\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  );
+  assert.equal(
+    probeToolPath("powershell", {}),
+    "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+  );
 });
