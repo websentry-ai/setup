@@ -360,7 +360,7 @@ def test_the_readme_states_the_limitation_and_the_runbook(pi_mdm_setup):
     readme = (REPO / "pi" / "mdm" / "README.md").read_text(encoding="utf-8")
     for needle in ("--no-extensions", "PI_CODING_AGENT_DIR", "noExtensions",
                    "coding-discovery-tool", "sudo python3", "--clear",
-                   "setdefault", "UNBOUND_PI_API_KEY", "mdm/onboard.py",
+                   "pi_mdm_api_key_sha256", "UNBOUND_PI_API_KEY", "mdm/onboard.py",
                    "/api/v1/setup/complete/", "install_mode"):
         assert needle in readme, needle
     assert len(readme.splitlines()) >= 25

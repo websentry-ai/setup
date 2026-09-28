@@ -200,6 +200,70 @@ def test_an_existing_different_api_key_is_left_byte_identical(unix, passthrough,
     assert config["org_name"] == "Acme"
 
 
+def test_a_rotated_key_replaces_the_one_this_installer_wrote(unix, passthrough, home):
+    """The failure a blanket "never overwrite" left behind. Push one writes the key; the org
+    revokes it; push two obtained the replacement, updated the rc exports and left the dead
+    key in config.json -- the one tier a GUI-launched pi and every already-open shell read. So
+    the extension kept authenticating with a revoked key after a redeployment that reported
+    success. A key we wrote is ours to rotate; the digest beside it is how we know."""
+    config_path = home / ".unbound" / "config.json"
+
+    assert unix.write_unbound_config_for_user("alice", home, "pi-key-v1") is True
+    assert json.loads(config_path.read_text())["api_key"] == "pi-key-v1"
+
+    assert unix.write_unbound_config_for_user("alice", home, "pi-key-v2") is True
+    config = json.loads(config_path.read_text())
+    assert config["api_key"] == "pi-key-v2"
+    assert "pi-key-v1" not in config_path.read_text(), "the revoked key survived the push"
+
+
+def test_a_key_the_user_manages_is_still_never_rotated(unix, passthrough, home):
+    """The other half, asserted after a push of ours so the provenance field is present: a
+    value that does not match what we recorded belongs to `unbound login`, and the five other
+    tools authenticate with it."""
+    config_path = home / ".unbound" / "config.json"
+    assert unix.write_unbound_config_for_user("alice", home, "pi-key-v1") is True
+
+    config = json.loads(config_path.read_text())
+    config["api_key"] = "the-users-own-key-do-not-touch"
+    config_path.write_text(json.dumps(config, indent=2))
+
+    assert unix.write_unbound_config_for_user("alice", home, "pi-key-v2") is True
+    assert json.loads(config_path.read_text())["api_key"] == "the-users-own-key-do-not-touch"
+    assert "pi-key-v2" not in config_path.read_text()
+
+
+def test_the_provenance_field_is_a_digest_not_the_key(unix, passthrough, home):
+    """It answers "is this still the value we wrote?", so a second copy of the secret would be
+    a gratuitous one. And it must track the key it is written beside, or the next rotation
+    would either refuse or fire on the wrong value."""
+    import hashlib
+
+    unix.write_unbound_config_for_user("alice", home, "pi-key-v1")
+    config = json.loads((home / ".unbound" / "config.json").read_text())
+    recorded = config[unix.MDM_KEY_PROVENANCE_FIELD]
+    assert recorded == hashlib.sha256(b"pi-key-v1").hexdigest()
+    assert "pi-key-v1" not in recorded
+
+
+def test_a_pre_existing_identical_key_is_adopted_rather_than_orphaned(unix, passthrough, home):
+    """The upgrade path off the old behaviour, and the idempotent re-push. A config carrying
+    the key we are about to write, with no provenance recorded (an older installer wrote it),
+    is claimed -- otherwise the very first rotation after this change would still be stuck."""
+    unbound_dir = home / ".unbound"
+    unbound_dir.mkdir()
+    config_path = unbound_dir / "config.json"
+    config_path.write_text(json.dumps({"api_key": "pi-key-v1", "email": "alice@acme.test"}))
+
+    assert unix.write_unbound_config_for_user("alice", home, "pi-key-v1") is True
+    assert unix.MDM_KEY_PROVENANCE_FIELD in json.loads(config_path.read_text())
+
+    assert unix.write_unbound_config_for_user("alice", home, "pi-key-v2") is True
+    config = json.loads(config_path.read_text())
+    assert config["api_key"] == "pi-key-v2"
+    assert config["email"] == "alice@acme.test", "the merge still preserves everything else"
+
+
 def test_empty_url_values_do_not_blank_existing_ones(unix, passthrough, home):
     """--frontend-url is optional, and None must not be written over a good value."""
     unbound_dir = home / ".unbound"
@@ -251,16 +315,17 @@ def test_a_symlinked_config_is_refused_not_written_through(
 
 
 def test_the_divergence_is_stated_at_the_write_site(unix):
-    """A silent `setdefault` reads like a typo. The next person to "fix" it back to an
-    assignment has to walk past the reason, in the comment above the line."""
+    """A conditional write reads like a typo next to the analog's plain assignment. The next
+    person to "fix" it into one has to walk past both halves of the reason -- why a user's own
+    key is never overwritten, AND why ours must be."""
     src = open(unix.__file__, encoding="utf-8").read()
     body = src.split("def write_unbound_config_for_user")[1].split("\ndef ")[0]
-    assert "setdefault(\"api_key\"" in body
     assert "DELIBERATE DIVERGENCE" in body
     assert "augment/hooks/mdm/setup.py" in body
     for tool in ("Cursor", "Claude Code", "Codex", "Copilot", "Augment"):
         assert tool in body, tool
-    assert 'config["api_key"] = ' not in body and "config['api_key'] = " not in body
+    assert "MDM_KEY_PROVENANCE_FIELD" in body, "the ownership check is what makes this safe"
+    assert "revoked" in body, "the rotation half of the reason is stated too"
 
 
 def test_the_env_gate_is_stated_as_an_addition(unix):

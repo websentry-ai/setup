@@ -53,7 +53,8 @@ way the other MDM installers in this repo do.
 | `<home>/.pi/agent/extensions/unbound/index.js` | `0644` | that user |
 | `<home>/.pi/agent/extensions/unbound/index.js.sha256` | `0644` | that user |
 | an `export UNBOUND_PI_API_KEY="…"` line in `~/.zprofile` + `~/.bash_profile` (macOS) or `~/.zshrc` + `~/.bashrc` (Linux) | — | that user |
-| `api_key` in `<home>/.unbound/config.json`, **only when absent** | `0600` in a `0700` dir | that user |
+| `api_key` in `<home>/.unbound/config.json`, **only when absent or previously written by this installer** | `0600` in a `0700` dir | that user |
+| `pi_mdm_api_key_sha256` in the same file — the digest that marks that `api_key` as ours | `0600` in a `0700` dir | that user |
 
 **Default agent directory only.** `PI_CODING_AGENT_DIR` belongs to the *target user's* shell
 environment, which root running from an MDM cannot read. Reading root's own copy of it would
@@ -73,12 +74,26 @@ session work.
 Two things differ from the `augment/hooks/mdm/setup.py` analog this script is otherwise a
 port of, both called out in comments at the code:
 
-1. **`config.json`'s `api_key` is written with `setdefault`, not assigned.** Augment
-   overwrites it unconditionally. That file is the shared identity store for `unbound-cli`
-   and five other tools (Cursor, Claude Code, Codex, Copilot, Augment), so on a device where
-   the user has run `unbound login`, overwriting it would silently repoint **all of them** at
-   this device key. The tenant URL fields (`base_url`, `gateway_url`, `frontend_url`) *are*
-   written unconditionally — they are configuration, not identity.
+1. **`config.json`'s `api_key` is written by ownership, not assigned.** Augment overwrites it
+   unconditionally. That file is the shared identity store for `unbound-cli` and five other
+   tools (Cursor, Claude Code, Codex, Copilot, Augment), so on a device where the user has run
+   `unbound login`, overwriting it would silently repoint **all of them** at this device key.
+
+   A blanket "never overwrite" was wrong in the other direction, though: the value *this
+   installer* wrote on the first push is also an existing value, so after the org revoked that
+   key a later push updated the rc exports and left the dead key in `config.json` — the one
+   tier a GUI-launched pi and every already-open shell read. The extension went on
+   authenticating with a revoked key, after a redeployment that reported success.
+
+   So the installer records a `pi_mdm_api_key_sha256` digest beside any `api_key` it writes,
+   and on a later push replaces the value only when it is absent, already equal to the key
+   being installed, or matches that digest. Anything else is the user's own credential and is
+   left byte-identical. **Rotating a pi application key therefore takes effect in both tiers
+   on the next push.** The digest is provenance, not a secret — the key itself is in the same
+   `0600` file — and no other tool reads that field.
+
+   The tenant URL fields (`base_url`, `gateway_url`, `frontend_url`) *are* written
+   unconditionally — they are configuration, not identity.
 2. **The `export` value passes a charset allow-list first** (`_is_safe_env_value`). An rc
    file is executed by the user's login shell, so an unvalidated value in it is command
    injection, on every account on the device. This check is an addition, not a port.

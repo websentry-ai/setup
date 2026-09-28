@@ -33,9 +33,12 @@ in-home write goes through three primitives, all of them ported from
 
 Two deliberate divergences from the Augment analog, both called out at the code:
 
-  * `config.json`'s `api_key` is written with `setdefault`, not assigned. That file is the
-    shared identity store for unbound-cli and five other tools; overwriting a key the user
-    minted with `unbound login` would silently repoint all of them at this device key.
+  * `config.json`'s `api_key` is not assigned unconditionally. That file is the shared
+    identity store for unbound-cli and five other tools; overwriting a key the user minted
+    with `unbound login` would silently repoint all of them at this device key. It IS
+    replaced when this installer is the one that wrote it -- recognised by a
+    `pi_mdm_api_key_sha256` digest recorded beside it -- or a revoked key would survive every
+    later push in the one tier a GUI-launched pi reads.
   * an `export` line is only written after `_is_safe_env_value()` passes, because an rc file
     is a shell script and an unvalidated value in it is command injection.
 
@@ -95,6 +98,12 @@ PI_AGENT_DIR_SEGMENTS = (".pi", "agent")
 # The extension's tier-1 key source (constants.ts:8 ENV_API_KEY_PI). pi-specific by design:
 # writing the generic UNBOUND_API_KEY instead would hand this device key to six other tools.
 ENV_API_KEY_PI = "UNBOUND_PI_API_KEY"
+
+# How this installer remembers which `api_key` in the shared config.json is its own, so a
+# rotation can replace the value it wrote without ever touching one the user manages. A
+# digest, not the key: the field is provenance, and the key itself is already in the same
+# file. Read by nothing else -- the other tools read named fields and ignore extras.
+MDM_KEY_PROVENANCE_FIELD = "pi_mdm_api_key_sha256"
 
 # Home enumeration, per platform. These are the analog's values
 # (augment/hooks/mdm/setup.py:356-398), lifted into constants so the test suite can point
@@ -1223,12 +1232,23 @@ def remove_env_var_from_user(username: str, home_dir, var_name: str) -> str:
     return result if result in ("cleared", "not_found", "failed") else "failed"
 
 
+def _key_provenance(api_key: str) -> str:
+    """The digest this installer records beside a key it wrote, to recognise it on the next push.
+
+    A digest rather than the key: the field exists to answer "is the value in this file still
+    the one we put there?", and storing a second copy of the secret to answer that would be
+    gratuitous (the first copy is two lines above it in the same 0600 file).
+    """
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()
+
+
 def write_unbound_config_for_user(username: str, home_dir, api_key: str,
                                   urls: Optional[dict] = None) -> bool:
     """Merge the key and the tenant URLs into one user's ~/.unbound/config.json.
 
     An rc export is invisible to an already-open shell and to a GUI-launched pi, so this is
-    what makes the CURRENT session work. Privilege-drops before any filesystem op.
+    what makes the CURRENT session work -- which is also why a key this installer wrote here
+    has to stay rotatable. Privilege-drops before any filesystem op.
     """
     home_dir = Path(home_dir)
     config_dir = home_dir / ".unbound"
@@ -1260,9 +1280,25 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
         # config['api_key'] unconditionally. This file is the shared identity store for
         # unbound-cli and five other tools (Cursor, Claude Code, Codex, Copilot, Augment):
         # on a device where the user has run `unbound login`, overwriting api_key would
-        # silently repoint ALL of them at this device key. setdefault writes it only when
-        # there is nothing there to lose.
-        config.setdefault("api_key", api_key)
+        # silently repoint ALL of them at this device key.
+        #
+        # But a blanket "never overwrite" was the other half of the bug. The value this
+        # installer wrote on the FIRST push is also an existing value, so once the org
+        # revoked that key a later push updated only the rc exports and left the dead key in
+        # config.json -- and config.json is precisely the tier a GUI-launched pi, or any
+        # already-open shell, reads. The extension authenticated with a revoked key and
+        # failed open, after a redeployment that reported success.
+        #
+        # So ownership is tracked instead of guessed: the value is replaced when it is
+        # absent, when it is already the key we are about to write, or when its digest
+        # matches the one we recorded the last time we wrote it. Anything else is the user's
+        # own credential and is left byte-identical.
+        existing = config.get("api_key")
+        existing = existing.strip() if isinstance(existing, str) else ""
+        if (not existing or existing == api_key
+                or config.get(MDM_KEY_PROVENANCE_FIELD) == _key_provenance(existing)):
+            config["api_key"] = api_key
+            config[MDM_KEY_PROVENANCE_FIELD] = _key_provenance(api_key)
         if urls:
             # URLs are tenant configuration, not identity, so they DO update unconditionally.
             config.update({k: v for k, v in urls.items() if v})
