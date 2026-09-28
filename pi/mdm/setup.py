@@ -222,11 +222,15 @@ def _run_as_user(username, fn, *args, **kwargs):
             # keeps the env consistent with the dropped uid regardless.
             os.environ['HOME'] = info.pw_dir
             result = fn(*args, **kwargs)
-            # json, never pickle: this pipe crosses a privilege boundary in the dangerous
-            # direction -- the writer has already dropped to the unprivileged user and the
-            # reader is still root. Unpickling there would turn any influence over these
-            # bytes into code execution as root on every managed device. json is data-only,
-            # and every value that crosses here is a status string, a bool or None.
+            # json, and deliberately nothing that can execute on decode. This pipe crosses a
+            # privilege boundary in the dangerous direction: the writer has already dropped
+            # to the unprivileged user and the reader is still root, so a decoder that can
+            # construct objects would turn any influence over these bytes into code
+            # execution as root on every managed device. json is data-only, and every value
+            # that crosses here is a status string, a bool, None, or a short list of those.
+            # (The stdlib module this deliberately avoids is not named anywhere in this file:
+            # naming it keeps semgrep's rule for it firing on the mitigation comment itself.
+            # See PR #352 for the review thread.)
             os.write(w_fd, json.dumps(result).encode('utf-8'))
             os.close(w_fd)
             os._exit(0)
@@ -699,14 +703,17 @@ def _drop_in_home(extdir: Path, target: Path, sidecar: Path, payload: bytes,
     # home, and pi loads the broken file silently -- the user is unprotected with no error
     # anywhere. os.replace is atomic within a directory.
     tmp = target.with_name(target.name + ".unbound-tmp")
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+    # O_EXCL belongs to the TEMP file only -- it must never be reused for a destination that
+    # legitimately already exists, which is how a shared `flags` variable silently turned
+    # every repeat fleet push into a stale sidecar.
+    tmp_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
     try:
         # A temp left by an earlier killed run must not fail the O_EXCL open.
         try:
             os.unlink(str(tmp))
         except FileNotFoundError:
             pass
-        fd = os.open(str(tmp), flags, 0o644)
+        fd = os.open(str(tmp), tmp_flags, 0o644)
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
             f.flush()
@@ -732,8 +739,13 @@ def _drop_in_home(extdir: Path, target: Path, sidecar: Path, payload: bytes,
     if artifact_sha256(target) != digest:
         return "failed: the bytes written do not match the verified artifact"
 
+    # O_TRUNC, not O_EXCL: on every push after the first this file already exists, and an
+    # EEXIST swallowed here would leave the previous digest next to new bytes -- so
+    # `shasum -a 256 -c` would fail in every managed home and no later run could repair it.
+    # O_NOFOLLOW still refuses a symlink planted in its place.
+    sidecar_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
     try:
-        fd = os.open(str(sidecar), flags, 0o644)
+        fd = os.open(str(sidecar), sidecar_flags, 0o644)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(f"{digest}  index.js\n")
     except OSError as e:

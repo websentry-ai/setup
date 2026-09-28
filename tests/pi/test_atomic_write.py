@@ -166,13 +166,61 @@ class TestTheMdmDropIsAtomicToo:
         assert (extdir / "index.js").read_bytes() == ARTIFACT
         assert list(extdir.glob("*" + TMP_SUFFIX)) == []
 
+    def test_a_second_push_refreshes_the_sidecar_rather_than_leaving_the_old_digest(
+            self, pi_mdm_setup, tmp_path, monkeypatch):
+        """Cursor Bugbot, second round, on the fix for the first: the temp file's O_EXCL was
+        reused for the sidecar, whose destination legitimately already exists after the
+        first push. EEXIST was swallowed, so index.js advanced while index.js.sha256 kept
+        the previous digest -- `shasum -a 256 -c` would then fail in EVERY managed home and
+        no later MDM run could repair it. O_EXCL now belongs to the temp file alone."""
+        mod = pi_mdm_setup
+        home = tmp_path / "carol"
+        (home / ".pi").mkdir(parents=True)
+        monkeypatch.setattr(mod, "_run_as_user", lambda user, fn, *a, **k: fn(*a, **k))
+        monkeypatch.setattr(mod, "_repair_user_ownership", lambda *a, **k: None)
+        extdir = home / ".pi" / "agent" / "extensions" / "unbound"
+
+        old_bytes = b"// an older bundle\n"
+        old_digest = hashlib.sha256(old_bytes).hexdigest()
+        assert mod.install_for_user("carol", home, old_bytes, old_digest) == "installed"
+        assert old_digest in (extdir / "index.js.sha256").read_text()
+
+        # The fleet push that ships a new build.
+        assert mod.install_for_user("carol", home, ARTIFACT, DIGEST) == "persisted"
+        assert (extdir / "index.js").read_bytes() == ARTIFACT
+        sidecar_text = (extdir / "index.js.sha256").read_text()
+        assert DIGEST in sidecar_text, "the sidecar advanced with the artifact"
+        assert old_digest not in sidecar_text, "and the stale digest is gone"
+
+    def test_the_refreshed_sidecar_actually_verifies_with_shasum(
+            self, pi_mdm_setup, tmp_path, monkeypatch):
+        """The property a stale sidecar breaks, asserted end to end rather than by digest
+        string comparison: recompute from the bytes on disk and compare to the file."""
+        mod = pi_mdm_setup
+        home = tmp_path / "dave"
+        (home / ".pi").mkdir(parents=True)
+        monkeypatch.setattr(mod, "_run_as_user", lambda user, fn, *a, **k: fn(*a, **k))
+        monkeypatch.setattr(mod, "_repair_user_ownership", lambda *a, **k: None)
+        extdir = home / ".pi" / "agent" / "extensions" / "unbound"
+
+        mod.install_for_user("dave", home, b"// first\n",
+                             hashlib.sha256(b"// first\n").hexdigest())
+        mod.install_for_user("dave", home, ARTIFACT, DIGEST)
+
+        on_disk = hashlib.sha256((extdir / "index.js").read_bytes()).hexdigest()
+        recorded = (extdir / "index.js.sha256").read_text().split()[0]
+        assert recorded == on_disk
+
 
 class TestNothingCrossesThePrivilegeDropAsAPickle:
-    def test_the_source_does_not_call_pickle(self, pi_mdm_setup):
+    def test_the_source_does_not_mention_the_module_at_all(self, pi_mdm_setup):
+        """Not even in a comment. The scanner's rule is name-based, so a mitigation comment
+        that names the module keeps the finding firing forever on the fix itself -- which is
+        how a closed finding turns into permanent review noise nobody reads."""
         src = Path(pi_mdm_setup.__file__).read_text(encoding="utf-8")
-        calls = [ln for ln in src.splitlines()
-                 if "pickle" in ln and not ln.strip().startswith("#")]
-        assert calls == [], f"pickle crosses the root/user boundary: {calls}"
+        hits = [f"{i}: {ln.strip()}" for i, ln in enumerate(src.splitlines(), 1)
+                if "pickle" in ln.lower()]
+        assert hits == [], f"the module is still named in the source: {hits}"
 
     def test_the_boundary_is_json(self, pi_mdm_setup):
         src = Path(pi_mdm_setup.__file__).read_text(encoding="utf-8")
