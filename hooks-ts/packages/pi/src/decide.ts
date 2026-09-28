@@ -36,14 +36,18 @@ import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
+import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import type { UiCtx } from "./ui.ts";
 
 /** The structural slice of `ExtensionContext` a decision needs (§A4). */
 export interface DecideCtx extends UiCtx {
   cwd: string;
   sessionManager: { getSessionId(): string };
-  /** `Model | undefined` in pi — the payload builder substitutes `'auto'`. */
-  model: { id: string } | undefined;
+  /**
+   * `Model | undefined` in pi — the payload builder substitutes `'auto'`. `provider` is read only by
+   * the account-identity lookup at `session_start`, to pick the matching `auth.json` entry.
+   */
+  model: { id: string; provider?: string } | undefined;
 }
 
 export interface DecideDeps {
@@ -82,6 +86,12 @@ export interface DecideDeps {
    * projection of it. What travels is `auditToolInput`'s output, never `event.input` itself.
    */
   onDecision?: (entry: DecisionEntry) => void;
+  /**
+   * The process's settled account identity, attached to the pretool body as `account_identity`.
+   * Never awaited here: a tool call does not wait on a profile lookup, so a call made before the
+   * lookup settles simply goes without it (the Python hook's pre-tool path reads a cache, likewise).
+   */
+  accountIdentity?: AccountIdentity;
 }
 
 /**
@@ -222,6 +232,7 @@ export async function decideToolCall(
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       pullPolicies,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
 
     // `notifySafe` already swallows its own failures, and `policy.ts` wraps the call again: a notice

@@ -37,7 +37,8 @@
 
 import { redactSecrets } from "./config.ts";
 import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL, TURNLOG_TOOL_USE_TYPE } from "./constants.ts";
-import { capCommand } from "./payload.ts";
+import type { AccountIdentity } from "./accountIdentity.ts";
+import { capCommand, withAccountIdentity } from "./payload.ts";
 import type { TurnRecord } from "./turn.ts";
 
 /** The hash pair, or the honest statement that the output was too big to hash. */
@@ -93,6 +94,8 @@ export interface TurnLogBody {
    * without diffing it against the marker.
    */
   assistant_truncated?: true;
+  /** Forwarded by the gateway into `metadata.account` / `metadata.device`. Absent when unknown. */
+  account_identity?: AccountIdentity;
 }
 
 export interface TurnLogOptions {
@@ -109,6 +112,8 @@ export interface TurnLogOptions {
   assistantText?: string;
   /** The session's API key, so `redactSecrets` can scrub it from anything the model or a command echoes. */
   apiKey?: string;
+  /** The process's settled account identity; attached as `account_identity` when present. */
+  accountIdentity?: AccountIdentity;
 }
 
 /**
@@ -245,5 +250,5 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
   if (truncated !== undefined) body.results_truncated = truncated;
   if (callsTruncated !== undefined) body.tool_calls_truncated = callsTruncated;
   if (assistant.truncated) body.assistant_truncated = true;
-  return body;
+  return withAccountIdentity(body, opts?.accountIdentity);
 }

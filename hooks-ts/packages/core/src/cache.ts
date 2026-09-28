@@ -91,13 +91,27 @@ function expandTilde(raw: unknown, homeDir: string): string | undefined {
  * plant one. Same reasoning, same guard, as `readUnboundConfig` (PR #348 finding 3).
  */
 export function resolveCachePath(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
-  let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
-  if (base === undefined || !isAbsolute(base)) {
-    if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return undefined;
-    base = join(homeDir, ...PI_AGENT_DIR_SEGMENTS);
-  }
-  if (!isAbsolute(base)) return undefined;
+  const base = resolvePiAgentDir(env, homeDir);
+  if (base === undefined) return undefined;
   return join(base, CACHE_DIR_NAME, CACHE_FILE_NAME);
+}
+
+/**
+ * pi's agent dir — `PI_CODING_AGENT_DIR` (tilde-expanded, absolute only) → `~/.pi/agent` — or
+ * `undefined` when no safe absolute base exists. The one resolution both the cache and the
+ * account-identity reader (`auth.json`) use, so the two can never look in different places.
+ */
+export function resolvePiAgentDir(env: NodeJS.ProcessEnv, homeDir: string): string | undefined {
+  try {
+    let base = expandTilde(env?.[ENV_PI_AGENT_DIR], typeof homeDir === "string" ? homeDir : "");
+    if (base === undefined || !isAbsolute(base)) {
+      if (typeof homeDir !== "string" || homeDir.length === 0 || !isAbsolute(homeDir)) return undefined;
+      base = join(homeDir, ...PI_AGENT_DIR_SEGMENTS);
+    }
+    return isAbsolute(base) ? base : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /**
