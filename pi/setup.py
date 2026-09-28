@@ -161,6 +161,52 @@ def artifact_path(agent_dir) -> Path:
     return extension_dir(agent_dir) / "index.js"
 
 
+def atomic_write_text(path, text: str, mode: int = 0o644, follow_symlink: bool = True) -> bool:
+    """Replace one file's contents with no truncate-in-place window.
+
+    A plain O_TRUNC open makes the destination the failure window: an interrupt, ENOSPC or
+    EIO after that open leaves the file empty or half-written. Every durable file either
+    installer writes goes through here, so the class is closed rather than one instance of
+    it. os.replace is atomic within a directory.
+
+    `follow_symlink` resolves a symlinked destination and rewrites the real file, because
+    os.replace on the link path would swap the link for a regular file -- silently detaching
+    a user who deliberately symlinks their own config somewhere.
+    """
+    try:
+        target = Path(os.path.realpath(str(path))) if follow_symlink else Path(path)
+        tmp = target.with_name(target.name + ".unbound-tmp")
+        try:
+            # A temp left by an earlier killed run must not fail the O_EXCL open.
+            try:
+                os.unlink(str(tmp))
+            except FileNotFoundError:
+                pass
+            fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                # fsync before the rename, or a crash can publish a name whose bytes never
+                # reached the disk.
+                os.fsync(f.fileno())
+            try:
+                # O_CREAT's mode is masked by umask, so set it explicitly before publishing.
+                os.chmod(str(tmp), mode)
+            except OSError as e:
+                debug_print(f"Could not set the mode on {tmp}: {e}")
+            os.replace(str(tmp), str(target))
+            return True
+        except OSError:
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        debug_print(f"Could not write {path}: {e}")
+        return False
+
+
 def sidecar_path(agent_dir) -> Path:
     """The digest written next to the artifact, so a later --clear can remove both."""
     return extension_dir(agent_dir) / "index.js.sha256"
@@ -440,12 +486,8 @@ def install_extension(agent_dir) -> Optional[str]:
 
         # Written next to the artifact so --clear can remove it and a human can check the
         # install by hand with `shasum -a 256 -c index.js.sha256`.
-        try:
-            fd = os.open(str(sidecar_path(agent_dir)), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(f"{written}  index.js\n")
-        except OSError as e:
-            debug_print(f"Could not write the local sidecar: {e}")
+        if not atomic_write_text(sidecar_path(agent_dir), f"{written}  index.js\n", 0o644):
+            debug_print("Could not write the local sidecar")
 
         print(f"✅ Installed the Unbound extension: {target} ({len(payload)} bytes, 0644)")
         return written
@@ -486,10 +528,9 @@ def write_unbound_config(api_key: str, urls: Optional[dict] = None) -> bool:
         config['api_key'] = api_key
         if urls:
             config.update({k: v for k, v in urls.items() if v})
-        fd = os.open(str(config_file), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(config, indent=2))
-        return True
+        # Atomic: this file is the shared identity store for six tools, so an interrupt
+        # during the write would log the user out of all of them, not just pi.
+        return atomic_write_text(config_file, json.dumps(config, indent=2), 0o600)
     except Exception as e:
         print(f"⚠️  Could not write config: {e}")
         return False

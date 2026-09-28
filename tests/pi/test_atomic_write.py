@@ -47,6 +47,16 @@ def good_fetch(pi_setup, fake_fetch):
     )
 
 
+@pytest.fixture
+def fake_home(pi_setup, pi_home, monkeypatch):
+    """Points Path.home() at the throwaway HOME -- write_unbound_config resolves the config
+    path from Path.home(), so without this it would touch the real one. Same fixture as
+    tests/pi/test_report.py."""
+    monkeypatch.setenv("HOME", str(pi_home.home))
+    monkeypatch.delenv("PI_CODING_AGENT_DIR", raising=False)
+    return pi_home
+
+
 class TestTheUserInstallIsAtomic:
     def test_a_failed_publish_leaves_the_existing_extension_byte_identical(
             self, pi_setup, pi_home, good_fetch, monkeypatch):
@@ -92,18 +102,26 @@ class TestTheUserInstallIsAtomic:
         """Pin the mechanism, not just the outcome: an implementation that went back to
         O_TRUNC on the target would still pass the outcome tests on a filesystem that
         never fails mid-write."""
-        seen = {}
+        seen = []
         real_replace = os.replace
 
         def spy(src, dst, *a, **k):
-            seen["src"], seen["dst"] = str(src), str(dst)
+            seen.append((str(src), str(dst)))
             return real_replace(src, dst, *a, **k)
 
         monkeypatch.setattr(pi_setup.os, "replace", spy)
         assert pi_setup.install_extension(pi_home.agent_dir) == DIGEST
-        assert seen["src"].endswith("index.js" + TMP_SUFFIX)
-        assert seen["dst"].endswith("index.js")
-        assert not seen["dst"].endswith(TMP_SUFFIX)
+
+        # Every durable file the install writes is published by rename, so assert on the
+        # artifact's own pair rather than the last call -- the sidecar is renamed too.
+        artifact = [(s, d) for s, d in seen if d.endswith("index.js")]
+        assert len(artifact) == 1, f"expected one index.js rename, got {seen}"
+        src, dst = artifact[0]
+        assert src.endswith("index.js" + TMP_SUFFIX)
+        assert not dst.endswith(TMP_SUFFIX)
+        # The sidecar too, since a half-written sidecar reads as tampering to a human.
+        assert any(d.endswith("index.js.sha256") and s.endswith(TMP_SUFFIX)
+                   for s, d in seen), f"the sidecar is not published by rename: {seen}"
 
 
 class TestAFailedKeyWriteIsNotSuccess:
@@ -325,7 +343,66 @@ class TestTheRcRewriteNeverDestroysAUserFile:
         assert b"export EDITOR=vim\n" in after
 
 
-class TestNothingCrossesThePrivilegeDropAsAPickle:
+class TestNoDurableFileIsWrittenByTruncation:
+    """Cursor Bugbot, fourth round, HIGH severity: `~/.unbound/config.json` was still opened
+    with O_TRUNC in both installers, so an interrupt mid-write left the SHARED identity file
+    empty -- logging the user out of all six tools that read it, not just pi.
+
+    Rather than patch the fourth instance of one bug class, these tests close the class: no
+    durable file either installer writes may be published by truncation. The two remaining
+    `open(..., "w")` calls in the pair are `tempfile.mkstemp` curl header files deleted in a
+    `finally`, which have no durability story to get wrong.
+    """
+
+    def test_neither_installer_opens_a_durable_file_with_o_trunc(
+            self, pi_setup, pi_mdm_setup):
+        """Matches `os.O_TRUNC`, the flag in use, rather than the bare token -- the prose
+        explaining why it is gone legitimately names it."""
+        for mod in (pi_setup, pi_mdm_setup):
+            src = Path(mod.__file__).read_text(encoding="utf-8")
+            offenders = [f"{i}: {ln.strip()}" for i, ln in enumerate(src.splitlines(), 1)
+                         if "os.O_TRUNC" in ln]
+            assert offenders == [], f"{mod.__file__} truncates in place: {offenders}"
+
+    def test_the_user_config_write_is_atomic(self, pi_setup, fake_home, monkeypatch):
+        """The file six tools authenticate with must survive a failed write intact."""
+        cfg = fake_home.config_path
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        original = '{\n  "api_key": "pre-existing",\n  "email": "someone@example.com"\n}'
+        cfg.write_text(original)
+
+        monkeypatch.setattr(pi_setup.os, "replace",
+                            lambda *a, **k: (_ for _ in ()).throw(OSError("ENOSPC")))
+        assert pi_setup.write_unbound_config("newkey", {"base_url": "https://b"}) is False
+        assert cfg.read_text() == original, "the shared identity file survived"
+        assert list(cfg.parent.glob("*" + TMP_SUFFIX)) == []
+
+    def test_a_successful_user_config_write_still_merges(self, pi_setup, fake_home):
+        """Positive control: the atomic path must not have broken read-merge-write."""
+        cfg = fake_home.config_path
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text('{"email": "someone@example.com", "org_name": "Acme"}')
+
+        assert pi_setup.write_unbound_config("newkey", {"base_url": "https://b"}) is True
+        import json as _json
+        data = _json.loads(cfg.read_text())
+        assert data["api_key"] == "newkey"
+        assert data["email"] == "someone@example.com", "unrelated fields preserved"
+        assert data["org_name"] == "Acme"
+        assert data["base_url"] == "https://b"
+        assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+    def test_the_mdm_config_write_refuses_a_symlink(self, pi_mdm_setup, tmp_path):
+        """Root writing into another user's home must not follow a planted link, even though
+        the user installer deliberately DOES follow one in the user's own home."""
+        mod = pi_mdm_setup
+        outside = tmp_path / "outside.json"
+        outside.write_text("untouched")
+        link = tmp_path / "config.json"
+        link.symlink_to(outside)
+
+        assert mod._atomic_write_text(link, '{"api_key": "k"}', 0o600) is False
+        assert outside.read_text() == "untouched"
     def test_the_source_does_not_mention_the_module_at_all(self, pi_mdm_setup):
         """Not even in a comment. The scanner's rule is name-based, so a mitigation comment
         that names the module keeps the finding firing forever on the fix itself -- which is

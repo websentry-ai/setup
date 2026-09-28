@@ -739,17 +739,11 @@ def _drop_in_home(extdir: Path, target: Path, sidecar: Path, payload: bytes,
     if artifact_sha256(target) != digest:
         return "failed: the bytes written do not match the verified artifact"
 
-    # O_TRUNC, not O_EXCL: on every push after the first this file already exists, and an
+    # Atomic, and NOT O_EXCL: on every push after the first this file already exists, and an
     # EEXIST swallowed here would leave the previous digest next to new bytes -- so
     # `shasum -a 256 -c` would fail in every managed home and no later run could repair it.
-    # O_NOFOLLOW still refuses a symlink planted in its place.
-    sidecar_flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
-    try:
-        fd = os.open(str(sidecar), sidecar_flags, 0o644)
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(f"{digest}  index.js\n")
-    except OSError as e:
-        debug_print(f"Could not write the local sidecar: {e}")
+    if not _atomic_write_text(sidecar, f"{digest}  index.js\n", 0o644):
+        debug_print("Could not write the local sidecar")
 
     return state
 
@@ -933,6 +927,55 @@ def append_to_file(file_path: Path, line: str, var_name: Optional[str] = None) -
         return _rewrite_rc_file(file_path, lines)
     except Exception as e:
         print(f"Failed to modify {file_path}: {e}")
+        return False
+
+
+def _atomic_write_text(path, text: str, mode: int = 0o644) -> bool:
+    """Replace one file's contents with no truncate-in-place window, refusing a symlink.
+
+    A plain O_TRUNC open makes the destination the failure window: an interrupt, ENOSPC or
+    EIO after that open leaves the file empty or half-written. For `~/.unbound/config.json`
+    that means logging the user out of all six tools that share it, not just pi.
+
+    Unlike the user installer's equivalent, and unlike `_rewrite_rc_file`, this REFUSES a
+    symlinked destination rather than following it: root is writing into someone else's
+    home, where a planted link is an attack rather than a dotfiles convention. That is the
+    guard O_NOFOLLOW gave us before the write went via a temp file.
+    """
+    try:
+        target = Path(path)
+        if os.path.islink(str(target)):
+            debug_print(f"Refusing to write {target}: it is a symlink")
+            return False
+        tmp = target.with_name(target.name + ".unbound-tmp")
+        try:
+            # A temp left by an earlier killed run must not fail the O_EXCL open.
+            try:
+                os.unlink(str(tmp))
+            except FileNotFoundError:
+                pass
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0)
+            fd = os.open(str(tmp), flags, mode)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                # fsync before the rename, or a crash can publish a name whose bytes never
+                # reached the disk.
+                os.fsync(f.fileno())
+            try:
+                os.chmod(str(tmp), mode)
+            except OSError as e:
+                debug_print(f"Could not set the mode on {tmp}: {e}")
+            os.replace(str(tmp), str(target))
+            return True
+        except OSError:
+            try:
+                os.unlink(str(tmp))
+            except OSError:
+                pass
+            raise
+    except Exception as e:
+        debug_print(f"Could not write {path}: {e}")
         return False
 
 
@@ -1148,10 +1191,10 @@ def write_unbound_config_for_user(username: str, home_dir, api_key: str,
         if urls:
             # URLs are tenant configuration, not identity, so they DO update unconditionally.
             config.update({k: v for k, v in urls.items() if v})
-        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, 'O_NOFOLLOW', 0)
-        fd = os.open(str(config_file), flags, 0o600)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            f.write(json.dumps(config, indent=2))
+        # Atomic, and still refusing a symlink: an interrupt during a truncating write would
+        # leave this shared identity file empty, logging the user out of all six tools.
+        if not _atomic_write_text(config_file, json.dumps(config, indent=2), 0o600):
+            return False
         try:
             os.chmod(config_file, 0o600)
         except OSError:
