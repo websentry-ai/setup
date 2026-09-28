@@ -55,6 +55,8 @@ var BREAKER_OPEN_MS = 6e4;
 var CACHE_TTL_MS = 3e5;
 var MAX_REASON_CHARS = 2e3;
 var MAX_CACHE_BYTES = 65536;
+var MAX_TOOLS_TO_CHECK = 256;
+var MAX_TOOL_NAME_CHARS = 64;
 var MAX_CONFIG_BYTES = 262144;
 var MAX_HASH_BYTES = 4194304;
 var MAX_TURN_RESULTS = 500;
@@ -151,7 +153,10 @@ function parseFailureAction(raw) {
 }
 function parseToolsToCheck(raw) {
   if (!Array.isArray(raw)) return void 0;
-  return raw.filter((entry) => typeof entry === "string");
+  if (raw.length > MAX_TOOLS_TO_CHECK) return void 0;
+  return raw.filter(
+    (entry) => typeof entry === "string" && entry.length <= MAX_TOOL_NAME_CHARS
+  );
 }
 function parseTimestamp(raw) {
   return typeof raw === "number" && Number.isFinite(raw) && raw >= 0 ? raw : void 0;

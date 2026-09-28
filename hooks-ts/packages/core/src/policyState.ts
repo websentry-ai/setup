@@ -28,6 +28,7 @@
 // And `[]` is a **value**: "this org has no file policies" is an answer; "the field was absent" is
 // not. Collapsing the two is what makes rule 2 violable in the first place.
 
+import { MAX_TOOLS_TO_CHECK, MAX_TOOL_NAME_CHARS } from "./constants.ts";
 import type { PreToolResponseBody } from "./types.ts";
 
 export type FailureAction = "allow" | "block";
@@ -76,10 +77,24 @@ export function parseFailureAction(raw: unknown): FailureAction | undefined {
  * A mixed array keeps its strings rather than rejecting the whole response: dropping a junk entry
  * narrows the skip set (more round trips, same verdicts), while rejecting the response would widen
  * it to whatever stale value was already remembered.
+ *
+ * Bounded (WR-01). Whatever this returns is held for the session, `JSON.stringify`ed to disk on the
+ * awaited tool-call path, re-read every session after, and linearly scanned on every native file
+ * call — so a compromised or misbehaving gateway answering one pretool call with a 50 MB
+ * `tools_to_check` must not be able to buy any of that. A local process with write access to the
+ * cache file is the same input by another route.
+ *
+ * Over-cap is **refused whole** rather than truncated: see `MAX_TOOLS_TO_CHECK`. A truncated list is
+ * a wrong list, and being wrong in this direction disables a check. `undefined` here means "not
+ * synced", so nothing is stored, `tools_synced_at` is not stamped, and every file tool keeps paying
+ * its round trip — the safe, self-correcting outcome.
  */
 export function parseToolsToCheck(raw: unknown): string[] | undefined {
   if (!Array.isArray(raw)) return undefined;
-  return raw.filter((entry): entry is string => typeof entry === "string");
+  if (raw.length > MAX_TOOLS_TO_CHECK) return undefined;
+  return raw.filter(
+    (entry): entry is string => typeof entry === "string" && entry.length <= MAX_TOOL_NAME_CHARS,
+  );
 }
 
 /**

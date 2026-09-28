@@ -165,6 +165,21 @@ export const MAX_REASON_CHARS = 2000;
  */
 export const MAX_CACHE_BYTES = 65_536;
 /**
+ * The most entries a `tools_to_check` may carry, and the longest one name may be (WR-01).
+ *
+ * The taxonomy has six entries, so 256 × 64 is generous by two orders of magnitude and still bounds
+ * what one response can make this process hold for a session and write to disk every session after.
+ *
+ * An OVER-CAP list is refused whole, not truncated, and that asymmetry is deliberate. A truncated
+ * list is a *wrong* list: dropping the entry that names the one tool an org does have a policy for
+ * turns `shouldSkipFileTool` into a skip, which is a silently disabled check. Refusing the whole
+ * field means "never learned" — the state that costs a round trip per call and enforces on every one.
+ * Junk entries *inside* a within-cap list are still dropped individually, because there the effect
+ * only ever narrows the skip set.
+ */
+export const MAX_TOOLS_TO_CHECK = 256;
+export const MAX_TOOL_NAME_CHARS = 64;
+/**
  * The same guard for `~/.unbound/config.json` (CR-01). Separate constant, larger value: the config
  * file is shared with unbound-cli and six other tools, so it may legitimately carry keys this
  * extension never reads, and a cap that refused a file the CLI wrote would silently unset identity —

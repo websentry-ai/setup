@@ -16,7 +16,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { CACHE_TTL_MS } from "../src/constants.ts";
+import { CACHE_TTL_MS, MAX_TOOLS_TO_CHECK, MAX_TOOL_NAME_CHARS } from "../src/constants.ts";
 import { createPolicyState, parseToolsToCheck } from "../src/policyState.ts";
 import type { PolicySnapshot } from "../src/policyState.ts";
 import type { PreToolResponseBody } from "../src/types.ts";
@@ -247,4 +247,55 @@ test("hydrate copies the list rather than aliasing the caller's array", () => {
 
 test("CACHE_TTL_MS is the Python hook's 300 s in milliseconds", () => {
   assert.equal(CACHE_TTL_MS, 300_000, "unbound.py:70 CACHE_TTL_SECONDS = 300");
+});
+
+// --- WR-01: the list a response can make us hold, write and rescan is bounded -------------------
+
+test("parseToolsToCheck: an over-cap list is 'not synced', not a truncated list", () => {
+  const huge = Array.from({ length: MAX_TOOLS_TO_CHECK + 1 }, (_, i) => `tool_${i}`);
+  // Refused WHOLE, deliberately. Truncating would produce a list that is merely wrong, and being
+  // wrong by omission here means `shouldSkipFileTool` skips a tool the org does have a policy for.
+  assert.equal(parseToolsToCheck(huge), undefined);
+  // Exactly at the cap is still a value — this is a cap, not a smaller taxonomy.
+  assert.equal(parseToolsToCheck(huge.slice(0, MAX_TOOLS_TO_CHECK))?.length, MAX_TOOLS_TO_CHECK);
+});
+
+test("parseToolsToCheck: an over-long entry is dropped, the rest of the list survives", () => {
+  const long = "x".repeat(MAX_TOOL_NAME_CHARS + 1);
+  // Per-entry damage only ever NARROWS the skip set (more round trips, identical verdicts), so here
+  // dropping the bad entry is the safe direction and keeping the response is worth it.
+  assert.deepEqual(parseToolsToCheck(["read", long, "write"]), ["read", "write"]);
+  assert.deepEqual(parseToolsToCheck(["x".repeat(MAX_TOOL_NAME_CHARS)]), ["x".repeat(MAX_TOOL_NAME_CHARS)]);
+});
+
+test("WR-01: an over-cap tools_to_check is not stored and does not stamp tools_synced_at", () => {
+  const state = createPolicyState();
+  state.recordSuccess(
+    {
+      decision: "allow",
+      tools_to_check: Array.from({ length: MAX_TOOLS_TO_CHECK + 1 }, () => "read"),
+      policy_check_failure_action: "block",
+    } as PreToolResponseBody,
+    T1,
+  );
+  // Nothing stored, nothing stamped: the state stays at "never learned", which costs a round trip
+  // per file tool and enforces on every one of them.
+  assert.equal(state.getToolsToCheck(), undefined);
+  assert.equal(state.getToolsSyncedAt(), undefined);
+  assert.equal(state.snapshot().tools_to_check, undefined);
+  // The failure action on the same response is still learned — one bad field must not cost the one
+  // field that can turn an API failure into a block.
+  assert.equal(state.getFailureAction(), "block");
+});
+
+test("WR-01: an over-cap list on DISK is a cache miss for both halves", () => {
+  const state = createPolicyState();
+  state.hydrate({
+    tools_synced_at: T1,
+    tools_to_check: Array.from({ length: MAX_TOOLS_TO_CHECK + 1 }, () => "read"),
+  });
+  // Both or neither: a refused list must not leave its stamp behind, or the stamp alone would look
+  // fresh with nothing to check against.
+  assert.equal(state.getToolsToCheck(), undefined);
+  assert.equal(state.getToolsSyncedAt(), undefined);
 });
