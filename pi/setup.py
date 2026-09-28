@@ -20,12 +20,14 @@ the sidecar in the same commit. Said plainly here so the reader of the installer
 exactly how much assurance this is.
 """
 
+import hashlib
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # Same host and ref as every other artifact this repo fetches (setup.js:14). The sidecar
@@ -172,6 +174,226 @@ def preflight() -> bool:
     return True
 
 
+def download_file(url: str, dest_path) -> bool:
+    """curl one URL to one path. Returns False on any failure and never raises."""
+    dest_path = Path(dest_path)
+    try:
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_print(f"Downloading {url} to {dest_path}")
+        result = subprocess.run(
+            ["curl", "-fsSL", "-o", str(dest_path), url],
+            capture_output=True,
+            timeout=30
+        )
+        if result.returncode == 0:
+            debug_print(f"File downloaded successfully: {dest_path}")
+        return result.returncode == 0
+    except Exception as e:
+        # A missing curl or a timed-out fetch is a refusal, not a traceback.
+        print(f"❌ Failed to download {url}: {e}")
+        return False
+
+
+def artifact_sha256(path) -> Optional[str]:
+    """sha256 of the bytes on disk, or None when the file is missing or unreadable.
+
+    Deliberately NOT named hook_script_hash: tests/test_setup_contract.py asserts that
+    exactly 10 installers define that name, and pi ships no unbound.py hook script -- what
+    is hashed here is the extension bundle itself.
+    """
+    try:
+        return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except Exception:
+        return None
+
+
+def parse_sha256_sidecar(text) -> Optional[str]:
+    """The digest out of a `shasum -a 256` line, or None if this is not one.
+
+    Accepts a bare 64-hex line and the two-field `<digest>  pi/index.js` form (including
+    the `*` binary-mode marker). Anything else -- empty, wrong length, non-hex, or a line
+    naming some other file -- returns None, which every caller turns into a refusal.
+    """
+    if not isinstance(text, str):
+        return None
+    tokens = text.strip().split()
+    if not tokens or len(tokens) > 2:
+        return None
+    digest = tokens[0].strip().lower()
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return None
+    if len(tokens) == 2:
+        # The committed sidecar is generated from the repo root, so the path is pi/index.js;
+        # a line naming anything else is a sidecar for a different artifact.
+        named = os.path.basename(tokens[1].lstrip("*"))
+        if named != "index.js":
+            return None
+    return digest
+
+
+def verify_artifact(path, sidecar_text) -> Tuple[bool, Optional[str], Optional[str]]:
+    """(ok, computed, expected) -- both digests come back so the caller can name them."""
+    expected = parse_sha256_sidecar(sidecar_text)
+    computed = artifact_sha256(path)
+    ok = bool(expected) and bool(computed) and expected == computed
+    return ok, computed, expected
+
+
+def _next_free_name(path) -> Path:
+    """`path`, or `path.1`, `path.2`, ... -- the first name nothing occupies.
+
+    A developer's own file is moved aside, never overwritten and never deleted, so a
+    second run with a second index.ts must not land on the first one's grave.
+    """
+    path = Path(path)
+    if not path.exists():
+        return path
+    for n in range(1, 1000):
+        candidate = path.with_name(f"{path.name}.{n}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{path.name}.{os.getpid()}")
+
+
+def handle_shadow_files(extdir) -> bool:
+    """Move aside anything pi would resolve before our index.js. False means give up.
+
+    pi resolves index.ts BEFORE index.js in an extension directory, so a leftover .ts
+    wins silently: pi starts, logs no load error, and no policy check ever fires. A
+    sibling package.json can change module resolution too, but not shadow us outright,
+    so it only warns.
+    """
+    extdir = Path(extdir)
+    for name in SHADOW_NAMES:
+        candidate = extdir / name
+        if not candidate.exists():
+            continue
+        moved_to = _next_free_name(extdir / (name + DISABLED_SUFFIX))
+        try:
+            candidate.rename(moved_to)
+        except Exception as e:
+            print(f"❌ A {name} would shadow index.js and could not be moved aside: {e}")
+            return False
+        print(f"⚠️  Found {name}, which would shadow index.js -- pi resolves it first.")
+        print(f"   Moved it to {moved_to.name}; it was not deleted. Nothing else changed.")
+    for name in WARN_NAMES:
+        if (extdir / name).exists():
+            print(f"⚠️  A {name} is present in {extdir}; it can change how pi resolves")
+            print("   this directory. Continuing -- remove it if the extension misbehaves.")
+    return True
+
+
+def detect_install_state(path) -> str:
+    """'persisted' when the extension is already on this device, else 'fresh'.
+
+    'tampered', the backend's third value, belongs to the managed path only -- a
+    user-level install is not tamper-eligible, so it is never reported here.
+    """
+    try:
+        return "persisted" if Path(path).exists() else "fresh"
+    except Exception as e:
+        debug_print(f"detect_install_state failed: {e}")
+        return "fresh"
+
+
+def install_extension(agent_dir) -> Optional[str]:
+    """Fetch, verify and drop the extension. Returns the digest written, or None.
+
+    Nothing is written until the downloaded bytes match the downloaded sidecar, so a
+    truncated or stale artifact can never become an installed extension -- and the
+    returned digest is of the bytes on disk, which is what gets reported as hook_hash.
+    """
+    if agent_dir is None:
+        print("❌ Could not work out where pi keeps its agent directory; nothing installed.")
+        return None
+
+    extdir = extension_dir(agent_dir)
+    target = artifact_path(agent_dir)
+    staging = None
+    try:
+        # A 0700 staging dir, so a partly-downloaded artifact is never visible to pi and
+        # is not readable by other users on a shared host.
+        staging = tempfile.mkdtemp(prefix=".unbound-pi.")
+        try:
+            os.chmod(staging, 0o700)
+        except OSError as e:
+            debug_print(f"Could not tighten the staging dir: {e}")
+        staged = Path(staging) / "index.js"
+        staged_sidecar = Path(staging) / "index.js.sha256"
+
+        if not download_file(ARTIFACT_URL, staged):
+            print(f"❌ Could not download the pi extension from {ARTIFACT_URL}")
+            return None
+        if not download_file(SHA_URL, staged_sidecar):
+            print(f"❌ Could not download the integrity sidecar from {SHA_URL}")
+            print("   The artifact and its sidecar are committed together, so a missing")
+            print("   sidecar means that ref is inconsistent. Refusing to install.")
+            return None
+
+        try:
+            sidecar_text = staged_sidecar.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"❌ Could not read the downloaded sidecar: {e}")
+            return None
+
+        ok, computed, expected = verify_artifact(staged, sidecar_text)
+        if not ok:
+            print(f"❌ Integrity check failed for {ARTIFACT_URL}")
+            print(f"   {SHA_URL} expects {str(expected)[:16]}...")
+            print(f"   the downloaded bytes are {str(computed)[:16]}...")
+            print("   Nothing was written; the existing install, if any, is untouched.")
+            return None
+
+        if not handle_shadow_files(extdir):
+            return None
+
+        try:
+            extdir.mkdir(mode=0o755, parents=True, exist_ok=True)
+        except OSError as e:
+            print(f"❌ Could not create {extdir}: {e}")
+            return None
+        try:
+            # mkdir's mode is masked by umask, and does nothing for a dir that existed.
+            os.chmod(extdir, 0o755)
+        except OSError as e:
+            debug_print(f"Could not set the mode on {extdir}: {e}")
+
+        try:
+            payload = staged.read_bytes()
+            fd = os.open(str(target), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+        except OSError as e:
+            print(f"❌ Could not write {target}: {e}")
+            return None
+        try:
+            # 0644 so pi can read it and nothing else can quietly edit it; O_CREAT's mode
+            # is masked by umask and is ignored entirely when the file already existed.
+            os.chmod(target, 0o644)
+        except OSError as e:
+            debug_print(f"Could not set the mode on {target}: {e}")
+
+        written = artifact_sha256(target)
+        if written != computed:
+            print(f"❌ {target} does not match what was verified; refusing to report it.")
+            return None
+
+        # Written next to the artifact so --clear can remove it and a human can check the
+        # install by hand with `shasum -a 256 -c index.js.sha256`.
+        try:
+            fd = os.open(str(sidecar_path(agent_dir)), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(f"{written}  index.js\n")
+        except OSError as e:
+            debug_print(f"Could not write the local sidecar: {e}")
+
+        print(f"✅ Installed the Unbound extension: {target} ({len(payload)} bytes, 0644)")
+        return written
+    finally:
+        if staging:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
 def _clear_path(path, label: str) -> str:
     """Remove one file we wrote. Returns "cleared"/"not_found"/"failed", never raises."""
     path = Path(path)
@@ -271,9 +493,21 @@ def main() -> bool:
     print("Pi Coding Agent Setup for Unbound Gateway")
     print("=" * 60)
 
-    # The install path lands in the next commit of this plan (10-01 Task 2).
-    print("❌ The install path is not wired up yet in this commit.")
-    return False
+    preflight()
+
+    agent_dir = resolve_agent_dir(Path.home(), os.environ)
+    if agent_dir is None:
+        print("❌ Could not resolve your home directory, so there is no safe place to install.")
+        return False
+    print(f"Agent directory: {agent_dir}")
+
+    digest = install_extension(agent_dir)
+    if not digest:
+        return False
+
+    # The key write and the backend report land in the next commit of this plan (Task 3).
+    print("The API key write and the install report are not wired up yet in this commit.")
+    return True
 
 
 if __name__ == "__main__":
