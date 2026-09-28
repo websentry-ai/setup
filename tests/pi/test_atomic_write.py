@@ -35,7 +35,11 @@ ARTIFACT = b"// GENERATED FILE - DO NOT EDIT\nexport default { name: 'unbound' }
 DIGEST = hashlib.sha256(ARTIFACT).hexdigest()
 OLD_GOOD = b"// the previously installed, working extension\n"
 
-TMP_SUFFIX = ".unbound-tmp"
+# Marks a publish-by-rename temp. The real name carries a pid and random bytes after this
+# marker (one shared temp name was a lost-update race between concurrent writers), so a
+# leftover sweep has to glob AROUND the marker rather than match a suffix.
+TMP_MARKER = ".unbound-tmp"
+TMP_GLOB = "*" + TMP_MARKER + "*"
 
 
 @pytest.fixture
@@ -79,23 +83,23 @@ class TestTheUserInstallIsAtomic:
         monkeypatch.setattr(pi_setup.os, "replace",
                             lambda *a, **k: (_ for _ in ()).throw(OSError("EIO")))
         pi_setup.install_extension(pi_home.agent_dir)
-        assert list(extdir.glob("*" + TMP_SUFFIX)) == []
+        assert list(extdir.glob(TMP_GLOB)) == []
 
     def test_a_successful_install_leaves_no_temp_file_behind(
             self, pi_setup, pi_home, good_fetch):
         assert pi_setup.install_extension(pi_home.agent_dir) == DIGEST
         extdir = pi_home.extension_dir()
-        assert list(extdir.glob("*" + TMP_SUFFIX)) == []
+        assert list(extdir.glob(TMP_GLOB)) == []
 
     def test_a_leftover_temp_from_a_killed_run_does_not_block_the_next_install(
             self, pi_setup, pi_home, good_fetch):
         """O_EXCL would otherwise turn one killed run into a permanently broken installer."""
         extdir = pi_home.extension_dir()
         extdir.mkdir(parents=True)
-        (extdir / ("index.js" + TMP_SUFFIX)).write_bytes(b"half a bundle")
+        (extdir / ("index.js" + TMP_MARKER)).write_bytes(b"half a bundle")
         assert pi_setup.install_extension(pi_home.agent_dir) == DIGEST
         assert pi_setup.artifact_path(pi_home.agent_dir).read_bytes() == ARTIFACT
-        assert list(extdir.glob("*" + TMP_SUFFIX)) == []
+        assert list(extdir.glob(TMP_GLOB)) == []
 
     def test_the_publish_is_a_rename_not_a_truncating_write(
             self, pi_setup, pi_home, good_fetch, monkeypatch):
@@ -117,10 +121,10 @@ class TestTheUserInstallIsAtomic:
         artifact = [(s, d) for s, d in seen if d.endswith("index.js")]
         assert len(artifact) == 1, f"expected one index.js rename, got {seen}"
         src, dst = artifact[0]
-        assert src.endswith("index.js" + TMP_SUFFIX)
-        assert not dst.endswith(TMP_SUFFIX)
+        assert ("index.js" + TMP_MARKER) in src
+        assert TMP_MARKER not in dst
         # The sidecar too, since a half-written sidecar reads as tampering to a human.
-        assert any(d.endswith("index.js.sha256") and s.endswith(TMP_SUFFIX)
+        assert any(d.endswith("index.js.sha256") and TMP_MARKER in s
                    for s, d in seen), f"the sidecar is not published by rename: {seen}"
 
 
@@ -191,7 +195,7 @@ class TestTheMdmDropIsAtomicToo:
 
         assert mod.install_for_user("alice", home, ARTIFACT, DIGEST).startswith("failed")
         assert (extdir / "index.js").read_bytes() == OLD_GOOD
-        assert list(extdir.glob("*" + TMP_SUFFIX)) == []
+        assert list(extdir.glob(TMP_GLOB)) == []
 
     def test_a_clean_run_publishes_by_rename_and_leaves_no_temp(
             self, pi_mdm_setup, tmp_path, monkeypatch):
@@ -204,7 +208,7 @@ class TestTheMdmDropIsAtomicToo:
         assert mod.install_for_user("bob", home, ARTIFACT, DIGEST) == "installed"
         extdir = home / ".pi" / "agent" / "extensions" / "unbound"
         assert (extdir / "index.js").read_bytes() == ARTIFACT
-        assert list(extdir.glob("*" + TMP_SUFFIX)) == []
+        assert list(extdir.glob(TMP_GLOB)) == []
 
     def test_a_second_push_refreshes_the_sidecar_rather_than_leaving_the_old_digest(
             self, pi_mdm_setup, tmp_path, monkeypatch):
@@ -311,7 +315,7 @@ class TestTheRcRewriteNeverDestroysAUserFile:
         assert mod.append_to_file(rc, "export UNBOUND_PI_API_KEY=k",
                                   "UNBOUND_PI_API_KEY") is False
         assert rc.read_bytes() == original
-        assert list(tmp_path.glob("*" + TMP_SUFFIX)) == []
+        assert list(tmp_path.glob(TMP_GLOB)) == []
 
     def test_an_rc_file_symlinked_into_a_dotfiles_repo_keeps_its_link(
             self, pi_mdm_setup, tmp_path):
@@ -385,6 +389,46 @@ class TestNoDurableFileIsWrittenByTruncation:
                          if "os.O_TRUNC" in ln]
             assert offenders == [], f"{mod.__file__} truncates in place: {offenders}"
 
+    def test_no_two_writers_share_one_temp_name(self, pi_setup, pi_mdm_setup, tmp_path):
+        """One fixed `<name>.unbound-tmp`, unlinked before every open, made concurrent writers
+        collide: B unlinked A's open temp, created its own at the same name, and A's rename
+        published B's half-written file over the destination -- returning True. Both
+        installers write ~/.unbound/config.json, so an MDM push during `unbound setup pi` is
+        the reachable case."""
+        target = tmp_path / "config.json"
+        names = {str(mod._unique_tmp_path(target))
+                 for mod in (pi_setup, pi_mdm_setup) for _ in range(40)}
+        assert len(names) == 80, "a temp name repeated across writers"
+        for name in names:
+            assert TMP_MARKER in name, name
+            assert name != str(target) + TMP_MARKER, "still the shared fixed name"
+
+    def test_a_writer_clearing_the_legacy_temp_name_cannot_hijack_the_publish(
+            self, pi_setup, tmp_path, monkeypatch):
+        """The race, played out. An interloper doing exactly what the old code did -- unlink
+        `<name>.unbound-tmp` and write its own partial file there -- can no longer have those
+        bytes published under our name, because our temp is not at that name."""
+        target = tmp_path / "config.json"
+        target.write_text("original")
+        legacy = tmp_path / ("config.json" + TMP_MARKER)
+        real_fsync = os.fsync
+        fired = []
+
+        def interlope(fd):
+            if not fired:
+                fired.append(True)
+                try:
+                    os.unlink(str(legacy))
+                except OSError:
+                    pass
+                legacy.write_text("PARTIAL-FROM-THE-OTHER-WRITER")
+            return real_fsync(fd)
+
+        monkeypatch.setattr(pi_setup.os, "fsync", interlope)
+        assert pi_setup.atomic_write_text(target, "ours, complete") is True
+        assert fired, "the interloper never ran, so this assertion would be vacuous"
+        assert target.read_text() == "ours, complete"
+
     def test_the_user_config_write_is_atomic(self, pi_setup, fake_home, monkeypatch):
         """The file six tools authenticate with must survive a failed write intact."""
         cfg = fake_home.config_path
@@ -396,7 +440,7 @@ class TestNoDurableFileIsWrittenByTruncation:
                             lambda *a, **k: (_ for _ in ()).throw(OSError("ENOSPC")))
         assert pi_setup.write_unbound_config("newkey", {"base_url": "https://b"}) is False
         assert cfg.read_text() == original, "the shared identity file survived"
-        assert list(cfg.parent.glob("*" + TMP_SUFFIX)) == []
+        assert list(cfg.parent.glob(TMP_GLOB)) == []
 
     def test_a_successful_user_config_write_still_merges(self, pi_setup, fake_home):
         """Positive control: the atomic path must not have broken read-merge-write."""

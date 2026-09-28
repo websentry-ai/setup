@@ -62,6 +62,10 @@ DISABLED_SUFFIX = ".unbound-disabled"
 # Exactly the files this installer writes, and so exactly what --clear may remove.
 INSTALLED_NAMES = ("index.js", "index.js.sha256")
 
+# Marks a publish-by-rename temp. The full name adds a pid and random bytes -- see
+# _unique_tmp_path -- so two concurrent writers can never share one temp file.
+TMP_MARKER = ".unbound-tmp"
+
 DEBUG = False
 
 
@@ -161,6 +165,32 @@ def artifact_path(agent_dir) -> Path:
     return extension_dir(agent_dir) / "index.js"
 
 
+def _unique_tmp_path(target: Path) -> Path:
+    """A temp name beside `target` that belongs to this writer alone.
+
+    One shared `<name>.unbound-tmp`, unlinked before every open, was a lost-update race with
+    a silent wrong answer: writer B unlinks A's open temp, creates its own at the same name,
+    and A's `os.replace` then publishes B's half-written file over the destination and
+    reports success. An MDM push landing while the user runs `unbound setup pi` is the
+    reachable version -- both write `~/.unbound/config.json`. With the pid and four random
+    bytes in the name, O_EXCL means what it says and the failure path unlinks only our own.
+    """
+    return target.with_name(f"{target.name}{TMP_MARKER}.{os.getpid()}.{os.urandom(4).hex()}")
+
+
+def _unlink_legacy_tmp(target: Path) -> None:
+    """Remove the pre-unique fixed-name temp an older killed run could have left behind.
+
+    Safe to unlink unconditionally because no writer creates this exact name any more, so it
+    can only be debris -- and unlike globbing the unique names, it can never take out a live
+    writer's temp file.
+    """
+    try:
+        os.unlink(str(target.with_name(target.name + TMP_MARKER)))
+    except OSError:
+        pass
+
+
 def atomic_write_text(path, text: str, mode: int = 0o644, follow_symlink: bool = True) -> bool:
     """Replace one file's contents with no truncate-in-place window.
 
@@ -175,13 +205,10 @@ def atomic_write_text(path, text: str, mode: int = 0o644, follow_symlink: bool =
     """
     try:
         target = Path(os.path.realpath(str(path))) if follow_symlink else Path(path)
-        tmp = target.with_name(target.name + ".unbound-tmp")
+        tmp = _unique_tmp_path(target)
         try:
-            # A temp left by an earlier killed run must not fail the O_EXCL open.
-            try:
-                os.unlink(str(tmp))
-            except FileNotFoundError:
-                pass
+            # Debris from a killed pre-unique run, never another live writer's temp.
+            _unlink_legacy_tmp(target)
             fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(text)
@@ -449,14 +476,11 @@ def install_extension(agent_dir) -> Optional[str]:
         # a previously working extension truncated, and pi loads the broken file silently --
         # enforcement disappears with no error anywhere. os.replace is atomic within a
         # directory, so index.js is either the old bytes or all of the new ones.
-        tmp = target.with_name(target.name + ".unbound-tmp")
+        tmp = _unique_tmp_path(target)
         try:
             payload = staged.read_bytes()
-            # A temp left by an earlier killed run must not fail the O_EXCL open below.
-            try:
-                os.unlink(str(tmp))
-            except FileNotFoundError:
-                pass
+            # Debris from a killed pre-unique run, never another live writer's temp.
+            _unlink_legacy_tmp(target)
             fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
             with os.fdopen(fd, "wb") as f:
                 f.write(payload)
