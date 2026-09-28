@@ -92,6 +92,7 @@ export async function decideUserBash(
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
 
     const hooks: CheckHooks =

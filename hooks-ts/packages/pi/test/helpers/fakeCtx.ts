@@ -35,6 +35,8 @@ export interface FakeCtxOptions {
   sessionId: string;
   /** `undefined` models the real `ctx.model: Model | undefined`. */
   modelId: string | undefined;
+  /** `ctx.model.provider`; omitted from the fake model when undefined. */
+  modelProvider: string | undefined;
   /** What `ui.confirm` resolves to. pi resolves `false` on dismiss, timeout and abort. */
   confirmResult: boolean;
 }
@@ -45,7 +47,7 @@ export interface FakeCtx {
   hasUI: boolean;
   signal: AbortSignal | undefined;
   sessionManager: { getSessionId(): string };
-  model: { id: string } | undefined;
+  model: { id: string; provider?: string } | undefined;
   ui: {
     confirm(title: string, message: string, opts?: FakeDialogOptions): Promise<boolean>;
     notify(message: string, type?: FakeNotifyType): void;
@@ -65,6 +67,7 @@ export function createFakeCtx(overrides: Partial<FakeCtxOptions> = {}): FakeCtx 
     signal: new AbortController().signal,
     sessionId: "session-abc",
     modelId: "claude-sonnet-4-5",
+    modelProvider: undefined,
     confirmResult: true,
     ...overrides,
   };
@@ -80,7 +83,12 @@ export function createFakeCtx(overrides: Partial<FakeCtxOptions> = {}): FakeCtx 
     sessionManager: {
       getSessionId: () => opts.sessionId,
     },
-    model: opts.modelId === undefined ? undefined : { id: opts.modelId },
+    model:
+      opts.modelId === undefined
+        ? undefined
+        : opts.modelProvider === undefined
+          ? { id: opts.modelId }
+          : { id: opts.modelId, provider: opts.modelProvider },
     ui: {
       async confirm(title, message, dialogOpts) {
         confirmCalls.push({ title, message, opts: dialogOpts });
