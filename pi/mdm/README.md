@@ -52,7 +52,7 @@ way the other MDM installers in this repo do.
 |---|---|---|
 | `<home>/.pi/agent/extensions/unbound/index.js` | `0644` | that user |
 | `<home>/.pi/agent/extensions/unbound/index.js.sha256` | `0644` | that user |
-| an `export UNBOUND_PI_API_KEY="…"` line in `~/.zprofile` + `~/.bash_profile` (macOS) or `~/.zshrc` + `~/.bashrc` (Linux) | group/other bits stripped (`0644` → `0600`) | that user |
+| an `export UNBOUND_PI_API_KEY="…"` line in `~/.zprofile` + the user's bash login profile (macOS) or `~/.zshrc` + `~/.bashrc` (Linux) | group/other bits stripped (`0644` → `0600`) | that user |
 | `api_key` in `<home>/.unbound/config.json`, **only when absent or previously written by this installer** | `0600` in a `0700` dir | that user |
 | `pi_mdm_api_key_sha256` in the same file — the digest that marks that `api_key` as ours | `0600` in a `0700` dir | that user |
 
@@ -107,6 +107,24 @@ port of, both called out in comments at the code:
 
 The `UNBOUND_PI_API_KEY` variable is deliberately the pi-specific tier and never the generic
 `UNBOUND_API_KEY`: writing a device key to the generic name would hand it to six other tools.
+
+### Which bash profile gets the export
+
+bash reads only the **first** of `.bash_profile`, `.bash_login`, `.profile` that exists. So the
+installer writes to whichever of those the user already has, and creates `.bash_profile` only
+when none of them does. Unconditionally writing `.bash_profile` created it for a user who
+relied on `.bash_login` or `.profile`, and from that point every new terminal silently stopped
+sourcing their `PATH` and environment — a breakage this installer caused and `--clear` could
+not undo.
+
+zsh has no such chain (it sources `.zshenv`, `.zprofile`, `.zshrc` and `.zlogin`), so
+`~/.zprofile` is unconditional, and the Linux pair are interactive rc files rather than a
+first-match login sequence.
+
+If an **older** version of this installer already created a shadowing `.bash_profile`,
+`--clear` empties it and prints exactly which file it is shadowing. It does not delete it: an
+empty `.bash_profile` is sometimes a deliberate way to suppress `.profile`, and removing a
+shell profile from someone's home on an uninstall path is worse than the problem it fixes.
 
 ## Writing into another user's home as root
 
