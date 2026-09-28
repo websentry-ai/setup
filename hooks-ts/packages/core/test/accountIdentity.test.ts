@@ -91,7 +91,7 @@ const oauthAnthropic = (expires = future()) => ({
 const noSerial: ExecFileLike = async () => undefined;
 // "No serial" must hold on every runner: the Linux fallback reads /etc/machine-id via `readFile`, not
 // `execFile`, so both probes are stubbed together — a GitHub runner has a machine-id.
-const noSerialProbe = { ...noSerialProbe, readFile: () => undefined } as const;
+const noSerialProbe = { execFile: noSerial, readFile: () => undefined } as const;
 
 // --- agent dir -----------------------------------------------------------------------------------
 
