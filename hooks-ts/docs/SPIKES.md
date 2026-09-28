@@ -2,8 +2,9 @@
 
 HOOK-07 asks two questions that a design document cannot answer: does policy still apply to tool
 calls made *inside* a pi subagent, and does it apply to tools that are not pi's own? Both were
-re-run against the installed pi `0.87.1` on 2026-09-27 (UTC) with the Phase 9 build
-(`dist/pi/index.js`, 52 771 bytes) installed at `~/.pi/agent/extensions/unbound/index.js` and the
+re-run against the installed pi `0.87.1` on 2026-09-27 (UTC) with the Phase 9 build — the
+committed `pi/index.js` at the branch head — installed at
+`~/.pi/agent/extensions/unbound/index.js` and the
 repo's own scripted mock on `http://127.0.0.1:8799`. Headless runs used
 `--model openrouter/openai/gpt-4.1-nano` (the default Anthropic provider is out of usage).
 
@@ -223,7 +224,13 @@ no further work), **Phase 10**, or **product** (a decision outside engineering's
 
 ## Metadata
 
-- Run 2026-09-27 (UTC) against pi `0.87.1`, Node `v22.22.2`, bundle `dist/pi/index.js` 52 771 bytes.
+- Run 2026-09-27 (UTC) against pi `0.87.1`, Node `v22.22.2`, bundle the committed `pi/index.js` at
+  the branch head.
+- **The seven Phase 9 review-fix commits post-date this run**, so no byte size is quoted — it would
+  be stale on the next commit. The three behaviour-changing fixes among them (the session-id
+  rollover of a pending turn record, heartbeat persistence through the cache seam, and blocking
+  rather than latching a rejected key at a fail-closed org) were re-verified against the current
+  artifact by the Phase 9 verifier (`09-VERIFICATION.md`); the spikes below were not re-run.
 - Spike teardown: `~/.pi/agent/extensions/zz-spike` removed; `~/.pi/agent/.unbound/policy_cache.json`
   cleared between runs; `~/.unbound/config.json` never touched.
 - Recipe source: `09-RESEARCH.md` §D3, run as written except for the `--mode allow` substitution in
