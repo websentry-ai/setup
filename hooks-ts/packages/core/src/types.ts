@@ -31,6 +31,25 @@ export interface PretoolRequestBody {
   messages: PretoolMessage[];
   unbound_app_label: "pi";
   client_entrypoint?: string;
+  /**
+   * Ask the response to carry the policy payload (RES-03).
+   *
+   * **Only honoured on the command-policy path** (§C2): `handleCommandPolicy` attaches
+   * `tools_to_check` when this is set, while `handleGuardrails` — the `user_prompt` path —
+   * deliberately omits it so a prompt check cannot clobber the tool cache, and the unrecognised-event
+   * fall-through carries no policy payload at all. So the field is meaningful on a genuine tool call
+   * and inert everywhere else; it is never sent as `false`, because an absent key and a false one
+   * mean the same thing to the server and the shorter body is the honest one.
+   */
+  pull_policies?: boolean;
+  /**
+   * RES-05. Read at `preToolUseHandler.ts:860` → `:2239`, where it suppresses **duplicate
+   * Slack-approval logging** and nothing else — in particular it has no effect on `tools_to_check`
+   * (§C2). Sent on the heartbeat because 09-CONTEXT locks it and because it is the honest description
+   * of a session's first contact; it is deliberately not sent on ordinary tool calls, where
+   * suppressing approval logging would be wrong.
+   */
+  first_approval_check?: boolean;
 }
 
 /** The four-value response enum (`DECISION`, `preToolUseHandler.ts:278-283`). */
@@ -66,4 +85,25 @@ export interface PretoolPayloadInput {
   model: string | undefined;
   clientEntrypoint: string;
   lastUserPrompt?: string;
+  /** Sets `pull_policies` on the body when true; when false or absent the key is omitted. */
+  pullPolicies?: boolean;
+}
+
+/**
+ * The structural input for a **prompt** check (HOOK-05). Separate from `PretoolPayloadInput` because
+ * a prompt has no tool semantics at all: no tool name, no command, no tool input, no file path.
+ * Sharing one input type would make every one of those absences an optional field somebody could
+ * accidentally fill.
+ *
+ * `images` is absent on purpose and must stay that way: `InputEvent.images` is base64 image data,
+ * potentially megabytes, that nothing server-side reads (§F5).
+ */
+export interface PromptPayloadInput {
+  prompt: string;
+  cwd: string;
+  sessionId: string;
+  model: string | undefined;
+  clientEntrypoint: string;
+  hasUI: boolean;
+  pullPolicies?: boolean;
 }

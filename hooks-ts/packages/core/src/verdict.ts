@@ -16,16 +16,53 @@ import type { Decision } from "./types.ts";
 /**
  * What core hands the adapter. `confirm` covers both `ask` and `approval_required`: Phase 8 renders
  * an identical local confirmation for each (Slack approval polling is Future, per 08-CONTEXT).
- * `unavailable` is the one non-allow failure outcome — see `policy.ts`.
+ * `unavailable` is the one non-allow failure outcome — see `policy.ts`. Its `reason` is optional and
+ * is **not** API text: no response body reaches this field, so it is never sanitised and never
+ * attacker-influenced. It is a constant from `constants.ts` naming a failure the generic
+ * `ENGINE_UNAVAILABLE_REASON` would describe wrongly — today, a rejected key at a fail-closed org,
+ * where "please retry" is bad advice. Absent means the generic string.
  */
 export type PolicyOutcome =
   | { kind: "allow" }
   | { kind: "deny"; reason?: string }
   | { kind: "confirm"; reason?: string }
-  | { kind: "unavailable" };
+  | { kind: "unavailable"; reason?: string };
 
-/** Every ASCII control character except `\n`, which is meaningful inside a multi-line reason. */
-const CONTROL_CHARS = /[\x00-\x09\x0b-\x1f\x7f]/g;
+/**
+ * Characters that change how the reason *reads* without being visible in it. Dropped outright:
+ *
+ *   * every ASCII control character except `\n` (which is meaningful inside a multi-line reason) —
+ *     `\x1b` is in the range, so ANSI escape sequences are defanged;
+ *   * `U+0080-U+009F`, the C1 control block. Non-printing to a terminal and to the TUI, and two of
+ *     them are escape-sequence introducers on their own: `U+009B` is CSI — the single-character form
+ *     of `ESC [`, so it carries the entire ANSI repertoire *without* containing an `ESC` byte — and
+ *     `U+009D` is OSC. Stripping `\x1b` alone left that path open. Written as one contiguous
+ *     `\x7f-\x9f` range together with DEL, because that is what the two are;
+ *   * `U+200B-200F` zero-width space/joiners and the LRM/RLM directional marks;
+ *   * `U+202A-202E` bidi embeddings and overrides — `U+202E` reverses the rendering of everything
+ *     after it, which is enough to make a deny reason read as an allow or to forge the
+ *     `Enforced by Unbound · Trace ID …` footer;
+ *   * `U+2060-2064` invisible word-joiner/operators, and `U+2066-2069` the bidi isolates;
+ *   * `U+FEFF`, a BOM anywhere but the start.
+ *
+ * Ordinary Unicode — accents, dashes, CJK, the footer's `·` — is untouched. The control range stops
+ * at `U+009F`; everything from `U+00A0` up is printable and is not this function's business.
+ *
+ * Built with `new RegExp` from an escaped string rather than written as a regex literal on purpose:
+ * a literal would have to contain these characters *verbatim* in the source, where they are by
+ * definition invisible to a reviewer (and `U+2028`/`U+2029` would terminate the line outright).
+ */
+const CONTROL_CHARS = new RegExp(
+  "[\\x00-\\x09\\x0b-\\x1f\\x7f-\\x9f\\u200b-\\u200f\\u202a-\\u202e\\u2060-\\u2064\\u2066-\\u2069\\ufeff]",
+  "g",
+);
+
+/**
+ * `U+2028`/`U+2029` are line breaks to a renderer and to the model, so they can inject what reads as
+ * a new instruction line. They become a space rather than being deleted, so the words either side
+ * stay separated instead of silently fusing into a different one.
+ */
+const UNICODE_LINE_SEPARATORS = new RegExp("[\\u2028\\u2029]", "g");
 
 /**
  * Strict equality against the four literals of the server enum (`preToolUseHandler.ts:278-283`) —
@@ -44,12 +81,12 @@ export function parseDecision(raw: unknown): Decision | undefined {
  *
  * Deliberately does NOT trim, reflow or ellipsise: the gateway may already have appended its
  * `"\n\nEnforced by Unbound · Trace ID <id>"` attribution footer at emit time, and that footer has
- * to survive byte-for-byte. Only two transformations happen — control characters are dropped and
- * the string is cut at `MAX_REASON_CHARS`.
+ * to survive byte-for-byte. Only three transformations happen — deceptive invisible characters are
+ * dropped, Unicode line separators become spaces, and the string is cut at `MAX_REASON_CHARS`.
  */
 export function sanitizeReason(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
-  const stripped = raw.replace(CONTROL_CHARS, "");
+  const stripped = raw.replace(CONTROL_CHARS, "").replace(UNICODE_LINE_SEPARATORS, " ");
   if (stripped.length === 0) return undefined;
   return stripped.length > MAX_REASON_CHARS ? stripped.slice(0, MAX_REASON_CHARS) : stripped;
 }

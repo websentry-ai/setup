@@ -45,6 +45,18 @@ async function build(overrides: Partial<Deps>): Promise<Stub> {
   return stub;
 }
 
+/**
+ * A heartbeat gate that never opens.
+ *
+ * Every keyed case in this file counts requests to prove a property of the DECISION path, and RES-05's
+ * heartbeat is a different concern with its own file. Injecting a closed gate keeps these counts about
+ * what they say they are — and, unlike relying on the module-scope gate having already fired, it does
+ * not make the assertions depend on the order the cases run in.
+ */
+function closedGate(): Deps["heartbeatGate"] {
+  return { shouldSend: () => false, markSent: () => {} };
+}
+
 async function toolCall(stub: Stub, ctx: FakeCtx): Promise<unknown> {
   const handler = stub.handlers.get("tool_call");
   assert.ok(handler !== undefined);
@@ -155,6 +167,10 @@ test("RES-06 with a key: session_start is silent and tool_call issues exactly on
       env: { UNBOUND_PI_API_KEY: "unb_test_key_1234567890", UNBOUND_GATEWAY_URL: api.url },
       homeDir: home.homeDir,
       entrypoint: "pi/0.87.1",
+      // This case counts requests to prove the DECISION path costs exactly one. RES-05's heartbeat is
+      // a separate, already-sent-per-process concern and is asserted in `heartbeat.test.ts`; a closed
+      // gate keeps this assertion about the thing it names.
+      heartbeatGate: closedGate(),
     });
     const ctx = createFakeCtx();
 
@@ -181,7 +197,12 @@ test("RES-06 the key resolves from ~/.unbound/config.json when no env var is set
   const api = await startMockApi({ mode: "allow" });
   const home = createFakeHome({ api_key: "unb_from_config_file_000", gateway_url: api.url });
   try {
-    const stub = await build({ env: {}, homeDir: home.homeDir, entrypoint: "pi/0.87.1" });
+    const stub = await build({
+      env: {},
+      homeDir: home.homeDir,
+      entrypoint: "pi/0.87.1",
+      heartbeatGate: closedGate(),
+    });
     const ctx = createFakeCtx();
 
     await sessionStart(stub, ctx);

@@ -5,14 +5,14 @@
 //     that does log (T-08-03);
 //   * the URL is normalised and https-only for non-loopback hosts, so a hostile value cannot
 //     receive the Bearer header in cleartext (T-08-04 / ASVS V9);
-//   * the whole file read sits in one try/catch. An exception thrown out of a pi `tool_call`
-//     handler is a BLOCK (RESEARCH §F1), so an EACCES on a config file must never stop a
-//     developer's tool call (T-08-07).
+//   * the whole file read sits in one try/catch, and goes through `safeRead.ts` so it cannot BLOCK
+//     rather than throw (CR-01). An exception thrown out of a pi `tool_call` handler is a BLOCK
+//     (RESEARCH §F1), so an EACCES on a config file must never stop a developer's tool call
+//     (T-08-07) — and a config file that is a FIFO must not stop it either.
 //
 // Read-only by design: Phase 8 adds no writer, so the file's 0600-in-0700 posture — created by
 // `unbound login` — cannot be widened here (T-08-09 / ASVS V12).
 
-import { readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 import {
@@ -22,7 +22,9 @@ import {
   ENV_API_KEY_GENERIC,
   ENV_API_KEY_PI,
   ENV_GATEWAY_URL,
+  MAX_CONFIG_BYTES,
 } from "./constants.ts";
+import { readSmallRegularFile } from "./safeRead.ts";
 
 /** Hosts for which plain `http:` is allowed — the documented mock-API-smoke exemption (§E4a). */
 const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
@@ -33,6 +35,11 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  * Returns `{}` on any failure — ENOENT, EACCES, malformed JSON, or a JSON body that is not an
  * object. Never throws and never echoes the file contents anywhere.
  *
+ * "Never throws" was not the same as "always returns" (CR-01). The read goes through
+ * `readSmallRegularFile`, which `lstat`s first: a `config.json` that is a FIFO — or a `$HOME` on a
+ * hung network mount — made `readFileSync` block forever here, on the `init()` path every handler
+ * awaits. Only a regular file of at most `MAX_CONFIG_BYTES` is opened.
+ *
  * A **non-absolute** `homeDir` is refused outright. `os.homedir()` can fail, and the caller's
  * fallback is `""`; `join("", ".unbound/config.json")` resolves relative to the process cwd — i.e.
  * the repository pi was started in. A repo-planted `.unbound/config.json` could then supply both
@@ -42,8 +49,9 @@ const LOOPBACK_HOSTS = new Set(["localhost", "127.0.0.1", "::1", "[::1]"]);
  */
 export function readUnboundConfig(homeDir: string): Record<string, unknown> {
   if (typeof homeDir !== "string" || homeDir === "" || !isAbsolute(homeDir)) return {};
+  const raw = readSmallRegularFile(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), MAX_CONFIG_BYTES);
+  if (raw === undefined) return {};
   try {
-    const raw = readFileSync(join(homeDir, CONFIG_DIR_NAME, CONFIG_FILE_NAME), "utf8");
     const parsed: unknown = JSON.parse(raw);
     if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return {};
     return parsed as Record<string, unknown>;
@@ -78,11 +86,26 @@ export function resolveApiKey(env: NodeJS.ProcessEnv, homeDir: string): string |
 }
 
 /**
- * Validate and canonicalise a gateway URL. Returns the `origin` — which drops any path, query and
- * trailing slash an attacker (or a copy-paste) appended — or `undefined` when the value is not a
- * usable, safe base URL, so resolution falls through to the next tier.
+ * Validate and canonicalise a gateway URL, or return `undefined` when the value is not a usable,
+ * safe base URL — in which case resolution falls through to the next tier.
  *
  * `https:` is required for every real host; plain `http:` is accepted only on loopback.
+ *
+ * **A non-root path prefix is preserved (WR-09).** This previously returned bare `url.origin`, which
+ * was framed as hardening: drop anything an attacker or a copy-paste appended. That framing was
+ * wrong. In the scenario it defends against the attacker already controls the entire host, so a
+ * preserved prefix adds no attack surface — while dropping it broke a real deployment shape. A
+ * prefixed tenant (`https://host/unbound` behind an ingress path route or an API-gateway stage) had
+ * every request rewritten to `https://host/v1/hooks/pretool`, which 404s, which fails open —
+ * permanently, silently, with no local signal. The prefix is also half the on-disk cache key
+ * (`cache.ts`), so truncating it would silently re-key the cache as well.
+ *
+ * Still dropped or refused, because none of these have a legitimate base-URL meaning:
+ *   * a **root** path (`/`, `///`) — normalised away so the base never ends in a slash and
+ *     `${base}${PRETOOL_PATH}` cannot produce a double slash;
+ *   * **query and fragment** — a base URL carrying either would corrupt every request target;
+ *   * **userinfo** (`https://user:pass@host`) — credentials must not ride the base URL beside the
+ *     Bearer header, and there is no prefixed-tenant case that needs them.
  */
 export function normalizeGatewayUrl(raw: unknown): string | undefined {
   const candidate = usableString(raw);
@@ -92,7 +115,11 @@ export function normalizeGatewayUrl(raw: unknown): string | undefined {
     const url = new URL(candidate);
     const isLoopbackHttp = url.protocol === "http:" && LOOPBACK_HOSTS.has(url.hostname);
     if (url.protocol !== "https:" && !isLoopbackHttp) return undefined;
-    return url.origin;
+    if (url.username !== "" || url.password !== "") return undefined;
+    // `url.pathname` is already percent-normalised by the URL parser; `url.origin` carries no path,
+    // query or fragment, so concatenating the two drops both by construction.
+    const path = url.pathname.replace(/\/+$/, "");
+    return path === "" ? url.origin : url.origin + path;
   } catch {
     return undefined;
   }

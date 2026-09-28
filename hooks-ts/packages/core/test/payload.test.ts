@@ -16,13 +16,19 @@ import { join } from "node:path";
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { MAX_COMMAND_CHARS, MAX_TOOL_INPUT_BYTES } from "../src/constants.ts";
+import {
+  MAX_COMMAND_CHARS,
+  MAX_TOOL_INPUT_BYTES,
+  MAX_TOOL_INPUT_VALUE_BYTES,
+  TOOL_INPUT_ALLOWLIST,
+} from "../src/constants.ts";
 import {
   buildPretoolPayload,
   capCommand,
   capToolInput,
   COMMAND_TRUNCATION_MARKER,
   resolveFilePath,
+  sanitizeToolInput,
 } from "../src/payload.ts";
 import { resolveClientEntrypoint } from "../src/piVersion.ts";
 import type { PretoolPayloadInput } from "../src/types.ts";
@@ -55,7 +61,10 @@ test("buildPretoolPayload: a bash call produces the exact §B1 body", () => {
   assert.equal(body.pre_tool_use_data.command, "cat /etc/shadow");
   assert.equal(body.pre_tool_use_data.tool_use_id, "toolu_01ABC");
   assert.equal(body.pre_tool_use_data.metadata.cwd, "/Users/dev/project");
-  assert.deepEqual(body.pre_tool_use_data.metadata.tool_input, { command: "cat /etc/shadow", timeout: 30 });
+  // WR-04: `tool_input` now carries only allowlisted keys. `command` is not one — it rides
+  // `pre_tool_use_data.command` verbatim, and no evaluator reads it from here (§C4) — so it is
+  // dropped and the forward is marked lossy. `timeout` is allowlisted and survives.
+  assert.deepEqual(body.pre_tool_use_data.metadata.tool_input, { timeout: 30, _dropped: true });
   assert.deepEqual(body.messages, [{ role: "user", content: "" }]);
 });
 
@@ -126,6 +135,153 @@ test("path contract: bash and other command tools never send a file_path", () =>
   assert.equal(resolveFilePath("grep", { path: "" }, "/cwd"), "/cwd");
   assert.equal(resolveFilePath("grep", { path: 42 }, "/cwd"), "/cwd");
   assert.equal(resolveFilePath("read", { path: "" }, "/cwd"), undefined);
+});
+
+// --- WR-04: the tool_input allowlist -----------------------------------------------------------
+//
+// `metadata.tool_input` had exactly one job and forwarded everything. For pi the **only** key any
+// server-side evaluator reads is `pattern`, via `buildSyntheticPattern` for grep/find
+// (`effectiveCommand.ts:7-38`); paths arrive as `metadata.file_path`, not through `tool_input`
+// (§C4). So a `write` call was shipping up to 16 KB of file body — and an `edit` its hunks — to the
+// gateway for nothing to read. That is undeclared egress of file contents (T-09-03), and the 2 KB
+// cap alone would only have shrunk it.
+
+test("WR-04 a write's file body never leaves the machine", () => {
+  const content = "SECRET_FILE_BODY_" + "x".repeat(50_000);
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "write", command: "", toolInput: { path: "/tmp/a.txt", content } }),
+  );
+  const toolInput = body.pre_tool_use_data.metadata.tool_input as Record<string, unknown>;
+
+  assert.equal(toolInput.path, "/tmp/a.txt", "the path is what file policy evaluates");
+  assert.equal(Object.hasOwn(toolInput, "content"), false, "`content` is not forwarded at all");
+  assert.equal(toolInput._dropped, true, "and the server is told the forward was lossy");
+
+  const serialised = JSON.stringify(body);
+  assert.equal(serialised.includes("SECRET_FILE_BODY_"), false, "not even a prefix of the body");
+  assert.equal(serialised.includes("xxxxxxxxxx"), false, "nor a slice of it");
+  assert.ok(
+    Buffer.byteLength(serialised) < 4096,
+    `a 50 KB write produces a ${Buffer.byteLength(serialised)}-byte request`,
+  );
+  // The path still reaches its own field, so enforcement is unchanged.
+  assert.equal(body.pre_tool_use_data.metadata.file_path, "/tmp/a.txt");
+});
+
+test("WR-04 an edit's hunks are dropped the same way", () => {
+  const edits = [{ oldText: "API_KEY = 'live'", newText: "API_KEY = 'other-live-value'" }];
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "edit", command: "", toolInput: { path: "/tmp/a.ts", edits } }),
+  );
+  const toolInput = body.pre_tool_use_data.metadata.tool_input as Record<string, unknown>;
+
+  assert.equal(Object.hasOwn(toolInput, "edits"), false);
+  assert.equal(toolInput._dropped, true);
+  assert.equal(JSON.stringify(body).includes("API_KEY"), false, "no source text is forwarded");
+});
+
+test("WR-04 an allowlisted pattern survives, and is capped at 2 KB with a marker", () => {
+  const small = buildPretoolPayload(
+    bashInput({ toolName: "grep", command: "", toolInput: { pattern: "secret", path: "/src" } }),
+  );
+  assert.deepEqual(small.pre_tool_use_data.metadata.tool_input, { pattern: "secret", path: "/src" });
+
+  const long = "p".repeat(MAX_TOOL_INPUT_VALUE_BYTES + 500);
+  const capped = buildPretoolPayload(
+    bashInput({ toolName: "grep", command: "", toolInput: { pattern: long } }),
+  );
+  const toolInput = capped.pre_tool_use_data.metadata.tool_input as Record<string, unknown>;
+  assert.equal(
+    Buffer.byteLength(String(toolInput.pattern)),
+    MAX_TOOL_INPUT_VALUE_BYTES,
+    "sliced to exactly the cap, by bytes",
+  );
+  assert.equal(toolInput._truncated, true, "and marked, so the server knows it is a prefix");
+  assert.equal(Object.hasOwn(toolInput, "_dropped"), false, "nothing was dropped, only shortened");
+});
+
+test("WR-04 the markers appear exactly when they should", () => {
+  // Nothing dropped, nothing truncated ⇒ no markers at all, so a clean forward stays diffable.
+  assert.deepEqual(sanitizeToolInput({ path: "/a", limit: 5, literal: true }), {
+    path: "/a",
+    limit: 5,
+    literal: true,
+  });
+  assert.deepEqual(sanitizeToolInput({}), {});
+
+  assert.deepEqual(sanitizeToolInput({ content: "body" }), { _dropped: true });
+  assert.deepEqual(sanitizeToolInput({ path: "/a", content: "body" }), {
+    path: "/a",
+    _dropped: true,
+  });
+
+  const long = "z".repeat(MAX_TOOL_INPUT_VALUE_BYTES + 1);
+  const both = sanitizeToolInput({ pattern: long, content: "body" });
+  assert.equal(both._truncated, true);
+  assert.equal(both._dropped, true, "a lossy forward can be lossy in both ways at once");
+});
+
+test("WR-04 only primitive values on allowlisted keys are forwarded", () => {
+  // A structured `path` is not something file policy can evaluate, and forwarding an arbitrary
+  // object re-opens the egress hole one key at a time.
+  assert.deepEqual(sanitizeToolInput({ path: { nested: "/etc/shadow" } }), { _dropped: true });
+  assert.deepEqual(sanitizeToolInput({ path: ["/a", "/b"] }), { _dropped: true });
+  assert.deepEqual(sanitizeToolInput({ path: null }), { _dropped: true });
+  assert.deepEqual(sanitizeToolInput({ pattern: undefined }), { _dropped: true });
+
+  // Non-objects are not a crash, they are an empty forward.
+  assert.doesNotThrow(() => sanitizeToolInput(null as unknown as Record<string, unknown>));
+  assert.deepEqual(sanitizeToolInput(null as unknown as Record<string, unknown>), {});
+  assert.deepEqual(sanitizeToolInput("nope" as unknown as Record<string, unknown>), {});
+});
+
+test("WR-04 the allowlist is exactly the keys any pi evaluator reads", () => {
+  // Widening this set is an egress decision, so it is spelled out here as well as in constants.ts.
+  assert.deepEqual([...TOOL_INPUT_ALLOWLIST].sort(), [
+    "glob",
+    "ignoreCase",
+    "limit",
+    "literal",
+    "offset",
+    "path",
+    "pattern",
+    "timeout",
+  ]);
+  const allowlist: readonly string[] = TOOL_INPUT_ALLOWLIST;
+  for (const forbidden of ["content", "edits", "old_string", "new_string", "text", "body"]) {
+    assert.equal(allowlist.includes(forbidden), false, `${forbidden} must never be forwarded`);
+  }
+});
+
+test("WR-04 the byte cap never splits a surrogate pair or a multi-byte character", () => {
+  // Each of these is 4 UTF-8 bytes and 2 UTF-16 code units, so a naive `slice(0, maxBytes)` would
+  // leave a lone surrogate — which then serialises as a replacement character.
+  const rocket = String.fromCodePoint(0x1f680);
+  const sliced = String(sanitizeToolInput({ pattern: rocket.repeat(2000) }).pattern);
+  assert.ok(Buffer.byteLength(sliced) <= MAX_TOOL_INPUT_VALUE_BYTES);
+  assert.equal(sliced.length % 2, 0, "whole code points only");
+  assert.equal(sliced.includes("�"), false, "no replacement character");
+  assert.equal(Buffer.from(sliced, "utf8").toString("utf8"), sliced, "valid UTF-8 round trip");
+
+  // A 3-byte character at the boundary is dropped rather than half-sent.
+  const cjk = "禁".repeat(1000);
+  const cjkSliced = String(sanitizeToolInput({ pattern: cjk }).pattern);
+  assert.equal(Buffer.byteLength(cjkSliced), 2046, "682 * 3 bytes, the last whole character");
+  assert.equal(cjkSliced.includes("�"), false);
+});
+
+test("WR-04 the 16 KB whole-object cap still runs after the allowlist", () => {
+  // Defence in depth: `pattern` is attacker-reachable and free-form, and the per-value cap could be
+  // raised in future. A pathological input must still not be able to produce a huge body.
+  const many: Record<string, unknown> = {};
+  for (const key of TOOL_INPUT_ALLOWLIST) many[key] = "q".repeat(MAX_TOOL_INPUT_VALUE_BYTES);
+  const out = capToolInput(sanitizeToolInput(many));
+  assert.ok(
+    Buffer.byteLength(JSON.stringify(out)) <= MAX_TOOL_INPUT_BYTES,
+    `${Buffer.byteLength(JSON.stringify(out))} bytes`,
+  );
+  const body = buildPretoolPayload(bashInput({ toolInput: many }));
+  assert.ok(Buffer.byteLength(JSON.stringify(body.pre_tool_use_data.metadata.tool_input)) <= MAX_TOOL_INPUT_BYTES);
 });
 
 test("capToolInput: an oversized tool_input is capped before it is sent", () => {

@@ -23,9 +23,12 @@ import {
   GENERIC_DENY_REASON,
   NO_UI_REASON,
 } from "../../core/src/constants.ts";
-import { buildPretoolPayload } from "../../core/src/payload.ts";
-import type { PolicyChecker } from "../../core/src/policy.ts";
-import { isBashCall } from "./narrow.ts";
+import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
+import { NATIVE_FILE_TOOLS, buildPretoolPayload, resolveFilePath } from "../../core/src/payload.ts";
+import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import { policyState } from "../../core/src/policyState.ts";
+import type { PolicyState } from "../../core/src/policyState.ts";
+import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 import type { UiCtx } from "./ui.ts";
@@ -42,6 +45,70 @@ export interface DecideDeps {
   checker: PolicyChecker;
   apiKey: string;
   entrypoint: string;
+  /** Injectable clock, so a 300 s cache-TTL test runs in milliseconds. Defaults to `Date.now`. */
+  now?: () => number;
+  /**
+   * The remembered policy metadata. Defaults to the process-wide `policyState`, which is the right
+   * production answer — the memory has to survive across tool calls within a session.
+   *
+   * Injectable because the singleton only ever moves forward: once a response has taught it a
+   * `tools_to_check`, no test in the same process can get back to "nothing learned", and the
+   * cache-skip cases are precisely about that starting point.
+   */
+  state?: PolicyState;
+  /**
+   * The per-call notice channel handed to `checkTool`. Defaults to a closure over the live `ctx`,
+   * which is what makes 09-02's breaker-open and key-rejected notices reachable at all: the checker
+   * is built once in `init()` and can never capture a `ctx` of its own.
+   */
+  hooks?: CheckHooks;
+  /**
+   * Hand the decision that actually applied to the turn record (RES-04).
+   *
+   * Without this seam the `PolicyOutcome.kind` dies inside this function — `decideToolCall` returns
+   * `BlockResult | undefined`, which cannot distinguish an allow from a cache skip from a declined
+   * confirm. The turn log's `tool_calls[].decision` has no other source.
+   *
+   * Optional so 09-03's call sites compile untouched, and **called through `noteDecision`**, never
+   * directly: an audit record must not be able to change a verdict.
+   */
+  onDecision?: (entry: { tool_name: string; tool_use_id: string; decision: string }) => void;
+}
+
+/**
+ * Emit one `onDecision` entry, swallowing everything.
+ *
+ * The guard is load-bearing, not defensive noise. `deps.onDecision` is wired to the module-scope turn
+ * store via a closure that reads `ctx.sessionManager.getSessionId()`; a throw from any of that inside
+ * the `try` below would be caught by the fail-open `catch` and return `undefined` — i.e. **allow** —
+ * even when the outcome was a deny. Shared with `userBash.ts`, which has the same hazard and a worse
+ * failure mode.
+ */
+export function noteDecision(
+  deps: Pick<DecideDeps, "onDecision">,
+  entry: { tool_name: string; tool_use_id: string; decision: string },
+): void {
+  noteSafe(() => deps.onDecision?.(entry));
+}
+
+/**
+ * The guard itself, for any audit emission that is not a decision entry (WR-06).
+ *
+ * `prompt.ts` used to call `deps.onPrompt?.(text)` bare, inside its own fail-open try/catch, which
+ * restated the invariant by omission instead of reusing it. Benign only by coincidence — both of that
+ * function's call sites already returned `undefined`, so a throw landed on the same answer. It stops
+ * being benign the moment anyone records the prompt before the deny branch, moves the call, or adds a
+ * verdict between them, and the failure would be a silently UN-suppressed prompt with no test
+ * pointing at it, because at that call site the hazard is invisible.
+ *
+ * One wrapper, exported, so the rule has a single place to be true.
+ */
+export function noteSafe(fn: (() => void) | undefined): void {
+  try {
+    fn?.();
+  } catch {
+    // An audit line is never worth a verdict.
+  }
 }
 
 /** What pi reads back from a `tool_call` handler; Phase 8 only ever blocks or says nothing. */
@@ -56,25 +123,92 @@ export async function decideToolCall(
   deps: DecideDeps,
 ): Promise<BlockResult | undefined> {
   try {
-    const bash = isBashCall(event);
-    const command = bash ? event.input.command : "";
+    // Both of pi's shell tools (`bash` and `powershell`) are checked on their `command` — see
+    // `narrow.ts`. Anything else carries no command and is judged server-side on `metadata`.
+    const shell = isShellCall(event);
+    const command = shell ? event.input.command : "";
+    // Computed once and handed to both the skip decision and the payload, so the two cannot disagree
+    // about what this call carries. `null` and `undefined` inputs both become `{}` here — see
+    // `narrow.ts` on why `input` is `unknown` and can genuinely be either (WR-07).
+    const toolInput = (event.input ?? {}) as Record<string, unknown>;
 
-    // Nothing to evaluate: the server's entry gate would answer allow after a full round trip, and
-    // pi awaits every call in a batch serially, so each pointless trip is felt N× (§B3 / §F2).
-    if (bash && command.trim() === "") return undefined;
+    // Nothing to evaluate: the server's entry gate needs a non-blank command or a native-tool
+    // `file_path` (§B3), so a call with neither is a guaranteed allow after a full round trip — and
+    // pi awaits every call in a batch serially, so each pointless trip is felt N× (§F2). This covers
+    // every custom/MCP tool that carries no command, not just an empty shell command (WR-04).
+    const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
+    if (command.trim() === "" && filePath === undefined) return undefined;
+
+    const now = (deps.now ?? Date.now)();
+    const state = deps.state ?? policyState;
+
+    // WR-02. "The server has already told us" is the entire justification for the skip below, so the
+    // skip is gated on the server having told *this process* — not on a number a file supplied.
+    // `policyState.hydrate` never sets this bit, so it is false until the first response that carries
+    // `tools_to_check` lands, which the forced pull below guarantees happens on the first real tool
+    // call of the session.
+    //
+    // Without it, a same-UID local process could read `policy_cache.json` — which hands it both
+    // halves of the identity in cleartext — rewrite it as `{tools_to_check: [], tools_synced_at: now}`
+    // and disable every read/write/edit/grep/find/ls for 300 s, renewably, while enforcement reported
+    // itself active. Cost of the fix is one round trip per session; the warm cache still pays for
+    // itself on every call after the first.
+    const toolsConfirmed = state.getToolsConfirmed();
+
+    // RES-03's fast path. When the org's own tool list is tools-FRESH and does not name this tool,
+    // the server has already told us there is no file policy that could apply — so there is nothing
+    // to ask, and no payload is even built. Bounded to the six native file tools: a shell command or
+    // a custom tool is evaluated on its `command`, which no cached list can answer for.
+    if (
+      toolsConfirmed &&
+      NATIVE_FILE_TOOLS.has(event.toolName) &&
+      shouldSkipFileToolFromState(event.toolName, state, now)
+    ) {
+      // Recorded, not silent: "we did not ask" is a different audit fact from "we asked and it was
+      // allowed", and a turn log that showed them identically would make the cache invisible.
+      noteDecision(deps, {
+        tool_name: event.toolName,
+        tool_use_id: event.toolCallId,
+        decision: "skipped",
+      });
+      return undefined;
+    }
+
+    // `tools_to_check` arrives on the command-policy path ONLY (§C2), so a genuine tool call is the
+    // only thing that can fill the cache. Ask for it when the list is missing or stale — never by
+    // fabricating a request: a synthetic `ls` would be evaluated as a real tool use and can fire a
+    // Slack approval for a command nobody ran.
+    //
+    // An UNCONFIRMED list is always pulled, however fresh its stamp looks (WR-02). That is the
+    // self-heal: the first real tool call of the session round-trips, the response re-establishes the
+    // list from the server, `toolsConfirmed` flips, and every call after this one takes the TTL logic
+    // exactly as before.
+    const pullPolicies = !toolsConfirmed || !areToolsFresh(state.getToolsSyncedAt(), now);
 
     const payload = buildPretoolPayload({
       toolName: event.toolName,
       command,
       toolUseId: event.toolCallId,
-      toolInput: (event.input ?? {}) as Record<string, unknown>,
+      toolInput,
       cwd: ctx.cwd,
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
+      pullPolicies,
     });
 
-    const outcome = await deps.checker.checkTool(payload, event.toolName);
+    // `notifySafe` already swallows its own failures, and `policy.ts` wraps the call again: a notice
+    // must never be able to change a verdict.
+    const hooks: CheckHooks =
+      deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+    const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
+    // Immediately, before the confirm dialog: the decision is what the POLICY said, and a turn log
+    // that waited for a 120 s modal would be recording the developer's answer instead.
+    noteDecision(deps, {
+      tool_name: event.toolName,
+      tool_use_id: event.toolCallId,
+      decision: outcome.kind,
+    });
 
     switch (outcome.kind) {
       case "allow":
@@ -103,7 +237,9 @@ export async function decideToolCall(
       }
 
       case "unavailable":
-        return { block: true, reason: ENGINE_UNAVAILABLE_REASON };
+        // Core supplies a `reason` only when the generic string would misdescribe the failure (a
+        // rejected key at a fail-closed org). It is a constant, never API text.
+        return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
     }
   } catch {
     // Belt and braces: `index.ts` catches too, but an internal fault must allow, never block.

@@ -18,7 +18,7 @@ import { startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { PolicyChecker } from "../../core/src/policy.ts";
 import extension, { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
-import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
+import { createFakeCtx, createFakeToolCallEvent, createFakeUserBashEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
 
 type AnyHandler = (event: unknown, ctx: unknown) => unknown;
@@ -66,6 +66,12 @@ async function callToolCall(stub: Stub, ctx: FakeCtx): Promise<unknown> {
   const handler = stub.handlers.get("tool_call");
   assert.ok(handler !== undefined, "tool_call must be registered");
   return await handler(createFakeToolCallEvent("bash", { command: "cat /etc/shadow" }), ctx);
+}
+
+async function callUserBash(stub: Stub, ctx: FakeCtx): Promise<unknown> {
+  const handler = stub.handlers.get("user_bash");
+  assert.ok(handler !== undefined, "user_bash must be registered");
+  return await handler(createFakeUserBashEvent("cat /etc/shadow"), ctx);
 }
 
 test("RES-01 a policy checker that raises synchronously still allows the call", async () => {
@@ -189,7 +195,7 @@ test("RES-01 session_start survives a ctx.ui.notify that raises", async () => {
   }
 });
 
-test("RES-01 the default export is a factory registering exactly tool_call and session_start", async () => {
+test("RES-01 the default export is a factory registering exactly the implemented events", async () => {
   assert.equal(typeof extension, "function", "pi loads a default-export factory (§A1)");
 
   const stub = stubApi();
@@ -197,6 +203,146 @@ test("RES-01 the default export is a factory registering exactly tool_call and s
     await extension(stub.api);
   });
 
-  assert.equal(stub.registered.length, 2, `registered ${stub.registered.join(", ")}`);
-  assert.deepStrictEqual([...stub.registered].sort(), ["session_start", "tool_call"]);
+  // Grows one entry per implemented event, and no further: an accidental placeholder handler is a
+  // handler pi will call, and every registration is another way to block or hang a session.
+  assert.equal(stub.registered.length, 6, `registered ${stub.registered.join(", ")}`);
+  assert.deepStrictEqual([...stub.registered].sort(), [
+    "agent_end",
+    "input",
+    "session_start",
+    "tool_call",
+    "tool_result",
+    "user_bash",
+  ]);
+});
+
+test("HOOK-06 the registered tool_result handler returns undefined, never a result patch", async () => {
+  const stub = stubApi();
+  await extension(stub.api);
+  const handler = stub.handlers.get("tool_result");
+  assert.ok(handler !== undefined, "tool_result must be registered");
+
+  // Whatever pi hands it — a real result, an error, junk — the answer is the same one value.
+  for (const event of [
+    { type: "tool_result", toolCallId: "c1", toolName: "bash", input: {}, content: [{ type: "text", text: "out" }], isError: false },
+    { type: "tool_result", toolCallId: "c2", toolName: "read", input: {}, content: [], isError: true },
+    { type: "tool_result" },
+    null,
+  ]) {
+    const result = await handler(event, createFakeCtx());
+    assert.strictEqual(
+      result,
+      undefined,
+      `any defined key rewrites the real tool result (agent-session.js:265-294): ${JSON.stringify(event)}`,
+    );
+  }
+});
+
+// HOOK-04's never-throw guarantee, which protects the phase's only SILENT failure mode. Every other
+// event either fails open by pi's own design or at least surfaces an error to the model; a thrown
+// `user_bash` handler means the typed command simply never runs, with no `BashExecutionComponent`
+// rendered at all (`runner.js:868-893` rethrows, `interactive-mode.js:5656-5666` gives up).
+//
+// The malformed-decision case is the second half: returning a wrong-shaped object is equivalent to
+// throwing, because `isUserBashEventResult` failing makes the runner throw (`runner.js:876-878`).
+
+test("HOOK-04 a user_bash checker that raises returns undefined, so pi runs the command", async () => {
+  const home = createFakeHome({});
+  try {
+    const stub = await build({
+      env: keyedEnv("http://127.0.0.1:1"),
+      homeDir: home.homeDir,
+      entrypoint: "pi/0.87.1",
+      makeChecker: () => checkerThatRaises(),
+    });
+
+    let result: unknown = "unset";
+    await assert.doesNotReject(async () => {
+      result = await callUserBash(stub, createFakeCtx());
+    }, "a thrown user_bash handler is a SILENT block — the one thing this event must never do");
+    assert.equal(result, undefined, "undefined hands execution back to pi");
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("HOOK-04 a user_bash checker that rejects returns undefined", async () => {
+  const home = createFakeHome({});
+  try {
+    const stub = await build({
+      env: keyedEnv("http://127.0.0.1:1"),
+      homeDir: home.homeDir,
+      entrypoint: "pi/0.87.1",
+      makeChecker: () => ({
+        checkTool: async () => {
+          await Promise.resolve();
+          throw new Error("core rejected");
+        },
+      }),
+    });
+
+    let result: unknown = "unset";
+    await assert.doesNotReject(async () => {
+      result = await callUserBash(stub, createFakeCtx());
+    });
+    assert.equal(result, undefined);
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("HOOK-04 a nonsense decision never escapes as a malformed result", async () => {
+  const home = createFakeHome({});
+  try {
+    const stub = await build({
+      env: keyedEnv("http://127.0.0.1:1"),
+      homeDir: home.homeDir,
+      entrypoint: "pi/0.87.1",
+      // An outcome kind nothing maps: a future core enum value, or a plain bug.
+      makeChecker: () => ({
+        checkTool: async () => ({ kind: "weird" }) as unknown as Awaited<
+          ReturnType<PolicyChecker["checkTool"]>
+        >,
+      }),
+    });
+
+    let result: unknown = "unset";
+    await assert.doesNotReject(async () => {
+      result = await callUserBash(stub, createFakeCtx());
+    });
+    assert.equal(result, undefined, "an unmapped verdict is no opinion, not a half-built object");
+  } finally {
+    home.cleanup();
+  }
+});
+
+test("HOOK-04 a ctx.ui.notify that raises cannot turn a deny into a thrown handler", async () => {
+  const home = createFakeHome({});
+  try {
+    const stub = await build({
+      env: keyedEnv("http://127.0.0.1:1"),
+      homeDir: home.homeDir,
+      entrypoint: "pi/0.87.1",
+      makeChecker: () => ({
+        checkTool: async () => ({ kind: "deny", reason: "nope" }),
+      }),
+    });
+
+    const ctx = createFakeCtx();
+    ctx.ui.notify = () => {
+      throw new Error("notify exploded");
+    };
+
+    let result: unknown = "unset";
+    await assert.doesNotReject(async () => {
+      result = await callUserBash(stub, ctx);
+    });
+    // The deny still stands — the notice is cosmetic, the BashResult is the enforcement.
+    assert.equal(
+      (result as { result?: { output?: string } } | undefined)?.result?.output,
+      "Blocked by Unbound policy: nope",
+    );
+  } finally {
+    home.cleanup();
+  }
 });

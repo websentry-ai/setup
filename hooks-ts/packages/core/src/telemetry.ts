@@ -19,18 +19,42 @@
 // would make every latency produce a distinct fingerprint, fragmenting the alert into noise.
 
 import { redactSecrets } from "./config.ts";
-import { ERROR_CATEGORY_BYPASS, ERROR_REPORT_INTERVAL_MS, HOOK_SOURCE } from "./constants.ts";
+import {
+  ERROR_CATEGORY_BLOCKED,
+  ERROR_CATEGORY_BYPASS,
+  ERROR_CATEGORY_TURNLOG,
+  ERROR_REPORT_INTERVAL_MS,
+  HOOK_SOURCE,
+} from "./constants.ts";
 import type { ApiClient, HookErrorsBody } from "./client.ts";
 
-/** Everything the report is allowed to know. Note the absence of a command or payload field. */
-export interface BypassContext {
+/** Everything any report is allowed to know. Note the absence of a command or payload field. */
+export interface ReportContext {
   errorClass: string;
+  /** A free-form label, not necessarily a tool: the turn-log path sends `agent_end` (§B6). */
   toolName: string;
   elapsedMs: number;
 }
 
+export interface BypassContext extends ReportContext {
+  /**
+   * WR-03: did this failure end in a **block** (a fail-closed org) rather than a bypass? The caller
+   * must therefore decide the failure action BEFORE reporting. Required, not optional, so a future
+   * call site cannot silently mislabel a block by forgetting it.
+   */
+  blocked: boolean;
+}
+
 export interface Telemetry {
+  /** An enforcement failure: bypassed (fail-open) or blocked (fail-closed). Never anything else. */
   reportBypass(ctx: BypassContext): void;
+  /**
+   * A lost audit row — `POST /v1/hooks/pi` failed. A separate method rather than a third state of
+   * `blocked`, because it is not an enforcement outcome at all: the check already happened and was
+   * honoured. Filed under `ERROR_CATEGORY_TURNLOG`, which exists so this cannot reach the fail-open
+   * alert. Shares the window, the re-entrancy guard and the redaction with `reportBypass`.
+   */
+  reportTurnLogFailure(ctx: ReportContext): void;
 }
 
 export interface TelemetryOptions {
@@ -39,6 +63,14 @@ export interface TelemetryOptions {
   apiKey?: string | undefined;
   now?: () => number;
   intervalMs?: number;
+  /**
+   * WR-01: the session's revoked-key latch (`keyState.ts`). Once it is set, reporting is pointless —
+   * this endpoint authenticates with the same rejected key (§F9) — so the reporter goes silent too.
+   *
+   * Belt and braces: `checkTool` already returns before any HTTP once the latch trips, but the
+   * reporter must not depend on its only caller getting that right.
+   */
+  isInactive?: () => boolean;
 }
 
 export function createTelemetry(opts: TelemetryOptions): Telemetry {
@@ -47,10 +79,21 @@ export function createTelemetry(opts: TelemetryOptions): Telemetry {
   let lastReportAtMs: number | undefined;
   let reporting = false;
 
-  function reportBypass(ctx: BypassContext): void {
+  /**
+   * The one dispatcher. `category` is chosen by the caller and used in BOTH the `category` field and
+   * the message prefix, so the Sentry tag and the fingerprint can never disagree — and so a new report
+   * kind cannot be added without stating its label.
+   *
+   * The rate-limit window is shared across every category on purpose: the one-per-60 s budget belongs
+   * to `/v1/hooks/errors`, not to a label, so a lost audit row must not buy a report that a bypass in
+   * the same window could not have.
+   */
+  function report(category: string, ctx: ReportContext): void {
     try {
       const apiKey = opts.apiKey;
       if (apiKey === undefined || apiKey === "") return;
+      // A rejected key cannot authenticate this endpoint either, so an inactive session says nothing.
+      if (opts.isInactive?.() === true) return;
       if (reporting) return;
 
       const at = now();
@@ -59,14 +102,15 @@ export function createTelemetry(opts: TelemetryOptions): Telemetry {
       lastReportAtMs = at;
       reporting = true;
 
+      // The `after <n>ms` suffix stays strictly last: the server fingerprints on
+      // `message.slice(0, 100)` (§B6), so a leading latency would fragment one alert into one per
+      // millisecond value.
       const message = redactSecrets(
-        `pi hook ${ERROR_CATEGORY_BYPASS}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
+        `pi hook ${category}: ${ctx.errorClass} for tool=${ctx.toolName} after ${ctx.elapsedMs}ms`,
         apiKey,
       );
       const body: HookErrorsBody = {
-        errors: [
-          { message, timestamp: new Date(at).toISOString(), category: ERROR_CATEGORY_BYPASS },
-        ],
+        errors: [{ message, timestamp: new Date(at).toISOString(), category }],
         hook_source: HOOK_SOURCE,
       };
 
@@ -82,5 +126,12 @@ export function createTelemetry(opts: TelemetryOptions): Telemetry {
     }
   }
 
-  return { reportBypass };
+  return {
+    reportBypass(ctx: BypassContext): void {
+      report(ctx.blocked === true ? ERROR_CATEGORY_BLOCKED : ERROR_CATEGORY_BYPASS, ctx);
+    },
+    reportTurnLogFailure(ctx: ReportContext): void {
+      report(ERROR_CATEGORY_TURNLOG, ctx);
+    },
+  };
 }
