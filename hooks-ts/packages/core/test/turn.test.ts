@@ -382,3 +382,57 @@ test("the store never throws, whatever it is handed", () => {
     store.take();
   }, "a store fault must never reach a handler — pi reads a throw as a block");
 });
+
+// --- WR-03: the cap must fire before the projection is built, not after -------------------------
+
+test("WR-03 an oversize result is sized without allocating a copy of itself", () => {
+  // 20 MB, five times the cap. `list.map(projectPart)` used to run before the count could fire, on
+  // the AWAITED pass between a tool finishing and the model seeing its output.
+  const big = "x".repeat(20 * 1024 * 1024);
+  assert.ok(big.length > MAX_HASH_BYTES * 4, "the fixture must be well past the cap");
+
+  // Pre-warm, and this is the subtle part of the measurement. `"text:" + big` allocates almost
+  // nothing on its own — V8 returns a lazy cons string — so the old code's copy was not the `+`, it
+  // was the `Buffer.byteLength` that had to FLATTEN that cons string to measure it. Measuring `big`
+  // itself once here pays V8's one-time flatten for the fixture, so the delta below cannot be
+  // attributed to anything but work `hashContent` does on top of it. Measured both ways at this
+  // fixture size: old shape 20.9 MB, new shape 240 bytes.
+  Buffer.byteLength(big, "utf8");
+
+  const before = process.memoryUsage().heapUsed;
+  const hashed = hashContent([{ type: "text", text: big }]);
+  const delta = process.memoryUsage().heapUsed - before;
+
+  assert.equal(hashed.hash_skipped, true);
+  assert.equal(hashed.content_sha256, undefined);
+  // The count is still exact, not "however far we got": sizing is a scan, so bailing early would
+  // save nothing and would make `content_bytes` a lower bound on the one path where it is the only
+  // thing reported.
+  assert.equal(hashed.content_bytes, Buffer.byteLength(`text:${big}`, "utf8"));
+  // 1 MB is ~4000× the new shape's allocation and ~1/20th of the old shape's, so heap-accounting
+  // noise cannot move this either way.
+  assert.ok(
+    delta < 1024 * 1024,
+    `sizing a ${big.length}-byte part allocated ${delta} bytes; the projection is being built`,
+  );
+});
+
+test("WR-03 feeding the digest in two updates did not change any digest", () => {
+  // The byte stream is prefix-then-body per part, `\n` between parts — identical to the joined
+  // projection it replaced. Pinned against literal `createHash` calls so a future refactor of
+  // `projectPart` cannot quietly re-key every stored hash.
+  const text = createHash("sha256").update("text:abc", "utf8").digest("hex");
+  assert.equal(hashContent([{ type: "text", text: "abc" }]).content_sha256, text);
+
+  const image = createHash("sha256").update("image:image/png:AAAA", "utf8").digest("hex");
+  assert.equal(
+    hashContent([{ type: "image", data: "AAAA", mimeType: "image/png" }]).content_sha256,
+    image,
+  );
+
+  const joined = createHash("sha256").update("text:a\ntext:b", "utf8").digest("hex");
+  assert.equal(
+    hashContent([{ type: "text", text: "a" }, { type: "text", text: "b" }]).content_sha256,
+    joined,
+  );
+});

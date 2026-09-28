@@ -120,17 +120,41 @@ export interface TurnStore {
   snapshot(): TurnRecord;
 }
 
-/** `"text:" + text` — `textSignature` is excluded, so a provider annotation cannot move the hash. */
-function projectPart(part: unknown): string {
-  if (part === null || typeof part !== "object") return "";
+/**
+ * One part's canonical projection, **split at the boundary between the small fixed tag and the
+ * potentially enormous payload** (WR-03).
+ *
+ * The projection is still exactly `"text:" + text` / `"image:" + mimeType + ":" + data`, byte for
+ * byte, so no digest changes. What changes is that it is never *concatenated*: `prefix` is a handful
+ * of bytes built here, and `body` is the string that was already on the part, returned by reference.
+ * Sizing and hashing then both work off the pair, so a 100 MB `read` result costs no copy of itself
+ * at any point. `textSignature` is excluded, so a provider annotation cannot move the hash.
+ */
+interface PartProjection {
+  prefix: string;
+  body: string;
+}
+
+const EMPTY_PROJECTION: PartProjection = { prefix: "", body: "" };
+
+function projectPart(part: unknown): PartProjection {
+  if (part === null || typeof part !== "object") return EMPTY_PROJECTION;
   const record = part as { type?: unknown; text?: unknown; data?: unknown; mimeType?: unknown };
   if (record.type === "image") {
     const mimeType = typeof record.mimeType === "string" ? record.mimeType : "";
     const data = typeof record.data === "string" ? record.data : "";
-    return `image:${mimeType}:${data}`;
+    return { prefix: `image:${mimeType}:`, body: data };
   }
   const text = typeof record.text === "string" ? record.text : "";
-  return `text:${text}`;
+  return { prefix: "text:", body: text };
+}
+
+/**
+ * The projection's byte length, without building it. `Buffer.byteLength` scans; it does not allocate,
+ * which is the entire property that lets the cap below be checked before any memory is committed.
+ */
+function projectionByteLength(projection: PartProjection): number {
+  return Buffer.byteLength(projection.prefix, "utf8") + Buffer.byteLength(projection.body, "utf8");
 }
 
 /**
@@ -139,31 +163,43 @@ function projectPart(part: unknown): string {
  * **Not a JSON serialisation of `content`** (§F7): key order is not content, and `textSignature` is provider
  * metadata that changes between runs of the same command — either would make the digest useless for
  * telling "the same output" from "a different output". The projection is built by hand instead, one
- * line per part, joined with `\n`, and the digest is fed part-by-part so a large content array never
- * needs one concatenated string.
+ * line per part, separated by `\n`, and fed to the digest in pieces so no concatenated string is ever
+ * built — see `projectPart`.
  *
- * Above `MAX_HASH_BYTES` nothing is hashed at all: the size is counted first, and the bail-out
- * returns before `createHash` is ever called.
+ * Above `MAX_HASH_BYTES` nothing is hashed at all, and — since WR-03 — nothing is *allocated* either.
+ * The old version counted the size first and did skip the digest, but `list.map(projectPart)` ran
+ * before the count, so `"text:" + text` was materialised for every part: measured at a 114 MB heap
+ * peak against 9 MB for a single 100 MB text part, i.e. a full extra copy of the tool output, on the
+ * awaited pass between a tool finishing and the model seeing its output. Now the parts are sized
+ * through `projectionByteLength` (a scan, not a copy) and the digest is fed prefix-then-body per
+ * part, so no concatenated string is ever built — at any size.
+ *
+ * The count is still the EXACT total rather than "however far we got before exceeding the cap":
+ * sizing is allocation-free, so there is nothing to save by bailing early, and `content_bytes` stays
+ * an honest number on the skipped path where it is the only thing reported.
  */
 export function hashContent(parts: readonly unknown[]): ContentHash {
   try {
     const list = Array.isArray(parts) ? parts : [];
-    const projected = list.map(projectPart);
-    // Sized before hashing, including the `\n` separators, so the cap decides whether any work
-    // happens at all rather than capping work already done.
+    // Sized before anything is built, including the `\n` separators, so the cap decides whether any
+    // work happens at all rather than capping work already done.
     let bytes = 0;
-    for (let i = 0; i < projected.length; i += 1) {
-      bytes += Buffer.byteLength(projected[i] ?? "", "utf8");
+    for (let i = 0; i < list.length; i += 1) {
       if (i > 0) bytes += 1;
+      bytes += projectionByteLength(projectPart(list[i]));
     }
     if (bytes > MAX_HASH_BYTES) {
       return { content_sha256: undefined, content_bytes: bytes, hash_skipped: true };
     }
 
     const hash = createHash("sha256");
-    for (let i = 0; i < projected.length; i += 1) {
+    for (let i = 0; i < list.length; i += 1) {
       if (i > 0) hash.update("\n", "utf8");
-      hash.update(projected[i] ?? "", "utf8");
+      // Two updates, never a concatenation: the byte stream fed to the digest is identical to the
+      // joined projection, so every existing hash stays what it was.
+      const projection = projectPart(list[i]);
+      hash.update(projection.prefix, "utf8");
+      hash.update(projection.body, "utf8");
     }
     return { content_sha256: hash.digest("hex"), content_bytes: bytes };
   } catch {

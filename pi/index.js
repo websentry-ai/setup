@@ -949,33 +949,38 @@ function createTelemetry(opts) {
 
 // packages/core/src/turn.ts
 import { createHash as createHash2 } from "node:crypto";
+var EMPTY_PROJECTION = { prefix: "", body: "" };
 function projectPart(part) {
-  if (part === null || typeof part !== "object") return "";
+  if (part === null || typeof part !== "object") return EMPTY_PROJECTION;
   const record = part;
   if (record.type === "image") {
     const mimeType = typeof record.mimeType === "string" ? record.mimeType : "";
     const data = typeof record.data === "string" ? record.data : "";
-    return `image:${mimeType}:${data}`;
+    return { prefix: `image:${mimeType}:`, body: data };
   }
   const text = typeof record.text === "string" ? record.text : "";
-  return `text:${text}`;
+  return { prefix: "text:", body: text };
+}
+function projectionByteLength(projection) {
+  return Buffer.byteLength(projection.prefix, "utf8") + Buffer.byteLength(projection.body, "utf8");
 }
 function hashContent(parts) {
   try {
     const list = Array.isArray(parts) ? parts : [];
-    const projected = list.map(projectPart);
     let bytes = 0;
-    for (let i = 0; i < projected.length; i += 1) {
-      bytes += Buffer.byteLength(projected[i] ?? "", "utf8");
+    for (let i = 0; i < list.length; i += 1) {
       if (i > 0) bytes += 1;
+      bytes += projectionByteLength(projectPart(list[i]));
     }
     if (bytes > MAX_HASH_BYTES) {
       return { content_sha256: void 0, content_bytes: bytes, hash_skipped: true };
     }
     const hash = createHash2("sha256");
-    for (let i = 0; i < projected.length; i += 1) {
+    for (let i = 0; i < list.length; i += 1) {
       if (i > 0) hash.update("\n", "utf8");
-      hash.update(projected[i] ?? "", "utf8");
+      const projection = projectPart(list[i]);
+      hash.update(projection.prefix, "utf8");
+      hash.update(projection.body, "utf8");
     }
     return { content_sha256: hash.digest("hex"), content_bytes: bytes };
   } catch {
