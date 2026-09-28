@@ -8,6 +8,7 @@ import sys
 import time
 import platform
 import subprocess
+import threading
 import hashlib
 import json
 import shlex
@@ -30,6 +31,7 @@ BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
+BACKFILL_TIMEOUT_SECONDS = 480
 
 
 def normalize_url(value: str) -> str:
@@ -2377,7 +2379,14 @@ def main():
                           install_mode="mdm-skip" if skip_managed_settings else "mdm")
 
     if backfill_mode:
-        run_backfill(api_key, base_url, get_all_user_homes())
+        # Bounded and best-effort: setup already succeeded, so backfill must not fail the policy.
+        worker = threading.Thread(
+            target=run_backfill, args=(api_key, base_url, get_all_user_homes()), daemon=True,
+        )
+        worker.start()
+        worker.join(BACKFILL_TIMEOUT_SECONDS)
+        if worker.is_alive():
+            print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
 
     return True
 
