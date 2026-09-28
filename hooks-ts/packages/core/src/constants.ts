@@ -52,8 +52,11 @@ export const EVENT_NAME_SESSION_START = "session_start";
  * durable row and keep the heartbeat; `heartbeat.test.ts` is written to pass either way, so flipping
  * it needs no test edit. Bounded by `derive_hook_request_id` collapsing identical empty turns into one
  * row per session.
+ *
+ * Disabled 2026-09-28: the row renders in the console as an empty-prompt turn (nothing server-side
+ * distinguishes it from a real turn), and `setup_complete` already marks the device connected.
  */
-export const SESSION_PRESENCE_ROW_ENABLED = true;
+export const SESSION_PRESENCE_ROW_ENABLED = false;
 /**
  * HOOK-05's `event_name`. Matched server-side at `preToolUseHandler.ts:655`, which routes to
  * `handleGuardrails` — the one branch that can deny a prompt, and the one that deliberately omits
