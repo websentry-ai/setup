@@ -285,8 +285,19 @@ export const GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 export const DECLINED_REASON = "Declined by user (Unbound policy)";
 /** Dialog title; pi renders a confirm as a Yes/No selector titled `title\nmessage` (§A5). */
 export const CONFIRM_TITLE = "Unbound policy";
-/** Appended after the API reason in the confirm body, so the dialog actually asks something. */
-export const CONFIRM_QUESTION_SUFFIX = "\n\nRun this command?";
+/**
+ * The confirm body, in full — the question and nothing else.
+ *
+ * It used to be a *suffix* appended to the API reason, which meant the reason was rendered twice for
+ * one verdict: once as the `warning` notification raised immediately before the dialog, and again
+ * inside the overlay, which pi draws as `title\nmessage` (§A5). The notification is the copy that
+ * stays (it survives after the dialog closes, and it is the channel that also survives `!!` on the
+ * `user_bash` path), so the dialog no longer repeats it and only has to ask.
+ *
+ * Both call sites still notify first. Removing the notice instead would have left the reason visible
+ * only while the modal was open.
+ */
+export const CONFIRM_QUESTION = "Run this command?";
 export const NO_UI_REASON =
   "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";

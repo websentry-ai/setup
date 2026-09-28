@@ -195,6 +195,16 @@ test("HOOK-04 confirm with a UI asks exactly once, with a bounded dialog", async
   assert.notEqual(opts?.signal, undefined, "and it must be abortable");
 });
 
+test("HOOK-04 confirm: the reason is notified once, and the dialog only asks", async () => {
+  // The same de-duplication as the `tool_call` path — `user_bash` mirrored the composition, so it
+  // rendered the reason twice in exactly the same way.
+  const { ctx } = await run("ask", { ctx: { hasUI: true, confirmResult: true } });
+
+  assert.deepStrictEqual(ctx.notifyCalls, [{ message: "Unusual command.", type: "warning" }]);
+  assert.equal(ctx.confirmCalls[0]?.title, "Unbound policy");
+  assert.equal(ctx.confirmCalls[0]?.message, "Run this command?");
+});
+
 test("HOOK-04 a declined confirmation becomes a BashResult carrying the declined reason", async () => {
   const { result, ctx } = await run("ask", { ctx: { hasUI: true, confirmResult: false } });
 

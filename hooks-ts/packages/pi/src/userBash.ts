@@ -27,7 +27,7 @@ import { randomBytes } from "node:crypto";
 import type { UserBashEvent, UserBashEventResult } from "@earendil-works/pi-coding-agent";
 
 import {
-  CONFIRM_QUESTION_SUFFIX,
+  CONFIRM_QUESTION,
   CONFIRM_TITLE,
   DECLINED_REASON,
   DENY_PREFIX,
@@ -122,12 +122,11 @@ export async function decideUserBash(
       case "confirm": {
         if (!ctx.hasUI) return denyBashResult(NO_UI_REASON);
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
+        // See `decide.ts`: the notice carries the reason, the dialog asks the question. On this path
+        // the notice matters more still — it is what survives `!!`, which keeps the rendered output
+        // out of the model's context.
         notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(
-          ctx,
-          CONFIRM_TITLE,
-          reason + CONFIRM_QUESTION_SUFFIX,
-        );
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
         return accepted ? undefined : denyBashResult(DECLINED_REASON);
       }
 

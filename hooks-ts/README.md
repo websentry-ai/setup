@@ -70,7 +70,7 @@ enforces independently under its own `conversation_id`. Both verified — see `d
 | --- | --- |
 | `allow` | nothing — the tool runs, and `event.input` is never modified |
 | `deny` | the tool is blocked; the model reads `Blocked by Unbound policy: <reason>`, and the reason is also shown as an error notification |
-| `ask` / `approval_required` | a `Unbound policy` Yes/No dialog with the reason; accepting runs the tool, anything else blocks with `Declined by user (Unbound policy)` |
+| `ask` / `approval_required` | the reason is shown once, as a warning notification; then a `Unbound policy` Yes/No dialog whose body is just `Run this command?` — it does not repeat the reason, which pi would have rendered as the same paragraph twice. Accepting runs the tool, anything else blocks with `Declined by user (Unbound policy)` |
 | API unreachable | the tool runs (see the fail-open contract), unless the organisation opted into block-on-failure |
 | API key rejected | after two consecutive 401/403s: a fail-open organisation is told once (`Unbound: API key rejected — enforcement inactive`) and the session then makes no further requests, so nothing is enforced until `/reload`. An organisation that opted into block-on-failure is **not** deactivated — every call blocks with `Unbound API key rejected — this organisation enforces fail-closed; contact your admin`, requests keep being made, and enforcement resumes on the first success |
 

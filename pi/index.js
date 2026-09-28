@@ -64,6 +64,7 @@ var MAX_TURN_TOOL_CALLS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
 var MAX_PROMPT_CHARS = 8192;
+var MAX_ASSISTANT_CHARS = 16384;
 var MAX_TOOL_INPUT_VALUE_BYTES = 2048;
 var TOOL_INPUT_ALLOWLIST = [
   "path",
@@ -79,7 +80,7 @@ var DENY_PREFIX = "Blocked by Unbound policy: ";
 var GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 var DECLINED_REASON = "Declined by user (Unbound policy)";
 var CONFIRM_TITLE = "Unbound policy";
-var CONFIRM_QUESTION_SUFFIX = "\n\nRun this command?";
+var CONFIRM_QUESTION = "Run this command?";
 var NO_UI_REASON = "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 var ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable \u2014 please retry";
 var NO_KEY_NOTICE = "Unbound: no API key found \u2014 extension inactive";
@@ -323,6 +324,14 @@ function capCommand(command, maxChars = MAX_COMMAND_CHARS) {
     command: command.slice(0, headChars) + COMMAND_TRUNCATION_MARKER + command.slice(-tailChars),
     truncated: true
   };
+}
+function auditToolInput(toolInput, command) {
+  const isObject = toolInput !== null && typeof toolInput === "object" && !Array.isArray(toolInput);
+  const source = isObject ? { ...toolInput } : {};
+  delete source.command;
+  const out = sanitizeToolInput(source);
+  if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
+  return capToolInput(out);
 }
 function buildPretoolPayload(input) {
   const metadata = {
@@ -638,6 +647,19 @@ function shouldPostTurn(record) {
     return false;
   }
 }
+function toolInputFor(value) {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return value;
+}
+function capAssistantText(text) {
+  try {
+    if (typeof text !== "string" || text === "") return { content: "", truncated: false };
+    const capped = capCommand(text, MAX_ASSISTANT_CHARS);
+    return { content: capped.command, truncated: capped.truncated };
+  } catch {
+    return { content: "", truncated: false };
+  }
+}
 function toolResponseFor(record, toolUseId) {
   const results = Array.isArray(record.results) ? record.results : [];
   const match = results.find((entry) => entry?.tool_use_id === toolUseId);
@@ -669,18 +691,20 @@ function buildTurnLogBody(record, opts) {
       type: TURNLOG_TOOL_USE_TYPE,
       tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
       tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // Not `call`-derived and not `event.input`-derived. Empty by design — header decision 2.
-      tool_input: {},
+      // `call`-derived, and still never `event.input`-derived: what the record holds was already
+      // allowlisted and capped by `auditToolInput` — header decision 2.
+      tool_input: toolInputFor(call?.tool_input),
       tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : "")
     }));
   } catch {
   }
+  const assistant = capAssistantText(opts?.assistantText);
   const body = {
     conversation_id: conversationId,
     model: TURNLOG_MODEL,
     messages: [
       { role: "user", content: prompt },
-      { role: "assistant", content: "", tool_use: toolUse }
+      { role: "assistant", content: assistant.content, tool_use: toolUse }
     ],
     cwd: opts.cwd,
     requestCompleted: new Date(opts.completedAtMs).toISOString(),
@@ -689,6 +713,7 @@ function buildTurnLogBody(record, opts) {
   if (startedAt !== void 0) body.requestInitialized = new Date(startedAt).toISOString();
   if (truncated !== void 0) body.results_truncated = truncated;
   if (callsTruncated !== void 0) body.tool_calls_truncated = callsTruncated;
+  if (assistant.truncated) body.assistant_truncated = true;
   return body;
 }
 
@@ -1053,6 +1078,10 @@ function createTurnStore() {
           decision: typeof entry.decision === "string" ? entry.decision : "",
           ts: now
         };
+        const input = entry.tool_input;
+        if (input !== null && typeof input === "object" && !Array.isArray(input)) {
+          stored.tool_input = { ...input };
+        }
         const incoming = idOf(sessionId);
         if (incoming !== void 0) stored.session_id = incoming;
         record.tool_calls.push(stored);
@@ -1118,7 +1147,12 @@ function createTurnStore() {
     },
     snapshot() {
       const copy = {
-        tool_calls: record.tool_calls.map((entry) => ({ ...entry })),
+        // `tool_input` is spread a second time so the copy is deep ENOUGH: its values are scalars by
+        // construction (`sanitizeToolInput` forwards nothing else), so one more level is the whole
+        // object. Without it, `snapshot()` handed callers a live reference into the record.
+        tool_calls: record.tool_calls.map(
+          (entry) => entry.tool_input === void 0 ? { ...entry } : { ...entry, tool_input: { ...entry.tool_input } }
+        ),
         results: record.results.map((entry) => ({ ...entry }))
       };
       if (record.prompt !== void 0) copy.prompt = record.prompt;
@@ -1135,8 +1169,32 @@ function createTurnStore() {
 var turnStore = createTurnStore();
 
 // packages/pi/src/agentEnd.ts
+function assistantTextFrom(messages) {
+  try {
+    const list = Array.isArray(messages) ? messages : [];
+    const chunks = [];
+    for (const message of list) {
+      if (message === null || typeof message !== "object") continue;
+      const { role, content } = message;
+      if (role !== "assistant") continue;
+      if (!Array.isArray(content)) continue;
+      const parts = [];
+      for (const part of content) {
+        if (part === null || typeof part !== "object") continue;
+        const { type, text } = part;
+        if (type !== "text") continue;
+        if (typeof text !== "string" || text === "") continue;
+        parts.push(text);
+      }
+      if (parts.length > 0) chunks.push(parts.join("\n"));
+    }
+    return chunks.join("\n");
+  } catch {
+    return "";
+  }
+}
 var TURNLOG_LABEL = "agent_end";
-function handleAgentEnd(_event, ctx, deps) {
+function handleAgentEnd(event, ctx, deps) {
   try {
     const record = deps.store.take();
     if (!shouldPostTurn(record)) return void 0;
@@ -1146,7 +1204,16 @@ function handleAgentEnd(_event, ctx, deps) {
       cwd = typeof ctx?.cwd === "string" ? ctx.cwd : "";
     } catch {
     }
-    const body = buildTurnLogBody(record, { cwd, completedAtMs });
+    let assistantText = "";
+    try {
+      assistantText = assistantTextFrom(event?.messages);
+    } catch {
+    }
+    const body = buildTurnLogBody(record, {
+      cwd,
+      completedAtMs,
+      assistantText
+    });
     const dispatchedAtMs = completedAtMs;
     void deps.client.postTurnLog(body).then((ok) => {
       if (ok) return;
@@ -1208,6 +1275,7 @@ async function decideToolCall(event, ctx, deps) {
     const toolInput = event.input ?? {};
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === void 0) return void 0;
+    const auditInput = auditToolInput(toolInput, command);
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
     const toolsConfirmed = state.getToolsConfirmed();
@@ -1215,7 +1283,10 @@ async function decideToolCall(event, ctx, deps) {
       noteDecision(deps, {
         tool_name: event.toolName,
         tool_use_id: event.toolCallId,
-        decision: "skipped"
+        decision: "skipped",
+        // Recorded on this path too: a skip is still a call the developer made, and the path it was
+        // made against is what makes the row readable.
+        tool_input: auditInput
       });
       return void 0;
     }
@@ -1236,7 +1307,8 @@ async function decideToolCall(event, ctx, deps) {
     noteDecision(deps, {
       tool_name: event.toolName,
       tool_use_id: event.toolCallId,
-      decision: outcome.kind
+      decision: outcome.kind,
+      tool_input: auditInput
     });
     switch (outcome.kind) {
       case "allow":
@@ -1253,11 +1325,7 @@ async function decideToolCall(event, ctx, deps) {
         if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
         notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(
-          ctx,
-          CONFIRM_TITLE,
-          reason + CONFIRM_QUESTION_SUFFIX
-        );
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
         return accepted ? void 0 : { block: true, reason: DECLINED_REASON };
       }
       case "unavailable":
@@ -1358,7 +1426,14 @@ async function decideUserBash(event, ctx, deps) {
     });
     const hooks = deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
     const outcome = await deps.checker.checkTool(payload, "bash", hooks);
-    noteDecision(deps, { tool_name: "bash", tool_use_id: toolUseId, decision: outcome.kind });
+    noteDecision(deps, {
+      tool_name: "bash",
+      tool_use_id: toolUseId,
+      decision: outcome.kind,
+      // `{}` in, so the only key out is the capped `command` — which is the entire content of a
+      // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
+      tool_input: auditToolInput({}, command)
+    });
     switch (outcome.kind) {
       case "allow":
         return void 0;
@@ -1371,11 +1446,7 @@ async function decideUserBash(event, ctx, deps) {
         if (!ctx.hasUI) return denyBashResult(NO_UI_REASON);
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
         notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(
-          ctx,
-          CONFIRM_TITLE,
-          reason + CONFIRM_QUESTION_SUFFIX
-        );
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
         return accepted ? void 0 : denyBashResult(DECLINED_REASON);
       }
       case "unavailable":

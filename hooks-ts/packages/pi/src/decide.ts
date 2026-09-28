@@ -15,7 +15,7 @@
 // Every user-facing string comes from `constants.ts`; none is retyped here.
 
 import {
-  CONFIRM_QUESTION_SUFFIX,
+  CONFIRM_QUESTION,
   CONFIRM_TITLE,
   DECLINED_REASON,
   DENY_PREFIX,
@@ -254,13 +254,12 @@ export async function decideToolCall(
       case "confirm": {
         if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
-        // Notified as well as asked, so the reason stays in the transcript after the dialog closes.
+        // The notice is where the reason is rendered — once. It also stays in the transcript after the
+        // dialog closes, which is why it is the copy that was kept when the dialog stopped repeating
+        // it: pi draws a confirm as `title\nmessage`, so a reason in both places was the same
+        // paragraph twice on one verdict.
         notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(
-          ctx,
-          CONFIRM_TITLE,
-          reason + CONFIRM_QUESTION_SUFFIX,
-        );
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
         return accepted ? undefined : { block: true, reason: DECLINED_REASON };
       }
 

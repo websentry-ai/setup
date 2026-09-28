@@ -73,11 +73,27 @@ test("HOOK-03 ask + accept: one bounded confirm, then the tool is allowed", asyn
   const call = ctx.confirmCalls[0];
   assert.ok(call !== undefined);
   assert.equal(call.title, "Unbound policy");
-  assert.ok(call.message.includes("Unusual command."), `reason missing from ${call.message}`);
-  assert.ok(call.message.includes("Run this command?"), "the question is asked");
+  assert.equal(call.message, "Run this command?", "the dialog asks, and only asks");
   assert.equal(typeof call.opts?.timeout, "number", "a confirm without a timeout can hang (§F5)");
   assert.ok((call.opts?.timeout ?? 0) > 0, "the timeout must be positive");
   assert.equal(call.opts?.signal, ctx.signal, "the turn's abort signal is forwarded");
+});
+
+test("HOOK-03 ask: the reason is rendered once, by the notification and not by the dialog", async () => {
+  // The reason used to be composed into the confirm body as well as raised as a warning, so pi
+  // rendered the same paragraph twice — once in the yellow warning box, once inside the overlay. The
+  // notice is the channel that keeps it: it is also what survives after the dialog closes.
+  const { ctx } = await run("ask", { confirmResult: true });
+
+  assert.equal(ctx.notifyCalls.length, 1, "exactly one notification");
+  assert.deepStrictEqual(ctx.notifyCalls[0], { message: "Unusual command.", type: "warning" });
+
+  assert.equal(ctx.confirmCalls.length, 1);
+  assert.equal(
+    ctx.confirmCalls[0]?.message.includes("Unusual command."),
+    false,
+    `the dialog body repeats the reason: ${String(ctx.confirmCalls[0]?.message)}`,
+  );
 });
 
 test("HOOK-03 ask + decline: blocks with the locked decline reason", async () => {
@@ -92,7 +108,11 @@ test("HOOK-03 approval_required takes the identical confirm path", async () => {
   assert.equal(accepted.result, undefined);
   assert.equal(accepted.ctx.confirmCalls.length, 1);
   assert.equal(accepted.ctx.confirmCalls[0]?.title, "Unbound policy");
-  assert.ok(accepted.ctx.confirmCalls[0]?.message.includes("Needs admin approval."));
+  assert.equal(accepted.ctx.confirmCalls[0]?.message, "Run this command?");
+  // The reason still reaches the developer — through the notification, exactly once.
+  assert.deepStrictEqual(accepted.ctx.notifyCalls, [
+    { message: "Needs admin approval.", type: "warning" },
+  ]);
 
   const declined = await run("approval", { confirmResult: false });
   assert.deepStrictEqual(declined.result, {
@@ -101,18 +121,25 @@ test("HOOK-03 approval_required takes the identical confirm path", async () => {
   });
 });
 
-test("HOOK-03 ask also notifies the reason as a warning so it survives the dialog", async () => {
-  const { ctx } = await run("ask", { confirmResult: true });
-
-  assert.equal(ctx.notifyCalls.length, 1, "exactly one notification");
-  assert.deepStrictEqual(ctx.notifyCalls[0], { message: "Unusual command.", type: "warning" });
-});
-
 test("HOOK-03 headless: ask blocks with the no-UI reason and never opens a dialog", async () => {
+  // Unchanged by the de-duplication above: with nobody to ask there is no dialog to strip a reason
+  // from, and the block reason is the only channel left.
   const { result, ctx } = await run("ask", { hasUI: false, mode: "json" });
 
   assert.deepStrictEqual(result, { block: true, reason: NO_UI_REASON });
   assert.equal(ctx.confirmCalls.length, 0, "there is nobody to ask");
+});
+
+test("HOOK-03 deny still notifies the reason exactly once, as an error", async () => {
+  // The deny path opens no dialog, so its notification is the whole of the developer's feedback and
+  // must not be touched by the confirm-path change.
+  const { result, ctx } = await run("deny");
+
+  assert.equal(result?.block, true);
+  assert.equal(ctx.confirmCalls.length, 0, "a deny is not a question");
+  assert.deepStrictEqual(ctx.notifyCalls, [
+    { message: "Reading secrets is blocked.", type: "error" },
+  ]);
 });
 
 test("HOOK-03 rpc mode (hasUI true): the confirm still carries a bounded timeout (§F5 guard)", async () => {
