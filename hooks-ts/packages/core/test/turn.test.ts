@@ -217,6 +217,60 @@ test("tool calls keep their decision and a timestamp, in arrival order", () => {
   ]);
 });
 
+test("a tool call carries the allowlisted input it was checked with", () => {
+  // The turn log's `tool_input` has no other source: `agent_end` cannot see `event.input`, and
+  // reaching back for it would re-open the egress the allowlist closed. What the decision seam hands
+  // over is the already-sanitised projection, so the record stores it as-is.
+  const store = createTurnStore();
+  store.recordToolCall(
+    { tool_name: "bash", tool_use_id: "call_1", decision: "allow", tool_input: { command: "echo hi" } },
+    SESSION,
+    100,
+  );
+  assert.deepEqual(store.snapshot().tool_calls[0]?.tool_input, { command: "echo hi" });
+
+  // Absent stays absent — a call recorded without one must not grow an empty object on the wire.
+  const bare = createTurnStore();
+  bare.recordToolCall({ tool_name: "bash", tool_use_id: "call_1", decision: "allow" }, SESSION, 100);
+  assert.equal(bare.snapshot().tool_calls[0]?.tool_input, undefined);
+
+  // And a non-object is not stored at all, rather than stored as junk.
+  const junk = createTurnStore();
+  junk.recordToolCall(
+    {
+      tool_name: "bash",
+      tool_use_id: "call_1",
+      decision: "allow",
+      tool_input: "command" as unknown as Record<string, unknown>,
+    },
+    SESSION,
+    100,
+  );
+  assert.equal(junk.snapshot().tool_calls[0]?.tool_input, undefined);
+});
+
+test("a stored tool_input cannot be mutated through the caller's object or through a snapshot", () => {
+  const store = createTurnStore();
+  const live: Record<string, unknown> = { command: "echo hi" };
+  store.recordToolCall(
+    { tool_name: "bash", tool_use_id: "call_1", decision: "allow", tool_input: live },
+    SESSION,
+    100,
+  );
+
+  live.command = "rm -rf /";
+  live.content = "a file body";
+  assert.deepEqual(
+    store.snapshot().tool_calls[0]?.tool_input,
+    { command: "echo hi" },
+    "the record copied it, so a later mutation of the caller's object cannot reach the wire",
+  );
+
+  const snap = store.snapshot();
+  (snap.tool_calls[0]?.tool_input as Record<string, unknown>).command = "injected";
+  assert.deepEqual(store.snapshot().tool_calls[0]?.tool_input, { command: "echo hi" });
+});
+
 test("recordResult stores a name, a flag, a digest and a count — and no text", () => {
   const store = createTurnStore();
   const hashed = hashContent([{ type: "text", text: MARKER }]);

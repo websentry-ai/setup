@@ -340,6 +340,80 @@ test("WR-07 a bash event with input: null is narrowed away and costs zero HTTP",
   }
 });
 
+// --- the decision seam: what the turn record is told --------------------------------------------
+//
+// `onDecision` is the turn log's only source for `tool_use[].tool_input`, and this function is the
+// last scope where pi's live `event.input` exists at all. The cases below are about what leaves it:
+// the allowlisted projection, never the input object.
+
+test("onDecision carries the allowlisted input for a shell call", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const ctx = createFakeCtx();
+  const entries: { tool_name: string; decision: string; tool_input?: Record<string, unknown> }[] = [];
+  try {
+    await decideToolCall(createFakeToolCallEvent("bash", { command: "echo hi" }, "toolu_seam"), ctx, {
+      ...depsFor(api),
+      onDecision: (entry) => entries.push(entry),
+    });
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.decision, "allow");
+    assert.deepEqual(entries[0]?.tool_input, { command: "echo hi" });
+  } finally {
+    await api.close();
+  }
+});
+
+test("onDecision carries path and pattern for a file tool, and never a file body", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const ctx = createFakeCtx();
+  const entries: { tool_input?: Record<string, unknown> }[] = [];
+  const deps = { ...depsFor(api), onDecision: (entry: { tool_input?: Record<string, unknown> }) => entries.push(entry) };
+  try {
+    await decideToolCall(
+      createFakeToolCallEvent("grep", { pattern: "AKIA", path: "/src" }, "toolu_grep"),
+      ctx,
+      deps,
+    );
+    await decideToolCall(
+      createFakeToolCallEvent("write", { path: "/src/a.ts", content: "SEAM_FILE_BODY" }, "toolu_write"),
+      ctx,
+      deps,
+    );
+
+    assert.deepEqual(entries[0]?.tool_input, { pattern: "AKIA", path: "/src" });
+    assert.equal(entries[1]?.tool_input?.path, "/src/a.ts");
+    assert.equal(Object.hasOwn(entries[1]?.tool_input ?? {}, "content"), false);
+    assert.equal(
+      JSON.stringify(entries).includes("SEAM_FILE_BODY"),
+      false,
+      "the body does not even reach the record, let alone the wire",
+    );
+  } finally {
+    await api.close();
+  }
+});
+
+test("onDecision cannot be handed pi's live input object", async () => {
+  // Mutating what the seam emitted must not be able to reach `event.input`, and vice versa: the two
+  // are different objects, because one is a projection of the other rather than a reference to it.
+  const api = await startMockApi({ mode: "allow" });
+  const ctx = createFakeCtx();
+  const entries: { tool_input?: Record<string, unknown> }[] = [];
+  try {
+    const event = createFakeToolCallEvent("bash", { command: "echo hi", timeout: 30 }, "toolu_alias");
+    await decideToolCall(event, ctx, {
+      ...depsFor(api),
+      onDecision: (entry) => entries.push(entry),
+    });
+
+    assert.notEqual(entries[0]?.tool_input, event.input, "not the same object");
+    assert.deepEqual(event.input, { command: "echo hi", timeout: 30 }, "and the input is untouched (§F9)");
+  } finally {
+    await api.close();
+  }
+});
+
 test("RES-01 a remembered block-on-failure turns a failure into the unavailable block", async () => {
   // `failBlock` answers the first call with `policy_check_failure_action: 'block'`, then hangs.
   const { result } = await run("failBlock", { warmups: 1 });

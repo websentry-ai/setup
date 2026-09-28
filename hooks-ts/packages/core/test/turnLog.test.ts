@@ -5,9 +5,11 @@
 //   * `model === "auto"`. `add_gateway_metrics_task.py:565-577` returns early on `"Model Not found"`
 //     and hook telemetry never takes the `add_new_model` path, so a real model id means **no row at
 //     all**. The test passes a real id in and asserts `"auto"` comes out.
-//   * nothing in `tool_use[]` carries content. `tool_input` is `{}` and `tool_response` holds a
-//     digest and a byte count — the serialised body is grepped for both a marker and the key names
-//     that would mean file bodies had come back.
+//   * nothing in `tool_use[]` carries content. `tool_input` carries the SAME allowlisted projection
+//     the pretool request sends — `command`, `path`, `pattern` — and `tool_response` holds a digest
+//     and a byte count. The serialised body is grepped for a marker and for the two key names that
+//     would mean file bodies had come back (`content`, `edits`), and asserted to contain the three
+//     that must be there.
 
 import assert from "node:assert/strict";
 import test from "node:test";
@@ -26,7 +28,15 @@ function record(overrides: Partial<TurnRecord> = {}): TurnRecord {
     prompt: "read the config and summarise it",
     session_id: "sess-turnlog-1",
     started_at: STARTED_AT,
-    tool_calls: [{ tool_name: "read", tool_use_id: "call_1", decision: "allow", ts: STARTED_AT + 5 }],
+    tool_calls: [
+      {
+        tool_name: "read",
+        tool_use_id: "call_1",
+        decision: "allow",
+        ts: STARTED_AT + 5,
+        tool_input: { path: "/etc/app/config.yaml" },
+      },
+    ],
     results: [
       {
         tool_name: "read",
@@ -83,8 +93,40 @@ test("each tool_use entry is the PostToolUse shape the backend reads", () => {
   assert.equal(entry?.type, "PostToolUse");
   assert.equal(entry?.tool_name, "read");
   assert.equal(entry?.tool_use_id, "call_1");
-  assert.deepEqual(entry?.tool_input, {}, "the turn record stores no tool input, by design");
+  assert.deepEqual(
+    entry?.tool_input,
+    { path: "/etc/app/config.yaml" },
+    "the allowlisted input the pretool request already sent, not a second projection of it",
+  );
   assert.deepEqual(entry?.tool_response, { content_sha256: "a".repeat(64), content_bytes: 812 });
+});
+
+test("a call recorded without a tool_input still sends the key, as an empty object", () => {
+  // The backend's reader expects the key (`coding_tools_backfill_service.py:1207-1219`), and a call
+  // that was cache-skipped or recorded before this field existed has nothing to put in it.
+  const rec = record({
+    tool_calls: [{ tool_name: "bash", tool_use_id: "call_1", decision: "skipped", ts: STARTED_AT }],
+  });
+  const [entry] = build(rec).messages[1]?.tool_use ?? [];
+  assert.deepEqual(entry?.tool_input, {});
+});
+
+test("a junk tool_input degrades to an empty object rather than riding the wire", () => {
+  for (const junk of ["command", 42, ["command"], null]) {
+    const rec = record({
+      tool_calls: [
+        {
+          tool_name: "bash",
+          tool_use_id: "call_1",
+          decision: "allow",
+          ts: STARTED_AT,
+          tool_input: junk as unknown as Record<string, unknown>,
+        },
+      ],
+    });
+    const [entry] = build(rec).messages[1]?.tool_use ?? [];
+    assert.deepEqual(entry?.tool_input, {}, `${JSON.stringify(junk)} became the tool_input`);
+  }
 });
 
 test("a skipped hash is encoded honestly rather than as a missing digest", () => {
@@ -176,8 +218,10 @@ test("no raw output and no file-body key reaches the body (T-09-10)", () => {
   // The prompt IS sent — that is the existing product contract. The tool output is not.
   assert.equal(toolUse.includes(MARKER), false, `output-bearing text in ${toolUse}`);
   // Matched as quoted JSON keys, so `content_sha256` (which is meant to be there) cannot satisfy
-  // the assertion for `content` (which must not be).
-  for (const key of ["content", "edits", "pattern", "path", "command"]) {
+  // the assertion for `content` (which must not be). These two are the file-body keys, and they are
+  // absent here because they are absent from what the decision seam recorded — the allowlist drops
+  // them before either the pretool request or this row can see them.
+  for (const key of ["content", "edits"]) {
     assert.equal(
       toolUse.includes(`"${key}":`),
       false,
@@ -185,6 +229,39 @@ test("no raw output and no file-body key reaches the body (T-09-10)", () => {
     );
   }
   assert.ok(toolUse.includes('"content_sha256":'), "the digest, by contrast, is present");
+});
+
+test("the allowlisted keys the pretool request sends ARE present in tool_use[]", () => {
+  // The inverse of the assertion above, and the whole of the fix: `command`, `path` and `pattern` are
+  // what the pretool check is evaluated on, so an audit row that omitted them described a tool call
+  // without saying what the call was.
+  const rec = record({
+    tool_calls: [
+      {
+        tool_name: "bash",
+        tool_use_id: "c1",
+        decision: "allow",
+        ts: STARTED_AT,
+        tool_input: { command: "echo hi" },
+      },
+      {
+        tool_name: "grep",
+        tool_use_id: "c2",
+        decision: "allow",
+        ts: STARTED_AT + 1,
+        tool_input: { pattern: "secret", path: "/src" },
+      },
+    ],
+    results: [],
+  });
+  const entries = build(rec).messages[1]?.tool_use ?? [];
+
+  assert.deepEqual(entries[0]?.tool_input, { command: "echo hi" });
+  assert.deepEqual(entries[1]?.tool_input, { pattern: "secret", path: "/src" });
+  const toolUse = JSON.stringify(entries);
+  for (const key of ["command", "pattern", "path"]) {
+    assert.ok(toolUse.includes(`"${key}":`), `tool_use[] lost the ${key} key: ${toolUse}`);
+  }
 });
 
 // --- the empty-turn guard (mirrors PY:4975 `if len(messages) < 2`) -------------------------------

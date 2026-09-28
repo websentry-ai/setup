@@ -36,7 +36,7 @@ import {
   NO_UI_REASON,
   USER_BASH_ID_PREFIX,
 } from "../../core/src/constants.ts";
-import { buildPretoolPayload } from "../../core/src/payload.ts";
+import { auditToolInput, buildPretoolPayload } from "../../core/src/payload.ts";
 import type { CheckHooks } from "../../core/src/policy.ts";
 import { denyBashResult } from "./bashResult.ts";
 import { noteDecision } from "./decide.ts";
@@ -100,7 +100,14 @@ export async function decideUserBash(
     // A typed `!cmd` is a real tool call in the audit trail, so it belongs in the turn record on the
     // same terms — `noteDecision` swallows its own failures, which matters more here than anywhere:
     // a throw out of this function means the command silently never runs (§A1.2).
-    noteDecision(deps, { tool_name: "bash", tool_use_id: toolUseId, decision: outcome.kind });
+    noteDecision(deps, {
+      tool_name: "bash",
+      tool_use_id: toolUseId,
+      decision: outcome.kind,
+      // `{}` in, so the only key out is the capped `command` — which is the entire content of a
+      // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
+      tool_input: auditToolInput({}, command),
+    });
 
     switch (outcome.kind) {
       case "allow":

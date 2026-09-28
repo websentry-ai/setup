@@ -35,7 +35,7 @@ reviewer can see at a glance where pi is at parity and where an event simply has
 | `user_bash` — the `!cmd` / `!!cmd` shell escape | the user's own command, blocked by returning a synthetic non-zero `BashResult` (the event has no `block` field); `tool_use_id` is `ubash_` + 20 hex | *no equivalent* — Claude Code has no user shell escape | *no equivalent* |
 | `input` — the typed prompt | the prompt text; a deny suppresses the turn entirely (`{action:"handled"}`) and a red notification is the user's only feedback channel | `UserPromptSubmit` | `beforeSubmitPrompt` |
 | `tool_result` | audits every result as name + `isError` + a sha256 digest + a byte count. Returns `undefined` on every path, so it can never rewrite what the model reads | `PostToolUse` | `afterShellExecution`, `afterFileEdit` |
-| `agent_end` | one best-effort turn log to `/v1/hooks/pi` per finished turn, dispatched without being awaited because pi gates run settlement on this handler | `Stop` | `stop`, `afterAgentResponse` |
+| `agent_end` | one best-effort turn log to `/v1/hooks/pi` per finished turn, dispatched without being awaited because pi gates run settlement on this handler. Each `tool_use[]` entry carries the **same** allowlisted, capped `tool_input` the pretool check carried (`command`, `path`, `pattern`) — never a file body — plus the sha256 of the output, never the output | `Stop` | `stop`, `afterAgentResponse` |
 | `session_start` | resolves the key, announces the session once per process, and warms the fail-open opt-out. Fires again on `/new`, `/resume`, `/fork`, `/clone`, `/reload` — the heartbeat is still sent once per process | `SessionStart` | `sessionStart` |
 
 Two pi events that the other integrations have no analogue for are also the two that carry the most

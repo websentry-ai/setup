@@ -253,6 +253,27 @@ test("HOOK-04 the payload carries tool_name bash, the typed command, and the EVE
   assert.deepStrictEqual(data.metadata?.tool_input, {});
 });
 
+test("HOOK-04 the recorded decision carries the typed command as its tool_input", async () => {
+  // A `!cmd` has no model-produced input at all, so `{}` in means the capped `command` is the only
+  // key out — and it is the entire content of the call. Without it the audit row said "bash" and
+  // nothing else about what the developer actually ran.
+  const api = await startMockApi({ mode: "allow" });
+  const ctx = createFakeCtx();
+  const entries: { tool_name: string; decision: string; tool_input?: Record<string, unknown> }[] = [];
+  try {
+    await decideUserBash(createFakeUserBashEvent("echo hi"), ctx, {
+      ...depsFor(api),
+      onDecision: (entry) => entries.push(entry),
+    });
+
+    assert.equal(entries.length, 1);
+    assert.equal(entries[0]?.tool_name, "bash");
+    assert.deepStrictEqual(entries[0]?.tool_input, { command: "echo hi" });
+  } finally {
+    await api.close();
+  }
+});
+
 test("HOOK-04 tool_use_id is a generated ubash_ id, and two calls never share one", async () => {
   const api = await startMockApi({ mode: "allow" });
   const ctx = createFakeCtx();

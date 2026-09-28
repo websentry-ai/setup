@@ -6,13 +6,17 @@
 //
 //   1. **`model` is `TURNLOG_MODEL`.** See that constant. A real model id means the backend drops the
 //      row. This is the single highest-consequence line in the file.
-//   2. **`tool_use[].tool_input` is literally `{}`.** The turn record stores no tool input (09-04 T1),
-//      and reaching back to the live `event.input` here would re-open exactly the egress that 09-02's
-//      `sanitizeToolInput` allowlist closed — file bodies (`content`, `edits`) would ride the turn log
-//      even though they no longer ride the pretool check. The key exists only because the backend's
-//      reader expects it (`coding_tools_backfill_service.py:1207-1219`); nothing reads its contents
-//      for pi. `turnLog.test.ts` asserts the absence of `content`/`edits`/`pattern`/`path`/`command`
-//      inside `tool_use[]` rather than trusting this paragraph.
+//   2. **`tool_use[].tool_input` is the allowlisted input, not `{}`.** It used to be literally `{}`,
+//      on the reasoning that reaching back to the live `event.input` would re-open the egress 09-02's
+//      `sanitizeToolInput` allowlist closed. That was true of `event.input` and false of what the
+//      pretool request already sends, and the cost was a row that named a tool without saying what it
+//      did — `bash` with no command, `read` with no path. So the decision seam now hands
+//      `payload.ts`'s `auditToolInput` projection to the record, and this file emits it verbatim:
+//      `command` (both-ends capped), `path`, `pattern` and the other allowlisted keys; **never**
+//      `content`, `edits` or any file body. One allowlist, shared with the enforcement request, so a
+//      key that cannot ride a pretool check cannot ride an audit row either. `turnLog.test.ts`
+//      asserts both halves — `content`/`edits` absent, `command`/`path`/`pattern` present — rather
+//      than trusting this paragraph.
 //   3. **`tool_response` carries `{content_sha256, content_bytes}`** — HOOK-06's whole point. This is
 //      also a documented parity gap: `audit_service.py:113-139` feeds the serialised `tool_use` array
 //      (including `tool_response`) to DLP, so **tool-output DLP cannot fire for pi**. That is a direct
@@ -39,8 +43,11 @@ export interface TurnLogToolUse {
   type: string;
   tool_name: string;
   tool_use_id: string;
-  /** Always `{}` — see decision 2 in the header. */
-  tool_input: Record<string, never>;
+  /**
+   * The allowlisted, capped input the pretool request carried — see decision 2 in the header. `{}`
+   * when the call was recorded without one.
+   */
+  tool_input: Record<string, unknown>;
   tool_response: ToolResponse;
 }
 
@@ -97,6 +104,19 @@ export function shouldPostTurn(record: TurnRecord | undefined): boolean {
   }
 }
 
+/**
+ * The recorded `tool_input`, or `{}`.
+ *
+ * Read, never re-sanitised: the allowlist ran at the decision seam, where the live `event.input` still
+ * existed, and a second pass here would only strip the `_dropped` / `_truncated` markers the server is
+ * meant to see. Anything that is not a plain object is `{}` — a malformed record degrades a key, not
+ * the row.
+ */
+function toolInputFor(value: unknown): Record<string, unknown> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+  return value as Record<string, unknown>;
+}
+
 /** `{}` for a call with no result, the hash pair otherwise. Never the raw output. */
 function toolResponseFor(record: TurnRecord, toolUseId: string): ToolResponse {
   const results = Array.isArray(record.results) ? record.results : [];
@@ -150,8 +170,9 @@ export function buildTurnLogBody(record: TurnRecord, opts: TurnLogOptions): Turn
       type: TURNLOG_TOOL_USE_TYPE,
       tool_name: typeof call?.tool_name === "string" ? call.tool_name : "",
       tool_use_id: typeof call?.tool_use_id === "string" ? call.tool_use_id : "",
-      // Not `call`-derived and not `event.input`-derived. Empty by design — header decision 2.
-      tool_input: {},
+      // `call`-derived, and still never `event.input`-derived: what the record holds was already
+      // allowlisted and capped by `auditToolInput` — header decision 2.
+      tool_input: toolInputFor(call?.tool_input),
       tool_response: toolResponseFor(safe, typeof call?.tool_use_id === "string" ? call.tool_use_id : ""),
     }));
   } catch {
