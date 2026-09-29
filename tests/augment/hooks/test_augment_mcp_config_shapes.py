@@ -236,6 +236,22 @@ class AugmentMcpConfigShapes(unittest.TestCase):
         # And nothing here matches the Splunk suffix, so resolution declines.
         self.assertEqual((None, None, None), self._resolve())
 
+    def test_the_cli_config_wins_over_vs_code_for_the_same_name(self):
+        """Sources are read CLI-first and the first definition of a name wins.
+        Widening the CLI reader therefore changes which config a machine with
+        both surfaces resolves to -- it used to fall through to VS Code when the
+        CLI file was unwrapped. CLI-first is the existing intent; this pins it.
+        """
+        self._write_settings({SERVER: {'command': 'from-cli'}})     # flat
+        base = unbound._vscode_user_dirs()[0].parent.parent
+        vs = (base / 'Code' / 'User' / 'globalStorage' / 'augment.vscode-augment'
+              / 'augment-global-state' / 'mcpServers.json')
+        vs.parent.mkdir(parents=True, exist_ok=True)
+        vs.write_text(json.dumps([{'name': SERVER, 'command': 'from-vscode'}]),
+                      encoding='utf-8')
+        self.assertEqual('from-cli',
+                         unbound.read_augment_mcp_servers({})[SERVER]['command'])
+
     # ── the same file, parsed twice, in two repos ───────────────────────
 
     def test_the_discovery_client_reads_the_same_shapes(self):

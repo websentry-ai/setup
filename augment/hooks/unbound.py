@@ -2320,10 +2320,8 @@ def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None,
 def _augment_cli_servers(data):
     """The `{name: entry}` mapping out of an Augment settings file.
 
-    Augment writes the servers three ways and only the first is wrapped, so a
-    reader that knows one shape returns nothing for the other two -- and no
-    servers means `resolve_augment_mcp` cannot name the server behind a munged
-    tool name. Precedence mirrors the discovery client's extractor.
+    Augment writes the servers three ways and only the first is wrapped.
+    Precedence mirrors the discovery client, which parses the same file.
     """
     if not isinstance(data, dict):
         return {}
