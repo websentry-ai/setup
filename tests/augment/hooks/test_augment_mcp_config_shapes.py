@@ -64,6 +64,12 @@ class AugmentMcpConfigShapes(unittest.TestCase):
         # loop silently stops protecting anything, which is how the first
         # attempt at this leaked into the real error.log.
         self.assertTrue(moved_any, 'no module paths were redirected; isolation is off')
+        # The Stop tests reach _device_serial(probe=True), which shells out to
+        # dmidecode before falling back. The rest of this suite stubs it for the
+        # same reason: a probe that hangs costs the test its 10s timeout.
+        serial = patch.object(unbound, '_device_serial', return_value=None)
+        serial.start()
+        self.addCleanup(serial.stop)
 
     def _write_settings(self, payload):
         path = self.home / '.augment' / 'settings.json'
