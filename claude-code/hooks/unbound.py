@@ -207,10 +207,15 @@ def _emit(text: str):
     try:
         print(text, flush=True)
     except (BrokenPipeError, OSError):
+        # dup2 devnull over the fd in place, so the wrapper's buffered bytes and exit-time flush drain silently.
         try:
-            sys.stdout = open(os.devnull, "w")
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         except Exception:
-            pass
+            # No usable fd (tests, detached stream): swap the object instead.
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except Exception:
+                pass
 
 
 def _read_policy_cache_raw() -> Optional[Dict]:
@@ -6582,10 +6587,6 @@ def main():
 
         _emit('{"suppressOutput": true}')
 
-    except BrokenPipeError:
-        # Host closed our stdout (hook timeout / user cancel / session end).
-        # Benign: exit quietly without self-reporting (AI-GATEWAY-3J).
-        pass
     except Exception as e:
         # Still return empty JSON object to Claude Code to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')

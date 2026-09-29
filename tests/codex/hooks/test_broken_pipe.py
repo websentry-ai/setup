@@ -10,17 +10,40 @@ import sys
 import unittest
 from unittest.mock import Mock, patch
 
-import unbound
+from tests.conftest import tool_module
+
+unbound = tool_module("codex/hooks")
 
 
 class TestMainBrokenPipeNotReported(unittest.TestCase):
-    def test_broken_pipe_on_emit_is_not_reported(self):
-        # Empty stdin -> main() hits the first _emit; make that _emit raise a
-        # broken pipe. main() must catch it, NOT log, NOT report to gateway.
-        with patch.object(unbound, "_emit", side_effect=BrokenPipeError(32, "Broken pipe")), \
-             patch.object(unbound, "report_error_to_gateway", Mock()) as report, \
+    def setUp(self):
+        self._real_stdout = sys.stdout
+
+    def tearDown(self):
+        swapped = unbound.sys.stdout
+        sys.stdout = self._real_stdout
+        if swapped is not self._real_stdout:
+            try:
+                swapped.close()
+            except Exception:
+                pass
+
+    def test_dead_stdout_pipe_is_not_reported(self):
+        # Empty stdin -> main() emits its response into a stdout whose reader
+        # is gone. The real _emit must swallow it: no log, no gateway report,
+        # nothing escapes. (No except BrokenPipeError in main(); _emit alone
+        # carries this, so a non-stdout broken pipe still reaches the
+        # catch-all and is reported like any real error.)
+        class DeadPipe:
+            def write(self, _):
+                raise BrokenPipeError(32, "Broken pipe")
+
+            def flush(self):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        unbound.sys.stdout = DeadPipe()
+        with patch.object(unbound, "report_error_to_gateway", Mock()) as report, \
              patch.object(unbound, "log_error", Mock()) as log, \
-             patch.object(unbound, "get_api_key", lambda: "K"), \
              patch.object(unbound.sys, "stdin", io.StringIO("")):
             try:
                 unbound.main()
@@ -38,7 +61,6 @@ class TestMainRealExceptionStillReported(unittest.TestCase):
         event = '{"hook_event_name": "Stop", "session_id": "s"}'
         with patch.object(unbound, "log_error", Mock()) as log, \
              patch.object(unbound, "append_to_audit_log", side_effect=RuntimeError("boom")), \
-             patch.object(unbound, "get_api_key", lambda: "K"), \
              patch.object(unbound.sys, "stdin", io.StringIO(event)), \
              patch.object(unbound.sys, "stdout", io.StringIO()):
             unbound.main()

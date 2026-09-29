@@ -1095,10 +1095,15 @@ def _emit(text):
     try:
         print(text, flush=True)
     except (BrokenPipeError, OSError):
+        # dup2 devnull over the fd in place, so the wrapper's buffered bytes and exit-time flush drain silently.
         try:
-            sys.stdout = open(os.devnull, "w")
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
         except Exception:
-            pass
+            # No usable fd (tests, detached stream): swap the object instead.
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except Exception:
+                pass
 
 
 
@@ -7964,10 +7969,6 @@ def main():
         # Output required by Copilot hooks
         _emit("{}")
 
-    except BrokenPipeError:
-        # Host closed our stdout (hook timeout / user cancel / session end).
-        # Benign: exit quietly without self-reporting (AI-GATEWAY-3J).
-        return
     except Exception as e:
         # Log errors but still output {} to not break Copilot
         log_error(f"Exception in main: {str(e)}", 'general')
