@@ -30,10 +30,17 @@ BACKFILL_TOOL_TYPE = "claude-code"
 BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
+BACKFILL_BATCH_BYTES = 32 * 1024 * 1024  # transcript bytes held in memory per batch
+BACKFILL_MAX_BATCHES_PER_HOME = 200
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
 _SCRIPT_START = time.time()
-BACKFILL_DEADLINE_SECONDS = 540  # inside onboard.py's 600s watchdog
+# All measured from script start. No new batch starts unless it can land before the
+# soft stop (margin: 90s or 1.5x the slowest batch so far); the hard kill backs it up
+# inside onboard.py's 720s watchdog.
+BACKFILL_SOFT_STOP_SECONDS = 600
+BACKFILL_MIN_MARGIN_SECONDS = 90
+BACKFILL_DEADLINE_SECONDS = 660
 
 
 def normalize_url(value: str) -> str:
@@ -103,16 +110,20 @@ def _run_as_user(username, fn, *args, **kwargs):
             os._exit(1)
     else:
         os.close(w_fd)
-        data = b''
+        # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
+        # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
+        chunks = []
         while True:
             try:
-                chunk = os.read(r_fd, 65536)
+                chunk = os.read(r_fd, 1 << 20)
             except OSError:
                 break
             if not chunk:
                 break
-            data += chunk
+            chunks.append(chunk)
         os.close(r_fd)
+        data = b''.join(chunks)
+        del chunks
         try:
             _, status = os.waitpid(pid, 0)
         except OSError:
@@ -1571,31 +1582,81 @@ def _backfill_state_path(home: Path) -> Path:
     return home / '.claude' / 'hooks' / BACKFILL_STATE_FILE
 
 
-def _backfill_read_cutoff(home: Path) -> float:
-    """mtime cutoff for transcript selection: the last successful backfill when
-    cached (so cron reruns only seed sessions touched since), else 30 days ago."""
-    default_cutoff = time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+def _backfill_read_state(home: Path) -> Dict[str, object]:
+    """{completed_at, cursor, cursor_path, force_epoch}. completed_at is when a walk last
+    finished; cursor/cursor_path/force_epoch mark a walk still in progress (position and
+    the request it serves). A bare float, which finished walks still write so older
+    installers can read it, is completed_at."""
+    state: Dict[str, object] = {'completed_at': None, 'cursor': None, 'force_epoch': None,
+                                'cursor_path': None}
     try:
-        last = float(_backfill_state_path(home).read_text().strip())
+        raw = json.loads(_backfill_state_path(home).read_text().strip())
     except (OSError, ValueError):
-        return default_cutoff
-    # Ignore corrupt or future timestamps (clock skew).
-    if last <= 0 or last > time.time():
-        return default_cutoff
-    return last
+        return state
+    if isinstance(raw, (int, float)):
+        raw = {'completed_at': raw}
+    if not isinstance(raw, dict):
+        return state
+    for key in ('completed_at', 'cursor', 'force_epoch'):
+        value = raw.get(key)
+        # Ignore corrupt or future timestamps (clock skew).
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= time.time():
+            state[key] = float(value)
+    path_value = raw.get('cursor_path')
+    if isinstance(path_value, str) and path_value:
+        state['cursor_path'] = path_value
+    return state
 
 
-def _backfill_write_cutoff(home: Path, ts: float) -> None:
+def _backfill_walk_start(state: Dict[str, object], force_epoch, force_days) -> Tuple[Tuple[float, Optional[str]], bool]:
+    """((mtime floor, tie-break path), forced) for a home's first batch in this run. With a
+    path the position is exclusive — the walk resumes strictly after it in (mtime, path)
+    order — so batches advance through files sharing one mtime."""
+    done = state['completed_at'] or time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
+    cursor = state['cursor']
+    resume = (cursor, state['cursor_path']) if cursor is not None else (done, None)
+    if cursor is not None and state['force_epoch'] is not None and (
+            force_epoch is None or state['force_epoch'] == force_epoch):
+        # Part-way through a request's walk: carry on, don't restart — also on a config
+        # miss, since the server validates the flag and a cancelled request degrades it.
+        return resume, True
+    if force_epoch is not None and force_epoch > done:
+        # The organization's window when it set one, otherwise this installer's own
+        # default. Widen only: a window narrower than what this device had already
+        # reached would skip the band in between, and the finished walk then advances
+        # the cutoff past it, so that history is never visited again.
+        window = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
+        return (resume if resume[0] <= window else (window, None)), True
+    return resume, False
+
+
+def _backfill_write_state_text(home: Path, text: str) -> None:
     # Write via temp + atomic replace so an overlapping cron run never reads a
-    # half-written timestamp.
+    # half-written state.
     try:
         path = _backfill_state_path(home)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.parent / f'{path.name}.{os.getpid()}.tmp'
-        tmp.write_text(str(ts))
+        tmp.write_text(text)
         os.replace(tmp, path)
     except OSError as e:
-        debug_print(f"failed to persist backfill timestamp: {e}")
+        debug_print(f"failed to persist backfill state: {e}")
+
+
+def _backfill_write_cutoff(home: Path, ts: float) -> None:
+    # A finished walk: a bare float, the format every installer version reads.
+    _backfill_write_state_text(home, str(ts))
+
+
+def _backfill_write_progress(home: Path, cursor: float, force_epoch: Optional[float],
+                             cursor_path: Optional[str] = None, forced: bool = False) -> None:
+    # A walk in progress: resume from cursor, keeping the last finished walk's time.
+    state = _backfill_read_state(home)
+    if forced and force_epoch is None:
+        force_epoch = state['force_epoch']  # config miss mid-walk: keep the latch
+    _backfill_write_state_text(home, json.dumps(
+        {'cursor': cursor, 'cursor_path': cursor_path, 'force_epoch': force_epoch,
+         'completed_at': state['completed_at']}))
 
 
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
@@ -1614,6 +1675,24 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
         except OSError:
             continue
         yield p
+
+
+def _backfill_oldest_first(paths):
+    """(mtime, size, path) oldest first, so a capped walk has a resume point."""
+    stamped = []
+    now = time.time()
+    for p in paths:
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        # A future-dated transcript (clock rollback, bad restore) would outrun any
+        # storable cursor and pin the walk; it becomes eligible once the clock passes it.
+        if st.st_mtime > now:
+            continue
+        stamped.append((st.st_mtime, st.st_size, p))
+    stamped.sort(key=lambda t: (t[0], str(t[2])))
+    return stamped
 
 
 def _backfill_is_real_user_prompt(content) -> bool:
@@ -1883,34 +1962,52 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
             session['user_email'] = email
 
 
-def _backfill_collect_sessions(home_dir: Path, force_epoch=None,
-                               force_days=None) -> Tuple[List[Dict], bool, bool]:
+def _backfill_read_batch(stamped) -> Tuple[List[Dict], object]:
+    """Read (mtime, size, path) oldest first up to one batch. Returns (sessions, capped):
+    capped is False, or the (mtime, path) position of the last file read — an exclusive
+    resume point, so files sharing one mtime never pin the walk in place."""
+    sessions: List[Dict] = []
+    bytes_read, last, skipped = 0, None, 0
+    capped = False
+    for mtime, size, transcript_path in stamped:
+        # Every session is held in memory (then pickled back through a pipe) before
+        # upload, so a batch is bounded by bytes as well as count. A heavy profile
+        # had one unbatched run reach 17 GB and outlive the MDM timeout.
+        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN or (
+                last is not None and bytes_read + size > BACKFILL_BATCH_BYTES):
+            capped = last
+            break
+        bytes_read += size
+        last = (mtime, str(transcript_path))
+        session = _backfill_collect_session(transcript_path)
+        if session:
+            sessions.append(session)
+        else:
+            skipped += 1
+    if skipped:
+        debug_print(f"backfill batch skipped {skipped} transcripts with no readable session")
+    return sessions, capped
+
+
+def _backfill_collect_sessions(home_dir: Path, force_epoch=None, force_days=None,
+                               start=None) -> Tuple[List[Dict], bool, bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
-    # Returns (sessions, capped, forced); capped=True means the per-run cap was hit and
-    # older files remain unprocessed, so this home's cutoff must not advance.
+    # Returns (sessions, capped, forced). capped is False, or the (mtime, path) position
+    # to resume strictly after: files are read in (mtime, path) order, so the next
+    # batch (start) picks up there instead of re-reading the same slice forever.
     projects_root = home_dir / '.claude' / 'projects'
     if not projects_root.exists():
         # Three values like every other exit: the caller unpacks one shape, and a
         # profile with no history here was not behind the request either.
         return [], False, False
-    cutoff_mtime = _backfill_read_cutoff(home_dir)
-    forced = force_epoch is not None and force_epoch > cutoff_mtime
-    if forced:
-        # The organization's window when it set one, otherwise this installer's own
-        # default. Widen only: a window narrower than what this device had already
-        # reached would skip the band in between, and the successful run then advances
-        # the cutoff past it, so that history is never visited again.
-        window = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
-        cutoff_mtime = min(cutoff_mtime, window)
-    sessions = []
-    capped = False
-    for transcript_path in sorted(_backfill_iter_transcripts(projects_root, cutoff_mtime)):
-        if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN:
-            capped = True
-            break
-        session = _backfill_collect_session(transcript_path)
-        if session:
-            sessions.append(session)
+    position, forced = _backfill_walk_start(_backfill_read_state(home_dir), force_epoch, force_days)
+    if start is not None:
+        # A later batch of this run: the first batch already decided the window.
+        position = start
+    stamped = _backfill_oldest_first(_backfill_iter_transcripts(projects_root, position[0]))
+    if position[1] is not None:
+        stamped = [t for t in stamped if (t[0], str(t[2])) > position]
+    sessions, capped = _backfill_read_batch(stamped)
     # Read here rather than in run_backfill: this runs privilege-dropped as the
     # owner, so another user's home is never read as root.
     _backfill_attach_identity(sessions, None, _backfill_account_email(home_dir))
@@ -1941,7 +2038,8 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     for header_name, header_value in headers.items():
         cmd += ["-H", f"{header_name}: {header_value}"]
     if body is not None:
-        cmd += ["--data-binary", "@-"]
+        # No 100-continue wait: on a stalled server curl reported it as "HTTP 100".
+        cmd += ["-H", "Expect:", "--data-binary", "@-"]
     cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
         result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout * 4 + 20)
@@ -1949,8 +2047,9 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
     if result.returncode != 0:
-        # curl transport error (DNS/TLS/refused); -sS keeps the message on stderr.
-        debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
+        # curl transport error (DNS/TLS/refused/timeout); -sS keeps the message on stderr.
+        debug_print(f"{method} failed, curl exit {result.returncode}: "
+                    f"{(result.stderr or b'').decode('utf-8', 'replace').strip()}")
     out = result.stdout or b''
     # curl appended "\n<http_code>" after the response body; split it off.
     sep = out.rfind(b'\n')
@@ -2063,12 +2162,15 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
                             forced: bool = False) -> Tuple[int, int, int]:
     """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts
-    distinct input session_ids that landed at least one successful chunk."""
+    distinct input session_ids that landed at least one successful chunk. Stops at
+    the first failed chunk: against a hung backend each one burns ~2 min of curl
+    retries, and the caller keeps the whole batch for the next run anyway."""
     chunks_total = 0
     chunks_sent = 0
     sessions_sent_ids: set = set()
     current_chunk: List[Dict] = []
     current_size = 2
+    skipped = 0
 
     def _flush():
         nonlocal current_chunk, current_size, chunks_total, chunks_sent
@@ -2083,20 +2185,77 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         current_size = 2
 
     for session in sessions:
+        if chunks_sent < chunks_total:
+            break
         for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
+            if chunks_sent < chunks_total:
+                break
             try:
                 slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
             except (TypeError, ValueError):
+                skipped += 1
                 continue
             if slice_bytes > BACKFILL_CHUNK_BYTES:
+                skipped += 1
                 continue
             if current_chunk and current_size + slice_bytes + 1 > BACKFILL_CHUNK_BYTES:
                 _flush()
             current_chunk.append(slice_session)
             current_size += slice_bytes + 1
 
-    _flush()
+    if chunks_sent == chunks_total:
+        _flush()
+    if skipped:
+        debug_print(f"backfill skipped {skipped} session slices that could not be sent")
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
+
+
+_WIN_THREAD_BACKGROUND_BEGIN = 0x00010000
+_WIN_THREAD_BACKGROUND_END = 0x00020000
+
+
+def _set_backfill_thread_mode(mode: int) -> bool:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # A private, typed kernel32: through the shared untyped windll the pointer-sized
+        # GetCurrentThread pseudo-handle is truncated and SetThreadPriority fails (error 6).
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetCurrentThread.restype = wintypes.HANDLE
+        k32.GetCurrentThread.argtypes = []
+        k32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        k32.SetThreadPriority.restype = wintypes.BOOL
+        if k32.SetThreadPriority(k32.GetCurrentThread(), mode):
+            return True
+        debug_print(f"SetThreadPriority({mode:#x}) failed: error {ctypes.get_last_error()}")
+    except Exception as e:
+        debug_print(f"SetThreadPriority({mode:#x}) failed: {e}")
+    return False
+
+
+def _lower_backfill_priority() -> bool:
+    # Backfill is catch-up work: yield CPU and disk to the person using the machine.
+    # Windows lowers only the calling (backfill) thread; returns True if that needs undoing.
+    if os.name == 'nt':
+        return _set_backfill_thread_mode(_WIN_THREAD_BACKGROUND_BEGIN)
+    try:
+        os.nice(19)
+    except (OSError, AttributeError) as e:
+        debug_print(f"lowering backfill priority failed: {e}")
+    return False
+
+
+def _restore_backfill_priority(lowered: bool) -> None:
+    if lowered:
+        _set_backfill_thread_mode(_WIN_THREAD_BACKGROUND_END)
+
+
+def _run_backfill_low_priority(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
+    lowered = _lower_backfill_priority()
+    try:
+        run_backfill(api_key, backend_url, user_homes)
+    finally:
+        _restore_backfill_priority(lowered)
 
 
 def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
@@ -2107,7 +2266,7 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
         return
     if os.name != 'posix':
         worker = threading.Thread(
-            target=run_backfill, args=(api_key, backend_url, user_homes), daemon=True,
+            target=_run_backfill_low_priority, args=(api_key, backend_url, user_homes), daemon=True,
         )
         worker.start()
         worker.join(budget)
@@ -2117,30 +2276,115 @@ def _run_backfill_bounded(api_key: str, backend_url: str, user_homes: List[Tuple
     # flush so the fork cannot replay buffered output
     sys.stdout.flush()
     sys.stderr.flush()
-    pid = os.fork()
+    try:
+        pid = os.fork()
+    except OSError as e:
+        print(f"[backfill] Skipped — could not start ({e}); backfill retries on the next run.", file=sys.stderr)
+        return
     if pid == 0:
         try:
             os.setsid()
             # self-destruct even if the parent dies first
             signal.signal(signal.SIGALRM, lambda *_: os.killpg(0, signal.SIGKILL))
             signal.alarm(int(budget) + 5)
+            _lower_backfill_priority()
             run_backfill(api_key, backend_url, user_homes)
             sys.stdout.flush()
             sys.stderr.flush()
         finally:
             os._exit(0)
-    deadline = time.time() + budget
-    while time.time() < deadline:
-        done_pid, _ = os.waitpid(pid, os.WNOHANG)
-        if done_pid:
-            return
-        time.sleep(1)
+    _wait_backfill_child(pid, time.time() + budget)
+
+
+def _wait_backfill_child(pid: int, deadline: float) -> None:
     try:
-        os.killpg(pid, signal.SIGKILL)
-    except OSError:
-        pass
-    os.waitpid(pid, 0)
+        while time.time() < deadline:
+            done_pid, _ = os.waitpid(pid, os.WNOHANG)
+            if done_pid:
+                return
+            time.sleep(1)
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+        os.waitpid(pid, 0)
+    except OSError as e:
+        debug_print(f"backfill child wait failed: {e}")
+        return
     print("[backfill] Did not finish in time — setup is complete; backfill retries on the next run.")
+
+
+class _BackfillRun:
+    """What every home in one run shares: where to upload, the force request, pacing."""
+
+    def __init__(self, api_key: str, backend_url: str, device_serial: Optional[str], force_config,
+                 completed_watermark: float):
+        self.api_key, self.backend_url = api_key, backend_url
+        self.device_serial = device_serial
+        self.force_epoch, self.force_days = force_config
+        self.completed_watermark = completed_watermark
+        self.slowest_batch = 0.0
+
+    def has_time_for_a_batch(self) -> bool:
+        # Start a batch only if even the slowest one so far would land before the soft stop.
+        margin = max(BACKFILL_MIN_MARGIN_SECONDS, 1.5 * self.slowest_batch)
+        return BACKFILL_SOFT_STOP_SECONDS - (time.time() - _SCRIPT_START) >= margin
+
+    def upload(self, sessions: List[Dict], forced: bool) -> Tuple[int, int]:
+        """(sessions_sent, chunks_failed) for one batch."""
+        _backfill_attach_identity(sessions, self.device_serial, None)
+        sent, _, failed = _backfill_send_sessions(self.api_key, self.backend_url, sessions, forced)
+        return sent, failed
+
+
+def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tuple[int, int, str]:
+    """Collect and upload one home a batch at a time, saving progress after each
+    upload lands. Returns (sessions_sent, batches, status); status is 'done',
+    'more' (history left for the next run), 'failed' or 'unreadable'."""
+    username, home_dir = user_home
+    start, home_forced, sent_total, batches = None, None, 0, 0
+    for _ in range(BACKFILL_MAX_BATCHES_PER_HOME):
+        if not run.has_time_for_a_batch():
+            return sent_total, batches, 'more'
+        began = time.time()
+        result = _run_as_user(username, _backfill_collect_sessions, home_dir,
+                              run.force_epoch, run.force_days, start)
+        if result is None:
+            # Unreadable (fork/perms): leave the cutoff, or its history is skipped for good.
+            return sent_total, batches, 'unreadable'
+        sessions, capped, forced = result
+        # The first batch decides; the rest of this home's walk serves the same request.
+        home_forced = forced if home_forced is None else home_forced
+        if sessions:
+            sent, failed = run.upload(sessions, home_forced)
+            sent_total, batches = sent_total + sent, batches + 1
+            if failed:
+                return sent_total, batches, 'failed'
+        run.slowest_batch = max(run.slowest_batch, time.time() - began)
+        if not capped:
+            # The pre-fetch watermark, not now: a force request that arrived mid-run
+            # must still read as pending on the next run.
+            _run_as_user(username, _backfill_write_cutoff, home_dir, run.completed_watermark)
+            return sent_total, batches, 'done'
+        # A legacy bool cap or a resume point that did not move cannot make progress.
+        if isinstance(capped, bool) or (start is not None and capped <= start):
+            return sent_total, batches, 'more'
+        start = (min(capped[0], time.time()), capped[1])
+        _run_as_user(username, _backfill_write_progress, home_dir, start[0],
+                     run.force_epoch if home_forced else None, start[1], home_forced)
+    return sent_total, batches, 'more'
+
+
+def _backfill_report(sessions_sent: int, batches: int, statuses: set) -> None:
+    if not batches and statuses <= {'done', 'unreadable'}:
+        print("[backfill] No past sessions found.")
+        return
+    line = f"[backfill] Queued {sessions_sent} sessions in {batches} batches."
+    if 'failed' in statuses:
+        line += " Some uploads failed and will retry on the next run."
+    if 'more' in statuses:
+        line += " More history remains and will continue on the next run."
+    print(line)
 
 
 def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
@@ -2158,60 +2402,24 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
         if not user_homes:
             debug_print("no user homes found — skipping backfill")
             return
-
-        started_at = time.time()
         device_serial = get_device_identifier()
+        # Watermark first: a force request filed after this instant must stay pending.
+        completed_watermark = time.time()
         # Fetched once, before privileges are dropped: one call per device, not per profile.
-        force_epoch, force_days = _backfill_force_config(api_key, backend_url)
-        # Kept apart by whether the profile they came from is actually behind the org's
-        # request. Merging them would assert force over a profile that never asked for
-        # it, letting its settled sessions be reopened.
-        forced_sessions = []
-        sessions = []
-        collected_homes: List[Tuple[str, Path]] = []
-        for username, home_dir in user_homes:
-            result = _run_as_user(username, _backfill_collect_sessions, home_dir,
-                                  force_epoch, force_days)
-            if result is None:
-                # Could not read this user's home (fork/perms) — don't advance its
-                # cutoff, or we'd permanently skip its history on the next run.
-                continue
-            user_sessions, capped, home_forced = result
-            if user_sessions:
-                debug_print(f"Found {len(user_sessions)} sessions for user: {username}")
-                # One serial for the machine; the email was attached per home above.
-                _backfill_attach_identity(user_sessions, device_serial, None)
-                (forced_sessions if home_forced else sessions).extend(user_sessions)
-            # Capped homes still have unprocessed files — leave their cutoff so the
-            # overflow stays eligible on the next run.
-            if not capped:
-                collected_homes.append((username, home_dir))
-
-        total = len(forced_sessions) + len(sessions)
-        if not total:
-            for username, home_dir in collected_homes:
-                _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
-            print("[backfill] No past sessions found.")
-            return
-
-        print(f"[backfill] Found {total} past sessions. Uploading (this may take a few minutes)...")
-        sessions_sent = 0
-        chunks_failed = 0
-        for batch, forced in ((forced_sessions, True), (sessions, False)):
-            if not batch:
-                continue
-            sent, _, failed = _backfill_send_sessions(api_key, backend_url, batch, forced)
-            sessions_sent += sent
-            chunks_failed += failed
-
-        if sessions_sent == 0:
-            print(f"[backfill] No sessions queued (all {chunks_failed} uploads failed).")
-        elif chunks_failed:
-            print(f"[backfill] Done — queued {sessions_sent} past sessions ({chunks_failed} chunks failed).")
-        else:
-            for username, home_dir in collected_homes:
-                _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
-            print(f"[backfill] Done — queued {sessions_sent} past sessions for processing.")
+        run = _BackfillRun(api_key, backend_url, device_serial,
+                           _backfill_force_config(api_key, backend_url), completed_watermark)
+        sessions_sent, batches, statuses = 0, 0, set()
+        for user_home in user_homes:
+            try:
+                sent, home_batches, status = _backfill_drain_home(run, user_home)
+            except Exception as e:
+                # One profile's failure must not cost the others their turn.
+                print(f"[backfill] Skipped one profile due to error: {e}", file=sys.stderr)
+                sent, home_batches, status = 0, 0, 'failed'
+            debug_print(f"backfill {user_home[0]}: {status}, {sent} sessions in {home_batches} batches")
+            sessions_sent, batches = sessions_sent + sent, batches + home_batches
+            statuses.add(status)
+        _backfill_report(sessions_sent, batches, statuses)
     except Exception as e:
         print(f"[backfill] Skipped due to error: {e}", file=sys.stderr)
 

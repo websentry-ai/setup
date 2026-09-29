@@ -105,16 +105,20 @@ def _run_as_user(username, fn, *args, **kwargs):
             os._exit(1)
     else:
         os.close(w_fd)
-        data = b''
+        # A list, not bytes +=: bytes concatenation copies the whole buffer per chunk,
+        # so a multi-GB pickle made this read quadratic and pinned a core past the timeout.
+        chunks = []
         while True:
             try:
-                chunk = os.read(r_fd, 65536)
+                chunk = os.read(r_fd, 1 << 20)
             except OSError:
                 break
             if not chunk:
                 break
-            data += chunk
+            chunks.append(chunk)
         os.close(r_fd)
+        data = b''.join(chunks)
+        del chunks
         try:
             _, status = os.waitpid(pid, 0)
         except OSError:

@@ -780,6 +780,25 @@ def log_error(message: str, category: str = 'general'):
     report_error_to_gateway(message, category, _cached_api_key)
 
 
+
+def _emit(text: str):
+    """Write a hook response line to stdout, treating a closed reader pipe as
+    a benign no-op. The host may close the read end (timeout, cancel, session
+    end, blocked approval-poll) before we flush — that is not a hook error."""
+    try:
+        print(text, flush=True)
+    except (BrokenPipeError, OSError):
+        # dup2 devnull over the fd in place, so the wrapper's buffered bytes and exit-time flush drain silently.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            # No usable fd (tests, detached stream): swap the object instead.
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except Exception:
+                pass
+
+
 def _read_policy_cache_raw() -> Optional[Dict]:
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
     try:
@@ -4610,13 +4629,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print('{}', flush=True)
+            _emit('{}')
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{}', flush=True)
+            _emit('{}')
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -4627,14 +4646,14 @@ def main():
             _cleanup_skill_policy_state()
             _dispatch_discovery()
             _dispatch_skills_sync(api_key)
-            print("{}")
+            _emit("{}")
             return
         session_id = event.get('session_id')
 
         # Handle PreToolUse - return immediately after decision is made
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             return
 
         # Handle UserPromptSubmit - check policy before processing
@@ -4649,7 +4668,7 @@ def main():
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                print(json.dumps(response), flush=True)
+                _emit(json.dumps(response))
                 return
 
             # Allowed but with hook output to emit (e.g. the spend-limit
@@ -4661,7 +4680,7 @@ def main():
                     'session_id': event.get('session_id'),
                     'event': event
                 })
-                print(json.dumps(response), flush=True)
+                _emit(json.dumps(response))
                 return
 
             # If allowed, continue to log the event (output printed at end)
@@ -4682,12 +4701,12 @@ def main():
 
         # Codex parses suppressOutput but does not implement it, and PostToolUse reports it as
         # unsupported and marks the hook failed. An empty object is accepted on every event.
-        print('{}', flush=True)
+        _emit('{}')
 
     except Exception as e:
         # Still acknowledge so Codex sees the hook complete.
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{}', flush=True)
+        _emit('{}')
 
 
 if __name__ == '__main__':

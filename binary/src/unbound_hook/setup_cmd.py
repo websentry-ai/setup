@@ -24,6 +24,7 @@ import platform
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from ._loader import load_mdm_setup_module
@@ -610,7 +611,10 @@ def _setup_claude_code(opts):
                             hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
                             install_mode="binary-skip" if skip_settings else "binary")
     if opts["backfill"]:
-        m.run_backfill(api_key, base, m.get_all_user_homes())
+        # Bounded like the MDM script: a heavy history must not hold setup open. The
+        # deadline origin is this tool's turn, not module import in the shared process.
+        m._SCRIPT_START = time.time()
+        m._run_backfill_bounded(api_key, base, m.get_all_user_homes())
     return ("configured", None)
 
 
