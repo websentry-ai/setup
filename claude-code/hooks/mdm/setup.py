@@ -1615,8 +1615,11 @@ def _backfill_walk_start(state: Dict[str, object], force_epoch, force_days) -> T
     done = state['completed_at'] or time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
     cursor = state['cursor']
     resume = (cursor, state['cursor_path']) if cursor is not None else (done, None)
-    if force_epoch is not None and cursor is not None and state['force_epoch'] == force_epoch:
-        return resume, True  # part-way through this request's walk: carry on, don't restart
+    if cursor is not None and state['force_epoch'] is not None and (
+            force_epoch is None or state['force_epoch'] == force_epoch):
+        # Part-way through a request's walk: carry on, don't restart — also on a config
+        # miss, since the server validates the flag and a cancelled request degrades it.
+        return resume, True
     if force_epoch is not None and force_epoch > done:
         # The organization's window when it set one, otherwise this installer's own
         # default. Widen only: a window narrower than what this device had already
@@ -1646,12 +1649,14 @@ def _backfill_write_cutoff(home: Path, ts: float) -> None:
 
 
 def _backfill_write_progress(home: Path, cursor: float, force_epoch: Optional[float],
-                             cursor_path: Optional[str] = None) -> None:
+                             cursor_path: Optional[str] = None, forced: bool = False) -> None:
     # A walk in progress: resume from cursor, keeping the last finished walk's time.
-    completed_at = _backfill_read_state(home)['completed_at']
+    state = _backfill_read_state(home)
+    if forced and force_epoch is None:
+        force_epoch = state['force_epoch']  # config miss mid-walk: keep the latch
     _backfill_write_state_text(home, json.dumps(
         {'cursor': cursor, 'cursor_path': cursor_path, 'force_epoch': force_epoch,
-         'completed_at': completed_at}))
+         'completed_at': state['completed_at']}))
 
 
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
@@ -2366,7 +2371,7 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
             return sent_total, batches, 'more'
         start = (min(capped[0], time.time()), capped[1])
         _run_as_user(username, _backfill_write_progress, home_dir, start[0],
-                     run.force_epoch if home_forced else None, start[1])
+                     run.force_epoch if home_forced else None, start[1], home_forced)
     return sent_total, batches, 'more'
 
 

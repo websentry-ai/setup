@@ -506,6 +506,22 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertEqual(run2, [(["t2"], False), (["t3"], False)])
         self.assertIsNone(mdm._backfill_read_state(home)["cursor"])
 
+    def test_a_config_miss_does_not_clear_a_mid_walk_force_latch(self):
+        """A forced walk cut short must stay forced when the next run's config fetch
+        returns nothing: the walk finishes under the stored request, whose flag the
+        server validates anyway."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("s20", 20, 60), ("s10", 10, 60), ("s5", 5, 60)])
+        epoch = time.time() - 86400
+        s20 = home / ".claude" / "projects" / "p" / "s20.jsonl"
+        mdm._backfill_write_progress(home, s20.stat().st_mtime, epoch, str(s20))
+
+        uploads = _drain_real_home(self, home, batch_bytes=1, force=(None, None))
+        self.assertEqual(uploads, [(["s10"], True), (["s5"], True)])
+        state = mdm._backfill_read_state(home)
+        self.assertIsNone(state["cursor"])
+        self.assertIsNotNone(state["completed_at"])
+
     def test_a_future_dated_transcript_waits_without_pinning_the_walk(self):
         """A transcript with an mtime ahead of the clock is left for a later run —
         uploaded once the clock passes it, never re-uploaded in a loop meanwhile."""
