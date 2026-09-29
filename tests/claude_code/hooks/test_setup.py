@@ -1,4 +1,5 @@
 import unittest
+import unittest.mock
 from unittest.mock import patch
 import io
 import json
@@ -567,24 +568,45 @@ class TestMdmBackfillBatches(unittest.TestCase):
             run3 = _drain_real_home(self, home, batch_bytes=1, force=force)
         self.assertEqual(run3, [])
 
-    def test_real_upload_with_a_failed_chunk_keeps_the_previous_batch_cursor(self):
-        """Real _backfill_send_sessions: batch 2 spans three chunks and the second
-        PUT fails. The cursor must stay where batch 1 left it."""
+    def _drain_with_failing_chunk(self, failing_call):
+        """Real _backfill_send_sessions over two batches: batch 1 is one chunk (call 1),
+        batch 2 would be three chunks (calls 2-4). Returns (calls, cursor, b2 mtime, stdout)."""
         mdm = self.mdm
         home = _transcript_home(self, [("b1", 5, 6000), ("b2", 4, 6000), ("b3", 4, 6000), ("b4", 4, 6000)])
         calls = []
 
         def fake_chunk(api_key, backend_url, sessions, forced=False):
             calls.append([s["session_id"] for s in sessions])
-            return len(calls) != 3  # batch 1 = call 1; batch 2 = calls 2-4
+            return len(calls) != failing_call
 
         with patch.object(mdm, "_backfill_upload_chunk", side_effect=fake_chunk), \
              patch.object(mdm, "BACKFILL_CHUNK_BYTES", 10000):
             out = _drain_real_home(self, home, batch_bytes=10000, real_send=True)
-        self.assertEqual(calls, [["b1"], ["b2"], ["b3"], ["b4"]])
         b2_mtime = (home / ".claude" / "projects" / "p" / "b2.jsonl").stat().st_mtime
-        self.assertEqual(mdm._backfill_read_state(home)["cursor"], b2_mtime)
+        return calls, mdm._backfill_read_state(home)["cursor"], b2_mtime, out
+
+    def test_first_failed_chunk_stops_the_batch_and_keeps_the_previous_cursor(self):
+        """Against a hung backend each chunk burns ~2 min of curl retries, so the rest
+        of a failing batch is never attempted; the batch is retried whole next run."""
+        calls, cursor, b2_mtime, out = self._drain_with_failing_chunk(failing_call=2)
+        self.assertEqual(calls, [["b1"], ["b2"]])
+        self.assertEqual(cursor, b2_mtime)
         self.assertIn("Some uploads failed", out)
+
+    def test_a_later_failed_chunk_also_stops_the_batch(self):
+        calls, cursor, b2_mtime, out = self._drain_with_failing_chunk(failing_call=3)
+        self.assertEqual(calls, [["b1"], ["b2"], ["b3"]])
+        self.assertEqual(cursor, b2_mtime)
+        self.assertIn("Some uploads failed", out)
+
+    def test_uploads_do_not_wait_for_100_continue(self):
+        """curl's Expect: 100-continue wait on a stalled server surfaced as "HTTP 100"."""
+        mdm = self.mdm
+        with patch.object(mdm.subprocess, "run") as run:
+            run.return_value = subprocess.CompletedProcess([], 0, b"\n200", b"")
+            mdm._backfill_http_request("https://s3/put", "PUT", {}, body=b"{}")
+        cmd = run.call_args[0][0]
+        self.assertIn("Expect:", cmd)
 
 
 class TestMdmBackfillProcessSafety(unittest.TestCase):
@@ -618,6 +640,41 @@ class TestMdmBackfillProcessSafety(unittest.TestCase):
             lowered = mdm._lower_backfill_priority()
         mdm._restore_backfill_priority(lowered)
         mdm._restore_backfill_priority(True)
+
+    def _windows_priority(self, set_results):
+        """Lower then restore on a faked Windows with a mocked kernel32; returns
+        (lowered, kernel32 mock, SetThreadPriority modes, debug output)."""
+        import ctypes
+        mdm = self.mdm
+        k32 = unittest.mock.MagicMock()
+        k32.GetCurrentThread.return_value = 0xFFFFFFFFFFFFFFFE  # the pseudo-handle, -2
+        k32.SetThreadPriority.side_effect = list(set_results)
+        out = io.StringIO()
+        with patch.object(mdm.os, "name", "nt"), patch.object(mdm, "DEBUG", True), \
+             patch.object(ctypes, "WinDLL", return_value=k32, create=True) as windll, \
+             patch.object(ctypes, "get_last_error", return_value=6, create=True), \
+             redirect_stdout(out):
+            lowered = mdm._lower_backfill_priority()
+            mdm._restore_backfill_priority(lowered)
+        windll.assert_called_with("kernel32", use_last_error=True)
+        modes = [c.args[1] for c in k32.SetThreadPriority.call_args_list]
+        return lowered, k32, modes, out.getvalue()
+
+    def test_windows_uses_a_typed_private_kernel32_and_restores(self):
+        from ctypes import c_int, wintypes
+        lowered, k32, modes, _ = self._windows_priority([True, True])
+        self.assertTrue(lowered)
+        self.assertEqual(modes, [0x00010000, 0x00020000])
+        self.assertEqual(k32.GetCurrentThread.restype, wintypes.HANDLE)
+        self.assertEqual(k32.SetThreadPriority.argtypes, [wintypes.HANDLE, c_int])
+        self.assertEqual(k32.SetThreadPriority.restype, wintypes.BOOL)
+        self.assertEqual(k32.SetThreadPriority.call_args_list[0].args[0], 0xFFFFFFFFFFFFFFFE)
+
+    def test_windows_priority_refused_is_logged_not_raised(self):
+        lowered, _, modes, out = self._windows_priority([False])
+        self.assertFalse(lowered)
+        self.assertEqual(modes, [0x00010000])  # nothing to restore
+        self.assertIn("SetThreadPriority(0x10000) failed: error 6", out)
 
     @unittest.skipIf(os.name == "nt", "fork path is POSIX only")
     def test_child_killed_mid_upload_leaves_the_last_completed_batch_saved(self):

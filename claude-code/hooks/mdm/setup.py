@@ -2021,7 +2021,8 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
     for header_name, header_value in headers.items():
         cmd += ["-H", f"{header_name}: {header_value}"]
     if body is not None:
-        cmd += ["--data-binary", "@-"]
+        # No 100-continue wait: on a stalled server curl reported it as "HTTP 100".
+        cmd += ["-H", "Expect:", "--data-binary", "@-"]
     cmd += ["--", url]  # -- stops option parsing so a '-'-leading URL can't be read as a flag
     try:
         result = subprocess.run(cmd, input=body, capture_output=True, timeout=timeout * 4 + 20)
@@ -2029,8 +2030,9 @@ def _backfill_http_request(url: str, method: str, headers: Dict[str, str], body:
         debug_print(f"HTTP request failed: {e}")
         return 0, b''
     if result.returncode != 0:
-        # curl transport error (DNS/TLS/refused); -sS keeps the message on stderr.
-        debug_print(f"curl exit {result.returncode}: {(result.stderr or b'').decode('utf-8', 'replace').strip()}")
+        # curl transport error (DNS/TLS/refused/timeout); -sS keeps the message on stderr.
+        debug_print(f"{method} failed, curl exit {result.returncode}: "
+                    f"{(result.stderr or b'').decode('utf-8', 'replace').strip()}")
     out = result.stdout or b''
     # curl appended "\n<http_code>" after the response body; split it off.
     sep = out.rfind(b'\n')
@@ -2143,7 +2145,9 @@ def _backfill_upload_chunk(api_key: str, backend_url: str, sessions: List[Dict],
 def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict],
                             forced: bool = False) -> Tuple[int, int, int]:
     """Return (sessions_sent, chunks_sent, chunks_failed). sessions_sent counts
-    distinct input session_ids that landed at least one successful chunk."""
+    distinct input session_ids that landed at least one successful chunk. Stops at
+    the first failed chunk: against a hung backend each one burns ~2 min of curl
+    retries, and the caller keeps the whole batch for the next run anyway."""
     chunks_total = 0
     chunks_sent = 0
     sessions_sent_ids: set = set()
@@ -2164,7 +2168,11 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
         current_size = 2
 
     for session in sessions:
+        if chunks_sent < chunks_total:
+            break
         for slice_session in _backfill_slice_session(session, BACKFILL_CHUNK_BYTES):
+            if chunks_sent < chunks_total:
+                break
             try:
                 slice_bytes = len(json.dumps(slice_session).encode('utf-8'))
             except (TypeError, ValueError):
@@ -2178,7 +2186,8 @@ def _backfill_send_sessions(api_key: str, backend_url: str, sessions: List[Dict]
             current_chunk.append(slice_session)
             current_size += slice_bytes + 1
 
-    _flush()
+    if chunks_sent == chunks_total:
+        _flush()
     if skipped:
         debug_print(f"backfill skipped {skipped} session slices that could not be sent")
     return len(sessions_sent_ids), chunks_sent, chunks_total - chunks_sent
@@ -2188,17 +2197,30 @@ _WIN_THREAD_BACKGROUND_BEGIN = 0x00010000
 _WIN_THREAD_BACKGROUND_END = 0x00020000
 
 
+def _set_backfill_thread_mode(mode: int) -> bool:
+    try:
+        import ctypes
+        from ctypes import wintypes
+        # A private, typed kernel32: through the shared untyped windll the pointer-sized
+        # GetCurrentThread pseudo-handle is truncated and SetThreadPriority fails (error 6).
+        k32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        k32.GetCurrentThread.restype = wintypes.HANDLE
+        k32.GetCurrentThread.argtypes = []
+        k32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        k32.SetThreadPriority.restype = wintypes.BOOL
+        if k32.SetThreadPriority(k32.GetCurrentThread(), mode):
+            return True
+        debug_print(f"SetThreadPriority({mode:#x}) failed: error {ctypes.get_last_error()}")
+    except Exception as e:
+        debug_print(f"SetThreadPriority({mode:#x}) failed: {e}")
+    return False
+
+
 def _lower_backfill_priority() -> bool:
     # Backfill is catch-up work: yield CPU and disk to the person using the machine.
     # Windows lowers only the calling (backfill) thread; returns True if that needs undoing.
     if os.name == 'nt':
-        try:
-            import ctypes
-            kernel32 = ctypes.windll.kernel32
-            return bool(kernel32.SetThreadPriority(kernel32.GetCurrentThread(), _WIN_THREAD_BACKGROUND_BEGIN))
-        except Exception as e:
-            debug_print(f"lowering backfill priority failed: {e}")
-            return False
+        return _set_backfill_thread_mode(_WIN_THREAD_BACKGROUND_BEGIN)
     try:
         os.nice(19)
     except (OSError, AttributeError) as e:
@@ -2207,14 +2229,8 @@ def _lower_backfill_priority() -> bool:
 
 
 def _restore_backfill_priority(lowered: bool) -> None:
-    if not lowered:
-        return
-    try:
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), _WIN_THREAD_BACKGROUND_END)
-    except Exception as e:
-        debug_print(f"restoring priority failed: {e}")
+    if lowered:
+        _set_backfill_thread_mode(_WIN_THREAD_BACKGROUND_END)
 
 
 def _run_backfill_low_priority(api_key: str, backend_url: str, user_homes: List[Tuple[str, Path]]) -> None:
