@@ -850,6 +850,7 @@ def get_recent_user_prompts_for_session(
         return []
 
     prompts: List[str] = []
+    prev_prompt_id = None
     logs = load_existing_logs()
     for log in logs:
         log_session = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -860,6 +861,12 @@ def get_recent_user_prompts_for_session(
             continue
         prompt = event.get('prompt')
         if prompt:
+            # Same submit logged once per registered hook: a repeat of the
+            # previous prompt_id is that duplicate, not a new prompt.
+            pid = event.get('prompt_id')
+            if pid is not None and pid == prev_prompt_id:
+                continue
+            prev_prompt_id = pid
             prompts.append(prompt)
 
     if prompts:
@@ -4861,6 +4868,7 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
+    prev_prompt_id = None
     assistant_tool_uses = []
 
     prompt_cwd = None
@@ -4889,11 +4897,22 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
                 entry = (prompt, prompt_cwd or cwd)
-                # Several registered hooks each log the same submit, so a repeated
-                # UserPromptSubmit is one prompt logged twice, not two prompts.
-                # Collapse it, or the join below concatenates the prompt with itself.
-                if not user_prompts or user_prompts[-1] != entry:
+                # Several registered hooks each log the same submit, so one prompt
+                # can arrive twice and would join with itself below as "p\n\np".
+                # Claude gives both copies the same prompt_id, so a repeat of the
+                # previous prompt_id is that duplicate and is dropped — a genuine
+                # re-typed prompt carries a new id and survives. Older Claude Code
+                # sends no prompt_id; there, fall back to dropping an identical
+                # adjacent (prompt, cwd).
+                pid = event.get('prompt_id')
+                is_dup = (
+                    (pid is not None and pid == prev_prompt_id)
+                    or (pid is None and prev_prompt_id is None
+                        and user_prompts and user_prompts[-1] == entry)
+                )
+                if not is_dup:
                     user_prompts.append(entry)
+                prev_prompt_id = pid
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')

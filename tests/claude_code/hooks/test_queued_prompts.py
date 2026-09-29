@@ -54,13 +54,31 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
         self.assertEqual(_user_messages(exchange), ["only"])
 
     def test_duplicate_submit_from_double_logged_hook_is_collapsed(self):
-        # Several registered hooks each log the same submit, so one prompt can
-        # land twice; it must collapse, not join with itself as "now\n\nnow".
+        # Two hooks log one submit with the same prompt_id: collapse to one,
+        # not "now\n\nnow".
         exchange = unbound.build_llm_exchange(
-            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="now"),
-             _log("UserPromptSubmit", FIRST_PROMPT, prompt="now")],
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="now", prompt_id="p1"),
+             _log("UserPromptSubmit", FIRST_PROMPT, prompt="now", prompt_id="p1")],
             stop_assistant_message="done")
         self.assertEqual(_user_messages(exchange), ["now"])
+
+    def test_genuine_repeat_with_distinct_prompt_id_is_kept(self):
+        # Same text typed twice in a turn carries different prompt_ids, so both
+        # are real submits and must be kept.
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="again", prompt_id="p1"),
+             _log("UserPromptSubmit", SECOND_PROMPT, prompt="again", prompt_id="p2")],
+            stop_assistant_message="done")
+        self.assertEqual(_user_messages(exchange), ["again\n\nagain"])
+
+    def test_double_log_without_prompt_id_falls_back_to_text(self):
+        # Older Claude Code sends no prompt_id: collapse an identical adjacent
+        # (prompt, cwd) instead.
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="hi"),
+             _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi")],
+            stop_assistant_message="done")
+        self.assertEqual(_user_messages(exchange), ["hi"])
 
     def test_a_typed_skill_in_the_earlier_prompt_is_recovered(self):
         # the queued prompt follows it, so a last-wins read would never see the slash
