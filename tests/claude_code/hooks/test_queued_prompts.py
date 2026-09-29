@@ -53,6 +53,15 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
             stop_assistant_message="done")
         self.assertEqual(_user_messages(exchange), ["only"])
 
+    def test_duplicate_submit_from_double_logged_hook_is_collapsed(self):
+        # Several registered hooks each log the same submit, so one prompt can
+        # land twice; it must collapse, not join with itself as "now\n\nnow".
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="now"),
+             _log("UserPromptSubmit", FIRST_PROMPT, prompt="now")],
+            stop_assistant_message="done")
+        self.assertEqual(_user_messages(exchange), ["now"])
+
     def test_a_typed_skill_in_the_earlier_prompt_is_recovered(self):
         # the queued prompt follows it, so a last-wins read would never see the slash
         with patch.object(unbound, "_resolve_skill_path",
