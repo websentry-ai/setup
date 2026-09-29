@@ -31,7 +31,6 @@ BACKFILL_MAX_FILE_BYTES = 50 * 1024 * 1024
 BACKFILL_MAX_LINES_PER_FILE = 50000
 BACKFILL_MAX_SESSIONS_PER_RUN = 5000
 BACKFILL_BATCH_BYTES = 32 * 1024 * 1024  # transcript bytes held in memory per batch
-BACKFILL_TIE_MAX_FILES = 50  # extra same-mtime files a full batch may take (within 2x bytes)
 BACKFILL_MAX_BATCHES_PER_HOME = 200
 BACKFILL_MAX_AGE_DAYS = 30
 BACKFILL_STATE_FILE = '.unbound_last_backfill'
@@ -1583,11 +1582,13 @@ def _backfill_state_path(home: Path) -> Path:
     return home / '.claude' / 'hooks' / BACKFILL_STATE_FILE
 
 
-def _backfill_read_state(home: Path) -> Dict[str, Optional[float]]:
-    """{completed_at, cursor, force_epoch}. completed_at is when a walk last finished;
-    cursor/force_epoch mark a walk still in progress (and the request it serves). A bare
-    float, which finished walks still write so older installers can read it, is completed_at."""
-    state: Dict[str, Optional[float]] = {'completed_at': None, 'cursor': None, 'force_epoch': None}
+def _backfill_read_state(home: Path) -> Dict[str, object]:
+    """{completed_at, cursor, cursor_path, force_epoch}. completed_at is when a walk last
+    finished; cursor/cursor_path/force_epoch mark a walk still in progress (position and
+    the request it serves). A bare float, which finished walks still write so older
+    installers can read it, is completed_at."""
+    state: Dict[str, object] = {'completed_at': None, 'cursor': None, 'force_epoch': None,
+                                'cursor_path': None}
     try:
         raw = json.loads(_backfill_state_path(home).read_text().strip())
     except (OSError, ValueError):
@@ -1596,28 +1597,34 @@ def _backfill_read_state(home: Path) -> Dict[str, Optional[float]]:
         raw = {'completed_at': raw}
     if not isinstance(raw, dict):
         return state
-    for key in state:
+    for key in ('completed_at', 'cursor', 'force_epoch'):
         value = raw.get(key)
         # Ignore corrupt or future timestamps (clock skew).
         if isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value <= time.time():
             state[key] = float(value)
+    path_value = raw.get('cursor_path')
+    if isinstance(path_value, str) and path_value:
+        state['cursor_path'] = path_value
     return state
 
 
-def _backfill_walk_start(state: Dict[str, Optional[float]], force_epoch, force_days) -> Tuple[float, bool]:
-    """(mtime floor, forced) for a home's first batch in this run."""
+def _backfill_walk_start(state: Dict[str, object], force_epoch, force_days) -> Tuple[Tuple[float, Optional[str]], bool]:
+    """((mtime floor, tie-break path), forced) for a home's first batch in this run. With a
+    path the position is exclusive — the walk resumes strictly after it in (mtime, path)
+    order — so batches advance through files sharing one mtime."""
     done = state['completed_at'] or time.time() - (BACKFILL_MAX_AGE_DAYS * 86400)
     cursor = state['cursor']
+    resume = (cursor, state['cursor_path']) if cursor is not None else (done, None)
     if force_epoch is not None and cursor is not None and state['force_epoch'] == force_epoch:
-        return cursor, True  # part-way through this request's walk: carry on, don't restart
+        return resume, True  # part-way through this request's walk: carry on, don't restart
     if force_epoch is not None and force_epoch > done:
         # The organization's window when it set one, otherwise this installer's own
         # default. Widen only: a window narrower than what this device had already
         # reached would skip the band in between, and the finished walk then advances
         # the cutoff past it, so that history is never visited again.
         window = time.time() - ((force_days or BACKFILL_MAX_AGE_DAYS) * 86400)
-        return min(cursor if cursor is not None else done, window), True
-    return (cursor if cursor is not None else done), False
+        return (resume if resume[0] <= window else (window, None)), True
+    return resume, False
 
 
 def _backfill_write_state_text(home: Path, text: str) -> None:
@@ -1638,11 +1645,13 @@ def _backfill_write_cutoff(home: Path, ts: float) -> None:
     _backfill_write_state_text(home, str(ts))
 
 
-def _backfill_write_progress(home: Path, cursor: float, force_epoch: Optional[float]) -> None:
+def _backfill_write_progress(home: Path, cursor: float, force_epoch: Optional[float],
+                             cursor_path: Optional[str] = None) -> None:
     # A walk in progress: resume from cursor, keeping the last finished walk's time.
     completed_at = _backfill_read_state(home)['completed_at']
     _backfill_write_state_text(home, json.dumps(
-        {'cursor': cursor, 'force_epoch': force_epoch, 'completed_at': completed_at}))
+        {'cursor': cursor, 'cursor_path': cursor_path, 'force_epoch': force_epoch,
+         'completed_at': completed_at}))
 
 
 def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
@@ -1945,25 +1954,21 @@ def _backfill_attach_identity(sessions: List[Dict], serial: Optional[str], email
 
 def _backfill_read_batch(stamped) -> Tuple[List[Dict], object]:
     """Read (mtime, size, path) oldest first up to one batch. Returns (sessions, capped):
-    capped is False, or the mtime of the first file left unread."""
+    capped is False, or the (mtime, path) position of the last file read — an exclusive
+    resume point, so files sharing one mtime never pin the walk in place."""
     sessions: List[Dict] = []
-    bytes_read, last_mtime, tie_files, skipped = 0, None, 0, 0
+    bytes_read, last, skipped = 0, None, 0
     capped = False
     for mtime, size, transcript_path in stamped:
         # Every session is held in memory (then pickled back through a pipe) before
         # upload, so a batch is bounded by bytes as well as count. A heavy profile
         # had one unbatched run reach 17 GB and outlive the MDM timeout.
         if len(sessions) >= BACKFILL_MAX_SESSIONS_PER_RUN or (
-                last_mtime is not None and bytes_read + size > BACKFILL_BATCH_BYTES):
-            # The resume point is an inclusive mtime floor: finish files sharing the last
-            # read mtime (bounded), or the next batch re-reads them and never advances.
-            if (mtime != last_mtime or tie_files >= BACKFILL_TIE_MAX_FILES
-                    or bytes_read + size > 2 * BACKFILL_BATCH_BYTES):
-                capped = mtime
-                break
-            tie_files += 1
+                last is not None and bytes_read + size > BACKFILL_BATCH_BYTES):
+            capped = last
+            break
         bytes_read += size
-        last_mtime = mtime
+        last = (mtime, str(transcript_path))
         session = _backfill_collect_session(transcript_path)
         if session:
             sessions.append(session)
@@ -1975,22 +1980,24 @@ def _backfill_read_batch(stamped) -> Tuple[List[Dict], object]:
 
 
 def _backfill_collect_sessions(home_dir: Path, force_epoch=None, force_days=None,
-                               start_mtime=None) -> Tuple[List[Dict], bool, bool]:
+                               start=None) -> Tuple[List[Dict], bool, bool]:
     # Must run inside _run_as_user (reads transcripts as the target user).
-    # Returns (sessions, capped, forced). capped is False, or the mtime to resume from
-    # when the batch cap stopped the walk: files are read oldest first, so the next
-    # batch (start_mtime) picks up there instead of re-reading the same slice forever.
+    # Returns (sessions, capped, forced). capped is False, or the (mtime, path) position
+    # to resume strictly after: files are read in (mtime, path) order, so the next
+    # batch (start) picks up there instead of re-reading the same slice forever.
     projects_root = home_dir / '.claude' / 'projects'
     if not projects_root.exists():
         # Three values like every other exit: the caller unpacks one shape, and a
         # profile with no history here was not behind the request either.
         return [], False, False
-    floor, forced = _backfill_walk_start(_backfill_read_state(home_dir), force_epoch, force_days)
-    if start_mtime is not None:
+    position, forced = _backfill_walk_start(_backfill_read_state(home_dir), force_epoch, force_days)
+    if start is not None:
         # A later batch of this run: the first batch already decided the window.
-        floor = start_mtime
-    sessions, capped = _backfill_read_batch(
-        _backfill_oldest_first(_backfill_iter_transcripts(projects_root, floor)))
+        position = start
+    stamped = _backfill_oldest_first(_backfill_iter_transcripts(projects_root, position[0]))
+    if position[1] is not None:
+        stamped = [t for t in stamped if (t[0], str(t[2])) > position]
+    sessions, capped = _backfill_read_batch(stamped)
     # Read here rather than in run_backfill: this runs privilege-dropped as the
     # owner, so another user's home is never read as root.
     _backfill_attach_identity(sessions, None, _backfill_account_email(home_dir))
@@ -2300,10 +2307,12 @@ def _wait_backfill_child(pid: int, deadline: float) -> None:
 class _BackfillRun:
     """What every home in one run shares: where to upload, the force request, pacing."""
 
-    def __init__(self, api_key: str, backend_url: str, device_serial: Optional[str], force_config):
+    def __init__(self, api_key: str, backend_url: str, device_serial: Optional[str], force_config,
+                 completed_watermark: float):
         self.api_key, self.backend_url = api_key, backend_url
         self.device_serial = device_serial
         self.force_epoch, self.force_days = force_config
+        self.completed_watermark = completed_watermark
         self.slowest_batch = 0.0
 
     def has_time_for_a_batch(self) -> bool:
@@ -2323,7 +2332,6 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
     upload lands. Returns (sessions_sent, batches, status); status is 'done',
     'more' (history left for the next run), 'failed' or 'unreadable'."""
     username, home_dir = user_home
-    started_at = time.time()
     start, home_forced, sent_total, batches = None, None, 0, 0
     for _ in range(BACKFILL_MAX_BATCHES_PER_HOME):
         if not run.has_time_for_a_batch():
@@ -2344,14 +2352,16 @@ def _backfill_drain_home(run: _BackfillRun, user_home: Tuple[str, Path]) -> Tupl
                 return sent_total, batches, 'failed'
         run.slowest_batch = max(run.slowest_batch, time.time() - began)
         if not capped:
-            _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
+            # The pre-fetch watermark, not now: a force request that arrived mid-run
+            # must still read as pending on the next run.
+            _run_as_user(username, _backfill_write_cutoff, home_dir, run.completed_watermark)
             return sent_total, batches, 'done'
         # A legacy bool cap or a resume point that did not move cannot make progress.
         if isinstance(capped, bool) or (start is not None and capped <= start):
             return sent_total, batches, 'more'
-        start = min(capped, time.time())
-        _run_as_user(username, _backfill_write_progress, home_dir, start,
-                     run.force_epoch if home_forced else None)
+        start = (min(capped[0], time.time()), capped[1])
+        _run_as_user(username, _backfill_write_progress, home_dir, start[0],
+                     run.force_epoch if home_forced else None, start[1])
     return sent_total, batches, 'more'
 
 
@@ -2383,9 +2393,11 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
             debug_print("no user homes found — skipping backfill")
             return
         device_serial = get_device_identifier()
+        # Watermark first: a force request filed after this instant must stay pending.
+        completed_watermark = time.time()
         # Fetched once, before privileges are dropped: one call per device, not per profile.
         run = _BackfillRun(api_key, backend_url, device_serial,
-                           _backfill_force_config(api_key, backend_url))
+                           _backfill_force_config(api_key, backend_url), completed_watermark)
         sessions_sent, batches, statuses = 0, 0, set()
         for user_home in user_homes:
             try:

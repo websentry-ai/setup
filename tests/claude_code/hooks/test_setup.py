@@ -310,7 +310,7 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         heavy = Path("/home/heavy")
         writes = []
         batches = iter([
-            ([{"session_id": "s1", "entries": [{}]}], 1234.5, False),
+            ([{"session_id": "s1", "entries": [{}]}], (1234.5, "t1"), False),
             ([{"session_id": "s2", "entries": [{}]}], False, False),
         ])
 
@@ -344,7 +344,7 @@ class TestMdmBackfillByteBudget(unittest.TestCase):
         projects = self.tmp / ".claude" / "projects" / "p"
         projects.mkdir(parents=True)
         now = time.time()
-        self.mtimes = {}
+        self.mtimes, self.paths = {}, {}
         # Written newest-name-first so path order and mtime order disagree.
         for i, name in enumerate(["c.jsonl", "b.jsonl", "a.jsonl"]):
             path = projects / name
@@ -353,6 +353,7 @@ class TestMdmBackfillByteBudget(unittest.TestCase):
             mtime = now - 3600 * (3 - i)
             os.utime(path, (mtime, mtime))
             self.mtimes[name] = mtime
+            self.paths[name] = str(path)
 
     def _collect(self, budget):
         with patch.object(self.mdm, "BACKFILL_BATCH_BYTES", budget), \
@@ -362,7 +363,7 @@ class TestMdmBackfillByteBudget(unittest.TestCase):
     def test_budget_stops_oldest_first_and_reports_resume_point(self):
         sessions, capped, _ = self._collect(budget=2500)
         self.assertEqual([s["session_id"] for s in sessions], ["c.jsonl", "b.jsonl"])
-        self.assertEqual(capped, self.mtimes["a.jsonl"])
+        self.assertEqual(capped, (self.mtimes["b.jsonl"], self.paths["b.jsonl"]))
 
     def test_under_budget_is_not_capped(self):
         sessions, capped, _ = self._collect(budget=10 ** 9)
@@ -373,7 +374,7 @@ class TestMdmBackfillByteBudget(unittest.TestCase):
         """A single transcript larger than the budget must not stall the home."""
         sessions, capped, _ = self._collect(budget=10)
         self.assertEqual([s["session_id"] for s in sessions], ["c.jsonl"])
-        self.assertEqual(capped, self.mtimes["b.jsonl"])
+        self.assertEqual(capped, (self.mtimes["c.jsonl"], self.paths["c.jsonl"]))
 
 
 class TestMdmBackfillBatches(unittest.TestCase):
@@ -417,6 +418,8 @@ class TestMdmBackfillBatches(unittest.TestCase):
 
     @staticmethod
     def _batch(ids, capped, forced=False):
+        if isinstance(capped, float):
+            capped = (capped, f"p{capped}")
         return ([{"session_id": i, "entries": [{}]} for i in ids], capped, forced)
 
     def test_heavy_home_drains_in_one_run_saving_progress_after_each_upload(self):
@@ -434,7 +437,7 @@ class TestMdmBackfillBatches(unittest.TestCase):
         # The last batch finishes the home: cutoff = when this run started, not a file mtime.
         self.assertEqual(events[5][:2], ("write", "a"))
         self.assertGreaterEqual(events[5][2], before)
-        self.assertEqual(starts, [("a", None), ("a", 100.0), ("a", 200.0)])
+        self.assertEqual(starts, [("a", None), ("a", (100.0, "p100.0")), ("a", (200.0, "p200.0"))])
         self.assertIn("Queued 3 sessions in 3 batches.", out)
         self.assertNotIn("More history remains", out)
 
@@ -472,15 +475,61 @@ class TestMdmBackfillBatches(unittest.TestCase):
 
     def test_files_sharing_an_mtime_past_the_budget_still_make_progress(self):
         """Real files: three transcripts share one mtime and together exceed the batch
-        budget. The resume point is an inclusive mtime floor, so the batch must take
-        the whole tie or the next batch re-reads it and never advances."""
+        budget. The (mtime, path) cursor advances through the tie file by file, so
+        ties of any size drain across bounded batches."""
         mdm = self.mdm
         home = _transcript_home(self, [("t1", 5, 60), ("t2", 5, 60), ("t3", 5, 60), ("t4", 4, 60)])
         uploads = _drain_real_home(self, home, batch_bytes=200)
-        self.assertEqual(uploads, [(["t1", "t2", "t3"], False), (["t4"], False)])
+        self.assertEqual(uploads, [(["t1"], False), (["t2"], False), (["t3"], False), (["t4"], False)])
         state = mdm._backfill_read_state(home)
         self.assertIsNone(state["cursor"])
         self.assertIsNotNone(state["completed_at"])
+
+    def test_a_tie_cut_short_resumes_mid_tie_on_the_next_run(self):
+        """Run 1 stops inside a shared-mtime group; run 2 resumes at the saved
+        (mtime, path) position instead of re-reading or skipping the rest of the tie."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("t1", 5, 60), ("t2", 5, 60), ("t3", 5, 60)])
+        sent = {"n": 0}
+
+        def stop_after_one(sessions):
+            sent["n"] += 1
+            if sent["n"] == 1:
+                mdm._SCRIPT_START -= mdm.BACKFILL_SOFT_STOP_SECONDS
+            return len(sessions), 1, 0
+
+        with patch.object(mdm, "_SCRIPT_START", time.time()):
+            run1 = _drain_real_home(self, home, batch_bytes=1, send=stop_after_one)
+        self.assertEqual(run1, [(["t1"], False)])
+        with patch.object(mdm, "_SCRIPT_START", time.time()):
+            run2 = _drain_real_home(self, home, batch_bytes=1)
+        self.assertEqual(run2, [(["t2"], False), (["t3"], False)])
+        self.assertIsNone(mdm._backfill_read_state(home)["cursor"])
+
+    def test_a_force_request_arriving_mid_run_stays_pending(self):
+        """completed_at is stamped before the force config is fetched, so a request
+        filed during the run reads as newer than the walk that missed it."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("t1", 5, 60)])
+        fetch_time = {}
+
+        def config_fetch(api_key, backend_url):
+            fetch_time["t"] = time.time()
+            return (None, None)
+
+        with patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)), \
+             patch.object(mdm, "_backfill_force_config", side_effect=config_fetch), \
+             patch.object(mdm, "_backfill_send_sessions", return_value=(1, 1, 0)), \
+             patch.object(mdm, "_backfill_account_email", return_value=None), \
+             patch.object(mdm, "get_device_identifier", return_value="SERIAL"), \
+             redirect_stdout(io.StringIO()):
+            mdm.run_backfill("key", "https://backend", [("alice", home)])
+        completed = mdm._backfill_read_state(home)["completed_at"]
+        self.assertLessEqual(completed, fetch_time["t"])
+        # A request filed at fetch time therefore still reads as pending.
+        position, forced = mdm._backfill_walk_start(
+            mdm._backfill_read_state(home), fetch_time["t"], None)
+        self.assertTrue(forced)
 
     def test_slowest_batch_sets_the_margin_before_the_soft_stop(self):
         """Each batch takes 100s on a fake clock: a new batch needs 1.5x that (150s)
@@ -569,10 +618,12 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertEqual(run3, [])
 
     def _drain_with_failing_chunk(self, failing_call):
-        """Real _backfill_send_sessions over two batches: batch 1 is one chunk (call 1),
-        batch 2 would be three chunks (calls 2-4). Returns (calls, cursor, b2 mtime, stdout)."""
+        """Real _backfill_send_sessions over one three-chunk batch (calls 1-3), resuming
+        from a saved cursor at b1. Returns (calls, cursor, b1 mtime, stdout)."""
         mdm = self.mdm
         home = _transcript_home(self, [("b1", 5, 6000), ("b2", 4, 6000), ("b3", 4, 6000), ("b4", 4, 6000)])
+        b1 = home / ".claude" / "projects" / "p" / "b1.jsonl"
+        mdm._backfill_write_progress(home, b1.stat().st_mtime, None, str(b1))
         calls = []
 
         def fake_chunk(api_key, backend_url, sessions, forced=False):
@@ -581,22 +632,21 @@ class TestMdmBackfillBatches(unittest.TestCase):
 
         with patch.object(mdm, "_backfill_upload_chunk", side_effect=fake_chunk), \
              patch.object(mdm, "BACKFILL_CHUNK_BYTES", 10000):
-            out = _drain_real_home(self, home, batch_bytes=10000, real_send=True)
-        b2_mtime = (home / ".claude" / "projects" / "p" / "b2.jsonl").stat().st_mtime
-        return calls, mdm._backfill_read_state(home)["cursor"], b2_mtime, out
+            out = _drain_real_home(self, home, batch_bytes=30000, real_send=True)
+        return calls, mdm._backfill_read_state(home)["cursor"], b1.stat().st_mtime, out
 
     def test_first_failed_chunk_stops_the_batch_and_keeps_the_previous_cursor(self):
         """Against a hung backend each chunk burns ~2 min of curl retries, so the rest
         of a failing batch is never attempted; the batch is retried whole next run."""
-        calls, cursor, b2_mtime, out = self._drain_with_failing_chunk(failing_call=2)
-        self.assertEqual(calls, [["b1"], ["b2"]])
-        self.assertEqual(cursor, b2_mtime)
+        calls, cursor, b1_mtime, out = self._drain_with_failing_chunk(failing_call=1)
+        self.assertEqual(calls, [["b2"]])
+        self.assertEqual(cursor, b1_mtime)
         self.assertIn("Some uploads failed", out)
 
     def test_a_later_failed_chunk_also_stops_the_batch(self):
-        calls, cursor, b2_mtime, out = self._drain_with_failing_chunk(failing_call=3)
-        self.assertEqual(calls, [["b1"], ["b2"], ["b3"]])
-        self.assertEqual(cursor, b2_mtime)
+        calls, cursor, b1_mtime, out = self._drain_with_failing_chunk(failing_call=2)
+        self.assertEqual(calls, [["b2"], ["b3"]])
+        self.assertEqual(cursor, b1_mtime)
         self.assertIn("Some uploads failed", out)
 
     def test_uploads_do_not_wait_for_100_continue(self):
@@ -679,7 +729,7 @@ class TestMdmBackfillProcessSafety(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "fork path is POSIX only")
     def test_child_killed_mid_upload_leaves_the_last_completed_batch_saved(self):
         """Real fork + hard kill: batch 1 uploads, batch 2's upload hangs past the
-        deadline. The persisted cursor is exactly where batch 1 finished."""
+        deadline. The persisted cursor is exactly the last file batch 1 read."""
         mdm = self.mdm
         home = _transcript_home(self, [("k1", 5, 60), ("k2", 4, 60), ("k3", 3, 60)])
         calls = {"n": 0}
@@ -701,8 +751,8 @@ class TestMdmBackfillProcessSafety(unittest.TestCase):
              patch.object(mdm, "_SCRIPT_START", time.time()), \
              redirect_stdout(out):
             mdm._run_backfill_bounded("key", "https://backend", [("me", home)])
-        k2_mtime = (home / ".claude" / "projects" / "p" / "k2.jsonl").stat().st_mtime
-        self.assertEqual(mdm._backfill_read_state(home)["cursor"], k2_mtime)
+        k1_mtime = (home / ".claude" / "projects" / "p" / "k1.jsonl").stat().st_mtime
+        self.assertEqual(mdm._backfill_read_state(home)["cursor"], k1_mtime)
         self.assertIn("Did not finish in time", out.getvalue())
 
 
