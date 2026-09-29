@@ -1088,6 +1088,25 @@ def log_error(message, category='general', extra=None):
     report_error_to_gateway(message, category, _cached_api_key, extra)
 
 
+def _emit(text):
+    """Write a hook response line to stdout, treating a closed reader pipe as
+    a benign no-op. The host may close the read end (timeout, cancel, session
+    end) before we flush — that is not a hook error."""
+    try:
+        print(text, flush=True)
+    except (BrokenPipeError, OSError):
+        # dup2 devnull over the fd in place, so the wrapper's buffered bytes and exit-time flush drain silently.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            # No usable fd (tests, detached stream): swap the object instead.
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except Exception:
+                pass
+
+
+
 # In-process in the sandbox: the cache file sits in agent-writable /tmp, and every reader
 # of it -- native-write short-circuit, repo gate, fail-open action -- would trust a plant.
 _CLOUD_POLICY_CACHE = {}
@@ -7791,13 +7810,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print("{}")
+            _emit("{}")
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print("{}")
+            _emit("{}")
             return
 
         event_name = _copilot_event_name(event)
@@ -7813,18 +7832,18 @@ def main():
                 _snapshot_copilot_skill_inventory(event)
                 _dispatch_discovery()
                 _dispatch_skills_sync(api_key)
-            print("{}")
+            _emit("{}")
             return
 
         # Skill context rides UserPromptSubmit's additionalContext. Configs written
         # before that still register this event, so answer them until setup rewrites.
         if event_name == 'userPromptTransformed':
-            print("{}")
+            _emit("{}")
             return
 
         if event_name in ('PreToolUse', 'preToolUse'):
             response = process_pre_tool_use(event, api_key)
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             return
 
         if event_name == 'UserPromptSubmit':
@@ -7834,7 +7853,7 @@ def main():
             })
             # No repo gate here: conversation is never gated, but this call refreshes the policy cache so the session's first gated TOOL call is enforceable.
             response = process_user_prompt_submit(event, api_key)
-            print(json.dumps(response) if response else "{}", flush=True)
+            _emit(json.dumps(response) if response else "{}")
             return
 
         # Create log entry with timestamp; the event already carries hook_event_name
@@ -7948,22 +7967,22 @@ def main():
             cleanup_old_logs()
 
         # Output required by Copilot hooks
-        print("{}")
+        _emit("{}")
 
     except Exception as e:
         # Log errors but still output {} to not break Copilot
         log_error(f"Exception in main: {str(e)}", 'general')
         # Empty output is an allow, and every other cloud failure path denies.
         if RUNNING_CLOUD and os.environ.get('UNBOUND_HOOK_EVENT') == 'preToolUse':
-            print(json.dumps(transform_response_for_copilot({
+            _emit(json.dumps(transform_response_for_copilot({
                 'decision': 'deny',
                 'reason': POLICY_CHECK_FAILURE_BLOCK_REASON,
                 'additionalContext': 'The Unbound hook failed before it could evaluate this '
                                      'action. Do not retry or work around it. Stop and say so '
                                      'in the pull request.',
-            })), flush=True)
+            })))
         else:
-            print("{}")
+            _emit("{}")
 
 
 if __name__ == '__main__':
