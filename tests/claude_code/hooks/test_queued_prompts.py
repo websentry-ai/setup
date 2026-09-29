@@ -358,10 +358,18 @@ class TestRecentUserPromptsDedupe(unittest.TestCase):
                             _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi", prompt_id="p1")])
         self.assertEqual(out, ["hi"])
 
-    def test_double_logged_submit_without_prompt_id_counted_once(self):
+    def test_same_words_with_distinct_prompt_ids_both_kept(self):
+        out = self._recent([_log("UserPromptSubmit", FIRST_PROMPT, prompt="again", prompt_id="p1"),
+                            _log("UserPromptSubmit", SECOND_PROMPT, prompt="again", prompt_id="p2")])
+        self.assertEqual(out, ["again", "again"])
+
+    def test_without_prompt_id_is_not_deduped(self):
+        # This list spans the whole session, so identical text without a
+        # prompt_id may be the same word typed in a later turn, not a double
+        # log — leave it, rather than risk merging real prompts.
         out = self._recent([_log("UserPromptSubmit", FIRST_PROMPT, prompt="hi"),
-                            _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi")])
-        self.assertEqual(out, ["hi"])
+                            _log("UserPromptSubmit", SECOND_PROMPT, prompt="hi")])
+        self.assertEqual(out, ["hi", "hi"])
 
     def test_distinct_prompts_both_kept(self):
         out = self._recent([_log("UserPromptSubmit", FIRST_PROMPT, prompt="a", prompt_id="p1"),

@@ -861,16 +861,15 @@ def get_recent_user_prompts_for_session(
             continue
         prompt = event.get('prompt')
         if prompt:
-            # Same submit logged once per hook: a repeat of the previous
-            # prompt_id (or, without one, the same adjacent prompt) is a duplicate.
+            # Both hooks log one submit with Claude's shared prompt_id, so a
+            # repeat of the previous id is that duplicate. This list spans the
+            # whole session, so identical text alone can't tell a double-log from
+            # the same word typed in a later turn — dedupe only on prompt_id.
             pid = event.get('prompt_id')
-            is_dup = (
-                (pid is not None and pid == prev_prompt_id)
-                or (pid is None and prev_prompt_id is None and prompts and prompts[-1] == prompt)
-            )
+            if pid is not None and pid == prev_prompt_id:
+                continue
             prev_prompt_id = pid
-            if not is_dup:
-                prompts.append(prompt)
+            prompts.append(prompt)
 
     if prompts:
         return prompts[-n:]
