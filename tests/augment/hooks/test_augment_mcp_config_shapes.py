@@ -31,6 +31,7 @@ class AugmentMcpConfigShapes(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
+        real_home = Path.home()          # captured BEFORE the patch below
         patcher = patch.object(unbound.Path, 'home', return_value=self.home)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -42,6 +43,27 @@ class AugmentMcpConfigShapes(unittest.TestCase):
         })
         env.start()
         self.addCleanup(env.stop)
+        # The module builds its log/cache paths from Path.home() at IMPORT time,
+        # so patching Path.home here is too late for them: a test that makes the
+        # hook log an error would append to the real user's error.log. Repoint
+        # every module constant that still resolves under the real home.
+        moved_any = False
+        for attr in dir(unbound):
+            value = getattr(unbound, attr, None)
+            if not isinstance(value, Path) or not attr.isupper():
+                continue
+            try:
+                rel = value.relative_to(real_home)
+            except ValueError:
+                continue
+            moved = patch.object(unbound, attr, self.home / rel)
+            moved.start()
+            self.addCleanup(moved.stop)
+            moved_any = True
+        # If the module ever stops deriving these from the home directory this
+        # loop silently stops protecting anything, which is how the first
+        # attempt at this leaked into the real error.log.
+        self.assertTrue(moved_any, 'no module paths were redirected; isolation is off')
 
     def _write_settings(self, payload):
         path = self.home / '.augment' / 'settings.json'
@@ -247,10 +269,14 @@ class AugmentMcpConfigShapes(unittest.TestCase):
         vs = (base / 'Code' / 'User' / 'globalStorage' / 'augment.vscode-augment'
               / 'augment-global-state' / 'mcpServers.json')
         vs.parent.mkdir(parents=True, exist_ok=True)
-        vs.write_text(json.dumps([{'name': SERVER, 'command': 'from-vscode'}]),
+        vs.write_text(json.dumps([{'name': SERVER, 'command': 'from-vscode'},
+                                  {'name': 'vscode-only', 'command': 'only-here'}]),
                       encoding='utf-8')
-        self.assertEqual('from-cli',
-                         unbound.read_augment_mcp_servers({})[SERVER]['command'])
+        servers = unbound.read_augment_mcp_servers({})
+        # A VS-Code-only server must still load, or this asserts nothing: the
+        # CLI value would win simply by being the only file ever read.
+        self.assertIn('vscode-only', servers)
+        self.assertEqual('from-cli', servers[SERVER]['command'])
 
     # ── the same file, parsed twice, in two repos ───────────────────────
 
