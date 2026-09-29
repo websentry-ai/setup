@@ -142,5 +142,148 @@ class AugmentMcpConfigShapes(unittest.TestCase):
             ev, unbound.read_augment_mcp_servers({}))
         self.assertEqual('mcp__%s__splunk_run_query' % SERVER, out['tool_name'])
 
+    # ── the Stop-event door (end-of-turn analytics) ─────────────────────
+
+    def _post_log(self):
+        return [{'event': {
+            'hook_event_name': 'PostToolUse', 'tool_name': RAW_TOOL,
+            'tool_input': {'q': 1}, 'is_mcp_tool': True, 'tool_use_id': 'tu-1'}}]
+
+    def _stop_event(self):
+        """A Stop carrying the turn's conversation. Without it the builder has
+        nothing to hang the tool calls on and returns None."""
+        return {'session_id': 's', 'hook_event_name': 'Stop',
+                'conversation': {'userPrompt': 'run the query',
+                                 'agentTextResponse': 'done'}}
+
+    def _tool_names(self, exchange):
+        names = []
+        for m in (exchange or {}).get('messages', []):
+            for tu in (m.get('tool_use') or []):
+                names.append(tu.get('tool_name'))
+        return names
+
+    def test_stop_event_analytics_names_the_server(self):
+        """build_llm_exchange is the door the hook actually runs at end of turn;
+        asserting on the inner builder would not have caught a break here."""
+        self._write_settings({'augment': {'advanced': {'mcpServers': {SERVER: ENTRY}}}})
+        ex = unbound.build_llm_exchange(
+            self._stop_event(), self._post_log())
+        self.assertIn('mcp__%s__splunk_run_query' % SERVER, self._tool_names(ex))
+
+    def test_stop_event_wrapped_shape_is_unchanged(self):
+        """Backward-compat: the shape that already worked still produces the
+        same tool_name after the reader was widened."""
+        self._write_settings({'mcpServers': {SERVER: ENTRY}})
+        ex = unbound.build_llm_exchange(
+            self._stop_event(), self._post_log())
+        self.assertIn('mcp__%s__splunk_run_query' % SERVER, self._tool_names(ex))
+
+    # ── the server config the gateway fingerprints on ───────────────────
+
+    def test_pre_tool_use_forwards_the_server_config(self):
+        """`mcp_server_config` is what the gateway fingerprints, and what
+        `_dispatch_mcp_server_scan` needs -- resolving the NAME but dropping the
+        config leaves the server unscannable."""
+        self._write_settings({SERVER: ENTRY})          # flat shape
+        captured = {}
+
+        def _capture(body, key):
+            captured['body'] = body
+            return {'decision': 'allow'}
+
+        event = {'hook_event_name': 'PreToolUse', 'session_id': 's',
+                 'tool_name': RAW_TOOL, 'tool_input': {'q': 1}, 'is_mcp_tool': True}
+        with patch.object(unbound, 'send_to_hook_api', side_effect=_capture):
+            unbound.process_pre_tool_use(event, 'sk-test')
+
+        cfg = captured['body']['pre_tool_use_data']['metadata'].get('mcp_server_config')
+        self.assertIsNotNone(cfg, 'server resolved but its config was dropped')
+        self.assertEqual('splunk-mcp', cfg.get('command'))
+
+    def test_a_resolved_server_still_dispatches_a_scan_when_unknown_to_the_gateway(self):
+        """The gateway answers `unknown_mcp_server` for a server it has never
+        fingerprinted. That path needs the config, so it must survive the
+        widened reader."""
+        self._write_settings({SERVER: ENTRY})
+        seen = {}
+
+        def _scan(name, cfg):
+            seen['name'], seen['cfg'] = name, cfg
+
+        event = {'hook_event_name': 'PreToolUse', 'session_id': 's',
+                 'tool_name': RAW_TOOL, 'tool_input': {'q': 1}, 'is_mcp_tool': True}
+        with patch.object(unbound, 'send_to_hook_api',
+                          return_value={'decision': 'allow', 'unknown_mcp_server': True}), \
+             patch.object(unbound, '_dispatch_mcp_server_scan', side_effect=_scan):
+            unbound.process_pre_tool_use(event, 'sk-test')
+        self.assertEqual(SERVER, seen.get('name'))
+
+    # ── hostile input: the settings file is user-editable ───────────────
+
+    def test_a_hostile_settings_file_yields_no_server_and_does_not_raise(self):
+        """Every key of the flat shape comes from a file a user (or anything
+        writing as them) controls."""
+        self._write_settings({
+            '__proto__': {'command': 'x'},
+            'constructor': {'url': 'http://x.test'},
+            'a' * 5000: {'command': 'y'},
+            'nested': {'deep': {'command': 'z'}},     # command not at this level
+        })
+        servers = unbound.read_augment_mcp_servers({})       # must not raise
+        # `nested` carries no command/url of its own, so it is not a server.
+        self.assertNotIn('nested', servers)
+        # And nothing here matches the Splunk suffix, so resolution declines.
+        self.assertEqual((None, None, None), self._resolve())
+
+    # ── the same file, parsed twice, in two repos ───────────────────────
+
+    def test_the_discovery_client_reads_the_same_shapes(self):
+        """`~/.augment/settings.json` is parsed here AND by the discovery
+        client's `_extract_servers_obj`. Two parsers, one file: when they
+        disagree the inventory and the enforcement path describe different
+        machines, and nothing says so. That divergence is what this fix was.
+
+        Skips where the sibling repo is not checked out -- it is absent on CI.
+        """
+        import subprocess
+        rel = ('scripts/coding_discovery_tools/macos/augment/'
+               'augment_mcp_config_extractor.py')
+        roots = [Path(__file__).resolve().parents[3].parent]
+        # A worktree lives outside the clone, so also look beside the main one.
+        try:
+            out = subprocess.run(
+                ['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                capture_output=True, text=True,
+                cwd=str(Path(__file__).resolve().parents[3]))
+            if out.returncode == 0 and out.stdout.strip():
+                roots.append(Path(out.stdout.strip()).parent.parent)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        mod_path = next((r / 'coding-discovery-tool' / rel for r in roots
+                         if (r / 'coding-discovery-tool' / rel).exists()), None)
+        if mod_path is None:
+            self.skipTest('coding-discovery-tool is not checked out beside this repo')
+        src = mod_path.read_text(encoding='utf-8')
+        # Import just the pure function; the module's own imports need the
+        # package installed, which the hook repo has no reason to carry.
+        start = src.index('def _extract_servers_obj')
+        end = src.index('\nclass ')
+        ns = {'Any': object, 'Dict': dict}
+        exec(compile(src[start:end], 'discovery_extract', 'exec'), ns)
+        theirs = ns['_extract_servers_obj']
+
+        for label, payload in (
+            ('wrapped', {'mcpServers': {SERVER: ENTRY}}),
+            ('nested', {'augment': {'advanced': {'mcpServers': {SERVER: ENTRY}}}}),
+            ('flat', {SERVER: ENTRY}),
+            ('flat with noise', {SERVER: ENTRY, 'theme': 'dark',
+                                 'telemetry': {'enabled': True}}),
+        ):
+            with self.subTest(shape=label):
+                self.assertEqual(
+                    set(theirs(payload)), set(unbound._augment_cli_servers(payload)),
+                    'the hook and the discovery client disagree on %s' % label)
+
 if __name__ == '__main__':
     unittest.main()
