@@ -317,6 +317,21 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         self.assertEqual(ties[:3], [None, None, 100.0])
         self.assertEqual(writes[2][1], math.nextafter(100.0, float("inf")))
 
+    def test_empty_tie_drain_does_not_finish_the_home(self):
+        """An all-corrupt tie group drains empty; newer transcripts must still follow."""
+        mdm = self._load_mdm()
+        home = Path("/home/corrupt_ties")
+        s1 = [{"session_id": "s1", "entries": [{}]}]
+        s2 = [{"session_id": "s2", "entries": [{}]}]
+        t0 = time.time()
+        writes, _ = self._run(
+            mdm,
+            {home: [self._b(s1, True, last=100.0), self._b(s1, True, last=100.0),
+                    self._b([], False, last=0.0), self._b(s2, False, last=200.0)]},
+            send_results=[(1, 1, 0), (1, 1, 0), (0, 0, 0), (1, 1, 0)])
+        self.assertEqual(writes[2][1], math.nextafter(100.0, float("inf")))
+        self.assertGreaterEqual(writes[3][1], t0)
+
     def test_forced_home_keeps_the_single_shot_walk(self):
         """A forced home routes through the legacy collector; capped -> no advance."""
         mdm = self._load_mdm()

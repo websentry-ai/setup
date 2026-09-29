@@ -2232,7 +2232,7 @@ def run_backfill(api_key: str, backend_url: str, user_homes: List[Tuple[str, Pat
                         _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
                     break
                 sessions = batch['sessions']
-                if not sessions and not batch['more']:
+                if tie_mtime is None and not sessions and not batch['more']:
                     _run_as_user(username, _backfill_write_cutoff, home_dir, started_at)
                     break
                 # One serial for the machine; the email was attached per home above.
