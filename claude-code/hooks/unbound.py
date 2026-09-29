@@ -4889,12 +4889,9 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
                 entry = (prompt, prompt_cwd or cwd)
-                # One submit fires every registered hook, so a machine still
-                # carrying the legacy user-level hook alongside the managed one
-                # logs the same UserPromptSubmit twice. Left in, the identical
-                # entries concatenate below into "<prompt>\n\n<prompt>"; collapse
-                # an immediately-repeated submit. Distinct prompts typed in one
-                # turn differ and are kept.
+                # Several registered hooks each log the same submit, so a repeated
+                # UserPromptSubmit is one prompt logged twice, not two prompts.
+                # Collapse it, or the join below concatenates the prompt with itself.
                 if not user_prompts or user_prompts[-1] != entry:
                     user_prompts.append(entry)
 
