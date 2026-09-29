@@ -348,5 +348,26 @@ class TestQueuedPromptFromTranscript(unittest.TestCase):
         self.assertEqual(_user_messages(exchange), ["hello\n\n/beta"])
 
 
+class TestRecentUserPromptsDedupe(unittest.TestCase):
+    def _recent(self, logs, n=5):
+        with patch.object(unbound, "load_existing_logs", lambda: logs):
+            return unbound.get_recent_user_prompts_for_session(SESSION, n)
+
+    def test_double_logged_submit_with_prompt_id_counted_once(self):
+        out = self._recent([_log("UserPromptSubmit", FIRST_PROMPT, prompt="hi", prompt_id="p1"),
+                            _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi", prompt_id="p1")])
+        self.assertEqual(out, ["hi"])
+
+    def test_double_logged_submit_without_prompt_id_counted_once(self):
+        out = self._recent([_log("UserPromptSubmit", FIRST_PROMPT, prompt="hi"),
+                            _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi")])
+        self.assertEqual(out, ["hi"])
+
+    def test_distinct_prompts_both_kept(self):
+        out = self._recent([_log("UserPromptSubmit", FIRST_PROMPT, prompt="a", prompt_id="p1"),
+                            _log("UserPromptSubmit", SECOND_PROMPT, prompt="b", prompt_id="p2")])
+        self.assertEqual(out, ["a", "b"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -861,13 +861,16 @@ def get_recent_user_prompts_for_session(
             continue
         prompt = event.get('prompt')
         if prompt:
-            # Same submit logged once per registered hook: a repeat of the
-            # previous prompt_id is that duplicate, not a new prompt.
+            # Same submit logged once per hook: a repeat of the previous
+            # prompt_id (or, without one, the same adjacent prompt) is a duplicate.
             pid = event.get('prompt_id')
-            if pid is not None and pid == prev_prompt_id:
-                continue
+            is_dup = (
+                (pid is not None and pid == prev_prompt_id)
+                or (pid is None and prev_prompt_id is None and prompts and prompts[-1] == prompt)
+            )
             prev_prompt_id = pid
-            prompts.append(prompt)
+            if not is_dup:
+                prompts.append(prompt)
 
     if prompts:
         return prompts[-n:]
@@ -4897,13 +4900,10 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
                 entry = (prompt, prompt_cwd or cwd)
-                # Several registered hooks each log the same submit, so one prompt
-                # can arrive twice and would join with itself below as "p\n\np".
-                # Claude gives both copies the same prompt_id, so a repeat of the
-                # previous prompt_id is that duplicate and is dropped — a genuine
-                # re-typed prompt carries a new id and survives. Older Claude Code
-                # sends no prompt_id; there, fall back to dropping an identical
-                # adjacent (prompt, cwd).
+                # Several hooks log one submit, so a prompt can arrive twice and
+                # join with itself below. Both copies share Claude's prompt_id, so
+                # a repeat of the previous id is that duplicate; older Claude Code
+                # sends none, so fall back to an identical adjacent (prompt, cwd).
                 pid = event.get('prompt_id')
                 is_dup = (
                     (pid is not None and pid == prev_prompt_id)
