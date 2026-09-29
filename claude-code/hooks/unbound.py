@@ -4898,20 +4898,14 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 # repo-level skill when the agent was opened at a parent dir. Held per
                 # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
-                entry = (prompt, prompt_cwd or cwd)
-                # Several hooks log one submit, so a prompt can arrive twice and
-                # join with itself below. Both copies share Claude's prompt_id, so
-                # a repeat of the previous id is that duplicate; older Claude Code
-                # sends none, so fall back to an identical adjacent (prompt, cwd).
+                # Several hooks log one submit with Claude's shared prompt_id, so a
+                # repeat of the previous id is that duplicate; drop it, or it joins
+                # with itself below as "<prompt>\n\n<prompt>".
                 pid = event.get('prompt_id')
-                is_dup = (
-                    (pid is not None and pid == prev_prompt_id)
-                    or (pid is None and prev_prompt_id is None
-                        and user_prompts and user_prompts[-1] == entry)
-                )
-                if not is_dup:
-                    user_prompts.append(entry)
+                is_dup = pid is not None and pid == prev_prompt_id
                 prev_prompt_id = pid
+                if not is_dup:
+                    user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')

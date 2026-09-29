@@ -71,15 +71,6 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
             stop_assistant_message="done")
         self.assertEqual(_user_messages(exchange), ["again\n\nagain"])
 
-    def test_double_log_without_prompt_id_falls_back_to_text(self):
-        # Older Claude Code sends no prompt_id: collapse an identical adjacent
-        # (prompt, cwd) instead.
-        exchange = unbound.build_llm_exchange(
-            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="hi"),
-             _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi")],
-            stop_assistant_message="done")
-        self.assertEqual(_user_messages(exchange), ["hi"])
-
     def test_a_typed_skill_in_the_earlier_prompt_is_recovered(self):
         # the queued prompt follows it, so a last-wins read would never see the slash
         with patch.object(unbound, "_resolve_skill_path",
