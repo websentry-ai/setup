@@ -17,6 +17,7 @@ The api key + backend url come from the target users' ~/.unbound/config.json
 
 import json
 import sys
+import time
 from pathlib import Path
 
 from ._loader import load_mdm_setup_module
@@ -112,6 +113,10 @@ def run(argv) -> int:
             continue
         m = load_mdm_setup_module(tool)
         m.DEBUG = True
+        if hasattr(m, "_SCRIPT_START"):
+            # One process runs every tool: each gets its own deadline origin, or a slow
+            # earlier tool starves the later ones' batch budget.
+            m._SCRIPT_START = time.time()
         print(f"\n[backfill] tool={tool}")
         if opts["dry_run"]:
             try:

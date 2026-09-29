@@ -64,6 +64,9 @@ _RAW_DISCOVERY = "https://raw.githubusercontent.com/websentry-ai/coding-discover
 # rather than a tight bound — picked to surface a hung subprocess as a clear
 # error instead of a silent indefinite hang on the wrapper.
 SUBPROCESS_TIMEOUT_SECONDS = 600
+# A tool running --backfill stops starting batches at 10 min and kills its own
+# backfill at 11 (from its start), so this watchdog only catches a hang past both.
+BACKFILL_SUBPROCESS_TIMEOUT_SECONDS = 720
 
 # Coding discovery legitimately takes much longer than a per-tool setup (a full
 # filesystem scan + per-user upload), so it gets its OWN, larger timeout instead
@@ -156,14 +159,17 @@ def run_tool(name: str, url: str, args: list) -> bool:
         # Use sys.executable so we run with the same Python that's executing
         # this wrapper — avoids `python3` vs `python` vs `py` PATH issues
         # (notably on Windows where python3 may not be on PATH).
+        # tool_arguments() only passes --backfill to tools that support it.
+        timeout = (BACKFILL_SUBPROCESS_TIMEOUT_SECONDS if "--backfill" in args
+                   else SUBPROCESS_TIMEOUT_SECONDS)
         try:
             result = subprocess.run(
-                [sys.executable, tmp_path] + args, timeout=SUBPROCESS_TIMEOUT_SECONDS,
+                [sys.executable, tmp_path] + args, timeout=timeout,
             )
             return result.returncode == 0
         except subprocess.TimeoutExpired:
             print(
-                f"❌ [{name}] timed out after {SUBPROCESS_TIMEOUT_SECONDS}s — child killed.",
+                f"❌ [{name}] timed out after {timeout}s — child killed.",
                 file=sys.stderr,
             )
             return False

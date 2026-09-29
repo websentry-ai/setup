@@ -2,6 +2,8 @@
 in MDM policies and crons. Every form of it must parse and be ignored — and it
 must never reach the per-tool MDM scripts, which reject unknown arguments."""
 
+import os
+
 import pytest
 
 from tests.conftest import load_module
@@ -96,3 +98,37 @@ def test_skip_managed_settings_is_still_appended_only_where_declared():
     assert onboard.tool_arguments(base, False, True, True) == base + ["--skip-managed-settings"]
     assert onboard.tool_arguments(base, False, False, True) == base
     assert onboard.tool_arguments(base, False, True, False) == base
+
+
+def _step_timeouts(monkeypatch, argv):
+    """Run onboard.main() with downloads and children faked; return each tool
+    step's subprocess timeout, keyed by the temp script's tool slug."""
+    timeouts = {}
+
+    class _Done:
+        returncode = 0
+
+    def _fake_run(cmd, *args, timeout=None, **kwargs):
+        if cmd and cmd[0] == onboard.sys.executable:
+            slug = os.path.basename(cmd[1])[len("unbound-mdm-"):].rsplit("-", 1)[0]
+            timeouts[slug] = timeout
+        return _Done()
+
+    monkeypatch.setattr(onboard, "check_admin_privileges", lambda: True)
+    monkeypatch.setattr(onboard, "fetch_script", lambda url: b"")
+    monkeypatch.setattr(onboard.subprocess, "run", _fake_run)
+    monkeypatch.setattr(onboard, "fetch_device_owner_key", lambda key, url: None)
+    monkeypatch.setattr(onboard.sys, "argv", ["onboard.py"] + argv)
+    assert onboard.main() == 0
+    return timeouts
+
+
+def test_backfill_steps_get_the_longer_timeout_only_with_backfill(monkeypatch):
+    """A backfilling tool soft-stops at 10 min and hard-kills its backfill at 11; the
+    watchdog must sit beyond both, and only for the tools that actually backfill."""
+    with_backfill = _step_timeouts(monkeypatch, ["--api-key", "K", "--backfill"])
+    assert with_backfill == {
+        "claude-code": 720, "cursor": 600, "codex": 720, "github-copilot": 720, "augment": 600,
+    }
+    without = _step_timeouts(monkeypatch, ["--api-key", "K"])
+    assert set(without.values()) == {600}
