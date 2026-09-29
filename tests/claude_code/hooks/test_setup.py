@@ -10,6 +10,7 @@ import urllib.request
 import urllib.error
 import urllib.parse
 import time
+import math
 from pathlib import Path
 
 from tests.conftest import tool_module
@@ -225,78 +226,135 @@ class TestBackfillCutoffCache(unittest.TestCase):
 
 
 class TestMdmBackfillCutoff(unittest.TestCase):
-    """Tests for the multi-user MDM run_backfill: a user's cutoff must advance
-    only when that user's transcripts were actually collected, so a failed
-    privilege-drop never strands their history behind an advanced cutoff."""
+    """The resumable MDM run_backfill: a home's cutoff advances per uploaded batch,
+    never past unsent work; forced homes keep the single-shot walk."""
 
     @staticmethod
     def _load_mdm():
         return tool_module("claude-code/hooks/mdm", "setup")
 
-    def _run(self, mdm, collect_by_home, send_result):
-        """Run run_backfill with _run_as_user mocked; return list of homes
-        whose cutoff was written."""
-        writes = []
+    @staticmethod
+    def _b(sessions, more, last=100.0, forced=False):
+        return {'sessions': sessions, 'more': more, 'forced': forced, 'last_mtime': last}
+
+    def _run(self, mdm, batches_by_home, send_results, legacy_by_home=None):
+        """Feed each home scripted batches; return cutoff writes and per-collect ties."""
+        writes, ties = [], []
+        state = {h: list(b) for h, b in batches_by_home.items()}
+        sends = list(send_results)
 
         def fake_run_as_user(username, fn, *args):
+            if fn is mdm._backfill_collect_batch:
+                ties.append(args[4])
+                seq = state[args[0]]
+                return seq.pop(0) if seq else self._b([], False)
             if fn is mdm._backfill_collect_sessions:
-                return collect_by_home[args[0]]
+                return (legacy_by_home or {}).get(args[0])
             if fn is mdm._backfill_write_cutoff:
-                writes.append(args[0])
+                writes.append((args[0], args[1]))
             return None
 
-        homes = [(f"u{i}", home) for i, home in enumerate(collect_by_home)]
+        homes = [(f"u{i}", h) for i, h in enumerate(batches_by_home)]
         with patch.object(mdm, "_run_as_user", side_effect=fake_run_as_user), \
              patch.object(mdm, "_backfill_force_config", return_value=(None, None)), \
-             patch.object(mdm, "_backfill_send_sessions", return_value=send_result):
+             patch.object(mdm, "_backfill_send_sessions",
+                          side_effect=lambda *a, **k: sends.pop(0)):
             mdm.run_backfill("key", "https://backend", homes)
-        return writes
+        return writes, ties
 
     def test_failed_home_cutoff_not_advanced(self):
         """Collection returning None (fork/perms failure) -> no cutoff write."""
         mdm = self._load_mdm()
         good, bad = Path("/home/good"), Path("/home/bad")
-        # good: collected, empty, not capped; bad: collection failed (None)
-        writes = self._run(mdm, {good: ([], False, False), bad: None}, send_result=(0, 0, 0))
-        self.assertIn(good, writes)
-        self.assertNotIn(bad, writes)
+        writes, _ = self._run(mdm, {good: [self._b([], False)], bad: [None]},
+                              send_results=[])
+        self.assertEqual([h for h, _ in writes], [good])
 
-    def test_collected_homes_advanced_on_success(self):
-        """Full upload success -> cutoff written for every collected home."""
+    def test_drained_home_advances_to_run_start(self):
+        """Full upload success -> final cutoff is the run's start time."""
         mdm = self._load_mdm()
         home = Path("/home/alice")
-        writes = self._run(
-            mdm,
-            {home: ([{"session_id": "s1", "entries": [{}]}], False, False)},
-            send_result=(1, 1, 0),
-        )
-        self.assertEqual(writes, [home])
+        t0 = time.time()
+        writes, _ = self._run(
+            mdm, {home: [self._b([{"session_id": "s1", "entries": [{}]}], False)]},
+            send_results=[(1, 1, 0)])
+        self.assertEqual(len(writes), 1)
+        self.assertGreaterEqual(writes[0][1], t0)
 
-    def test_partial_upload_failure_does_not_advance(self):
+    def test_failed_upload_does_not_advance(self):
         """A failed chunk -> no cutoff write, so the next cron retries."""
         mdm = self._load_mdm()
         home = Path("/home/alice")
-        writes = self._run(
-            mdm,
-            {home: ([{"session_id": "s1", "entries": [{}]}], False, False)},
-            send_result=(1, 0, 1),  # one chunk failed
-        )
+        writes, _ = self._run(
+            mdm, {home: [self._b([{"session_id": "s1", "entries": [{}]}], True)]},
+            send_results=[(1, 0, 1)])
         self.assertEqual(writes, [])
 
-    def test_capped_home_not_advanced(self):
-        """A home that hit the per-run cap -> its cutoff is not advanced even on
-        a fully successful upload, so its overflow stays eligible next run."""
+    def test_partial_batches_advance_to_their_own_mtime(self):
+        """Each uploaded batch advances the cutoff to that batch's newest mtime."""
         mdm = self._load_mdm()
-        capped_home, ok_home = Path("/home/heavy"), Path("/home/light")
-        writes = self._run(
+        home = Path("/home/heavy")
+        t0 = time.time()
+        writes, _ = self._run(
             mdm,
-            {
-                capped_home: ([{"session_id": "s1", "entries": [{}]}], True, False),
-                ok_home: ([{"session_id": "s2", "entries": [{}]}], False, False),
-            },
-            send_result=(2, 1, 0),
-        )
-        self.assertEqual(writes, [ok_home])
+            {home: [self._b([{"session_id": "s1", "entries": [{}]}], True, last=111.0),
+                    self._b([{"session_id": "s2", "entries": [{}]}], False, last=222.0)]},
+            send_results=[(1, 1, 0), (1, 1, 0)])
+        self.assertEqual(writes[0], (home, 111.0))
+        self.assertGreaterEqual(writes[1][1], t0)
+
+    def test_stalled_mtime_drains_the_tie_group(self):
+        """Two batches stuck on one mtime -> a bounded tie collect, then the cutoff
+        steps just past the tie instead of re-selecting it forever."""
+        mdm = self._load_mdm()
+        home = Path("/home/tied")
+        s1 = [{"session_id": "s1", "entries": [{}]}]
+        writes, ties = self._run(
+            mdm,
+            {home: [self._b(s1, True, last=100.0), self._b(s1, True, last=100.0),
+                    self._b(s1, False, last=100.0)]},
+            send_results=[(1, 1, 0)] * 4)
+        self.assertEqual(ties[:3], [None, None, 100.0])
+        self.assertEqual(writes[2][1], math.nextafter(100.0, float("inf")))
+
+    def test_empty_tie_drain_does_not_finish_the_home(self):
+        """An all-corrupt tie group drains empty; newer transcripts must still follow."""
+        mdm = self._load_mdm()
+        home = Path("/home/corrupt_ties")
+        s1 = [{"session_id": "s1", "entries": [{}]}]
+        s2 = [{"session_id": "s2", "entries": [{}]}]
+        t0 = time.time()
+        writes, _ = self._run(
+            mdm,
+            {home: [self._b(s1, True, last=100.0), self._b(s1, True, last=100.0),
+                    self._b([], False, last=0.0), self._b(s2, False, last=200.0)]},
+            send_results=[(1, 1, 0), (1, 1, 0), (0, 0, 0), (1, 1, 0)])
+        self.assertEqual(writes[2][1], math.nextafter(100.0, float("inf")))
+        self.assertGreaterEqual(writes[3][1], t0)
+
+    def test_forced_home_keeps_the_single_shot_walk(self):
+        """A forced home routes through the legacy collector; capped -> no advance."""
+        mdm = self._load_mdm()
+        done, capped = Path("/home/done"), Path("/home/capped")
+        t0 = time.time()
+        writes, _ = self._run(
+            mdm,
+            {done: [self._b([], False, forced=True)],
+             capped: [self._b([], False, forced=True)]},
+            send_results=[(1, 1, 0), (1, 1, 0)],
+            legacy_by_home={done: ([{"session_id": "f1", "entries": [{}]}], False, True),
+                            capped: ([{"session_id": "f2", "entries": [{}]}], True, True)})
+        self.assertEqual([h for h, _ in writes], [done])
+        self.assertGreaterEqual(writes[0][1], t0)
+
+    def test_exhausted_budget_pauses_before_collecting(self):
+        """A deadline already spent -> no collection, no writes, just the pause."""
+        mdm = self._load_mdm()
+        home = Path("/home/alice")
+        with patch.object(mdm, "_SCRIPT_START", time.time() - mdm.BACKFILL_DEADLINE_SECONDS):
+            writes, ties = self._run(mdm, {home: [self._b([], False)]}, send_results=[])
+        self.assertEqual(writes, [])
+        self.assertEqual(ties, [])
 
 
 class TestMdmWriteConfigReportsSuccess(unittest.TestCase):

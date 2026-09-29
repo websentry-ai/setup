@@ -23,6 +23,23 @@ USER_SCOPE = {
 }
 
 
+
+def _collector_fns(module):
+    fns = {module._backfill_collect_sessions}
+    batch = getattr(module, "_backfill_collect_batch", None)
+    if batch is not None:
+        fns.add(batch)
+    return fns
+
+
+def _as_collector_result(module, fn, res3):
+    batch = getattr(module, "_backfill_collect_batch", None)
+    if res3 is None or fn is not batch:
+        return res3
+    sessions, capped, forced = res3
+    return {'sessions': list(sessions), 'more': capped, 'forced': forced, 'last_mtime': 100.0}
+
+
 def _forced_cutoff(relpath, force_days, persisted, tmp_path):
     """The mtime floor a forced run actually walks from."""
     module = load_module(relpath)
@@ -94,8 +111,8 @@ class TestForceStaysScopedToTheProfilesBehind:
         uploads = []
 
         def _fake_run_as_user(username, fn, *args, **kwargs):
-            if fn is module._backfill_collect_sessions:
-                return collect_by_user[username]
+            if fn in _collector_fns(module):
+                return _as_collector_result(module, fn, collect_by_user[username])
             return None
 
         def _fake_send(api_key, backend_url, sessions, forced=False):
@@ -159,12 +176,13 @@ class TestOneProfileCannotSinkTheDevice:
         uploaded = []
 
         def _fake_run_as_user(username, fn, *args, **kwargs):
-            if fn is not module._backfill_collect_sessions:
+            if fn not in _collector_fns(module):
                 return None
             if username == "empty":
                 # The real collector's answer for a home with no transcript directory.
-                return module._backfill_collect_sessions(tmp_path / "no-such-home", *args[1:])
-            return ([{"session_id": "S1", "entries": [{}]}], False, False)
+                res = module._backfill_collect_sessions(tmp_path / "no-such-home", *args[1:3])
+                return _as_collector_result(module, fn, res)
+            return _as_collector_result(module, fn, ([{"session_id": "S1", "entries": [{}]}], False, False))
 
         stack = [
             patch.object(module, "_run_as_user", _fake_run_as_user),
