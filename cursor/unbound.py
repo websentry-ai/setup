@@ -689,6 +689,20 @@ def log_error(message, category='general'):
     report_error_to_gateway(message, category, _cached_api_key)
 
 
+def _emit(text):
+    """Write a hook response line to stdout, treating a closed reader pipe as
+    a benign no-op. The host may close the read end (timeout, cancel, session
+    end) before we flush — that is not a hook error."""
+    try:
+        print(text, flush=True)
+    except (BrokenPipeError, OSError):
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
+
+
+
 def _read_policy_cache_raw():
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
     try:
@@ -4525,14 +4539,14 @@ def main():
         input_data = sys.stdin.read().strip()
         
         if not input_data:
-            print("{}")
+            _emit("{}")
             return
         
         # Parse the event
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print("{}")
+            _emit("{}")
             return
 
         # Get event details
@@ -4545,14 +4559,14 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _dispatch_discovery()
             _dispatch_skills_sync(api_key)
-            print("{}")
+            _emit("{}")
             return
         generation_id = event.get('generation_id')
         conversation_id = event.get('conversation_id')
 
         if hook_event_name == 'preToolUse':
             response = _with_deferred_skill_context(event, process_pre_tool_use(event, api_key))
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -4562,7 +4576,7 @@ def main():
             response = _with_deferred_skill_context(
                 event, process_pre_tool_use_execution(event, api_key, 'Shell', event.get('command', ''))
             )
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -4575,7 +4589,7 @@ def main():
                 event, api_key, f'MCP:{mcp_tool_name}', json.dumps(event.get('tool_input') or {}),
                 mcp_server=mcp_server, mcp_tool=mcp_tool_name
             ))
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             if response.get('permission') == 'deny':
                 handle_deny_and_exit()
             return
@@ -4595,7 +4609,7 @@ def main():
                     'continue': False,
                     'user_message': response.get('reason', 'Prompt blocked by policy')
                 }
-                print(json.dumps(cursor_response), flush=True)
+                _emit(json.dumps(cursor_response))
                 sys.exit(2)
 
         # Create log entry with timestamp
@@ -4622,14 +4636,21 @@ def main():
             cleanup_old_logs()
         
         # Output required by Cursor hooks
-        print("{}")
+        _emit("{}")
 
+    except BrokenPipeError:
+        # Host closed our stdout (hook timeout / user cancel / session end).
+        # Benign: exit quietly without self-reporting (AI-GATEWAY-3J).
+        return
     except Exception as e:
         # Log errors but still output {} to not break Cursor
         log_error(f"Exception in main: {str(e)}", 'general')
-        print("{}", file=sys.stderr)
-        print(f"Error: {redact_secrets(str(e), _cached_api_key)}", file=sys.stderr)
-        print("{}")
+        try:
+            print("{}", file=sys.stderr)
+            print(f"Error: {redact_secrets(str(e), _cached_api_key)}", file=sys.stderr)
+        except (BrokenPipeError, OSError):
+            pass
+        _emit("{}")
 
 
 if __name__ == '__main__':

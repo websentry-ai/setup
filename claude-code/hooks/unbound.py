@@ -200,6 +200,19 @@ def log_error(message: str, category: str = 'general', extra: Optional[Dict] = N
     report_error_to_gateway(message, category, _cached_api_key, extra)
 
 
+def _emit(text: str):
+    """Write a hook response line to stdout, treating a closed reader pipe as
+    a benign no-op. The host may close the read end (timeout, cancel, session
+    end, blocked approval-poll) before we flush — that is not a hook error."""
+    try:
+        print(text, flush=True)
+    except (BrokenPipeError, OSError):
+        try:
+            sys.stdout = open(os.devnull, "w")
+        except Exception:
+            pass
+
+
 def _read_policy_cache_raw() -> Optional[Dict]:
     """Read and JSON-parse the policy cache file. Returns None on missing/corrupt."""
     try:
@@ -6493,13 +6506,13 @@ def main():
         input_data = sys.stdin.read().strip()
 
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            _emit('{"suppressOutput": true}')
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            _emit('{"suppressOutput": true}')
             return
 
         hook_event_name = event.get('hook_event_name')
@@ -6510,7 +6523,7 @@ def main():
             _device_serial()  # warm the (slow) serial probe + cache once per session
             _dispatch_discovery()
             _dispatch_skills_sync(api_key)
-            print("{}")
+            _emit("{}")
             return
         session_id = event.get('session_id')
 
@@ -6518,7 +6531,7 @@ def main():
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             response["suppressOutput"] = True
-            print(json.dumps(response), flush=True)
+            _emit(json.dumps(response))
             return
 
         # Handle UserPromptSubmit - check policy before processing
@@ -6534,7 +6547,7 @@ def main():
                     'event': event
                 })
                 response["suppressOutput"] = True
-                print(json.dumps(response), flush=True)
+                _emit(json.dumps(response))
                 return
 
             # Allowed but with hook output to emit (e.g. the spend-limit
@@ -6548,7 +6561,7 @@ def main():
                     'event': event
                 })
                 response["suppressOutput"] = True
-                print(json.dumps(response), flush=True)
+                _emit(json.dumps(response))
                 return
 
             # If allowed, continue to log the event (output printed at end)
@@ -6567,12 +6580,16 @@ def main():
 
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
+        _emit('{"suppressOutput": true}')
 
+    except BrokenPipeError:
+        # Host closed our stdout (hook timeout / user cancel / session end).
+        # Benign: exit quietly without self-reporting (AI-GATEWAY-3J).
+        pass
     except Exception as e:
         # Still return empty JSON object to Claude Code to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        _emit('{"suppressOutput": true}')
 
 
 if __name__ == '__main__':
