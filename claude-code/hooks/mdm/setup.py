@@ -1675,10 +1675,15 @@ def _backfill_iter_transcripts(root: Path, cutoff_mtime: float):
 def _backfill_oldest_first(paths):
     """(mtime, size, path) oldest first, so a capped walk has a resume point."""
     stamped = []
+    now = time.time()
     for p in paths:
         try:
             st = p.stat()
         except OSError:
+            continue
+        # A future-dated transcript (clock rollback, bad restore) would outrun any
+        # storable cursor and pin the walk; it becomes eligible once the clock passes it.
+        if st.st_mtime > now:
             continue
         stamped.append((st.st_mtime, st.st_size, p))
     stamped.sort(key=lambda t: (t[0], str(t[2])))

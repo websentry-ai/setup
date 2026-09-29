@@ -506,6 +506,25 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertEqual(run2, [(["t2"], False), (["t3"], False)])
         self.assertIsNone(mdm._backfill_read_state(home)["cursor"])
 
+    def test_a_future_dated_transcript_waits_without_pinning_the_walk(self):
+        """A transcript with an mtime ahead of the clock is left for a later run —
+        uploaded once the clock passes it, never re-uploaded in a loop meanwhile."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("t1", 5, 60)])
+        future = home / ".claude" / "projects" / "p" / "future.jsonl"
+        future.write_text(json.dumps({"sessionId": "future", "type": "user"}) + "\n")
+        ahead = time.time() + 3600
+        os.utime(future, (ahead, ahead))
+
+        run1 = _drain_real_home(self, home, batch_bytes=1)
+        self.assertEqual(run1, [(["t1"], False)])
+        self.assertIsNone(mdm._backfill_read_state(home)["cursor"])
+
+        caught_up = time.time()
+        os.utime(future, (caught_up, caught_up))
+        run2 = _drain_real_home(self, home, batch_bytes=1)
+        self.assertEqual(run2, [(["future"], False)])
+
     def test_a_force_request_arriving_mid_run_stays_pending(self):
         """completed_at is stamped before the force config is fetched, so a request
         filed during the run reads as newer than the walk that missed it."""
