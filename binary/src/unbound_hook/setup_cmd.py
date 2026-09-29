@@ -610,7 +610,8 @@ def _setup_claude_code(opts):
                             hook_hash=m.hook_script_hash(hook_source_path("claude-code")),
                             install_mode="binary-skip" if skip_settings else "binary")
     if opts["backfill"]:
-        m.run_backfill(api_key, base, m.get_all_user_homes())
+        # Bounded like the MDM script: a heavy history must not hold setup open.
+        m._run_backfill_bounded(api_key, base, m.get_all_user_homes())
     return ("configured", None)
 
 

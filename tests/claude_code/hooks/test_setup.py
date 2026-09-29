@@ -316,6 +316,8 @@ class TestMdmBackfillCutoff(unittest.TestCase):
         def fake_run_as_user(username, fn, *args):
             if fn is mdm._backfill_collect_sessions:
                 return next(batches)
+            if fn is mdm._backfill_write_progress:
+                writes.append(args[:2])
             if fn is mdm._backfill_write_cutoff:
                 writes.append(args)
             return None
@@ -393,7 +395,7 @@ class TestMdmBackfillBatches(unittest.TestCase):
             if fn is mdm._backfill_collect_sessions:
                 starts.append((username, args[3]))
                 return next(batches[username])
-            if fn is mdm._backfill_write_cutoff:
+            if fn in (mdm._backfill_write_cutoff, mdm._backfill_write_progress):
                 events.append(("write", username, args[1]))
             return None
 
@@ -467,10 +469,34 @@ class TestMdmBackfillBatches(unittest.TestCase):
         self.assertIn("Queued 1 sessions in 1 batches.", out)
         self.assertIn("More history remains and will continue on the next run.", out)
 
-    def test_resume_point_that_does_not_advance_ends_the_home(self):
-        events, starts, out = self._run({"a": [self._batch(["a-1"], 100.0)] * 5})
-        self.assertEqual(len(starts), 2)
-        self.assertEqual([e for e in events if e[0] == "write"], [("write", "a", 100.0)])
+    def test_files_sharing_an_mtime_past_the_budget_still_make_progress(self):
+        """Real files: three transcripts share one mtime and together exceed the batch
+        budget. The resume point is an inclusive mtime floor, so the batch must take
+        the whole tie or the next batch re-reads it and never advances."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("t1", 5, 60), ("t2", 5, 60), ("t3", 5, 60), ("t4", 4, 60)])
+        uploads = _drain_real_home(self, home, batch_bytes=200)
+        self.assertEqual(uploads, [(["t1", "t2", "t3"], False), (["t4"], False)])
+        state = mdm._backfill_read_state(home)
+        self.assertIsNone(state["cursor"])
+        self.assertIsNotNone(state["completed_at"])
+
+    def test_slowest_batch_sets_the_margin_before_the_soft_stop(self):
+        """Each batch takes 100s on a fake clock: a new batch needs 1.5x that (150s)
+        left, not just the 90s floor, so the batch that would end at 600s never starts."""
+        mdm = self.mdm
+        clock = {"now": 0.0}
+        fake_time = type("T", (), {"time": staticmethod(lambda: clock["now"])})
+
+        def slow_send(sessions):
+            clock["now"] += 100
+            return len(sessions), 1, 0
+
+        batches = [self._batch([f"a-{i}"], float(i + 1)) for i in range(10)]
+        with patch.object(mdm, "time", fake_time), patch.object(mdm, "_SCRIPT_START", 0.0):
+            events, starts, out = self._run({"a": batches}, send=slow_send)
+        self.assertEqual(len(starts), 5)  # batches start at 0, 100, 200, 300, 400s
+        self.assertEqual(events[-1], ("write", "a", 5.0))
         self.assertIn("More history remains", out)
 
     def test_batch_cap_bounds_one_run(self):
@@ -512,7 +538,53 @@ class TestMdmBackfillBatches(unittest.TestCase):
              redirect_stdout(io.StringIO()):
             mdm.run_backfill("key", "https://backend", [("alice", home)])
         self.assertEqual(uploads, [(["s20"], True), (["s10"], True), (["s5"], True), (["s3"], True)])
-        self.assertGreaterEqual(mdm._backfill_read_cutoff(home), now)
+        state = mdm._backfill_read_state(home)
+        self.assertIsNone(state["cursor"])
+        self.assertGreaterEqual(state["completed_at"], now)
+
+    def test_forced_walk_cut_short_resumes_next_run_instead_of_restarting(self):
+        """Run 1 hits the soft stop after two batches. Run 2 must carry on from its
+        cursor under the same request (still forced), not re-widen to the window and
+        re-send the oldest history; run 3, after the walk finished, is not forced."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("s20", 20, 60), ("s10", 10, 60), ("s5", 5, 60), ("s3", 3, 60)])
+        force = (time.time() - 86400, 30)
+        sent = {"n": 0}
+
+        def stop_after_two(sessions):
+            sent["n"] += 1
+            if sent["n"] == 2:
+                mdm._SCRIPT_START -= mdm.BACKFILL_SOFT_STOP_SECONDS
+            return len(sessions), 1, 0
+
+        with patch.object(mdm, "_SCRIPT_START", time.time()):
+            run1 = _drain_real_home(self, home, batch_bytes=1, force=force, send=stop_after_two)
+        self.assertEqual(run1, [(["s20"], True), (["s10"], True)])
+        with patch.object(mdm, "_SCRIPT_START", time.time()):
+            run2 = _drain_real_home(self, home, batch_bytes=1, force=force)
+        self.assertEqual(run2, [(["s5"], True), (["s3"], True)])
+        with patch.object(mdm, "_SCRIPT_START", time.time()):
+            run3 = _drain_real_home(self, home, batch_bytes=1, force=force)
+        self.assertEqual(run3, [])
+
+    def test_real_upload_with_a_failed_chunk_keeps_the_previous_batch_cursor(self):
+        """Real _backfill_send_sessions: batch 2 spans three chunks and the second
+        PUT fails. The cursor must stay where batch 1 left it."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("b1", 5, 6000), ("b2", 4, 6000), ("b3", 4, 6000), ("b4", 4, 6000)])
+        calls = []
+
+        def fake_chunk(api_key, backend_url, sessions, forced=False):
+            calls.append([s["session_id"] for s in sessions])
+            return len(calls) != 3  # batch 1 = call 1; batch 2 = calls 2-4
+
+        with patch.object(mdm, "_backfill_upload_chunk", side_effect=fake_chunk), \
+             patch.object(mdm, "BACKFILL_CHUNK_BYTES", 10000):
+            out = _drain_real_home(self, home, batch_bytes=10000, real_send=True)
+        self.assertEqual(calls, [["b1"], ["b2"], ["b3"], ["b4"]])
+        b2_mtime = (home / ".claude" / "projects" / "p" / "b2.jsonl").stat().st_mtime
+        self.assertEqual(mdm._backfill_read_state(home)["cursor"], b2_mtime)
+        self.assertIn("Some uploads failed", out)
 
 
 class TestMdmBackfillProcessSafety(unittest.TestCase):
@@ -533,26 +605,94 @@ class TestMdmBackfillProcessSafety(unittest.TestCase):
             mdm._run_backfill_bounded("key", "https://backend", [("a", Path("/home/a"))])
         self.assertIn("could not start", err.getvalue())
 
-    def test_lowering_priority_never_raises_when_every_mechanism_fails(self):
+    def test_lowering_priority_never_raises_when_nice_fails(self):
         mdm = self.mdm
-        with patch.object(mdm.os, "nice", side_effect=OSError("denied")), \
-             patch.object(mdm.os.path, "exists", return_value=True), \
-             patch.object(mdm.sys, "platform", "darwin"), \
-             patch.object(mdm.subprocess, "run", side_effect=OSError("no taskpolicy")) as run:
-            self.assertIsNone(mdm._lower_backfill_priority())
-        self.assertEqual(run.call_args[0][0][:2], ["/usr/sbin/taskpolicy", "-b"])
-        with patch.object(mdm.subprocess, "run", side_effect=subprocess.TimeoutExpired("taskpolicy", 5)), \
-             patch.object(mdm.os, "nice", return_value=19), \
-             patch.object(mdm.os.path, "exists", return_value=True), \
-             patch.object(mdm.sys, "platform", "darwin"):
-            mdm._lower_backfill_priority()
+        with patch.object(mdm.os, "nice", side_effect=OSError("denied")) as nice, \
+             patch.object(mdm.subprocess, "run", side_effect=AssertionError("no subprocess")):
+            self.assertFalse(mdm._lower_backfill_priority())
+        nice.assert_called_once_with(19)
 
     def test_windows_priority_path_never_raises_without_win32(self):
         mdm = self.mdm
         with patch.object(mdm.os, "name", "nt"):
-            mode = mdm._lower_backfill_priority()
-        mdm._restore_backfill_priority(mode)
-        mdm._restore_backfill_priority(0x00200000)
+            lowered = mdm._lower_backfill_priority()
+        mdm._restore_backfill_priority(lowered)
+        mdm._restore_backfill_priority(True)
+
+    @unittest.skipIf(os.name == "nt", "fork path is POSIX only")
+    def test_child_killed_mid_upload_leaves_the_last_completed_batch_saved(self):
+        """Real fork + hard kill: batch 1 uploads, batch 2's upload hangs past the
+        deadline. The persisted cursor is exactly where batch 1 finished."""
+        mdm = self.mdm
+        home = _transcript_home(self, [("k1", 5, 60), ("k2", 4, 60), ("k3", 3, 60)])
+        calls = {"n": 0}
+
+        def hanging_send(api_key, backend_url, sessions, forced=False):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                time.sleep(60)
+            return len(sessions), 1, 0
+
+        out = io.StringIO()
+        with patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)), \
+             patch.object(mdm, "_backfill_force_config", return_value=(None, None)), \
+             patch.object(mdm, "_backfill_send_sessions", side_effect=hanging_send), \
+             patch.object(mdm, "_backfill_account_email", return_value=None), \
+             patch.object(mdm, "get_device_identifier", return_value="SERIAL"), \
+             patch.object(mdm, "BACKFILL_BATCH_BYTES", 1), \
+             patch.object(mdm, "BACKFILL_DEADLINE_SECONDS", 3), \
+             patch.object(mdm, "_SCRIPT_START", time.time()), \
+             redirect_stdout(out):
+            mdm._run_backfill_bounded("key", "https://backend", [("me", home)])
+        k2_mtime = (home / ".claude" / "projects" / "p" / "k2.jsonl").stat().st_mtime
+        self.assertEqual(mdm._backfill_read_state(home)["cursor"], k2_mtime)
+        self.assertIn("Did not finish in time", out.getvalue())
+
+
+def _transcript_home(test, files):
+    """A temp home with ~/.claude/projects/p/<name>.jsonl for each (name, days_ago,
+    pad_bytes); every file with the same days_ago shares one exact mtime."""
+    home = Path(tempfile.mkdtemp())
+    test.addCleanup(shutil.rmtree, home)
+    projects = home / ".claude" / "projects" / "p"
+    projects.mkdir(parents=True)
+    now = int(time.time())
+    for name, days_ago, pad in files:
+        path = projects / f"{name}.jsonl"
+        path.write_text(json.dumps({"sessionId": name, "type": "user", "pad": "x" * pad}) + "\n")
+        os.utime(path, (now - days_ago * 86400, now - days_ago * 86400))
+    return home
+
+
+def _drain_real_home(test, home, batch_bytes, force=(None, None), send=None, real_send=False):
+    """run_backfill over one real home, uploads recorded as (ids, forced). With
+    real_send the real _backfill_send_sessions runs and stdout is returned instead."""
+    mdm = test.mdm
+    uploads = []
+
+    def fake_send(api_key, backend_url, sessions, forced=False):
+        uploads.append(([s["session_id"] for s in sessions], forced))
+        return send(sessions) if send else (len(sessions), 1, 0)
+
+    out = io.StringIO()
+    stack = [
+        patch.object(mdm, "_run_as_user", side_effect=lambda u, fn, *a, **k: fn(*a, **k)),
+        patch.object(mdm, "_backfill_force_config", return_value=force),
+        patch.object(mdm, "_backfill_account_email", return_value=None),
+        patch.object(mdm, "get_device_identifier", return_value="SERIAL"),
+        patch.object(mdm, "BACKFILL_BATCH_BYTES", batch_bytes),
+        redirect_stdout(out),
+    ]
+    if not real_send:
+        stack.append(patch.object(mdm, "_backfill_send_sessions", side_effect=fake_send))
+    for ctx in stack:
+        ctx.__enter__()
+    try:
+        mdm.run_backfill("key", "https://backend", [("me", home)])
+    finally:
+        for ctx in reversed(stack):
+            ctx.__exit__(None, None, None)
+    return out.getvalue() if real_send else uploads
 
 
 @unittest.skipIf(os.name == "nt", "fork-based privilege drop is POSIX only")
