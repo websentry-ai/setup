@@ -19,12 +19,6 @@ from tests.conftest import REPO, tool_module
 
 unbound = tool_module("copilot/hooks")
 
-TRAILER = (
-    'Add a thing\n\n'
-    'Co-authored-by: Nanda Pranesh <12345+nandapranesh@users.noreply.github.com>\n'
-)
-
-
 class _Completed:
     def __init__(self, stdout=b'', returncode=0, stderr=b''):
         self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
@@ -95,79 +89,164 @@ class TestCloudEventNormalization(unittest.TestCase):
         self.assertIs(self._normalize(original, 'Stop', cloud=False), original)
 
 
-class TestGithubActor(unittest.TestCase):
-    """The sandbox names only the bot; the requester is the commit co-author."""
-
-    def _run(self, env, completed):
-        with patch.dict(unbound.os.environ, env, clear=True), \
-                patch.object(unbound.subprocess, 'run', return_value=completed) as run:
-            return unbound._github_actor(), run
-
-    def test_takes_the_login_not_the_display_name(self):
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(TRAILER.encode()))
-        self.assertEqual(actor, 'nandapranesh')
-
-    def test_reads_the_id_less_noreply_form_too(self):
-        body = b'Fix\n\nCo-authored-by: Octo <octocat@users.noreply.github.com>\n'
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
-        self.assertEqual(actor, 'octocat')
-
-    def test_scoped_to_this_sessions_first_parent_commits(self):
-        _, run = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(TRAILER.encode()))
-        self.assertEqual(run.call_args[0][0],
-                         ['git', 'log', 'abc..HEAD', '--first-parent', '--no-merges',
-                          '--reverse', '--format=%B'])
-
-    def test_no_base_commit_means_no_unscoped_search(self):
-        with patch.dict(unbound.os.environ, {}, clear=True), \
-                patch.object(unbound.subprocess, 'run') as run:
-            self.assertIsNone(unbound._github_actor())
-            run.assert_not_called()
-
-    def test_the_sessions_first_trailer_wins_not_its_last(self):
-        """GitHub stamps the requester on the agent's first commit. Every commit after it
-        was written by the agent, which can address one to any login it likes -- so with
-        --reverse the git output starts at the one commit it did not get to compose."""
-        body = (b'agent first commit\n\n'
-                b'Co-authored-by: Real <1+realuser@users.noreply.github.com>\n'
-                b'agent later commit\n\n'
-                b'Co-authored-by: Victim <2+victim@users.noreply.github.com>\n')
-        actor, run = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
-        self.assertEqual(actor, 'realuser')
-        self.assertIn('--reverse', run.call_args[0][0])
-
-    def test_a_real_address_is_not_mistaken_for_a_login(self):
-        body = b'Fix\n\nCo-authored-by: Nanda <nanda@unboundsecurity.ai>\n'
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
-        self.assertIsNone(actor)
-
-    def test_a_failed_git_log_yields_nothing(self):
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'},
-                             _Completed(b'', returncode=128, stderr=b'bad revision'))
-        self.assertIsNone(actor)
-
-
 class TestGithubContext(unittest.TestCase):
     def test_a_laptop_sends_no_github_block(self):
         with patch.object(unbound, 'RUNNING_CLOUD', False):
             self.assertIsNone(unbound.build_github_context())
 
-    def test_provenance_is_repo_session_and_trigger(self):
-        env = {'GITHUB_REPOSITORY': 'websentry-ai/setup',
-               'COPILOT_AGENT_SESSION_ID': 'sess-1',
-               'COPILOT_JOB_EVENT_TYPE': 'issues'}
+    CLOUD_ENV = {'GITHUB_REPOSITORY': 'websentry-ai/setup',
+                 'COPILOT_AGENT_SESSION_ID': 'sess-1',
+                 'COPILOT_JOB_EVENT_TYPE': 'issues'}
+
+    def _context(self, env=None, session_actor=None):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
-                patch.dict(unbound.os.environ, env, clear=True), \
-                patch.object(unbound, '_github_actor', return_value='octocat'):
-            self.assertEqual(unbound.build_github_context(),
-                             {'actor': 'octocat', 'repo': 'websentry-ai/setup',
-                              'session': 'sess-1', 'event': 'issues'})
+                patch.dict(unbound.os.environ, dict(self.CLOUD_ENV, **(env or {})), clear=True), \
+                patch.object(unbound, '_cloud_session_actor', return_value=session_actor):
+            return unbound.build_github_context()
+
+    def test_provenance_is_repo_session_and_trigger(self):
+        self.assertEqual(self._context(session_actor='octocat'),
+                         {'actor': 'octocat', 'actor_source': 'github_api',
+                          'repo': 'websentry-ai/setup',
+                          'session': 'sess-1', 'event': 'issues'})
+
+    def test_a_commit_trailer_cannot_name_the_actor(self):
+        """The agent authors its own commit messages, so the reader is deleted rather than
+        left unused, where wiring it back would look like a one-line change."""
+        self.assertFalse(hasattr(unbound, '_github_actor'))
+        self.assertFalse(hasattr(unbound, '_GITHUB_COAUTHOR_RE'))
+
+    def test_the_runner_answers_only_when_the_lookup_cannot(self):
+        named = self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'},
+                              session_actor='api-login')
+        self.assertEqual(named['actor'], 'api-login')
+        fell_back = self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'})
+        self.assertEqual(fell_back['actor'], 'runner-login')
+
+    def test_every_name_says_which_source_produced_it(self):
+        """Both sources write one field and only one is GitHub's record; unlabelled, a
+        reader cannot tell them apart."""
+        self.assertEqual(self._context(session_actor='api-login')['actor_source'], 'github_api')
+        self.assertEqual(
+            self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'})['actor_source'],
+            'runner_env')
+        self.assertNotIn('actor_source', self._context())
+
+    def test_the_agents_own_identity_is_not_a_person(self):
+        for login in ('copilot-swe-agent[bot]', 'Copilot', 'github-actions'):
+            self.assertNotIn('actor', self._context({'GITHUB_ACTOR': login}), login)
+        self.assertEqual(self._context({'GITHUB_ACTOR': 'anonpran'})['actor'], 'anonpran')
 
     def test_absent_fields_are_dropped_rather_than_sent_empty(self):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
-                patch.dict(unbound.os.environ, {'COPILOT_AGENT_SESSION_ID': 'sess-1'}, clear=True), \
-                patch.object(unbound, '_github_actor', return_value=None):
+                patch.dict(unbound.os.environ, {'COPILOT_AGENT_SESSION_ID': 'sess-1'}, clear=True):
             self.assertEqual(unbound.build_github_context(), {'session': 'sess-1'})
+
+
+class TestCloudSessionActor(unittest.TestCase):
+    """The session's owner as GitHub records it. Bounded, because it runs before the turn is
+    uploaded and a name is worth less than the audit record."""
+
+    def setUp(self):
+        unbound._cloud_actor_memo.clear()
+
+    @staticmethod
+    def _api(pages, clock=None):
+        calls = []
+
+        def api(path, deadline=None):
+            calls.append(path)
+            if clock is not None:
+                clock[0] += 3.0
+            return pages.get(path)
+        return api, calls
+
+    def test_the_session_names_its_user(self):
+        api, calls = self._api({
+            'agents/repos/o/r/tasks': {'tasks': [{'id': 't1'}]},
+            'agents/repos/o/r/tasks/t1': {'sessions': [{'id': 's1', 'user': {'id': 7}}]},
+            'user/7': {'login': 'anonpran'},
+        })
+        with patch.object(unbound, '_github_api', api):
+            self.assertEqual(unbound._cloud_session_actor('o/r', 's1'), 'anonpran')
+        self.assertEqual(len(calls), 3)
+
+    def test_a_session_nobody_claims_names_nobody(self):
+        api, _ = self._api({'agents/repos/o/r/tasks': {'tasks': [{'id': 't1'}]},
+                            'agents/repos/o/r/tasks/t1': {'sessions': []}})
+        with patch.object(unbound, '_github_api', api):
+            self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
+
+    def test_one_lookup_serves_every_turn_in_the_process(self):
+        api, calls = self._api({
+            'agents/repos/o/r/tasks': {'tasks': [{'id': 't1'}]},
+            'agents/repos/o/r/tasks/t1': {'sessions': [{'id': 's1', 'user': {'id': 7}}]},
+            'user/7': {'login': 'anonpran'},
+        })
+        with patch.object(unbound, '_github_api', api):
+            for _ in range(4):
+                unbound._cloud_session_actor('o/r', 's1')
+        self.assertEqual(len(calls), 3)
+
+    def test_the_scan_stops_at_the_budget(self):
+        """Unbounded, the scan outlasts the agentStop timeout and the turn goes
+        unreported -- a missing audit record, not merely a missing name."""
+        clock = [0.0]
+        api, calls = self._api(
+            {'agents/repos/o/r/tasks': {'tasks': [{'id': 't%d' % i} for i in range(5)]}},
+            clock=clock)
+        with patch.object(unbound, '_github_api', api), \
+                patch.object(unbound.time, 'monotonic', lambda: clock[0]):
+            self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
+        self.assertLess(len(calls), 6)
+
+    def test_copilots_own_token_outranks_the_actions_one(self):
+        """These routes reject the Actions token, which is always set, so reaching for it
+        first would mask a working one."""
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen['auth'] = kwargs['input'].decode()
+            return _Completed(b'{}')
+        env = {'COPILOT_GITHUB_TOKEN': 'copilot-tok', 'GITHUB_TOKEN': 'actions-tok',
+               'GITHUB_SERVER_URL': 'https://github.com'}
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound.subprocess, 'run', run):
+            unbound._github_api('user/7')
+        self.assertIn('copilot-tok', seen['auth'])
+
+    def test_no_token_asks_nothing(self):
+        with patch.dict(unbound.os.environ, {'GITHUB_SERVER_URL': 'https://github.com'}, clear=True), \
+                patch.object(unbound.subprocess, 'run',
+                             side_effect=AssertionError('asked GitHub without a token')):
+            self.assertIsNone(unbound._github_api('user/7'))
+
+    def test_the_last_sliver_of_budget_never_uncaps_curl(self):
+        """Anything under 0.05s formats to 0.0, which curl reads as no limit -- the end of
+        the budget would lift the cap instead of enforcing it."""
+        clock = [0.0]
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append(argv[argv.index('--max-time') + 1])
+            return _Completed(b'{}')
+        env = {'GITHUB_SERVER_URL': 'https://github.com', 'COPILOT_GITHUB_TOKEN': 'tok'}
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound.time, 'monotonic', lambda: clock[0]), \
+                patch.object(unbound.subprocess, 'run', run):
+            self.assertIsNone(unbound._github_api('user/7', deadline=0.04))
+            self.assertIsNotNone(unbound._github_api('user/7', deadline=0.5))
+        self.assertEqual(seen, ['0.5'])
+
+    def test_an_enterprise_token_never_reaches_public_github(self):
+        """Enterprise Server issues its own credentials. An unset host is refused too."""
+        for server in ('https://github.acme-corp.com', ''):
+            with patch.dict(unbound.os.environ,
+                            {'GITHUB_SERVER_URL': server, 'COPILOT_GITHUB_TOKEN': 'ghes-tok'},
+                            clear=True), \
+                    patch.object(unbound.subprocess, 'run',
+                                 side_effect=AssertionError('sent %r token to github.com' % server)):
+                self.assertIsNone(unbound._github_api('user/7'))
 
 
 class TestCloudModeCannotBeTurnedOnByEnvironment(unittest.TestCase):

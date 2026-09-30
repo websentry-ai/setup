@@ -108,6 +108,7 @@ APPROVAL_POLL_PHASES = (
 )
 
 _cached_api_key = None
+_cached_hook_sha = None
 _reporting_error = False
 
 
@@ -431,6 +432,62 @@ def curl_with_auth(auth_headers: List[str], curl_args: List[str], *,
             pass
 
 
+def _hook_sha():
+    """Hash of the running file, so a report names the hook version that made it."""
+    global _cached_hook_sha
+    if _cached_hook_sha is None:
+        try:
+            _cached_hook_sha = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:12]
+        except Exception:
+            _cached_hook_sha = 'unknown'
+    return _cached_hook_sha
+
+
+def _emit(text: str) -> bool:
+    """Write a hook response line to stdout, treating a closed reader pipe as a
+    benign no-op. The host may close the read end (timeout, cancel, session end)
+    before we flush; that is not a hook error. False means the host was no longer
+    listening, so the caller can tell a dropped allow from a dropped block."""
+    try:
+        print(text, flush=True)
+        return True
+    except (BrokenPipeError, OSError):
+        # dup2 devnull over the fd in place, so the wrapper's buffered bytes and exit-time flush drain silently.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except Exception:
+            # No usable fd (tests, detached stream): swap the object instead.
+            try:
+                sys.stdout = open(os.devnull, "w")
+            except Exception:
+                pass
+        return False
+
+
+def _read_stdin() -> Optional[str]:
+    """None when the host's stdin pipe is already gone: same benign teardown as _emit."""
+    try:
+        return sys.stdin.read().strip()
+    except OSError:
+        return None
+
+
+def _blocking_decision(response: Optional[Dict]) -> Optional[str]:
+    """The verdict that gates the call, or None when the response lets it run."""
+    response = response or {}
+    if response.get('decision') == 'block':
+        return 'block'
+    decision = (response.get('hookSpecificOutput') or {}).get('permissionDecision')
+    return decision if decision in ('deny', 'ask') else None
+
+
+def _report_undelivered(hook_event_name: str, response: Dict) -> None:
+    decision = _blocking_decision(response)
+    if decision:
+        log_error("verdict undelivered: event=%s decision=%s" % (hook_event_name, decision),
+                  'undelivered_verdict')
+
+
 def report_error_to_gateway(message, category='general', api_key=None):
     """Fire-and-forget error report to gateway. Never blocks, never raises."""
     global _reporting_error
@@ -442,6 +499,7 @@ def report_error_to_gateway(message, category='general', api_key=None):
         payload = json.dumps({
             'errors': [{'message': message, 'timestamp': _utc_now_z(), 'category': category}],
             'hook_source': 'augment_code',
+            'hook_sha': _hook_sha(),
         })
         # Auth header off-argv via the 0600 temp file; body off-argv via stdin.
         # Rate-limited (1/60s) + reentrancy-guarded, so a short blocking curl
@@ -4310,16 +4368,16 @@ def main():
     _cached_api_key = api_key
 
     try:
-        input_data = sys.stdin.read().strip()
+        input_data = _read_stdin()
 
         if not input_data:
-            print('{"suppressOutput": true}', flush=True)
+            _emit('{"suppressOutput": true}')
             return
 
         try:
             event = json.loads(input_data)
         except json.JSONDecodeError:
-            print('{"suppressOutput": true}', flush=True)
+            _emit('{"suppressOutput": true}')
             return
 
         # Augment identifies the conversation with conversation_id; alias it to
@@ -4344,7 +4402,7 @@ def main():
             except Exception:
                 pass  # the repo gate below must still print
             _dispatch_discovery()
-            print(json.dumps(_repo_gate_session_start_output(event)), flush=True)
+            _emit(json.dumps(_repo_gate_session_start_output(event)))
             return
         session_id = event.get('session_id')
 
@@ -4352,7 +4410,8 @@ def main():
         if hook_event_name == 'PreToolUse':
             response = process_pre_tool_use(event, api_key)
             response["suppressOutput"] = True
-            print(json.dumps(response), flush=True)
+            if not _emit(json.dumps(response)):
+                _report_undelivered(hook_event_name, response)
             return
 
         timestamp = _utc_now_z()
@@ -4369,12 +4428,12 @@ def main():
 
         cleanup_old_logs()
 
-        print('{"suppressOutput": true}', flush=True)
+        _emit('{"suppressOutput": true}')
 
     except Exception as e:
         # Still return empty JSON object to Augment to indicate completion
         log_error(f"Exception in main: {str(e)}", 'general')
-        print('{"suppressOutput": true}', flush=True)
+        _emit('{"suppressOutput": true}')
 
 
 if __name__ == '__main__':
