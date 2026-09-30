@@ -270,6 +270,23 @@ class TestCloudSessionActor(unittest.TestCase):
                              side_effect=AssertionError('asked GitHub without a token')):
             self.assertIsNone(unbound._github_api('user/7'))
 
+    def test_the_last_sliver_of_budget_never_uncaps_curl(self):
+        """curl reads a --max-time of 0 as no limit, and anything under 0.05s formats to
+        0.0 -- so the end of the budget would lift the cap instead of enforcing it."""
+        clock = [0.0]
+        seen = []
+
+        def run(argv, **kwargs):
+            seen.append(argv[argv.index('--max-time') + 1])
+            return _Completed(b'{}')
+        env = {'GITHUB_SERVER_URL': 'https://github.com', 'COPILOT_GITHUB_TOKEN': 'tok'}
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound.time, 'monotonic', lambda: clock[0]), \
+                patch.object(unbound.subprocess, 'run', run):
+            self.assertIsNone(unbound._github_api('user/7', deadline=0.04))
+            self.assertIsNotNone(unbound._github_api('user/7', deadline=0.5))
+        self.assertEqual(seen, ['0.5'])
+
     def test_an_enterprise_token_never_reaches_public_github(self):
         """Enterprise Server issues its own credentials, and the lookup failing costs a name
         while sending one to a third party costs rather more. An unset host is refused too."""

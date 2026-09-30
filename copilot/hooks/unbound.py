@@ -1824,8 +1824,10 @@ def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
             break
     else:
         return None
+    # Below 0.1 rather than 0: curl reads a --max-time that formats to 0.0 as no limit at
+    # all, so the last sliver of the budget would uncap the very request it is bounding.
     left = 5.0 if deadline is None else min(5.0, deadline - time.monotonic())
-    if left <= 0:
+    if left < 0.1:
         return None
     result = subprocess.run(
         _curl_base() + ["-fsS", "--max-time", "%.1f" % left, "-H", "@-",
