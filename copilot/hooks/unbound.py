@@ -1751,8 +1751,10 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
-# Which of the two answered, since only one of them is GitHub's own record. A reader that
-# attributes cost or policy to a login should insist on the first.
+# Which of the two answered, since only one of them is GitHub's own record. This travels in
+# the same payload as the actor and is written here, inside the sandbox, so it says what
+# this hook believes rather than proving anything: a reader attributing cost or policy has
+# to re-check the actor against GitHub for the session, not take the label's word for it.
 ACTOR_SOURCE_API = 'github_api'
 ACTOR_SOURCE_ENV = 'runner_env'
 
