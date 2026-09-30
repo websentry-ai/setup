@@ -6,6 +6,7 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 
 import sys
 import base64
+import functools
 import json
 import io
 import os
@@ -1639,6 +1640,7 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
 _COPILOT_CLI_TOKEN_VARS = ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
 
 
+@functools.lru_cache(maxsize=8)
 def _copilot_cli_credential(account: str) -> Optional[bool]:
     """Whether the OS credential store holds the CLI's sign-in for host:login; None when it can't say. Never reads the secret."""
     try:
@@ -1651,11 +1653,22 @@ def _copilot_cli_credential(account: str) -> Optional[bool]:
                                     capture_output=True, text=True, timeout=5)
             if result.returncode != 0:
                 return None
-            entries = [line.lower() for line in result.stdout.splitlines() if 'copilot-cli' in line.lower()]
-            return any(account.lower() in line for line in entries) if entries else None
+            targets = [m.group(1).strip().lower() for m in re.finditer(r'target=(\S+)', result.stdout, re.I)]
+            targets = [t for t in targets if 'copilot-cli' in t]
+            if not targets:
+                return None
+            wanted = account.lower()
+            return any(_strip_copilot_cli_service(t) in (wanted, wanted + ':github') for t in targets)
     except Exception as error:
         log_error(f'copilot cli credential check failed: {type(error).__name__}', 'identity')
     return None
+
+
+def _strip_copilot_cli_service(target: str) -> str:
+    for prefix in ('copilot-cli/', 'copilot-cli:'):
+        if target.startswith(prefix):
+            return target[len(prefix):]
+    return target[:-len('.copilot-cli')] if target.endswith('.copilot-cli') else target
 
 
 def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
@@ -1695,10 +1708,20 @@ def _vscode_state_values(path, keys):
     return values
 
 
-def _vscode_copilot_account() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Login, plan and org of the newest install signed in to Copilot. The login key survives a sign-out; the plan does not."""
+def _vscode_user_dir_of(transcript_path) -> Optional[Path]:
+    """The Code/User dir a VS Code transcript lives under."""
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    for parent in Path(transcript_path).parents:
+        if parent.name in ('workspaceStorage', 'globalStorage'):
+            return parent.parent
+    return None
+
+
+def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Login, plan and org of the turn's install, else the newest one. The login key survives a sign-out; the plan does not."""
     databases = []
-    for user_dir in _vscode_user_dirs():
+    for user_dir in [user_dir] if user_dir else _vscode_user_dirs():
         path = user_dir / 'globalStorage' / 'state.vscdb'
         try:
             databases.append((path.stat().st_mtime_ns, path))
@@ -1724,11 +1747,12 @@ def _vscode_copilot_account() -> Tuple[Optional[str], Optional[str], Optional[st
     return None, None, None
 
 
-def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None) -> Dict:
+def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
+                          transcript_path: Optional[str] = None) -> Dict:
     """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in."""
     plan = org = None
     if surface == 'vscode':
-        login, plan, org = _vscode_copilot_account()
+        login, plan, org = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
         host = 'https://github.com' if login else None
     elif surface == 'cloud':
         login, host = _copilot_login()
@@ -1957,10 +1981,10 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
 
 
 def build_account_identity(event: Optional[Dict] = None, probe: bool = False,
-                           surface: Optional[str] = None) -> Dict:
+                           surface: Optional[str] = None, transcript_path: Optional[str] = None) -> Dict:
     """The account plus the device serial. The event is unused here. Never raises."""
     try:
-        identity = read_account_identity(event, surface)
+        identity = read_account_identity(event, surface, transcript_path)
         if not isinstance(identity, dict):
             identity = {}
     except Exception:
@@ -2041,7 +2065,8 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'requestCompleted': pending.get('until'),
         # Cache-only: called once per waiting turn, so probing here would cost a
         # 10s command on each of them.
-        'account_identity': build_account_identity(surface=copilot_surface(transcript_path)),
+        'account_identity': build_account_identity(surface=copilot_surface(transcript_path),
+                                                   transcript_path=transcript_path),
         # A re-send is the same turn and needs the same provenance; unlabelled, the control
         # plane falls back to the API key's owner and bills the turn to them.
         'agent_surface': copilot_surface(transcript_path),
@@ -6194,7 +6219,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
         # rotates or collides across sessions. The github block below is the provenance.
         'account_identity': build_account_identity(probe=not RUNNING_CLOUD,
-                                                   surface=copilot_surface(transcript_path)),
+                                                   surface=copilot_surface(transcript_path),
+                                                   transcript_path=transcript_path),
         'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 

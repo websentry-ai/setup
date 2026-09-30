@@ -302,6 +302,19 @@ class TestVSCodeAccount(_IsolatedConfig):
         self._vscode(login=None, sku=None, install=1, mtime=2_000)
         self.assertEqual(unbound.read_account_identity(surface="vscode")["account_login"], "stable-user")
 
+    def test_a_turn_reads_the_install_its_transcript_came_from(self):
+        self._vscode(login="stable-user", install=0, mtime=1_000)
+        self._vscode(login="insiders-user", install=1, mtime=2_000)
+        transcript = str(self.vscode_dirs[0] / "workspaceStorage" / "abc" / "GitHub.copilot-chat" / "transcripts" / "s.jsonl")
+        identity = unbound.read_account_identity(surface="vscode", transcript_path=transcript)
+        self.assertEqual(identity["account_login"], "stable-user")
+
+    def test_a_turn_from_a_signed_out_install_reports_no_one(self):
+        self._vscode(login="gone-user", sku=None, install=0, mtime=1_000)
+        self._vscode(login="insiders-user", install=1, mtime=2_000)
+        transcript = str(self.vscode_dirs[0] / "workspaceStorage" / "abc" / "GitHub.copilot-chat" / "transcripts" / "s.jsonl")
+        self.assertIsNone(unbound.read_account_identity(surface="vscode", transcript_path=transcript)["account_login"])
+
     def test_the_most_recently_used_install_wins(self):
         self._vscode(login="stable-user", install=0, mtime=1_000)
         self._vscode(login="insiders-user", install=1, mtime=2_000)
@@ -371,7 +384,12 @@ class TestCopilotCliAccount(_IsolatedConfig):
 class TestCopilotCliCredential(unittest.TestCase):
     """Only the entry's label is looked up; the secret is never read."""
 
+    def setUp(self):
+        unbound._copilot_cli_credential.cache_clear()
+        self.addCleanup(unbound._copilot_cli_credential.cache_clear)
+
     def _mac(self, returncode):
+        unbound._copilot_cli_credential.cache_clear()
         result = unittest.mock.Mock(returncode=returncode)
         with patch.object(unbound.platform, "system", return_value="Darwin"), \
                 patch.object(unbound.subprocess, "run", return_value=result) as run:
@@ -388,6 +406,7 @@ class TestCopilotCliCredential(unittest.TestCase):
                                 "-a", "https://github.com:octocat"])
 
     def _windows(self, stdout, returncode=0):
+        unbound._copilot_cli_credential.cache_clear()
         result = unittest.mock.Mock(returncode=returncode, stdout=stdout)
         with patch.object(unbound.platform, "system", return_value="Windows"), \
                 patch.object(unbound, "_is_windows", return_value=True), \
@@ -400,6 +419,16 @@ class TestCopilotCliCredential(unittest.TestCase):
                        "LegacyGeneric:target=copilot-cli/https://github.com:OctoCat"):
             with self.subTest(target=target):
                 self.assertIs(self._windows("    Target: %s\n    Type: Generic\n" % target), True)
+
+    def test_windows_a_longer_login_is_not_a_match(self):
+        self.assertIs(self._windows("    Target: LegacyGeneric:target=https://github.com:octocat2.copilot-cli\n"), False)
+
+    def test_a_repeat_check_in_one_run_spawns_no_second_process(self):
+        with patch.object(unbound.platform, "system", return_value="Darwin"), \
+                patch.object(unbound.subprocess, "run", return_value=unittest.mock.Mock(returncode=0)) as run:
+            unbound._copilot_cli_credential("https://github.com:octocat")
+            unbound._copilot_cli_credential("https://github.com:octocat")
+        self.assertEqual(run.call_count, 1)
 
     def test_windows_other_copilot_entries_mean_signed_out(self):
         self.assertIs(self._windows("    Target: LegacyGeneric:target=https://github.com:someone.copilot-cli\n"), False)
