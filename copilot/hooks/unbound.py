@@ -1636,16 +1636,149 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def read_account_identity(event: Optional[Dict] = None) -> Dict:
+_COPILOT_USER_CACHE_MAX_BYTES = 1024 * 1024
+_COPILOT_USER_CACHE_MAX_AGE_SECONDS = 7 * 24 * 3600
+
+
+def _copilot_user_cache_path() -> Optional[Path]:
+    if _is_windows():
+        base = os.environ.get('LOCALAPPDATA')
+        return Path(base) / 'copilot' / 'copilot-user-cache.json' if base else None
+    if platform.system() == 'Darwin':
+        return Path.home() / 'Library' / 'Caches' / 'copilot' / 'copilot-user-cache.json'
+    return Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'copilot' / 'copilot-user-cache.json'
+
+
+def _github_org_id(response: Dict) -> Optional[str]:
+    """The seat's org: organization_login_list names the orgs granting it, organization_list carries their IDs."""
+    orgs = response.get('organization_list')
+    seat = response.get('organization_login_list')
+    seat = {o.lower() for o in seat if isinstance(o, str)} if isinstance(seat, list) else None
+    ids = sorted(o['id'] for o in orgs if isinstance(o, dict) and isinstance(o.get('id'), int)
+                 and (seat is None or str(o.get('login') or '').lower() in seat)) if isinstance(orgs, list) else []
+    return str(ids[0]) if ids else None
+
+
+def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
+    path = _copilot_user_cache_path()
+    try:
+        if path is None or path.stat().st_size > _COPILOT_USER_CACHE_MAX_BYTES:
+            return None, None
+        raw = path.read_text(encoding='utf-8')
+        entries = json.loads(re.sub(r'^\s*//.*$', '', raw, flags=re.M)).get('copilotUserCache')
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError, AttributeError) as error:
+        log_error(f'copilot user cache unreadable: {type(error).__name__}', 'identity')
+        return None, None
+    newest = None
+    for entry in entries.values() if isinstance(entries, dict) else ():
+        response = entry.get('response') if isinstance(entry, dict) else None
+        if not isinstance(response, dict) or str(response.get('login') or '').lower() != login.lower():
+            continue
+        try:
+            at = datetime.fromisoformat(str(entry.get('retrievedAt')).replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            continue
+        if time.time() - at > _COPILOT_USER_CACHE_MAX_AGE_SECONDS:
+            continue
+        if newest is None or at > newest[0]:
+            newest = (at, response)
+    if newest is None:
+        return None, None
+    response = newest[1]
+    sku = response.get('access_type_sku')
+    return (sku.strip() or None) if isinstance(sku, str) else None, _github_org_id(response)
+
+
+_VSCODE_COPILOT_ACCOUNT_KEY = 'github.copilot-github'
+_VSCODE_COPILOT_CHAT_STATE_KEY = 'GitHub.copilot-chat'
+_VSCODE_COPILOT_STATE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _vscode_state_values(path, keys):
+    try:
+        uri = f'{path.resolve().as_uri()}?mode=ro'
+        marks = ','.join('?' * len(keys))
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
+            rows = connection.execute(
+                f'SELECT key, value FROM ItemTable WHERE key IN ({marks}) '
+                f'AND length(CAST(value AS BLOB)) <= ?',
+                (*keys, _VSCODE_COPILOT_STATE_MAX_BYTES)).fetchall()
+    except (OSError, sqlite3.Error) as error:
+        log_error(f'vscode copilot account read failed path={path} err={error}', 'identity')
+        return {}
+    values = {}
+    for key, value in rows:
+        if isinstance(value, bytes):
+            value = value.decode('utf-8', 'replace')
+        if isinstance(value, str):
+            values[key] = value
+    return values
+
+
+def _vscode_user_dir_of(transcript_path) -> Optional[Path]:
+    if not isinstance(transcript_path, str) or not transcript_path:
+        return None
+    for parent in Path(transcript_path).parents:
+        if parent.name in ('workspaceStorage', 'globalStorage'):
+            return parent.parent
+    return None
+
+
+def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str]]:
+    """The login key survives a sign-out; the sku does not."""
+    databases = []
+    for user_dir in [user_dir] if user_dir else _vscode_user_dirs():
+        path = user_dir / 'globalStorage' / 'state.vscdb'
+        try:
+            databases.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    for _, path in sorted(databases, reverse=True):
+        values = _vscode_state_values(path, (_VSCODE_COPILOT_ACCOUNT_KEY, _VSCODE_COPILOT_CHAT_STATE_KEY))
+        login = (values.get(_VSCODE_COPILOT_ACCOUNT_KEY) or '').strip()
+        if not login:
+            continue
+        try:
+            chat = json.loads(values.get(_VSCODE_COPILOT_CHAT_STATE_KEY) or '{}')
+        except json.JSONDecodeError:
+            chat = {}
+        chat = chat if isinstance(chat, dict) else {}
+        sku = chat.get('exp.github.copilot.sku')
+        sku = sku.strip() if isinstance(sku, str) else ''
+        return (login, sku) if sku else (None, None)
+    return None, None
+
+
+def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
+                          transcript_path: Optional[str] = None) -> Dict:
     """The signed-in account, keyed by GitHub login rather than address."""
-    login, host = _copilot_login()
+    plan = org = None
+    if surface == 'vscode':
+        login, plan = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
+        host = 'https://github.com' if login else None
+        if login:
+            cached_plan, cached_org = _copilot_cached_seat(login)
+            org = cached_org if cached_plan == plan else None
+    elif surface == 'cloud':
+        login, host = _copilot_login()
+    else:
+        login, host = _copilot_login()
+        if login and urlparse(host or 'https://github.com').hostname == 'github.com':
+            plan, org = _copilot_cached_seat(login)
+            if not plan:
+                org = None
+                vscode_login, vscode_plan = _vscode_copilot_account()
+                if vscode_login and vscode_login.lower() == login.lower():
+                    plan = vscode_plan
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None,
                 'account_login': None, 'account_host': None}
     return {
-        'org_id': None,
-        'plan': None,
+        'org_id': org,
+        'plan': plan,
         'auth_mode': 'subscription',
         # Never user_email: the gateway maps that to device.email, which
         # provisions and hands off devices to whatever address it names.
@@ -1774,32 +1907,44 @@ CLOUD_ACTOR_TASK_SCAN = 5
 # unreported. A name is worth less than the audit record.
 CLOUD_ACTOR_BUDGET = 8.0
 _cloud_actor_memo = {}
+# Why the last call named nobody. Reported once a session: the lookup has several ways to
+# come back empty and the row alone cannot tell a missing token from a refused one.
+_cloud_api_reason = None
 
 
 def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
     """GitHub's REST API with the sandbox's own token. Never raises."""
+    global _cloud_api_reason
     # An Enterprise Server token must not reach public GitHub; _copilot_seat refuses the
     # same case. Unset is refused too.
     if urlparse(os.environ.get('GITHUB_SERVER_URL') or '').hostname != 'github.com':
+        _cloud_api_reason = 'server_url'
         return None
-    # Copilot's token first: the Actions GITHUB_TOKEN is always set and these routes
-    # reject it, so reaching for it first would mask a working one.
-    for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
+    # The two the cloud sandbox documents. GITHUB_TOKEN is documented as not set there, and
+    # the laptop names the seat lookup uses do not exist in it either.
+    for var in ('GITHUB_COPILOT_API_TOKEN', 'GITHUB_COPILOT_GIT_TOKEN'):
         token = (os.environ.get(var) or '').strip()
         if token:
             break
     else:
+        _cloud_api_reason = 'no_token'
         return None
     # Not 0: a --max-time formatting to 0.0 is unlimited to curl.
     left = 5.0 if deadline is None else min(5.0, deadline - time.monotonic())
     if left < 0.1:
+        _cloud_api_reason = 'budget_spent'
         return None
     result = subprocess.run(
         _curl_base() + ["-fsS", "--max-time", "%.1f" % left, "-H", "@-",
                         "https://api.github.com/%s" % path],
         input=("Authorization: token %s\n" % token).encode(),
         capture_output=True, timeout=left + 5)
-    return json.loads(result.stdout) if result.returncode == 0 else None
+    if result.returncode != 0:
+        # The token rides stdin, never argv, so curl's own message cannot carry it.
+        _cloud_api_reason = '%s rc=%d %s' % (
+            var, result.returncode, result.stderr.decode('utf-8', 'replace').strip()[:120])
+        return None
+    return json.loads(result.stdout)
 
 
 def _cloud_session_user_id(repo: str, session: str, deadline: float) -> Optional[int]:
@@ -1833,6 +1978,9 @@ def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
                      or '').strip() or None
     except Exception as e:
         log_error('cloud session actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
+    if login is None:
+        log_error('cloud session actor unresolved: %s' % (_cloud_api_reason or 'session_not_found'),
+                  'identity')
     _cloud_actor_memo[session] = login
     return login
 
@@ -1891,7 +2039,7 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     day; only the end-of-turn path (probe) asks GitHub. Never raises."""
     try:
         cached = json.loads(COPILOT_SEAT_CACHE_PATH.read_text(encoding='utf-8'))
-        if cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
+        if cached.get('v') == 3 and cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
             return cached.get('plan'), cached.get('org')
     except Exception:
         pass
@@ -1905,15 +2053,13 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     plan = org = None
     # Another account's token (a different gh login) must not lend its seat.
     if isinstance(seat, dict) and str(seat.get('login') or '').lower() == login.lower():
-        plan = seat.get('copilot_plan') if isinstance(seat.get('copilot_plan'), str) else None
-        orgs = seat.get('organization_login_list')
-        orgs = sorted(o for o in orgs if isinstance(o, str) and o) if isinstance(orgs, list) else []
-        org = orgs[0] if orgs else None
+        plan = next((seat[k] for k in ('access_type_sku', 'copilot_plan') if isinstance(seat.get(k), str) and seat[k]), None)
+        org = _github_org_id(seat)
     # A miss is cached too, or a machine with no token asks GitHub every turn.
     try:
         COPILOT_SEAT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = COPILOT_SEAT_CACHE_PATH.parent / (".copilot_seat.%d.tmp" % os.getpid())
-        tmp.write_text(json.dumps({'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
+        tmp.write_text(json.dumps({'v': 3, 'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
                        encoding='utf-8')
         os.replace(str(tmp), str(COPILOT_SEAT_CACHE_PATH))
     except Exception:
@@ -1921,18 +2067,23 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     return plan, org
 
 
-def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
+def build_account_identity(event: Optional[Dict] = None, probe: bool = False,
+                           surface: Optional[str] = None, transcript_path: Optional[str] = None) -> Dict:
     """The account plus the device serial. The event is unused here. Never raises."""
     try:
-        identity = read_account_identity(event)
+        identity = read_account_identity(event, surface, transcript_path)
         if not isinstance(identity, dict):
             identity = {}
     except Exception:
         identity = {}
     try:
-        if identity.get('account_login'):
-            identity['plan'], identity['org_id'] = _copilot_seat(
+        if identity.get('account_login') and not (identity.get('plan') and identity.get('org_id')):
+            plan, org = _copilot_seat(
                 identity['account_login'], identity.get('account_host'), probe)
+            if not identity.get('plan'):
+                identity['plan'], identity['org_id'] = plan, identity.get('org_id') or org
+            elif plan == identity['plan']:
+                identity['org_id'] = org
     except Exception:
         pass
     try:
@@ -2004,7 +2155,8 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'requestCompleted': pending.get('until'),
         # Cache-only: called once per waiting turn, so probing here would cost a
         # 10s command on each of them.
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(surface=copilot_surface(transcript_path),
+                                                   transcript_path=transcript_path),
         # A re-send is the same turn and needs the same provenance; unlabelled, the control
         # plane falls back to the API key's owner and bills the turn to them.
         'agent_surface': copilot_surface(transcript_path),
@@ -6156,7 +6308,9 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'agent_surface': copilot_surface(transcript_path),
         # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
         # rotates or collides across sessions. The github block below is the provenance.
-        'account_identity': build_account_identity(probe=not RUNNING_CLOUD),
+        'account_identity': build_account_identity(probe=not RUNNING_CLOUD,
+                                                   surface=copilot_surface(transcript_path),
+                                                   transcript_path=transcript_path),
         'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 

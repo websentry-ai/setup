@@ -200,20 +200,46 @@ class TestCloudSessionActor(unittest.TestCase):
             self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
         self.assertLess(len(calls), 6)
 
-    def test_copilots_own_token_outranks_the_actions_one(self):
-        """These routes reject the Actions token, which is always set, so reaching for it
-        first would mask a working one."""
+    def test_it_reads_the_token_the_sandbox_actually_sets(self):
+        """GITHUB_TOKEN is documented as unset in the cloud sandbox, and the laptop names
+        are not there either; only the GITHUB_COPILOT_* pair is."""
         seen = {}
 
         def run(argv, **kwargs):
             seen['auth'] = kwargs['input'].decode()
             return _Completed(b'{}')
-        env = {'COPILOT_GITHUB_TOKEN': 'copilot-tok', 'GITHUB_TOKEN': 'actions-tok',
-               'GITHUB_SERVER_URL': 'https://github.com'}
+        env = {'GITHUB_COPILOT_API_TOKEN': 'sandbox-tok', 'GITHUB_TOKEN': 'actions-tok',
+               'COPILOT_GITHUB_TOKEN': 'laptop-tok', 'GITHUB_SERVER_URL': 'https://github.com'}
         with patch.dict(unbound.os.environ, env, clear=True), \
                 patch.object(unbound.subprocess, 'run', run):
             unbound._github_api('user/7')
-        self.assertIn('copilot-tok', seen['auth'])
+        self.assertIn('sandbox-tok', seen['auth'])
+        self.assertNotIn('actions-tok', seen['auth'])
+
+    def test_an_empty_lookup_says_why(self):
+        """Several paths come back empty and the row cannot tell them apart, so the reason
+        is reported rather than left to be guessed at from prod."""
+        reasons = []
+        env = {'GITHUB_SERVER_URL': 'https://github.com'}
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound, 'log_error', lambda m, c=None, e=None: reasons.append(m)):
+            unbound._cloud_actor_memo.clear()
+            self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
+        self.assertTrue(any('no_token' in r for r in reasons), reasons)
+
+    def test_a_refused_token_is_told_apart_from_a_missing_one(self):
+        reasons = []
+        env = {'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_COPILOT_API_TOKEN': 'tok'}
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound.subprocess, 'run',
+                             return_value=_Completed(b'', returncode=22,
+                                                     stderr=b'The requested URL returned error: 401')), \
+                patch.object(unbound, 'log_error', lambda m, c=None, e=None: reasons.append(m)):
+            unbound._cloud_actor_memo.clear()
+            self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
+        joined = ' '.join(reasons)
+        self.assertIn('401', joined)
+        self.assertNotIn('no_token', joined)
 
     def test_no_token_asks_nothing(self):
         with patch.dict(unbound.os.environ, {'GITHUB_SERVER_URL': 'https://github.com'}, clear=True), \
@@ -230,7 +256,7 @@ class TestCloudSessionActor(unittest.TestCase):
         def run(argv, **kwargs):
             seen.append(argv[argv.index('--max-time') + 1])
             return _Completed(b'{}')
-        env = {'GITHUB_SERVER_URL': 'https://github.com', 'COPILOT_GITHUB_TOKEN': 'tok'}
+        env = {'GITHUB_SERVER_URL': 'https://github.com', 'GITHUB_COPILOT_API_TOKEN': 'tok'}
         with patch.dict(unbound.os.environ, env, clear=True), \
                 patch.object(unbound.time, 'monotonic', lambda: clock[0]), \
                 patch.object(unbound.subprocess, 'run', run):
@@ -242,7 +268,7 @@ class TestCloudSessionActor(unittest.TestCase):
         """Enterprise Server issues its own credentials. An unset host is refused too."""
         for server in ('https://github.acme-corp.com', ''):
             with patch.dict(unbound.os.environ,
-                            {'GITHUB_SERVER_URL': server, 'COPILOT_GITHUB_TOKEN': 'ghes-tok'},
+                            {'GITHUB_SERVER_URL': server, 'GITHUB_COPILOT_API_TOKEN': 'ghes-tok'},
                             clear=True), \
                     patch.object(unbound.subprocess, 'run',
                                  side_effect=AssertionError('sent %r token to github.com' % server)):
