@@ -19,12 +19,6 @@ from tests.conftest import REPO, tool_module
 
 unbound = tool_module("copilot/hooks")
 
-TRAILER = (
-    'Add a thing\n\n'
-    'Co-authored-by: Nanda Pranesh <12345+nandapranesh@users.noreply.github.com>\n'
-)
-
-
 class _Completed:
     def __init__(self, stdout=b'', returncode=0, stderr=b''):
         self.stdout, self.returncode, self.stderr = stdout, returncode, stderr
@@ -95,58 +89,6 @@ class TestCloudEventNormalization(unittest.TestCase):
         self.assertIs(self._normalize(original, 'Stop', cloud=False), original)
 
 
-class TestGithubActor(unittest.TestCase):
-    """The sandbox names only the bot; the requester is the commit co-author."""
-
-    def _run(self, env, completed):
-        with patch.dict(unbound.os.environ, env, clear=True), \
-                patch.object(unbound.subprocess, 'run', return_value=completed) as run:
-            return unbound._github_actor(), run
-
-    def test_takes_the_login_not_the_display_name(self):
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(TRAILER.encode()))
-        self.assertEqual(actor, 'nandapranesh')
-
-    def test_reads_the_id_less_noreply_form_too(self):
-        body = b'Fix\n\nCo-authored-by: Octo <octocat@users.noreply.github.com>\n'
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
-        self.assertEqual(actor, 'octocat')
-
-    def test_scoped_to_this_sessions_first_parent_commits(self):
-        _, run = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(TRAILER.encode()))
-        self.assertEqual(run.call_args[0][0],
-                         ['git', 'log', 'abc..HEAD', '--first-parent', '--no-merges',
-                          '--reverse', '--format=%B'])
-
-    def test_no_base_commit_means_no_unscoped_search(self):
-        with patch.dict(unbound.os.environ, {}, clear=True), \
-                patch.object(unbound.subprocess, 'run') as run:
-            self.assertIsNone(unbound._github_actor())
-            run.assert_not_called()
-
-    def test_the_sessions_first_trailer_wins_not_its_last(self):
-        """GitHub stamps the requester on the agent's first commit. Every commit after it
-        was written by the agent, which can address one to any login it likes -- so with
-        --reverse the git output starts at the one commit it did not get to compose."""
-        body = (b'agent first commit\n\n'
-                b'Co-authored-by: Real <1+realuser@users.noreply.github.com>\n'
-                b'agent later commit\n\n'
-                b'Co-authored-by: Victim <2+victim@users.noreply.github.com>\n')
-        actor, run = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
-        self.assertEqual(actor, 'realuser')
-        self.assertIn('--reverse', run.call_args[0][0])
-
-    def test_a_real_address_is_not_mistaken_for_a_login(self):
-        body = b'Fix\n\nCo-authored-by: Nanda <nanda@unboundsecurity.ai>\n'
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'}, _Completed(body))
-        self.assertIsNone(actor)
-
-    def test_a_failed_git_log_yields_nothing(self):
-        actor, _ = self._run({'COPILOT_AGENT_BASE_COMMIT': 'abc'},
-                             _Completed(b'', returncode=128, stderr=b'bad revision'))
-        self.assertIsNone(actor)
-
-
 class TestGithubContext(unittest.TestCase):
     def test_a_laptop_sends_no_github_block(self):
         with patch.object(unbound, 'RUNNING_CLOUD', False):
@@ -156,11 +98,10 @@ class TestGithubContext(unittest.TestCase):
                  'COPILOT_AGENT_SESSION_ID': 'sess-1',
                  'COPILOT_JOB_EVENT_TYPE': 'issues'}
 
-    def _context(self, env=None, session_actor=None, trailer_actor=None):
+    def _context(self, env=None, session_actor=None):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
                 patch.dict(unbound.os.environ, dict(self.CLOUD_ENV, **(env or {})), clear=True), \
-                patch.object(unbound, '_cloud_session_actor', return_value=session_actor), \
-                patch.object(unbound, '_github_actor', return_value=trailer_actor):
+                patch.object(unbound, '_cloud_session_actor', return_value=session_actor):
             return unbound.build_github_context()
 
     def test_provenance_is_repo_session_and_trigger(self):
@@ -169,10 +110,12 @@ class TestGithubContext(unittest.TestCase):
                           'repo': 'websentry-ai/setup',
                           'session': 'sess-1', 'event': 'issues'})
 
-    def test_the_commit_trailer_never_names_the_actor(self):
-        """The agent writes its own commit messages, and nothing in the payload separates a
-        login it claimed from one GitHub confirmed. Naming nobody is the safer answer."""
-        self.assertNotIn('actor', self._context(trailer_actor='octocat'))
+    def test_a_commit_trailer_cannot_name_the_actor(self):
+        """The agent writes its own commit messages, so a trailer names whoever it likes.
+        No reader is left: the git-log helper that once supplied one is gone, rather than
+        kept unused where wiring it back in would look like a one-line change."""
+        self.assertFalse(hasattr(unbound, '_github_actor'))
+        self.assertFalse(hasattr(unbound, '_GITHUB_COAUTHOR_RE'))
 
     def test_the_runner_answers_only_when_the_lookup_cannot(self):
         named = self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'},
@@ -197,8 +140,7 @@ class TestGithubContext(unittest.TestCase):
 
     def test_absent_fields_are_dropped_rather_than_sent_empty(self):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
-                patch.dict(unbound.os.environ, {'COPILOT_AGENT_SESSION_ID': 'sess-1'}, clear=True), \
-                patch.object(unbound, '_github_actor', return_value=None):
+                patch.dict(unbound.os.environ, {'COPILOT_AGENT_SESSION_ID': 'sess-1'}, clear=True):
             self.assertEqual(unbound.build_github_context(), {'session': 'sess-1'})
 
 

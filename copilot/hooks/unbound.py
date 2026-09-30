@@ -1751,10 +1751,6 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
-_GITHUB_COAUTHOR_RE = re.compile(
-    r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>', re.M | re.I)
-
-
 # Which of the two answered, since only one of them is GitHub's own record. A reader that
 # attributes cost or policy to a login should insist on the first.
 ACTOR_SOURCE_API = 'github_api'
@@ -1772,38 +1768,6 @@ def _env_actor() -> Optional[str]:
         if login and '[bot]' not in login.lower() and login.lower() not in _ENV_ACTOR_SERVICE:
             return login
     return None
-
-
-def _github_actor() -> Optional[str]:
-    """The login that triggered the session, read from the co-author trailer GitHub stamps.
-
-    Claimed, never proven. The agent writes commit messages, so it can address one to any
-    login it likes; taking the session's first commit only means it has to do so before
-    doing anything else. Treat downstream as provenance, not identity.
-
-    Scoped to this session's commits: an unscoped search reads unrelated history and would
-    upload a stranger's login as this session's actor. The login, not the display name — a
-    display name is neither stable nor unique, so it joins to nothing later.
-    """
-    base = os.environ.get('COPILOT_AGENT_BASE_COMMIT')
-    if not base:
-        return None
-    try:
-        # --reverse: GitHub stamps the requester on the agent's first commit, and every
-        # later one the agent wrote itself and could address to anyone.
-        # --first-parent --no-merges: a merge mid-session drags in other branches' trailers.
-        out = subprocess.run(['git', 'log', '%s..HEAD' % base,
-                              '--first-parent', '--no-merges', '--reverse', '--format=%B'],
-                             capture_output=True, timeout=5)
-        if out.returncode != 0:
-            log_error('github actor: git log %s..HEAD failed rc=%s %s' % (
-                base, out.returncode, out.stderr.decode('utf-8', 'replace')[:200]), 'identity')
-            return None
-        match = _GITHUB_COAUTHOR_RE.search(out.stdout.decode('utf-8', 'replace'))
-        return (match.group(1).strip() or None) if match else None
-    except Exception as e:
-        log_error('github actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
-        return None
 
 
 CLOUD_ACTOR_TASK_SCAN = 5
