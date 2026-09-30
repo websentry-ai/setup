@@ -1653,7 +1653,7 @@ def _github_org_id(response: Dict) -> Optional[str]:
     """The seat's org: organization_login_list names the orgs granting it, organization_list carries their IDs."""
     orgs = response.get('organization_list')
     seat = response.get('organization_login_list')
-    seat = {o.lower() for o in seat if isinstance(o, str)} if isinstance(seat, list) and seat else None
+    seat = {o.lower() for o in seat if isinstance(o, str)} if isinstance(seat, list) else None
     ids = sorted(o['id'] for o in orgs if isinstance(o, dict) and isinstance(o.get('id'), int)
                  and (seat is None or str(o.get('login') or '').lower() in seat)) if isinstance(orgs, list) else []
     return str(ids[0]) if ids else None
@@ -2061,10 +2061,10 @@ def build_account_identity(event: Optional[Dict] = None, probe: bool = False,
     except Exception:
         identity = {}
     try:
-        if identity.get('account_login') and not identity.get('plan'):
+        if identity.get('account_login') and not (identity.get('plan') and identity.get('org_id')):
             plan, org = _copilot_seat(
                 identity['account_login'], identity.get('account_host'), probe)
-            identity['plan'], identity['org_id'] = plan, identity.get('org_id') or org
+            identity['plan'], identity['org_id'] = identity.get('plan') or plan, identity.get('org_id') or org
     except Exception:
         pass
     try:

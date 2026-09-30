@@ -218,6 +218,12 @@ class TestCopilotSeat(unittest.TestCase):
                                   "organization_list": [{"id": 5, "login": "hobby"}, {"id": 101, "login": "acme"}]})
         self.assertEqual(org, "101")
 
+    def test_a_seat_no_org_grants_has_no_org(self):
+        (_, org), _ = self._seat({"login": "octocat", "access_type_sku": "copilot_individual",
+                                  "organization_login_list": [],
+                                  "organization_list": [{"id": 5, "login": "hobby"}]})
+        self.assertIsNone(org)
+
     def test_the_plan_is_the_sku_when_github_sends_one(self):
         (plan, _), _ = self._seat({"login": "octocat", "copilot_plan": "business",
                                    "access_type_sku": "copilot_for_business_seat_quota"})
@@ -359,6 +365,14 @@ class TestVSCodeAccount(_IsolatedConfig):
         with patch.object(unbound, "log_error") as logged:
             self.assertIsNone(unbound.read_account_identity(surface="vscode")["account_login"])
         self.assertEqual(logged.call_count, 1)
+
+    def test_github_fills_the_org_when_the_disk_has_only_the_plan(self):
+        self._vscode(login="vs-user", sku="copilot_for_business_seat")
+        with patch.object(unbound, "_copilot_seat", return_value=("copilot_business", "101")) as seat, \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True, surface="vscode")
+        seat.assert_called_once()
+        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat", "101"))
 
     def test_github_is_not_asked_when_vscode_names_the_plan(self):
         self._vscode(login="vs-user", sku="copilot_for_business_seat")
