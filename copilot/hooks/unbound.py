@@ -1681,6 +1681,50 @@ def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
     return login, host
 
 
+_COPILOT_USER_CACHE_MAX_BYTES = 1024 * 1024
+
+
+def _copilot_user_cache_path() -> Optional[Path]:
+    """Copilot's shared cache of GitHub's copilot_internal/user answers, written by the CLI and VS Code."""
+    if _is_windows():
+        base = os.environ.get('LOCALAPPDATA')
+        return Path(base) / 'copilot' / 'copilot-user-cache.json' if base else None
+    if platform.system() == 'Darwin':
+        return Path.home() / 'Library' / 'Caches' / 'copilot' / 'copilot-user-cache.json'
+    return Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'copilot' / 'copilot-user-cache.json'
+
+
+def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
+    """Plan (sku) and org GitHub last reported for this login, from Copilot's own user cache."""
+    path = _copilot_user_cache_path()
+    try:
+        if path is None or path.stat().st_size > _COPILOT_USER_CACHE_MAX_BYTES:
+            return None, None
+        raw = path.read_text(encoding='utf-8')
+        entries = json.loads(re.sub(r'^\s*//.*$', '', raw, flags=re.M)).get('copilotUserCache')
+    except FileNotFoundError:
+        return None, None
+    except (OSError, ValueError, AttributeError) as error:
+        log_error(f'copilot user cache unreadable: {type(error).__name__}', 'identity')
+        return None, None
+    newest = None
+    for entry in entries.values() if isinstance(entries, dict) else ():
+        response = entry.get('response') if isinstance(entry, dict) else None
+        if not isinstance(response, dict) or str(response.get('login') or '').lower() != login.lower():
+            continue
+        at = entry.get('retrievedAt') if isinstance(entry.get('retrievedAt'), str) else ''
+        if newest is None or at > newest[0]:
+            newest = (at, response)
+    if newest is None:
+        return None, None
+    response = newest[1]
+    sku = response.get('access_type_sku')
+    orgs = response.get('organization_list')
+    orgs = sorted(o['login'].strip() for o in orgs if isinstance(o, dict) and isinstance(o.get('login'), str)
+                  and o['login'].strip()) if isinstance(orgs, list) else []
+    return (sku.strip() or None) if isinstance(sku, str) else None, orgs[0] if orgs else None
+
+
 _VSCODE_COPILOT_ACCOUNT_KEY = 'github.copilot-github'
 _VSCODE_COPILOT_CHAT_STATE_KEY = 'GitHub.copilot-chat'
 _VSCODE_COPILOT_STATE_MAX_BYTES = 4 * 1024 * 1024
@@ -1749,15 +1793,24 @@ def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[s
 
 def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
                           transcript_path: Optional[str] = None) -> Dict:
-    """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in."""
+    """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in; plan and org
+    come from Copilot's user cache for that login, else from VS Code when it is signed in as the same login."""
     plan = org = None
     if surface == 'vscode':
         login, plan, org = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
         host = 'https://github.com' if login else None
+        if login:
+            org = _copilot_cached_seat(login)[1] or org
     elif surface == 'cloud':
         login, host = _copilot_login()
     else:
         login, host = _copilot_cli_account()
+        if login:
+            plan, org = _copilot_cached_seat(login)
+            if not plan:
+                vscode_login, vscode_plan, vscode_org = _vscode_copilot_account()
+                if vscode_login and vscode_login.lower() == login.lower():
+                    plan, org = vscode_plan, org or vscode_org
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None,

@@ -47,9 +47,24 @@ class _IsolatedConfig(unittest.TestCase):
         self.credential = patch.object(unbound, "_copilot_cli_credential", return_value=None)
         self.credential.start()
         self.addCleanup(self.credential.stop)
+        self.user_cache_path = Path(self._tmp.name) / "copilot-user-cache.json"
+        user_cache = patch.object(unbound, "_copilot_user_cache_path", return_value=self.user_cache_path)
+        user_cache.start()
+        self.addCleanup(user_cache.stop)
+        self._user_cache_entries = {}
 
     def _write(self, body: str):
         self.config_path.write_text(body, encoding="utf-8")
+
+    def _user_cache(self, login, sku="copilot_for_business_seat_quota", orgs=("acme",), at="2026-09-30T04:16:13.733Z"):
+        """Add one GitHub copilot_internal/user answer to Copilot's user cache, the way Copilot writes it."""
+        self._user_cache_entries["v1:%d" % len(self._user_cache_entries)] = {
+            "schemaVersion": 1, "generation": "g", "retrievedAt": at,
+            "response": {"login": login, "copilot_plan": "business", "access_type_sku": sku,
+                         "organization_list": [{"id": 1, "login": o, "name": o.title()} for o in orgs]}}
+        self.user_cache_path.write_text(
+            "// Disposable cache for Copilot user responses, safe to delete. Managed automatically.\n"
+            + json.dumps({"copilotUserCache": self._user_cache_entries}), encoding="utf-8")
 
     def _vscode(self, login="vs-user", sku="copilot_for_business_seat", orgs=None, install=0, mtime=None):
         """Write a VS Code globalStorage/state.vscdb the way VS Code keeps it."""
@@ -443,6 +458,84 @@ class TestCopilotCliCredential(unittest.TestCase):
         with patch.object(unbound.platform, "system", return_value="Linux"), \
                 patch.object(unbound, "_is_windows", return_value=False):
             self.assertIsNone(unbound._copilot_cli_credential("https://github.com:octocat"))
+
+
+class TestCopilotUserCache(_IsolatedConfig):
+    """Copilot caches GitHub's answer about each signed-in login; plan and org come from there."""
+
+    def test_a_cli_turn_gets_plan_and_org_name_for_its_login(self):
+        self._write(SIGNED_IN)
+        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=["zeta", "acme"])
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["account_login"], identity["plan"], identity["org_id"]),
+                         ("octocat", "copilot_for_business_seat_quota", "acme"))
+
+    def test_the_newest_answer_for_the_login_wins(self):
+        self._write(SIGNED_IN)
+        self._user_cache("octocat", sku="free_limited_copilot", orgs=[], at="2026-09-01T00:00:00Z")
+        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=["acme"], at="2026-09-30T00:00:00Z")
+        self.assertEqual(unbound.read_account_identity(surface="cli")["plan"], "copilot_for_business_seat_quota")
+
+    def test_another_logins_answer_is_ignored(self):
+        self._write(SIGNED_IN)
+        self._user_cache("someone-else")
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["plan"], identity["org_id"]), (None, None))
+
+    def test_a_personal_seat_has_a_plan_and_no_org(self):
+        self._write(SIGNED_IN)
+        self._user_cache("OctoCat", sku="free_educational_quota", orgs=[])
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
+
+    def test_without_a_cache_entry_the_cli_borrows_vscode_signed_in_as_the_same_login(self):
+        self._write(SIGNED_IN)
+        self._vscode(login="octocat", sku="copilot_for_business_seat_quota", orgs=["opaque-org"])
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat_quota", "opaque-org"))
+
+    def test_the_cli_never_borrows_vscode_signed_in_as_another_login(self):
+        self._write(SIGNED_IN)
+        self._vscode(login="vs-user")
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["plan"], identity["org_id"]), (None, None))
+
+    def test_a_vscode_turn_reports_the_org_name_when_the_cache_has_it(self):
+        self._vscode(login="vs-user", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
+        self._user_cache("vs-user", orgs=["acme"])
+        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "acme")
+
+    def test_a_vscode_turn_keeps_the_opaque_org_without_a_cache_entry(self):
+        self._vscode(login="vs-user", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
+        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "3d1901ce21d7ca4bb9dd9818d628f3b5")
+
+    def test_an_unreadable_cache_is_logged_and_adds_nothing(self):
+        self._write(SIGNED_IN)
+        self.user_cache_path.write_text("{not json", encoding="utf-8")
+        with patch.object(unbound, "log_error") as logged:
+            self.assertIsNone(unbound.read_account_identity(surface="cli")["plan"])
+        self.assertEqual(logged.call_count, 1)
+
+    def test_the_seat_lookup_is_skipped_when_the_cache_names_the_plan(self):
+        self._write(SIGNED_IN)
+        self._user_cache("octocat")
+        with patch.object(unbound, "_copilot_seat") as seat, patch.object(unbound, "_device_serial", return_value=None):
+            unbound.build_account_identity(probe=True, surface="cli")
+        seat.assert_not_called()
+
+
+class TestCopilotUserCachePath(unittest.TestCase):
+    def test_macos(self):
+        with patch.object(unbound, "_is_windows", return_value=False), \
+                patch.object(unbound.platform, "system", return_value="Darwin"):
+            self.assertEqual(unbound._copilot_user_cache_path(),
+                             Path.home() / "Library" / "Caches" / "copilot" / "copilot-user-cache.json")
+
+    def test_linux_honours_xdg_cache_home(self):
+        with patch.object(unbound, "_is_windows", return_value=False), \
+                patch.object(unbound.platform, "system", return_value="Linux"), \
+                patch.dict(os.environ, {"XDG_CACHE_HOME": "/tmp/xdg"}):
+            self.assertEqual(unbound._copilot_user_cache_path(), Path("/tmp/xdg/copilot/copilot-user-cache.json"))
 
 
 if __name__ == "__main__":
