@@ -111,9 +111,8 @@ class TestGithubContext(unittest.TestCase):
                           'session': 'sess-1', 'event': 'issues'})
 
     def test_a_commit_trailer_cannot_name_the_actor(self):
-        """The agent writes its own commit messages, so a trailer names whoever it likes.
-        No reader is left: the git-log helper that once supplied one is gone, rather than
-        kept unused where wiring it back in would look like a one-line change."""
+        """The agent authors its own commit messages, so the reader is deleted rather than
+        left unused, where wiring it back would look like a one-line change."""
         self.assertFalse(hasattr(unbound, '_github_actor'))
         self.assertFalse(hasattr(unbound, '_GITHUB_COAUTHOR_RE'))
 
@@ -125,8 +124,8 @@ class TestGithubContext(unittest.TestCase):
         self.assertEqual(fell_back['actor'], 'runner-login')
 
     def test_every_name_says_which_source_produced_it(self):
-        """Both sources write the same field, and only one of them is GitHub's own record.
-        Unlabelled, a reader attributing cost or policy cannot tell them apart."""
+        """Both sources write one field and only one is GitHub's record; unlabelled, a
+        reader cannot tell them apart."""
         self.assertEqual(self._context(session_actor='api-login')['actor_source'], 'github_api')
         self.assertEqual(
             self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'})['actor_source'],
@@ -145,8 +144,8 @@ class TestGithubContext(unittest.TestCase):
 
 
 class TestCloudSessionActor(unittest.TestCase):
-    """The session's owner as GitHub records it. This runs before the turn is uploaded, so it
-    is bounded: a name is worth less than the audit record it would otherwise delay."""
+    """The session's owner as GitHub records it. Bounded, because it runs before the turn is
+    uploaded and a name is worth less than the audit record."""
 
     def setUp(self):
         unbound._cloud_actor_memo.clear()
@@ -190,8 +189,8 @@ class TestCloudSessionActor(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
     def test_the_scan_stops_at_the_budget(self):
-        """Without one aggregate deadline the scan outlasts the agentStop timeout and the
-        turn goes unreported -- a missing audit record, not merely a missing name."""
+        """Unbounded, the scan outlasts the agentStop timeout and the turn goes
+        unreported -- a missing audit record, not merely a missing name."""
         clock = [0.0]
         api, calls = self._api(
             {'agents/repos/o/r/tasks': {'tasks': [{'id': 't%d' % i} for i in range(5)]}},
@@ -202,8 +201,8 @@ class TestCloudSessionActor(unittest.TestCase):
         self.assertLess(len(calls), 6)
 
     def test_copilots_own_token_outranks_the_actions_one(self):
-        """The sandbox always carries an Actions GITHUB_TOKEN, and these routes reject the
-        installation token it is -- so reaching for it first would mask a working one."""
+        """These routes reject the Actions token, which is always set, so reaching for it
+        first would mask a working one."""
         seen = {}
 
         def run(argv, **kwargs):
@@ -223,8 +222,8 @@ class TestCloudSessionActor(unittest.TestCase):
             self.assertIsNone(unbound._github_api('user/7'))
 
     def test_the_last_sliver_of_budget_never_uncaps_curl(self):
-        """curl reads a --max-time of 0 as no limit, and anything under 0.05s formats to
-        0.0 -- so the end of the budget would lift the cap instead of enforcing it."""
+        """Anything under 0.05s formats to 0.0, which curl reads as no limit -- the end of
+        the budget would lift the cap instead of enforcing it."""
         clock = [0.0]
         seen = []
 
@@ -240,8 +239,7 @@ class TestCloudSessionActor(unittest.TestCase):
         self.assertEqual(seen, ['0.5'])
 
     def test_an_enterprise_token_never_reaches_public_github(self):
-        """Enterprise Server issues its own credentials, and the lookup failing costs a name
-        while sending one to a third party costs rather more. An unset host is refused too."""
+        """Enterprise Server issues its own credentials. An unset host is refused too."""
         for server in ('https://github.acme-corp.com', ''):
             with patch.dict(unbound.os.environ,
                             {'GITHUB_SERVER_URL': server, 'COPILOT_GITHUB_TOKEN': 'ghes-tok'},

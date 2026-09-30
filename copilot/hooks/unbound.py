@@ -1751,10 +1751,8 @@ def _device_serial(probe: bool = True) -> Optional[str]:
     return serial
 
 
-# Which of the two answered, since only one of them is GitHub's own record. This travels in
-# the same payload as the actor and is written here, inside the sandbox, so it says what
-# this hook believes rather than proving anything: a reader attributing cost or policy has
-# to re-check the actor against GitHub for the session, not take the label's word for it.
+# The hook's claim about where the actor came from, not proof: written in the sandbox and
+# sent with the actor. Attributing cost or policy must re-check it against GitHub.
 ACTOR_SOURCE_API = 'github_api'
 ACTOR_SOURCE_ENV = 'runner_env'
 
@@ -1762,9 +1760,8 @@ _ENV_ACTOR_SERVICE = {'copilot', 'copilot-swe-agent', 'github-actions', 'github-
 
 
 def _env_actor() -> Optional[str]:
-    """The login the runner names as having triggered the job. The agent's own identity is
-    not a person and turns up both with and without a `[bot]` suffix, so both are refused:
-    naming the agent would be worse than naming nobody."""
+    """The login the runner says triggered the job. The agent is not a person, and appears
+    both with and without a `[bot]` suffix."""
     for var in ('GITHUB_TRIGGERING_ACTOR', 'GITHUB_ACTOR'):
         login = (os.environ.get(var) or '').strip()
         if login and '[bot]' not in login.lower() and login.lower() not in _ENV_ACTOR_SERVICE:
@@ -1773,30 +1770,27 @@ def _env_actor() -> Optional[str]:
 
 
 CLOUD_ACTOR_TASK_SCAN = 5
-# One budget for the whole lookup, not per call: seven five-second requests would outlast the
-# agentStop timeout and take the turn's telemetry down with them. A name is worth less than
-# the audit record, so the lookup gives up long before the upload is at risk.
+# Whole lookup, not per call: unbounded it outlasts the agentStop timeout and the turn goes
+# unreported. A name is worth less than the audit record.
 CLOUD_ACTOR_BUDGET = 8.0
 _cloud_actor_memo = {}
 
 
 def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
     """GitHub's REST API with the sandbox's own token. Never raises."""
-    # Anything but github.com may be Enterprise Server, whose token must not reach public
-    # GitHub; _copilot_seat refuses the same case. Unset is refused too: the lookup failing
-    # costs a name, sending an enterprise credential to a third party costs rather more.
+    # An Enterprise Server token must not reach public GitHub; _copilot_seat refuses the
+    # same case. Unset is refused too.
     if urlparse(os.environ.get('GITHUB_SERVER_URL') or '').hostname != 'github.com':
         return None
-    # Copilot's own token first, as _fetch_copilot_seat does: the sandbox always carries an
-    # Actions GITHUB_TOKEN, and an installation token these routes reject would mask it.
+    # Copilot's token first: the Actions GITHUB_TOKEN is always set and these routes
+    # reject it, so reaching for it first would mask a working one.
     for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
         token = (os.environ.get(var) or '').strip()
         if token:
             break
     else:
         return None
-    # Below 0.1 rather than 0: curl reads a --max-time that formats to 0.0 as no limit at
-    # all, so the last sliver of the budget would uncap the very request it is bounding.
+    # Not 0: a --max-time formatting to 0.0 is unlimited to curl.
     left = 5.0 if deadline is None else min(5.0, deadline - time.monotonic())
     if left < 0.1:
         return None
@@ -1809,8 +1803,8 @@ def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
 
 
 def _cloud_session_user_id(repo: str, session: str, deadline: float) -> Optional[int]:
-    """The task list carries no session ids, so each task's sessions are read until this one
-    turns up. Newest first, and a session's own task is the newest one on the repo."""
+    """The task list carries no session ids, so each task is opened until this one turns up.
+    Newest first: a session's own task is the newest on the repo."""
     tasks = (_github_api('agents/repos/%s/tasks' % repo, deadline) or {}).get('tasks') or []
     for task in tasks[:CLOUD_ACTOR_TASK_SCAN]:
         if time.monotonic() >= deadline:
@@ -1823,13 +1817,10 @@ def _cloud_session_user_id(repo: str, session: str, deadline: float) -> Optional
 
 
 def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
-    """The login GitHub records for this session, which unlike the commit trailer the agent
-    cannot author.
+    """The login GitHub records for this session.
 
-    Memoised for the process and never written down. Every path the sandbox can reach is
-    writable by the agent, so a cache file would let it plant the very name this call exists
-    to establish; a process that uploads several turns still asks GitHub once, and the next
-    process retries rather than inheriting a transient failure for the whole session.
+    Memoised per process, never to disk: the sandbox is agent-writable, so a cache file
+    would let it plant the name this call exists to establish.
     """
     if session in _cloud_actor_memo:
         return _cloud_actor_memo[session]
@@ -1852,11 +1843,8 @@ def build_github_context() -> Optional[Dict]:
         return None
     repo = os.environ.get('GITHUB_REPOSITORY')
     session = os.environ.get('COPILOT_AGENT_SESSION_ID')
-    # GitHub's own record first: it is the only source here the agent cannot author. What the
-    # runner's variables hold in this sandbox has never been established, so they answer only
-    # when the lookup cannot -- and say so, because a reader cannot otherwise tell a claimed
-    # login from a confirmed one. The commit trailer stays out: the agent writes those
-    # messages, so it names whoever it likes and no marker would make that safe to attribute.
+    # GitHub's record first, the runner's unverified variables only when it cannot answer.
+    # Each says which it was, or a reader cannot tell them apart.
     actor = _cloud_session_actor(repo, session) if repo and session else None
     source = ACTOR_SOURCE_API if actor else None
     if not actor:
