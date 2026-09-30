@@ -949,18 +949,24 @@ def _flat_managed_settings_has_unbound_hook(managed_dir: Path) -> bool:
     try:
         if not flat.exists():
             return False
-        hooks = json.loads(flat.read_text(encoding="utf-8")).get("hooks", {})
+        data = json.loads(flat.read_text(encoding="utf-8"))
     except Exception:
         return False
-    # managed-settings.json is shared with other policy, so one malformed entry
-    # must not abandon the scan before a real managed hook is seen.
+    # managed-settings.json is shared with other policy, so any malformed shape is
+    # skipped rather than aborting the scan before a real managed hook is seen.
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return False
     for groups in hooks.values():
         if not isinstance(groups, list):
             continue
         for group in groups:
             if not isinstance(group, dict):
                 continue
-            for hook in group.get("hooks", []):
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                continue
+            for hook in entries:
                 if isinstance(hook, dict) and _is_unbound_binary_hook_command(hook.get("command")):
                     return True
     return False

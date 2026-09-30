@@ -1255,11 +1255,11 @@ class TestEnterpriseHooksConflict(unittest.TestCase):
         self.assertFalse(self._conflict())
 
     def test_a_malformed_entry_does_not_abandon_the_scan(self):
-        # A dirty/foreign entry earlier in the shared file must not stop us from
-        # finding a real managed hook after it.
+        # Dirty/foreign shapes earlier in the shared file (non-dict group, null
+        # hooks list, non-dict hook) must not stop us finding a real one after.
         (self.managed / "managed-settings.json").write_text(json.dumps({
             "hooks": {
-                "PreToolUse": ["not-a-dict", {"hooks": ["also-bad"]}],
+                "PreToolUse": ["not-a-dict", {"hooks": None}, {"hooks": ["also-bad"]}],
                 "UserPromptSubmit": [{"hooks": [
                     {"type": "command",
                      "command": '"/opt/unbound/current/unbound-hook/unbound-hook" hook claude-code User'}
@@ -1267,6 +1267,12 @@ class TestEnterpriseHooksConflict(unittest.TestCase):
             }
         }))
         self.assertTrue(self._conflict())
+
+    def test_top_level_hooks_not_a_dict_is_not_a_conflict(self):
+        # A hooks value that is a list (or otherwise malformed) must fail open,
+        # not raise.
+        (self.managed / "managed-settings.json").write_text(json.dumps({"hooks": ["x"]}))
+        self.assertFalse(self._conflict())
 
     def test_unmanaged_box_is_not_a_conflict(self):
         self.assertFalse(self._conflict())
