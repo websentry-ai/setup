@@ -2375,6 +2375,28 @@ def _normalize_mcp_entry(entry: Dict, name: Optional[str] = None,
     return out or None
 
 
+def _augment_cli_servers(data):
+    """The `{name: entry}` mapping out of an Augment settings file.
+
+    Augment writes the servers three ways and only the first is wrapped.
+    Precedence mirrors the discovery client, which parses the same file.
+    """
+    if not isinstance(data, dict):
+        return {}
+    wrapped = data.get('mcpServers')
+    if isinstance(wrapped, dict):
+        return wrapped
+    advanced = data.get('augment')
+    if isinstance(advanced, dict):
+        advanced = advanced.get('advanced')
+        if isinstance(advanced, dict) and isinstance(advanced.get('mcpServers'), dict):
+            return advanced['mcpServers']
+    # Unwrapped: every other settings key sits at this level too, so a value
+    # counts as a server only when it carries what one is addressed by.
+    return {name: value for name, value in data.items()
+            if isinstance(value, dict) and ('command' in value or 'url' in value)}
+
+
 def read_augment_mcp_servers(event: Dict, script_server: Optional[str] = None) -> Dict:
     """Aggregate MCP servers across all Augment surfaces into {name -> config}.
     First definition of a name wins; never raises (fail-open). Only
@@ -2389,8 +2411,8 @@ def read_augment_mcp_servers(event: Dict, script_server: Optional[str] = None) -
             entries = []
             if fmt == 'vscode' and isinstance(data, list):
                 entries = [(e.get('name'), e) for e in data if isinstance(e, dict)]
-            elif fmt == 'cli' and isinstance(data, dict) and isinstance(data.get('mcpServers'), dict):
-                entries = list(data['mcpServers'].items())
+            elif fmt == 'cli':
+                entries = list(_augment_cli_servers(data).items())
             for name, entry in entries:
                 if name:
                     servers.setdefault(
