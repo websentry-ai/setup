@@ -1787,14 +1787,75 @@ def _github_actor() -> Optional[str]:
         return None
 
 
+CLOUD_ACTOR_CACHE_PATH = LOG_DIR / "cloud_actor.json"
+CLOUD_ACTOR_TASK_SCAN = 5
+
+
+def _github_api(path: str) -> Optional[Dict]:
+    """GitHub's REST API with the sandbox's own token. Never raises."""
+    for var in ('GITHUB_TOKEN', 'GH_TOKEN', 'COPILOT_GITHUB_TOKEN'):
+        token = (os.environ.get(var) or '').strip()
+        if token:
+            break
+    else:
+        return None
+    result = subprocess.run(
+        _curl_base() + ["-fsS", "--max-time", "5", "-H", "@-",
+                        "https://api.github.com/%s" % path],
+        input=("Authorization: token %s\n" % token).encode(),
+        capture_output=True, timeout=10)
+    return json.loads(result.stdout) if result.returncode == 0 else None
+
+
+def _cloud_session_user_id(repo: str, session: str) -> Optional[int]:
+    """The task list carries no session ids, so each task's sessions are read until this one
+    turns up. Newest first, and a session's own task is the newest one on the repo."""
+    tasks = (_github_api('agents/repos/%s/tasks' % repo) or {}).get('tasks') or []
+    for task in tasks[:CLOUD_ACTOR_TASK_SCAN]:
+        detail = _github_api('agents/repos/%s/tasks/%s' % (repo, task.get('id')))
+        for entry in (detail or {}).get('sessions') or []:
+            if entry.get('id') == session:
+                return (entry.get('user') or {}).get('id')
+    return None
+
+
+def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
+    """The login GitHub records for this session, which unlike the commit trailer the agent
+    cannot author. Asked once: this runs per turn, and a miss is cached or every turn re-asks."""
+    try:
+        cached = json.loads(CLOUD_ACTOR_CACHE_PATH.read_text(encoding='utf-8'))
+        if cached.get('session') == session:
+            return cached.get('login')
+    except Exception:
+        pass
+    login = None
+    try:
+        user_id = _cloud_session_user_id(repo, session)
+        if user_id:
+            login = ((_github_api('user/%s' % user_id) or {}).get('login') or '').strip() or None
+    except Exception as e:
+        log_error('cloud session actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
+    try:
+        CLOUD_ACTOR_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CLOUD_ACTOR_CACHE_PATH.write_text(
+            json.dumps({'session': session, 'login': login}), encoding='utf-8')
+    except Exception:
+        pass
+    return login
+
+
 def build_github_context() -> Optional[Dict]:
     """Cloud-agent provenance. None on a laptop, where the device identity applies."""
     if not RUNNING_CLOUD:
         return None
+    repo = os.environ.get('GITHUB_REPOSITORY')
+    session = os.environ.get('COPILOT_AGENT_SESSION_ID')
+    # GitHub's answer first: the trailer is only ever what the agent chose to write.
+    actor = _cloud_session_actor(repo, session) if repo and session else None
     context = {
-        'actor': _github_actor(),
-        'repo': os.environ.get('GITHUB_REPOSITORY'),
-        'session': os.environ.get('COPILOT_AGENT_SESSION_ID'),
+        'actor': actor or _github_actor(),
+        'repo': repo,
+        'session': session,
         'event': os.environ.get('COPILOT_JOB_EVENT_TYPE'),
     }
     return {key: value for key, value in context.items() if value} or None
