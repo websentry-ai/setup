@@ -61,9 +61,7 @@ class _IsolatedHome(unittest.TestCase):
             moved.start()
             self.addCleanup(moved.stop)
             moved_any = True
-        # If the module ever stops deriving these from the home directory this
-        # loop silently stops protecting anything, which is how the first
-        # attempt at this leaked into the real error.log.
+        # Fail loudly if nothing was redirected, rather than protect nothing.
         self.assertTrue(moved_any, 'no module paths were redirected; isolation is off')
         # The Stop tests reach _device_serial(probe=True), which shells out to
         # dmidecode before falling back. The rest of this suite stubs it for the
@@ -196,8 +194,7 @@ class AugmentMcpConfigShapes(_IsolatedHome):
     # ── the Stop-event door (end-of-turn analytics) ─────────────────────
 
     def test_stop_event_analytics_names_the_server(self):
-        """build_llm_exchange is the door the hook actually runs at end of turn;
-        asserting on the inner builder would not have caught a break here."""
+        """build_llm_exchange is the door the hook runs at end of turn."""
         self._write_settings({'augment': {'advanced': {'mcpServers': {SERVER: ENTRY}}}})
         ex = unbound.build_llm_exchange(
             self._stop_event(), self._post_log())
@@ -269,11 +266,8 @@ class AugmentMcpConfigShapes(_IsolatedHome):
         self.assertEqual((None, None, None), self._resolve())
 
     def test_the_cli_config_wins_over_vs_code_for_the_same_name(self):
-        """Sources are read CLI-first and the first definition of a name wins.
-        Widening the CLI reader therefore changes which config a machine with
-        both surfaces resolves to -- it used to fall through to VS Code when the
-        CLI file was unwrapped. CLI-first is the existing intent; this pins it.
-        """
+        """Sources are read CLI-first and the first definition wins, so a flat
+        CLI file beats VS Code for the same server name."""
         self._write_settings({SERVER: {'command': 'from-cli'}})     # flat
         base = unbound._vscode_user_dirs()[0].parent.parent
         vs = (base / 'Code' / 'User' / 'globalStorage' / 'augment.vscode-augment'
@@ -291,13 +285,9 @@ class AugmentMcpConfigShapes(_IsolatedHome):
     # ── the same file, parsed twice, in two repos ───────────────────────
 
     def test_the_discovery_client_reads_the_same_shapes(self):
-        """`~/.augment/settings.json` is parsed here AND by the discovery
-        client's `_extract_servers_obj`. Two parsers, one file: when they
-        disagree the inventory and the enforcement path describe different
-        machines, and nothing says so. That divergence is what this fix was.
-
-        Skips where the sibling repo is not checked out -- it is absent on CI.
-        """
+        """The discovery client parses this same file; when the two disagree,
+        inventory and enforcement describe different machines. Skips on CI,
+        where the sibling repo is absent."""
         import subprocess
         rel = ('scripts/coding_discovery_tools/macos/augment/'
                'augment_mcp_config_extractor.py')
@@ -339,14 +329,8 @@ class AugmentMcpConfigShapes(_IsolatedHome):
 
 
 class ThroughTheRealEntrypoint(_IsolatedHome):
-    """Augment runs the hook as a script: JSON on stdin, a decision on stdout.
-
-    Every other test here enters one level down, at process_pre_tool_use or
-    build_llm_exchange. That skips main() -- the stdin read, the dispatch on
-    hook_event_name, and the emit -- which is exactly the layer that changes
-    when output handling does. These drive main() itself; only the network
-    calls are stubbed, so the read and the emit run for real.
-    """
+    """Drives main() -- stdin, dispatch, emit -- as Augment runs the hook.
+    Only the network calls are stubbed."""
 
     def _run_main(self, event):
         import io
@@ -406,11 +390,8 @@ class ThroughTheRealEntrypoint(_IsolatedHome):
 
     # H3
     def test_a_deny_survives_a_hostile_config(self):
-        """An allow and main()'s blanket-except fallback emit the SAME output,
-        so an allow cannot show whether the hook reached a verdict. A deny can:
-        if reading the config ever raised out of process_pre_tool_use, main()
-        would emit its fallback and the deny would be dropped -- the tool runs
-        with nothing reported. A hostile settings file must not open that."""
+        """An allow and main()'s except-fallback emit identical output; only a
+        deny shows the hook reached a verdict rather than silently failing open."""
         path = self.home / '.augment' / 'settings.json'
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({
