@@ -71,6 +71,35 @@ class TestBuildExchangeJoinsPrompts(unittest.TestCase):
             stop_assistant_message="done")
         self.assertEqual(_user_messages(exchange), ["again\n\nagain"])
 
+    def test_duplicate_survives_a_tool_call_between_the_two_copies(self):
+        # A real turn interleaves tool calls; the two hook copies of the submit
+        # still share prompt_id and must collapse across the PostToolUse.
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="go", prompt_id="p1"),
+             _bash_call(TOOL_CALL),
+             _log("UserPromptSubmit", SECOND_PROMPT, prompt="go", prompt_id="p1")],
+            stop_assistant_message="done")
+        self.assertEqual(_user_messages(exchange), ["go"])
+
+    def test_triple_logged_submit_collapses_to_one(self):
+        # Three registered hooks (or a stuck extra) log the same submit.
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="hey", prompt_id="p1"),
+             _log("UserPromptSubmit", FIRST_PROMPT, prompt="hey", prompt_id="p1"),
+             _log("UserPromptSubmit", FIRST_PROMPT, prompt="hey", prompt_id="p1")],
+            stop_assistant_message="done")
+        self.assertEqual(_user_messages(exchange), ["hey"])
+
+    def test_without_prompt_id_the_double_log_is_not_deduped(self):
+        # Pre-v2.1.196 clients send no prompt_id. Text alone can't tell a double
+        # log from a real repeat, so build_llm_exchange leaves both — that client
+        # is fixed at the source by removing the duplicate hook registration.
+        exchange = unbound.build_llm_exchange(
+            [_log("UserPromptSubmit", FIRST_PROMPT, prompt="hi"),
+             _log("UserPromptSubmit", FIRST_PROMPT, prompt="hi")],
+            stop_assistant_message="done")
+        self.assertEqual(_user_messages(exchange), ["hi\n\nhi"])
+
     def test_a_typed_skill_in_the_earlier_prompt_is_recovered(self):
         # the queued prompt follows it, so a last-wins read would never see the slash
         with patch.object(unbound, "_resolve_skill_path",
@@ -174,6 +203,14 @@ class TestStopEventTurnAssembly(unittest.TestCase):
                          _log("UserPromptSubmit", SECOND_PROMPT, prompt="second"),
                          _log("Stop", FIRST_STOP)])
         self.assertEqual(out["ceiling"], FIRST_STOP)
+
+    def test_double_logged_submit_reports_one_prompt_end_to_end(self):
+        # Real Stop entrypoint: a submit logged by two hooks (same prompt_id)
+        # must reach the report as one prompt, not "now\n\nnow".
+        out = self._run([_log("UserPromptSubmit", FIRST_PROMPT, prompt="now", prompt_id="p1"),
+                         _log("UserPromptSubmit", FIRST_PROMPT, prompt="now", prompt_id="p1"),
+                         _log("Stop", FIRST_STOP)])
+        self.assertEqual(_user_messages(out["exchange"]), ["now"])
 
     def test_a_retained_stop_before_this_turn_is_the_floor(self):
         # audit-log trimming can retain a Stop that precedes this turn's first prompt
