@@ -214,6 +214,11 @@ class TestCopilotSeat(unittest.TestCase):
                                      "organization_login_list": ["zeta", "acme"]})
         self.assertEqual((plan, org), ("business", "acme"))
 
+    def test_the_plan_is_the_sku_when_github_sends_one(self):
+        (plan, _), _ = self._seat({"login": "octocat", "copilot_plan": "business",
+                                   "access_type_sku": "copilot_for_business_seat_quota"})
+        self.assertEqual(plan, "copilot_for_business_seat_quota")
+
     def test_a_personal_seat_has_no_org(self):
         (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "individual",
                                      "organization_login_list": []})
@@ -501,13 +506,27 @@ class TestCopilotUserCache(_IsolatedConfig):
         self.assertEqual((identity["plan"], identity["org_id"]), (None, None))
 
     def test_a_vscode_turn_reports_the_org_name_when_the_cache_has_it(self):
-        self._vscode(login="vs-user", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
-        self._user_cache("vs-user", orgs=["acme"])
+        self._vscode(login="vs-user", sku="copilot_for_business_seat_quota", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=["acme"])
         self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "acme")
 
     def test_a_vscode_turn_keeps_the_opaque_org_without_a_cache_entry(self):
         self._vscode(login="vs-user", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
         self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "3d1901ce21d7ca4bb9dd9818d628f3b5")
+
+    def test_a_cached_seat_that_disagrees_with_vscode_is_not_used(self):
+        """A former employer's cached business seat must not name the org of a current personal seat."""
+        self._vscode(login="vs-user", sku="free_educational_quota", orgs=[])
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=["old-employer"])
+        identity = unbound.read_account_identity(surface="vscode")
+        self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
+
+    def test_an_enterprise_host_cli_borrows_nothing(self):
+        self._write('{"lastLoggedInUser":{"host":"https://acme.ghe.com","login":"octocat"}}')
+        self._user_cache("octocat")
+        self._vscode(login="octocat")
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["account_login"], identity["plan"], identity["org_id"]), ("octocat", None, None))
 
     def test_an_unreadable_cache_is_logged_and_adds_nothing(self):
         self._write(SIGNED_IN)

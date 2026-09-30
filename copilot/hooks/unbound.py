@@ -1800,12 +1800,14 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
         login, plan, org = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
         host = 'https://github.com' if login else None
         if login:
-            org = _copilot_cached_seat(login)[1] or org
+            cached_plan, cached_org = _copilot_cached_seat(login)
+            if cached_org and cached_plan == plan:
+                org = cached_org
     elif surface == 'cloud':
         login, host = _copilot_login()
     else:
         login, host = _copilot_cli_account()
-        if login:
+        if login and urlparse(host or 'https://github.com').hostname == 'github.com':
             plan, org = _copilot_cached_seat(login)
             if not plan:
                 vscode_login, vscode_plan, vscode_org = _vscode_copilot_account()
@@ -2017,7 +2019,7 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     plan = org = None
     # Another account's token (a different gh login) must not lend its seat.
     if isinstance(seat, dict) and str(seat.get('login') or '').lower() == login.lower():
-        plan = seat.get('copilot_plan') if isinstance(seat.get('copilot_plan'), str) else None
+        plan = next((seat[k] for k in ('access_type_sku', 'copilot_plan') if isinstance(seat.get(k), str) and seat[k]), None)
         orgs = seat.get('organization_login_list')
         orgs = sorted(o for o in orgs if isinstance(o, str) and o) if isinstance(orgs, list) else []
         org = orgs[0] if orgs else None
