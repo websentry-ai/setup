@@ -43,8 +43,6 @@ class _IsolatedConfig(unittest.TestCase):
         env = patch.dict(os.environ, {})
         env.start()
         self.addCleanup(env.stop)
-        for var in unbound._COPILOT_CLI_TOKEN_VARS:
-            os.environ.pop(var, None)
         self.user_cache_path = Path(self._tmp.name) / "copilot-user-cache.json"
         user_cache = patch.object(unbound, "_copilot_user_cache_path", return_value=self.user_cache_path)
         user_cache.start()
@@ -214,6 +212,12 @@ class TestCopilotSeat(unittest.TestCase):
                                      "organization_list": [{"id": 202, "login": "zeta"}, {"id": 101, "login": "acme"}]})
         self.assertEqual((plan, org), ("business", "101"))
 
+    def test_the_org_is_one_that_grants_the_seat(self):
+        (_, org), _ = self._seat({"login": "octocat", "access_type_sku": "copilot_for_business_seat_quota",
+                                  "organization_login_list": ["acme"],
+                                  "organization_list": [{"id": 5, "login": "hobby"}, {"id": 101, "login": "acme"}]})
+        self.assertEqual(org, "101")
+
     def test_the_plan_is_the_sku_when_github_sends_one(self):
         (plan, _), _ = self._seat({"login": "octocat", "copilot_plan": "business",
                                    "access_type_sku": "copilot_for_business_seat_quota"})
@@ -380,16 +384,10 @@ class TestCopilotCliAccount(_IsolatedConfig):
         self._write(SIGNED_IN)
         self.assertEqual(unbound.read_account_identity(surface="cli")["account_login"], "octocat")
 
-    def test_an_env_token_overrides_the_stored_sign_in(self):
+    def test_an_env_token_does_not_hide_the_config_login(self):
         self._write(SIGNED_IN)
-        for var in unbound._COPILOT_CLI_TOKEN_VARS:
-            with self.subTest(var=var), patch.dict(os.environ, {var: "x"}):
-                self.assertIsNone(unbound.read_account_identity(surface="cli")["account_login"])
-
-    def test_a_cloud_turn_ignores_env_tokens(self):
-        self._write(SIGNED_IN)
-        with patch.dict(os.environ, {"GITHUB_TOKEN": "x"}):
-            self.assertEqual(unbound.read_account_identity(surface="cloud")["account_login"], "octocat")
+        with patch.dict(os.environ, {"GH_TOKEN": "x"}):
+            self.assertEqual(unbound.read_account_identity(surface="cli")["account_login"], "octocat")
 
 class TestCopilotUserCache(_IsolatedConfig):
     """Copilot caches GitHub's answer about each signed-in login; plan and org come from there."""

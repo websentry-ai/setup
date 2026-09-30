@@ -1636,16 +1636,6 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-_COPILOT_CLI_TOKEN_VARS = ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
-
-
-def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
-    """An env token overrides the stored sign-in."""
-    if any(os.environ.get(var) for var in _COPILOT_CLI_TOKEN_VARS):
-        return None, None
-    return _copilot_login()
-
-
 _COPILOT_USER_CACHE_MAX_BYTES = 1024 * 1024
 _COPILOT_USER_CACHE_MAX_AGE_SECONDS = 7 * 24 * 3600
 
@@ -1660,8 +1650,12 @@ def _copilot_user_cache_path() -> Optional[Path]:
 
 
 def _github_org_id(response: Dict) -> Optional[str]:
+    """The seat's org: organization_login_list names the orgs granting it, organization_list carries their IDs."""
     orgs = response.get('organization_list')
-    ids = sorted(o['id'] for o in orgs if isinstance(o, dict) and isinstance(o.get('id'), int)) if isinstance(orgs, list) else []
+    seat = response.get('organization_login_list')
+    seat = {o.lower() for o in seat if isinstance(o, str)} if isinstance(seat, list) and seat else None
+    ids = sorted(o['id'] for o in orgs if isinstance(o, dict) and isinstance(o.get('id'), int)
+                 and (seat is None or str(o.get('login') or '').lower() in seat)) if isinstance(orgs, list) else []
     return str(ids[0]) if ids else None
 
 
@@ -1769,7 +1763,7 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
     elif surface == 'cloud':
         login, host = _copilot_login()
     else:
-        login, host = _copilot_cli_account()
+        login, host = _copilot_login()
         if login and urlparse(host or 'https://github.com').hostname == 'github.com':
             plan, org = _copilot_cached_seat(login)
             if not plan:
