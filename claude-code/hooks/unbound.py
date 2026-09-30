@@ -891,6 +891,7 @@ def get_recent_user_prompts_for_session(
         return []
 
     prompts: List[str] = []
+    prev_prompt_id = None
     logs = load_existing_logs()
     for log in logs:
         log_session = log.get('session_id') or log.get('event', {}).get('session_id')
@@ -901,6 +902,14 @@ def get_recent_user_prompts_for_session(
             continue
         prompt = event.get('prompt')
         if prompt:
+            # Both hooks log one submit with Claude's shared prompt_id, so a
+            # repeat of the previous id is that duplicate. This list spans the
+            # whole session, so identical text alone can't tell a double-log from
+            # the same word typed in a later turn — dedupe only on prompt_id.
+            pid = event.get('prompt_id')
+            if pid is not None and pid == prev_prompt_id:
+                continue
+            prev_prompt_id = pid
             prompts.append(prompt)
 
     if prompts:
@@ -4902,6 +4911,7 @@ def _resolve_skill_path(skill: Optional[str], cwd: Optional[str]) -> Optional[st
 def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str] = None, transcript_assistant_messages: Optional[List[str]] = None, model: Optional[str] = None, usage: Optional[Dict] = None, request_initialized: Optional[str] = None, request_completed: Optional[str] = None, cwd: Optional[str] = None, queued_prompts: Optional[List[str]] = None) -> Optional[Dict]:
     messages = []
     user_prompts = []
+    prev_prompt_id = None
     assistant_tool_uses = []
 
     prompt_cwd = None
@@ -4929,7 +4939,14 @@ def build_llm_exchange(events: List[Dict], stop_assistant_message: Optional[str]
                 # repo-level skill when the agent was opened at a parent dir. Held per
                 # prompt: a turn can carry several, each submitted from its own directory.
                 prompt_cwd = event.get('cwd') or prompt_cwd
-                user_prompts.append((prompt, prompt_cwd or cwd))
+                # Several hooks log one submit with Claude's shared prompt_id, so a
+                # repeat of the previous id is that duplicate; drop it, or it joins
+                # with itself below as "<prompt>\n\n<prompt>".
+                pid = event.get('prompt_id')
+                is_dup = pid is not None and pid == prev_prompt_id
+                prev_prompt_id = pid
+                if not is_dup:
+                    user_prompts.append((prompt, prompt_cwd or cwd))
 
         elif hook_event_name == 'PostToolUse':
             tool_name = event.get('tool_name')
