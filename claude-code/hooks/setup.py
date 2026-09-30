@@ -932,6 +932,14 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
+def _is_unbound_binary_hook_command(command) -> bool:
+    """The managed hook runs the packaged binary from /opt/unbound. Require both
+    tokens, like the MDM strip path, so a foreign command that merely mentions the
+    binary name isn't mistaken for ours (which would wrongly skip the user hook)."""
+    command = command or ""
+    return "/opt/unbound/" in command and "unbound-hook" in command
+
+
 def _flat_managed_settings_has_unbound_hook(managed_dir: Path) -> bool:
     """The MDM install prefers a managed-settings.d/unbound.json drop-in but falls
     back to a flat managed-settings.json. The fallback is a managed Unbound hook
@@ -942,14 +950,20 @@ def _flat_managed_settings_has_unbound_hook(managed_dir: Path) -> bool:
         if not flat.exists():
             return False
         hooks = json.loads(flat.read_text(encoding="utf-8")).get("hooks", {})
-        return any(
-            "unbound-hook" in (hook.get("command") or "")
-            for groups in hooks.values() if isinstance(groups, list)
-            for group in groups
-            for hook in group.get("hooks", [])
-        )
     except Exception:
         return False
+    # managed-settings.json is shared with other policy, so one malformed entry
+    # must not abandon the scan before a real managed hook is seen.
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for hook in group.get("hooks", []):
+                if isinstance(hook, dict) and _is_unbound_binary_hook_command(hook.get("command")):
+                    return True
+    return False
 
 
 def check_enterprise_hooks_conflict() -> bool:

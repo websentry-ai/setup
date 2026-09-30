@@ -1244,5 +1244,29 @@ class TestEnterpriseHooksConflict(unittest.TestCase):
         }))
         self.assertFalse(self._conflict())
 
+    def test_command_with_token_but_not_our_path_is_not_a_conflict(self):
+        # A foreign command that merely mentions "unbound-hook" is not ours —
+        # matching it would wrongly skip the user hook.
+        (self.managed / "managed-settings.json").write_text(json.dumps({
+            "hooks": {"PreToolUse": [{"hooks": [
+                {"type": "command", "command": "/usr/local/bin/unbound-hook-lookalike"}
+            ]}]}
+        }))
+        self.assertFalse(self._conflict())
+
+    def test_a_malformed_entry_does_not_abandon_the_scan(self):
+        # A dirty/foreign entry earlier in the shared file must not stop us from
+        # finding a real managed hook after it.
+        (self.managed / "managed-settings.json").write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": ["not-a-dict", {"hooks": ["also-bad"]}],
+                "UserPromptSubmit": [{"hooks": [
+                    {"type": "command",
+                     "command": '"/opt/unbound/current/unbound-hook/unbound-hook" hook claude-code User'}
+                ]}],
+            }
+        }))
+        self.assertTrue(self._conflict())
+
     def test_unmanaged_box_is_not_a_conflict(self):
         self.assertFalse(self._conflict())
