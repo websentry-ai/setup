@@ -1811,6 +1811,11 @@ _cloud_actor_memo = {}
 
 def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
     """GitHub's REST API with the sandbox's own token. Never raises."""
+    # Anything but github.com may be Enterprise Server, whose token must not reach public
+    # GitHub; _copilot_seat refuses the same case. Unset is refused too: the lookup failing
+    # costs a name, sending an enterprise credential to a third party costs rather more.
+    if urlparse(os.environ.get('GITHUB_SERVER_URL') or '').hostname != 'github.com':
+        return None
     # Copilot's own token first, as _fetch_copilot_seat does: the sandbox always carries an
     # Actions GITHUB_TOKEN, and an installation token these routes reject would mask it.
     for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):

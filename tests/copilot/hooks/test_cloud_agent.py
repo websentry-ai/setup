@@ -257,17 +257,29 @@ class TestCloudSessionActor(unittest.TestCase):
         def run(argv, **kwargs):
             seen['auth'] = kwargs['input'].decode()
             return _Completed(b'{}')
-        env = {'COPILOT_GITHUB_TOKEN': 'copilot-tok', 'GITHUB_TOKEN': 'actions-tok'}
+        env = {'COPILOT_GITHUB_TOKEN': 'copilot-tok', 'GITHUB_TOKEN': 'actions-tok',
+               'GITHUB_SERVER_URL': 'https://github.com'}
         with patch.dict(unbound.os.environ, env, clear=True), \
                 patch.object(unbound.subprocess, 'run', run):
             unbound._github_api('user/7')
         self.assertIn('copilot-tok', seen['auth'])
 
     def test_no_token_asks_nothing(self):
-        with patch.dict(unbound.os.environ, {}, clear=True), \
+        with patch.dict(unbound.os.environ, {'GITHUB_SERVER_URL': 'https://github.com'}, clear=True), \
                 patch.object(unbound.subprocess, 'run',
                              side_effect=AssertionError('asked GitHub without a token')):
             self.assertIsNone(unbound._github_api('user/7'))
+
+    def test_an_enterprise_token_never_reaches_public_github(self):
+        """Enterprise Server issues its own credentials, and the lookup failing costs a name
+        while sending one to a third party costs rather more. An unset host is refused too."""
+        for server in ('https://github.acme-corp.com', ''):
+            with patch.dict(unbound.os.environ,
+                            {'GITHUB_SERVER_URL': server, 'COPILOT_GITHUB_TOKEN': 'ghes-tok'},
+                            clear=True), \
+                    patch.object(unbound.subprocess, 'run',
+                                 side_effect=AssertionError('sent %r token to github.com' % server)):
+                self.assertIsNone(unbound._github_api('user/7'))
 
 
 class TestCloudModeCannotBeTurnedOnByEnvironment(unittest.TestCase):
