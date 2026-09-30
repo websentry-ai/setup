@@ -5,8 +5,13 @@
 // `first_approval_check`, `pull_policies`, `user_prompts`) are intentionally absent from the type so
 // they cannot be added by accident.
 //
+// `account_identity` has since joined the type (parity with the Claude Code hook): optional, and
+// only ever set through `withAccountIdentity`, which forwards the six wire strings and nothing else.
+//
 // Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
 // future opencode adapter can reuse it unchanged.
+
+import type { AccountIdentity } from "./accountIdentity.ts";
 
 export interface PretoolMessage {
   role: "user";
@@ -50,6 +55,8 @@ export interface PretoolRequestBody {
    * suppressing approval logging would be wrong.
    */
   first_approval_check?: boolean;
+  /** Who pi is signed in as (`preToolUseHandler.ts` `account_identity`). Absent when unknown. */
+  account_identity?: AccountIdentity;
 }
 
 /** The four-value response enum (`DECISION`, `preToolUseHandler.ts:278-283`). */
@@ -87,6 +94,8 @@ export interface PretoolPayloadInput {
   lastUserPrompt?: string;
   /** Sets `pull_policies` on the body when true; when false or absent the key is omitted. */
   pullPolicies?: boolean;
+  /** The process's settled account identity, when known. */
+  accountIdentity?: AccountIdentity;
 }
 
 /**
@@ -106,4 +115,5 @@ export interface PromptPayloadInput {
   clientEntrypoint: string;
   hasUI: boolean;
   pullPolicies?: boolean;
+  accountIdentity?: AccountIdentity;
 }

@@ -15,7 +15,7 @@
 // Every user-facing string comes from `constants.ts`; none is retyped here.
 
 import {
-  CONFIRM_QUESTION_SUFFIX,
+  CONFIRM_QUESTION,
   CONFIRM_TITLE,
   DECLINED_REASON,
   DENY_PREFIX,
@@ -24,21 +24,30 @@ import {
   NO_UI_REASON,
 } from "../../core/src/constants.ts";
 import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
-import { NATIVE_FILE_TOOLS, buildPretoolPayload, resolveFilePath } from "../../core/src/payload.ts";
+import {
+  NATIVE_FILE_TOOLS,
+  auditToolInput,
+  buildPretoolPayload,
+  resolveFilePath,
+} from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
 import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
+import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import type { UiCtx } from "./ui.ts";
 
 /** The structural slice of `ExtensionContext` a decision needs (§A4). */
 export interface DecideCtx extends UiCtx {
   cwd: string;
   sessionManager: { getSessionId(): string };
-  /** `Model | undefined` in pi — the payload builder substitutes `'auto'`. */
-  model: { id: string } | undefined;
+  /**
+   * `Model | undefined` in pi — the payload builder substitutes `'auto'`. `provider` is read only by
+   * the account-identity lookup at `session_start`, to pick the matching `auth.json` entry.
+   */
+  model: { id: string; provider?: string } | undefined;
 }
 
 export interface DecideDeps {
@@ -71,8 +80,30 @@ export interface DecideDeps {
    *
    * Optional so 09-03's call sites compile untouched, and **called through `noteDecision`**, never
    * directly: an audit record must not be able to change a verdict.
+   *
+   * `tool_input` rides the same seam for the same reason: this function is the last place the live
+   * `event.input` is in scope, so it is the only place that can hand the record the allowlisted
+   * projection of it. What travels is `auditToolInput`'s output, never `event.input` itself.
    */
-  onDecision?: (entry: { tool_name: string; tool_use_id: string; decision: string }) => void;
+  onDecision?: (entry: DecisionEntry) => void;
+  /**
+   * The process's settled account identity, attached to the pretool body as `account_identity`.
+   * Never awaited here: a tool call does not wait on a profile lookup, so a call made before the
+   * lookup settles simply goes without it (the Python hook's pre-tool path reads a cache, likewise).
+   */
+  accountIdentity?: AccountIdentity;
+}
+
+/**
+ * What the decision seam hands the turn record. Structurally a `TurnToolCall` minus `ts`, but
+ * declared here rather than imported so `decide.ts` keeps no dependency on the store it feeds.
+ */
+export interface DecisionEntry {
+  tool_name: string;
+  tool_use_id: string;
+  decision: string;
+  /** Already allowlisted and capped by `auditToolInput`. Absent is allowed; raw input is not. */
+  tool_input?: Record<string, unknown>;
 }
 
 /**
@@ -84,10 +115,7 @@ export interface DecideDeps {
  * even when the outcome was a deny. Shared with `userBash.ts`, which has the same hazard and a worse
  * failure mode.
  */
-export function noteDecision(
-  deps: Pick<DecideDeps, "onDecision">,
-  entry: { tool_name: string; tool_use_id: string; decision: string },
-): void {
+export function noteDecision(deps: Pick<DecideDeps, "onDecision">, entry: DecisionEntry): void {
   noteSafe(() => deps.onDecision?.(entry));
 }
 
@@ -139,6 +167,12 @@ export async function decideToolCall(
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === undefined) return undefined;
 
+    // The audit projection, computed once for whichever branch below records the decision. Derived
+    // from the same `toolInput` and the same functions `buildPretoolPayload` uses, so the two agree by
+    // construction rather than by a comment — and computed here, because this is the last scope that
+    // has the live input at all.
+    const auditInput = auditToolInput(toolInput, command);
+
     const now = (deps.now ?? Date.now)();
     const state = deps.state ?? policyState;
 
@@ -170,6 +204,9 @@ export async function decideToolCall(
         tool_name: event.toolName,
         tool_use_id: event.toolCallId,
         decision: "skipped",
+        // Recorded on this path too: a skip is still a call the developer made, and the path it was
+        // made against is what makes the row readable.
+        tool_input: auditInput,
       });
       return undefined;
     }
@@ -195,6 +232,7 @@ export async function decideToolCall(
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       pullPolicies,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
 
     // `notifySafe` already swallows its own failures, and `policy.ts` wraps the call again: a notice
@@ -208,6 +246,7 @@ export async function decideToolCall(
       tool_name: event.toolName,
       tool_use_id: event.toolCallId,
       decision: outcome.kind,
+      tool_input: auditInput,
     });
 
     switch (outcome.kind) {
@@ -226,13 +265,12 @@ export async function decideToolCall(
       case "confirm": {
         if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
-        // Notified as well as asked, so the reason stays in the transcript after the dialog closes.
+        // The notice is where the reason is rendered — once. It also stays in the transcript after the
+        // dialog closes, which is why it is the copy that was kept when the dialog stopped repeating
+        // it: pi draws a confirm as `title\nmessage`, so a reason in both places was the same
+        // paragraph twice on one verdict.
         notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(
-          ctx,
-          CONFIRM_TITLE,
-          reason + CONFIRM_QUESTION_SUFFIX,
-        );
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
         return accepted ? undefined : { block: true, reason: DECLINED_REASON };
       }
 

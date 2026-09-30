@@ -35,6 +35,8 @@ export interface FakeCtxOptions {
   sessionId: string;
   /** `undefined` models the real `ctx.model: Model | undefined`. */
   modelId: string | undefined;
+  /** `ctx.model.provider`; omitted from the fake model when undefined. */
+  modelProvider: string | undefined;
   /** What `ui.confirm` resolves to. pi resolves `false` on dismiss, timeout and abort. */
   confirmResult: boolean;
 }
@@ -45,7 +47,7 @@ export interface FakeCtx {
   hasUI: boolean;
   signal: AbortSignal | undefined;
   sessionManager: { getSessionId(): string };
-  model: { id: string } | undefined;
+  model: { id: string; provider?: string } | undefined;
   ui: {
     confirm(title: string, message: string, opts?: FakeDialogOptions): Promise<boolean>;
     notify(message: string, type?: FakeNotifyType): void;
@@ -65,6 +67,7 @@ export function createFakeCtx(overrides: Partial<FakeCtxOptions> = {}): FakeCtx 
     signal: new AbortController().signal,
     sessionId: "session-abc",
     modelId: "claude-sonnet-4-5",
+    modelProvider: undefined,
     confirmResult: true,
     ...overrides,
   };
@@ -80,7 +83,12 @@ export function createFakeCtx(overrides: Partial<FakeCtxOptions> = {}): FakeCtx 
     sessionManager: {
       getSessionId: () => opts.sessionId,
     },
-    model: opts.modelId === undefined ? undefined : { id: opts.modelId },
+    model:
+      opts.modelId === undefined
+        ? undefined
+        : opts.modelProvider === undefined
+          ? { id: opts.modelId }
+          : { id: opts.modelId, provider: opts.modelProvider },
     ui: {
       async confirm(title, message, dialogOpts) {
         confirmCalls.push({ title, message, opts: dialogOpts });
@@ -271,6 +279,41 @@ export function createFakeToolResultEvent(
   };
   if (overrides.usage !== undefined) event.usage = overrides.usage;
   return event;
+}
+
+/** pi's `ThinkingContent` (pi-ai `types.d.ts:247-255`) - provider reasoning, never sent. */
+export interface FakeThinkingContent {
+  type: "thinking";
+  thinking: string;
+  thinkingSignature?: string;
+}
+
+/** pi's `ToolCall` content part (pi-ai `types.d.ts:261-269`). `arguments` is the RAW tool input. */
+export interface FakeToolCallContent {
+  type: "toolCall";
+  id: string;
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+/** The three part kinds an `AssistantMessage.content` array can hold (pi-ai `types.d.ts:353-355`). */
+export type FakeAssistantPart = FakeTextContent | FakeThinkingContent | FakeToolCallContent;
+
+/**
+ * `AssistantMessage` (pi-ai `types.d.ts:353-375`), reduced to the two fields a turn log reads.
+ *
+ * The real message carries `api`, `provider`, `model`, `usage`, `stopReason` and `timestamp` as well.
+ * They are omitted rather than faked because the rule in this file cuts one way only: a factory must
+ * not emit a key pi does not, so that a handler cannot read something here and find it missing at
+ * runtime. Emitting FEWER keys is safe, and `assistantTextFrom` reads exactly `role` and `content`.
+ */
+export function createFakeAssistantMessage(content: FakeAssistantPart[]): Record<string, unknown> {
+  return { role: "assistant", content };
+}
+
+/** The same for a `UserMessage` (pi-ai `types.d.ts:348-352`), whose `content` may be a bare string. */
+export function createFakeUserMessage(content: string | FakeContent[]): Record<string, unknown> {
+  return { role: "user", content };
 }
 
 /** `AgentEndEvent` (`types.d.ts:570-573`). */

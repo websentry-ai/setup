@@ -52,8 +52,11 @@ export const EVENT_NAME_SESSION_START = "session_start";
  * durable row and keep the heartbeat; `heartbeat.test.ts` is written to pass either way, so flipping
  * it needs no test edit. Bounded by `derive_hook_request_id` collapsing identical empty turns into one
  * row per session.
+ *
+ * Disabled 2026-09-28: the row renders in the console as an empty-prompt turn (nothing server-side
+ * distinguishes it from a real turn), and `setup_complete` already marks the device connected.
  */
-export const SESSION_PRESENCE_ROW_ENABLED = true;
+export const SESSION_PRESENCE_ROW_ENABLED = false;
 /**
  * HOOK-05's `event_name`. Matched server-side at `preToolUseHandler.ts:655`, which routes to
  * `handleGuardrails` — the one branch that can deny a prompt, and the one that deliberately omits
@@ -235,6 +238,17 @@ export const MAX_COMMAND_CHARS = 8192;
  */
 export const MAX_PROMPT_CHARS = 8192;
 /**
+ * The turn log's cap on assistant text (RES-04), kept at **both ends** like every other cap here.
+ *
+ * Twice `MAX_PROMPT_CHARS` deliberately: an answer is routinely longer than the question that
+ * prompted it — a long explanation, a file listing read back, a diff described in prose — and this
+ * value is not a guardrail input. Nothing matches against it and nothing decides on it; it is an
+ * audit column, so the cost of being generous is bytes on a fire-and-forget POST rather than a
+ * bypass. Past it the middle goes and `assistant_truncated` says so, because the opening and the
+ * conclusion are the two parts of a long answer a reviewer actually reads.
+ */
+export const MAX_ASSISTANT_CHARS = 16_384;
+/**
  * WR-04: the per-value cap on what survives `TOOL_INPUT_ALLOWLIST`. `pattern` is model-produced and
  * free-form, and the server truncates it at 4096 anyway (`effectiveCommand.ts:20 PATTERN_MAX`), so
  * 2 KB costs no enforcement and bounds what a single value can carry off the machine.
@@ -271,8 +285,19 @@ export const GENERIC_DENY_REASON = "Blocked by Unbound policy.";
 export const DECLINED_REASON = "Declined by user (Unbound policy)";
 /** Dialog title; pi renders a confirm as a Yes/No selector titled `title\nmessage` (§A5). */
 export const CONFIRM_TITLE = "Unbound policy";
-/** Appended after the API reason in the confirm body, so the dialog actually asks something. */
-export const CONFIRM_QUESTION_SUFFIX = "\n\nRun this command?";
+/**
+ * The confirm body, in full — the question and nothing else.
+ *
+ * It used to be a *suffix* appended to the API reason, which meant the reason was rendered twice for
+ * one verdict: once as the `warning` notification raised immediately before the dialog, and again
+ * inside the overlay, which pi draws as `title\nmessage` (§A5). The notification is the copy that
+ * stays (it survives after the dialog closes, and it is the channel that also survives `!!` on the
+ * `user_bash` path), so the dialog no longer repeats it and only has to ask.
+ *
+ * Both call sites still notify first. Removing the notice instead would have left the reason visible
+ * only while the modal was open.
+ */
+export const CONFIRM_QUESTION = "Run this command?";
 export const NO_UI_REASON =
   "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";
@@ -301,3 +326,45 @@ export const KEY_REJECTED_NOTICE = "Unbound: API key rejected — enforcement in
  */
 export const KEY_REJECTED_BLOCK_REASON =
   "Unbound API key rejected — this organisation enforces fail-closed; contact your admin";
+
+// --- Account identity (parity with the Claude Code hook's `account_identity`) ------------------
+
+/** pi's credential store, beside its own install: `<agent dir>/auth.json`. Read, never written. */
+export const PI_AUTH_FILE_NAME = "auth.json";
+/** A handful of provider entries. Anything bigger is not pi's auth file, and is not opened. */
+export const MAX_AUTH_FILE_BYTES = 65_536;
+/** The only provider whose OAuth token we know how to turn into an account. */
+export const ANTHROPIC_PROVIDER_ID = "anthropic";
+/** pi's credential `type` for a subscription sign-in. */
+export const PI_AUTH_TYPE_OAUTH = "oauth";
+/**
+ * The profile endpoint Claude Code itself uses. The token goes to its own issuer and nowhere else:
+ * this is the ONLY request that ever carries it, and redirects are refused so it cannot be bounced.
+ */
+export const ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile";
+export const ANTHROPIC_OAUTH_BETA_HEADER = "anthropic-beta";
+export const ANTHROPIC_OAUTH_BETA_VALUE = "oauth-2025-04-20";
+/** The profile answer is a small JSON object; a bigger body is ignored, not parsed. */
+export const MAX_PROFILE_BYTES = 65_536;
+/** Every identity field is a short label; anything longer is dropped rather than truncated. */
+export const MAX_IDENTITY_FIELD_CHARS = 320;
+/** One deadline for the profile call and for the serial probe, like the Python hook's `timeout=10`. */
+export const ACCOUNT_IDENTITY_TIMEOUT_MS = 10_000;
+/** `auth_mode` vocabulary, identical to what the Claude Code hook sends. */
+export const AUTH_MODE_SUBSCRIPTION = "subscription";
+export const AUTH_MODE_API_KEY = "api_key";
+/** Enough for `system_profiler SPHardwareDataType`; anything bigger is killed and ignored. */
+export const MAX_SERIAL_PROBE_BYTES = 1_048_576;
+/** The per-install fallbacks the Python hook reads on Linux when `dmidecode` is unavailable. */
+export const LINUX_MACHINE_ID_PATHS = ["/etc/machine-id", "/var/lib/dbus/machine-id"] as const;
+/**
+ * DMI/BIOS placeholders that come back with a zero exit code on VMs and OEM boards. Mapping them to a
+ * serial would put many machines on one fake device, so they read as "no serial" (`unbound.py`).
+ */
+export const PLACEHOLDER_SERIALS: readonly string[] = [
+  "", "0", "00000000", "000000000", "0000000000", "none", "na", "n/a",
+  "unknown", "default", "default string", "to be filled by o.e.m.",
+  "to be filled by oem", "system serial number", "serial number",
+  "not applicable", "not specified", "not available", "oem", "o.e.m.",
+  "invalid", "123456789", "xxxxxxxx",
+];

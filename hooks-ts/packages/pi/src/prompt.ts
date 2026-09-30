@@ -40,6 +40,7 @@ import {
   ENGINE_UNAVAILABLE_REASON,
   GENERIC_DENY_REASON,
 } from "../../core/src/constants.ts";
+import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
 import { buildPromptPayload } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
 import { noteSafe } from "./decide.ts";
@@ -56,7 +57,7 @@ export interface InputLike {
 export interface InputCtx extends UiCtx {
   cwd: string;
   sessionManager: { getSessionId(): string };
-  model: { id: string } | undefined;
+  model: { id: string; provider?: string } | undefined;
 }
 
 export interface InputDeps {
@@ -76,6 +77,8 @@ export interface InputDeps {
    * silently proceeding.
    */
   onPrompt?: (text: string) => void;
+  /** The process's settled account identity, when known. Never awaited on this path. */
+  accountIdentity?: AccountIdentity;
 }
 
 /** What pi reads back: suppress the turn, or say nothing. */
@@ -98,6 +101,7 @@ export async function decideInput(
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
       hasUI: ctx.hasUI,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
 
     const hooks: CheckHooks =

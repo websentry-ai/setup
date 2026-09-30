@@ -36,8 +36,8 @@ import type { MockApi } from "./helpers/mockApi.ts";
 // The repo's only pure clock (09-00); it has no imports of its own, so this borrows a fixture, not a
 // dependency on the pi package.
 import { createFakeClock } from "../../pi/test/helpers/fakeCtx.ts";
+import { TEST_KEY } from "./helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const TIMEOUT_MS = 50;
 
 function payload(): PretoolRequestBody {

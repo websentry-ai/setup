@@ -55,8 +55,20 @@ import { homedir } from "node:os";
 
 import type { ExtensionAPI, ExtensionFactory } from "@earendil-works/pi-coding-agent";
 
+import { createAccountIdentityLoader } from "../../core/src/accountIdentity.ts";
+import type {
+  AccountIdentity,
+  AccountIdentityLoader,
+  AccountIdentityLoaderOptions,
+} from "../../core/src/accountIdentity.ts";
 import { createBreaker } from "../../core/src/breaker.ts";
-import { keyFingerprint, readCache, resolveCachePath, writeCache } from "../../core/src/cache.ts";
+import {
+  keyFingerprint,
+  readCache,
+  resolveCachePath,
+  resolvePiAgentDir,
+  writeCache,
+} from "../../core/src/cache.ts";
 import { createApiClient } from "../../core/src/client.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import {
@@ -108,6 +120,19 @@ function safeCwd(ctx: { cwd: string }): string {
 }
 
 /**
+ * `ctx.model.provider`, read behind a guard. Only the account-identity lookup uses it, to pick the
+ * `auth.json` entry the session is actually signed in with.
+ */
+function modelProviderOf(ctx: { model?: { provider?: unknown } | undefined }): string | undefined {
+  try {
+    const provider = ctx.model?.provider;
+    return typeof provider === "string" && provider.length > 0 ? provider : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * `"pi/0.87.1"` → `"0.87.1"`, for `metadata.pi_version`.
  *
  * Derived from the resolved entrypoint rather than resolved a second time: two independent lookups
@@ -142,6 +167,11 @@ export interface Deps {
    * whose cases each expect a cold gate would be silently order-dependent.
    */
   heartbeatGate: HeartbeatGate;
+  /**
+   * Seams for the account-identity lookup (profile URL, fetch, serial probe, deadline). The agent dir
+   * is NOT among them: it is always resolved from `env` / `homeDir`, exactly like the policy cache.
+   */
+  identity: Omit<AccountIdentityLoaderOptions, "agentDir">;
 }
 
 interface Resolved {
@@ -271,7 +301,29 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
       overrides.makeChecker ?? ((apiKey, baseUrl) => defaultMakeChecker(apiKey, baseUrl, env, homeDir)),
     entrypoint: overrides.entrypoint,
     heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate,
+    identity: overrides.identity ?? {},
   };
+
+  /**
+   * Account identity (parity with the Claude Code hook's `account_identity`). Built here, but it
+   * touches nothing until `session_start` calls `start()` — the factory stays free of work (§A1).
+   * One loader per extension instance, i.e. one lookup per process; `/reload` re-derives it, like
+   * every other module-scope latch.
+   */
+  const identityLoader: AccountIdentityLoader = createAccountIdentityLoader({
+    ...deps.identity,
+    agentDir: resolvePiAgentDir(env, homeDir),
+  });
+
+  /** The settled identity as a spreadable option: `{}` while pending or when there is none. */
+  function identityOption(): { accountIdentity?: AccountIdentity } {
+    try {
+      const identity = identityLoader.current();
+      return identity === undefined ? {} : { accountIdentity: identity };
+    } catch {
+      return {};
+    }
+  }
 
   let resolved: Resolved | undefined;
   let notified = false;
@@ -345,22 +397,36 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         // the developer is trying to start.
         if (state.apiKey === undefined || state.client === undefined) return undefined;
         if (keyState.isInactive()) return undefined;
+        // Fired, never awaited here: the promise settles within its own deadline and is cached, so
+        // every later `session_start` gets the same one back. Started before the heartbeat gate so a
+        // process whose gate is already closed (a `/reload`) still learns who it is signed in as.
+        const identityPending = identityLoader.start(modelProviderOf(ctx));
         if (!deps.heartbeatGate.shouldSend(policyState.getFetchedAt())) return undefined;
         // Claimed BEFORE dispatch, like `telemetry.ts`'s rate-limit window: two `session_start`
         // events in the same tick must not both get through.
         deps.heartbeatGate.markSent();
 
-        const payload = buildHeartbeatPayload({
+        // Read from `ctx` now, while this handler still owns it; only the identity is waited for.
+        const heartbeatInput = {
           cwd: safeCwd(ctx),
           sessionId: sessionIdOf(ctx),
           model: ctx.model?.id,
           clientEntrypoint: state.entrypoint,
           hasUI: ctx.hasUI === true,
           piVersion: versionOf(state.entrypoint),
-        });
+        };
         const client = state.client;
-        void client
-          .postPretool(payload)
+        // The heartbeat waits for the identity (bounded by its deadline) so the session's first
+        // contact carries the account; `session_start` itself returns immediately.
+        void identityPending
+          .then((identity) =>
+            client.postPretool(
+              buildHeartbeatPayload({
+                ...heartbeatInput,
+                ...(identity === undefined ? {} : { accountIdentity: identity }),
+              }),
+            ),
+          )
           .then((result) => {
             // The response warms `policy_check_failure_action` only. `recordSuccess` is what
             // structurally refuses to stamp tools-freshness for a body with no `tools_to_check`
@@ -413,6 +479,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          ...identityOption(),
           // Bound to the LIVE ctx at the registration, so 09-02's breaker-open and key-rejected
           // notices — raised deep inside `checkTool` — actually reach the editor on this path.
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
@@ -463,7 +530,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         return handleAgentEnd(event, ctx, {
           client: state.client,
           store: turnStore,
+          ...(state.apiKey === undefined ? {} : { apiKey: state.apiKey }),
           ...(state.telemetry === undefined ? {} : { telemetry: state.telemetry }),
+          ...identityOption(),
         });
       } catch {
         // Telemetry is never worth a diagnostic on the developer's screen.
@@ -479,6 +548,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          ...identityOption(),
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
           onDecision: (entry) => {
             if (recordingActive(state)) turnStore.recordToolCall(entry, sessionIdOf(ctx));
@@ -500,6 +570,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           checker: state.checker,
           apiKey: state.apiKey,
           entrypoint: state.entrypoint,
+          ...identityOption(),
           hooks: { notify: (message, level) => notifySafe(ctx, message, level) },
           // The turn log's only source for the prompt: `agent_end.messages` is pi's `newMessages`
           // and never contains it (§A4). Called for an ALLOWED prompt only — a suppressed turn

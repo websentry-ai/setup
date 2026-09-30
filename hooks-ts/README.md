@@ -35,8 +35,9 @@ reviewer can see at a glance where pi is at parity and where an event simply has
 | `user_bash` — the `!cmd` / `!!cmd` shell escape | the user's own command, blocked by returning a synthetic non-zero `BashResult` (the event has no `block` field); `tool_use_id` is `ubash_` + 20 hex | *no equivalent* — Claude Code has no user shell escape | *no equivalent* |
 | `input` — the typed prompt | the prompt text; a deny suppresses the turn entirely (`{action:"handled"}`) and a red notification is the user's only feedback channel | `UserPromptSubmit` | `beforeSubmitPrompt` |
 | `tool_result` | audits every result as name + `isError` + a sha256 digest + a byte count. Returns `undefined` on every path, so it can never rewrite what the model reads | `PostToolUse` | `afterShellExecution`, `afterFileEdit` |
-| `agent_end` | one best-effort turn log to `/v1/hooks/pi` per finished turn, dispatched without being awaited because pi gates run settlement on this handler | `Stop` | `stop`, `afterAgentResponse` |
+| `agent_end` | one best-effort turn log to `/v1/hooks/pi` per finished turn, dispatched without being awaited because pi gates run settlement on this handler. Carries the prompt, the model's own text (`text` parts only — never `thinking`, never `toolCall` arguments; 16 KB cap, both ends kept), and per `tool_use[]` entry the **same** allowlisted, capped `tool_input` the pretool check carried (`command`, `path`, `pattern` — never a file body) plus the sha256 of the output, never the output | `Stop` | `stop`, `afterAgentResponse` |
 | `session_start` | resolves the key, announces the session once per process, and warms the fail-open opt-out. Fires again on `/new`, `/resume`, `/fork`, `/clone`, `/reload` — the heartbeat is still sent once per process | `SessionStart` | `sessionStart` |
+| account identity (rides the `session_start` heartbeat, every tool and prompt check, and the turn log as `account_identity`) | email/org/plan for Anthropic OAuth via the same profile endpoint Claude Code uses (`plan` is the organisation type, e.g. `claude_max`; `auth_mode: "subscription"`); `auth_mode: "api_key"` only for API-key providers — no email is knowable there; `device_serial` probed like the Python hook. Read from pi's `<agent dir>/auth.json`, looked up once per process at `session_start` without delaying it (10 s deadline). The token is sent only to its issuer (`api.anthropic.com`, redirects refused) — never to Unbound, never logged or written. A missing or corrupt `auth.json` sends no `account_identity` at all | `read_account_identity` + `_device_serial` | `read_account_identity` |
 
 Two pi events that the other integrations have no analogue for are also the two that carry the most
 pi-specific risk: `user_bash` fails **closed and silently** if a handler throws, and `agent_end`
@@ -48,8 +49,11 @@ statement.
 Shipped knowingly, each with its owner and evidence, in
 **[`docs/SPIKES.md`](docs/SPIKES.md) → Intentional parity gaps**. In short:
 
-- **Tool-output and assistant-text DLP cannot fire for pi.** `tool_result` sends a digest, not the
-  output, and the turn record holds no assistant text — so there is nothing for DLP to match on.
+- **Tool-output DLP cannot fire for pi.** `tool_result` sends a sha256 digest and a byte count, never
+  the output, so there is nothing for DLP to match on. Assistant text is no longer part of this gap:
+  the turn log carries the model's own text (16 KB cap, both ends kept), and tool input carries the
+  allowlisted keys — `command`, `path`, `pattern` — that the pretool check is evaluated on. File
+  bodies (`content`, `edits`) are in neither.
 - **Prompt templates are checked unexpanded.** `input` fires before expansion, so `/name args` is
   checked as the literal text typed, not as what it becomes.
 - **Slash commands never reach the `input` handler.** Built-ins and extension commands are
@@ -67,7 +71,7 @@ enforces independently under its own `conversation_id`. Both verified — see `d
 | --- | --- |
 | `allow` | nothing — the tool runs, and `event.input` is never modified |
 | `deny` | the tool is blocked; the model reads `Blocked by Unbound policy: <reason>`, and the reason is also shown as an error notification |
-| `ask` / `approval_required` | a `Unbound policy` Yes/No dialog with the reason; accepting runs the tool, anything else blocks with `Declined by user (Unbound policy)` |
+| `ask` / `approval_required` | the reason is shown once, as a warning notification; then a `Unbound policy` Yes/No dialog whose body is just `Run this command?` — it does not repeat the reason, which pi would have rendered as the same paragraph twice. Accepting runs the tool, anything else blocks with `Declined by user (Unbound policy)` |
 | API unreachable | the tool runs (see the fail-open contract), unless the organisation opted into block-on-failure |
 | API key rejected | after two consecutive 401/403s: a fail-open organisation is told once (`Unbound: API key rejected — enforcement inactive`) and the session then makes no further requests, so nothing is enforced until `/reload`. An organisation that opted into block-on-failure is **not** deactivated — every call blocks with `Unbound API key rejected — this organisation enforces fail-closed; contact your admin`, requests keep being made, and enforcement resumes on the first success |
 

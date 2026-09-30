@@ -27,7 +27,7 @@ import { randomBytes } from "node:crypto";
 import type { UserBashEvent, UserBashEventResult } from "@earendil-works/pi-coding-agent";
 
 import {
-  CONFIRM_QUESTION_SUFFIX,
+  CONFIRM_QUESTION,
   CONFIRM_TITLE,
   DECLINED_REASON,
   DENY_PREFIX,
@@ -36,7 +36,7 @@ import {
   NO_UI_REASON,
   USER_BASH_ID_PREFIX,
 } from "../../core/src/constants.ts";
-import { buildPretoolPayload } from "../../core/src/payload.ts";
+import { auditToolInput, buildPretoolPayload } from "../../core/src/payload.ts";
 import type { CheckHooks } from "../../core/src/policy.ts";
 import { denyBashResult } from "./bashResult.ts";
 import { noteDecision } from "./decide.ts";
@@ -92,6 +92,7 @@ export async function decideUserBash(
       sessionId: ctx.sessionManager.getSessionId(),
       model: ctx.model?.id,
       clientEntrypoint: deps.entrypoint,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
     });
 
     const hooks: CheckHooks =
@@ -100,7 +101,14 @@ export async function decideUserBash(
     // A typed `!cmd` is a real tool call in the audit trail, so it belongs in the turn record on the
     // same terms — `noteDecision` swallows its own failures, which matters more here than anywhere:
     // a throw out of this function means the command silently never runs (§A1.2).
-    noteDecision(deps, { tool_name: "bash", tool_use_id: toolUseId, decision: outcome.kind });
+    noteDecision(deps, {
+      tool_name: "bash",
+      tool_use_id: toolUseId,
+      decision: outcome.kind,
+      // `{}` in, so the only key out is the capped `command` — which is the entire content of a
+      // `!cmd`, and what the audit row would otherwise have described as an unnamed bash call.
+      tool_input: auditToolInput({}, command),
+    });
 
     switch (outcome.kind) {
       case "allow":
@@ -115,12 +123,11 @@ export async function decideUserBash(
       case "confirm": {
         if (!ctx.hasUI) return denyBashResult(NO_UI_REASON);
         const reason = outcome.reason ?? GENERIC_DENY_REASON;
+        // See `decide.ts`: the notice carries the reason, the dialog asks the question. On this path
+        // the notice matters more still — it is what survives `!!`, which keeps the rendered output
+        // out of the model's context.
         notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(
-          ctx,
-          CONFIRM_TITLE,
-          reason + CONFIRM_QUESTION_SUFFIX,
-        );
+        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
         return accepted ? undefined : denyBashResult(DECLINED_REASON);
       }
 

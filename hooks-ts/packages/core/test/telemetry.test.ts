@@ -23,8 +23,8 @@ import { createTelemetry } from "../src/telemetry.ts";
 import type { BypassContext } from "../src/telemetry.ts";
 import { startMockApi } from "./helpers/mockApi.ts";
 import type { CapturedRequest, MockApi, MockErrorsMode } from "./helpers/mockApi.ts";
+import { TEST_KEY } from "./helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const START_MS = 1_700_000_000_000;
 
 interface Harness {

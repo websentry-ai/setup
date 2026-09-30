@@ -29,6 +29,7 @@ def env(tmp_path, monkeypatch):
     home.mkdir()
     notified = []
     backfilled = []
+    bounded = []
     modules = {}
     for tool in ("claude-code", "cursor", "codex", "copilot", "augment"):
         m = load_mdm_setup_module(tool)
@@ -44,6 +45,9 @@ def env(tmp_path, monkeypatch):
         if hasattr(m, "run_backfill"):
             monkeypatch.setattr(m, "run_backfill",
                                 lambda *a, **k: backfilled.append(a))
+        if hasattr(m, "_run_backfill_bounded"):
+            monkeypatch.setattr(m, "_run_backfill_bounded",
+                                lambda *a, t=tool, **k: (bounded.append(t), backfilled.append(a)))
         if hasattr(m, "set_env_var_system_wide"):
             monkeypatch.setattr(m, "set_env_var_system_wide", lambda n, v: (True, False))
         if hasattr(m, "set_env_var"):
@@ -71,7 +75,7 @@ def env(tmp_path, monkeypatch):
     discovery_bin.chmod(0o755)
     monkeypatch.setattr(setup_cmd, "DISCOVERY_BINARY", discovery_bin)
     return {"tmp": tmp_path, "home": home, "modules": modules,
-            "notified": notified, "backfilled": backfilled, "bootouts": bootouts}
+            "notified": notified, "backfilled": backfilled, "bounded": bounded, "bootouts": bootouts}
 
 
 def _cmd(tool, event):
@@ -230,6 +234,13 @@ def test_setup_backfill_flag_runs_backfill_for_supporting_tools(env):
     assert len(env["backfilled"]) == 3
     copilot_args = next(args for args in env["backfilled"] if len(args) == 4)
     assert "def read_copilot_mcp_servers" in copilot_args[3]
+
+
+def test_claude_code_backfill_goes_through_the_time_bounded_wrapper(env):
+    """Unbounded, a heavy Claude Code history held `unbound-hook setup` open past the
+    MDM policy's own timeout; the bounded wrapper soft-stops and hard-kills in time."""
+    assert setup_cmd.run(["--api-key", "admin-key", "--backfill"]) == 0
+    assert env["bounded"] == ["claude-code"]
 
 
 def test_setup_requires_api_key(env, capsys):

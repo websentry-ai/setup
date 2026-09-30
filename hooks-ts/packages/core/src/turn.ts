@@ -5,7 +5,10 @@
 //   * **No raw tool output.** A result is recorded as a tool name, an `isError` flag, a sha256 of a
 //     canonical projection and a byte count. The content itself is read once, projected, hashed and
 //     dropped; it is never stored, never serialised and never written anywhere. That is the whole
-//     requirement, and `turn.test.ts` proves it by grepping `snapshot()` for a marker string.
+//     requirement, and `turn.test.ts` proves it by grepping `snapshot()` for a marker string. Tool
+//     *input* is a different question and answered differently: a call stores the allowlisted
+//     projection the pretool request already sent (`tool_input`), because that is what makes the row
+//     say which command ran. Nothing here does the allowlisting — see that field.
 //   * **No `model`.** 09-CONTEXT's record shape lists one, and it is deliberately omitted here: the
 //     wire value is pinned to `TURNLOG_MODEL` (`"auto"`) because the backend drops the row for any id
 //     that is not an enabled `AIModel` (`add_gateway_metrics_task.py:565-577`). Keeping a real model
@@ -71,6 +74,18 @@ export interface TurnToolCall {
   /** The `PolicyOutcome.kind` that actually applied, or `"skipped"` for a cache-skipped file tool. */
   decision: string;
   ts: number;
+  /**
+   * The **already-sanitised** tool input, as `payload.ts`'s `auditToolInput` produced it: the
+   * allowlisted keys plus the capped `command`, and never a file body.
+   *
+   * Sanitised by the caller, not here, and that is the contract — this module holds no allowlist and
+   * must not grow one. The decision seam is the only place that still has the live `event.input`, so
+   * it is the only place that can project it; by the time a value reaches this field it is already
+   * the same thing the pretool request sent. Absent means the call was recorded without one (a
+   * cache-skipped file tool has no command and may have no allowlisted key either), which the turn
+   * log sends as `{}`.
+   */
+  tool_input?: Record<string, unknown>;
   /**
    * The session this call actually happened in (WR-04). Never sent — it exists so a record can be
    * *attributed* rather than merely dropped: the whole-record rollover keys on `record.session_id`,
@@ -300,6 +315,14 @@ export function createTurnStore(): TurnStore {
           decision: typeof entry.decision === "string" ? entry.decision : "",
           ts: now,
         };
+        // Copied, not referenced: the caller's object is derived from pi's live `event.input`, and a
+        // record that aliased it would describe whatever that object became later rather than what
+        // was actually checked. A non-object is not stored at all — an audit field is either the
+        // sanitised projection or absent, never junk.
+        const input = entry.tool_input;
+        if (input !== null && typeof input === "object" && !Array.isArray(input)) {
+          stored.tool_input = { ...input };
+        }
         // Stamped at record time, from the id this call was actually made under — not read back off
         // the record, which may carry an older session's id or none at all.
         const incoming = idOf(sessionId);
@@ -373,7 +396,14 @@ export function createTurnStore(): TurnStore {
 
     snapshot(): TurnRecord {
       const copy: TurnRecord = {
-        tool_calls: record.tool_calls.map((entry) => ({ ...entry })),
+        // `tool_input` is spread a second time so the copy is deep ENOUGH: its values are scalars by
+        // construction (`sanitizeToolInput` forwards nothing else), so one more level is the whole
+        // object. Without it, `snapshot()` handed callers a live reference into the record.
+        tool_calls: record.tool_calls.map((entry) =>
+          entry.tool_input === undefined
+            ? { ...entry }
+            : { ...entry, tool_input: { ...entry.tool_input } },
+        ),
         results: record.results.map((entry) => ({ ...entry })),
       };
       if (record.prompt !== undefined) copy.prompt = record.prompt;

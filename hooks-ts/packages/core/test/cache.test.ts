@@ -38,10 +38,11 @@ import type { CachedPolicy, CacheIdentity } from "../src/cache.ts";
 import { NATIVE_FILE_TOOLS } from "../src/payload.ts";
 import { createPolicyState } from "../src/policyState.ts";
 import { createFakeHome } from "./helpers/fakeHome.ts";
+import { TEST_KEY } from "./helpers/testKey.ts";
 
 const GATEWAY = "https://api.getunbound.ai";
 const OTHER_GATEWAY = "https://api.getunbound.ai/tenant-a";
-const KEY = "unb_test_key_1234567890";
+const KEY = TEST_KEY;
 const NOW = 1_700_000_000_000;
 
 function identityFor(gatewayUrl = GATEWAY, apiKey = KEY): CacheIdentity {

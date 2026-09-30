@@ -5,14 +5,17 @@
 //   * `model === "auto"`. `add_gateway_metrics_task.py:565-577` returns early on `"Model Not found"`
 //     and hook telemetry never takes the `add_new_model` path, so a real model id means **no row at
 //     all**. The test passes a real id in and asserts `"auto"` comes out.
-//   * nothing in `tool_use[]` carries content. `tool_input` is `{}` and `tool_response` holds a
-//     digest and a byte count — the serialised body is grepped for both a marker and the key names
-//     that would mean file bodies had come back.
+//   * nothing in `tool_use[]` carries content. `tool_input` carries the SAME allowlisted projection
+//     the pretool request sends — `command`, `path`, `pattern` — and `tool_response` holds a digest
+//     and a byte count. The serialised body is grepped for a marker and for the two key names that
+//     would mean file bodies had come back (`content`, `edits`), and asserted to contain the three
+//     that must be there.
 
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { TURNLOG_MODEL } from "../src/constants.ts";
+import { MAX_ASSISTANT_CHARS, TURNLOG_MODEL } from "../src/constants.ts";
+import { COMMAND_TRUNCATION_MARKER } from "../src/payload.ts";
 import { buildTurnLogBody, shouldPostTurn } from "../src/turnLog.ts";
 import type { TurnRecord } from "../src/turn.ts";
 
@@ -26,7 +29,15 @@ function record(overrides: Partial<TurnRecord> = {}): TurnRecord {
     prompt: "read the config and summarise it",
     session_id: "sess-turnlog-1",
     started_at: STARTED_AT,
-    tool_calls: [{ tool_name: "read", tool_use_id: "call_1", decision: "allow", ts: STARTED_AT + 5 }],
+    tool_calls: [
+      {
+        tool_name: "read",
+        tool_use_id: "call_1",
+        decision: "allow",
+        ts: STARTED_AT + 5,
+        tool_input: { path: "/etc/app/config.yaml" },
+      },
+    ],
     results: [
       {
         tool_name: "read",
@@ -41,6 +52,9 @@ function record(overrides: Partial<TurnRecord> = {}): TurnRecord {
 }
 
 const build = (rec: TurnRecord) => buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT });
+/** The same, with the assistant text `agent_end` extracted from its messages. */
+const buildWith = (rec: TurnRecord, assistantText: string | undefined) =>
+  buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT, assistantText });
 
 // --- the locked model ---------------------------------------------------------------------------
 
@@ -73,8 +87,58 @@ test("the body is two messages: the user prompt, then an assistant message carry
   assert.equal(body.messages[0]?.role, "user");
   assert.equal(body.messages[0]?.content, "read the config and summarise it");
   assert.equal(body.messages[1]?.role, "assistant");
-  assert.equal(body.messages[1]?.content, "", "no assistant text is recorded, so none is invented");
+  assert.equal(body.messages[1]?.content, "", "no assistant text was passed, so none is invented");
   assert.equal(body.messages[1]?.tool_use?.length, 1);
+});
+
+// --- the assistant text ---------------------------------------------------------------------------
+//
+// It used to be hard-coded `""`, on the reasoning that the turn record holds no assistant text and
+// inventing one would be new egress. The record still holds none — it is read off `agent_end`'s
+// messages and passed straight through this builder, never stored and never logged — but the row is
+// what a reviewer reads, and one that showed the user's prompt and a silent assistant described half a
+// conversation.
+
+test("assistant text arrives verbatim in the assistant message", () => {
+  const body = buildWith(record(), "I read the config. It sets two replicas.");
+
+  assert.equal(body.messages[1]?.role, "assistant");
+  assert.equal(body.messages[1]?.content, "I read the config. It sets two replicas.");
+  assert.equal(body.messages[1]?.tool_use?.length, 1, "and the tool_use array is still there");
+  assert.equal(body.assistant_truncated, undefined, "nothing was capped, so nothing is claimed");
+});
+
+test("no assistant text is the empty string, exactly as before", () => {
+  for (const text of [undefined, "", 42 as unknown as string, {} as unknown as string]) {
+    const body = buildWith(record(), text);
+    assert.equal(body.messages[1]?.content, "", `${JSON.stringify(text)} became the content`);
+    assert.equal(body.messages.length, 2, "the two-message shape the server reads is preserved");
+    assert.equal(body.assistant_truncated, undefined);
+  }
+});
+
+test("assistant text past MAX_ASSISTANT_CHARS keeps both ends, with the marker and a flag", () => {
+  // Both ends for the same reason a command keeps both: the interesting part of a long answer is as
+  // likely to be the conclusion as the opening, and a head-only cut would always lose one of them.
+  const head = "HEAD_OF_THE_ANSWER";
+  const tail = "TAIL_OF_THE_ANSWER";
+  const text = head + "z".repeat(40_000) + tail;
+  const body = buildWith(record(), text);
+  const content = body.messages[1]?.content ?? "";
+
+  assert.equal(content.length, MAX_ASSISTANT_CHARS, "capped to exactly the cap");
+  assert.equal(MAX_ASSISTANT_CHARS, 16_384, "the cap is stated here so a change to it is deliberate");
+  assert.ok(content.startsWith(head), "the opening survives");
+  assert.ok(content.endsWith(tail), "and so does the conclusion");
+  assert.ok(content.includes(COMMAND_TRUNCATION_MARKER), "spliced with the existing marker");
+  assert.equal(body.assistant_truncated, true, "and the row says it is a prefix-plus-suffix");
+});
+
+test("assistant text just under the cap is sent whole and unflagged", () => {
+  const text = "a".repeat(MAX_ASSISTANT_CHARS);
+  const body = buildWith(record(), text);
+  assert.equal(body.messages[1]?.content, text);
+  assert.equal(body.assistant_truncated, undefined);
 });
 
 test("each tool_use entry is the PostToolUse shape the backend reads", () => {
@@ -83,8 +147,40 @@ test("each tool_use entry is the PostToolUse shape the backend reads", () => {
   assert.equal(entry?.type, "PostToolUse");
   assert.equal(entry?.tool_name, "read");
   assert.equal(entry?.tool_use_id, "call_1");
-  assert.deepEqual(entry?.tool_input, {}, "the turn record stores no tool input, by design");
+  assert.deepEqual(
+    entry?.tool_input,
+    { path: "/etc/app/config.yaml" },
+    "the allowlisted input the pretool request already sent, not a second projection of it",
+  );
   assert.deepEqual(entry?.tool_response, { content_sha256: "a".repeat(64), content_bytes: 812 });
+});
+
+test("a call recorded without a tool_input still sends the key, as an empty object", () => {
+  // The backend's reader expects the key (`coding_tools_backfill_service.py:1207-1219`), and a call
+  // that was cache-skipped or recorded before this field existed has nothing to put in it.
+  const rec = record({
+    tool_calls: [{ tool_name: "bash", tool_use_id: "call_1", decision: "skipped", ts: STARTED_AT }],
+  });
+  const [entry] = build(rec).messages[1]?.tool_use ?? [];
+  assert.deepEqual(entry?.tool_input, {});
+});
+
+test("a junk tool_input degrades to an empty object rather than riding the wire", () => {
+  for (const junk of ["command", 42, ["command"], null]) {
+    const rec = record({
+      tool_calls: [
+        {
+          tool_name: "bash",
+          tool_use_id: "call_1",
+          decision: "allow",
+          ts: STARTED_AT,
+          tool_input: junk as unknown as Record<string, unknown>,
+        },
+      ],
+    });
+    const [entry] = build(rec).messages[1]?.tool_use ?? [];
+    assert.deepEqual(entry?.tool_input, {}, `${JSON.stringify(junk)} became the tool_input`);
+  }
 });
 
 test("a skipped hash is encoded honestly rather than as a missing digest", () => {
@@ -176,8 +272,10 @@ test("no raw output and no file-body key reaches the body (T-09-10)", () => {
   // The prompt IS sent — that is the existing product contract. The tool output is not.
   assert.equal(toolUse.includes(MARKER), false, `output-bearing text in ${toolUse}`);
   // Matched as quoted JSON keys, so `content_sha256` (which is meant to be there) cannot satisfy
-  // the assertion for `content` (which must not be).
-  for (const key of ["content", "edits", "pattern", "path", "command"]) {
+  // the assertion for `content` (which must not be). These two are the file-body keys, and they are
+  // absent here because they are absent from what the decision seam recorded — the allowlist drops
+  // them before either the pretool request or this row can see them.
+  for (const key of ["content", "edits"]) {
     assert.equal(
       toolUse.includes(`"${key}":`),
       false,
@@ -185,6 +283,39 @@ test("no raw output and no file-body key reaches the body (T-09-10)", () => {
     );
   }
   assert.ok(toolUse.includes('"content_sha256":'), "the digest, by contrast, is present");
+});
+
+test("the allowlisted keys the pretool request sends ARE present in tool_use[]", () => {
+  // The inverse of the assertion above, and the whole of the fix: `command`, `path` and `pattern` are
+  // what the pretool check is evaluated on, so an audit row that omitted them described a tool call
+  // without saying what the call was.
+  const rec = record({
+    tool_calls: [
+      {
+        tool_name: "bash",
+        tool_use_id: "c1",
+        decision: "allow",
+        ts: STARTED_AT,
+        tool_input: { command: "echo hi" },
+      },
+      {
+        tool_name: "grep",
+        tool_use_id: "c2",
+        decision: "allow",
+        ts: STARTED_AT + 1,
+        tool_input: { pattern: "secret", path: "/src" },
+      },
+    ],
+    results: [],
+  });
+  const entries = build(rec).messages[1]?.tool_use ?? [];
+
+  assert.deepEqual(entries[0]?.tool_input, { command: "echo hi" });
+  assert.deepEqual(entries[1]?.tool_input, { pattern: "secret", path: "/src" });
+  const toolUse = JSON.stringify(entries);
+  for (const key of ["command", "pattern", "path"]) {
+    assert.ok(toolUse.includes(`"${key}":`), `tool_use[] lost the ${key} key: ${toolUse}`);
+  }
 });
 
 // --- the empty-turn guard (mirrors PY:4975 `if len(messages) < 2`) -------------------------------
@@ -246,4 +377,73 @@ test("WR-04 a call's session_id stamp is never sent on the wire", () => {
   const serialised = JSON.stringify(body);
   assert.ok(!serialised.includes("sess-x"), "the per-entry stamp stays local");
   assert.ok(!serialised.includes("session_id"), serialised);
+});
+
+// ---------------------------------------------------------------------------------------------------
+// Secret redaction before egress (#355 review, MEDIUM): the model often quotes what a tool returned,
+// and a command can carry a bearer token. Both are scrubbed with the same `redactSecrets` the
+// telemetry path uses — the session key by literal match, bearer tokens by pattern — before the cap.
+// Server-side DLP scans what remains, exactly as for every other hook's turn log.
+// ---------------------------------------------------------------------------------------------------
+
+const SESSION_KEY = "unb_live_" + "0123456789abcdef";
+
+test("the session key never rides the assistant text", () => {
+  const body = buildTurnLogBody(record(), {
+    cwd: CWD,
+    completedAtMs: COMPLETED_AT,
+    assistantText: `The config uses api_key=${SESSION_KEY} for the gateway.`,
+    apiKey: SESSION_KEY,
+  });
+
+  assert.equal(body.messages[1]?.content.includes(SESSION_KEY), false);
+  assert.equal(body.messages[1]?.content, "The config uses api_key=[REDACTED] for the gateway.");
+});
+
+test("a bearer token quoted by the model is redacted by pattern, key or no key", () => {
+  const body = buildTurnLogBody(record(), {
+    cwd: CWD,
+    completedAtMs: COMPLETED_AT,
+    assistantText: "It sends Authorization: Bearer sk-live-deadbeefcafe to the API.",
+  });
+
+  assert.equal(body.messages[1]?.content.includes("deadbeefcafe"), false);
+  assert.match(body.messages[1]?.content ?? "", /Bearer \[REDACTED\]/);
+});
+
+test("tool_input.command is scrubbed of bearer tokens and the session key before it persists", () => {
+  const rec = record({
+    tool_calls: [
+      {
+        tool_name: "bash",
+        tool_use_id: "call_curl",
+        decision: "allow",
+        ts: STARTED_AT + 5,
+        tool_input: { command: `curl -H "Authorization: Bearer ${SESSION_KEY}" https://x.test` },
+      },
+    ],
+  });
+  const body = buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT, apiKey: SESSION_KEY });
+  const command = body.messages[1]?.tool_use?.[0]?.tool_input.command;
+
+  assert.equal(typeof command, "string");
+  assert.equal(String(command).includes(SESSION_KEY), false);
+  // `redactSecrets`' bearer pattern is greedy to the next whitespace, so the closing quote goes with
+  // the token — the URL that follows is untouched.
+  assert.match(String(command), /^curl -H "Authorization: Bearer \[REDACTED\]\S* https:\/\/x\.test$/);
+  // The record itself is untouched: redaction happens at the wire, not in the store.
+  assert.match(String(rec.tool_calls[0]?.tool_input?.command), /deadbeef|unb_live_/);
+});
+
+test("redaction is applied before the cap, so a key straddling the splice cannot survive", () => {
+  const filler = "a".repeat(MAX_ASSISTANT_CHARS);
+  const body = buildTurnLogBody(record(), {
+    cwd: CWD,
+    completedAtMs: COMPLETED_AT,
+    assistantText: `${filler}${SESSION_KEY}${filler}`,
+    apiKey: SESSION_KEY,
+  });
+
+  assert.equal(body.messages[1]?.content.includes(SESSION_KEY), false);
+  assert.equal(body.assistant_truncated, true);
 });

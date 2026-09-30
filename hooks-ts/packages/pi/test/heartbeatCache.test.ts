@@ -41,8 +41,8 @@ import type { MockApi } from "../../core/test/helpers/mockApi.ts";
 import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import { createFakeCtx, createFakeSessionStartEvent } from "./helpers/fakeCtx.ts";
+import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
 
-const TEST_KEY = "unb_test_key_1234567890";
 const ENTRYPOINT = "pi/0.87.1";
 const OLD_SYNCED_AT = 1_600_000_000_000;
 
