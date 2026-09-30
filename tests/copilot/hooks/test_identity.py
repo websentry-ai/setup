@@ -7,7 +7,9 @@ the Copilot account, and reporting it would dress a signed-out machine as a
 signed-in one.
 """
 
+import json
 import os
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,9 +33,30 @@ class _IsolatedConfig(unittest.TestCase):
                                    return_value=self.config_path)
         self._patch.start()
         self.addCleanup(self._patch.stop)
+        self.vscode_dirs = [Path(self._tmp.name) / "Code" / "User",
+                            Path(self._tmp.name) / "Code - Insiders" / "User"]
+        vscode = patch.object(unbound, "_vscode_user_dirs", return_value=self.vscode_dirs)
+        vscode.start()
+        self.addCleanup(vscode.stop)
 
     def _write(self, body: str):
         self.config_path.write_text(body, encoding="utf-8")
+
+    def _vscode(self, login="vs-user", sku="copilot_for_business_seat", orgs=None, install=0, mtime=None):
+        """Write a VS Code globalStorage/state.vscdb the way VS Code keeps it."""
+        path = self.vscode_dirs[install] / "globalStorage" / "state.vscdb"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        chat = {"exp.github.copilot.organizationList": orgs or []}
+        if sku is not None:
+            chat["exp.github.copilot.sku"] = sku
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)")
+            if login is not None:
+                db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("github.copilot-github", login))
+            db.execute("INSERT INTO ItemTable VALUES (?, ?)", ("GitHub.copilot-chat", json.dumps(chat)))
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
 
 
 class TestCopilotConfigPath(unittest.TestCase):
@@ -223,6 +246,73 @@ class TestCopilotSeat(unittest.TestCase):
                 patch.object(unbound, "_device_serial", return_value=None):
             identity = unbound.build_account_identity(probe=True)
         self.assertEqual((identity["plan"], identity["org_id"]), ("business", "acme"))
+
+
+class TestVSCodeAccount(_IsolatedConfig):
+    """VS Code keeps the account Copilot uses, with its plan, in globalStorage/state.vscdb."""
+
+    def test_a_vscode_turn_reports_vscode_account_plan_and_org(self):
+        self._write(SIGNED_IN)
+        self._vscode(login="vs-user", sku="copilot_for_business_seat", orgs=["zeta", "acme"])
+        identity = unbound.read_account_identity(surface="vscode")
+        self.assertEqual((identity["account_login"], identity["account_host"], identity["plan"], identity["org_id"]),
+                         ("vs-user", "https://github.com", "copilot_for_business_seat", "acme"))
+
+    def test_a_personal_seat_has_no_org(self):
+        self._vscode(sku="free_educational_quota", orgs=[])
+        identity = unbound.read_account_identity(surface="vscode")
+        self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
+
+    def test_a_login_left_behind_by_a_sign_out_is_not_an_account(self):
+        """Signing out clears the plan but leaves the preferred-account key."""
+        self._vscode(login="gone-user", sku=None)
+        self.assertIsNone(unbound.read_account_identity(surface="vscode")["account_login"])
+
+    def test_a_vscode_turn_never_borrows_the_cli_sign_in(self):
+        self._write(SIGNED_IN)
+        self._vscode(sku=None)
+        self.assertIsNone(unbound.read_account_identity(surface="vscode")["account_login"])
+
+    def test_a_cli_turn_keeps_the_cli_account(self):
+        self._write(SIGNED_IN)
+        self._vscode(login="vs-user")
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["account_login"], identity["plan"]), ("octocat", None))
+
+    def test_an_unlabelled_turn_never_reads_vscode(self):
+        self._vscode(login="vs-user")
+        self.assertIsNone(unbound.read_account_identity()["account_login"])
+
+    def test_the_most_recently_used_install_wins(self):
+        self._vscode(login="stable-user", install=0, mtime=1_000)
+        self._vscode(login="insiders-user", install=1, mtime=2_000)
+        self.assertEqual(unbound.read_account_identity(surface="vscode")["account_login"], "insiders-user")
+
+    def test_an_unreadable_database_is_logged_and_names_no_one(self):
+        path = self.vscode_dirs[0] / "globalStorage" / "state.vscdb"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"not a database")
+        with patch.object(unbound, "log_error") as logged:
+            self.assertIsNone(unbound.read_account_identity(surface="vscode")["account_login"])
+        self.assertEqual(logged.call_count, 1)
+
+    def test_github_is_not_asked_when_vscode_names_the_plan(self):
+        self._vscode(login="vs-user", sku="copilot_for_business_seat", orgs=["acme"])
+        with patch.object(unbound, "_copilot_seat") as seat, \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True, surface="vscode")
+        seat.assert_not_called()
+        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat", "acme"))
+
+    def test_github_fills_only_what_the_disk_left_blank(self):
+        self._write(SIGNED_IN)
+        with patch.object(unbound, "read_account_identity",
+                          return_value={"account_login": "octocat", "account_host": "https://github.com",
+                                        "plan": None, "org_id": "disk-org"}), \
+                patch.object(unbound, "_copilot_seat", return_value=("business", "api-org")), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True)
+        self.assertEqual((identity["plan"], identity["org_id"]), ("business", "disk-org"))
 
 
 if __name__ == "__main__":

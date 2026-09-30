@@ -1636,16 +1636,77 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
-def read_account_identity(event: Optional[Dict] = None) -> Dict:
-    """The signed-in account, keyed by GitHub login rather than address."""
-    login, host = _copilot_login()
+_VSCODE_COPILOT_ACCOUNT_KEY = 'github.copilot-github'
+_VSCODE_COPILOT_CHAT_STATE_KEY = 'GitHub.copilot-chat'
+_VSCODE_COPILOT_STATE_MAX_BYTES = 4 * 1024 * 1024
+
+
+def _vscode_state_values(path, keys):
+    """Named values from one state.vscdb, read-only."""
+    try:
+        uri = f'{path.resolve().as_uri()}?mode=ro'
+        marks = ','.join('?' * len(keys))
+        with closing(sqlite3.connect(uri, uri=True, timeout=1.0)) as connection:
+            rows = connection.execute(
+                f'SELECT key, value FROM ItemTable WHERE key IN ({marks}) '
+                f'AND length(CAST(value AS BLOB)) <= ?',
+                (*keys, _VSCODE_COPILOT_STATE_MAX_BYTES)).fetchall()
+    except (OSError, sqlite3.Error) as error:
+        log_error(f'vscode copilot account read failed path={path} err={error}', 'identity')
+        return {}
+    values = {}
+    for key, value in rows:
+        if isinstance(value, bytes):
+            value = value.decode('utf-8', 'replace')
+        if isinstance(value, str):
+            values[key] = value
+    return values
+
+
+def _vscode_copilot_account() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Login, plan and org of VS Code's Copilot account. The login key survives a sign-out; the plan does not."""
+    databases = []
+    for user_dir in _vscode_user_dirs():
+        path = user_dir / 'globalStorage' / 'state.vscdb'
+        try:
+            databases.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    for _, path in sorted(databases, reverse=True):
+        values = _vscode_state_values(path, (_VSCODE_COPILOT_ACCOUNT_KEY, _VSCODE_COPILOT_CHAT_STATE_KEY))
+        login = (values.get(_VSCODE_COPILOT_ACCOUNT_KEY) or '').strip()
+        if not login:
+            continue
+        try:
+            chat = json.loads(values.get(_VSCODE_COPILOT_CHAT_STATE_KEY) or '{}')
+        except json.JSONDecodeError:
+            chat = {}
+        chat = chat if isinstance(chat, dict) else {}
+        sku = chat.get('exp.github.copilot.sku')
+        sku = sku.strip() if isinstance(sku, str) else ''
+        if not sku:
+            continue
+        orgs = chat.get('exp.github.copilot.organizationList')
+        orgs = sorted(o.strip() for o in orgs if isinstance(o, str) and o.strip()) if isinstance(orgs, list) else []
+        return login, sku, orgs[0] if orgs else None
+    return None, None, None
+
+
+def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None) -> Dict:
+    """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in."""
+    plan = org = None
+    if surface == 'vscode':
+        login, plan, org = _vscode_copilot_account()
+        host = 'https://github.com' if login else None
+    else:
+        login, host = _copilot_login()
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None,
                 'account_login': None, 'account_host': None}
     return {
-        'org_id': None,
-        'plan': None,
+        'org_id': org,
+        'plan': plan,
         'auth_mode': 'subscription',
         # Never user_email: the gateway maps that to device.email, which
         # provisions and hands off devices to whatever address it names.
@@ -1861,18 +1922,20 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     return plan, org
 
 
-def build_account_identity(event: Optional[Dict] = None, probe: bool = False) -> Dict:
+def build_account_identity(event: Optional[Dict] = None, probe: bool = False,
+                           surface: Optional[str] = None) -> Dict:
     """The account plus the device serial. The event is unused here. Never raises."""
     try:
-        identity = read_account_identity(event)
+        identity = read_account_identity(event, surface)
         if not isinstance(identity, dict):
             identity = {}
     except Exception:
         identity = {}
     try:
-        if identity.get('account_login'):
-            identity['plan'], identity['org_id'] = _copilot_seat(
+        if identity.get('account_login') and not identity.get('plan'):
+            plan, org = _copilot_seat(
                 identity['account_login'], identity.get('account_host'), probe)
+            identity['plan'], identity['org_id'] = plan, identity.get('org_id') or org
     except Exception:
         pass
     try:
@@ -1944,7 +2007,7 @@ def complete_pending_turn(event, pending, api_key, final=False):
         'requestCompleted': pending.get('until'),
         # Cache-only: called once per waiting turn, so probing here would cost a
         # 10s command on each of them.
-        'account_identity': build_account_identity(),
+        'account_identity': build_account_identity(surface=copilot_surface(transcript_path)),
         # A re-send is the same turn and needs the same provenance; unlabelled, the control
         # plane falls back to the API key's owner and bills the turn to them.
         'agent_surface': copilot_surface(transcript_path),
@@ -6096,7 +6159,8 @@ def build_exchange_from_transcript(transcript_path, fallback_session_id, session
         'agent_surface': copilot_surface(transcript_path),
         # No probe in the sandbox: an ephemeral VM's machine-id invents hardware that
         # rotates or collides across sessions. The github block below is the provenance.
-        'account_identity': build_account_identity(probe=not RUNNING_CLOUD),
+        'account_identity': build_account_identity(probe=not RUNNING_CLOUD,
+                                                   surface=copilot_surface(transcript_path)),
         'github': build_github_context(),
     }, forwarded_now, text_sig, turn_prompt_ids, turn_id
 
