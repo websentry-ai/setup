@@ -25,7 +25,8 @@ RAW_TOOL = 'splunk_run_query_Splunk'          # Augment's munged `<tool>_<Server
 ENTRY = {'command': 'splunk-mcp', 'args': ['--stdio']}
 
 
-class AugmentMcpConfigShapes(unittest.TestCase):
+class _IsolatedHome(unittest.TestCase):
+    """Shared setup only -- no tests, so subclasses do not inherit and rerun any."""
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
@@ -79,6 +80,28 @@ class AugmentMcpConfigShapes(unittest.TestCase):
     def _resolve(self):
         return unbound.resolve_augment_mcp(
             RAW_TOOL, unbound.read_augment_mcp_servers({}))
+
+    def _post_log(self):
+        return [{'event': {
+            'hook_event_name': 'PostToolUse', 'tool_name': RAW_TOOL,
+            'tool_input': {'q': 1}, 'is_mcp_tool': True, 'tool_use_id': 'tu-1'}}]
+
+    def _stop_event(self):
+        """A Stop carrying the turn's conversation. Without it the builder has
+        nothing to hang the tool calls on and returns None."""
+        return {'session_id': 's', 'hook_event_name': 'Stop',
+                'conversation': {'userPrompt': 'run the query',
+                                 'agentTextResponse': 'done'}}
+
+    def _tool_names(self, exchange):
+        names = []
+        for m in (exchange or {}).get('messages', []):
+            for tu in (m.get('tool_use') or []):
+                names.append(tu.get('tool_name'))
+        return names
+
+
+class AugmentMcpConfigShapes(_IsolatedHome):
 
     # ── the three shapes ────────────────────────────────────────────────
 
@@ -171,25 +194,6 @@ class AugmentMcpConfigShapes(unittest.TestCase):
         self.assertEqual('mcp__%s__splunk_run_query' % SERVER, out['tool_name'])
 
     # ── the Stop-event door (end-of-turn analytics) ─────────────────────
-
-    def _post_log(self):
-        return [{'event': {
-            'hook_event_name': 'PostToolUse', 'tool_name': RAW_TOOL,
-            'tool_input': {'q': 1}, 'is_mcp_tool': True, 'tool_use_id': 'tu-1'}}]
-
-    def _stop_event(self):
-        """A Stop carrying the turn's conversation. Without it the builder has
-        nothing to hang the tool calls on and returns None."""
-        return {'session_id': 's', 'hook_event_name': 'Stop',
-                'conversation': {'userPrompt': 'run the query',
-                                 'agentTextResponse': 'done'}}
-
-    def _tool_names(self, exchange):
-        names = []
-        for m in (exchange or {}).get('messages', []):
-            for tu in (m.get('tool_use') or []):
-                names.append(tu.get('tool_name'))
-        return names
 
     def test_stop_event_analytics_names_the_server(self):
         """build_llm_exchange is the door the hook actually runs at end of turn;
@@ -332,6 +336,95 @@ class AugmentMcpConfigShapes(unittest.TestCase):
                 self.assertEqual(
                     set(theirs(payload)), set(unbound._augment_cli_servers(payload)),
                     'the hook and the discovery client disagree on %s' % label)
+
+
+class ThroughTheRealEntrypoint(_IsolatedHome):
+    """Augment runs the hook as a script: JSON on stdin, a decision on stdout.
+
+    Every other test here enters one level down, at process_pre_tool_use or
+    build_llm_exchange. That skips main() -- the stdin read, the dispatch on
+    hook_event_name, and the emit -- which is exactly the layer that changes
+    when output handling does. These drive main() itself; only the network
+    calls are stubbed, so the read and the emit run for real.
+    """
+
+    def _run_main(self, event):
+        import io
+        out = io.StringIO()
+        with patch.object(unbound.sys, 'stdin', io.StringIO(json.dumps(event))), \
+             patch.object(unbound.sys, 'stdout', out), \
+             patch.object(unbound, 'get_api_key', return_value='sk-test'):
+            unbound.main()
+        return out.getvalue()
+
+    def _decision(self, stdout):
+        lines = [l for l in stdout.strip().splitlines() if l.strip()]
+        self.assertTrue(lines, 'the hook emitted nothing -- the host would hang or fail open')
+        return json.loads(lines[-1])
+
+    # H1
+    def test_pre_tool_use_through_main_resolves_the_server(self):
+        self._write_settings({'augment': {'advanced': {'mcpServers': {SERVER: ENTRY}}}})
+        sent = {}
+
+        def _capture(body, key):
+            sent['body'] = body
+            return {'decision': 'allow'}
+
+        with patch.object(unbound, 'send_to_hook_api', side_effect=_capture):
+            out = self._run_main({
+                'hook_event_name': 'PreToolUse', 'session_id': 'sess-h1',
+                'tool_name': RAW_TOOL, 'tool_input': {'q': 1}, 'is_mcp_tool': True})
+
+        self._decision(out)                                    # a valid decision reached stdout
+        meta = sent['body']['pre_tool_use_data']['metadata']
+        self.assertEqual(SERVER, meta.get('mcp_server'))
+        self.assertEqual('splunk_run_query', meta.get('mcp_tool'))
+
+    # H2
+    def test_post_tool_use_then_stop_through_main_names_the_server(self):
+        """Analytics spans two hook invocations: PostToolUse writes the audit
+        log, Stop reads it back and sends the turn. Both go through main()."""
+        self._write_settings({SERVER: ENTRY})                  # flat shape
+        sent = {}
+
+        def _capture(exchange, key):
+            sent['exchange'] = exchange
+
+        self._run_main({
+            'hook_event_name': 'PostToolUse', 'session_id': 'sess-h2',
+            'tool_name': RAW_TOOL, 'tool_input': {'q': 1}, 'is_mcp_tool': True,
+            'tool_use_id': 'tu-h2'})
+        with patch.object(unbound, 'send_to_api', side_effect=_capture):
+            self._run_main({
+                'hook_event_name': 'Stop', 'session_id': 'sess-h2',
+                'conversation': {'userPrompt': 'run the query',
+                                 'agentTextResponse': 'done'}})
+
+        self.assertIn('exchange', sent, 'Stop sent nothing for a turn that made an MCP call')
+        self.assertIn('mcp__%s__splunk_run_query' % SERVER, self._tool_names(sent['exchange']))
+
+    # H3
+    def test_a_deny_survives_a_hostile_config(self):
+        """An allow and main()'s blanket-except fallback emit the SAME output,
+        so an allow cannot show whether the hook reached a verdict. A deny can:
+        if reading the config ever raised out of process_pre_tool_use, main()
+        would emit its fallback and the deny would be dropped -- the tool runs
+        with nothing reported. A hostile settings file must not open that."""
+        path = self.home / '.augment' / 'settings.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            'augment': {'advanced': {'mcpServers': 'not-a-dict'}},
+            'x': {'command': None}, 'y': {'url': 12345}, 'z': 'plain'}),
+            encoding='utf-8')
+        with patch.object(unbound, 'send_to_hook_api',
+                          return_value={'decision': 'deny', 'reason': 'blocked by policy'}):
+            out = self._run_main({
+                'hook_event_name': 'PreToolUse', 'session_id': 'sess-h3',
+                'tool_name': RAW_TOOL, 'tool_input': {'q': 1}, 'is_mcp_tool': True})
+        hso = self._decision(out).get('hookSpecificOutput') or {}
+        self.assertEqual('deny', hso.get('permissionDecision'),
+                         'the deny was dropped: the hook fell back instead of blocking')
 
 if __name__ == '__main__':
     unittest.main()
