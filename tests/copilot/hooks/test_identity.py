@@ -14,7 +14,6 @@ import tempfile
 import time
 from datetime import datetime, timezone
 import unittest
-import unittest.mock
 from pathlib import Path
 from unittest.mock import patch
 
@@ -46,9 +45,6 @@ class _IsolatedConfig(unittest.TestCase):
         self.addCleanup(env.stop)
         for var in unbound._COPILOT_CLI_TOKEN_VARS:
             os.environ.pop(var, None)
-        self.credential = patch.object(unbound, "_copilot_cli_credential", return_value=None)
-        self.credential.start()
-        self.addCleanup(self.credential.stop)
         self.user_cache_path = Path(self._tmp.name) / "copilot-user-cache.json"
         user_cache = patch.object(unbound, "_copilot_user_cache_path", return_value=self.user_cache_path)
         user_cache.start()
@@ -380,105 +376,20 @@ class TestVSCodeAccount(_IsolatedConfig):
 
 
 class TestCopilotCliAccount(_IsolatedConfig):
-    """The CLI's config names who signed in last; the credential store says who is signed in now."""
-
-    def _cli(self, credential):
-        with patch.object(unbound, "_copilot_cli_credential", return_value=credential) as check:
-            return unbound.read_account_identity(surface="cli")["account_login"], check
-
-    def test_a_stored_credential_confirms_the_config_login(self):
+    def test_a_cli_turn_reports_the_config_login(self):
         self._write(SIGNED_IN)
-        login, check = self._cli(True)
-        self.assertEqual(login, "octocat")
-        check.assert_called_once_with("https://github.com:octocat")
-
-    def test_a_config_login_without_its_credential_is_signed_out(self):
-        self._write(SIGNED_IN)
-        self.assertIsNone(self._cli(False)[0])
-
-    def test_an_unanswerable_store_keeps_the_config_login(self):
-        self._write(SIGNED_IN)
-        self.assertEqual(self._cli(None)[0], "octocat")
+        self.assertEqual(unbound.read_account_identity(surface="cli")["account_login"], "octocat")
 
     def test_an_env_token_overrides_the_stored_sign_in(self):
         self._write(SIGNED_IN)
         for var in unbound._COPILOT_CLI_TOKEN_VARS:
             with self.subTest(var=var), patch.dict(os.environ, {var: "x"}):
-                self.assertIsNone(self._cli(True)[0])
+                self.assertIsNone(unbound.read_account_identity(surface="cli")["account_login"])
 
-    def test_a_cloud_turn_is_not_checked(self):
+    def test_a_cloud_turn_ignores_env_tokens(self):
         self._write(SIGNED_IN)
-        with patch.object(unbound, "_copilot_cli_credential", return_value=False) as check:
+        with patch.dict(os.environ, {"GITHUB_TOKEN": "x"}):
             self.assertEqual(unbound.read_account_identity(surface="cloud")["account_login"], "octocat")
-        check.assert_not_called()
-
-
-class TestCopilotCliCredential(unittest.TestCase):
-    """Only the entry's label is looked up; the secret is never read."""
-
-    def setUp(self):
-        unbound._copilot_cli_credential.cache_clear()
-        self.addCleanup(unbound._copilot_cli_credential.cache_clear)
-
-    def _mac(self, returncode):
-        unbound._copilot_cli_credential.cache_clear()
-        result = unittest.mock.Mock(returncode=returncode)
-        with patch.object(unbound.platform, "system", return_value="Darwin"), \
-                patch.object(unbound.subprocess, "run", return_value=result) as run:
-            return unbound._copilot_cli_credential("https://github.com:octocat"), run.call_args[0][0]
-
-    def test_macos_found_missing_and_unknown(self):
-        self.assertIs(self._mac(0)[0], True)
-        self.assertIs(self._mac(44)[0], False)
-        self.assertIsNone(self._mac(51)[0])
-
-    def test_macos_asks_for_the_label_only(self):
-        _, argv = self._mac(0)
-        self.assertEqual(argv, ["/usr/bin/security", "find-generic-password", "-s", "copilot-cli",
-                                "-a", "https://github.com:octocat"])
-
-    def _windows(self, stdout, returncode=0):
-        unbound._copilot_cli_credential.cache_clear()
-        result = unittest.mock.Mock(returncode=returncode, stdout=stdout)
-        with patch.object(unbound.platform, "system", return_value="Windows"), \
-                patch.object(unbound, "_is_windows", return_value=True), \
-                patch.object(unbound, "_windows_system32_path", return_value="cmdkey.exe"), \
-                patch.object(unbound.subprocess, "run", return_value=result):
-            return unbound._copilot_cli_credential("https://github.com:octocat")
-
-    def test_windows_matches_either_target_layout(self):
-        for target in ("LegacyGeneric:target=https://github.com:octocat.copilot-cli",
-                       "LegacyGeneric:target=copilot-cli/https://github.com:OctoCat"):
-            with self.subTest(target=target):
-                self.assertIs(self._windows("    Target: %s\n    Type: Generic\n" % target), True)
-
-    def test_windows_a_longer_login_is_not_a_match(self):
-        self.assertIs(self._windows("    Target: LegacyGeneric:target=https://github.com:octocat2.copilot-cli\n"), False)
-
-    def test_a_repeat_check_in_one_run_spawns_no_second_process(self):
-        with patch.object(unbound.platform, "system", return_value="Darwin"), \
-                patch.object(unbound.subprocess, "run", return_value=unittest.mock.Mock(returncode=0)) as run:
-            unbound._copilot_cli_credential("https://github.com:octocat")
-            unbound._copilot_cli_credential("https://github.com:octocat")
-        self.assertEqual(run.call_count, 1)
-
-    def test_windows_other_copilot_entries_mean_signed_out(self):
-        self.assertIs(self._windows("    Target: LegacyGeneric:target=https://github.com:someone.copilot-cli\n"), False)
-
-    def test_windows_an_unfamiliar_entry_layout_cannot_say(self):
-        self.assertIsNone(self._windows("    Target: LegacyGeneric:target=copilot-cli-v2|octocat\n"))
-
-    def test_windows_without_any_copilot_entry_cannot_say(self):
-        self.assertIsNone(self._windows("    Target: LegacyGeneric:target=git:https://github.com\n"))
-
-    def test_windows_cmdkey_failure_cannot_say(self):
-        self.assertIsNone(self._windows("", returncode=1))
-
-    def test_linux_cannot_say(self):
-        with patch.object(unbound.platform, "system", return_value="Linux"), \
-                patch.object(unbound, "_is_windows", return_value=False):
-            self.assertIsNone(unbound._copilot_cli_credential("https://github.com:octocat"))
-
 
 class TestCopilotUserCache(_IsolatedConfig):
     """Copilot caches GitHub's answer about each signed-in login; plan and org come from there."""

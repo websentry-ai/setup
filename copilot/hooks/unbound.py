@@ -6,7 +6,6 @@ Reads JSON events from stdin, appends to agent-audit.log, and processes them on 
 
 import sys
 import base64
-import functools
 import json
 import io
 import os
@@ -1640,48 +1639,11 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
 _COPILOT_CLI_TOKEN_VARS = ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
 
 
-@functools.lru_cache(maxsize=8)
-def _copilot_cli_credential(account: str) -> Optional[bool]:
-    """None when the store can't say. Never reads the secret."""
-    try:
-        if platform.system() == 'Darwin':
-            result = subprocess.run(['/usr/bin/security', 'find-generic-password', '-s', 'copilot-cli', '-a', account],
-                                    capture_output=True, timeout=5)
-            return True if result.returncode == 0 else False if result.returncode == 44 else None
-        if _is_windows():
-            result = subprocess.run([_windows_system32_path('cmdkey.exe'), '/list'],
-                                    capture_output=True, text=True, timeout=5)
-            if result.returncode != 0:
-                return None
-            targets = [m.group(1).strip().lower() for m in re.finditer(r'target=(\S+)', result.stdout, re.I)]
-            targets = [t for t in targets if 'copilot-cli' in t]
-            if not targets:
-                return None
-            wanted = account.lower()
-            accounts = [_strip_copilot_cli_service(t) for t in targets]
-            if any(a in (wanted, wanted + ':github') for a in accounts):
-                return True
-            return False if all(a != t for a, t in zip(accounts, targets)) else None
-    except Exception as error:
-        log_error(f'copilot cli credential check failed: {type(error).__name__}', 'identity')
-    return None
-
-
-def _strip_copilot_cli_service(target: str) -> str:
-    for prefix in ('copilot-cli/', 'copilot-cli:'):
-        if target.startswith(prefix):
-            return target[len(prefix):]
-    return target[:-len('.copilot-cli')] if target.endswith('.copilot-cli') else target
-
-
 def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
     """An env token overrides the stored sign-in."""
     if any(os.environ.get(var) for var in _COPILOT_CLI_TOKEN_VARS):
         return None, None
-    login, host = _copilot_login()
-    if login and _copilot_cli_credential(f'{host or "https://github.com"}:{login}') is False:
-        return None, None
-    return login, host
+    return _copilot_login()
 
 
 _COPILOT_USER_CACHE_MAX_BYTES = 1024 * 1024
