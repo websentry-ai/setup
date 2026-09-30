@@ -1682,6 +1682,7 @@ def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
 
 
 _COPILOT_USER_CACHE_MAX_BYTES = 1024 * 1024
+_COPILOT_USER_CACHE_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 
 def _copilot_user_cache_path() -> Optional[Path]:
@@ -1695,7 +1696,7 @@ def _copilot_user_cache_path() -> Optional[Path]:
 
 
 def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
-    """Plan (sku) and org GitHub last reported for this login, from Copilot's own user cache."""
+    """Plan (sku) and org GitHub reported for this login within the last week, from Copilot's own user cache."""
     path = _copilot_user_cache_path()
     try:
         if path is None or path.stat().st_size > _COPILOT_USER_CACHE_MAX_BYTES:
@@ -1712,7 +1713,12 @@ def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
         response = entry.get('response') if isinstance(entry, dict) else None
         if not isinstance(response, dict) or str(response.get('login') or '').lower() != login.lower():
             continue
-        at = entry.get('retrievedAt') if isinstance(entry.get('retrievedAt'), str) else ''
+        try:
+            at = datetime.fromisoformat(str(entry.get('retrievedAt')).replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            continue
+        if time.time() - at > _COPILOT_USER_CACHE_MAX_AGE_SECONDS:
+            continue
         if newest is None or at > newest[0]:
             newest = (at, response)
     if newest is None:

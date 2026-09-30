@@ -11,6 +11,8 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
+from datetime import datetime, timezone
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -56,10 +58,12 @@ class _IsolatedConfig(unittest.TestCase):
     def _write(self, body: str):
         self.config_path.write_text(body, encoding="utf-8")
 
-    def _user_cache(self, login, sku="copilot_for_business_seat_quota", orgs=("acme",), at="2026-09-30T04:16:13.733Z"):
+    def _user_cache(self, login, sku="copilot_for_business_seat_quota", orgs=("acme",), age_days=0):
         """Add one GitHub copilot_internal/user answer to Copilot's user cache, the way Copilot writes it."""
         self._user_cache_entries["v1:%d" % len(self._user_cache_entries)] = {
-            "schemaVersion": 1, "generation": "g", "retrievedAt": at,
+            "schemaVersion": 1, "generation": "g",
+            "retrievedAt": datetime.fromtimestamp(time.time() - age_days * 86400, timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "response": {"login": login, "copilot_plan": "business", "access_type_sku": sku,
                          "organization_list": [{"id": 1, "login": o, "name": o.title()} for o in orgs]}}
         self.user_cache_path.write_text(
@@ -477,8 +481,8 @@ class TestCopilotUserCache(_IsolatedConfig):
 
     def test_the_newest_answer_for_the_login_wins(self):
         self._write(SIGNED_IN)
-        self._user_cache("octocat", sku="free_limited_copilot", orgs=[], at="2026-09-01T00:00:00Z")
-        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=["acme"], at="2026-09-30T00:00:00Z")
+        self._user_cache("octocat", sku="free_limited_copilot", orgs=[], age_days=3)
+        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=["acme"], age_days=1)
         self.assertEqual(unbound.read_account_identity(surface="cli")["plan"], "copilot_for_business_seat_quota")
 
     def test_another_logins_answer_is_ignored(self):
@@ -527,6 +531,27 @@ class TestCopilotUserCache(_IsolatedConfig):
         self._vscode(login="octocat")
         identity = unbound.read_account_identity(surface="cli")
         self.assertEqual((identity["account_login"], identity["plan"], identity["org_id"]), ("octocat", None, None))
+
+    def test_an_answer_older_than_a_week_is_ignored(self):
+        """A seat cached before an employer change must not name the new employer's org."""
+        self._write(SIGNED_IN)
+        self._user_cache("octocat", orgs=["old-employer"], age_days=8)
+        identity = unbound.read_account_identity(surface="cli")
+        self.assertEqual((identity["plan"], identity["org_id"]), (None, None))
+
+    def test_a_stale_answer_lets_the_seat_lookup_run(self):
+        self._write(SIGNED_IN)
+        self._user_cache("octocat", age_days=30)
+        with patch.object(unbound, "_copilot_seat", return_value=("copilot_for_business_seat_quota", "new-employer")) as seat, \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True, surface="cli")
+        seat.assert_called_once()
+        self.assertEqual(identity["org_id"], "new-employer")
+
+    def test_a_vscode_turn_ignores_a_stale_org_with_the_same_sku(self):
+        self._vscode(login="vs-user", sku="copilot_for_business_seat_quota", orgs=["current-opaque-org"])
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=["old-employer"], age_days=8)
+        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "current-opaque-org")
 
     def test_an_unreadable_cache_is_logged_and_adds_nothing(self):
         self._write(SIGNED_IN)
