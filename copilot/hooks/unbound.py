@@ -2064,7 +2064,10 @@ def build_account_identity(event: Optional[Dict] = None, probe: bool = False,
         if identity.get('account_login') and not (identity.get('plan') and identity.get('org_id')):
             plan, org = _copilot_seat(
                 identity['account_login'], identity.get('account_host'), probe)
-            identity['plan'], identity['org_id'] = identity.get('plan') or plan, identity.get('org_id') or org
+            if not identity.get('plan'):
+                identity['plan'], identity['org_id'] = plan, identity.get('org_id') or org
+            elif plan == identity['plan']:
+                identity['org_id'] = org
     except Exception:
         pass
     try:

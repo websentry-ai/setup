@@ -368,11 +368,19 @@ class TestVSCodeAccount(_IsolatedConfig):
 
     def test_github_fills_the_org_when_the_disk_has_only_the_plan(self):
         self._vscode(login="vs-user", sku="copilot_for_business_seat")
-        with patch.object(unbound, "_copilot_seat", return_value=("copilot_business", "101")) as seat, \
+        with patch.object(unbound, "_copilot_seat", return_value=("copilot_for_business_seat", "101")) as seat, \
                 patch.object(unbound, "_device_serial", return_value=None):
             identity = unbound.build_account_identity(probe=True, surface="vscode")
         seat.assert_called_once()
         self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat", "101"))
+
+    def test_an_older_seats_org_never_joins_the_current_plan(self):
+        """A personal plan has no org; a cached business seat for the same login must not lend it one."""
+        self._vscode(login="vs-user", sku="free_educational_quota")
+        with patch.object(unbound, "_copilot_seat", return_value=("copilot_for_business_seat_quota", "303")), \
+                patch.object(unbound, "_device_serial", return_value=None):
+            identity = unbound.build_account_identity(probe=True, surface="vscode")
+        self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
 
     def test_github_is_not_asked_when_vscode_names_the_plan(self):
         self._vscode(login="vs-user", sku="copilot_for_business_seat")
