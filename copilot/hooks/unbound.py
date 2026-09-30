@@ -1697,6 +1697,12 @@ def _copilot_user_cache_path() -> Optional[Path]:
     return Path(os.environ.get('XDG_CACHE_HOME') or Path.home() / '.cache') / 'copilot' / 'copilot-user-cache.json'
 
 
+def _github_org_id(response: Dict) -> Optional[str]:
+    orgs = response.get('organization_list')
+    ids = sorted(o['id'] for o in orgs if isinstance(o, dict) and isinstance(o.get('id'), int)) if isinstance(orgs, list) else []
+    return str(ids[0]) if ids else None
+
+
 def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
     path = _copilot_user_cache_path()
     try:
@@ -1726,10 +1732,7 @@ def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
         return None, None
     response = newest[1]
     sku = response.get('access_type_sku')
-    orgs = response.get('organization_list')
-    orgs = sorted(o['login'].strip() for o in orgs if isinstance(o, dict) and isinstance(o.get('login'), str)
-                  and o['login'].strip()) if isinstance(orgs, list) else []
-    return (sku.strip() or None) if isinstance(sku, str) else None, orgs[0] if orgs else None
+    return (sku.strip() or None) if isinstance(sku, str) else None, _github_org_id(response)
 
 
 _VSCODE_COPILOT_ACCOUNT_KEY = 'github.copilot-github'
@@ -2066,7 +2069,7 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     day; only the end-of-turn path (probe) asks GitHub. Never raises."""
     try:
         cached = json.loads(COPILOT_SEAT_CACHE_PATH.read_text(encoding='utf-8'))
-        if cached.get('v') == 2 and cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
+        if cached.get('v') == 3 and cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
             return cached.get('plan'), cached.get('org')
     except Exception:
         pass
@@ -2081,14 +2084,12 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     # Another account's token (a different gh login) must not lend its seat.
     if isinstance(seat, dict) and str(seat.get('login') or '').lower() == login.lower():
         plan = next((seat[k] for k in ('access_type_sku', 'copilot_plan') if isinstance(seat.get(k), str) and seat[k]), None)
-        orgs = seat.get('organization_login_list')
-        orgs = sorted(o for o in orgs if isinstance(o, str) and o) if isinstance(orgs, list) else []
-        org = orgs[0] if orgs else None
+        org = _github_org_id(seat)
     # A miss is cached too, or a machine with no token asks GitHub every turn.
     try:
         COPILOT_SEAT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = COPILOT_SEAT_CACHE_PATH.parent / (".copilot_seat.%d.tmp" % os.getpid())
-        tmp.write_text(json.dumps({'v': 2, 'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
+        tmp.write_text(json.dumps({'v': 3, 'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
                        encoding='utf-8')
         os.replace(str(tmp), str(COPILOT_SEAT_CACHE_PATH))
     except Exception:

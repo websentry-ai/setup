@@ -58,14 +58,14 @@ class _IsolatedConfig(unittest.TestCase):
     def _write(self, body: str):
         self.config_path.write_text(body, encoding="utf-8")
 
-    def _user_cache(self, login, sku="copilot_for_business_seat_quota", orgs=("acme",), age_days=0):
+    def _user_cache(self, login, sku="copilot_for_business_seat_quota", orgs=(101,), age_days=0):
         """Add one GitHub copilot_internal/user answer to Copilot's user cache, the way Copilot writes it."""
         self._user_cache_entries["v1:%d" % len(self._user_cache_entries)] = {
             "schemaVersion": 1, "generation": "g",
             "retrievedAt": datetime.fromtimestamp(time.time() - age_days * 86400, timezone.utc)
             .strftime("%Y-%m-%dT%H:%M:%S.000Z"),
             "response": {"login": login, "copilot_plan": "business", "access_type_sku": sku,
-                         "organization_list": [{"id": 1, "login": o, "name": o.title()} for o in orgs]}}
+                         "organization_list": [{"id": o, "login": "org%d" % o, "name": "Org %d" % o} for o in orgs]}}
         self.user_cache_path.write_text(
             "// Disposable cache for Copilot user responses, safe to delete. Managed automatically.\n"
             + json.dumps({"copilotUserCache": self._user_cache_entries}), encoding="utf-8")
@@ -215,8 +215,8 @@ class TestCopilotSeat(unittest.TestCase):
 
     def test_reads_the_plan_and_the_org(self):
         (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "business",
-                                     "organization_login_list": ["zeta", "acme"]})
-        self.assertEqual((plan, org), ("business", "acme"))
+                                     "organization_list": [{"id": 202, "login": "zeta"}, {"id": 101, "login": "acme"}]})
+        self.assertEqual((plan, org), ("business", "101"))
 
     def test_the_plan_is_the_sku_when_github_sends_one(self):
         (plan, _), _ = self._seat({"login": "octocat", "copilot_plan": "business",
@@ -225,7 +225,7 @@ class TestCopilotSeat(unittest.TestCase):
 
     def test_a_personal_seat_has_no_org(self):
         (plan, org), _ = self._seat({"login": "octocat", "copilot_plan": "individual",
-                                     "organization_login_list": []})
+                                     "organization_list": []})
         self.assertEqual((plan, org), ("individual", None))
 
     def test_another_accounts_seat_is_refused(self):
@@ -240,9 +240,9 @@ class TestCopilotSeat(unittest.TestCase):
 
     def test_a_cached_seat_is_served_without_a_call(self):
         self._seat({"login": "octocat", "copilot_plan": "business",
-                    "organization_login_list": ["acme"]})
+                    "organization_list": [{"id": 101, "login": "acme"}]})
         result, fetch = self._seat(None, probe=False)
-        self.assertEqual(result, ("business", "acme"))
+        self.assertEqual(result, ("business", "101"))
         fetch.assert_not_called()
 
     def test_a_seat_cached_before_the_sku_change_is_asked_again(self):
@@ -485,15 +485,15 @@ class TestCopilotUserCache(_IsolatedConfig):
 
     def test_a_cli_turn_gets_plan_and_org_name_for_its_login(self):
         self._write(SIGNED_IN)
-        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=["zeta", "acme"])
+        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=[202, 101])
         identity = unbound.read_account_identity(surface="cli")
         self.assertEqual((identity["account_login"], identity["plan"], identity["org_id"]),
-                         ("octocat", "copilot_for_business_seat_quota", "acme"))
+                         ("octocat", "copilot_for_business_seat_quota", "101"))
 
     def test_the_newest_answer_for_the_login_wins(self):
         self._write(SIGNED_IN)
         self._user_cache("octocat", sku="free_limited_copilot", orgs=[], age_days=3)
-        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=["acme"], age_days=1)
+        self._user_cache("octocat", sku="copilot_for_business_seat_quota", orgs=[101], age_days=1)
         self.assertEqual(unbound.read_account_identity(surface="cli")["plan"], "copilot_for_business_seat_quota")
 
     def test_another_logins_answer_is_ignored(self):
@@ -523,7 +523,7 @@ class TestCopilotUserCache(_IsolatedConfig):
     def test_a_vscode_turn_never_takes_the_cached_org(self):
         """Only VS Code's own org is current for a VS Code turn; a cached org may belong to a former seat."""
         self._vscode(login="vs-user", sku="copilot_for_business_seat_quota", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
-        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=["acme"])
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[101])
         self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "3d1901ce21d7ca4bb9dd9818d628f3b5")
 
     def test_a_vscode_turn_keeps_the_opaque_org_without_a_cache_entry(self):
@@ -533,7 +533,7 @@ class TestCopilotUserCache(_IsolatedConfig):
     def test_a_cached_seat_that_disagrees_with_vscode_is_not_used(self):
         """A former employer's cached business seat must not name the org of a current personal seat."""
         self._vscode(login="vs-user", sku="free_educational_quota", orgs=[])
-        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=["old-employer"])
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[303])
         identity = unbound.read_account_identity(surface="vscode")
         self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
 
@@ -547,7 +547,7 @@ class TestCopilotUserCache(_IsolatedConfig):
     def test_an_answer_older_than_a_week_is_ignored(self):
         """A seat cached before an employer change must not name the new employer's org."""
         self._write(SIGNED_IN)
-        self._user_cache("octocat", orgs=["old-employer"], age_days=8)
+        self._user_cache("octocat", orgs=[303], age_days=8)
         identity = unbound.read_account_identity(surface="cli")
         self.assertEqual((identity["plan"], identity["org_id"]), (None, None))
 
@@ -562,12 +562,12 @@ class TestCopilotUserCache(_IsolatedConfig):
 
     def test_a_vscode_turn_ignores_a_stale_org_with_the_same_sku(self):
         self._vscode(login="vs-user", sku="copilot_for_business_seat_quota", orgs=["current-opaque-org"])
-        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=["old-employer"], age_days=8)
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[303], age_days=8)
         self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "current-opaque-org")
 
     def test_a_planless_cache_org_is_not_paired_with_a_borrowed_plan(self):
         self._write(SIGNED_IN)
-        self._user_cache("octocat", sku="", orgs=["old-employer"])
+        self._user_cache("octocat", sku="", orgs=[303])
         self._vscode(login="octocat", sku="copilot_for_business_seat_quota", orgs=["current-opaque-org"])
         identity = unbound.read_account_identity(surface="cli")
         self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat_quota", "current-opaque-org"))
