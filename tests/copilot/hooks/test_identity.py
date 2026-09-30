@@ -290,11 +290,11 @@ class TestVSCodeAccount(_IsolatedConfig):
 
     def test_a_vscode_turn_reports_vscode_account_plan_and_org(self):
         self._write(SIGNED_IN)
-        self._vscode(login="vs-user", sku="copilot_for_business_seat", orgs=["zeta", "acme"])
+        self._vscode(login="vs-user", sku="copilot_for_business_seat")
+        self._user_cache("vs-user", orgs=[202, 101])
         identity = unbound.read_account_identity(surface="vscode")
         self.assertEqual((identity["account_login"], identity["account_host"], identity["plan"], identity["org_id"]),
-                         ("vs-user", "https://github.com", "copilot_for_business_seat", "acme"))
-
+                         ("vs-user", "https://github.com", "copilot_for_business_seat", "101"))
     def test_a_personal_seat_has_no_org(self):
         self._vscode(sku="free_educational_quota", orgs=[])
         identity = unbound.read_account_identity(surface="vscode")
@@ -357,13 +357,13 @@ class TestVSCodeAccount(_IsolatedConfig):
         self.assertEqual(logged.call_count, 1)
 
     def test_github_is_not_asked_when_vscode_names_the_plan(self):
-        self._vscode(login="vs-user", sku="copilot_for_business_seat", orgs=["acme"])
+        self._vscode(login="vs-user", sku="copilot_for_business_seat")
+        self._user_cache("vs-user", orgs=[101])
         with patch.object(unbound, "_copilot_seat") as seat, \
                 patch.object(unbound, "_device_serial", return_value=None):
             identity = unbound.build_account_identity(probe=True, surface="vscode")
         seat.assert_not_called()
-        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat", "acme"))
-
+        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat", "101"))
     def test_github_fills_only_what_the_disk_left_blank(self):
         self._write(SIGNED_IN)
         with patch.object(unbound, "read_account_identity",
@@ -421,33 +421,24 @@ class TestCopilotUserCache(_IsolatedConfig):
 
     def test_without_a_cache_entry_the_cli_borrows_vscode_signed_in_as_the_same_login(self):
         self._write(SIGNED_IN)
-        self._vscode(login="octocat", sku="copilot_for_business_seat_quota", orgs=["opaque-org"])
+        self._vscode(login="octocat", sku="copilot_for_business_seat_quota")
         identity = unbound.read_account_identity(surface="cli")
-        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat_quota", "opaque-org"))
-
+        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat_quota", None))
     def test_the_cli_never_borrows_vscode_signed_in_as_another_login(self):
         self._write(SIGNED_IN)
         self._vscode(login="vs-user")
         identity = unbound.read_account_identity(surface="cli")
         self.assertEqual((identity["plan"], identity["org_id"]), (None, None))
 
-    def test_a_vscode_turn_never_takes_the_cached_org(self):
-        """Only VS Code's own org is current for a VS Code turn; a cached org may belong to a former seat."""
-        self._vscode(login="vs-user", sku="copilot_for_business_seat_quota", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
-        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[101])
-        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "3d1901ce21d7ca4bb9dd9818d628f3b5")
-
-    def test_a_vscode_turn_keeps_the_opaque_org_without_a_cache_entry(self):
+    def test_both_surfaces_send_the_same_numeric_org_id(self):
+        self._write(SIGNED_IN)
+        self._vscode(login="octocat", sku="copilot_for_business_seat_quota", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
+        self._user_cache("octocat", orgs=[131423224])
+        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "131423224")
+        self.assertEqual(unbound.read_account_identity(surface="cli")["org_id"], "131423224")
+    def test_a_vscode_turn_never_sends_vscodes_opaque_org(self):
         self._vscode(login="vs-user", orgs=["3d1901ce21d7ca4bb9dd9818d628f3b5"])
-        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "3d1901ce21d7ca4bb9dd9818d628f3b5")
-
-    def test_a_cached_seat_that_disagrees_with_vscode_is_not_used(self):
-        """A former employer's cached business seat must not name the org of a current personal seat."""
-        self._vscode(login="vs-user", sku="free_educational_quota", orgs=[])
-        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[303])
-        identity = unbound.read_account_identity(surface="vscode")
-        self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
-
+        self.assertIsNone(unbound.read_account_identity(surface="vscode")["org_id"])
     def test_an_enterprise_host_cli_borrows_nothing(self):
         self._write('{"lastLoggedInUser":{"host":"https://acme.ghe.com","login":"octocat"}}')
         self._user_cache("octocat")
@@ -471,18 +462,16 @@ class TestCopilotUserCache(_IsolatedConfig):
         seat.assert_called_once()
         self.assertEqual(identity["org_id"], "new-employer")
 
-    def test_a_vscode_turn_ignores_a_stale_org_with_the_same_sku(self):
-        self._vscode(login="vs-user", sku="copilot_for_business_seat_quota", orgs=["current-opaque-org"])
-        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[303], age_days=8)
-        self.assertEqual(unbound.read_account_identity(surface="vscode")["org_id"], "current-opaque-org")
-
+    def test_a_stale_cache_gives_a_vscode_turn_no_org(self):
+        self._vscode(login="vs-user", sku="copilot_for_business_seat_quota")
+        self._user_cache("vs-user", orgs=[303], age_days=8)
+        self.assertIsNone(unbound.read_account_identity(surface="vscode")["org_id"])
     def test_a_planless_cache_org_is_not_paired_with_a_borrowed_plan(self):
         self._write(SIGNED_IN)
         self._user_cache("octocat", sku="", orgs=[303])
-        self._vscode(login="octocat", sku="copilot_for_business_seat_quota", orgs=["current-opaque-org"])
+        self._vscode(login="octocat", sku="copilot_for_business_seat_quota")
         identity = unbound.read_account_identity(surface="cli")
-        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat_quota", "current-opaque-org"))
-
+        self.assertEqual((identity["plan"], identity["org_id"]), ("copilot_for_business_seat_quota", None))
     def test_an_unreadable_cache_is_logged_and_adds_nothing(self):
         self._write(SIGNED_IN)
         self.user_cache_path.write_text("{not json", encoding="utf-8")

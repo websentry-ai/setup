@@ -1732,7 +1732,7 @@ def _vscode_user_dir_of(transcript_path) -> Optional[Path]:
     return None
 
 
-def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str]]:
     """The login key survives a sign-out; the sku does not."""
     databases = []
     for user_dir in [user_dir] if user_dir else _vscode_user_dirs():
@@ -1753,12 +1753,8 @@ def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[s
         chat = chat if isinstance(chat, dict) else {}
         sku = chat.get('exp.github.copilot.sku')
         sku = sku.strip() if isinstance(sku, str) else ''
-        if not sku:
-            return None, None, None
-        orgs = chat.get('exp.github.copilot.organizationList')
-        orgs = sorted(o.strip() for o in orgs if isinstance(o, str) and o.strip()) if isinstance(orgs, list) else []
-        return login, sku, orgs[0] if orgs else None
-    return None, None, None
+        return (login, sku) if sku else (None, None)
+    return None, None
 
 
 def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
@@ -1766,8 +1762,10 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
     """The signed-in account, keyed by GitHub login rather than address."""
     plan = org = None
     if surface == 'vscode':
-        login, plan, org = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
+        login, plan = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
         host = 'https://github.com' if login else None
+        if login:
+            org = _copilot_cached_seat(login)[1]
     elif surface == 'cloud':
         login, host = _copilot_login()
     else:
@@ -1776,9 +1774,9 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
             plan, org = _copilot_cached_seat(login)
             if not plan:
                 org = None
-                vscode_login, vscode_plan, vscode_org = _vscode_copilot_account()
+                vscode_login, vscode_plan = _vscode_copilot_account()
                 if vscode_login and vscode_login.lower() == login.lower():
-                    plan, org = vscode_plan, org or vscode_org
+                    plan = vscode_plan
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None,
