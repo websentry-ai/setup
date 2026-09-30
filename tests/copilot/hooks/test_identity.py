@@ -465,6 +465,9 @@ class TestCopilotCliCredential(unittest.TestCase):
     def test_windows_other_copilot_entries_mean_signed_out(self):
         self.assertIs(self._windows("    Target: LegacyGeneric:target=https://github.com:someone.copilot-cli\n"), False)
 
+    def test_windows_an_unfamiliar_entry_layout_cannot_say(self):
+        self.assertIsNone(self._windows("    Target: LegacyGeneric:target=copilot-cli-v2|octocat\n"))
+
     def test_windows_without_any_copilot_entry_cannot_say(self):
         self.assertIsNone(self._windows("    Target: LegacyGeneric:target=git:https://github.com\n"))
 

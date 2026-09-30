@@ -1658,7 +1658,10 @@ def _copilot_cli_credential(account: str) -> Optional[bool]:
             if not targets:
                 return None
             wanted = account.lower()
-            return any(_strip_copilot_cli_service(t) in (wanted, wanted + ':github') for t in targets)
+            accounts = [_strip_copilot_cli_service(t) for t in targets]
+            if any(a in (wanted, wanted + ':github') for a in accounts):
+                return True
+            return False if all(a != t for a, t in zip(accounts, targets)) else None
     except Exception as error:
         log_error(f'copilot cli credential check failed: {type(error).__name__}', 'identity')
     return None
