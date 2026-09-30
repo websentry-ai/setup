@@ -1259,7 +1259,8 @@ class TestEnterpriseHooksConflict(unittest.TestCase):
         # hooks list, non-dict hook) must not stop us finding a real one after.
         (self.managed / "managed-settings.json").write_text(json.dumps({
             "hooks": {
-                "PreToolUse": ["not-a-dict", {"hooks": None}, {"hooks": ["also-bad"]}],
+                "PreToolUse": ["not-a-dict", {"hooks": None}, {"hooks": ["also-bad"]},
+                               {"hooks": [{"command": 1}]}],
                 "UserPromptSubmit": [{"hooks": [
                     {"type": "command",
                      "command": '"/opt/unbound/current/unbound-hook/unbound-hook" hook claude-code User'}

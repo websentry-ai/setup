@@ -936,7 +936,8 @@ def _is_unbound_binary_hook_command(command) -> bool:
     """The managed hook runs the packaged binary from /opt/unbound. Require both
     tokens, like the MDM strip path, so a foreign command that merely mentions the
     binary name isn't mistaken for ours (which would wrongly skip the user hook)."""
-    command = command or ""
+    if not isinstance(command, str):
+        return False
     return "/opt/unbound/" in command and "unbound-hook" in command
 
 
