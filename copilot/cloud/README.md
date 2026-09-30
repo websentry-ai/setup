@@ -32,10 +32,12 @@ restamp on upgrade.
 |---|---|
 | Secret (Settings → Secrets and variables → Agents) | `UNBOUND_COPILOT_API_KEY` |
 | Secret | `UNBOUND_GATEWAY_URL` |
-| Allowlist (Settings → Copilot → Internet access) | the gateway host, `raw.githubusercontent.com` |
+| Allowlist (Settings → Copilot → Internet access) | the gateway host, `raw.githubusercontent.com`, `api.github.com` |
 
-Both hosts are required. Without the gateway the session reports nothing; without
+The first two are required. Without the gateway the session reports nothing; without
 `raw.githubusercontent.com` the hook never loads and every `preToolUse` denies.
+`api.github.com` only names the session's user: without it the session still reports, as
+`Cloud Agent` rather than a login.
 
 Use a dedicated application's API key, not one shared with devices: every cloud session
 attributes to the application that key belongs to.
