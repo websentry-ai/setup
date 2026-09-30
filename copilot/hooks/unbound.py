@@ -1755,6 +1755,11 @@ _GITHUB_COAUTHOR_RE = re.compile(
     r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>', re.M | re.I)
 
 
+# Which of the two answered, since only one of them is GitHub's own record. A reader that
+# attributes cost or policy to a login should insist on the first.
+ACTOR_SOURCE_API = 'github_api'
+ACTOR_SOURCE_ENV = 'runner_env'
+
 _ENV_ACTOR_SERVICE = {'copilot', 'copilot-swe-agent', 'github-actions', 'github-copilot'}
 
 
@@ -1883,11 +1888,17 @@ def build_github_context() -> Optional[Dict]:
     session = os.environ.get('COPILOT_AGENT_SESSION_ID')
     # GitHub's own record first: it is the only source here the agent cannot author. What the
     # runner's variables hold in this sandbox has never been established, so they answer only
-    # when the lookup cannot. The commit trailer stays out: the agent writes those messages,
-    # and the payload carries no field to tell a claimed login from a confirmed one.
+    # when the lookup cannot -- and say so, because a reader cannot otherwise tell a claimed
+    # login from a confirmed one. The commit trailer stays out: the agent writes those
+    # messages, so it names whoever it likes and no marker would make that safe to attribute.
     actor = _cloud_session_actor(repo, session) if repo and session else None
+    source = ACTOR_SOURCE_API if actor else None
+    if not actor:
+        actor = _env_actor()
+        source = ACTOR_SOURCE_ENV if actor else None
     context = {
-        'actor': actor or _env_actor(),
+        'actor': actor,
+        'actor_source': source,
         'repo': repo,
         'session': session,
         'event': os.environ.get('COPILOT_JOB_EVENT_TYPE'),

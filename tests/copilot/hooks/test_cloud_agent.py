@@ -165,7 +165,8 @@ class TestGithubContext(unittest.TestCase):
 
     def test_provenance_is_repo_session_and_trigger(self):
         self.assertEqual(self._context(session_actor='octocat'),
-                         {'actor': 'octocat', 'repo': 'websentry-ai/setup',
+                         {'actor': 'octocat', 'actor_source': 'github_api',
+                          'repo': 'websentry-ai/setup',
                           'session': 'sess-1', 'event': 'issues'})
 
     def test_the_commit_trailer_never_names_the_actor(self):
@@ -179,6 +180,15 @@ class TestGithubContext(unittest.TestCase):
         self.assertEqual(named['actor'], 'api-login')
         fell_back = self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'})
         self.assertEqual(fell_back['actor'], 'runner-login')
+
+    def test_every_name_says_which_source_produced_it(self):
+        """Both sources write the same field, and only one of them is GitHub's own record.
+        Unlabelled, a reader attributing cost or policy cannot tell them apart."""
+        self.assertEqual(self._context(session_actor='api-login')['actor_source'], 'github_api')
+        self.assertEqual(
+            self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'})['actor_source'],
+            'runner_env')
+        self.assertNotIn('actor_source', self._context())
 
     def test_the_agents_own_identity_is_not_a_person(self):
         for login in ('copilot-swe-agent[bot]', 'Copilot', 'github-actions'):
