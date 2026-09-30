@@ -1787,8 +1787,8 @@ def _github_actor() -> Optional[str]:
         return None
 
 
-CLOUD_ACTOR_CACHE_PATH = LOG_DIR / "cloud_actor.json"
 CLOUD_ACTOR_TASK_SCAN = 5
+_cloud_actor_memo = {}
 
 
 def _github_api(path: str) -> Optional[Dict]:
@@ -1821,13 +1821,15 @@ def _cloud_session_user_id(repo: str, session: str) -> Optional[int]:
 
 def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
     """The login GitHub records for this session, which unlike the commit trailer the agent
-    cannot author. Asked once: this runs per turn, and a miss is cached or every turn re-asks."""
-    try:
-        cached = json.loads(CLOUD_ACTOR_CACHE_PATH.read_text(encoding='utf-8'))
-        if cached.get('session') == session:
-            return cached.get('login')
-    except Exception:
-        pass
+    cannot author.
+
+    Memoised for the process and never written down. Every path the sandbox can reach is
+    writable by the agent, so a cache file would let it plant the very name this call exists
+    to establish; a process that uploads several turns still asks GitHub once, and the next
+    process retries rather than inheriting a transient failure for the whole session.
+    """
+    if session in _cloud_actor_memo:
+        return _cloud_actor_memo[session]
     login = None
     try:
         user_id = _cloud_session_user_id(repo, session)
@@ -1835,12 +1837,7 @@ def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
             login = ((_github_api('user/%s' % user_id) or {}).get('login') or '').strip() or None
     except Exception as e:
         log_error('cloud session actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
-    try:
-        CLOUD_ACTOR_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CLOUD_ACTOR_CACHE_PATH.write_text(
-            json.dumps({'session': session, 'login': login}), encoding='utf-8')
-    except Exception:
-        pass
+    _cloud_actor_memo[session] = login
     return login
 
 
