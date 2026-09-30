@@ -1907,32 +1907,44 @@ CLOUD_ACTOR_TASK_SCAN = 5
 # unreported. A name is worth less than the audit record.
 CLOUD_ACTOR_BUDGET = 8.0
 _cloud_actor_memo = {}
+# Why the last call named nobody. Reported once a session: the lookup has several ways to
+# come back empty and the row alone cannot tell a missing token from a refused one.
+_cloud_api_reason = None
 
 
 def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
     """GitHub's REST API with the sandbox's own token. Never raises."""
+    global _cloud_api_reason
     # An Enterprise Server token must not reach public GitHub; _copilot_seat refuses the
     # same case. Unset is refused too.
     if urlparse(os.environ.get('GITHUB_SERVER_URL') or '').hostname != 'github.com':
+        _cloud_api_reason = 'server_url'
         return None
-    # Copilot's token first: the Actions GITHUB_TOKEN is always set and these routes
-    # reject it, so reaching for it first would mask a working one.
-    for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
+    # The two the cloud sandbox documents. GITHUB_TOKEN is documented as not set there, and
+    # the laptop names the seat lookup uses do not exist in it either.
+    for var in ('GITHUB_COPILOT_API_TOKEN', 'GITHUB_COPILOT_GIT_TOKEN'):
         token = (os.environ.get(var) or '').strip()
         if token:
             break
     else:
+        _cloud_api_reason = 'no_token'
         return None
     # Not 0: a --max-time formatting to 0.0 is unlimited to curl.
     left = 5.0 if deadline is None else min(5.0, deadline - time.monotonic())
     if left < 0.1:
+        _cloud_api_reason = 'budget_spent'
         return None
     result = subprocess.run(
         _curl_base() + ["-fsS", "--max-time", "%.1f" % left, "-H", "@-",
                         "https://api.github.com/%s" % path],
         input=("Authorization: token %s\n" % token).encode(),
         capture_output=True, timeout=left + 5)
-    return json.loads(result.stdout) if result.returncode == 0 else None
+    if result.returncode != 0:
+        # The token rides stdin, never argv, so curl's own message cannot carry it.
+        _cloud_api_reason = '%s rc=%d %s' % (
+            var, result.returncode, result.stderr.decode('utf-8', 'replace').strip()[:120])
+        return None
+    return json.loads(result.stdout)
 
 
 def _cloud_session_user_id(repo: str, session: str, deadline: float) -> Optional[int]:
@@ -1966,6 +1978,9 @@ def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
                      or '').strip() or None
     except Exception as e:
         log_error('cloud session actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
+    if login is None:
+        log_error('cloud session actor unresolved: %s' % (_cloud_api_reason or 'session_not_found'),
+                  'identity')
     _cloud_actor_memo[session] = login
     return login
 
