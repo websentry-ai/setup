@@ -1755,6 +1755,33 @@ _GITHUB_COAUTHOR_RE = re.compile(
     r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>', re.M | re.I)
 
 
+def _env_actor() -> Optional[str]:
+    """The login the runner names as having triggered the job. A `[bot]` is the agent's own
+    identity rather than a person, and naming it would be worse than naming nobody."""
+    for var in ('GITHUB_TRIGGERING_ACTOR', 'GITHUB_ACTOR'):
+        login = (os.environ.get(var) or '').strip()
+        if login and '[bot]' not in login.lower():
+            return login
+    return None
+
+
+def _session_base() -> Optional[str]:
+    """The commit this session branched from. COPILOT_AGENT_BASE_COMMIT is unset in the
+    sandbox, so the fork point off the default branch scopes the range in its place."""
+    base = (os.environ.get('COPILOT_AGENT_BASE_COMMIT') or '').strip()
+    if base:
+        return base
+    ref = (os.environ.get('GITHUB_BASE_REF') or '').strip()
+    try:
+        out = subprocess.run(['git', 'merge-base', 'HEAD', 'origin/%s' % ref if ref else 'origin/HEAD'],
+                             capture_output=True, timeout=5)
+        if out.returncode != 0:
+            return None
+        return out.stdout.decode('utf-8', 'replace').strip() or None
+    except Exception:
+        return None
+
+
 def _github_actor() -> Optional[str]:
     """The login that triggered the session, read from the co-author trailer GitHub stamps.
 
@@ -1766,7 +1793,7 @@ def _github_actor() -> Optional[str]:
     upload a stranger's login as this session's actor. The login, not the display name — a
     display name is neither stable nor unique, so it joins to nothing later.
     """
-    base = os.environ.get('COPILOT_AGENT_BASE_COMMIT')
+    base = _session_base()
     if not base:
         return None
     try:
@@ -1847,8 +1874,11 @@ def build_github_context() -> Optional[Dict]:
         return None
     repo = os.environ.get('GITHUB_REPOSITORY')
     session = os.environ.get('COPILOT_AGENT_SESSION_ID')
-    # GitHub's answer first: the trailer is only ever what the agent chose to write.
-    actor = _cloud_session_actor(repo, session) if repo and session else None
+    # The runner's own answer, then GitHub's. The trailer is last: it costs nothing but is
+    # only ever what the agent chose to write, and a session that commits nothing has none.
+    actor = _env_actor()
+    if not actor and repo and session:
+        actor = _cloud_session_actor(repo, session)
     context = {
         'actor': actor or _github_actor(),
         'repo': repo,
