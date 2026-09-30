@@ -152,22 +152,122 @@ class TestGithubContext(unittest.TestCase):
         with patch.object(unbound, 'RUNNING_CLOUD', False):
             self.assertIsNone(unbound.build_github_context())
 
-    def test_provenance_is_repo_session_and_trigger(self):
-        env = {'GITHUB_REPOSITORY': 'websentry-ai/setup',
-               'COPILOT_AGENT_SESSION_ID': 'sess-1',
-               'COPILOT_JOB_EVENT_TYPE': 'issues'}
+    CLOUD_ENV = {'GITHUB_REPOSITORY': 'websentry-ai/setup',
+                 'COPILOT_AGENT_SESSION_ID': 'sess-1',
+                 'COPILOT_JOB_EVENT_TYPE': 'issues'}
+
+    def _context(self, env=None, session_actor=None, trailer_actor=None):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
-                patch.dict(unbound.os.environ, env, clear=True), \
-                patch.object(unbound, '_github_actor', return_value='octocat'):
-            self.assertEqual(unbound.build_github_context(),
-                             {'actor': 'octocat', 'repo': 'websentry-ai/setup',
-                              'session': 'sess-1', 'event': 'issues'})
+                patch.dict(unbound.os.environ, dict(self.CLOUD_ENV, **(env or {})), clear=True), \
+                patch.object(unbound, '_cloud_session_actor', return_value=session_actor), \
+                patch.object(unbound, '_github_actor', return_value=trailer_actor):
+            return unbound.build_github_context()
+
+    def test_provenance_is_repo_session_and_trigger(self):
+        self.assertEqual(self._context(session_actor='octocat'),
+                         {'actor': 'octocat', 'repo': 'websentry-ai/setup',
+                          'session': 'sess-1', 'event': 'issues'})
+
+    def test_the_commit_trailer_never_names_the_actor(self):
+        """The agent writes its own commit messages, and nothing in the payload separates a
+        login it claimed from one GitHub confirmed. Naming nobody is the safer answer."""
+        self.assertNotIn('actor', self._context(trailer_actor='octocat'))
+
+    def test_the_runner_answers_only_when_the_lookup_cannot(self):
+        named = self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'},
+                              session_actor='api-login')
+        self.assertEqual(named['actor'], 'api-login')
+        fell_back = self._context({'GITHUB_TRIGGERING_ACTOR': 'runner-login'})
+        self.assertEqual(fell_back['actor'], 'runner-login')
+
+    def test_the_agents_own_identity_is_not_a_person(self):
+        for login in ('copilot-swe-agent[bot]', 'Copilot', 'github-actions'):
+            self.assertNotIn('actor', self._context({'GITHUB_ACTOR': login}), login)
+        self.assertEqual(self._context({'GITHUB_ACTOR': 'anonpran'})['actor'], 'anonpran')
 
     def test_absent_fields_are_dropped_rather_than_sent_empty(self):
         with patch.object(unbound, 'RUNNING_CLOUD', True), \
                 patch.dict(unbound.os.environ, {'COPILOT_AGENT_SESSION_ID': 'sess-1'}, clear=True), \
                 patch.object(unbound, '_github_actor', return_value=None):
             self.assertEqual(unbound.build_github_context(), {'session': 'sess-1'})
+
+
+class TestCloudSessionActor(unittest.TestCase):
+    """The session's owner as GitHub records it. This runs before the turn is uploaded, so it
+    is bounded: a name is worth less than the audit record it would otherwise delay."""
+
+    def setUp(self):
+        unbound._cloud_actor_memo.clear()
+
+    @staticmethod
+    def _api(pages, clock=None):
+        calls = []
+
+        def api(path, deadline=None):
+            calls.append(path)
+            if clock is not None:
+                clock[0] += 3.0
+            return pages.get(path)
+        return api, calls
+
+    def test_the_session_names_its_user(self):
+        api, calls = self._api({
+            'agents/repos/o/r/tasks': {'tasks': [{'id': 't1'}]},
+            'agents/repos/o/r/tasks/t1': {'sessions': [{'id': 's1', 'user': {'id': 7}}]},
+            'user/7': {'login': 'anonpran'},
+        })
+        with patch.object(unbound, '_github_api', api):
+            self.assertEqual(unbound._cloud_session_actor('o/r', 's1'), 'anonpran')
+        self.assertEqual(len(calls), 3)
+
+    def test_a_session_nobody_claims_names_nobody(self):
+        api, _ = self._api({'agents/repos/o/r/tasks': {'tasks': [{'id': 't1'}]},
+                            'agents/repos/o/r/tasks/t1': {'sessions': []}})
+        with patch.object(unbound, '_github_api', api):
+            self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
+
+    def test_one_lookup_serves_every_turn_in_the_process(self):
+        api, calls = self._api({
+            'agents/repos/o/r/tasks': {'tasks': [{'id': 't1'}]},
+            'agents/repos/o/r/tasks/t1': {'sessions': [{'id': 's1', 'user': {'id': 7}}]},
+            'user/7': {'login': 'anonpran'},
+        })
+        with patch.object(unbound, '_github_api', api):
+            for _ in range(4):
+                unbound._cloud_session_actor('o/r', 's1')
+        self.assertEqual(len(calls), 3)
+
+    def test_the_scan_stops_at_the_budget(self):
+        """Without one aggregate deadline the scan outlasts the agentStop timeout and the
+        turn goes unreported -- a missing audit record, not merely a missing name."""
+        clock = [0.0]
+        api, calls = self._api(
+            {'agents/repos/o/r/tasks': {'tasks': [{'id': 't%d' % i} for i in range(5)]}},
+            clock=clock)
+        with patch.object(unbound, '_github_api', api), \
+                patch.object(unbound.time, 'monotonic', lambda: clock[0]):
+            self.assertIsNone(unbound._cloud_session_actor('o/r', 's1'))
+        self.assertLess(len(calls), 6)
+
+    def test_copilots_own_token_outranks_the_actions_one(self):
+        """The sandbox always carries an Actions GITHUB_TOKEN, and these routes reject the
+        installation token it is -- so reaching for it first would mask a working one."""
+        seen = {}
+
+        def run(argv, **kwargs):
+            seen['auth'] = kwargs['input'].decode()
+            return _Completed(b'{}')
+        env = {'COPILOT_GITHUB_TOKEN': 'copilot-tok', 'GITHUB_TOKEN': 'actions-tok'}
+        with patch.dict(unbound.os.environ, env, clear=True), \
+                patch.object(unbound.subprocess, 'run', run):
+            unbound._github_api('user/7')
+        self.assertIn('copilot-tok', seen['auth'])
+
+    def test_no_token_asks_nothing(self):
+        with patch.dict(unbound.os.environ, {}, clear=True), \
+                patch.object(unbound.subprocess, 'run',
+                             side_effect=AssertionError('asked GitHub without a token')):
+            self.assertIsNone(unbound._github_api('user/7'))
 
 
 class TestCloudModeCannotBeTurnedOnByEnvironment(unittest.TestCase):
