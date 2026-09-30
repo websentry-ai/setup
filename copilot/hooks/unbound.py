@@ -1755,31 +1755,18 @@ _GITHUB_COAUTHOR_RE = re.compile(
     r'^Co-authored-by:[^<\n]*<(?:\d+\+)?([^@\s]+)@users\.noreply\.github\.com>', re.M | re.I)
 
 
+_ENV_ACTOR_SERVICE = {'copilot', 'copilot-swe-agent', 'github-actions', 'github-copilot'}
+
+
 def _env_actor() -> Optional[str]:
-    """The login the runner names as having triggered the job. A `[bot]` is the agent's own
-    identity rather than a person, and naming it would be worse than naming nobody."""
+    """The login the runner names as having triggered the job. The agent's own identity is
+    not a person and turns up both with and without a `[bot]` suffix, so both are refused:
+    naming the agent would be worse than naming nobody."""
     for var in ('GITHUB_TRIGGERING_ACTOR', 'GITHUB_ACTOR'):
         login = (os.environ.get(var) or '').strip()
-        if login and '[bot]' not in login.lower():
+        if login and '[bot]' not in login.lower() and login.lower() not in _ENV_ACTOR_SERVICE:
             return login
     return None
-
-
-def _session_base() -> Optional[str]:
-    """The commit this session branched from. COPILOT_AGENT_BASE_COMMIT is unset in the
-    sandbox, so the fork point off the default branch scopes the range in its place."""
-    base = (os.environ.get('COPILOT_AGENT_BASE_COMMIT') or '').strip()
-    if base:
-        return base
-    ref = (os.environ.get('GITHUB_BASE_REF') or '').strip()
-    try:
-        out = subprocess.run(['git', 'merge-base', 'HEAD', 'origin/%s' % ref if ref else 'origin/HEAD'],
-                             capture_output=True, timeout=5)
-        if out.returncode != 0:
-            return None
-        return out.stdout.decode('utf-8', 'replace').strip() or None
-    except Exception:
-        return None
 
 
 def _github_actor() -> Optional[str]:
@@ -1793,7 +1780,7 @@ def _github_actor() -> Optional[str]:
     upload a stranger's login as this session's actor. The login, not the display name — a
     display name is neither stable nor unique, so it joins to nothing later.
     """
-    base = _session_base()
+    base = os.environ.get('COPILOT_AGENT_BASE_COMMIT')
     if not base:
         return None
     try:
@@ -1815,31 +1802,42 @@ def _github_actor() -> Optional[str]:
 
 
 CLOUD_ACTOR_TASK_SCAN = 5
+# One budget for the whole lookup, not per call: seven five-second requests would outlast the
+# agentStop timeout and take the turn's telemetry down with them. A name is worth less than
+# the audit record, so the lookup gives up long before the upload is at risk.
+CLOUD_ACTOR_BUDGET = 8.0
 _cloud_actor_memo = {}
 
 
-def _github_api(path: str) -> Optional[Dict]:
+def _github_api(path: str, deadline: Optional[float] = None) -> Optional[Dict]:
     """GitHub's REST API with the sandbox's own token. Never raises."""
-    for var in ('GITHUB_TOKEN', 'GH_TOKEN', 'COPILOT_GITHUB_TOKEN'):
+    # Copilot's own token first, as _fetch_copilot_seat does: the sandbox always carries an
+    # Actions GITHUB_TOKEN, and an installation token these routes reject would mask it.
+    for var in ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'):
         token = (os.environ.get(var) or '').strip()
         if token:
             break
     else:
         return None
+    left = 5.0 if deadline is None else min(5.0, deadline - time.monotonic())
+    if left <= 0:
+        return None
     result = subprocess.run(
-        _curl_base() + ["-fsS", "--max-time", "5", "-H", "@-",
+        _curl_base() + ["-fsS", "--max-time", "%.1f" % left, "-H", "@-",
                         "https://api.github.com/%s" % path],
         input=("Authorization: token %s\n" % token).encode(),
-        capture_output=True, timeout=10)
+        capture_output=True, timeout=left + 5)
     return json.loads(result.stdout) if result.returncode == 0 else None
 
 
-def _cloud_session_user_id(repo: str, session: str) -> Optional[int]:
+def _cloud_session_user_id(repo: str, session: str, deadline: float) -> Optional[int]:
     """The task list carries no session ids, so each task's sessions are read until this one
     turns up. Newest first, and a session's own task is the newest one on the repo."""
-    tasks = (_github_api('agents/repos/%s/tasks' % repo) or {}).get('tasks') or []
+    tasks = (_github_api('agents/repos/%s/tasks' % repo, deadline) or {}).get('tasks') or []
     for task in tasks[:CLOUD_ACTOR_TASK_SCAN]:
-        detail = _github_api('agents/repos/%s/tasks/%s' % (repo, task.get('id')))
+        if time.monotonic() >= deadline:
+            return None
+        detail = _github_api('agents/repos/%s/tasks/%s' % (repo, task.get('id')), deadline)
         for entry in (detail or {}).get('sessions') or []:
             if entry.get('id') == session:
                 return (entry.get('user') or {}).get('id')
@@ -1858,10 +1856,12 @@ def _cloud_session_actor(repo: str, session: str) -> Optional[str]:
     if session in _cloud_actor_memo:
         return _cloud_actor_memo[session]
     login = None
+    deadline = time.monotonic() + CLOUD_ACTOR_BUDGET
     try:
-        user_id = _cloud_session_user_id(repo, session)
+        user_id = _cloud_session_user_id(repo, session, deadline)
         if user_id:
-            login = ((_github_api('user/%s' % user_id) or {}).get('login') or '').strip() or None
+            login = ((_github_api('user/%s' % user_id, deadline) or {}).get('login')
+                     or '').strip() or None
     except Exception as e:
         log_error('cloud session actor lookup failed: %s: %s' % (type(e).__name__, e), 'identity')
     _cloud_actor_memo[session] = login
@@ -1874,13 +1874,13 @@ def build_github_context() -> Optional[Dict]:
         return None
     repo = os.environ.get('GITHUB_REPOSITORY')
     session = os.environ.get('COPILOT_AGENT_SESSION_ID')
-    # The runner's own answer, then GitHub's. The trailer is last: it costs nothing but is
-    # only ever what the agent chose to write, and a session that commits nothing has none.
-    actor = _env_actor()
-    if not actor and repo and session:
-        actor = _cloud_session_actor(repo, session)
+    # GitHub's own record first: it is the only source here the agent cannot author. What the
+    # runner's variables hold in this sandbox has never been established, so they answer only
+    # when the lookup cannot. The commit trailer stays out: the agent writes those messages,
+    # and the payload carries no field to tell a claimed login from a confirmed one.
+    actor = _cloud_session_actor(repo, session) if repo and session else None
     context = {
-        'actor': actor or _github_actor(),
+        'actor': actor or _env_actor(),
         'repo': repo,
         'session': session,
         'event': os.environ.get('COPILOT_JOB_EVENT_TYPE'),
