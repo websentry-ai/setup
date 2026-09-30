@@ -1642,7 +1642,7 @@ _COPILOT_CLI_TOKEN_VARS = ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
 
 @functools.lru_cache(maxsize=8)
 def _copilot_cli_credential(account: str) -> Optional[bool]:
-    """Whether the OS credential store holds the CLI's sign-in for host:login; None when it can't say. Never reads the secret."""
+    """None when the store can't say. Never reads the secret."""
     try:
         if platform.system() == 'Darwin':
             result = subprocess.run(['/usr/bin/security', 'find-generic-password', '-s', 'copilot-cli', '-a', account],
@@ -1675,7 +1675,7 @@ def _strip_copilot_cli_service(target: str) -> str:
 
 
 def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
-    """The account the CLI signs in with: an env token overrides it, and a config login needs its stored credential."""
+    """An env token overrides the stored sign-in."""
     if any(os.environ.get(var) for var in _COPILOT_CLI_TOKEN_VARS):
         return None, None
     login, host = _copilot_login()
@@ -1689,7 +1689,6 @@ _COPILOT_USER_CACHE_MAX_AGE_SECONDS = 7 * 24 * 3600
 
 
 def _copilot_user_cache_path() -> Optional[Path]:
-    """Copilot's shared cache of GitHub's copilot_internal/user answers, written by the CLI and VS Code."""
     if _is_windows():
         base = os.environ.get('LOCALAPPDATA')
         return Path(base) / 'copilot' / 'copilot-user-cache.json' if base else None
@@ -1699,7 +1698,6 @@ def _copilot_user_cache_path() -> Optional[Path]:
 
 
 def _copilot_cached_seat(login: str) -> Tuple[Optional[str], Optional[str]]:
-    """Plan (sku) and org GitHub reported for this login within the last week, from Copilot's own user cache."""
     path = _copilot_user_cache_path()
     try:
         if path is None or path.stat().st_size > _COPILOT_USER_CACHE_MAX_BYTES:
@@ -1740,7 +1738,6 @@ _VSCODE_COPILOT_STATE_MAX_BYTES = 4 * 1024 * 1024
 
 
 def _vscode_state_values(path, keys):
-    """Named values from one state.vscdb, read-only."""
     try:
         uri = f'{path.resolve().as_uri()}?mode=ro'
         marks = ','.join('?' * len(keys))
@@ -1762,7 +1759,6 @@ def _vscode_state_values(path, keys):
 
 
 def _vscode_user_dir_of(transcript_path) -> Optional[Path]:
-    """The Code/User dir a VS Code transcript lives under."""
     if not isinstance(transcript_path, str) or not transcript_path:
         return None
     for parent in Path(transcript_path).parents:
@@ -1772,7 +1768,7 @@ def _vscode_user_dir_of(transcript_path) -> Optional[Path]:
 
 
 def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Login, plan and org of the turn's install, else the newest one. The login key survives a sign-out; the plan does not."""
+    """The login key survives a sign-out; the sku does not."""
     databases = []
     for user_dir in [user_dir] if user_dir else _vscode_user_dirs():
         path = user_dir / 'globalStorage' / 'state.vscdb'
@@ -1802,8 +1798,7 @@ def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[s
 
 def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
                           transcript_path: Optional[str] = None) -> Dict:
-    """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in. VS Code names its
-    own plan and org; the CLI's come from Copilot's user cache, else from VS Code signed in as the same login."""
+    """The signed-in account, keyed by GitHub login rather than address."""
     plan = org = None
     if surface == 'vscode':
         login, plan, org = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
