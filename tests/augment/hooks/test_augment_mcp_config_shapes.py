@@ -191,10 +191,11 @@ class AugmentMcpConfigShapes(_IsolatedHome):
             ev, unbound.read_augment_mcp_servers({}))
         self.assertEqual('mcp__%s__splunk_run_query' % SERVER, out['tool_name'])
 
-    # ── the Stop-event door (end-of-turn analytics) ─────────────────────
+    # ── the Stop-event path (end-of-turn analytics) ─────────────────────
 
     def test_stop_event_analytics_names_the_server(self):
-        """build_llm_exchange is the door the hook runs at end of turn."""
+        """The Stop exchange names the server. build_llm_exchange sits under
+        main(); ThroughTheRealEntrypoint drives it from the real door."""
         self._write_settings({'augment': {'advanced': {'mcpServers': {SERVER: ENTRY}}}})
         ex = unbound.build_llm_exchange(
             self._stop_event(), self._post_log())
