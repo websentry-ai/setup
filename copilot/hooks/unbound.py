@@ -1636,6 +1636,38 @@ def _copilot_login() -> Tuple[Optional[str], Optional[str]]:
         return None, None
 
 
+_COPILOT_CLI_TOKEN_VARS = ('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')
+
+
+def _copilot_cli_credential(account: str) -> Optional[bool]:
+    """Whether the OS credential store holds the CLI's sign-in for host:login; None when it can't say. Never reads the secret."""
+    try:
+        if platform.system() == 'Darwin':
+            result = subprocess.run(['/usr/bin/security', 'find-generic-password', '-s', 'copilot-cli', '-a', account],
+                                    capture_output=True, timeout=5)
+            return True if result.returncode == 0 else False if result.returncode == 44 else None
+        if _is_windows():
+            result = subprocess.run([_windows_system32_path('cmdkey.exe'), '/list'],
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode != 0:
+                return None
+            entries = [line.lower() for line in result.stdout.splitlines() if 'copilot-cli' in line.lower()]
+            return any(account.lower() in line for line in entries) if entries else None
+    except Exception as error:
+        log_error(f'copilot cli credential check failed: {type(error).__name__}', 'identity')
+    return None
+
+
+def _copilot_cli_account() -> Tuple[Optional[str], Optional[str]]:
+    """The account the CLI signs in with: an env token overrides it, and a config login needs its stored credential."""
+    if any(os.environ.get(var) for var in _COPILOT_CLI_TOKEN_VARS):
+        return None, None
+    login, host = _copilot_login()
+    if login and _copilot_cli_credential(f'{host or "https://github.com"}:{login}') is False:
+        return None, None
+    return login, host
+
+
 _VSCODE_COPILOT_ACCOUNT_KEY = 'github.copilot-github'
 _VSCODE_COPILOT_CHAT_STATE_KEY = 'GitHub.copilot-chat'
 _VSCODE_COPILOT_STATE_MAX_BYTES = 4 * 1024 * 1024
@@ -1664,7 +1696,7 @@ def _vscode_state_values(path, keys):
 
 
 def _vscode_copilot_account() -> Tuple[Optional[str], Optional[str], Optional[str]]:
-    """Login, plan and org of VS Code's Copilot account. The login key survives a sign-out; the plan does not."""
+    """Login, plan and org of the newest install signed in to Copilot. The login key survives a sign-out; the plan does not."""
     databases = []
     for user_dir in _vscode_user_dirs():
         path = user_dir / 'globalStorage' / 'state.vscdb'
@@ -1685,7 +1717,7 @@ def _vscode_copilot_account() -> Tuple[Optional[str], Optional[str], Optional[st
         sku = chat.get('exp.github.copilot.sku')
         sku = sku.strip() if isinstance(sku, str) else ''
         if not sku:
-            continue
+            return None, None, None
         orgs = chat.get('exp.github.copilot.organizationList')
         orgs = sorted(o.strip() for o in orgs if isinstance(o, str) and o.strip()) if isinstance(orgs, list) else []
         return login, sku, orgs[0] if orgs else None
@@ -1698,8 +1730,10 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
     if surface == 'vscode':
         login, plan, org = _vscode_copilot_account()
         host = 'https://github.com' if login else None
-    else:
+    elif surface == 'cloud':
         login, host = _copilot_login()
+    else:
+        login, host = _copilot_cli_account()
     if not login:
         return {'org_id': None, 'plan': None, 'auth_mode': None,
                 'user_email': None, 'email_domain': None,
