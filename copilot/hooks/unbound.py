@@ -1759,7 +1759,8 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
         login, plan = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
         host = 'https://github.com' if login else None
         if login:
-            org = _copilot_cached_seat(login)[1]
+            cached_plan, cached_org = _copilot_cached_seat(login)
+            org = cached_org if cached_plan == plan else None
     elif surface == 'cloud':
         login, host = _copilot_login()
     else:

@@ -301,7 +301,7 @@ class TestVSCodeAccount(_IsolatedConfig):
     def test_a_vscode_turn_reports_vscode_account_plan_and_org(self):
         self._write(SIGNED_IN)
         self._vscode(login="vs-user", sku="copilot_for_business_seat")
-        self._user_cache("vs-user", orgs=[202, 101])
+        self._user_cache("vs-user", sku="copilot_for_business_seat", orgs=[202, 101])
         identity = unbound.read_account_identity(surface="vscode")
         self.assertEqual((identity["account_login"], identity["account_host"], identity["plan"], identity["org_id"]),
                          ("vs-user", "https://github.com", "copilot_for_business_seat", "101"))
@@ -384,7 +384,7 @@ class TestVSCodeAccount(_IsolatedConfig):
 
     def test_github_is_not_asked_when_vscode_names_the_plan(self):
         self._vscode(login="vs-user", sku="copilot_for_business_seat")
-        self._user_cache("vs-user", orgs=[101])
+        self._user_cache("vs-user", sku="copilot_for_business_seat", orgs=[101])
         with patch.object(unbound, "_copilot_seat") as seat, \
                 patch.object(unbound, "_device_serial", return_value=None):
             identity = unbound.build_account_identity(probe=True, surface="vscode")
@@ -481,6 +481,13 @@ class TestCopilotUserCache(_IsolatedConfig):
             identity = unbound.build_account_identity(probe=True, surface="cli")
         seat.assert_called_once()
         self.assertEqual(identity["org_id"], "new-employer")
+
+    def test_a_cached_seat_with_another_plan_gives_a_vscode_turn_no_org(self):
+        """A user who moved to a personal seat must not keep the former business seat's org."""
+        self._vscode(login="vs-user", sku="free_educational_quota")
+        self._user_cache("vs-user", sku="copilot_for_business_seat_quota", orgs=[303])
+        identity = unbound.read_account_identity(surface="vscode")
+        self.assertEqual((identity["plan"], identity["org_id"]), ("free_educational_quota", None))
 
     def test_a_stale_cache_gives_a_vscode_turn_no_org(self):
         self._vscode(login="vs-user", sku="copilot_for_business_seat_quota")
