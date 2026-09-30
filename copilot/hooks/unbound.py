@@ -1799,16 +1799,12 @@ def _vscode_copilot_account(user_dir: Optional[Path] = None) -> Tuple[Optional[s
 
 def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] = None,
                           transcript_path: Optional[str] = None) -> Dict:
-    """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in; plan and org
-    come from Copilot's user cache for that login, else from VS Code when it is signed in as the same login."""
+    """The signed-in account, keyed by GitHub login. Each surface reports its own sign-in. VS Code names its
+    own plan and org; the CLI's come from Copilot's user cache, else from VS Code signed in as the same login."""
     plan = org = None
     if surface == 'vscode':
         login, plan, org = _vscode_copilot_account(_vscode_user_dir_of(transcript_path))
         host = 'https://github.com' if login else None
-        if login:
-            cached_plan, cached_org = _copilot_cached_seat(login)
-            if cached_org and cached_plan == plan:
-                org = cached_org
     elif surface == 'cloud':
         login, host = _copilot_login()
     else:
@@ -1816,6 +1812,7 @@ def read_account_identity(event: Optional[Dict] = None, surface: Optional[str] =
         if login and urlparse(host or 'https://github.com').hostname == 'github.com':
             plan, org = _copilot_cached_seat(login)
             if not plan:
+                org = None
                 vscode_login, vscode_plan, vscode_org = _vscode_copilot_account()
                 if vscode_login and vscode_login.lower() == login.lower():
                     plan, org = vscode_plan, org or vscode_org
@@ -2071,7 +2068,7 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     day; only the end-of-turn path (probe) asks GitHub. Never raises."""
     try:
         cached = json.loads(COPILOT_SEAT_CACHE_PATH.read_text(encoding='utf-8'))
-        if cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
+        if cached.get('v') == 2 and cached.get('login') == login and time.time() - cached.get('at', 0) < COPILOT_SEAT_TTL:
             return cached.get('plan'), cached.get('org')
     except Exception:
         pass
@@ -2093,7 +2090,7 @@ def _copilot_seat(login: str, host: Optional[str], probe: bool) -> Tuple[Optiona
     try:
         COPILOT_SEAT_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = COPILOT_SEAT_CACHE_PATH.parent / (".copilot_seat.%d.tmp" % os.getpid())
-        tmp.write_text(json.dumps({'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
+        tmp.write_text(json.dumps({'v': 2, 'login': login, 'plan': plan, 'org': org, 'at': time.time()}),
                        encoding='utf-8')
         os.replace(str(tmp), str(COPILOT_SEAT_CACHE_PATH))
     except Exception:
