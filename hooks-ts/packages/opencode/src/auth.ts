@@ -18,7 +18,7 @@
 // wholesale, as opencode itself does (`:59-61`); otherwise `<dataDir>/auth.json` through
 // `readSmallRegularFile`. The file is read, never written.
 //
-// Total: no throw statement here; any failure is "no credential store", i.e. `undefined`.
+// Total: nothing here raises; any failure is "no credential store", i.e. `undefined`.
 
 import { join } from "node:path";
 
