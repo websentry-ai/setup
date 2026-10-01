@@ -291,6 +291,12 @@ export const MAX_ASSISTANT_CHARS = 16_384;
  */
 export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
 /**
+ * The longest MCP server or tool name sent as `metadata.mcp_server` / `metadata.mcp_tool`. A name
+ * longer than this is not a real name, so it is dropped, never truncated: a truncated name could
+ * attribute the call to a different server.
+ */
+export const MAX_MCP_NAME_CHARS = 256;
+/**
  * The only `metadata.tool_input` keys that leave the machine (WR-04 / T-09-03).
  *
  * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a pi tool call

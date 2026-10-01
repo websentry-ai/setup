@@ -100,6 +100,13 @@ export interface PretoolPayloadInput {
   pullPolicies?: boolean;
   /** The process's settled account identity, when known. */
   accountIdentity?: AccountIdentity;
+  /**
+   * Explicit MCP attribution. Becomes `metadata.mcp_server` / `metadata.mcp_tool`, the API's
+   * explicit-attribution contract (PLAT-12). Only the adapter knows a call is an MCP call; core never
+   * infers this from a tool name. Each name is sent only when it is a non-blank string of at most
+   * `MAX_MCP_NAME_CHARS`; `mcp_tool` only alongside a valid `mcp_server`.
+   */
+  mcp?: { server: string; tool: string };
 }
 
 /**

@@ -65,7 +65,7 @@ function deps(checker: PolicyChecker, overrides: Partial<EvaluateDeps> = {}): Ev
   };
 }
 
-function mcpCall(overrides: Partial<ToolCallInput> & { mcp?: unknown } = {}): ToolCallInput {
+function mcpCall(overrides: Omit<Partial<ToolCallInput>, "mcp"> & { mcp?: unknown } = {}): ToolCallInput {
   return {
     toolName: "github_create_issue",
     toolCallId: "call_1",

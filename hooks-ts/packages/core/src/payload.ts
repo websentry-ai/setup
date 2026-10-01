@@ -32,6 +32,7 @@ import {
   EVENT_NAME_TOOL_USE,
   EVENT_NAME_USER_PROMPT,
   MAX_COMMAND_CHARS,
+  MAX_MCP_NAME_CHARS,
   MAX_PROMPT_CHARS,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
@@ -114,6 +115,55 @@ export function resolveFilePath(
 const ALLOWED_TOOL_INPUT_KEYS: ReadonlySet<string> = new Set(TOOL_INPUT_ALLOWLIST);
 
 /**
+ * The keys a tool input may forward: `TOOL_INPUT_ALLOWLIST` plus the string members of `extraKeys`
+ * (a profile's `extraToolInputKeys`). Total: anything that is not a readable array of strings adds
+ * nothing, so an unreadable declaration behaves exactly like no declaration.
+ */
+function allowedKeysFor(extraKeys: unknown): ReadonlySet<string> {
+  try {
+    if (!Array.isArray(extraKeys) || extraKeys.length === 0) return ALLOWED_TOOL_INPUT_KEYS;
+    const allowed = new Set<string>(ALLOWED_TOOL_INPUT_KEYS);
+    for (const key of extraKeys) if (typeof key === "string" && key !== "") allowed.add(key);
+    return allowed;
+  } catch {
+    return ALLOWED_TOOL_INPUT_KEYS;
+  }
+}
+
+/** A profile's `extraToolInputKeys`, read so that a throwing getter is "none declared". */
+export function profileExtraToolInputKeys(profile: unknown): readonly string[] | undefined {
+  try {
+    if (profile === null || typeof profile !== "object") return undefined;
+    const keys: unknown = (profile as { extraToolInputKeys?: unknown }).extraToolInputKeys;
+    return Array.isArray(keys) ? (keys as readonly string[]) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function validMcpName(value: unknown): string | undefined {
+  if (typeof value !== "string" || value.trim() === "" || value.length > MAX_MCP_NAME_CHARS) return undefined;
+  return value;
+}
+
+/**
+ * Explicit MCP attribution, validated: a non-blank `server` of at most `MAX_MCP_NAME_CHARS`, and the
+ * `tool` when it is likewise valid. `undefined` for anything else (null, a number, a getter that
+ * raises, a bad server). Names are dropped when invalid, never truncated. Total.
+ */
+export function normaliseMcp(raw: unknown): { server: string; tool?: string } | undefined {
+  try {
+    if (raw === null || typeof raw !== "object") return undefined;
+    const server = validMcpName((raw as { server?: unknown }).server);
+    if (server === undefined) return undefined;
+    const tool = validMcpName((raw as { tool?: unknown }).tool);
+    return tool === undefined ? { server } : { server, tool };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Slice a string to at most `maxBytes` UTF-8 bytes **on a code-point boundary**.
  *
  * `value.slice(0, maxBytes)` would cut UTF-16 code units, which splits a surrogate pair at the
@@ -136,7 +186,7 @@ function sliceToBytes(value: string, maxBytes: number): string {
 }
 
 /**
- * Apply `TOOL_INPUT_ALLOWLIST` (WR-04). Keeps only allowlisted keys whose values are
+ * Apply `TOOL_INPUT_ALLOWLIST` (WR-04), plus a profile's `extraKeys` when given. Keeps only allowed keys whose values are
  * `string | number | boolean`, slices any surviving string to `MAX_TOOL_INPUT_VALUE_BYTES`, and says
  * so:
  *
@@ -147,15 +197,19 @@ function sliceToBytes(value: string, maxBytes: number): string {
  * Neither marker appears when nothing happened, so a clean forward stays byte-diffable. Total: a
  * non-object input is an empty forward, never a throw.
  */
-export function sanitizeToolInput(toolInput: Record<string, unknown>): Record<string, unknown> {
+export function sanitizeToolInput(
+  toolInput: Record<string, unknown>,
+  extraKeys?: readonly string[],
+): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   if (toolInput === null || typeof toolInput !== "object" || Array.isArray(toolInput)) return out;
+  const allowed = allowedKeysFor(extraKeys);
 
   let dropped = false;
   let truncated = false;
 
   for (const [key, value] of Object.entries(toolInput)) {
-    if (!ALLOWED_TOOL_INPUT_KEYS.has(key)) {
+    if (!allowed.has(key)) {
       dropped = true;
       continue;
     }
@@ -268,12 +322,14 @@ export function capCommand(
 export function auditToolInput(
   toolInput: Record<string, unknown>,
   command: string,
+  extraKeys?: readonly string[],
 ): Record<string, unknown> {
   const isObject = toolInput !== null && typeof toolInput === "object" && !Array.isArray(toolInput);
   // A copy: the caller's `event.input` is pi's live object and must not be mutated (§F9).
   const source: Record<string, unknown> = isObject ? { ...toolInput } : {};
   delete source.command;
-  const out = sanitizeToolInput(source);
+  // The same extra keys the request forwards, so the audit row and the request agree.
+  const out = sanitizeToolInput(source, extraKeys);
   if (typeof command === "string" && command !== "") out.command = capCommand(command).command;
   return capToolInput(out);
 }
@@ -320,17 +376,17 @@ export function withAccountIdentity<T extends { account_identity?: AccountIdenti
 /**
  * Assemble the §B1 body. Pure: same input, same output, no side effects.
  *
- * The profile supplies the two things that differ per agent: the wire app label and the file-tool
- * taxonomy that decides `metadata.file_path`.
+ * The profile supplies the things that differ per agent: the wire app label, the file-tool taxonomy
+ * that decides `metadata.file_path`, and any extra tool-input keys its tools use.
  */
 export function buildPretoolPayload(
   input: PretoolPayloadInput,
-  profile: Pick<AgentProfile, "appLabel" | "fileTools">,
+  profile: Pick<AgentProfile, "appLabel" | "fileTools" | "extraToolInputKeys">,
 ): PretoolRequestBody {
   const metadata: Record<string, unknown> = {
     cwd: input.cwd,
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
-    tool_input: capToolInput(sanitizeToolInput(input.toolInput)),
+    tool_input: capToolInput(sanitizeToolInput(input.toolInput, profileExtraToolInputKeys(profile))),
   };
   const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd, profile.fileTools);
   if (filePath !== undefined) metadata.file_path = filePath;
@@ -342,6 +398,13 @@ export function buildPretoolPayload(
     // partial command as if it were the command that will actually run.
     metadata.command_truncated = true;
     metadata.command_original_chars = input.command.length;
+  }
+  // Explicit MCP attribution (PLAT-12), appended after every existing key so a body without it is
+  // byte-identical to before. Only from the caller's validated field; never derived from a tool name.
+  const mcp = normaliseMcp(input.mcp);
+  if (mcp !== undefined) {
+    metadata.mcp_server = mcp.server;
+    if (mcp.tool !== undefined) metadata.mcp_tool = mcp.tool;
   }
 
   const preToolUseData: PreToolUseData = {

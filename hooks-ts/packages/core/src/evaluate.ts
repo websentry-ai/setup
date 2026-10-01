@@ -39,7 +39,15 @@ import {
   GENERIC_DENY_REASON,
   PRETOOL_TIMEOUT_MS,
 } from "./constants.ts";
-import { auditToolInput, buildPretoolPayload, buildPromptPayload, nativeFileTools, resolveFilePath } from "./payload.ts";
+import {
+  auditToolInput,
+  buildPretoolPayload,
+  buildPromptPayload,
+  nativeFileTools,
+  normaliseMcp,
+  profileExtraToolInputKeys,
+  resolveFilePath,
+} from "./payload.ts";
 import type { CheckHooks, PolicyChecker } from "./policy.ts";
 import { createPolicyState } from "./policyState.ts";
 import type { PolicyState } from "./policyState.ts";
@@ -65,6 +73,12 @@ export interface ToolCallInput {
   cwd: string;
   sessionId: string;
   model: string | undefined;
+  /**
+   * Explicit MCP attribution, when the adapter knows this call goes to an MCP server. Sent as
+   * `metadata.mcp_server` / `metadata.mcp_tool`, and makes a call with no command and no file path
+   * evaluable. Validated inside; an unusable value is treated as absent.
+   */
+  mcp?: { server: string; tool: string };
 }
 
 /** One user prompt, as the adapter sees it. Images and attachments have no field here on purpose. */
@@ -92,7 +106,7 @@ export interface DecisionEntry {
 
 export interface EvaluateDeps {
   checker: PolicyChecker;
-  profile: Pick<AgentProfile, "appLabel" | "fileTools">;
+  profile: Pick<AgentProfile, "appLabel" | "fileTools" | "extraToolInputKeys">;
   /** `client_entrypoint` on the wire: "<agent>/<version>". */
   entrypoint: string;
   /**
@@ -295,16 +309,23 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
     const cwd = asString(source.cwd);
     const profile = deps.profile;
 
-    // Nothing to evaluate: the server's entry gate needs a non-blank command or a native-tool
-    // `file_path`, so a call with neither is a guaranteed allow after a full round trip. This covers
-    // every custom/MCP tool that carries no command, not just an empty shell command (WR-04).
+    // Explicit MCP attribution, validated once here and handed to the payload as the validated value.
+    const mcp = normaliseMcp(source.mcp);
+
+    // Nothing to evaluate: the server's entry gate needs a non-blank command, a native-tool
+    // `file_path`, or an explicitly attributed MCP server, so a call with none of them is a
+    // guaranteed allow after a full round trip. This covers every custom tool that carries no
+    // command, not just an empty shell command (WR-04).
     const filePath = resolveFilePath(toolName, toolInput, cwd, profile.fileTools);
-    if (command.trim() === "" && filePath === undefined) return { kind: "skip", why: "nothing-evaluable" };
+    if (command.trim() === "" && filePath === undefined && mcp === undefined) {
+      return { kind: "skip", why: "nothing-evaluable" };
+    }
 
     // The audit projection, computed once for whichever branch below records the decision. Derived
-    // from the same `toolInput` and the same functions `buildPretoolPayload` uses, so the two agree by
-    // construction.
-    const auditInput = auditToolInput(toolInput, command);
+    // from the same `toolInput`, the same extra keys and the same functions `buildPretoolPayload`
+    // uses, so the two agree by construction.
+    const extraKeys = profileExtraToolInputKeys(profile);
+    const auditInput = auditToolInput(toolInput, command, extraKeys);
 
     const now = (deps.now ?? Date.now)();
     const state = resolveState(deps.state);
@@ -364,6 +385,7 @@ export async function evaluateToolCall(call: ToolCallInput, deps: EvaluateDeps):
       clientEntrypoint: asString(deps.entrypoint),
       pullPolicies,
       ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
+      ...(mcp === undefined ? {} : { mcp: { server: mcp.server, tool: mcp.tool ?? "" } }),
     }, profile);
 
     const outcome = await check(payload, toolName, deps, state);

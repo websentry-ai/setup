@@ -57,6 +57,13 @@ export interface AgentProfile {
   /** the agent's own data directory (absolute), or `undefined` when no safe base exists */
   resolveAgentDir(env: NodeJS.ProcessEnv, homeDir: string): string | undefined;
   readonly fileTools: AgentFileTools;
+  /**
+   * optional: wire keys, beyond `TOOL_INPUT_ALLOWLIST`, that this agent's tools use for a path or a
+   * search filter (a grep `include`). Widening is an egress decision, so only names that carry a
+   * path, pattern or filter belong here, never a body. The same per-value and whole-object caps
+   * apply. A profile that declares none forwards exactly the global allowlist.
+   */
+  readonly extraToolInputKeys?: readonly string[];
   /** optional: an agent with no readable credential store omits it, and no account identity is sent */
   readAuth?(agentDir: string | undefined, modelProvider: string | undefined): AgentAuthSummary | undefined;
 }
