@@ -14,7 +14,9 @@
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
     "build": "node scripts/build.mjs",
-    "test:unit": "node --test --experimental-strip-types packages/core/test/*.test.ts packages/pi/test/*.test.ts",
+    "artifacts:check": "node scripts/artifacts.mjs check",
+    "artifacts:sync": "node scripts/artifacts.mjs sync",
+    "test:unit": "node --test --experimental-strip-types packages/core/test/*.test.ts packages/pi/test/*.test.ts scripts/targets.test.ts",
     "test:build": "node --test --experimental-strip-types packages/pi/test/build.test.ts",
     "test": "npm run typecheck && npm run build && npm run test:unit",
     "mock-api": "node --experimental-strip-types scripts/mock-api.mjs"
