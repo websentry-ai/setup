@@ -93,6 +93,8 @@ export function makeDeps(
     timeouts: { pretoolMs: 2000, errorsMs: 2000, turnLogMs: 2000 },
     sentinelKey,
     moduleToken: {},
+    // No real serial probe in tests: an unknown platform probes nothing and settles at once.
+    identity: { platform: "unbound-test" },
     ...rest,
   };
   return {

@@ -36,7 +36,12 @@ import { keyFingerprint, readCache, resolveCachePath, writeCache } from "../../c
 import { createApiClient } from "../../core/src/client.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import { resolveApiKey, resolveGatewayUrl } from "../../core/src/config.ts";
-import type { AccountIdentity } from "../../core/src/accountIdentity.ts";
+import { createAccountIdentityLoader } from "../../core/src/accountIdentity.ts";
+import type {
+  AccountIdentity,
+  AccountIdentityLoader,
+  AccountIdentityLoaderOptions,
+} from "../../core/src/accountIdentity.ts";
 import { MAX_TRACKED_INSTANCES, MAX_TRACKED_SESSIONS } from "../../core/src/constants.ts";
 import { createKeyedState } from "../../core/src/keyedState.ts";
 import { createPolicyChecker } from "../../core/src/policy.ts";
@@ -51,6 +56,7 @@ import type { SignalReporter } from "../../core/src/signals.ts";
 import { createTelemetry } from "../../core/src/telemetry.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
 import type { TurnRecord, TurnStore } from "../../core/src/turn.ts";
+import { readOpencodeAuthSummary } from "./auth.ts";
 import { toolExecuteBefore } from "./before.ts";
 import {
   ENTRYPOINT_PREFIX,
@@ -60,7 +66,9 @@ import {
   UNKNOWN_ENTRYPOINT,
 } from "./constants.ts";
 import type { HooksLike, ServerFactory } from "./hostTypes.ts";
-import { OPENCODE_PROFILE } from "./profile.ts";
+import { chatMessage } from "./prompt.ts";
+import { OPENCODE_PROFILE, resolveOpencodeDataDir } from "./profile.ts";
+import { eventHandler } from "./record.ts";
 
 /** The token of THIS module copy. A second evaluated copy of the bundle has a different one. */
 const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
@@ -69,6 +77,10 @@ const MODULE_TOKEN: object = Object.freeze({ module: "unbound.opencode" });
 const MAX_MCP_SERVER_NAMES = 1024;
 /** The most allowed-call digests kept per session (HOOK-18); the oldest is dropped first. */
 const MAX_DIGESTS_PER_SESSION = 256;
+/** How far up a parent chain `rootOf` walks before it stops (a real chain is one or two deep). */
+const MAX_PARENT_DEPTH = 8;
+/** The longest model string kept per session. */
+const MAX_MODEL_CHARS = 256;
 
 /** The injectable seam. Production uses every default; tests replace what they need to observe. */
 export interface Deps {
@@ -84,6 +96,8 @@ export interface Deps {
   deadlineMs?: number;
   /** Signal reporter window per category; defaults to core's. */
   signalIntervalMs?: number;
+  /** Account-identity loader options (serial probe seams, deadline). Tests pin the platform. */
+  identity?: Partial<Omit<AccountIdentityLoaderOptions, "agentDir" | "readAuth">>;
   /** The `globalThis` slot of the double-load sentinel. Default `Symbol.for(SENTINEL_KEY)`. */
   sentinelKey: symbol;
   /** This copy's identity in that slot. Default: the module token. */
@@ -131,12 +145,27 @@ export interface Runtime {
   reportSignal(category: string, toolName: string, detail?: string): void;
   /** A signal sent at most once per plugin copy; no-op without a key. */
   reportOnce(category: string, toolName: string, detail?: string): void;
-  /** The turn record a session's decisions go to. 13-06 re-points a child session to its root. */
+  /**
+   * The turn record a session's decisions go to: its ROOT session's record (Pitfall 6), so a
+   * subagent's tool calls roll up into the turn that spawned it. For a child the store is a thin view
+   * that records under the root's id, because core's store rolls a record over when a different
+   * session id arrives.
+   */
   turnFor(sessionID: string): TurnStore;
-  /** The model a session is using, once 13-06 records it from `chat.message`. */
+  /** Remember the `provider/model` a session's prompt used (bounded). */
+  setModel(sessionID: string, model: string): void;
+  /** The model a session (or, for a child, its root) is using, once a prompt named it. */
   modelFor(sessionID: string): string | undefined;
-  /** The settled account identity, once 13-06 loads it. */
+  /** Start loading the account identity for a provider (first call wins; fire-and-forget). */
+  startIdentity(provider: string | undefined): void;
+  /** The settled account identity, or `undefined` while pending / when there is none. */
   identity(): AccountIdentity | undefined;
+  /** Record a session's parent (only a non-empty `info.parentID` makes a child). */
+  setParent(sessionID: string, parentID: unknown): void;
+  /** True when the session is a known child (subagent) session. */
+  isChild(sessionID: string): boolean;
+  /** The root of a session's parent chain (depth ≤ 8, cycle-safe); the session itself if unknown. */
+  rootOf(sessionID: string): string;
   /** Remember the args digest of an ALLOWED call, for the after-hook comparison (HOOK-18). */
   rememberDigest(sessionID: string, callID: string, digest: string | undefined): void;
   /** Take (and forget) a remembered digest. */
@@ -208,6 +237,37 @@ function later(fn: () => void): void {
   }
 }
 
+/** Per-session bookkeeping beyond the turn record. Every collection is bounded by its writer. */
+export interface SessionExtras {
+  /** `provider/model` from the session's latest prompt. */
+  model?: string;
+  /** The parent session id, for a child (subagent) session. */
+  parent?: string;
+}
+
+function freshExtras(): SessionExtras {
+  return {};
+}
+
+/**
+ * A view of a root session's turn store for one of its child sessions: everything is recorded under
+ * the ROOT id. Core's store treats a different session id as a new conversation and rolls the record
+ * over, which would drop the root's prompt the moment a subagent made a call. `reset` is a no-op: a
+ * child must never discard its root's turn.
+ */
+function rollUp(store: TurnStore, root: string): TurnStore {
+  return {
+    startTurn: (_sessionId, now) => store.startTurn(root, now),
+    reset: () => undefined,
+    recordPrompt: (text, _sessionId, now) => store.recordPrompt(text, root, now),
+    recordToolCall: (entry, _sessionId, now) => store.recordToolCall(entry, root, now),
+    recordResult: (entry) => store.recordResult(entry),
+    take: () => store.take(),
+    isEmpty: () => store.isEmpty(),
+    snapshot: () => store.snapshot(),
+  };
+}
+
 export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin {
   // Construction reads no env value and no home directory: both are read on the first hook call.
   const source: Partial<Deps> = overrides ?? {};
@@ -232,6 +292,13 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     fallback: () => ({ directory: "", client: undefined, mcpServerNames: [] }),
   });
 
+  // Per-session bookkeeping: bounded sessions; every member is itself bounded.
+  const extras = createKeyedState<SessionExtras>({
+    max: MAX_TRACKED_SESSIONS,
+    create: () => freshExtras(),
+    fallback: () => freshExtras(),
+  });
+
   // Per-session digests of allowed calls: bounded sessions, each a bounded insertion-ordered map.
   const digests = createKeyedState<Map<string, string>>({
     max: MAX_TRACKED_SESSIONS,
@@ -241,6 +308,21 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
 
   let resolved: Resolved | undefined;
   let resolveCount = 0;
+  let identityLoader: AccountIdentityLoader | undefined;
+
+  /** The identity loader, created on first use with the DATA dir and an env-aware reader. */
+  function loaderOf(): AccountIdentityLoader {
+    if (identityLoader === undefined) {
+      const env: NodeJS.ProcessEnv = source.env ?? process.env;
+      const homeDir: string = "homeDir" in source && typeof source.homeDir === "string" ? source.homeDir : safeHomeDir();
+      identityLoader = createAccountIdentityLoader({
+        ...(source.identity ?? {}),
+        agentDir: resolveOpencodeDataDir(env, homeDir),
+        readAuth: (dataDir, provider) => readOpencodeAuthSummary(dataDir, provider, env),
+      });
+    }
+    return identityLoader;
+  }
   const reportedOnce = new Set<string>();
 
   function resolveNow(): Resolved {
@@ -353,13 +435,78 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
       }
     },
     turnFor(sessionID: string): TurnStore {
-      return sessions.forSession(sessionID).turn;
+      const root = runtime.rootOf(sessionID);
+      const store = sessions.forSession(root).turn;
+      return root === sessionID ? store : rollUp(store, root);
     },
-    modelFor(_sessionID: string): string | undefined {
-      return undefined;
+    setModel(sessionID: string, model: string): void {
+      try {
+        if (sessionID === "" || typeof model !== "string" || model === "" || model.length > MAX_MODEL_CHARS) return;
+        extras.get(sessionID).model = model;
+      } catch {
+        // A model we could not keep is `auto` on the wire.
+      }
+    },
+    modelFor(sessionID: string): string | undefined {
+      try {
+        const own = extras.peek(sessionID)?.model;
+        if (own !== undefined) return own;
+        const root = runtime.rootOf(sessionID);
+        return root === sessionID ? undefined : extras.peek(root)?.model;
+      } catch {
+        return undefined;
+      }
+    },
+    startIdentity(provider: string | undefined): void {
+      try {
+        // No key, no identity work: nothing would ever carry it.
+        if (runtime.init().apiKey === undefined) return;
+        void loaderOf()
+          .start(typeof provider === "string" && provider !== "" ? provider : undefined)
+          .catch(() => undefined);
+      } catch {
+        // Identity is decoration; never a fault.
+      }
     },
     identity(): AccountIdentity | undefined {
-      return undefined;
+      try {
+        return identityLoader?.current();
+      } catch {
+        return undefined;
+      }
+    },
+    setParent(sessionID: string, parentID: unknown): void {
+      try {
+        if (sessionID === "") return;
+        // Truthiness, never key presence: a root session carries `parentID: undefined` (13-SPIKES.md).
+        if (typeof parentID !== "string" || parentID === "" || parentID === sessionID) return;
+        extras.get(sessionID).parent = parentID;
+      } catch {
+        // Unknown parent = root.
+      }
+    },
+    isChild(sessionID: string): boolean {
+      try {
+        const parent = extras.peek(sessionID)?.parent;
+        return typeof parent === "string" && parent !== "";
+      } catch {
+        return false;
+      }
+    },
+    rootOf(sessionID: string): string {
+      try {
+        let current = sessionID;
+        const seen = new Set<string>([current]);
+        for (let depth = 0; depth < MAX_PARENT_DEPTH; depth += 1) {
+          const parent = extras.peek(current)?.parent;
+          if (typeof parent !== "string" || parent === "" || seen.has(parent)) break;
+          seen.add(parent);
+          current = parent;
+        }
+        return current;
+      } catch {
+        return sessionID;
+      }
     },
     rememberDigest(sessionID: string, callID: string, digest: string | undefined): void {
       try {
@@ -415,6 +562,10 @@ export function createServerPlugin(overrides: Partial<Deps> = {}): ServerPlugin 
     return {
       // The enforcement path. The handler raises only through `block.ts`, and only on a verdict.
       "tool.execute.before": toolExecuteBefore({ runtime, record }),
+      // The prompt check (V1-5 GO). Raises only through `block.ts`, and only on a verdict.
+      "chat.message": chatMessage({ runtime, record }),
+      // The bus. Never rejects (V1-4): every branch is guarded and nothing is awaited.
+      event: eventHandler({ runtime, record }),
       // Called with the live merged config once per instance. Read-only (Pitfall 16): the object is
       // shared with every other plugin, so only its MCP server NAMES are copied out.
       config: async (cfg: unknown) => {
