@@ -932,6 +932,47 @@ def get_managed_settings_dir() -> Path:
     raise OSError(f"Unsupported operating system: {system}")
 
 
+def _is_unbound_binary_hook_command(command) -> bool:
+    """The managed hook runs the packaged binary from /opt/unbound. Require both
+    tokens, like the MDM strip path, so a foreign command that merely mentions the
+    binary name isn't mistaken for ours (which would wrongly skip the user hook)."""
+    if not isinstance(command, str):
+        return False
+    return "/opt/unbound/" in command and "unbound-hook" in command
+
+
+def _flat_managed_settings_has_unbound_hook(managed_dir: Path) -> bool:
+    """The MDM install prefers a managed-settings.d/unbound.json drop-in but falls
+    back to a flat managed-settings.json. The fallback is a managed Unbound hook
+    just the same, so it must count as a conflict — otherwise the user-level setup
+    adds a second hook and every event fires twice."""
+    flat = managed_dir / "managed-settings.json"
+    try:
+        if not flat.exists():
+            return False
+        data = json.loads(flat.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    # managed-settings.json is shared with other policy, so any malformed shape is
+    # skipped rather than aborting the scan before a real managed hook is seen.
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    if not isinstance(hooks, dict):
+        return False
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            entries = group.get("hooks")
+            if not isinstance(entries, list):
+                continue
+            for hook in entries:
+                if isinstance(hook, dict) and _is_unbound_binary_hook_command(hook.get("command")):
+                    return True
+    return False
+
+
 def check_enterprise_hooks_conflict() -> bool:
     """True if an Unbound MDM (managed) setup already exists for Claude Code on
     this device. User-level setup must not run alongside it — the managed config
@@ -944,7 +985,9 @@ def check_enterprise_hooks_conflict() -> bool:
             managed_dir / "anthropic_key.sh",
             managed_dir / "managed-settings.d" / "unbound.json",
         ]
-        return any(marker.exists() for marker in markers)
+        if any(marker.exists() for marker in markers):
+            return True
+        return _flat_managed_settings_has_unbound_hook(managed_dir)
     except Exception as e:
         print(f"Warning: could not check for an MDM install ({e!r}); continuing with user-level setup.")
         return False
