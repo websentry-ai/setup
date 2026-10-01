@@ -23,7 +23,6 @@
 //   | Event         | Role     | Returns                                                |
 //   | ------------- | -------- | ------------------------------------------------------ |
 //   | `tool_call`   | decide   | `{block, reason}` or `undefined`                       |
-//   |               |          | (shell command, native file path, or a resolved MCP call) |
 //   | `user_bash`   | decide   | a full `BashResult` or `undefined` — never a partial   |
 //   | `input`       | decide   | `{action:"handled"}` or `undefined` — never a transform |
 //   | `tool_result` | record   | **always `undefined`**                                 |
@@ -37,10 +36,19 @@
 // POST. `tool_call` also sends the turn's prompt as the pretool `messages`, which is what the gateway
 // writes a block/warn row from.
 //
+// **MCP is decided off that table, on `pi.events`.** pi-mcp-adapter (>= 2.21.0) emits
+// `pi-mcp-adapter:tool-approval-request` for every MCP call it is about to run — proxy, direct,
+// `mcpScript`, resource, iframe — with its own resolution of server, tool and arguments. One listener
+// claims it (key present and not latched) and answers `allow_once` / `deny` / `abstain` from the same
+// policy check every other call gets (`mcpBroker.ts`, `decideMcpApproval`). `tool_call` makes no MCP
+// request and resolves no MCP names; it only remembers in-flight calls so the broker's decision can
+// carry the call's id on the audit row. Older adapters, other MCP bridges and a pi without
+// `pi.events` are unenforced for MCP.
+//
 // Nothing is registered speculatively: a registered handler is one pi will call, and every
-// registration is another way to block or hang a session. `nothrow.test.ts` asserts the exact set and
-// `build.test.ts` re-asserts it against the real bundle, so both adding and losing one is a
-// deliberate act.
+// registration is another way to block or hang a session. `nothrow.test.ts` asserts the exact set —
+// six `pi.on` events plus the one guarded `pi.events` listener — and `build.test.ts` re-asserts it
+// against the real bundle, so both adding and losing one is a deliberate act.
 //
 // **The two fail-CLOSED exceptions**, against the fail-open default above:
 //   * an org whose last successful response asked for `policy_check_failure_action: block` — ours, and
@@ -85,9 +93,12 @@ import { createApiClient } from "../../core/src/client.ts";
 import type { ApiClient } from "../../core/src/client.ts";
 import {
   CACHE_TTL_MS,
+  MAX_INFLIGHT_MCP_CALLS,
+  MCP_TOOL_APPROVAL_REQUEST_EVENT,
   NO_KEY_NOTICE,
   SESSION_PRESENCE_ROW_ENABLED,
 } from "../../core/src/constants.ts";
+import { NATIVE_FILE_TOOLS } from "../../core/src/payload.ts";
 import { buildHeartbeatPayload, createHeartbeatGate } from "../../core/src/heartbeat.ts";
 import type { HeartbeatGate } from "../../core/src/heartbeat.ts";
 import { buildTurnLogBody } from "../../core/src/turnLog.ts";
@@ -102,9 +113,12 @@ import { createTelemetry } from "../../core/src/telemetry.ts";
 import type { Telemetry } from "../../core/src/telemetry.ts";
 import { turnStore } from "../../core/src/turn.ts";
 import { handleAgentEnd, postStandaloneTurn } from "./agentEnd.ts";
-import { decideToolCall } from "./decide.ts";
-import { createMcpResolver } from "./mcpResolve.ts";
-import type { McpResolver } from "./mcpResolve.ts";
+import { decideMcpApproval, decideToolCall } from "./decide.ts";
+import type { DecideCtx, McpApprovalAnswer } from "./decide.ts";
+import { createInflightCalls, createMcpApprovalListener, mintBrokerId } from "./mcpBroker.ts";
+import type { McpBrokerCall } from "./mcpBroker.ts";
+import { createMcpConfigReader } from "./mcpConfig.ts";
+import { isShellCall } from "./narrow.ts";
 import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
 import { notifySafe } from "./ui.ts";
@@ -186,6 +200,8 @@ export interface Deps {
    * is NOT among them: it is always resolved from `env` / `homeDir`, exactly like the policy cache.
    */
   identity: Omit<AccountIdentityLoaderOptions, "agentDir">;
+  /** pi's argv, read only for the adapter's `--mcp-config` flag. Defaults to `process.argv`. */
+  argv: readonly string[];
 }
 
 interface Resolved {
@@ -316,6 +332,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     entrypoint: overrides.entrypoint,
     heartbeatGate: overrides.heartbeatGate ?? processHeartbeatGate,
     identity: overrides.identity ?? {},
+    argv: overrides.argv ?? process.argv,
   };
 
   /**
@@ -340,11 +357,21 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
   }
 
   /**
-   * pi-mcp-adapter call resolution for `tool_call`. One per extension instance, built from the same
-   * env/home pair as everything else; it touches nothing until a non-native tool call asks, and then
-   * memoises the adapter's config and cache against their lstat signatures (`mcpResolve.ts`).
+   * MCP enforcement state (see `mcpBroker.ts`). The config reader finds `mcp_server_config` by the
+   * broker's exact server name; the in-flight list correlates a brokered call with its `tool_call`
+   * for the audit row only. Neither touches anything until a handler or the broker asks.
    */
-  const mcpResolver: McpResolver = createMcpResolver({ env, homeDir });
+  const mcpConfigReader = createMcpConfigReader({ env, homeDir, argv: deps.argv });
+  const inflight = createInflightCalls(MAX_INFLIGHT_MCP_CALLS);
+  /**
+   * The most recent ctx a handler saw. The broker request carries none, so the confirm dialog, the
+   * notice, the cwd and the session id for a brokered call come from here. Possibly stale after a
+   * reload — every read of it goes through a guard, and a stale UI simply means "no UI": deny.
+   */
+  let lastCtx: DecideCtx | undefined;
+  const seeCtx = (ctx: unknown): void => {
+    if (ctx !== null && typeof ctx === "object") lastCtx = ctx as DecideCtx;
+  };
 
   let resolved: Resolved | undefined;
   let notified = false;
@@ -395,7 +422,82 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     return state.apiKey !== undefined && state.client !== undefined && !keyState.isInactive();
   }
 
+  /** `ctx.model.id`, read behind a guard (a stale ctx's getters throw). */
+  function modelIdOf(ctx: DecideCtx | undefined): string | undefined {
+    try {
+      const id = ctx?.model?.id;
+      return typeof id === "string" ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** Synchronous: claim a broker request only with a key that is present and not latched. */
+  function brokerActive(): boolean {
+    try {
+      const state = init();
+      return recordingActive(state) && state.checker !== undefined;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Decide one brokered MCP call. Rejections and throws become `abstain` in the listener. */
+  async function decideBrokered(call: McpBrokerCall): Promise<McpApprovalAnswer> {
+    const state = init();
+    if (!recordingActive(state) || state.checker === undefined) return "abstain";
+    const ctx = lastCtx;
+    const sessionId = ctx === undefined ? "" : sessionIdOf(ctx);
+    const cwd = ctx === undefined ? "" : safeCwd(ctx);
+    // Audit only: the matching in-flight `tool_call`'s id, or a minted one. Never a verdict input.
+    const toolUseId = inflight.claim(call.prefixedToolName, call.originalToolName) ?? mintBrokerId();
+    const serverConfig = mcpConfigReader.serverConfig(call.serverName, cwd);
+    return decideMcpApproval(
+      {
+        call: {
+          server: call.serverName,
+          tool: call.originalToolName,
+          args: call.args,
+          ...(call.origin === "" ? {} : { origin: call.origin }),
+          ...(serverConfig === undefined ? {} : { serverConfig }),
+        },
+        toolUseId,
+        cwd,
+        sessionId,
+        model: modelIdOf(ctx),
+        ui: ctx,
+      },
+      {
+        checker: state.checker,
+        apiKey: state.apiKey,
+        entrypoint: state.entrypoint,
+        ...identityOption(),
+        currentPrompt: () => turnStore.currentPrompt(sessionId),
+        onDecision: (entry) => {
+          if (recordingActive(state)) turnStore.recordToolCall(entry, sessionId);
+        },
+      },
+    );
+  }
+
   return (pi: ExtensionAPI) => {
+    // MCP enforcement: the adapter's approval broker, on the shared `pi.events` bus. The one
+    // non-`pi.on` registration, and guarded: a pi without `events` (or a stub) simply has no MCP
+    // enforcement, never a failed load. Registering a listener does no work — the factory stays
+    // free of filesystem and network access (§A1).
+    try {
+      const events = (pi as unknown as { events?: { on?: unknown } }).events;
+      if (events !== null && typeof events === "object" && typeof events.on === "function") {
+        (events.on as (channel: string, handler: (data: unknown) => void) => unknown).call(
+          events,
+          MCP_TOOL_APPROVAL_REQUEST_EVENT,
+          createMcpApprovalListener({ active: brokerActive, decide: decideBrokered }),
+        );
+      }
+    } catch {
+      // No bus, no MCP enforcement — the other six registrations are unaffected.
+    }
+
     pi.on("session_start", async (_event, ctx) => {
       try {
         // FIRST, before `init()` and before every early return below: a turn record left pending by
@@ -405,6 +507,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         // place for a POST. `reset` keys on the id, so a `/reload` re-firing with the same session
         // and a ctx whose id cannot be read both leave a mid-flight turn alone.
         turnStore.reset(sessionIdOf(ctx));
+        // In-flight MCP correlation entries from another session can never match a call in this one.
+        inflight.keepSession(sessionIdOf(ctx));
+        seeCtx(ctx);
 
         const state = init();
         // One notice per extension instance. pi clears the module cache on `/reload`, so a reload
@@ -496,6 +601,16 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         const state = init();
         // No key ⇒ inert. Never a block, never a request (RES-06).
         if (state.apiKey === undefined || state.checker === undefined) return undefined;
+        seeCtx(ctx);
+        // A non-native, non-shell call may be an MCP tool the adapter will broker: remember it, so
+        // the broker handler can put this call's id on the audit row. No request, no resolution —
+        // enforcement happens at the broker — and nothing remembered when nothing will be posted.
+        if (recordingActive(state) && !isShellCall(event) && !NATIVE_FILE_TOOLS.has(event.toolName)) {
+          inflight.remember(
+            { toolCallId: event.toolCallId, toolName: event.toolName, input: event.input },
+            sessionIdOf(ctx),
+          );
+        }
         return await decideToolCall(event, ctx, {
           checker: state.checker,
           apiKey: state.apiKey,
@@ -507,9 +622,6 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // The pretool `messages[0].content`, which the gateway writes its block/warn row from. A
           // cheap getter, not `snapshot()`: this runs on every evaluated tool call.
           currentPrompt: () => turnStore.currentPrompt(sessionIdOf(ctx)),
-          // An MCP call made through pi-mcp-adapter goes to the gateway's MCP path (Path 3) rather
-          // than taking the nothing-evaluable skip. `tool_call` only: no other event carries one.
-          resolveMcp: (name, input, cwd) => mcpResolver.resolve(name, input, cwd),
           // Re-checked here rather than above: `checkTool` may have latched the key on this very
           // call, and the turn that latched is one nothing will post.
           onDecision: (entry) => {
@@ -525,8 +637,11 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     // HOOK-06. Registered LAST among the tool events in reading order, and first in importance for
     // one reason: this handler returns `undefined` unconditionally, on every path, for every input.
     // Anything else here rewrites the tool result pi hands the model (`agent-session.js:265-294`).
-    pi.on("tool_result", async (event, _ctx) => {
+    pi.on("tool_result", async (event, ctx) => {
       try {
+        seeCtx(ctx);
+        // The call is over: its in-flight correlation entry, if any, can no longer be claimed.
+        inflight.forget(event?.toolCallId);
         // The branch IS cheaper than the hash, and it is also the only thing bounding this array: a
         // session that cannot post has no reader for what it records, and `recordToolResult` hashes
         // up to `MAX_HASH_BYTES` of output per call. Checked before the hash, not after it.
@@ -570,6 +685,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     pi.on("user_bash", async (event, ctx) => {
       try {
         const state = init();
+        seeCtx(ctx);
         if (state.apiKey === undefined || state.checker === undefined) return undefined;
         return await decideUserBash(event, ctx, {
           checker: state.checker,
@@ -603,6 +719,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     pi.on("input", async (event, ctx) => {
       try {
         const state = init();
+        seeCtx(ctx);
         // No key ⇒ the prompt is never suppressed. Silence, not interference.
         if (state.apiKey === undefined || state.checker === undefined) return undefined;
         return await decideInput(event, ctx, {

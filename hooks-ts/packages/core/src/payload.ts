@@ -28,15 +28,16 @@
 // `tool_input` must be the SAME projection this file already sends, so both come out of one allowlist
 // and one pair of caps. A key the pretool request does not carry cannot appear in an audit row.
 //
-// **The one exception: a resolved MCP call** (`PretoolPayloadInput.mcp`). The gateway's MCP path
-// (Path 3) evaluates MCP policies and input DLP on the arguments themselves, so for a call
-// `mcpResolve.ts` resolved to a pi-mcp-adapter (server, tool), `metadata.tool_input` carries the
-// arguments — whole when they fit `MAX_TOOL_INPUT_BYTES`, scalars-that-fit otherwise (`capMcpArgs`),
-// and unredacted, exactly as the Claude Code hook sends them. That is a deliberate, MCP-only egress
-// widening; every native tool still goes through the allowlist above. The same branch names the call
-// `mcp__<server>__<tool>` with explicit `metadata.mcp_server` / `mcp_tool`, so neither the gateway's
-// Path-2 name diversion nor its first-`__` split can reinterpret it, and attaches the secret-free
-// `mcp_server_config` (`url`, or `command` + `args`) the sanction fingerprint needs.
+// **The one exception: an MCP call** (`PretoolPayloadInput.mcp`). The gateway's MCP path (Path 3)
+// evaluates MCP policies and input DLP on the arguments themselves, so for a call the
+// pi-mcp-adapter approval broker handed us, `metadata.tool_input` carries the arguments WHOLE up to
+// `MAX_MCP_ARGS_BYTES` (1 MiB) and unredacted, exactly as the Claude Code hook sends them; past that,
+// the head and tail of their serialisation with `metadata.tool_input_truncated: true`
+// (`mcpArgsForWire`). That is a deliberate, MCP-only egress widening; every native tool still goes
+// through the allowlist above. The same branch names the call `mcp__<server>__<tool>` with explicit
+// `metadata.mcp_server` / `mcp_tool`, so neither the gateway's Path-2 name diversion nor its
+// first-`__` split can reinterpret it, and attaches `mcp_server_config` (`url`, or `command` + `args`)
+// when the config could be read unambiguously.
 
 import {
   APP_LABEL,
@@ -44,6 +45,7 @@ import {
   EVENT_NAME_USER_PROMPT,
   MAX_COMMAND_CHARS,
   MAX_PROMPT_CHARS,
+  MAX_MCP_ARGS_BYTES,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
@@ -302,34 +304,84 @@ export function withAccountIdentity<T extends { account_identity?: AccountIdenti
   return body;
 }
 
+/** Spliced between the head and tail of an over-1-MiB MCP argument serialisation. */
+export const MCP_ARGS_TRUNCATION_MARKER = "\n...unbound: arguments truncated...\n";
+
+/** What `mcpArgsForWire` hands the builder. */
+export interface McpArgsForWire {
+  toolInput: Record<string, unknown>;
+  truncated: boolean;
+  /** The full serialised size, when `truncated`. */
+  originalBytes?: number;
+}
+
 /**
  * The MCP arguments as `metadata.tool_input` — the MCP-only egress widening described in the header.
  *
- * The whole object when its JSON fits `maxBytes`; otherwise `{_truncated, _original_bytes}` plus the
- * top-level scalars that still fit, strings sliced to `MAX_TOOL_INPUT_VALUE_BYTES`. Unlike
- * `capToolInput` nothing nested is dropped when it fits, because MCP arguments are routinely nested
- * and the gateway's DLP must see what the tool will receive. No redaction, for the same reason.
- * Total: unserialisable arguments are `{_truncated: true}`.
+ * The object itself, whole and unredacted, while its JSON fits `maxBytes` (1 MiB): DLP and arg-based
+ * policies must see exactly what the tool receives, nested values and all (CR-04). Past it — and only
+ * then — `{_truncated_json}` holding the head and tail of the serialisation, sized so the result stays
+ * within `maxBytes` even for 3-byte characters, and the caller sets `tool_input_truncated`. Nothing
+ * is silently dropped from the part that is sent. Total: unserialisable arguments are
+ * `{_unserializable: true}`, marked truncated.
  */
-export function capMcpArgs(
-  args: Record<string, unknown>,
-  maxBytes = MAX_TOOL_INPUT_BYTES,
-): Record<string, unknown> {
+export function mcpArgsForWire(args: Record<string, unknown>, maxBytes = MAX_MCP_ARGS_BYTES): McpArgsForWire {
+  try {
+    if (args === null || typeof args !== "object" || Array.isArray(args)) return { toolInput: {}, truncated: false };
+    const serialised = JSON.stringify(args);
+    if (typeof serialised !== "string") return { toolInput: { _unserializable: true }, truncated: true };
+    const originalBytes = Buffer.byteLength(serialised);
+    if (originalBytes <= maxBytes) return { toolInput: args, truncated: false };
+    const side = Math.max(1, Math.floor((maxBytes - MCP_ARGS_TRUNCATION_MARKER.length * 3) / 6));
+    return {
+      toolInput: {
+        _truncated_json: serialised.slice(0, side) + MCP_ARGS_TRUNCATION_MARKER + serialised.slice(-side),
+      },
+      truncated: true,
+      originalBytes,
+    };
+  } catch {
+    return { toolInput: { _unserializable: true }, truncated: true };
+  }
+}
+
+/** Set an own, enumerable data property — never the `__proto__` setter (WR-06). */
+function defineData(target: Record<string, unknown>, key: string, value: unknown): void {
+  Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
+
+/**
+ * The turn record's copy of MCP arguments: capped (it is an audit column, not an enforcement input),
+ * owned (a JSON clone, so the record never aliases pi's live input) and `__proto__`-safe.
+ *
+ * Whole when the JSON fits `MAX_TOOL_INPUT_BYTES`; otherwise `{_truncated, _original_bytes}` plus the
+ * top-level scalars that still fit, strings sliced to `MAX_TOOL_INPUT_VALUE_BYTES`. `JSON.parse`
+ * creates an own `__proto__` key as data, and every key here is written with `defineProperty`, so a
+ * model cannot hide an argument from the audit row by naming it `__proto__` (WR-06). The turn log
+ * redacts every string leaf before posting. Total.
+ */
+export function auditMcpArgs(args: Record<string, unknown>, maxBytes = MAX_TOOL_INPUT_BYTES): Record<string, unknown> {
   try {
     if (args === null || typeof args !== "object" || Array.isArray(args)) return {};
-    const serialised = JSON.stringify(args) ?? "";
+    const serialised = JSON.stringify(args);
+    if (typeof serialised !== "string") return { _truncated: true };
     const originalBytes = Buffer.byteLength(serialised);
-    if (originalBytes <= maxBytes) return args;
-
+    if (originalBytes <= maxBytes) {
+      const cloned = JSON.parse(serialised) as unknown;
+      return cloned !== null && typeof cloned === "object" && !Array.isArray(cloned)
+        ? (cloned as Record<string, unknown>)
+        : {};
+    }
     const capped: Record<string, unknown> = { _truncated: true, _original_bytes: originalBytes };
     let usedBytes = Buffer.byteLength(JSON.stringify(capped));
-    for (const [key, raw] of Object.entries(args)) {
+    for (const key of Object.keys(args)) {
+      const raw = args[key];
       if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") continue;
       const value = typeof raw === "string" ? sliceToBytes(raw, MAX_TOOL_INPUT_VALUE_BYTES) : raw;
       // +2 for the separating comma and the key/value colon.
       const entryBytes = Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(value)) + 2;
       if (usedBytes + entryBytes > maxBytes) continue;
-      capped[key] = value;
+      defineData(capped, key, value);
       usedBytes += entryBytes;
     }
     return capped;
@@ -347,8 +399,14 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
     // only when there is one. No `file_path` — an MCP tool has no file semantics here.
     metadata.mcp_server = mcp.server;
     metadata.mcp_tool = mcp.tool;
-    metadata.tool_input = capMcpArgs(mcp.args);
+    const wire = mcpArgsForWire(mcp.args);
+    metadata.tool_input = wire.toolInput;
+    if (wire.truncated) {
+      metadata.tool_input_truncated = true;
+      if (wire.originalBytes !== undefined) metadata.tool_input_original_bytes = wire.originalBytes;
+    }
     if (mcp.serverConfig !== undefined) metadata.mcp_server_config = mcp.serverConfig;
+    if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
   } else {
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
     metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));

@@ -29,8 +29,8 @@ import {
   NATIVE_FILE_TOOLS,
   auditToolInput,
   buildPretoolPayload,
+  auditMcpArgs,
   capCommand,
-  capMcpArgs,
   resolveFilePath,
 } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
@@ -110,49 +110,6 @@ export interface DecideDeps {
    * and never the verdict. Optional: absent means `""`, today's behaviour.
    */
   currentPrompt?: () => string | undefined;
-  /**
-   * Resolve a pi-mcp-adapter call to the MCP (server, original tool, args) it will run — see
-   * `mcpResolve.ts`. Consulted only for a call that is neither a shell call nor a native file tool,
-   * BEFORE the nothing-evaluable return, and only through `mcpOf`: a resolver that throws is a miss,
-   * and a miss is today's path (an unevaluable custom tool: no request, allowed). Optional, so every
-   * existing call site keeps that behaviour.
-   */
-  resolveMcp?: (toolName: string, input: unknown, cwd: string) => McpCallInfo | undefined;
-}
-
-/** `deps.resolveMcp`, made total. Anything that is not a well-formed hit is a miss. */
-function mcpOf(
-  deps: Pick<DecideDeps, "resolveMcp">,
-  toolName: string,
-  input: unknown,
-  cwd: string,
-): McpCallInfo | undefined {
-  try {
-    const call = deps.resolveMcp?.(toolName, input, cwd);
-    if (call === null || typeof call !== "object") return undefined;
-    if (typeof call.server !== "string" || call.server === "") return undefined;
-    if (typeof call.tool !== "string" || call.tool === "") return undefined;
-    if (call.args === null || typeof call.args !== "object" || Array.isArray(call.args)) return undefined;
-    return call;
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * The record's copy of the MCP arguments: the capped projection the pretool request sent, cloned so
- * the turn record never aliases pi's live `event.input` (a direct tool's input IS its arguments).
- * The clone is JSON because `capMcpArgs`' output has just been proven JSON-serialisable.
- */
-function auditMcpArgs(args: Record<string, unknown>): Record<string, unknown> {
-  try {
-    const cloned = JSON.parse(JSON.stringify(capMcpArgs(args))) as unknown;
-    return cloned !== null && typeof cloned === "object" && !Array.isArray(cloned)
-      ? (cloned as Record<string, unknown>)
-      : {};
-  } catch {
-    return {};
-  }
 }
 
 /**
@@ -235,19 +192,12 @@ export async function decideToolCall(
     // `narrow.ts` on why `input` is `unknown` and can genuinely be either (WR-07).
     const toolInput = (event.input ?? {}) as Record<string, unknown>;
 
-    // A pi-mcp-adapter call (proxy, namespace wrapper or direct tool) goes to the gateway's MCP path
-    // instead, resolved forward to (server, original tool, args). Asked only of a call that is
-    // neither a shell call nor a native file tool, so the common path costs nothing.
-    if (!shell && !NATIVE_FILE_TOOLS.has(event.toolName)) {
-      const mcp = mcpOf(deps, event.toolName, event.input, ctx.cwd);
-      if (mcp !== undefined) return await decideMcpCall(event, ctx, deps, mcp);
-    }
-
     // Nothing to evaluate: the server's entry gate needs a non-blank command or a native-tool
     // `file_path` (§B3), so a call with neither is a guaranteed allow after a full round trip — and
     // pi awaits every call in a batch serially, so each pointless trip is felt N× (§F2). This covers
-    // every custom tool that carries no command, including an MCP-looking call the resolver could
-    // not attribute to exactly one (server, tool) — not just an empty shell command (WR-04).
+    // every custom tool that carries no command — including every pi-mcp-adapter tool, which is
+    // enforced at the adapter's approval broker instead (`decideMcpApproval`), with the adapter's own
+    // resolution of server, tool and arguments — not just an empty shell command (WR-04).
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === undefined) return undefined;
 
@@ -342,53 +292,99 @@ export async function decideToolCall(
   }
 }
 
+/** The three answers the adapter's broker handler ever gets from us. */
+export type McpApprovalAnswer = "allow_once" | "deny" | "abstain";
+
+/** One brokered MCP call, with the context values already read (a stale ctx's getters can throw). */
+export interface McpApprovalInput {
+  /** The adapter's own resolution: exact server, original tool, the arguments it will send. */
+  call: McpCallInfo;
+  /** The audit id: the matched `tool_call`'s `toolCallId`, or a minted `mcpb_…`. */
+  toolUseId: string;
+  cwd: string;
+  sessionId: string;
+  model: string | undefined;
+  /** The most recent live ctx, for the notice and the confirm. Absent ⇒ no UI. */
+  ui: UiCtx | undefined;
+}
+
 /**
- * A resolved MCP call: the gateway's Path 3, never the file-tool cache.
+ * Decide one MCP call the pi-mcp-adapter approval broker handed us — the MCP enforcement point.
  *
- * The 300 s skip answers "is there a FILE policy for this tool" from a cached list, and no cached list
- * can say whether an MCP sanction or MCP policy applies — so an MCP call always round-trips. It still
- * pulls policies on the same rule as every other call, because the MCP response carries
- * `tools_to_check` when asked. The checker's label stays pi's own tool name; the body and the turn
- * record both name the call `mcp__<server>__<tool>`, which is what the gateway and the backend parse.
+ * The gateway's Path 3 sees exactly what the adapter will run (`buildPretoolPayload`'s `mcp` branch),
+ * through the same checker as every other call, so the breaker, the key latch, `pull_policies` and
+ * bypass telemetry all behave the same. Never the file-tool cache: no cached list can say whether an
+ * MCP policy applies. The answer maps onto the adapter's vocabulary:
+ *
+ *   | policy outcome                         | answer                                             |
+ *   | -------------------------------------- | -------------------------------------------------- |
+ *   | allow (incl. a fail-open API failure)  | `abstain` — the adapter's own approval still runs  |
+ *   | deny                                   | `deny`, and the reason is notified to the developer |
+ *   | confirm                                | asked through the live ctx: yes `allow_once`, no / no UI `deny` |
+ *   | unavailable (a fail-closed org)        | `deny`                                             |
+ *
+ * The model sees the adapter's fixed denial text, not our reason (an accepted cost: the broker has no
+ * reason channel); the developer sees the reason as a notice. Total: any fault is `abstain`, because
+ * the adapter reads a throw as a deny and an internal error must not block.
  */
-async function decideMcpCall(
-  event: ToolCallLike,
-  ctx: DecideCtx,
-  deps: DecideDeps,
-  mcp: McpCallInfo,
-): Promise<BlockResult | undefined> {
-  const now = (deps.now ?? Date.now)();
-  const state = deps.state ?? policyState;
-  const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
+export async function decideMcpApproval(input: McpApprovalInput, deps: DecideDeps): Promise<McpApprovalAnswer> {
+  try {
+    const { call } = input;
+    const toolName = `mcp__${call.server}__${call.tool}`;
+    const now = (deps.now ?? Date.now)();
+    const state = deps.state ?? policyState;
+    const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
 
-  const payload = buildPretoolPayload({
-    toolName: event.toolName,
-    command: "",
-    toolUseId: event.toolCallId,
-    toolInput: {},
-    cwd: ctx.cwd,
-    sessionId: ctx.sessionManager.getSessionId(),
-    model: ctx.model?.id,
-    clientEntrypoint: deps.entrypoint,
-    pullPolicies,
-    lastUserPrompt: promptOf(deps),
-    mcp,
-    ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
-  });
+    const payload = buildPretoolPayload({
+      toolName,
+      command: "",
+      toolUseId: input.toolUseId,
+      toolInput: {},
+      cwd: input.cwd,
+      sessionId: input.sessionId,
+      model: input.model,
+      clientEntrypoint: deps.entrypoint,
+      pullPolicies,
+      lastUserPrompt: promptOf(deps),
+      mcp: call,
+      ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
+    });
 
-  const hooks: CheckHooks =
-    deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
-  const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
-  // Before the confirm, for the same reason as the native path. The capped arguments are what the
-  // record carries — the same projection the gateway saw — and `turnLog.ts` redacts every string
-  // leaf of them before they are posted.
-  noteDecision(deps, {
-    tool_name: `mcp__${mcp.server}__${mcp.tool}`,
-    tool_use_id: event.toolCallId,
-    decision: outcome.kind,
-    tool_input: auditMcpArgs(mcp.args),
-  });
-  return await applyOutcome(outcome, ctx);
+    const ui = input.ui;
+    const hooks: CheckHooks =
+      deps.hooks ?? { notify: (message, level) => (ui === undefined ? undefined : notifySafe(ui, message, level)) };
+    const outcome = await deps.checker.checkTool(payload, toolName, hooks);
+    // Before the confirm, as on the native path: the row records what the POLICY said.
+    noteDecision(deps, {
+      tool_name: toolName,
+      tool_use_id: input.toolUseId,
+      decision: outcome.kind,
+      tool_input: auditMcpArgs(call.args),
+    });
+
+    switch (outcome.kind) {
+      case "allow":
+        return "abstain";
+      case "deny":
+        if (ui !== undefined) notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "error");
+        return "deny";
+      case "confirm": {
+        if (ui === undefined || ui.hasUI !== true) {
+          if (ui !== undefined) notifySafe(ui, NO_UI_REASON, "warning");
+          return "deny";
+        }
+        notifySafe(ui, outcome.reason ?? GENERIC_DENY_REASON, "warning");
+        const accepted = await confirmWithTimeout(ui, CONFIRM_TITLE, CONFIRM_QUESTION);
+        return accepted ? "allow_once" : "deny";
+      }
+      case "unavailable":
+        if (ui !== undefined) notifySafe(ui, outcome.reason ?? ENGINE_UNAVAILABLE_REASON, "error");
+        return "deny";
+    }
+    return "abstain";
+  } catch {
+    return "abstain";
+  }
 }
 
 /** The verdict-to-pi-behaviour mapping both paths share — header rules 1 and 2 live here. */

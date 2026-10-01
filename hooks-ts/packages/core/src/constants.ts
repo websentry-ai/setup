@@ -287,8 +287,9 @@ export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
  * independently so an addition cannot be slipped in as a formatting change.
  *
  * MCP arguments reach `metadata.tool_input` through the separate MCP branch in `payload.ts`
- * (`capMcpArgs`), which is the deliberate, MCP-only egress widening: the gateway's MCP policies and
- * input DLP evaluate exactly those arguments. This list still governs every native tool.
+ * (`mcpArgsForWire`, whole up to 1 MiB), which is the deliberate, MCP-only egress widening: the
+ * gateway's MCP policies and input DLP evaluate exactly those arguments. This list still governs
+ * every native tool.
  */
 export const TOOL_INPUT_ALLOWLIST = [
   "path",
@@ -395,32 +396,41 @@ export const PLACEHOLDER_SERIALS: readonly string[] = [
 
 // --- pi-mcp-adapter (MCP tool calls) ---------------------------------------------------------
 //
-// pi has no native MCP; MCP tools arrive through the `pi-mcp-adapter` extension (4.0.0 at the time
-// of writing). These are the adapter's own names and files, transcribed so `mcpResolve.ts` can map a
-// pi tool call back to (server, tool) without importing the adapter.
+// pi has no native MCP; MCP tools arrive through the `pi-mcp-adapter` extension. Enforcement rides
+// the adapter's own approval broker (>= 2.21.0), which hands us the exact server, tool and arguments
+// it is about to run. These are the adapter's own names, transcribed so nothing imports the adapter.
 
-/** The adapter's proxy tool (`index.ts:1886`): `mcp({tool, args, server?})` is a call. */
+/**
+ * The adapter's broker event (`types.ts MCP_TOOL_APPROVAL_REQUEST_EVENT`, README "Tool Approval").
+ * Emitted on `pi.events` for EVERY resolved MCP call — proxy, direct, `mcpScript`, resource, iframe.
+ */
+export const MCP_TOOL_APPROVAL_REQUEST_EVENT = "pi-mcp-adapter:tool-approval-request";
+/** The adapter's proxy tool: `mcp({tool, args, server?})`. Used only to correlate audit ids. */
 export const MCP_PROXY_TOOL_NAME = "mcp";
-/** Namespace wrappers are `mcp__<formatServerNamespace(server)>` (`namespace-tools.ts`). */
+/** Namespace wrappers are `mcp__<namespace>`. Used only to correlate audit ids. */
 export const MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
 /**
- * Proxy `action`s the adapter dispatches BEFORE looking at `tool` (`index.ts:2010-2048`): none of
- * them is an MCP tool call, so a proxy invocation carrying one is never resolved.
+ * Prefix of the `tool_use_id` minted for a brokered call that no in-flight `tool_call` matched (an
+ * `mcpScript` call, a resource read, an iframe). Distinct from `toolu_…`/`ubash_…` so a row says so.
  */
-export const MCP_PROXY_NON_CALL_ACTIONS: readonly string[] = [
-  "install",
-  "ui-messages",
-  "auth-start",
-  "auth-complete",
-];
-/** `PI_MCP_CONFIG_MODE=exclusive` makes the adapter read only `<agentDir>/mcp-adapter.json`. */
+export const MCP_BROKER_ID_PREFIX = "mcpb_";
+/** In-flight non-native tool calls remembered for audit correlation. Oldest dropped past this. */
+export const MAX_INFLIGHT_MCP_CALLS = 64;
+/**
+ * MCP arguments go on the wire whole up to this many serialised bytes (1 MiB) — parity with the
+ * Claude Code hook, which sends them uncapped, because the gateway's MCP input DLP and arg-based
+ * policies must see what the tool will receive. Beyond it the head and tail of the serialisation
+ * are sent, with `metadata.tool_input_truncated: true`.
+ */
+export const MAX_MCP_ARGS_BYTES = 1_048_576;
+/** `PI_MCP_CONFIG_MODE=exclusive` makes the adapter read only its own config file. */
 export const ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
 /** The adapter's own config file, under the agent dir and under `<cwd>/.pi/`. */
 export const MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
-/** The adapter's tool-metadata cache, under the agent dir: `servers.<name>.tools[].name`. */
-export const MCP_CACHE_FILE_NAME = "mcp-cache.json";
+/** The pi CLI flag the adapter registers to replace that file (`index.ts registerFlag`). */
+export const MCP_CONFIG_FLAG = "--mcp-config";
 /**
- * The cap on `mcp-cache.json`. Larger than `MAX_CONFIG_BYTES` because the cache carries every tool's
- * input schema; a file over it is treated as absent (a cold cache), never partially parsed.
+ * A generous cap on one MCP config file (16 MiB). The adapter has none; a file over it is treated as
+ * unreadable, which omits `mcp_server_config` rather than guessing.
  */
-export const MAX_MCP_CACHE_BYTES = 2_097_152;
+export const MAX_MCP_CONFIG_BYTES = 16_777_216;

@@ -8,11 +8,12 @@
 // `account_identity` has since joined the type (parity with the Claude Code hook): optional, and
 // only ever set through `withAccountIdentity`, which forwards the six wire strings and nothing else.
 //
-// `PretoolPayloadInput.mcp` is the one input that changes the body's SHAPE: a resolved pi-mcp-adapter
-// call goes to the gateway's MCP path (Path 3) as `tool_name: "mcp__<server>__<tool>"` with
-// `metadata.mcp_server` / `mcp_tool` / `tool_input` (the capped MCP arguments) and, when resolvable,
-// `mcp_server_config` (`url`, or `command` + `args`, never credentials). The native-tool allowlist
-// still governs every other call; MCP arguments are the one explicit exception.
+// `PretoolPayloadInput.mcp` is the one input that changes the body's SHAPE: an MCP call handed over
+// by the pi-mcp-adapter approval broker goes to the gateway's MCP path (Path 3) as
+// `tool_name: "mcp__<server>__<tool>"` with `metadata.mcp_server` / `mcp_tool` / `tool_input` (the
+// arguments, whole up to 1 MiB) and, when the config could be read unambiguously,
+// `mcp_server_config`. The native-tool allowlist still governs every other call; MCP arguments are
+// the one explicit exception.
 //
 // Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
 // future opencode adapter can reuse it unchanged.
@@ -110,21 +111,27 @@ export interface PretoolPayloadInput {
 }
 
 /**
- * One MCP call resolved to the adapter's (server, original tool) pair — what `mcpResolve.ts` produces
- * and what the MCP branch of `buildPretoolPayload` consumes.
+ * One MCP call as the pi-mcp-adapter approval broker describes it — the adapter's own resolution of
+ * (server, original tool, args), never re-derived here — and what the MCP branch of
+ * `buildPretoolPayload` consumes.
  */
 export interface McpCallInfo {
-  /** The configured server name, verbatim (dashes and all). */
+  /** The configured server name, verbatim (the broker's `serverName`). */
   server: string;
-  /** The MCP tool's ORIGINAL name, as the server publishes it — never the pi-side prefixed name. */
+  /** The MCP tool's ORIGINAL name (the broker's `originalToolName`). */
   tool: string;
-  /** The arguments the tool will receive. Capped by the builder, never redacted (gateway DLP). */
+  /** The arguments the tool will receive. Sent whole up to 1 MiB, never redacted (gateway DLP). */
   args: Record<string, unknown>;
   /**
-   * The secret-free projection of the server's config: `{url, type?}` or `{command, args?, type?}`.
-   * Absent when the server is known only from the cache. Never `env`, `headers` or token fields.
+   * The server's config as `{url, type?}` or `{command, args?, type?}`, read from the adapter's config
+   * files by exact server name — the same fields the Claude Code hook sends. `env`, `headers`, bearer
+   * tokens and OAuth settings are never read into it, but a `url` query string or an `args` entry can
+   * itself carry a credential, and is sent as written, exactly as the Python hook sends it. Absent
+   * when any config source was unreadable, imports were in play, or the server was not found.
    */
   serverConfig?: Record<string, unknown>;
+  /** The broker's `origin`: `proxy` | `direct` | `script` | `resource` | `iframe`. Audit only. */
+  origin?: string;
 }
 
 /**

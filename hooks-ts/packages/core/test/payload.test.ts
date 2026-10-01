@@ -18,6 +18,7 @@ import test from "node:test";
 
 import {
   MAX_COMMAND_CHARS,
+  MAX_MCP_ARGS_BYTES,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
   TOOL_INPUT_ALLOWLIST,
@@ -26,8 +27,10 @@ import {
   auditToolInput,
   buildPretoolPayload,
   capCommand,
-  capMcpArgs,
+  auditMcpArgs,
   capToolInput,
+  MCP_ARGS_TRUNCATION_MARKER,
+  mcpArgsForWire,
   COMMAND_TRUNCATION_MARKER,
   resolveFilePath,
   sanitizeToolInput,
@@ -129,7 +132,7 @@ test("path contract: bash and other command tools never send a file_path", () =>
   assert.equal(Object.hasOwn(bash.pre_tool_use_data.metadata, "file_path"), false);
 
   // Without an `mcp` field the builder does not know this is an MCP call — resolution happens in
-  // `mcpResolve.ts`, upstream — so an `mcp__`-looking name is a plain custom tool: no file_path, and
+  // the pi-mcp-adapter approval broker, upstream — so an `mcp__`-looking name is a plain custom tool: no file_path, and
   // the native allowlist still applies to its input (only `path` survives, `query` is dropped). The
   // MCP shape is pinned by the "MCP branch" cases below.
   const custom = buildPretoolPayload(
@@ -495,7 +498,7 @@ test("resolveClientEntrypoint: a hostile version string is sanitised and capped"
 
 // --- The MCP branch (gateway Path 3) -----------------------------------------------------------
 //
-// A call `mcpResolve.ts` resolved to a pi-mcp-adapter (server, tool) is the ONE deliberate exception
+// A call the pi-mcp-adapter approval broker handed us (exact server, tool) is the ONE deliberate exception
 // to the native allowlist: the gateway's MCP policies and input DLP evaluate the arguments.
 
 const MCP = {
@@ -531,26 +534,58 @@ test("MCP branch: a command passed alongside is ignored", () => {
   assert.equal(Object.hasOwn(body.pre_tool_use_data.metadata, "command_truncated"), false);
 });
 
-test("capMcpArgs: whole object under the cap, scalars-that-fit over it, marker on failure", () => {
-  const small = { a: 1, b: { c: [1, 2, 3] } };
-  assert.equal(capMcpArgs(small), small, "under the cap the object is forwarded as is");
+test("MCP args: whole on the wire up to 1 MiB — a secret deep in a big arg reaches the gateway (CR-04)", () => {
+  // The security property, not only the size bound: the gateway's MCP input DLP must see what the
+  // tool will receive. A 17 KB pad used to push everything nested, and every byte past 2 KB of a
+  // string, out of `tool_input`.
+  const args = { pad: "x".repeat(17_000), text: "y".repeat(17_000) + " AKIA-SECRET-AT-34K", data: { token: "ghp_nested" } };
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }));
+  const metadata = body.pre_tool_use_data.metadata;
+  assert.deepStrictEqual(metadata.tool_input, args, "whole, nested values and all");
+  assert.equal(Object.hasOwn(metadata, "tool_input_truncated"), false);
+  assert.ok(JSON.stringify(body).includes("AKIA-SECRET-AT-34K"));
+  assert.ok(JSON.stringify(body).includes("ghp_nested"));
+});
 
-  const big = { keep: "short", n: 42, ok: true, nested: { blob: "x".repeat(MAX_TOOL_INPUT_BYTES) } };
-  const capped = capMcpArgs(big);
-  assert.equal(capped._truncated, true);
-  assert.equal(typeof capped._original_bytes, "number");
-  assert.ok((capped._original_bytes as number) > MAX_TOOL_INPUT_BYTES);
-  assert.equal(capped.keep, "short");
-  assert.equal(capped.n, 42);
-  assert.equal(capped.ok, true);
-  assert.equal(Object.hasOwn(capped, "nested"), false, "a nested value over the cap is dropped");
-  assert.ok(Buffer.byteLength(JSON.stringify(capped)) <= MAX_TOOL_INPUT_BYTES);
+test("MCP args over 1 MiB: head and tail of the serialisation, with an explicit truncation marker", () => {
+  const args = { head: "HEAD-SECRET", blob: "z".repeat(MAX_MCP_ARGS_BYTES + 10), tail: "TAIL-SECRET" };
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, args } }));
+  const metadata = body.pre_tool_use_data.metadata;
+  assert.equal(metadata.tool_input_truncated, true);
+  assert.ok((metadata.tool_input_original_bytes as number) > MAX_MCP_ARGS_BYTES);
+  const json = (metadata.tool_input as { _truncated_json?: string })._truncated_json ?? "";
+  assert.ok(json.includes("HEAD-SECRET"), "the head is kept");
+  assert.ok(json.includes("TAIL-SECRET"), "and the tail");
+  assert.ok(json.includes(MCP_ARGS_TRUNCATION_MARKER));
+  assert.ok(Buffer.byteLength(JSON.stringify(metadata.tool_input)) <= MAX_MCP_ARGS_BYTES + 64);
+});
 
-  const longString = capMcpArgs({ s: "y".repeat(MAX_TOOL_INPUT_BYTES * 2) });
-  assert.equal((longString.s as string).length, MAX_TOOL_INPUT_VALUE_BYTES, "strings sliced per value");
-
+test("mcpArgsForWire is total: unserialisable args are marked, never a throw", () => {
   const circular: Record<string, unknown> = {};
   circular.self = circular;
-  assert.deepStrictEqual(capMcpArgs(circular), { _truncated: true });
-  assert.deepStrictEqual(capMcpArgs({ big: 10n } as unknown as Record<string, unknown>), { _truncated: true });
+  assert.deepStrictEqual(mcpArgsForWire(circular), { toolInput: { _unserializable: true }, truncated: true });
+  assert.deepStrictEqual(
+    mcpArgsForWire({ big: 10n } as unknown as Record<string, unknown>),
+    { toolInput: { _unserializable: true }, truncated: true },
+  );
+});
+
+test("auditMcpArgs: an owned copy, capped for the audit row, __proto__ and constructor kept as data (WR-06)", () => {
+  const parsed = JSON.parse('{"__proto__":{"secret":"hidden?"},"constructor":"c","q":"x"}') as Record<string, unknown>;
+  const copy = auditMcpArgs(parsed);
+  assert.deepStrictEqual(Object.keys(copy).sort(), ["__proto__", "constructor", "q"]);
+  assert.equal(Object.getPrototypeOf(copy), Object.prototype, "no prototype assignment");
+  assert.equal(JSON.stringify(copy), '{"__proto__":{"secret":"hidden?"},"constructor":"c","q":"x"}');
+  assert.notEqual(copy, parsed, "owned, never the live object");
+
+  const big = { keep: "short", nested: { blob: "x".repeat(MAX_TOOL_INPUT_BYTES) } };
+  const capped = auditMcpArgs(big);
+  assert.equal(capped._truncated, true);
+  assert.equal(capped.keep, "short");
+  assert.equal(Object.hasOwn(capped, "nested"), false, "the audit column is capped; the wire copy is not");
+
+  const bigProto = JSON.parse(`{"__proto__":"proto-value","pad":"${"p".repeat(MAX_TOOL_INPUT_BYTES)}"}`) as Record<string, unknown>;
+  const cappedProto = auditMcpArgs(bigProto);
+  assert.ok(Object.hasOwn(cappedProto, "__proto__"), "kept as an own key in the truncated branch too");
+  assert.equal(Object.getPrototypeOf(cappedProto), Object.prototype);
 });
