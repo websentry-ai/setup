@@ -154,10 +154,12 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
   resource reads and MCP UI iframes. The adapter tells the extension exactly which server and tool it
   is about to run and with which arguments; the extension sends that to the gateway's MCP policy path
   as `mcp__<server>__<tool>`.
-  - **Arguments** are sent whole up to 512 KB. Larger arguments are sent as the head and tail of their
-    serialisation with a `tool_input_truncated` flag, and **the middle of oversized arguments is not
-    inspected**. The whole request is kept under 900 KB so the gateway's 1 MB request limit can never
-    turn a check into an unchecked allow.
+  - **Arguments** are sent whole up to 512 KB. Past that, every argument is still sent and only the
+    largest values are cut to their head and tail, with `tool_input_truncated` and the names of the
+    cut arguments (`tool_input_truncated_keys`). **The middle of oversized values is not inspected;
+    other fields are sent whole**, so a policy on a specific argument still sees it exactly. The whole
+    request is kept under 900 KB so the gateway's 1 MB request limit can never turn a check into an
+    unchecked allow.
   - **Server config** (`url`, or `command` + `args`) is sent only when the adapter's config files are
     unambiguous: every one of them is plain JSON (no comments, no trailing commas), uses only the
     settings and server fields the extension understands (no `imports`, plugins, ancestor roots, host
@@ -179,7 +181,8 @@ with a key on the machine (no key, or a key the gateway rejected, means nothing 
   - **Requires pi-mcp-adapter 2.21.0 or later.** Older adapters, other MCP bridges, and pi builds
     without `pi.events` are not enforced for MCP, and nothing signals that at runtime.
 - **The turn log** (`POST /v1/hooks/pi`) carries each tool's text output, capped at 8 KB per result
-  (head and tail kept) and 128 KB per turn, with bearer tokens and the Unbound key redacted, next to a
+  (head and tail kept) and 128 KB per turn, with bearer tokens and the Unbound key redacted before the
+  output is cut (so a key straddling the cut cannot leak in part), next to a
   sha256 and a byte count. Image output is never sent; it is represented by its hash and size only.
   This is what lets tool-output DLP and MCP output audit run for pi (where the org has them enabled).
 - **A typed `!cmd`** is logged as its own one-call row the moment it is checked, not folded into the

@@ -68,6 +68,7 @@ var MAX_TURN_RESULTS = 500;
 var MAX_TOOL_OUTPUT_CHARS = 8192;
 var MAX_TURN_OUTPUT_CHARS = 131072;
 var OUTPUT_TRUNCATION_MARKER = "\n...unbound: output truncated...\n";
+var OUTPUT_REDACTION_MARGIN_CHARS = 4096;
 var MAX_TURN_TOOL_CALLS = 500;
 var MAX_TOOL_INPUT_BYTES = 16384;
 var MAX_COMMAND_CHARS = 8192;
@@ -697,6 +698,38 @@ function withAccountIdentity(body, identity) {
   return body;
 }
 var MCP_ARGS_TRUNCATION_MARKER = "\n...unbound: arguments truncated...\n";
+var MAX_STRUCTURED_KEYS = 512;
+var MIN_KEPT_VALUE_BYTES = 256;
+var MAX_TRUNCATED_KEYS_REPORTED = 32;
+var MAX_TRUNCATED_KEY_CHARS = 128;
+function jsonBytes(value) {
+  const text = JSON.stringify(value);
+  return typeof text === "string" ? Buffer.byteLength(text) : 0;
+}
+function headTailFitting(text, targetBytes) {
+  const markerBytes = Buffer.byteLength(MCP_ARGS_TRUNCATION_MARKER) + 8;
+  let keep = Math.max(2, targetBytes - markerBytes);
+  let candidate = MCP_ARGS_TRUNCATION_MARKER;
+  for (let attempt2 = 0; attempt2 < 8; attempt2 += 1) {
+    const half = Math.max(1, Math.floor(keep / 2));
+    const head = Buffer.from(text.slice(0, half), "utf8").subarray(0, half).toString("utf8");
+    const tailSource = Buffer.from(text.slice(-half), "utf8");
+    const tail = tailSource.subarray(Math.max(0, tailSource.length - half)).toString("utf8");
+    candidate = head + MCP_ARGS_TRUNCATION_MARKER + tail;
+    const measured = jsonBytes(candidate);
+    if (measured <= targetBytes) return candidate;
+    keep = Math.floor(keep * targetBytes / measured) - 1;
+    if (keep < 2) break;
+  }
+  return MCP_ARGS_TRUNCATION_MARKER;
+}
+function singleStringForm(serialised, maxBytes) {
+  const half = Math.max(1, Math.floor((maxBytes - Buffer.byteLength(MCP_ARGS_TRUNCATION_MARKER)) / 2));
+  const bytes = Buffer.from(serialised, "utf8");
+  const head = bytes.subarray(0, half).toString("utf8");
+  const tail = bytes.subarray(bytes.length - half).toString("utf8");
+  return { _truncated_json: head + MCP_ARGS_TRUNCATION_MARKER + tail };
+}
 function mcpArgsForWire(args, maxBytes = MAX_MCP_ARGS_BYTES) {
   try {
     if (args === null || typeof args !== "object" || Array.isArray(args)) return { toolInput: {}, truncated: false };
@@ -704,15 +737,42 @@ function mcpArgsForWire(args, maxBytes = MAX_MCP_ARGS_BYTES) {
     if (typeof serialised !== "string") return { toolInput: { _unserializable: true }, truncated: true };
     const originalBytes = Buffer.byteLength(serialised);
     if (originalBytes <= maxBytes) return { toolInput: args, truncated: false };
-    const half = Math.max(1, Math.floor((maxBytes - Buffer.byteLength(MCP_ARGS_TRUNCATION_MARKER)) / 2));
-    const bytes = Buffer.from(serialised, "utf8");
-    const head = bytes.subarray(0, half).toString("utf8");
-    const tail = bytes.subarray(bytes.length - half).toString("utf8");
-    return {
-      toolInput: { _truncated_json: head + MCP_ARGS_TRUNCATION_MARKER + tail },
-      truncated: true,
-      originalBytes
-    };
+    const keys = Object.keys(args);
+    if (keys.length <= MAX_STRUCTURED_KEYS) {
+      const entries = [];
+      for (const key of keys) {
+        const value = args[key];
+        const text = JSON.stringify(value);
+        if (typeof text !== "string") continue;
+        entries.push({ key, value, size: Buffer.byteLength(text), overhead: jsonBytes(key) + 2, cut: false });
+      }
+      const totalOf = () => 2 + entries.reduce((sum, e) => sum + e.size + e.overhead, 0) - 1;
+      let fits = false;
+      for (let round = 0; round < entries.length * 4 + 16; round += 1) {
+        const total = totalOf();
+        if (total <= maxBytes) {
+          fits = true;
+          break;
+        }
+        let largest;
+        for (const entry of entries) {
+          if (entry.size > MIN_KEPT_VALUE_BYTES && (largest === void 0 || entry.size > largest.size)) largest = entry;
+        }
+        if (largest === void 0) break;
+        const target = Math.max(MIN_KEPT_VALUE_BYTES, largest.size - (total - maxBytes));
+        const source = typeof largest.value === "string" ? largest.value : JSON.stringify(largest.value) ?? "";
+        largest.value = headTailFitting(source, target);
+        largest.size = jsonBytes(largest.value);
+        largest.cut = true;
+      }
+      if (fits) {
+        const toolInput = {};
+        for (const entry of entries) defineData(toolInput, entry.key, entry.value);
+        const truncatedKeys = entries.filter((entry) => entry.cut).slice(0, MAX_TRUNCATED_KEYS_REPORTED).map((entry) => entry.key.slice(0, MAX_TRUNCATED_KEY_CHARS));
+        return { toolInput, truncated: true, originalBytes, truncatedKeys };
+      }
+    }
+    return { toolInput: singleStringForm(serialised, maxBytes), truncated: true, originalBytes };
   } catch {
     return { toolInput: { _unserializable: true }, truncated: true };
   }
@@ -752,12 +812,7 @@ function buildPretoolPayload(input) {
   if (mcp !== void 0) {
     metadata.mcp_server = mcp.server;
     metadata.mcp_tool = mcp.tool;
-    const wire = mcpArgsForWire(mcp.args);
-    metadata.tool_input = wire.toolInput;
-    if (wire.truncated) {
-      metadata.tool_input_truncated = true;
-      if (wire.originalBytes !== void 0) metadata.tool_input_original_bytes = wire.originalBytes;
-    }
+    applyWireArgs(metadata, mcpArgsForWire(mcp.args));
     if (mcp.serverConfig !== void 0) metadata.mcp_server_config = mcp.serverConfig;
     if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
   } else {
@@ -797,6 +852,18 @@ function buildPretoolPayload(input) {
   if (mcp !== void 0) fitMcpBody(finished, mcp.args);
   return finished;
 }
+function applyWireArgs(metadata, wire) {
+  metadata.tool_input = wire.toolInput;
+  delete metadata.tool_input_truncated;
+  delete metadata.tool_input_original_bytes;
+  delete metadata.tool_input_truncated_keys;
+  if (!wire.truncated) return;
+  metadata.tool_input_truncated = true;
+  if (wire.originalBytes !== void 0) metadata.tool_input_original_bytes = wire.originalBytes;
+  if (wire.truncatedKeys !== void 0 && wire.truncatedKeys.length > 0) {
+    metadata.tool_input_truncated_keys = wire.truncatedKeys;
+  }
+}
 function serialisedBytes(value) {
   try {
     const text = JSON.stringify(value);
@@ -815,12 +882,11 @@ function fitMcpBody(body, args) {
         metadata.tool_input = {};
         metadata.tool_input_truncated = true;
         metadata.tool_input_original_bytes = serialisedBytes(args);
+        delete metadata.tool_input_truncated_keys;
         return;
       }
       const wire = mcpArgsForWire(args, budget);
-      metadata.tool_input = wire.toolInput;
-      metadata.tool_input_truncated = true;
-      metadata.tool_input_original_bytes = wire.originalBytes ?? serialisedBytes(args);
+      applyWireArgs(metadata, { ...wire, truncated: true, originalBytes: wire.originalBytes ?? serialisedBytes(args) });
     }
   } catch {
   }
@@ -1540,7 +1606,26 @@ function textOf(part) {
 function flatten(value) {
   return Buffer.from(value, "utf8").toString("utf8");
 }
-function captureText(parts, maxChars) {
+function headOf(segments, n) {
+  let out = "";
+  for (const segment of segments) {
+    const room = n - out.length;
+    if (room <= 0) break;
+    out += segment.length <= room ? segment : segment.slice(0, room);
+  }
+  return out;
+}
+function tailOf(segments, n) {
+  let out = "";
+  for (let i = segments.length - 1; i >= 0; i -= 1) {
+    const room = n - out.length;
+    if (room <= 0) break;
+    const segment = segments[i];
+    out = (segment.length <= room ? segment : segment.slice(segment.length - room)) + out;
+  }
+  return out;
+}
+function captureText(parts, maxChars, redact, margin = OUTPUT_REDACTION_MARGIN_CHARS) {
   try {
     if (!Array.isArray(parts)) return void 0;
     const texts = [];
@@ -1549,30 +1634,22 @@ function captureText(parts, maxChars) {
       if (text !== void 0) texts.push(text);
     }
     if (texts.length === 0) return void 0;
+    const clean = (text) => redact === void 0 ? text : redact(text);
     let total = 0;
     for (let i = 0; i < texts.length; i += 1) total += (i > 0 ? 1 : 0) + texts[i].length;
     const cap = Number.isFinite(maxChars) && maxChars > 0 ? Math.floor(maxChars) : 0;
-    if (total <= cap) return { text: flatten(texts.join("\n")) };
+    if (total <= cap) return { text: flatten(clean(texts.join("\n"))) };
     const headBudget = Math.ceil(cap / 2);
     const tailBudget = cap - headBudget;
+    const extra = Number.isFinite(margin) && margin > 0 ? Math.floor(margin) : 0;
     const segments = [];
     for (let i = 0; i < texts.length; i += 1) {
       if (i > 0) segments.push("\n");
       segments.push(texts[i]);
     }
-    let head = "";
-    for (const segment of segments) {
-      const room = headBudget - head.length;
-      if (room <= 0) break;
-      head += segment.length <= room ? segment : segment.slice(0, room);
-    }
-    let tail = "";
-    for (let i = segments.length - 1; i >= 0; i -= 1) {
-      const room = tailBudget - tail.length;
-      if (room <= 0) break;
-      const segment = segments[i];
-      tail = (segment.length <= room ? segment : segment.slice(segment.length - room)) + tail;
-    }
+    const head = clean(headOf(segments, headBudget + extra)).slice(0, headBudget);
+    const redactedTail = clean(tailOf(segments, tailBudget + extra));
+    const tail = redactedTail.slice(Math.max(0, redactedTail.length - tailBudget));
     return {
       text: flatten(head) + OUTPUT_TRUNCATION_MARKER + flatten(tail),
       truncated: true,
@@ -2139,10 +2216,11 @@ function stableKey(value) {
     return void 0;
   }
 }
-function argsKeyOf(toolName, input) {
+function mayBeWrapper(toolName) {
+  return toolName === MCP_PROXY_TOOL_NAME || toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
+}
+function wrapperArgsKey(input) {
   try {
-    const wrapper = toolName === MCP_PROXY_TOOL_NAME || toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
-    if (!wrapper) return stableKey(isRecord2(input) ? input : {});
     const raw = isRecord2(input) ? input.args : void 0;
     if (raw === void 0 || raw === "") return stableKey({});
     if (typeof raw === "string") return stableKey(JSON.parse(raw));
@@ -2150,6 +2228,9 @@ function argsKeyOf(toolName, input) {
   } catch {
     return void 0;
   }
+}
+function directArgsKey(input) {
+  return stableKey(isRecord2(input) ? input : {});
 }
 function createInflightCalls(max, maxAgeMs, now = Date.now) {
   let entries = [];
@@ -2170,7 +2251,8 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
           toolCallId: entry.toolCallId,
           toolName: entry.toolName,
           tool,
-          argsKey: argsKeyOf(entry.toolName, entry.input),
+          directKey: directArgsKey(entry.input),
+          wrapperKey: mayBeWrapper(entry.toolName) ? wrapperArgsKey(entry.input) : void 0,
           sessionId: typeof sessionId === "string" ? sessionId : "",
           at: now()
         });
@@ -2198,10 +2280,10 @@ function createInflightCalls(max, maxAgeMs, now = Date.now) {
         const argsKey = stableKey(isRecord2(args) ? args : {});
         if (argsKey === void 0) return void 0;
         const index = entries.findIndex((entry) => {
-          if (entry.argsKey === void 0 || entry.argsKey !== argsKey) return false;
-          if (prefixedToolName !== "" && entry.toolName === prefixedToolName) return true;
-          const wrapper = entry.toolName === MCP_PROXY_TOOL_NAME || entry.toolName.startsWith(MCP_NAMESPACE_TOOL_PREFIX);
-          return wrapper && entry.tool !== void 0 && (entry.tool === originalToolName || prefixedToolName !== "" && entry.tool === prefixedToolName);
+          if (prefixedToolName !== "" && entry.toolName === prefixedToolName && entry.directKey === argsKey) {
+            return true;
+          }
+          return mayBeWrapper(entry.toolName) && entry.wrapperKey === argsKey && entry.tool !== void 0 && (entry.tool === originalToolName || prefixedToolName !== "" && entry.tool === prefixedToolName);
         });
         if (index === -1) return void 0;
         const [found] = entries.splice(index, 1);
@@ -2457,28 +2539,29 @@ function createMcpConfigReader(options) {
   function take(cwd) {
     const safeCwd2 = typeof cwd === "string" ? cwd : "";
     const sources = mcpConfigSources(options, safeCwd2);
-    const signature = sources === void 0 ? "" : signatureOf(sources);
+    if (sources === void 0) return false;
+    const signature = signatureOf(sources);
     const view = readMcpServerView(sources);
-    if (sources !== void 0 && signatureOf(sources) !== signature) invalidated = true;
+    if (signatureOf(sources) !== signature) invalidated = true;
     snap = { cwd: safeCwd2, sources, signature, view };
+    return true;
   }
   return {
     snapshot(cwd) {
       try {
         if (snap === void 0) take(cwd);
       } catch {
-        invalidated = true;
       }
     },
     serverConfig(serverName, cwd) {
       try {
-        if (snap === void 0) take(cwd);
-        if (invalidated || snap === void 0) return void 0;
-        if (snap.sources === void 0 || snap.view === void 0) return void 0;
-        if (cwd !== snap.cwd || signatureOf(snap.sources) !== snap.signature) {
+        if (snap === void 0 && !take(cwd)) return void 0;
+        if (invalidated || snap === void 0 || snap.view === void 0) return void 0;
+        if (signatureOf(snap.sources) !== snap.signature) {
           invalidated = true;
           return void 0;
         }
+        if (cwd !== snap.cwd) return void 0;
         return projectServerConfig(snap.view, serverName);
       } catch {
         return void 0;
@@ -2529,11 +2612,11 @@ async function decideInput(event, ctx, deps) {
 }
 
 // packages/pi/src/toolResult.ts
-function recordToolResult(event, store) {
+function recordToolResult(event, store, redact) {
   try {
     const content = Array.isArray(event?.content) ? event.content : [];
     const hashed = hashContent(content);
-    const captured = captureText(content, MAX_TOOL_OUTPUT_CHARS);
+    const captured = captureText(content, MAX_TOOL_OUTPUT_CHARS, redact);
     store.recordResult({
       tool_name: typeof event?.toolName === "string" ? event.toolName : "",
       tool_use_id: typeof event?.toolCallId === "string" ? event.toolCallId : "",
@@ -2920,7 +3003,8 @@ function createExtension(overrides = {}) {
         seeCtx(ctx);
         inflight.forget(event?.toolCallId);
         if (!recordingActive(init())) return void 0;
-        recordToolResult(event, turnStore);
+        const apiKey = init().apiKey;
+        recordToolResult(event, turnStore, (text) => redactSecrets(text, apiKey));
       } catch {
       }
       return void 0;
