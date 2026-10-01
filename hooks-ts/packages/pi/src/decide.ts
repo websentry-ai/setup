@@ -12,7 +12,8 @@
 //   3. **`event.input` is never written.** pi permits mutation but re-validates nothing afterwards
 //      (`types.d.ts:788`), and Phase 8 has no reason to patch arguments (§F9).
 //
-// Every user-facing string comes from `constants.ts`; none is retyped here.
+// Every user-facing string comes from a `constants.ts` (core's, or this package's for pi-only
+// wording); none is retyped here.
 
 import {
   CONFIRM_QUESTION,
@@ -21,7 +22,6 @@ import {
   DENY_PREFIX,
   ENGINE_UNAVAILABLE_REASON,
   GENERIC_DENY_REASON,
-  NO_UI_REASON,
 } from "../../core/src/constants.ts";
 import { areToolsFresh, shouldSkipFileToolFromState } from "../../core/src/cache.ts";
 import {
@@ -34,6 +34,7 @@ import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
 import type { ToolCallLike } from "./narrow.ts";
+import { NO_UI_REASON } from "./constants.ts";
 import { PI_NATIVE_FILE_TOOLS, PI_PROFILE } from "./profile.ts";
 import { confirmWithTimeout, notifySafe } from "./ui.ts";
 import type { AccountIdentity } from "../../core/src/accountIdentity.ts";

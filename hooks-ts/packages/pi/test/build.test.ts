@@ -5,7 +5,7 @@
 //
 // WR-08: the supply-chain guard reads esbuild's own metafile (`dist/meta/pi.json`) rather than
 // grepping the output for the vendor package name. The old substring assertion was satisfiable by
-// fragmenting the string in source - which is exactly what `piVersion.ts` had to do to hold a
+// fragmenting the string in source - which is exactly what `version.ts` had to do to hold a
 // package name it only ever uses as data. Neither metafile assertion below can be satisfied that
 // way: every input must be a workspace source path, and every surviving import of the entry output
 // must be an external `node:` builtin. A value import of the pi package fails both.

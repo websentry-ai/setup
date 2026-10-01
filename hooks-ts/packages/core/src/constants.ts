@@ -310,8 +310,7 @@ export const CONFIRM_TITLE = "Unbound policy";
  * only while the modal was open.
  */
 export const CONFIRM_QUESTION = "Run this command?";
-export const NO_UI_REASON =
-  "Requires confirmation but pi is running without a UI (-p/json). Run interactively or adjust the policy.";
+// The no-UI block reason names the agent and its CLI modes, so each adapter package owns its own.
 export const ENGINE_UNAVAILABLE_REASON = "Unbound policy engine unavailable — please retry";
 export const NO_KEY_NOTICE = "Unbound: no API key found — extension inactive";
 /**
