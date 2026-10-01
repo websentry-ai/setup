@@ -87,6 +87,9 @@ export interface TurnToolCall {
    * the same thing the pretool request sent. Absent means the call was recorded without one (a
    * cache-skipped file tool has no command and may have no allowlisted key either), which the turn
    * log sends as `{}`.
+   *
+   * For a resolved MCP call it is the capped MCP arguments (`capMcpArgs`), cloned by the decision
+   * seam — the one case where values can be nested objects. `turnLog.ts` redacts every string leaf.
    */
   tool_input?: Record<string, unknown>;
   /**
@@ -245,6 +248,15 @@ export function hashContent(parts: readonly unknown[]): ContentHash {
     // A digest we could not compute is a digest we do not report. The count is not worth guessing
     // either, so this is the one shape that says "nothing is known".
     return { content_sha256: undefined, content_bytes: 0, hash_skipped: true };
+  }
+}
+
+/** A structural copy of a recorded input; a shallow one if the structure cannot be cloned. */
+function copyInput(input: Record<string, unknown>): Record<string, unknown> {
+  try {
+    return structuredClone(input);
+  } catch {
+    return { ...input };
   }
 }
 
@@ -410,13 +422,13 @@ export function createTurnStore(): TurnStore {
 
     snapshot(): TurnRecord {
       const copy: TurnRecord = {
-        // `tool_input` is spread a second time so the copy is deep ENOUGH: its values are scalars by
-        // construction (`sanitizeToolInput` forwards nothing else), so one more level is the whole
-        // object. Without it, `snapshot()` handed callers a live reference into the record.
+        // `tool_input` is copied a second time so `snapshot()` never hands callers a live reference
+        // into the record. A native call's values are scalars (`sanitizeToolInput` forwards nothing
+        // else), but an MCP call's capped arguments can nest, so the copy is structural.
         tool_calls: record.tool_calls.map((entry) =>
           entry.tool_input === undefined
             ? { ...entry }
-            : { ...entry, tool_input: { ...entry.tool_input } },
+            : { ...entry, tool_input: copyInput(entry.tool_input) },
         ),
         results: record.results.map((entry) => ({ ...entry })),
       };

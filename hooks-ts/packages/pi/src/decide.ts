@@ -30,9 +30,12 @@ import {
   auditToolInput,
   buildPretoolPayload,
   capCommand,
+  capMcpArgs,
   resolveFilePath,
 } from "../../core/src/payload.ts";
 import type { CheckHooks, PolicyChecker } from "../../core/src/policy.ts";
+import type { McpCallInfo } from "../../core/src/types.ts";
+import type { PolicyOutcome } from "../../core/src/verdict.ts";
 import { policyState } from "../../core/src/policyState.ts";
 import type { PolicyState } from "../../core/src/policyState.ts";
 import { isShellCall } from "./narrow.ts";
@@ -107,6 +110,49 @@ export interface DecideDeps {
    * and never the verdict. Optional: absent means `""`, today's behaviour.
    */
   currentPrompt?: () => string | undefined;
+  /**
+   * Resolve a pi-mcp-adapter call to the MCP (server, original tool, args) it will run — see
+   * `mcpResolve.ts`. Consulted only for a call that is neither a shell call nor a native file tool,
+   * BEFORE the nothing-evaluable return, and only through `mcpOf`: a resolver that throws is a miss,
+   * and a miss is today's path (an unevaluable custom tool: no request, allowed). Optional, so every
+   * existing call site keeps that behaviour.
+   */
+  resolveMcp?: (toolName: string, input: unknown, cwd: string) => McpCallInfo | undefined;
+}
+
+/** `deps.resolveMcp`, made total. Anything that is not a well-formed hit is a miss. */
+function mcpOf(
+  deps: Pick<DecideDeps, "resolveMcp">,
+  toolName: string,
+  input: unknown,
+  cwd: string,
+): McpCallInfo | undefined {
+  try {
+    const call = deps.resolveMcp?.(toolName, input, cwd);
+    if (call === null || typeof call !== "object") return undefined;
+    if (typeof call.server !== "string" || call.server === "") return undefined;
+    if (typeof call.tool !== "string" || call.tool === "") return undefined;
+    if (call.args === null || typeof call.args !== "object" || Array.isArray(call.args)) return undefined;
+    return call;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The record's copy of the MCP arguments: the capped projection the pretool request sent, cloned so
+ * the turn record never aliases pi's live `event.input` (a direct tool's input IS its arguments).
+ * The clone is JSON because `capMcpArgs`' output has just been proven JSON-serialisable.
+ */
+function auditMcpArgs(args: Record<string, unknown>): Record<string, unknown> {
+  try {
+    const cloned = JSON.parse(JSON.stringify(capMcpArgs(args))) as unknown;
+    return cloned !== null && typeof cloned === "object" && !Array.isArray(cloned)
+      ? (cloned as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -189,10 +235,19 @@ export async function decideToolCall(
     // `narrow.ts` on why `input` is `unknown` and can genuinely be either (WR-07).
     const toolInput = (event.input ?? {}) as Record<string, unknown>;
 
+    // A pi-mcp-adapter call (proxy, namespace wrapper or direct tool) goes to the gateway's MCP path
+    // instead, resolved forward to (server, original tool, args). Asked only of a call that is
+    // neither a shell call nor a native file tool, so the common path costs nothing.
+    if (!shell && !NATIVE_FILE_TOOLS.has(event.toolName)) {
+      const mcp = mcpOf(deps, event.toolName, event.input, ctx.cwd);
+      if (mcp !== undefined) return await decideMcpCall(event, ctx, deps, mcp);
+    }
+
     // Nothing to evaluate: the server's entry gate needs a non-blank command or a native-tool
     // `file_path` (§B3), so a call with neither is a guaranteed allow after a full round trip — and
     // pi awaits every call in a batch serially, so each pointless trip is felt N× (§F2). This covers
-    // every custom/MCP tool that carries no command, not just an empty shell command (WR-04).
+    // every custom tool that carries no command, including an MCP-looking call the resolver could
+    // not attribute to exactly one (server, tool) — not just an empty shell command (WR-04).
     const filePath = resolveFilePath(event.toolName, toolInput, ctx.cwd);
     if (command.trim() === "" && filePath === undefined) return undefined;
 
@@ -280,38 +335,93 @@ export async function decideToolCall(
       tool_input: auditInput,
     });
 
-    switch (outcome.kind) {
-      case "allow":
-        return undefined;
-
-      case "deny": {
-        const reason = outcome.reason;
-        notifySafe(ctx, reason ?? GENERIC_DENY_REASON, "error");
-        return {
-          block: true,
-          reason: reason === undefined ? GENERIC_DENY_REASON : DENY_PREFIX + reason,
-        };
-      }
-
-      case "confirm": {
-        if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
-        const reason = outcome.reason ?? GENERIC_DENY_REASON;
-        // The notice is where the reason is rendered — once. It also stays in the transcript after the
-        // dialog closes, which is why it is the copy that was kept when the dialog stopped repeating
-        // it: pi draws a confirm as `title\nmessage`, so a reason in both places was the same
-        // paragraph twice on one verdict.
-        notifySafe(ctx, reason, "warning");
-        const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
-        return accepted ? undefined : { block: true, reason: DECLINED_REASON };
-      }
-
-      case "unavailable":
-        // Core supplies a `reason` only when the generic string would misdescribe the failure (a
-        // rejected key at a fail-closed org). It is a constant, never API text.
-        return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
-    }
+    return await applyOutcome(outcome, ctx);
   } catch {
     // Belt and braces: `index.ts` catches too, but an internal fault must allow, never block.
     return undefined;
   }
+}
+
+/**
+ * A resolved MCP call: the gateway's Path 3, never the file-tool cache.
+ *
+ * The 300 s skip answers "is there a FILE policy for this tool" from a cached list, and no cached list
+ * can say whether an MCP sanction or MCP policy applies — so an MCP call always round-trips. It still
+ * pulls policies on the same rule as every other call, because the MCP response carries
+ * `tools_to_check` when asked. The checker's label stays pi's own tool name; the body and the turn
+ * record both name the call `mcp__<server>__<tool>`, which is what the gateway and the backend parse.
+ */
+async function decideMcpCall(
+  event: ToolCallLike,
+  ctx: DecideCtx,
+  deps: DecideDeps,
+  mcp: McpCallInfo,
+): Promise<BlockResult | undefined> {
+  const now = (deps.now ?? Date.now)();
+  const state = deps.state ?? policyState;
+  const pullPolicies = !state.getToolsConfirmed() || !areToolsFresh(state.getToolsSyncedAt(), now);
+
+  const payload = buildPretoolPayload({
+    toolName: event.toolName,
+    command: "",
+    toolUseId: event.toolCallId,
+    toolInput: {},
+    cwd: ctx.cwd,
+    sessionId: ctx.sessionManager.getSessionId(),
+    model: ctx.model?.id,
+    clientEntrypoint: deps.entrypoint,
+    pullPolicies,
+    lastUserPrompt: promptOf(deps),
+    mcp,
+    ...(deps.accountIdentity === undefined ? {} : { accountIdentity: deps.accountIdentity }),
+  });
+
+  const hooks: CheckHooks =
+    deps.hooks ?? { notify: (message, level) => notifySafe(ctx, message, level) };
+  const outcome = await deps.checker.checkTool(payload, event.toolName, hooks);
+  // Before the confirm, for the same reason as the native path. The capped arguments are what the
+  // record carries — the same projection the gateway saw — and `turnLog.ts` redacts every string
+  // leaf of them before they are posted.
+  noteDecision(deps, {
+    tool_name: `mcp__${mcp.server}__${mcp.tool}`,
+    tool_use_id: event.toolCallId,
+    decision: outcome.kind,
+    tool_input: auditMcpArgs(mcp.args),
+  });
+  return await applyOutcome(outcome, ctx);
+}
+
+/** The verdict-to-pi-behaviour mapping both paths share — header rules 1 and 2 live here. */
+async function applyOutcome(outcome: PolicyOutcome, ctx: DecideCtx): Promise<BlockResult | undefined> {
+  switch (outcome.kind) {
+    case "allow":
+      return undefined;
+
+    case "deny": {
+      const reason = outcome.reason;
+      notifySafe(ctx, reason ?? GENERIC_DENY_REASON, "error");
+      return {
+        block: true,
+        reason: reason === undefined ? GENERIC_DENY_REASON : DENY_PREFIX + reason,
+      };
+    }
+
+    case "confirm": {
+      if (!ctx.hasUI) return { block: true, reason: NO_UI_REASON };
+      const reason = outcome.reason ?? GENERIC_DENY_REASON;
+      // The notice is where the reason is rendered — once. It also stays in the transcript after the
+      // dialog closes, which is why it is the copy that was kept when the dialog stopped repeating
+      // it: pi draws a confirm as `title\nmessage`, so a reason in both places was the same
+      // paragraph twice on one verdict.
+      notifySafe(ctx, reason, "warning");
+      const accepted = await confirmWithTimeout(ctx, CONFIRM_TITLE, CONFIRM_QUESTION);
+      return accepted ? undefined : { block: true, reason: DECLINED_REASON };
+    }
+
+    case "unavailable":
+      // Core supplies a `reason` only when the generic string would misdescribe the failure (a
+      // rejected key at a fail-closed org). It is a constant, never API text.
+      return { block: true, reason: outcome.reason ?? ENGINE_UNAVAILABLE_REASON };
+  }
+  return undefined;
 }

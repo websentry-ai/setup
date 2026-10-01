@@ -257,14 +257,18 @@ export const MAX_TOOL_INPUT_VALUE_BYTES = 2048;
 /**
  * The only `metadata.tool_input` keys that leave the machine (WR-04 / T-09-03).
  *
- * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a pi tool call
- * never takes that path), `:1201` (RepoGate only) and `:1594` (`buildSyntheticPattern`, which reads
+ * `tool_input` has three consumers in `preToolUseHandler.ts`: `:914` (MCP input DLP — a native pi
+ * tool call never takes that path), `:1201` (RepoGate only) and `:1594` (`buildSyntheticPattern`, which reads
  * `pattern` for grep/find and nothing else). File paths arrive as `metadata.file_path`, not from here
  * (§C4). So `content` (write) and `edits` (edit) are read by nothing at all, and forwarding them was
  * undeclared egress of file contents.
  *
  * **Widening this list is an egress decision, not a convenience.** A test spells the set out
  * independently so an addition cannot be slipped in as a formatting change.
+ *
+ * MCP arguments reach `metadata.tool_input` through the separate MCP branch in `payload.ts`
+ * (`capMcpArgs`), which is the deliberate, MCP-only egress widening: the gateway's MCP policies and
+ * input DLP evaluate exactly those arguments. This list still governs every native tool.
  */
 export const TOOL_INPUT_ALLOWLIST = [
   "path",
@@ -368,3 +372,35 @@ export const PLACEHOLDER_SERIALS: readonly string[] = [
   "not applicable", "not specified", "not available", "oem", "o.e.m.",
   "invalid", "123456789", "xxxxxxxx",
 ];
+
+// --- pi-mcp-adapter (MCP tool calls) ---------------------------------------------------------
+//
+// pi has no native MCP; MCP tools arrive through the `pi-mcp-adapter` extension (4.0.0 at the time
+// of writing). These are the adapter's own names and files, transcribed so `mcpResolve.ts` can map a
+// pi tool call back to (server, tool) without importing the adapter.
+
+/** The adapter's proxy tool (`index.ts:1886`): `mcp({tool, args, server?})` is a call. */
+export const MCP_PROXY_TOOL_NAME = "mcp";
+/** Namespace wrappers are `mcp__<formatServerNamespace(server)>` (`namespace-tools.ts`). */
+export const MCP_NAMESPACE_TOOL_PREFIX = "mcp__";
+/**
+ * Proxy `action`s the adapter dispatches BEFORE looking at `tool` (`index.ts:2010-2048`): none of
+ * them is an MCP tool call, so a proxy invocation carrying one is never resolved.
+ */
+export const MCP_PROXY_NON_CALL_ACTIONS: readonly string[] = [
+  "install",
+  "ui-messages",
+  "auth-start",
+  "auth-complete",
+];
+/** `PI_MCP_CONFIG_MODE=exclusive` makes the adapter read only `<agentDir>/mcp-adapter.json`. */
+export const ENV_PI_MCP_CONFIG_MODE = "PI_MCP_CONFIG_MODE";
+/** The adapter's own config file, under the agent dir and under `<cwd>/.pi/`. */
+export const MCP_ADAPTER_CONFIG_FILE_NAME = "mcp-adapter.json";
+/** The adapter's tool-metadata cache, under the agent dir: `servers.<name>.tools[].name`. */
+export const MCP_CACHE_FILE_NAME = "mcp-cache.json";
+/**
+ * The cap on `mcp-cache.json`. Larger than `MAX_CONFIG_BYTES` because the cache carries every tool's
+ * input schema; a file over it is treated as absent (a cold cache), never partially parsed.
+ */
+export const MAX_MCP_CACHE_BYTES = 2_097_152;

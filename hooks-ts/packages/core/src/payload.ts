@@ -6,7 +6,7 @@
 //
 // **File bodies and edit hunks are never forwarded.** Not capped — absent. `write.content` and
 // `edit.edits` are read by nothing server-side: `metadata.tool_input` has three consumers in
-// `preToolUseHandler.ts` (`:914` MCP input DLP, which a pi tool call never reaches; `:1201` RepoGate;
+// `preToolUseHandler.ts` (`:914` MCP input DLP, which only a resolved MCP call reaches; `:1201` RepoGate;
 // `:1594` `buildSyntheticPattern`, which reads `pattern` for grep/find), and paths come from
 // `metadata.file_path` (§C4). Sending them was undeclared egress of file contents for zero
 // enforcement value (WR-04 / T-09-03) — so if a future reader is tempted to "restore" them as a
@@ -27,6 +27,16 @@
 // `auditToolInput` lives here rather than in `turnLog.ts` for the same reason: the turn log's
 // `tool_input` must be the SAME projection this file already sends, so both come out of one allowlist
 // and one pair of caps. A key the pretool request does not carry cannot appear in an audit row.
+//
+// **The one exception: a resolved MCP call** (`PretoolPayloadInput.mcp`). The gateway's MCP path
+// (Path 3) evaluates MCP policies and input DLP on the arguments themselves, so for a call
+// `mcpResolve.ts` resolved to a pi-mcp-adapter (server, tool), `metadata.tool_input` carries the
+// arguments — whole when they fit `MAX_TOOL_INPUT_BYTES`, scalars-that-fit otherwise (`capMcpArgs`),
+// and unredacted, exactly as the Claude Code hook sends them. That is a deliberate, MCP-only egress
+// widening; every native tool still goes through the allowlist above. The same branch names the call
+// `mcp__<server>__<tool>` with explicit `metadata.mcp_server` / `mcp_tool`, so neither the gateway's
+// Path-2 name diversion nor its first-`__` split can reinterpret it, and attaches the secret-free
+// `mcp_server_config` (`url`, or `command` + `args`) the sanction fingerprint needs.
 
 import {
   APP_LABEL,
@@ -291,17 +301,62 @@ export function withAccountIdentity<T extends { account_identity?: AccountIdenti
   return body;
 }
 
+/**
+ * The MCP arguments as `metadata.tool_input` — the MCP-only egress widening described in the header.
+ *
+ * The whole object when its JSON fits `maxBytes`; otherwise `{_truncated, _original_bytes}` plus the
+ * top-level scalars that still fit, strings sliced to `MAX_TOOL_INPUT_VALUE_BYTES`. Unlike
+ * `capToolInput` nothing nested is dropped when it fits, because MCP arguments are routinely nested
+ * and the gateway's DLP must see what the tool will receive. No redaction, for the same reason.
+ * Total: unserialisable arguments are `{_truncated: true}`.
+ */
+export function capMcpArgs(
+  args: Record<string, unknown>,
+  maxBytes = MAX_TOOL_INPUT_BYTES,
+): Record<string, unknown> {
+  try {
+    if (args === null || typeof args !== "object" || Array.isArray(args)) return {};
+    const serialised = JSON.stringify(args) ?? "";
+    const originalBytes = Buffer.byteLength(serialised);
+    if (originalBytes <= maxBytes) return args;
+
+    const capped: Record<string, unknown> = { _truncated: true, _original_bytes: originalBytes };
+    let usedBytes = Buffer.byteLength(JSON.stringify(capped));
+    for (const [key, raw] of Object.entries(args)) {
+      if (typeof raw !== "string" && typeof raw !== "number" && typeof raw !== "boolean") continue;
+      const value = typeof raw === "string" ? sliceToBytes(raw, MAX_TOOL_INPUT_VALUE_BYTES) : raw;
+      // +2 for the separating comma and the key/value colon.
+      const entryBytes = Buffer.byteLength(JSON.stringify(key)) + Buffer.byteLength(JSON.stringify(value)) + 2;
+      if (usedBytes + entryBytes > maxBytes) continue;
+      capped[key] = value;
+      usedBytes += entryBytes;
+    }
+    return capped;
+  } catch {
+    return { _truncated: true };
+  }
+}
+
 /** Assemble the §B1 body. Pure: same input, same output, no side effects. */
 export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestBody {
-  const metadata: Record<string, unknown> = {
-    cwd: input.cwd,
+  const mcp = input.mcp;
+  const metadata: Record<string, unknown> = { cwd: input.cwd };
+  if (mcp !== undefined) {
+    // Path 3 (see the header): explicit server/tool, the capped arguments, and the projected config
+    // only when there is one. No `file_path` — an MCP tool has no file semantics here.
+    metadata.mcp_server = mcp.server;
+    metadata.mcp_tool = mcp.tool;
+    metadata.tool_input = capMcpArgs(mcp.args);
+    if (mcp.serverConfig !== undefined) metadata.mcp_server_config = mcp.serverConfig;
+  } else {
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
-    tool_input: capToolInput(sanitizeToolInput(input.toolInput)),
-  };
-  const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
-  if (filePath !== undefined) metadata.file_path = filePath;
+    metadata.tool_input = capToolInput(sanitizeToolInput(input.toolInput));
+    const filePath = resolveFilePath(input.toolName, input.toolInput, input.cwd);
+    if (filePath !== undefined) metadata.file_path = filePath;
+  }
 
-  const capped = capCommand(input.command);
+  // An MCP call carries no command: an empty one keeps it out of the Path-2 command gate.
+  const capped = capCommand(mcp === undefined ? input.command : "");
   if (capped.truncated) {
     // The server cannot tell a whole command from a capped one by looking at the string. Say so
     // explicitly, so a future entry gate can choose to ask or deny rather than matching a
@@ -312,8 +367,9 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
 
   const preToolUseData: PreToolUseData = {
     // Forwarded verbatim: Phase 7 registered the lowercase pi names, so title-casing means the
-    // server never matches the tool and enforcement silently disappears.
-    tool_name: input.toolName,
+    // server never matches the tool and enforcement silently disappears. A resolved MCP call is
+    // named the way the gateway and the backend parse MCP names, `mcp__<server>__<tool>`.
+    tool_name: mcp === undefined ? input.toolName : `mcp__${mcp.server}__${mcp.tool}`,
     command: capped.command,
     metadata,
   };

@@ -26,6 +26,7 @@ import {
   auditToolInput,
   buildPretoolPayload,
   capCommand,
+  capMcpArgs,
   capToolInput,
   COMMAND_TRUNCATION_MARKER,
   resolveFilePath,
@@ -127,8 +128,16 @@ test("path contract: bash and other command tools never send a file_path", () =>
   const bash = buildPretoolPayload(bashInput());
   assert.equal(Object.hasOwn(bash.pre_tool_use_data.metadata, "file_path"), false);
 
-  const custom = buildPretoolPayload(bashInput({ toolName: "mcp__x__y", toolInput: { path: "/a" } }));
+  // Without an `mcp` field the builder does not know this is an MCP call — resolution happens in
+  // `mcpResolve.ts`, upstream — so an `mcp__`-looking name is a plain custom tool: no file_path, and
+  // the native allowlist still applies to its input (only `path` survives, `query` is dropped). The
+  // MCP shape is pinned by the "MCP branch" cases below.
+  const custom = buildPretoolPayload(
+    bashInput({ toolName: "mcp__x__y", toolInput: { path: "/a", query: "q" } }),
+  );
   assert.equal(Object.hasOwn(custom.pre_tool_use_data.metadata, "file_path"), false);
+  assert.deepStrictEqual(custom.pre_tool_use_data.metadata.tool_input, { path: "/a", _dropped: true });
+  assert.equal(custom.pre_tool_use_data.tool_name, "mcp__x__y");
 
   assert.equal(resolveFilePath("bash", { path: "/a" }, "/cwd"), undefined);
   assert.equal(resolveFilePath("powershell", {}, "/cwd"), undefined);
@@ -482,4 +491,66 @@ test("resolveClientEntrypoint: a hostile version string is sanitised and capped"
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+// --- The MCP branch (gateway Path 3) -----------------------------------------------------------
+//
+// A call `mcpResolve.ts` resolved to a pi-mcp-adapter (server, tool) is the ONE deliberate exception
+// to the native allowlist: the gateway's MCP policies and input DLP evaluate the arguments.
+
+const MCP = {
+  server: "my-srv",
+  tool: "create_page",
+  args: { title: "Q3", body: { blocks: [{ text: "nested is kept" }] }, content: "a file body is fine here" },
+};
+
+test("MCP branch: tool_name, explicit server/tool, the whole args, no command and no file_path", () => {
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "mcp__my_srv", command: "", toolInput: { tool: "create_page" }, mcp: MCP }),
+  );
+  const data = body.pre_tool_use_data;
+  assert.equal(data.tool_name, "mcp__my-srv__create_page");
+  assert.equal(data.command, "");
+  assert.equal(data.metadata.mcp_server, "my-srv");
+  assert.equal(data.metadata.mcp_tool, "create_page");
+  assert.deepStrictEqual(data.metadata.tool_input, MCP.args, "not allowlisted: nested and `content` survive");
+  assert.equal(Object.hasOwn(data.metadata, "file_path"), false);
+  assert.equal(Object.hasOwn(data.metadata, "mcp_server_config"), false, "only when provided");
+});
+
+test("MCP branch: mcp_server_config rides only when provided, verbatim", () => {
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, serverConfig: { url: "https://x.invalid/mcp" } } }),
+  );
+  assert.deepStrictEqual(body.pre_tool_use_data.metadata.mcp_server_config, { url: "https://x.invalid/mcp" });
+});
+
+test("MCP branch: a command passed alongside is ignored", () => {
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "rm -rf /", mcp: MCP }));
+  assert.equal(body.pre_tool_use_data.command, "");
+  assert.equal(Object.hasOwn(body.pre_tool_use_data.metadata, "command_truncated"), false);
+});
+
+test("capMcpArgs: whole object under the cap, scalars-that-fit over it, marker on failure", () => {
+  const small = { a: 1, b: { c: [1, 2, 3] } };
+  assert.equal(capMcpArgs(small), small, "under the cap the object is forwarded as is");
+
+  const big = { keep: "short", n: 42, ok: true, nested: { blob: "x".repeat(MAX_TOOL_INPUT_BYTES) } };
+  const capped = capMcpArgs(big);
+  assert.equal(capped._truncated, true);
+  assert.equal(typeof capped._original_bytes, "number");
+  assert.ok((capped._original_bytes as number) > MAX_TOOL_INPUT_BYTES);
+  assert.equal(capped.keep, "short");
+  assert.equal(capped.n, 42);
+  assert.equal(capped.ok, true);
+  assert.equal(Object.hasOwn(capped, "nested"), false, "a nested value over the cap is dropped");
+  assert.ok(Buffer.byteLength(JSON.stringify(capped)) <= MAX_TOOL_INPUT_BYTES);
+
+  const longString = capMcpArgs({ s: "y".repeat(MAX_TOOL_INPUT_BYTES * 2) });
+  assert.equal((longString.s as string).length, MAX_TOOL_INPUT_VALUE_BYTES, "strings sliced per value");
+
+  const circular: Record<string, unknown> = {};
+  circular.self = circular;
+  assert.deepStrictEqual(capMcpArgs(circular), { _truncated: true });
+  assert.deepStrictEqual(capMcpArgs({ big: 10n } as unknown as Record<string, unknown>), { _truncated: true });
 });

@@ -133,6 +133,37 @@ export function shouldPostTurn(record: TurnRecord | undefined): boolean {
   }
 }
 
+/** How deep `redactLeaves` walks a recorded input before dropping what is below. */
+const MAX_REDACT_DEPTH = 8;
+
+/**
+ * A copy of `value` with `redactSecrets` applied to every string leaf, arrays included. Plain objects
+ * and arrays are walked to `MAX_REDACT_DEPTH`; anything deeper, and anything that is not a string,
+ * number, boolean, `null`, plain object or array, is dropped (`undefined`).
+ *
+ * Leaf by leaf, never serialise-then-redact: `redactSecrets`' `Bearer \S+` would swallow the JSON
+ * quote and comma after a token and corrupt the structure it was meant to scrub.
+ */
+function redactLeaves(value: unknown, apiKey: string | undefined, depth: number): unknown {
+  if (typeof value === "string") return redactSecrets(value, apiKey);
+  if (typeof value === "number" || typeof value === "boolean" || value === null) return value;
+  if (depth >= MAX_REDACT_DEPTH || typeof value !== "object") return undefined;
+  if (Array.isArray(value)) {
+    return value.map((item) => {
+      const out = redactLeaves(item, apiKey, depth + 1);
+      return out === undefined ? null : out;
+    });
+  }
+  const proto = Object.getPrototypeOf(value) as unknown;
+  if (proto !== Object.prototype && proto !== null) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const redacted = redactLeaves(item, apiKey, depth + 1);
+    if (redacted !== undefined) out[key] = redacted;
+  }
+  return out;
+}
+
 /**
  * The recorded `tool_input`, or `{}`.
  *
@@ -140,14 +171,22 @@ export function shouldPostTurn(record: TurnRecord | undefined): boolean {
  * existed, and a second pass here would only strip the `_dropped` / `_truncated` markers the server is
  * meant to see. Anything that is not a plain object is `{}` — a malformed record degrades a key, not
  * the row.
+ *
+ * Every string leaf is scrubbed (bearer tokens and the session key, the same scrub the telemetry path
+ * applies), not just `command`: a resolved MCP call records its capped ARGUMENTS here, which are free
+ * text the model wrote and can carry a token anywhere in the structure. The audit row persists; the
+ * pretool check itself saw the input unredacted.
  */
 function toolInputFor(value: unknown, apiKey?: string): Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
-  const input = { ...(value as Record<string, unknown>) };
-  // The command persists in the audit row, so bearer tokens and the session key are scrubbed the same
-  // way the telemetry path scrubs them. The pretool check itself saw the command unredacted.
-  if (typeof input.command === "string") input.command = redactSecrets(input.command, apiKey);
-  return input;
+  try {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return {};
+    const redacted = redactLeaves(value, apiKey, 0);
+    return redacted !== null && typeof redacted === "object" && !Array.isArray(redacted)
+      ? (redacted as Record<string, unknown>)
+      : {};
+  } catch {
+    return {};
+  }
 }
 
 /**

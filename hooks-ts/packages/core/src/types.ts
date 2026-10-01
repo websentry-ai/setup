@@ -8,6 +8,12 @@
 // `account_identity` has since joined the type (parity with the Claude Code hook): optional, and
 // only ever set through `withAccountIdentity`, which forwards the six wire strings and nothing else.
 //
+// `PretoolPayloadInput.mcp` is the one input that changes the body's SHAPE: a resolved pi-mcp-adapter
+// call goes to the gateway's MCP path (Path 3) as `tool_name: "mcp__<server>__<tool>"` with
+// `metadata.mcp_server` / `mcp_tool` / `tool_input` (the capped MCP arguments) and, when resolvable,
+// `mcp_server_config` (`url`, or `command` + `args`, never credentials). The native-tool allowlist
+// still governs every other call; MCP arguments are the one explicit exception.
+//
 // Type-only file. Core stays free of any `@earendil-works/*` import, even a type-only one, so a
 // future opencode adapter can reuse it unchanged.
 
@@ -96,6 +102,29 @@ export interface PretoolPayloadInput {
   pullPolicies?: boolean;
   /** The process's settled account identity, when known. */
   accountIdentity?: AccountIdentity;
+  /**
+   * A resolved MCP call (see the header). When set, `toolName`/`command`/`toolInput` no longer shape
+   * the body: the builder sends the Path-3 MCP shape instead. Absent for every native/custom tool.
+   */
+  mcp?: McpCallInfo;
+}
+
+/**
+ * One MCP call resolved to the adapter's (server, original tool) pair — what `mcpResolve.ts` produces
+ * and what the MCP branch of `buildPretoolPayload` consumes.
+ */
+export interface McpCallInfo {
+  /** The configured server name, verbatim (dashes and all). */
+  server: string;
+  /** The MCP tool's ORIGINAL name, as the server publishes it — never the pi-side prefixed name. */
+  tool: string;
+  /** The arguments the tool will receive. Capped by the builder, never redacted (gateway DLP). */
+  args: Record<string, unknown>;
+  /**
+   * The secret-free projection of the server's config: `{url, type?}` or `{command, args?, type?}`.
+   * Absent when the server is known only from the cache. Never `env`, `headers` or token fields.
+   */
+  serverConfig?: Record<string, unknown>;
 }
 
 /**

@@ -18,7 +18,8 @@ import { createTelemetry } from "../../core/src/telemetry.ts";
 import { ATTRIBUTION_SUFFIX, startMockApi } from "../../core/test/helpers/mockApi.ts";
 import type { MockApi, MockMode } from "../../core/test/helpers/mockApi.ts";
 import { decideToolCall } from "../src/decide.ts";
-import type { DecideDeps } from "../src/decide.ts";
+import type { DecideDeps, DecisionEntry } from "../src/decide.ts";
+import type { McpCallInfo } from "../../core/src/types.ts";
 import { isShellCall } from "../src/narrow.ts";
 import { createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx, FakeCtxOptions } from "./helpers/fakeCtx.ts";
@@ -63,11 +64,12 @@ async function run(
     ctx?: Partial<FakeCtxOptions>;
     /** Extra calls to make before the asserted one (used to prime `failBlock`). */
     warmups?: number;
+    resolveMcp?: DecideDeps["resolveMcp"];
   } = {},
 ): Promise<RunResult> {
   const api = await startMockApi({ mode });
   const ctx = createFakeCtx(opts.ctx);
-  const deps = depsFor(api);
+  const deps = { ...depsFor(api), ...(opts.resolveMcp === undefined ? {} : { resolveMcp: opts.resolveMcp }) };
   try {
     for (let i = 0; i < (opts.warmups ?? 0); i += 1) {
       await decideToolCall(
@@ -274,14 +276,27 @@ test("HOOK-01 the wire body carries the pi identity taken from ctx", async () =>
 // field was making exactly that trip.
 
 test("WR-04 a custom tool with nothing evaluable makes zero HTTP requests", async () => {
-  // A deny-scripted mock proves it: a request would have produced a block.
+  // A deny-scripted mock proves it: a request would have produced a block. A non-MCP name now: MCP
+  // calls the resolver can attribute go to the gateway's MCP path (see the MCP cases below), so this
+  // case pins the contract for a genuinely unevaluable custom tool.
   const { result, api } = await run("deny", {
-    toolName: "mcp__notion__search",
+    toolName: "my_custom_tool",
     input: { query: "quarterly numbers" },
   });
 
   assert.equal(result, undefined, "nothing to evaluate is nothing to ask about");
   assert.equal(api.requests.length, 0, "no round trip at all");
+});
+
+test("WR-04 an MCP-looking call the resolver cannot attribute still makes zero HTTP requests", async () => {
+  // No adapter config, no cache: `mcp__notion__search` resolves to nothing, so today's skip holds.
+  const { result, api } = await run("deny", {
+    toolName: "mcp__notion__search",
+    input: { query: "quarterly numbers" },
+    resolveMcp: () => undefined,
+  });
+  assert.equal(result, undefined);
+  assert.equal(api.requests.length, 0);
 });
 
 test("WR-04 a tool with an empty input object makes zero HTTP requests", async () => {
@@ -479,4 +494,97 @@ test("a currentPrompt getter that throws costs the prompt, never the verdict", a
     block: true,
     reason: "Blocked by Unbound policy: Reading secrets is blocked.",
   }, "the deny still applied — a throw did not turn into an allow or a different block");
+});
+
+// --- MCP calls (gateway Path 3) -----------------------------------------------------------------
+//
+// A call `mcpResolve.ts` attributes to exactly one (server, tool) goes to the gateway's MCP path with
+// the Path-3 shape; the resolver itself is stubbed here (its own file covers resolution).
+
+const RESOLVED: McpCallInfo = {
+  server: "my-srv",
+  tool: "create_page",
+  args: { title: "Q3", nested: { a: [1, 2] } },
+  serverConfig: { command: "node", args: ["srv.js"] },
+};
+
+async function mcpRun(
+  mode: MockMode,
+  opts: { ctx?: Partial<FakeCtxOptions>; resolveMcp?: DecideDeps["resolveMcp"] } = {},
+): Promise<{ result: unknown; bodies: Record<string, unknown>[]; entries: DecisionEntry[] }> {
+  const api = await startMockApi({ mode });
+  const entries: DecisionEntry[] = [];
+  try {
+    const result = await decideToolCall(
+      createFakeToolCallEvent("mcp__my_srv", { tool: "create_page", args: RESOLVED.args }),
+      createFakeCtx(opts.ctx),
+      {
+        ...depsFor(api),
+        resolveMcp: opts.resolveMcp ?? (() => RESOLVED),
+        onDecision: (entry) => entries.push(entry),
+      },
+    );
+    const bodies = (pretoolRequests(api) as { body: Record<string, unknown> }[]).map((r) => r.body);
+    return { result, bodies, entries };
+  } finally {
+    await api.close();
+  }
+}
+
+test("MCP: a resolved call makes exactly one pretool request with the Path-3 shape", async () => {
+  const { result, bodies } = await mcpRun("allow");
+  assert.equal(result, undefined);
+  assert.equal(bodies.length, 1);
+  const data = bodies[0]?.pre_tool_use_data as { tool_name: string; command: string; metadata: Record<string, unknown> };
+  assert.equal(data.tool_name, "mcp__my-srv__create_page");
+  assert.equal(data.command, "");
+  assert.equal(data.metadata.mcp_server, "my-srv");
+  assert.equal(data.metadata.mcp_tool, "create_page");
+  assert.deepStrictEqual(data.metadata.tool_input, RESOLVED.args);
+  assert.deepStrictEqual(data.metadata.mcp_server_config, { command: "node", args: ["srv.js"] });
+  assert.equal(Object.hasOwn(data.metadata, "file_path"), false);
+  assert.equal(bodies[0]?.pull_policies, true, "pull_policies follows the same rule: nothing learned ⇒ pull");
+});
+
+test("MCP: a deny blocks with the prefixed reason, an ask goes to confirm", async () => {
+  const denied = await mcpRun("deny");
+  assert.deepStrictEqual(denied.result, {
+    block: true,
+    reason: "Blocked by Unbound policy: Reading secrets is blocked.",
+  });
+
+  const asked = await mcpRun("ask", { ctx: { hasUI: true, confirmResult: false } });
+  assert.deepStrictEqual(asked.result, { block: true, reason: "Declined by user (Unbound policy)" });
+});
+
+test("MCP: onDecision records mcp__<server>__<tool> with the capped args", async () => {
+  const { entries } = await mcpRun("allow");
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]?.tool_name, "mcp__my-srv__create_page");
+  assert.equal(entries[0]?.decision, "allow");
+  assert.deepStrictEqual(entries[0]?.tool_input, RESOLVED.args);
+  assert.notEqual(entries[0]?.tool_input, RESOLVED.args, "a copy — the record never aliases live input");
+});
+
+test("MCP: a resolver that throws is a miss — allow, with zero requests", async () => {
+  const { result, bodies } = await mcpRun("deny", {
+    resolveMcp: () => {
+      throw new Error("resolver exploded");
+    },
+  });
+  assert.equal(result, undefined);
+  assert.equal(bodies.length, 0);
+});
+
+test("MCP: the resolver is never asked about a shell call or a native file tool", async () => {
+  const api = await startMockApi({ mode: "allow" });
+  const asked: string[] = [];
+  try {
+    const deps = { ...depsFor(api), resolveMcp: (name: string) => (asked.push(name), RESOLVED) };
+    await decideToolCall(createFakeToolCallEvent("bash", { command: "ls" }), createFakeCtx(), deps);
+    await decideToolCall(createFakeToolCallEvent("read", { path: "/a" }), createFakeCtx(), deps);
+    assert.deepStrictEqual(asked, []);
+  } finally {
+    await api.close();
+  }
 });

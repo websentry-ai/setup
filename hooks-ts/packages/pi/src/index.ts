@@ -23,6 +23,7 @@
 //   | Event         | Role     | Returns                                                |
 //   | ------------- | -------- | ------------------------------------------------------ |
 //   | `tool_call`   | decide   | `{block, reason}` or `undefined`                       |
+//   |               |          | (shell command, native file path, or a resolved MCP call) |
 //   | `user_bash`   | decide   | a full `BashResult` or `undefined` — never a partial   |
 //   | `input`       | decide   | `{action:"handled"}` or `undefined` — never a transform |
 //   | `tool_result` | record   | **always `undefined`**                                 |
@@ -98,6 +99,8 @@ import type { Telemetry } from "../../core/src/telemetry.ts";
 import { turnStore } from "../../core/src/turn.ts";
 import { handleAgentEnd, postStandaloneTurn } from "./agentEnd.ts";
 import { decideToolCall } from "./decide.ts";
+import { createMcpResolver } from "./mcpResolve.ts";
+import type { McpResolver } from "./mcpResolve.ts";
 import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
 import { notifySafe } from "./ui.ts";
@@ -332,6 +335,13 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
     }
   }
 
+  /**
+   * pi-mcp-adapter call resolution for `tool_call`. One per extension instance, built from the same
+   * env/home pair as everything else; it touches nothing until a non-native tool call asks, and then
+   * memoises the adapter's config and cache against their lstat signatures (`mcpResolve.ts`).
+   */
+  const mcpResolver: McpResolver = createMcpResolver({ env, homeDir });
+
   let resolved: Resolved | undefined;
   let notified = false;
 
@@ -493,6 +503,9 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
           // The pretool `messages[0].content`, which the gateway writes its block/warn row from. A
           // cheap getter, not `snapshot()`: this runs on every evaluated tool call.
           currentPrompt: () => turnStore.currentPrompt(sessionIdOf(ctx)),
+          // An MCP call made through pi-mcp-adapter goes to the gateway's MCP path (Path 3) rather
+          // than taking the nothing-evaluable skip. `tool_call` only: no other event carries one.
+          resolveMcp: (name, input, cwd) => mcpResolver.resolve(name, input, cwd),
           // Re-checked here rather than above: `checkTool` may have latched the key on this very
           // call, and the turn that latched is one nothing will post.
           onDecision: (entry) => {

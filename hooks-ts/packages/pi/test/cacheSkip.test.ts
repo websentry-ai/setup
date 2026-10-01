@@ -213,6 +213,8 @@ test("RES-03 the skip predicate refuses every name outside the six, whatever the
   const state = createPolicyState();
   seedTools(state, clock, []);
 
+  // `mcp__notion__search` is kept here as a NAME the predicate refuses; whether a call under that
+  // name round-trips at all is the MCP resolver's question, covered by the integration case below.
   for (const toolName of ["bash", "powershell", "mcp__notion__search", "some_custom_tool", "READ", "Read", ""]) {
     assert.equal(
       shouldSkipFileToolFromState(toolName, state, clock.now()),
@@ -310,6 +312,37 @@ test("WR-02 the confirming round trip still enforces: a planted [] cannot pre-al
       reason: "Blocked by Unbound policy: Reading secrets is blocked.",
     });
     assert.equal(pretoolBodies(api).length, 1, "the plant bought the attacker nothing");
+  } finally {
+    await api.close();
+  }
+});
+
+test("RES-03 a resolved MCP call is never cache-skipped, even with a fresh confirmed list that omits it", async () => {
+  // The 300 s skip answers "is there a FILE policy for this tool" — no cached list can say whether an
+  // MCP sanction or MCP policy applies. So a call the resolver attributes always round-trips.
+  const clock = createFakeClock();
+  const state = createPolicyState();
+  seedTools(state, clock, []);
+  assert.equal(state.getToolsConfirmed(), true, "the list is confirmed and fresh");
+
+  const api = await startMockApi({ mode: "deny" });
+  try {
+    const result = await decideToolCall(
+      createFakeToolCallEvent("notion_search", { query: "q" }),
+      createFakeCtx(),
+      {
+        ...depsFor(api, state, clock),
+        resolveMcp: () => ({ server: "notion", tool: "search", args: { query: "q" } }),
+      },
+    );
+    assert.equal((result as { block?: boolean } | undefined)?.block, true, "evaluated, and the deny applied");
+    const bodies = pretoolBodies(api);
+    assert.equal(bodies.length, 1);
+    assert.equal(
+      (bodies[0]?.pre_tool_use_data as { tool_name?: string }).tool_name,
+      "mcp__notion__search",
+    );
+    assert.equal(Object.hasOwn(bodies[0] ?? {}, "pull_policies"), false, "fresh and confirmed ⇒ no pull");
   } finally {
     await api.close();
   }

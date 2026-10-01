@@ -447,3 +447,49 @@ test("redaction is applied before the cap, so a key straddling the splice cannot
   assert.equal(body.messages[1]?.content.includes(SESSION_KEY), false);
   assert.equal(body.assistant_truncated, true);
 });
+
+test("every string leaf of a recorded MCP tool_input is scrubbed, structure intact", () => {
+  // A resolved MCP call records its capped ARGUMENTS, which are free model-written text: a token can
+  // sit anywhere in the structure, not just under `command`. Leaf by leaf — serialise-then-redact
+  // would let the greedy bearer pattern swallow the JSON quotes around it.
+  const rec = record({
+    tool_calls: [
+      {
+        tool_name: "mcp__my-srv__create_page",
+        tool_use_id: "call_mcp",
+        decision: "allow",
+        ts: STARTED_AT + 5,
+        tool_input: {
+          title: `uses ${SESSION_KEY}`,
+          headers: { auth: "Bearer sk-live-deadbeefcafe" },
+          list: ["plain", `key=${SESSION_KEY}`, 7, true, null],
+          count: 3,
+        },
+      },
+    ],
+  });
+  const body = buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT, apiKey: SESSION_KEY });
+  const input = body.messages[1]?.tool_use?.[0]?.tool_input;
+
+  assert.deepStrictEqual(input, {
+    title: "uses [REDACTED]",
+    headers: { auth: "Bearer [REDACTED]" },
+    list: ["plain", "key=[REDACTED]", 7, true, null],
+    count: 3,
+  });
+  const wire = JSON.stringify(body);
+  assert.equal(wire.includes(SESSION_KEY), false);
+  assert.equal(wire.includes("deadbeefcafe"), false);
+});
+
+test("a recorded tool_input deeper than the walk cap is cut, never a throw", () => {
+  let deep: Record<string, unknown> = { leaf: "bottom" };
+  for (let i = 0; i < 20; i += 1) deep = { next: deep };
+  const rec = record({
+    tool_calls: [{ tool_name: "mcp__s__t", tool_use_id: "c", decision: "allow", ts: 1, tool_input: deep }],
+  });
+  const body = buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT });
+  const wire = JSON.stringify(body.messages[1]?.tool_use?.[0]?.tool_input);
+  assert.equal(wire.includes("bottom"), false, "below the cap is dropped");
+  assert.ok(wire.startsWith('{"next":{"next"'), "above it is kept");
+});
