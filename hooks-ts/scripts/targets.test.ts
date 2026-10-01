@@ -68,6 +68,8 @@ test("TARGETS holds the pi target, built from the pi package entry", () => {
 
   assert.ok(pi !== undefined, "the pi target is gone from TARGETS");
   assert.equal(pi.entry, "packages/pi/src/index.ts");
+  // The ceiling `build.test.ts` held dist/pi/index.js under before the assertions became per-target.
+  assert.equal(pi.maxBytes, 204_800);
   assert.ok(pi.banner.startsWith("/**\n * GENERATED FILE - DO NOT EDIT."));
   assert.ok(pi.banner.endsWith(" */"));
 });
@@ -85,6 +87,10 @@ test("TARGETS names are unique, path-safe, and every entry file exists", () => {
       `${target.name}: entry ${target.entry} does not exist`,
     );
     assert.ok(target.banner.length > 0, `${target.name}: empty banner`);
+    assert.ok(
+      Number.isInteger(target.maxBytes) && target.maxBytes > 0,
+      `${target.name}: maxBytes must be a positive integer, got ${String(target.maxBytes)}`,
+    );
   }
 });
 

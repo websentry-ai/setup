@@ -2,8 +2,9 @@
 //
 // Everything that has to know which bundles exist reads it from here: `build.mjs` (what to build),
 // `artifacts.mjs` (what to compare against the committed copy and its sidecar) and the CI workflow
-// (which sidecars to hand to `shasum -c`, via the CLI at the bottom of this file). Adding a target
-// is one new entry in TARGETS and nothing else.
+// (which sidecars to hand to `shasum -c`, via the CLI at the bottom of this file), and the
+// target-independent build assertions in `targets.build.test.ts` (run by `npm run test:build`),
+// which iterate this table. Adding a target is one new entry in TARGETS and nothing else.
 //
 // Every path is derived from the target's name:
 //
@@ -36,12 +37,14 @@ const PI_BANNER = [
 ].join("\n");
 
 /**
- * name   - the directory name, both under dist/ and at the repo root. Lowercase, path-safe.
- * entry  - the bundle's entry point, relative to hooks-ts/.
- * banner - the comment esbuild puts at the top of the output.
+ * name     - the directory name, both under dist/ and at the repo root. Lowercase, path-safe.
+ * entry    - the bundle's entry point, relative to hooks-ts/.
+ * banner   - the comment esbuild puts at the top of the output.
+ * maxBytes - the size ceiling `scripts/targets.build.test.ts` holds the built bundle under. A value
+ *            import of an agent's own package would blow past it by megabytes.
  */
 export const TARGETS = Object.freeze([
-  Object.freeze({ name: "pi", entry: "packages/pi/src/index.ts", banner: PI_BANNER }),
+  Object.freeze({ name: "pi", entry: "packages/pi/src/index.ts", banner: PI_BANNER, maxBytes: 204_800 }),
 ]);
 
 /** Where the metafiles go, relative to hooks-ts/. */

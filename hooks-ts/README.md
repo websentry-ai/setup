@@ -84,7 +84,7 @@ enforces independently under its own `conversation_id`. Both verified — see `d
 | `npm run artifacts:check` | every committed `<name>/index.js` and its `.sha256` sidecar match the fresh build |
 | `npm run artifacts:sync` | copy each fresh build to `<name>/index.js` at the repo root and rewrite its sidecar |
 | `npm run test:unit` | `node --test --experimental-strip-types` over `packages/*/test/*.test.ts` and `scripts/targets.test.ts` |
-| `npm run test:build` | the INST-05 build assertions against a built `dist/pi/index.js` |
+| `npm run test:build` | the INST-05 build assertions: the supply-chain checks for every built `dist/<name>/index.js` in `scripts/targets.mjs` (`scripts/targets.build.test.ts`), plus pi's event-registration check (`packages/pi/test/build.test.ts`) |
 | `npm test` | `typecheck` + `build` + `test:unit` |
 | `npm run mock-api` | standalone scripted mock gateway for the manual pi smoke test |
 
