@@ -17,17 +17,22 @@ import test from "node:test";
 import {
   DENY_PREFIX,
   ENGINE_UNAVAILABLE_REASON,
+  ERROR_CATEGORY_BYPASS,
+  EVALUATE_DEADLINE_ERROR_CLASS,
   EVALUATE_DEADLINE_SLACK_MS,
   GENERIC_DENY_REASON,
   KEY_REJECTED_BLOCK_REASON,
   PRETOOL_TIMEOUT_MS,
 } from "../src/constants.ts";
+import type { HookErrorsBody } from "../src/client.ts";
 import { evaluatePrompt, evaluateToolCall, verdictMessage } from "../src/evaluate.ts";
 import type { DecisionEntry, EvaluateDeps, PromptInput, ToolCallInput, ToolEvaluation } from "../src/evaluate.ts";
 import type { CheckHooks, PolicyChecker } from "../src/policy.ts";
 import { createPolicyState } from "../src/policyState.ts";
 import type { PolicyState } from "../src/policyState.ts";
 import type { AgentProfile } from "../src/profile.ts";
+import { createTelemetry } from "../src/telemetry.ts";
+import type { BypassContext, Telemetry } from "../src/telemetry.ts";
 import type { PretoolRequestBody } from "../src/types.ts";
 import type { PolicyOutcome } from "../src/verdict.ts";
 import { TEST_PROFILE } from "./helpers/testProfile.ts";
@@ -649,6 +654,107 @@ test("prompt deadline: a checker that never settles is bounded and honours the f
 
   const closed = harness({ checker: hangingChecker(), state: confirmedState([], "block"), deadlineMs: 25 });
   assert.deepEqual(await settle(() => evaluatePrompt(promptInput(), closed.deps)), { kind: "unavailable" });
+});
+
+// IN-02. A deadline timeout is reported through the existing `reportBypass` path.
+function telemetrySpy(): { telemetry: Pick<Telemetry, "reportBypass">; reports: BypassContext[] } {
+  const reports: BypassContext[] = [];
+  return { telemetry: { reportBypass: (ctx) => reports.push(ctx) }, reports };
+}
+
+test("deadline telemetry: a timeout is reported as a bypass, or as a block for a fail-closed org", async () => {
+  const open = telemetrySpy();
+  const h1 = harness({ checker: hangingChecker(), deadlineMs: 25, telemetry: open.telemetry });
+  assert.deepEqual(await settle(() => evaluateToolCall(shellCall(), h1.deps)), { kind: "allow" });
+  assert.deepEqual(open.reports, [
+    { errorClass: EVALUATE_DEADLINE_ERROR_CLASS, toolName: "bash", elapsedMs: 25, blocked: false },
+  ]);
+
+  const closed = telemetrySpy();
+  const h2 = harness({
+    checker: hangingChecker(),
+    state: confirmedState(["bash"], "block"),
+    deadlineMs: 25,
+    telemetry: closed.telemetry,
+  });
+  assert.deepEqual(await settle(() => evaluateToolCall(shellCall(), h2.deps)), { kind: "unavailable" });
+  assert.deepEqual(closed.reports, [
+    { errorClass: EVALUATE_DEADLINE_ERROR_CLASS, toolName: "bash", elapsedMs: 25, blocked: true },
+  ]);
+
+  // The prompt path reports under the label it hands the checker.
+  const prompt = telemetrySpy();
+  const h3 = harness({
+    checker: hangingChecker(),
+    state: confirmedState([], "block"),
+    deadlineMs: 25,
+    telemetry: prompt.telemetry,
+  });
+  assert.deepEqual(await settle(() => evaluatePrompt(promptInput(), h3.deps)), { kind: "unavailable" });
+  assert.deepEqual(prompt.reports, [
+    { errorClass: EVALUATE_DEADLINE_ERROR_CLASS, toolName: "user_prompt", elapsedMs: 25, blocked: true },
+  ]);
+});
+
+test("deadline telemetry: an answer, a fault or a skip reports nothing", async () => {
+  const spy = telemetrySpy();
+  for (const outcome of [{ kind: "allow" }, { kind: "deny", reason: "no" }, { kind: "unavailable" }]) {
+    const h = harness({ telemetry: spy.telemetry }, outcome);
+    await settle(() => evaluateToolCall(shellCall(), h.deps));
+    await settle(() => evaluatePrompt(promptInput(), h.deps));
+  }
+  const faulting: PolicyChecker = {
+    checkTool: () => Promise.reject(new Error("boom")),
+  };
+  await settle(() => evaluateToolCall(shellCall(), harness({ checker: faulting, telemetry: spy.telemetry }).deps));
+  await settle(() =>
+    evaluateToolCall(fileCall("custom_tool", {}), harness({ checker: hangingChecker(), telemetry: spy.telemetry, deadlineMs: 25 }).deps),
+  );
+  assert.deepEqual(spy.reports, []);
+});
+
+test("deadline telemetry: a reporter that throws, or is not callable, cannot change the verdict", async () => {
+  const hostile: unknown[] = [
+    { reportBypass: () => { throw new Error("reporter down"); } },
+    { reportBypass: 5 },
+    throwingProxy<object>(),
+    null,
+  ];
+  for (const telemetry of hostile) {
+    const open = harness({ checker: hangingChecker(), deadlineMs: 25, telemetry: telemetry as Telemetry });
+    assert.deepEqual(await settle(() => evaluateToolCall(shellCall(), open.deps)), { kind: "allow" });
+    const closed = harness({
+      checker: hangingChecker(),
+      state: confirmedState(["bash"], "block"),
+      deadlineMs: 25,
+      telemetry: telemetry as Telemetry,
+    });
+    assert.deepEqual(await settle(() => evaluateToolCall(shellCall(), closed.deps)), { kind: "unavailable" });
+  }
+});
+
+test("deadline telemetry: through the real reporter it is one bypass-category /v1/hooks/errors entry", async () => {
+  const posted: HookErrorsBody[] = [];
+  const telemetry = createTelemetry({
+    client: {
+      postHookErrors: async (body) => {
+        posted.push(body);
+        return true;
+      },
+    },
+    profile: TEST_PROFILE,
+    apiKey: "test-key",
+    now: () => NOW,
+  });
+  const h = harness({ checker: hangingChecker(), deadlineMs: 25, telemetry });
+  assert.deepEqual(await settle(() => evaluateToolCall(shellCall(), h.deps)), { kind: "allow" });
+  assert.equal(posted.length, 1);
+  assert.equal(posted[0]?.errors[0]?.category, ERROR_CATEGORY_BYPASS);
+  assert.equal(
+    posted[0]?.errors[0]?.message,
+    `${TEST_PROFILE.hookSource} hook ${ERROR_CATEGORY_BYPASS}: ${EVALUATE_DEADLINE_ERROR_CLASS} for tool=bash after 25ms`,
+  );
+  assert.deepEqual(Object.keys(posted[0] ?? {}).sort(), ["errors", "hook_source"], "no new wire field");
 });
 
 // WR-01. The tests above run under `node:test` (and `settle`'s keep-alive), which holds the event

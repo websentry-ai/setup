@@ -94,6 +94,13 @@ export const PRETOOL_TIMEOUT_MS = 20_000;
  * abort always comes first, and the timing an adapter sees is unchanged.
  */
 export const EVALUATE_DEADLINE_SLACK_MS = 2_000;
+/**
+ * The `errorClass` an outer-deadline timeout is reported under (IN-02), in the same CamelCase style
+ * as the client's own classes (`HttpStatus503`, `MalformedJson`, ...). It is filed through
+ * `reportBypass`, so it lands in `ERROR_CATEGORY_BYPASS` or `ERROR_CATEGORY_BLOCKED` like any other
+ * enforcement failure; no new category or wire field exists for it.
+ */
+export const EVALUATE_DEADLINE_ERROR_CLASS = "EvaluateDeadline";
 export const ERRORS_TIMEOUT_MS = 10_000;
 /**
  * The turn-log deadline, locked by 09-CONTEXT and matching the Python hook's 10 s curl timeout

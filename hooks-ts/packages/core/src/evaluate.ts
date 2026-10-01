@@ -34,6 +34,7 @@ import { areToolsFresh, shouldSkipFileToolFromState } from "./cache.ts";
 import {
   DENY_PREFIX,
   ENGINE_UNAVAILABLE_REASON,
+  EVALUATE_DEADLINE_ERROR_CLASS,
   EVALUATE_DEADLINE_SLACK_MS,
   GENERIC_DENY_REASON,
   PRETOOL_TIMEOUT_MS,
@@ -43,6 +44,7 @@ import type { CheckHooks, PolicyChecker } from "./policy.ts";
 import { policyState } from "./policyState.ts";
 import type { PolicyState } from "./policyState.ts";
 import type { AgentProfile } from "./profile.ts";
+import type { Telemetry } from "./telemetry.ts";
 import type { PretoolRequestBody } from "./types.ts";
 import { sanitizeReason } from "./verdict.ts";
 import type { PolicyOutcome } from "./verdict.ts";
@@ -117,6 +119,15 @@ export interface EvaluateDeps {
    * falls back to that default.
    */
   deadlineMs?: number;
+  /**
+   * Where an outer-deadline timeout is reported (IN-02): `reportBypass` with
+   * `errorClass: EVALUATE_DEADLINE_ERROR_CLASS`, the label the checker was given as `toolName`, the
+   * deadline as `elapsedMs`, and `blocked` when the timeout became `unavailable`. So a fail-closed
+   * block the user saw, or a fail-open timeout, leaves the same trace a client failure does.
+   * Optional: without it a timeout is still audited through `onDecision`, just not reported. Called
+   * through `noteSafe`, so a failing reporter cannot change the verdict.
+   */
+  telemetry?: Pick<Telemetry, "reportBypass">;
 }
 
 /** A policy outcome, or a call that was never sent for a check. */
@@ -234,13 +245,23 @@ async function check(
   state: PolicyState,
 ): Promise<PolicyOutcome | undefined> {
   const hooks = safeHooks(deps.hooks);
-  const raced = await raceDeadline(
-    () => deps.checker.checkTool(payload, label, hooks),
-    resolveDeadlineMs(deps.deadlineMs),
-  );
+  const deadlineMs = resolveDeadlineMs(deps.deadlineMs);
+  const raced = await raceDeadline(() => deps.checker.checkTool(payload, label, hooks), deadlineMs);
   if (raced.state === "answered") return normaliseOutcome(raced.value);
   if (raced.state === "faulted") return undefined;
-  return state.getFailureAction() === "block" ? { kind: "unavailable" } : { kind: "allow" };
+  const blocked = state.getFailureAction() === "block";
+  // IN-02: the timeout is an enforcement failure like any other, so it is reported the way
+  // `policy.ts` reports a failed request — after the failure action is decided, so a fail-closed
+  // block is filed as a block and not as a bypass.
+  noteSafe(() =>
+    deps.telemetry?.reportBypass({
+      errorClass: EVALUATE_DEADLINE_ERROR_CLASS,
+      toolName: label,
+      elapsedMs: deadlineMs,
+      blocked,
+    }),
+  );
+  return blocked ? { kind: "unavailable" } : { kind: "allow" };
 }
 
 /**
