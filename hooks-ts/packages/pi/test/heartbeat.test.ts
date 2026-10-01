@@ -24,7 +24,6 @@ import {
   NO_KEY_NOTICE,
   PRETOOL_PATH,
   SESSION_PRESENCE_ROW_ENABLED,
-  TURNLOG_PATH,
 } from "../../core/src/constants.ts";
 import { buildHeartbeatPayload, createHeartbeatGate } from "../../core/src/heartbeat.ts";
 import { createPolicyState, policyState } from "../../core/src/policyState.ts";
@@ -35,6 +34,9 @@ import type { Deps } from "../src/index.ts";
 import { createFakeClock, createFakeCtx, createFakeSessionStartEvent } from "./helpers/fakeCtx.ts";
 import type { FakeCtx } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 const ENTRYPOINT = "pi/0.87.1";
 

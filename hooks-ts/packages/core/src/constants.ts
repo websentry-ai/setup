@@ -1,11 +1,13 @@
 // Every literal Phase 8 depends on, in exactly one place.
 //
-// RESEARCH assumption A3: `UNBOUND_PI_API_KEY` (and every other user-visible string) lives here so
-// Phase 9's handlers and Phase 10's `setup/pi/setup.py` installer import the same value instead of
-// re-typing it. Nothing in this file imports anything.
+// RESEARCH assumption A3: every user-visible string lives here so Phase 9's handlers and Phase 10's
+// `setup/pi/setup.py` installer import the same value instead of re-typing it. Nothing in this file
+// imports anything.
+//
+// What is NOT here: the facts that differ per agent. The agent-specific key env var, the errors
+// `hook_source` and the turn-log route come from the injected `AgentProfile` (`profile.ts`).
 
 // --- Environment variables (naming precedent: RESEARCH §C3) ---------------------------------
-export const ENV_API_KEY_PI = "UNBOUND_PI_API_KEY";
 export const ENV_API_KEY_GENERIC = "UNBOUND_API_KEY";
 export const ENV_GATEWAY_URL = "UNBOUND_GATEWAY_URL";
 
@@ -29,8 +31,6 @@ export const ENV_PI_AGENT_DIR = "PI_CODING_AGENT_DIR";
 export const KEY_FINGERPRINT_PREFIX = "sha256:";
 /** `unbound_app_label` on the wire; `'pi'` joined the union in Phase 7. */
 export const APP_LABEL = "pi";
-/** `hook_source` on POST /v1/hooks/errors — the label rides this field, there is no app label there. */
-export const HOOK_SOURCE = "pi";
 export const EVENT_NAME_TOOL_USE = "tool_use";
 /**
  * RES-05's `event_name`. It lands on `preToolUseHandler.ts:1008-1012` — the fall-through for an
@@ -69,11 +69,8 @@ export const EVENT_NAME_USER_PROMPT = "user_prompt";
 export const USER_BASH_ID_PREFIX = "ubash_";
 export const PRETOOL_PATH = "/v1/hooks/pretool";
 export const ERRORS_PATH = "/v1/hooks/errors";
-/**
- * The turn log (RES-04). `piHandler` is registered here and at `/hooks/pi`; unlike pretool, a missing
- * `Authorization: Bearer` is a hard 401 (`hooksHandlerFactory.ts:46-50`).
- */
-export const TURNLOG_PATH = "/v1/hooks/pi";
+// The turn-log route (RES-04) is per agent — `AgentProfile.turnLogPath`, e.g. `/v1/hooks/pi`. Unlike
+// pretool, a missing `Authorization: Bearer` there is a hard 401 (`hooksHandlerFactory.ts:46-50`).
 /**
  * **The turn log's `model` is this literal, not `ctx.model?.id`. Do not "improve" it.**
  *

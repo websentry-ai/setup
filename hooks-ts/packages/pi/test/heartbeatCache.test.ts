@@ -42,6 +42,7 @@ import { createExtension } from "../src/index.ts";
 import type { Deps } from "../src/index.ts";
 import { createFakeCtx, createFakeSessionStartEvent } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
 
 const ENTRYPOINT = "pi/0.87.1";
 const OLD_SYNCED_AT = 1_600_000_000_000;
@@ -195,7 +196,7 @@ test("after a restart the persisted block turns the first failed tool call into 
 
     // ---- the first tool call of the new process, against a failing gateway ----
     api.setMode("500");
-    const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: 200 });
+    const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: 200, profile: PI_PROFILE });
     const checker = createPolicyChecker({
       client,
       state: restarted,

@@ -24,9 +24,9 @@ import {
   ERRORS_TIMEOUT_MS,
   PRETOOL_PATH,
   PRETOOL_TIMEOUT_MS,
-  TURNLOG_PATH,
   TURNLOG_TIMEOUT_MS,
 } from "./constants.ts";
+import type { AgentProfile } from "./profile.ts";
 import type { TurnLogBody } from "./turnLog.ts";
 import type { PreToolResponseBody, PretoolRequestBody } from "./types.ts";
 
@@ -65,6 +65,8 @@ export interface ApiClient {
 export interface ApiClientOptions {
   baseUrl: string;
   apiKey: string;
+  /** Which agent this client speaks for: its turn-log route is the only per-agent path. */
+  profile: Pick<AgentProfile, "turnLogPath">;
   timeoutMs?: number;
   errorsTimeoutMs?: number;
   /** Injected only by tests, so a 10 s abort is observable in milliseconds. */
@@ -176,7 +178,7 @@ export function createApiClient(opts: ApiClientOptions): ApiClient {
    */
   async function postTurnLog(body: TurnLogBody): Promise<boolean> {
     try {
-      const res = await resolveFetch()(`${opts.baseUrl}${TURNLOG_PATH}`, {
+      const res = await resolveFetch()(`${opts.baseUrl}${opts.profile.turnLogPath}`, {
         method: "POST",
         headers: headers(),
         body: JSON.stringify(body),

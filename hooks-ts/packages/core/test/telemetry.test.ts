@@ -24,6 +24,7 @@ import type { BypassContext } from "../src/telemetry.ts";
 import { startMockApi } from "./helpers/mockApi.ts";
 import type { CapturedRequest, MockApi, MockErrorsMode } from "./helpers/mockApi.ts";
 import { TEST_KEY } from "./helpers/testKey.ts";
+import { TEST_PROFILE } from "./helpers/testProfile.ts";
 
 const START_MS = 1_700_000_000_000;
 
@@ -50,6 +51,7 @@ async function harness(
     baseUrl: api.url,
     apiKey: apiKey ?? "",
     errorsTimeoutMs: 50,
+    profile: TEST_PROFILE,
   });
   const telemetry = createTelemetry({
     client,
@@ -57,6 +59,7 @@ async function harness(
     now: () => clockMs,
     intervalMs: opts.intervalMs ?? ERROR_REPORT_INTERVAL_MS,
     isInactive: opts.isInactive,
+    profile: TEST_PROFILE,
   });
   return {
     api,

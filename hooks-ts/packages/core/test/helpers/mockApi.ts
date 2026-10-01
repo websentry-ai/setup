@@ -1,7 +1,7 @@
 // Scripted in-process mock of the Unbound API (`/v1/hooks/*`).
 //
 // One responder table, two entry points: unit tests call `startMockApi()` on an ephemeral port,
-// and `scripts/mock-api.mjs` starts the same server on a fixed port for the manual pi smoke test.
+// and `scripts/mock-api.mjs` starts the same server on a fixed port for a manual agent smoke test.
 // Zero dependencies - `node:http` only.
 //
 // THE ENTRY GATE (see `hasEvaluableInput` below) is the reason this mock is trustworthy.
@@ -43,7 +43,7 @@ export type MockMode =
 /** Scripted behaviour of `POST /v1/hooks/errors`, independent of `MockMode`. */
 export type MockErrorsMode = "ok" | "500" | "hang";
 
-/** Scripted behaviour of `POST /v1/hooks/pi` (the turn log), independent of `MockMode`. */
+/** Scripted behaviour of `POST /v1/hooks/<agent>` (the agent turn log), independent of `MockMode`. */
 export type MockTurnLogMode = "ok" | "401" | "hang";
 
 export interface CapturedRequest {
@@ -212,7 +212,28 @@ export function pretoolResponse(
   }
 }
 
-/** The turn-log responder. Mirrors `hooksHandlerFactory.ts:46-50,86-89`. */
+/**
+ * The agents whose turn-log route (`POST /v1/hooks/<agent>`, `AgentProfile.turnLogPath`) this mock
+ * serves. The real API registers one handler per agent, so an agent that is not listed here 404s —
+ * exactly what a mistyped or not-yet-shipped route does in production. Add a name when its adapter
+ * exists.
+ */
+export const TURNLOG_AGENTS: ReadonlySet<string> = new Set(["pi"]);
+
+/** `/v1/hooks/<agent>`: one lowercase path segment. Which names are served is `TURNLOG_AGENTS`. */
+const TURNLOG_ROUTE = /^\/v1\/hooks\/([a-z][a-z0-9-]*)$/;
+
+/**
+ * The agent a path is the turn-log route of, or `undefined`. `pretool` and `errors` match the route
+ * shape but are never agents: they keep their own handlers, which the server checks first, and the
+ * explicit set membership means neither could be served as a turn log even if that order changed.
+ */
+export function turnLogAgentOf(path: string): string | undefined {
+  const agent = TURNLOG_ROUTE.exec(path)?.[1];
+  return agent !== undefined && TURNLOG_AGENTS.has(agent) ? agent : undefined;
+}
+
+/** The agent turn-log responder. Mirrors `hooksHandlerFactory.ts:46-50,86-89`. */
 export function turnLogResponse(mode: MockTurnLogMode): ScriptedResponse | typeof HANG {
   if (mode === "hang") return HANG;
   // A missing/invalid Authorization header is a 401 here, unlike pretool which fails open.
@@ -299,7 +320,9 @@ export async function startMockApi(opts: StartMockApiOptions = {}): Promise<Mock
         return;
       }
 
-      if (req.method === "POST" && path === "/v1/hooks/pi") {
+      // The agent turn log. Checked after pretool and errors, which keep precedence; the captured
+      // request above already carries the real path, so a test can tell the agents apart.
+      if (req.method === "POST" && turnLogAgentOf(path) !== undefined) {
         const scripted = turnLogResponse(turnLogMode);
         if (scripted === HANG) hold(res);
         else send(res, scripted);

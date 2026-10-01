@@ -3,14 +3,17 @@
 //   npm run mock-api -- --mode deny --port 8799
 //   UNBOUND_GATEWAY_URL=http://127.0.0.1:8799 UNBOUND_PI_API_KEY=test pi
 //
-// Everything is logged to stderr, never stdout - pi's print/json modes own stdout.
+// `--agent <name>` (default: pi) only changes the hint printed at startup; the mock serves the
+// turn-log route of every agent in TURNLOG_AGENTS whichever one is named.
+//
+// Everything is logged to stderr, never stdout - an agent's print/json modes own stdout.
 // Run through the npm script (it supplies --experimental-strip-types for the .ts import).
 //
 // NOTE: the mock models the server's Path-2 entry gate, so a pretool request carrying neither a
 // command nor a metadata.file_path is answered `allow` with `_entry_gate: no_evaluable_input`
 // whatever --mode says. That is faithful to the real API; see mockApi.ts's header.
 
-import { startMockApi } from "../packages/core/test/helpers/mockApi.ts";
+import { startMockApi, TURNLOG_AGENTS } from "../packages/core/test/helpers/mockApi.ts";
 
 const VALID_MODES = [
   "allow",
@@ -32,6 +35,8 @@ const VALID_MODES = [
 
 const VALID_ERRORS_MODES = ["ok", "500", "hang"];
 const VALID_TURNLOG_MODES = ["ok", "401", "hang"];
+const VALID_AGENTS = [...TURNLOG_AGENTS];
+const DEFAULT_AGENT = "pi";
 
 const USAGE = `usage: npm run mock-api -- [options]
 
@@ -39,8 +44,10 @@ const USAGE = `usage: npm run mock-api -- [options]
                           ${VALID_MODES.join(", ")}
   --errors-mode <mode>    POST /v1/hooks/errors behaviour (default: ok)
                           ${VALID_ERRORS_MODES.join(", ")}
-  --turnlog-mode <mode>   POST /v1/hooks/pi turn-log behaviour (default: ok)
+  --turnlog-mode <mode>   POST /v1/hooks/<agent> turn-log behaviour (default: ok)
                           ${VALID_TURNLOG_MODES.join(", ")}
+  --agent <name>          agent named in the startup hint (default: ${DEFAULT_AGENT})
+                          ${VALID_AGENTS.join(", ")}
   --port <n>              listen port (default: 8799)
   --help                  print this and exit 0
 
@@ -53,6 +60,7 @@ function parseArgs(argv) {
     port: 8799,
     errorsMode: "ok",
     turnLogMode: "ok",
+    agent: DEFAULT_AGENT,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -60,6 +68,7 @@ function parseArgs(argv) {
     else if (arg === "--port") parsed.port = Number(argv[++i]);
     else if (arg === "--errors-mode") parsed.errorsMode = argv[++i];
     else if (arg === "--turnlog-mode") parsed.turnLogMode = argv[++i];
+    else if (arg === "--agent") parsed.agent = argv[++i];
     else if (arg === "--help" || arg === "-h") {
       console.error(USAGE);
       process.exit(0);
@@ -72,7 +81,7 @@ function parseArgs(argv) {
   return parsed;
 }
 
-const { mode, port, errorsMode, turnLogMode } = parseArgs(process.argv.slice(2));
+const { mode, port, errorsMode, turnLogMode, agent } = parseArgs(process.argv.slice(2));
 
 if (!VALID_MODES.includes(mode)) {
   console.error(`invalid --mode ${mode}; valid modes: ${VALID_MODES.join(", ")}`);
@@ -88,6 +97,10 @@ if (!VALID_TURNLOG_MODES.includes(turnLogMode)) {
   );
   process.exit(2);
 }
+if (!VALID_AGENTS.includes(agent)) {
+  console.error(`invalid --agent ${agent}; valid agents: ${VALID_AGENTS.join(", ")}`);
+  process.exit(2);
+}
 if (!Number.isInteger(port) || port < 0 || port > 65535) {
   console.error(`invalid --port ${port}`);
   process.exit(2);
@@ -99,7 +112,9 @@ console.error(`[mock-api] listening on ${mock.url}`);
 console.error(
   `[mock-api] pretool mode: ${mode}    errors mode: ${errorsMode}    turn-log mode: ${turnLogMode}`,
 );
-console.error(`[mock-api] UNBOUND_GATEWAY_URL=${mock.url} UNBOUND_PI_API_KEY=test pi`);
+// The agent-specific key env var follows one convention: UNBOUND_<AGENT>_API_KEY.
+const agentKeyEnv = `UNBOUND_${agent.toUpperCase().replace(/-/g, "_")}_API_KEY`;
+console.error(`[mock-api] UNBOUND_GATEWAY_URL=${mock.url} ${agentKeyEnv}=test ${agent}`);
 
 let logged = 0;
 const tail = setInterval(() => {

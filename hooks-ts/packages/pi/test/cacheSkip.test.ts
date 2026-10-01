@@ -35,6 +35,7 @@ import type { DecideDeps } from "../src/decide.ts";
 import { createFakeClock, createFakeCtx, createFakeToolCallEvent } from "./helpers/fakeCtx.ts";
 import type { FakeClock } from "./helpers/fakeCtx.ts";
 import { TEST_KEY } from "../../core/test/helpers/testKey.ts";
+import { PI_PROFILE } from "../src/profile.ts";
 
 const TIMEOUT_MS = 50;
 const PRETOOL_PATH = "/v1/hooks/pretool";
@@ -42,12 +43,12 @@ const PRETOOL_PATH = "/v1/hooks/pretool";
 const TTL_MS = 300_000;
 
 function depsFor(api: MockApi, state: PolicyState, clock: FakeClock): DecideDeps {
-  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS });
+  const client = createApiClient({ baseUrl: api.url, apiKey: TEST_KEY, timeoutMs: TIMEOUT_MS, profile: PI_PROFILE });
   return {
     checker: createPolicyChecker({
       client,
       state,
-      telemetry: createTelemetry({ client, apiKey: TEST_KEY }),
+      telemetry: createTelemetry({ client, apiKey: TEST_KEY, profile: PI_PROFILE }),
       now: clock.now,
     }),
     apiKey: TEST_KEY,

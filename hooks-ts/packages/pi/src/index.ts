@@ -90,11 +90,11 @@ import type { Telemetry } from "../../core/src/telemetry.ts";
 import { turnStore } from "../../core/src/turn.ts";
 import { handleAgentEnd } from "./agentEnd.ts";
 import { decideToolCall } from "./decide.ts";
+import { PI_PROFILE } from "./profile.ts";
 import { decideInput } from "./prompt.ts";
 import { recordToolResult } from "./toolResult.ts";
 import { notifySafe } from "./ui.ts";
 import { decideUserBash } from "./userBash.ts";
-import { resolveClientEntrypoint } from "./version.ts";
 
 /**
  * The session id, read defensively: `ctx.sessionManager` is the live object and a fault reading it
@@ -249,11 +249,16 @@ export function defaultMakeChecker(
   env: NodeJS.ProcessEnv = {},
   homeDir = "",
 ): PolicyChecker {
-  const client = createApiClient({ baseUrl, apiKey });
+  const client = createApiClient({ baseUrl, apiKey, profile: PI_PROFILE });
   return createPolicyChecker({
     client,
     state: policyState,
-    telemetry: createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+    telemetry: createTelemetry({
+      client,
+      apiKey,
+      profile: PI_PROFILE,
+      isInactive: () => keyState.isInactive(),
+    }),
     breaker: createBreaker({ now: Date.now }),
     keyState,
     onSync: makeCacheSync(apiKey, baseUrl, env, homeDir),
@@ -335,7 +340,7 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
    */
   function init(): Resolved {
     if (resolved === undefined) {
-      const apiKey = resolveApiKey(deps.env, deps.homeDir);
+      const apiKey = resolveApiKey(deps.env, deps.homeDir, PI_PROFILE);
       // One resolution, used for the cache identity, the hydrate and the checker — three call sites
       // that must not be able to disagree, since the base URL is half the cache key (WR-09).
       const baseUrl = apiKey === undefined ? undefined : resolveGatewayUrl(deps.env, deps.homeDir);
@@ -343,16 +348,21 @@ export function createExtension(overrides: Partial<Deps> = {}): ExtensionFactory
         hydrateFromCache(apiKey, baseUrl, deps.env, deps.homeDir);
       }
       const inactive = apiKey === undefined || baseUrl === undefined;
-      const client = inactive ? undefined : createApiClient({ baseUrl, apiKey });
+      const client = inactive ? undefined : createApiClient({ baseUrl, apiKey, profile: PI_PROFILE });
       resolved = {
         apiKey,
-        entrypoint: deps.entrypoint ?? resolveClientEntrypoint(deps.env, process.argv[1]),
+        entrypoint: deps.entrypoint ?? PI_PROFILE.resolveClientEntrypoint(deps.env, process.argv[1]),
         checker: inactive ? undefined : deps.makeChecker(apiKey, baseUrl),
         client,
         telemetry:
           client === undefined
             ? undefined
-            : createTelemetry({ client, apiKey, isInactive: () => keyState.isInactive() }),
+            : createTelemetry({
+                client,
+                apiKey,
+                profile: PI_PROFILE,
+                isInactive: () => keyState.isInactive(),
+              }),
         cacheSync: inactive ? undefined : makeCacheSync(apiKey, baseUrl, deps.env, deps.homeDir),
       };
     }

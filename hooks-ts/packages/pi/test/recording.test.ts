@@ -23,7 +23,6 @@ import test from "node:test";
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-import { TURNLOG_PATH } from "../../core/src/constants.ts";
 import { keyState } from "../../core/src/keyState.ts";
 import { turnStore } from "../../core/src/turn.ts";
 import { startMockApi } from "../../core/test/helpers/mockApi.ts";
@@ -38,6 +37,9 @@ import {
   createFakeToolCallEvent,
   createFakeToolResultEvent,
 } from "./helpers/fakeCtx.ts";
+import { PI_PROFILE } from "../src/profile.ts";
+
+const TURNLOG_PATH = PI_PROFILE.turnLogPath;
 
 const SESSION = "sess-recording-1";
 
