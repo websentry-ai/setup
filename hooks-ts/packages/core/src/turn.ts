@@ -97,8 +97,9 @@ export interface TurnToolCall {
    * cache-skipped file tool has no command and may have no allowlisted key either), which the turn
    * log sends as `{}`.
    *
-   * For a resolved MCP call it is the capped MCP arguments (`capMcpArgs`), cloned by the decision
-   * seam — the one case where values can be nested objects. `turnLog.ts` redacts every string leaf.
+   * For an MCP call (recorded by the approval-broker handler) it is the audit copy of the MCP
+   * arguments (`auditMcpArgs`: owned, capped, `__proto__`-safe) — the one case where values can be
+   * nested objects. `turnLog.ts` redacts every string leaf.
    */
   tool_input?: Record<string, unknown>;
   /**
@@ -477,8 +478,10 @@ export function createTurnStore(): TurnStore {
       try {
         if (entry === null || typeof entry !== "object") return;
         while (record.results.length >= MAX_TURN_RESULTS) {
-          record.results.shift();
+          const evicted = record.results.shift();
           record.results_truncated = (record.results_truncated ?? 0) + 1;
+          // Refund: an evicted result's text is never posted, so it must not keep spending (WR-03).
+          if (typeof evicted?.content === "string") outputChars = Math.max(0, outputChars - evicted.content.length);
         }
         const stored: TurnResult = {
           tool_name: typeof entry.tool_name === "string" ? entry.tool_name : "",
@@ -490,7 +493,17 @@ export function createTurnStore(): TurnStore {
         if (entry.hash_skipped === true) stored.hash_skipped = true;
         // The output text, under the per-turn budget. Over it, the text is dropped and the row says
         // so; the hash and the byte count above still describe the output.
-        if (typeof entry.content === "string") {
+        //
+        // Only for a result whose CALL is recorded (WR-03). The turn log pairs results to calls by id
+        // and never posts an unmatched one, so text from an unrecorded call (a custom tool that took
+        // the nothing-evaluable skip, an MCP proxy `search`) would be held and charged for nothing —
+        // and a model could spend the whole budget that way to blind output DLP on a later call. Calls
+        // are recorded at the decision seam (or by the MCP broker) before their result arrives.
+        const id = stored.tool_use_id;
+        const recorded = id !== "" && record.tool_calls.some((call) => call.tool_use_id === id);
+        if (!recorded) {
+          // Hash and bytes only; nothing to post it against, so nothing is charged.
+        } else if (typeof entry.content === "string") {
           if (outputChars + entry.content.length > MAX_TURN_OUTPUT_CHARS) {
             stored.content_omitted = true;
           } else {

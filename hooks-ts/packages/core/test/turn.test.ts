@@ -691,6 +691,9 @@ test("once the turn's output budget is spent, results keep hash and bytes but no
   const chunk = "x".repeat(MAX_TOOL_OUTPUT_CHARS);
   const fits = Math.floor(MAX_TURN_OUTPUT_CHARS / MAX_TOOL_OUTPUT_CHARS);
   for (let i = 0; i < fits + 2; i += 1) {
+    // Each call recorded first, as the decision seam does: since WR-03 only a recorded call's text
+    // is kept and charged.
+    store.recordToolCall({ tool_name: "bash", tool_use_id: `c${i}`, decision: "allow" }, SESSION, 2);
     store.recordResult({
       tool_name: "bash",
       tool_use_id: `c${i}`,
@@ -714,8 +717,10 @@ test("once the turn's output budget is spent, results keep hash and bytes but no
 test("the output budget resets on take() and on a session rollover", () => {
   const store = createTurnStore();
   const chunk = "y".repeat(MAX_TURN_OUTPUT_CHARS);
-  const fill = (id: string) =>
+  const fill = (id: string, sessionId = SESSION) => {
+    store.recordToolCall({ tool_name: "bash", tool_use_id: id, decision: "allow" }, sessionId, 2);
     store.recordResult({ tool_name: "bash", tool_use_id: id, is_error: false, content_bytes: 1, content: chunk });
+  };
 
   store.recordPrompt("one", SESSION, 1);
   fill("a1");
@@ -728,6 +733,52 @@ test("the output budget resets on take() and on a session rollover", () => {
   assert.equal(store.snapshot().results[0]?.content, chunk, "a fresh turn has a fresh budget");
 
   store.recordPrompt("three", "another-session", 3);
-  fill("c1");
+  fill("c1", "another-session");
   assert.equal(store.snapshot().results[0]?.content, chunk, "and so does a rolled-over record");
+});
+
+// --- WR-03: the budget is spent only by results that will be posted ------------------------------
+
+test("a result whose call was never recorded keeps no text and charges nothing (WR-03)", () => {
+  // The turn log only posts results matched to a recorded call, so text from an unrecorded call (a
+  // custom tool that took the nothing-evaluable skip, an MCP proxy `search`) is never sent. Charging
+  // it let a model burn the whole budget and blind output DLP on a later, evaluated call.
+  const store = createTurnStore();
+  store.recordPrompt("p", SESSION, 1);
+  const chunk = "u".repeat(MAX_TOOL_OUTPUT_CHARS);
+  for (let i = 0; i < 40; i += 1) {
+    store.recordResult({ tool_name: "custom", tool_use_id: `u${i}`, is_error: false, content_bytes: 1, content: chunk });
+  }
+  assert.equal(store.snapshot().results.every((r) => r.content === undefined && r.content_omitted === undefined), true);
+
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "real", decision: "allow" }, SESSION, 2);
+  store.recordResult({ tool_name: "bash", tool_use_id: "real", is_error: false, content_bytes: 1, content: "AWS_SECRET=x" });
+  const real = store.snapshot().results.find((r) => r.tool_use_id === "real");
+  assert.equal(real?.content, "AWS_SECRET=x", "the evaluated call's output is still captured");
+});
+
+test("an evicted result refunds its budget (WR-03)", () => {
+  const store = createTurnStore();
+  store.recordPrompt("p", SESSION, 1);
+  const big = "b".repeat(MAX_TURN_OUTPUT_CHARS);
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "first", decision: "allow" }, SESSION, 2);
+  store.recordResult({ tool_name: "bash", tool_use_id: "first", is_error: false, content_bytes: 1, content: big });
+  // Push `first` out through the MAX_TURN_RESULTS cap with text-free results.
+  for (let i = 0; i < MAX_TURN_RESULTS; i += 1) {
+    store.recordResult({ tool_name: "x", tool_use_id: `e${i}`, is_error: false, content_bytes: 0 });
+  }
+  assert.equal(store.snapshot().results.some((r) => r.tool_use_id === "first"), false, "evicted");
+  store.recordToolCall({ tool_name: "bash", tool_use_id: "after", decision: "allow" }, SESSION, 3);
+  store.recordResult({ tool_name: "bash", tool_use_id: "after", is_error: false, content_bytes: 1, content: "fits again" });
+  assert.equal(store.snapshot().results.find((r) => r.tool_use_id === "after")?.content, "fits again");
+});
+
+test("recorded args with __proto__ / constructor keys survive copying as plain data (WR-06)", () => {
+  const store = createTurnStore();
+  const args = JSON.parse('{"__proto__":{"secret":"s"},"constructor":"c","q":"x"}') as Record<string, unknown>;
+  store.recordToolCall({ tool_name: "mcp__s__t", tool_use_id: "m", decision: "allow", tool_input: args }, SESSION, 1);
+  const recorded = store.snapshot().tool_calls[0]?.tool_input ?? {};
+  assert.deepStrictEqual(Object.keys(recorded).sort(), ["__proto__", "constructor", "q"]);
+  assert.equal(Object.getPrototypeOf(recorded), Object.prototype);
+  assert.equal(JSON.stringify(recorded), '{"__proto__":{"secret":"s"},"constructor":"c","q":"x"}');
 });

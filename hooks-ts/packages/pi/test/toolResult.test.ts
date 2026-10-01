@@ -64,8 +64,16 @@ test("a throwing store still yields undefined and no exception escapes", () => {
   assert.strictEqual(result, undefined);
 });
 
-test("the result is recorded as name, isError, digest and byte count", () => {
+/** A store whose call `id` is recorded, as the decision seam does before any result arrives. */
+function storeWithCall(id: string): ReturnType<typeof createTurnStore> {
   const store = createTurnStore();
+  store.recordToolCall({ tool_name: "read", tool_use_id: id, decision: "allow" }, "sess-tr", 1);
+  return store;
+}
+
+test("the result is recorded as name, isError, digest and byte count", () => {
+  // The call is recorded first: since WR-03 only a recorded call's text is kept (and charged).
+  const store = storeWithCall("call_read_1");
   const event = createFakeToolResultEvent("read", {
     toolCallId: "call_read_1",
     content: [{ type: "text", text: "file contents" }],
@@ -97,8 +105,9 @@ test("text output is recorded; image data and the tool input never are (T-09-10,
   // now captured (capped) by user decision; what still never enters the record is an image part's
   // base64 and `event.input`.
   const IMAGE_SECRET = "IMAGE-ONLY-SECRET";
-  const store = createTurnStore();
+  const store = storeWithCall("call_t0910");
   const event = createFakeToolResultEvent("bash", {
+    toolCallId: "call_t0910",
     input: { command: `echo ${MARKER}` },
     content: [
       { type: "text", text: `stdout:\n${MARKER}\n`, textSignature: "sig" },
@@ -118,9 +127,12 @@ test("text output is recorded; image data and the tool input never are (T-09-10,
 });
 
 test("a 10 MB text output is recorded capped at both ends, and the handler still returns undefined", () => {
-  const store = createTurnStore();
+  const store = storeWithCall("call_huge");
   const huge = "A".repeat(5_000_000) + "B".repeat(5_000_000);
-  const result = recordToolResult(createFakeToolResultEvent("read", { content: [{ type: "text", text: huge }] }), store);
+  const result = recordToolResult(
+    createFakeToolResultEvent("read", { toolCallId: "call_huge", content: [{ type: "text", text: huge }] }),
+    store,
+  );
   assert.strictEqual(result, undefined);
 
   const [only] = store.snapshot().results;

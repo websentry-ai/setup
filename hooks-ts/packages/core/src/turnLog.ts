@@ -176,7 +176,11 @@ function redactLeaves(value: unknown, apiKey: string | undefined, depth: number)
   const out: Record<string, unknown> = {};
   for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
     const redacted = redactLeaves(item, apiKey, depth + 1);
-    if (redacted !== undefined) out[key] = redacted;
+    // `defineProperty`, never `out[key] =`: a `__proto__` key in model-written args would otherwise
+    // hit the prototype setter and vanish from the audit row while the tool still received it (WR-06).
+    if (redacted !== undefined) {
+      Object.defineProperty(out, key, { value: redacted, enumerable: true, writable: true, configurable: true });
+    }
   }
   return out;
 }

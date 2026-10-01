@@ -581,3 +581,16 @@ test("a recorded tool_input deeper than the walk cap is cut, never a throw", () 
   assert.equal(wire.includes("bottom"), false, "below the cap is dropped");
   assert.ok(wire.startsWith('{"next":{"next"'), "above it is kept");
 });
+
+test("a __proto__ key in recorded MCP args reaches the audit row, redacted, as plain data (WR-06)", () => {
+  const args = JSON.parse('{"__proto__":{"secret":"Bearer sk-live-hiddenproto"},"q":"x"}') as Record<string, unknown>;
+  const rec = record({
+    tool_calls: [{ tool_name: "mcp__s__t", tool_use_id: "c", decision: "allow", ts: 1, tool_input: args }],
+  });
+  const body = buildTurnLogBody(rec, { cwd: CWD, completedAtMs: COMPLETED_AT });
+  const input = body.messages[1]?.tool_use?.[0]?.tool_input ?? {};
+  assert.deepStrictEqual(Object.keys(input).sort(), ["__proto__", "q"], "not swallowed by the prototype setter");
+  const wire = JSON.stringify(body);
+  assert.ok(wire.includes('"__proto__":{"secret":"Bearer [REDACTED]"}'));
+  assert.equal(wire.includes("hiddenproto"), false);
+});
