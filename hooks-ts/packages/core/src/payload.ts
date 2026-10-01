@@ -49,6 +49,7 @@ import {
   MAX_COMMAND_CHARS,
   MAX_PROMPT_CHARS,
   MAX_MCP_ARGS_BYTES,
+  MAX_MCP_SERVER_CONFIG_BYTES,
   MAX_PRETOOL_BODY_BYTES,
   MAX_TOOL_INPUT_BYTES,
   MAX_TOOL_INPUT_VALUE_BYTES,
@@ -491,7 +492,11 @@ export function buildPretoolPayload(input: PretoolPayloadInput): PretoolRequestB
     metadata.mcp_server = mcp.server;
     metadata.mcp_tool = mcp.tool;
     applyWireArgs(metadata, mcpArgsForWire(mcp.args));
-    if (mcp.serverConfig !== undefined) metadata.mcp_server_config = mcp.serverConfig;
+    // Bounded on its own, BEFORE the arguments are sized: over the budget it is omitted whole, never
+    // cut — a cut config would fingerprint as a different server.
+    if (mcp.serverConfig !== undefined && serialisedBytes(mcp.serverConfig) <= MAX_MCP_SERVER_CONFIG_BYTES) {
+      metadata.mcp_server_config = mcp.serverConfig;
+    }
     if (typeof mcp.origin === "string" && mcp.origin !== "") metadata.mcp_origin = mcp.origin;
   } else {
     // Allowlist first, then the whole-object cap as defence in depth (WR-04).
@@ -580,6 +585,9 @@ function fitMcpBody(body: PretoolRequestBody, args: Record<string, unknown>): vo
   try {
     const metadata = body.pre_tool_use_data.metadata;
     let budget = MAX_MCP_ARGS_BYTES;
+    // Re-measured after EVERY step, including the last fallback. With the prompt capped and the
+    // config bounded above, the body fits by construction; if it ever did not, the checker refuses to
+    // post it (`checkTool`'s oversize guard) rather than letting the ingress answer 413.
     while (serialisedBytes(body) >= MAX_PRETOOL_BODY_BYTES) {
       budget = Math.floor(budget / 2);
       if (budget < 1024) {

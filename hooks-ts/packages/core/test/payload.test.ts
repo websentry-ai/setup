@@ -674,3 +674,51 @@ test("structure-keeping is __proto__-safe", () => {
   assert.equal(Object.getPrototypeOf(wire.toolInput), Object.prototype);
   assert.equal(JSON.parse(JSON.stringify(wire.toolInput)).__proto__, "keep");
 });
+
+// --- PR #371 round 2: the whole body is bounded, config included -----------------------------------
+
+const GUARD = 921_600;
+
+test("a fat mcp_server_config is omitted whole (never cut), before the args are sized", () => {
+  const fatConfig = { command: "npx", args: Array.from({ length: 30_000 }, (_, i) => `--flag-${i}-${"a".repeat(20)}`) };
+  const args = { query: "DROP TABLE users", pad: "x".repeat(2 * 1024 * 1024) };
+  const body = buildPretoolPayload(
+    bashInput({ toolName: "mcp", command: "", lastUserPrompt: "中".repeat(8192), mcp: { ...MCP, args, serverConfig: fatConfig } }),
+  );
+  const metadata = body.pre_tool_use_data.metadata;
+  assert.equal(Object.hasOwn(metadata, "mcp_server_config"), false, "omitted, never a truncated fingerprint");
+  assert.equal((metadata.tool_input as Record<string, unknown>).query, "DROP TABLE users", "args structure kept");
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) < GUARD);
+});
+
+test("a config just under the budget is sent intact", () => {
+  const args: string[] = [];
+  while (Buffer.byteLength(JSON.stringify({ command: "npx", args: [...args, "y".repeat(100)] })) <= 32_768) args.push("y".repeat(100));
+  const config = { command: "npx", args };
+  assert.ok(Buffer.byteLength(JSON.stringify(config)) <= 32_768);
+  const body = buildPretoolPayload(bashInput({ toolName: "mcp", command: "", mcp: { ...MCP, serverConfig: config } }));
+  assert.deepStrictEqual(body.pre_tool_use_data.metadata.mcp_server_config, config);
+});
+
+test("no combination of prompt, config and args yields a body at or over the guard", () => {
+  const prompts = ["", "p".repeat(8192), "中".repeat(8192), "\u0001".repeat(8192)];
+  const configs = [undefined, { url: "https://x.invalid" }, { command: "c", args: ["z".repeat(40_000)] }];
+  const argSets: Record<string, unknown>[] = [
+    {},
+    { q: "x" },
+    { pad: '"'.repeat(3_000_000) },
+    { a: "中".repeat(500_000), b: "\u0002".repeat(300_000), c: { deep: "d".repeat(900_000) } },
+    Object.fromEntries(Array.from({ length: 3000 }, (_, i) => [`k${i}`, "v".repeat(500)])),
+  ];
+  for (const lastUserPrompt of prompts) {
+    for (const serverConfig of configs) {
+      for (const args of argSets) {
+        const body = buildPretoolPayload(
+          bashInput({ toolName: "mcp", command: "", lastUserPrompt, mcp: { ...MCP, args, ...(serverConfig ? { serverConfig } : {}) } }),
+        );
+        const bytes = Buffer.byteLength(JSON.stringify(body));
+        assert.ok(bytes < GUARD, `body ${bytes} bytes`);
+      }
+    }
+  }
+});
