@@ -152,6 +152,24 @@ export const BREAKER_OPEN_MS = 60_000;
  */
 export const CACHE_TTL_MS = 300_000;
 
+/**
+ * How many sessions one process keeps a turn record for (`sessionState.ts`). A host that runs many
+ * sessions in one process counts every open session and every subagent session; real use is a
+ * handful. 256 is far above that and still bounds a desktop process that stays up for a week and
+ * never reports a session as ended — past it, the least-recently-used session's record is dropped.
+ */
+export const MAX_TRACKED_SESSIONS = 256;
+/**
+ * How many project directories one host process keeps per-instance state for (the heartbeat gate
+ * and the no-key notice latch). One per open project; 64 is more projects than one process serves.
+ */
+export const MAX_TRACKED_INSTANCES = 64;
+/**
+ * How many distinct gateway URLs one process keeps a circuit breaker for (`breakerRegistry.ts`).
+ * Normally exactly 1; more only when projects in the same process point at different gateways.
+ */
+export const MAX_TRACKED_GATEWAYS = 16;
+
 // --- Caps (V5 / T-08-06) ---------------------------------------------------------------------
 export const MAX_REASON_CHARS = 2000;
 /**
